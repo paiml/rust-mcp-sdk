@@ -48,7 +48,7 @@ base64 = "0.22"
 tokio-tungstenite = { version = "0.27", features = ["native-tls"], optional = true }
 hyper = { version = "1.6", features = ["full"], optional = true }
 hyper-util = { version = "0.1", features = ["full"], optional = true }
-axum = { version = "0.7.5", optional = true }
+axum = { version = "0.8.5", optional = true }
 notify = { version = "8.2", optional = true }
 glob-match = { version = "0.2", optional = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
