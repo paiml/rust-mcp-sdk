@@ -13,7 +13,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     
     - name: Get version from tag
       id: get_version
@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: create-release
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -74,7 +74,7 @@ jobs:
       id-token: write  # Required for OIDC authentication
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Wait for crates.io availability
       run: |
