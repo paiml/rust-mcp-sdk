@@ -4,7 +4,7 @@
 //! deployment targets in Cargo workspaces.
 
 use anyhow::{Context, Result};
-use cargo_metadata::{MetadataCommand, Package};
+use cargo_metadata::MetadataCommand;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -70,10 +70,10 @@ pub fn detect_workspace_binaries(project_root: &Path) -> Result<Vec<BinaryInfo>>
 
     for package in metadata.packages {
         for target in &package.targets {
-            if target.kind.contains(&"bin".to_string()) {
+            if target.kind.contains(&cargo_metadata::TargetKind::Bin) {
                 binaries.push(BinaryInfo {
-                    binary_name: target.name.clone(),
-                    package_name: package.name.clone(),
+                    binary_name: target.name.to_string(),
+                    package_name: package.name.to_string(),
                     package_path: package
                         .manifest_path
                         .parent()

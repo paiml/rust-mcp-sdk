@@ -151,7 +151,14 @@ pub async fn deploy_to_pmcp_run(
     println!("   • View dashboard: https://pmcp.run/dashboard");
     println!();
 
-    Ok(outputs)
+    // Add deployment_id to custom outputs so it can be saved
+    let mut outputs_with_id = outputs;
+    outputs_with_id.custom.insert(
+        "deployment_id".to_string(),
+        serde_json::Value::String(deployment.deployment_id.clone()),
+    );
+
+    Ok(outputs_with_id)
 }
 
 /// Poll deployment status until complete or failed

@@ -522,7 +522,6 @@ anyhow = "1"
 "#,
                 server_name,
                 server_name,
-                server_name,
                 core_workspace_dir,
                 server_name,
                 server_common_path
@@ -563,7 +562,7 @@ tracing-subscriber = {{ version = "0.3", features = ["env-filter"] }}
 # Error handling
 anyhow = "1"
 "#,
-                server_name, server_name, server_name, core_workspace_dir, server_name
+                server_name, server_name, core_workspace_dir, server_name
             )
         };
 

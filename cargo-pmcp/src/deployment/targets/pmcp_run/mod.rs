@@ -1,6 +1,6 @@
-mod auth;
+pub mod auth;
 mod deploy;
-mod graphql;
+pub mod graphql;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;

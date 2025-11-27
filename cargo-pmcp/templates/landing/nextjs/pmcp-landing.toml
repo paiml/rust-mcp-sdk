@@ -1,0 +1,16 @@
+[landing]
+server_name = "{{SERVER_NAME}}"
+title = "{{TITLE}}"
+tagline = "{{TAGLINE}}"
+description = "{{DESCRIPTION}}"
+
+[landing.hero]
+cta_text = "Get Started"
+
+[landing.branding]
+primary_color = "{{PRIMARY_COLOR}}"
+# logo = "public/logo.svg"  # Optional: path to logo file
+
+[deployment]
+target = "pmcp.run"
+# server_id and endpoint are auto-populated from deployment

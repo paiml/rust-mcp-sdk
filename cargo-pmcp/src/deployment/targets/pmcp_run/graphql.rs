@@ -385,3 +385,169 @@ pub async fn get_deployment_outputs(
         custom: std::collections::HashMap::new(),
     })
 }
+
+// ========== Landing Page Deployment GraphQL Functions ==========
+
+/// Response from getLandingUploadUrl mutation
+#[derive(Debug, Deserialize)]
+pub struct LandingUploadUrl {
+    #[serde(rename = "uploadUrl")]
+    pub upload_url: String,
+    #[serde(rename = "s3Key")]
+    pub s3_key: String,
+    #[serde(rename = "s3Bucket")]
+    pub s3_bucket: String,
+    #[serde(rename = "expiresIn")]
+    pub expires_in: i32,
+}
+
+/// Response from deployLandingPage mutation
+#[derive(Debug, Deserialize)]
+pub struct LandingInfo {
+    #[serde(rename = "landingId")]
+    pub landing_id: String,
+    #[serde(rename = "amplifyAppId")]
+    pub amplify_app_id: String,
+    #[serde(rename = "amplifyDomainUrl")]
+    pub amplify_domain_url: String,
+    pub status: String,
+    #[serde(rename = "buildJobId")]
+    pub build_job_id: String,
+}
+
+/// Landing page status from getLandingStatus mutation
+#[derive(Debug, Deserialize)]
+pub struct LandingStatus {
+    pub id: String,
+    #[serde(rename = "serverId")]
+    pub server_id: String,
+    pub status: String,
+    #[serde(rename = "amplifyDomainUrl")]
+    pub amplify_domain_url: Option<String>,
+    #[serde(rename = "customDomain")]
+    pub custom_domain: Option<String>,
+    #[serde(rename = "lastDeployedAt")]
+    pub last_deployed_at: Option<String>,
+    #[serde(rename = "errorMessage")]
+    pub error_message: Option<String>,
+}
+
+/// Get presigned S3 upload URL for landing page zip
+pub async fn get_landing_upload_url(
+    access_token: &str,
+    server_id: &str,
+    zip_size: usize,
+) -> Result<LandingUploadUrl> {
+    let query = r#"
+        mutation GetLandingUploadUrl(
+            $serverId: String!,
+            $fileSize: Int!
+        ) {
+            getLandingUploadUrl(
+                serverId: $serverId,
+                fileSize: $fileSize
+            ) {
+                uploadUrl
+                s3Key
+                s3Bucket
+                expiresIn
+            }
+        }
+    "#;
+
+    let variables = serde_json::json!({
+        "serverId": server_id,
+        "fileSize": zip_size as i64
+    });
+
+    #[derive(Debug, Deserialize)]
+    struct GetLandingUploadUrlResponse {
+        #[serde(rename = "getLandingUploadUrl")]
+        get_landing_upload_url: LandingUploadUrl,
+    }
+
+    let response: GetLandingUploadUrlResponse =
+        execute_graphql(access_token, query, variables).await?;
+
+    Ok(response.get_landing_upload_url)
+}
+
+/// Deploy landing page from S3 zip file
+pub async fn deploy_landing_page(
+    access_token: &str,
+    s3_key: &str,
+    server_id: &str,
+    server_name: &str,
+    config_json: &str,
+) -> Result<LandingInfo> {
+    let query = r#"
+        mutation DeployLandingPage(
+            $serverId: String!,
+            $serverName: String!,
+            $sourceS3Key: String!,
+            $config: AWSJSON!
+        ) {
+            deployLandingPage(
+                serverId: $serverId,
+                serverName: $serverName,
+                sourceS3Key: $sourceS3Key,
+                config: $config
+            ) {
+                landingId
+                amplifyAppId
+                amplifyDomainUrl
+                status
+                buildJobId
+            }
+        }
+    "#;
+
+    let variables = serde_json::json!({
+        "serverId": server_id,
+        "serverName": server_name,
+        "sourceS3Key": s3_key,
+        "config": config_json
+    });
+
+    #[derive(Debug, Deserialize)]
+    struct DeployLandingResponse {
+        #[serde(rename = "deployLandingPage")]
+        deploy_landing_page: LandingInfo,
+    }
+
+    let response: DeployLandingResponse = execute_graphql(access_token, query, variables).await?;
+
+    Ok(response.deploy_landing_page)
+}
+
+/// Get landing page status
+/// NOTE: This is a MUTATION, not a Query! It checks Amplify job status and updates DB.
+pub async fn get_landing_status(access_token: &str, landing_id: &str) -> Result<LandingStatus> {
+    let query = r#"
+        mutation GetLandingStatus($landingId: String!) {
+            getLandingStatus(landingId: $landingId) {
+                id
+                serverId
+                status
+                amplifyDomainUrl
+                customDomain
+                lastDeployedAt
+                errorMessage
+            }
+        }
+    "#;
+
+    let variables = serde_json::json!({
+        "landingId": landing_id
+    });
+
+    #[derive(Debug, Deserialize)]
+    struct GetLandingStatusResponse {
+        #[serde(rename = "getLandingStatus")]
+        get_landing_status: Option<LandingStatus>,
+    }
+
+    let response: GetLandingStatusResponse = execute_graphql(access_token, query, variables).await?;
+
+    response.get_landing_status.context("Landing page not found")
+}

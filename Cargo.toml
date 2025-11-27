@@ -69,7 +69,7 @@ web-sys = { version = "0.3", features = ["console", "Window", "Document", "WebSo
 js-sys = "0.3"
 futures-channel = "0.3"
 futures-locks = { version = "0.7", default-features = false }
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 # Transport dependencies
 tokio-tungstenite = { version = "0.27", optional = true }
@@ -81,7 +81,7 @@ notify = { version = "8.2", optional = true }
 glob-match = { version = "0.2", optional = true }
 
 # Validation
-jsonschema = { version = "0.32", optional = true }
+jsonschema = { version = "0.37", optional = true }
 garde = { version = "0.22", optional = true }
 
 # SIMD support

@@ -334,6 +334,11 @@ impl DeployCommand {
                 println!();
                 outputs.display();
 
+                // Save deployment info for pmcp-run target (for landing page integration)
+                if target_id == "pmcp-run" {
+                    Self::save_deployment_info(&project_root, &outputs)?;
+                }
+
                 Ok(())
             },
         }
@@ -368,5 +373,49 @@ impl DeployCommand {
                 anyhow::anyhow!("Could not find Cargo.toml in any parent directory")
             })?;
         }
+    }
+
+    /// Save deployment info to .pmcp/deployment.toml for landing page integration
+    fn save_deployment_info(
+        project_root: &PathBuf,
+        outputs: &crate::deployment::DeploymentOutputs,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        // Extract deployment_id from custom outputs
+        let deployment_id = outputs
+            .custom
+            .get("deployment_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No deployment_id in outputs"))?;
+
+        // Get URL
+        let url = outputs
+            .url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No URL in deployment outputs"))?;
+
+        // Create .pmcp directory if it doesn't exist
+        let pmcp_dir = project_root.join(".pmcp");
+        std::fs::create_dir_all(&pmcp_dir)?;
+
+        // Create deployment.toml content
+        let content = format!(
+            r#"# Auto-generated deployment info for landing page integration
+# This file is created automatically when deploying to pmcp-run
+
+[deployment]
+server_id = "{}"
+endpoint = "{}"
+"#,
+            deployment_id, url
+        );
+
+        // Write to .pmcp/deployment.toml
+        let deployment_file = pmcp_dir.join("deployment.toml");
+        let mut file = std::fs::File::create(&deployment_file)?;
+        file.write_all(content.as_bytes())?;
+
+        Ok(())
     }
 }

@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod deployment;
+mod landing;
 mod templates;
 mod utils;
 
@@ -105,6 +106,14 @@ enum Commands {
     ///
     /// Deploy to AWS Lambda, Azure Container Apps, Google Cloud Run, etc.
     Deploy(commands::deploy::DeployCommand),
+
+    /// Manage landing pages for MCP servers
+    ///
+    /// Create, develop, and deploy landing pages that showcase your MCP server
+    Landing {
+        #[command(subcommand)]
+        command: commands::landing::LandingCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +223,11 @@ fn execute_command(command: Commands) -> Result<()> {
         },
         Commands::Deploy(deploy_cmd) => {
             deploy_cmd.execute()?;
+        },
+        Commands::Landing { command } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let project_root = std::env::current_dir()?;
+            runtime.block_on(command.execute(project_root))?;
         },
     }
     Ok(())

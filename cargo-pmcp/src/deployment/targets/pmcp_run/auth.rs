@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
-use oauth2::reqwest::async_http_client;
 use oauth2::{
-    basic::BasicTokenType, AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken,
-    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
+    basic::{BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse, BasicTokenType},
+    AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken,
+    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse,
     TokenUrl,
 };
 use serde::{Deserialize, Serialize};
@@ -19,16 +19,28 @@ pub struct CognitoTokenFields {
 
 impl oauth2::ExtraTokenFields for CognitoTokenFields {}
 
-type CognitoClient = Client<
-    oauth2::StandardErrorResponse<oauth2::basic::BasicErrorResponseType>,
-    CognitoTokenResponse,
-    BasicTokenType,
-    oauth2::StandardTokenIntrospectionResponse<CognitoTokenFields, BasicTokenType>,
-    oauth2::StandardRevocableToken,
-    oauth2::StandardErrorResponse<oauth2::RevocationErrorResponseType>,
->;
-
 type CognitoTokenResponse = StandardTokenResponse<CognitoTokenFields, BasicTokenType>;
+
+// Custom OAuth2 client with Cognito token fields
+// This is like BasicClient but with custom token response type
+type CognitoClient<
+    HasAuthUrl = oauth2::EndpointNotSet,
+    HasDeviceAuthUrl = oauth2::EndpointNotSet,
+    HasIntrospectionUrl = oauth2::EndpointNotSet,
+    HasRevocationUrl = oauth2::EndpointNotSet,
+    HasTokenUrl = oauth2::EndpointNotSet,
+> = Client<
+    BasicErrorResponse,
+    CognitoTokenResponse,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
+>;
 
 // Cognito configuration - reads from environment variables or uses defaults
 const CALLBACK_PORT: u16 = 8787;
@@ -102,10 +114,11 @@ async fn refresh_credentials(refresh_token: &str) -> Result<Credentials> {
     println!("🔄 Refreshing access token...");
 
     let client = create_oauth_client()?;
+    let http_client = reqwest::Client::new();
 
     let token_result = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(async_http_client)
+        .request_async(&http_client)
         .await
         .map_err(|e| {
             eprintln!("❌ Token refresh failed: {}", e);
@@ -167,7 +180,7 @@ fn save_credentials(credentials: &Credentials) -> Result<()> {
 }
 
 /// Create OAuth 2.0 client
-fn create_oauth_client() -> Result<CognitoClient> {
+fn create_oauth_client() -> Result<CognitoClient<oauth2::EndpointSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointSet>> {
     let cognito_domain = get_cognito_domain();
     let cognito_client_id = get_cognito_client_id();
 
@@ -176,12 +189,9 @@ fn create_oauth_client() -> Result<CognitoClient> {
     let token_url = TokenUrl::new(format!("https://{}/oauth2/token", cognito_domain))
         .context("Invalid token URL")?;
 
-    Ok(Client::new(
-        ClientId::new(cognito_client_id),
-        None, // No client secret for public clients
-        auth_url,
-        Some(token_url),
-    ))
+    Ok(Client::new(ClientId::new(cognito_client_id))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url))
 }
 
 /// Start local HTTP server to receive OAuth callback
@@ -290,11 +300,12 @@ pub async fn login() -> Result<()> {
     let redirect_url = RedirectUrl::new(format!("http://localhost:{}", CALLBACK_PORT))
         .context("Invalid redirect URL")?;
 
+    let http_client = reqwest::Client::new();
     let token_result = client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(pkce_verifier)
         .set_redirect_uri(std::borrow::Cow::Owned(redirect_url))
-        .request_async(async_http_client)
+        .request_async(&http_client)
         .await
         .map_err(|e| {
             eprintln!("Token exchange error details: {:?}", e);
