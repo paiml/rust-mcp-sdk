@@ -25,6 +25,7 @@ allow = [
     "Unicode-3.0",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 exceptions = []
@@ -35,7 +36,36 @@ wildcards = "allow"
 highlight = "all"
 allow = []
 deny = []
-skip = []
+skip = [
+    # Allow multiple getrandom versions during transition period
+    # v0.2.16 is used by ring/rustls (not yet updated to v0.3)
+    # v0.3.4 is our direct dependency for WASM support
+    { name = "getrandom", version = "=0.2.16" },
+
+    # Allow multiple hashbrown versions during indexmap transition
+    # v0.14.5 is used by older dependencies
+    # v0.16.1 is used by updated indexmap v2.12.1
+    { name = "hashbrown", version = "=0.14.5" },
+
+    # Allow multiple windows-sys versions during ecosystem transition
+    # Various versions used by different Windows dependencies
+    { name = "windows-sys", version = "=0.52.0" },
+    { name = "windows-sys", version = "=0.59.0" },
+    { name = "windows-sys", version = "=0.60.2" },
+
+    # Allow multiple windows-targets versions
+    { name = "windows-targets", version = "=0.52.6" },
+
+    # Allow multiple windows_* crate versions (0.52.6 used by older deps)
+    { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
+    { name = "windows_aarch64_msvc", version = "=0.52.6" },
+    { name = "windows_i686_gnu", version = "=0.52.6" },
+    { name = "windows_i686_gnullvm", version = "=0.52.6" },
+    { name = "windows_i686_msvc", version = "=0.52.6" },
+    { name = "windows_x86_64_gnu", version = "=0.52.6" },
+    { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
+    { name = "windows_x86_64_msvc", version = "=0.52.6" },
+]
 skip-tree = []
 
 [sources]
