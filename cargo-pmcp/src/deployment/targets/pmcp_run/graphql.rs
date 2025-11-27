@@ -547,7 +547,10 @@ pub async fn get_landing_status(access_token: &str, landing_id: &str) -> Result<
         get_landing_status: Option<LandingStatus>,
     }
 
-    let response: GetLandingStatusResponse = execute_graphql(access_token, query, variables).await?;
+    let response: GetLandingStatusResponse =
+        execute_graphql(access_token, query, variables).await?;
 
-    response.get_landing_status.context("Landing page not found")
+    response
+        .get_landing_status
+        .context("Landing page not found")
 }

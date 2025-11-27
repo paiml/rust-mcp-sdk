@@ -81,14 +81,14 @@ impl LandingCommand {
 
             LandingCommand::Dev { dir, port, watch } => {
                 dev::run_dev_server(project_root, dir, port, watch).await
-            }
+            },
 
             LandingCommand::Build { dir, output: _ } => {
                 // TODO: Implement in P1
                 println!("🚧 Build command coming in Phase 1!");
                 println!("   For now, use: cd {} && npm run build", dir.display());
                 Ok(())
-            }
+            },
 
             LandingCommand::Deploy {
                 dir,

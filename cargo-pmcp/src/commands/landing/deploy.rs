@@ -85,9 +85,9 @@ pub async fn deploy_landing_page(
 
     // Authenticate with pmcp.run
     println!("🔐 Authenticating with pmcp.run...");
-    let credentials = auth::get_credentials()
-        .await
-        .context("Failed to get pmcp.run credentials. Run: cargo pmcp deploy login --target pmcp-run")?;
+    let credentials = auth::get_credentials().await.context(
+        "Failed to get pmcp.run credentials. Run: cargo pmcp deploy login --target pmcp-run",
+    )?;
     println!("   ✅ Authenticated");
     println!();
 
@@ -120,13 +120,18 @@ pub async fn deploy_landing_page(
     println!("📦 Creating deployment package...");
     let zip_path = create_deployment_zip(&out_dir)?;
     let zip_size = std::fs::metadata(&zip_path)?.len();
-    println!("   ✅ Created {} ({} KB)", zip_path.display(), zip_size / 1024);
+    println!(
+        "   ✅ Created {} ({} KB)",
+        zip_path.display(),
+        zip_size / 1024
+    );
     println!();
 
     // Upload to pmcp.run via GraphQL (same as server deployment)
     println!("☁️  Uploading to pmcp.run...");
-    let landing_id = upload_landing_via_graphql(&zip_path, &server_id, &config, &credentials.access_token)
-        .await?;
+    let landing_id =
+        upload_landing_via_graphql(&zip_path, &server_id, &config, &credentials.access_token)
+            .await?;
     println!("   ✅ Uploaded (ID: {})", landing_id);
     println!();
 
@@ -263,7 +268,7 @@ async fn poll_landing_status(landing_id: &str, access_token: &str) -> Result<Str
                 }
                 std::io::stdout().flush()?;
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
+            },
             "deployed" => {
                 if dots > 0 {
                     println!();
@@ -274,7 +279,7 @@ async fn poll_landing_status(landing_id: &str, access_token: &str) -> Result<Str
                     .or(status.amplify_domain_url)
                     .ok_or_else(|| anyhow::anyhow!("Missing URL in deployed landing page"))?;
                 return Ok(url);
-            }
+            },
             "failed" => {
                 if dots > 0 {
                     println!();
@@ -283,10 +288,10 @@ async fn poll_landing_status(landing_id: &str, access_token: &str) -> Result<Str
                     .error_message
                     .unwrap_or_else(|| "Unknown error".to_string());
                 anyhow::bail!("Deployment failed: {}", error);
-            }
+            },
             _ => {
                 anyhow::bail!("Unknown deployment status: {}", status.status);
-            }
+            },
         }
     }
 }
@@ -303,13 +308,13 @@ fn check_node_installed(dir: &PathBuf) -> Result<()> {
             let version = String::from_utf8_lossy(&output.stdout);
             println!("   Node.js: {}", version.trim());
             Ok(())
-        }
+        },
         _ => {
             anyhow::bail!(
                 "Node.js not found. Please install Node.js 18+ from:\n\
                  https://nodejs.org/"
             )
-        }
+        },
     }
 }
 

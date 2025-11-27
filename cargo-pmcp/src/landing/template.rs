@@ -71,7 +71,10 @@ pub fn clone_template(template_name: &str, output_dir: &Path) -> Result<()> {
     sparse_clone_template(&temp_dir, template.path)?;
 
     // Copy template to output directory
-    let template_source = temp_dir.join("rust-mcp-sdk").join("cargo-pmcp").join(template.path);
+    let template_source = temp_dir
+        .join("rust-mcp-sdk")
+        .join("cargo-pmcp")
+        .join(template.path);
     copy_dir_recursive(&template_source, output_dir)?;
 
     // Clean up temp directory
@@ -131,7 +134,8 @@ fn sparse_clone_template(temp_dir: &Path, template_path: &str) -> Result<()> {
     let output = Command::new("git")
         .args(&[
             "clone",
-            "--depth", "1",
+            "--depth",
+            "1",
             "--filter=blob:none",
             "--sparse",
             CARGO_PMCP_REPO,
@@ -148,7 +152,11 @@ fn sparse_clone_template(temp_dir: &Path, template_path: &str) -> Result<()> {
     // Set sparse-checkout to only include the template
     let repo_dir = git_dir.join("rust-mcp-sdk");
     let output = Command::new("git")
-        .args(&["sparse-checkout", "set", &format!("cargo-pmcp/{}", template_path)])
+        .args(&[
+            "sparse-checkout",
+            "set",
+            &format!("cargo-pmcp/{}", template_path),
+        ])
         .current_dir(&repo_dir)
         .output()
         .context("Failed to set sparse checkout")?;
@@ -199,10 +207,7 @@ fn check_git_installed() -> Result<()> {
 }
 
 /// Replace variables in files
-pub fn replace_variables_in_files(
-    dir: &Path,
-    variables: &HashMap<String, String>,
-) -> Result<()> {
+pub fn replace_variables_in_files(dir: &Path, variables: &HashMap<String, String>) -> Result<()> {
     println!("🔧 Customizing template...");
 
     // Files that need variable replacement

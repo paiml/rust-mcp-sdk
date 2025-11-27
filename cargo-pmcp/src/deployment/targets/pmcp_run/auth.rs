@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
 use oauth2::{
-    basic::{BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse, BasicTokenType},
-    AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken,
-    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse,
-    TokenUrl,
+    basic::{
+        BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+        BasicTokenType,
+    },
+    AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    RefreshToken, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -180,7 +182,15 @@ fn save_credentials(credentials: &Credentials) -> Result<()> {
 }
 
 /// Create OAuth 2.0 client
-fn create_oauth_client() -> Result<CognitoClient<oauth2::EndpointSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointNotSet, oauth2::EndpointSet>> {
+fn create_oauth_client() -> Result<
+    CognitoClient<
+        oauth2::EndpointSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointSet,
+    >,
+> {
     let cognito_domain = get_cognito_domain();
     let cognito_client_id = get_cognito_client_id();
 

@@ -92,22 +92,20 @@ pub async fn run_dev_server(
 
 /// Check if Node.js is installed
 fn check_node_installed() -> Result<()> {
-    let output = Command::new("node")
-        .arg("--version")
-        .output();
+    let output = Command::new("node").arg("--version").output();
 
     match output {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             println!("✅ Node.js found: {}", version.trim());
             Ok(())
-        }
+        },
         _ => {
             anyhow::bail!(
                 "Node.js not found. Please install Node.js 18+ from:\n\
                  https://nodejs.org/"
             );
-        }
+        },
     }
 }
 

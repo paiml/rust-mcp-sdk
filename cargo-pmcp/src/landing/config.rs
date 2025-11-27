@@ -122,8 +122,7 @@ impl LandingConfig {
 
     /// Save configuration to a TOML file
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize landing config")?;
+        let content = toml::to_string_pretty(self).context("Failed to serialize landing config")?;
 
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
@@ -176,7 +175,10 @@ impl LandingConfig {
             landing: LandingSection {
                 server_name: server_name.clone(),
                 title: Some(format!("{} MCP Server", server_name)),
-                tagline: Some(format!("Powerful {} capabilities for AI assistants", server_name)),
+                tagline: Some(format!(
+                    "Powerful {} capabilities for AI assistants",
+                    server_name
+                )),
                 description: Some(format!(
                     "This MCP server provides {} functionality for Claude and other AI assistants.",
                     server_name

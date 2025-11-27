@@ -32,7 +32,7 @@ pub async fn init_landing_page(
             let name = detect_server_name(&project_root)?;
             println!("📝 Detected server name: {}", name);
             name
-        }
+        },
     };
 
     // Check if output directory already exists
@@ -52,17 +52,16 @@ pub async fn init_landing_page(
     println!();
 
     // Check for existing deployment info
-    let (server_id, endpoint) = if let Some((id, ep)) =
-        crate::landing::config::load_deployment_info(&project_root)
-    {
-        println!("✅ Found existing deployment:");
-        println!("   Server ID: {}", id);
-        println!("   Endpoint: {}", ep);
-        println!();
-        (Some(id), Some(ep))
-    } else {
-        (None, None)
-    };
+    let (server_id, endpoint) =
+        if let Some((id, ep)) = crate::landing::config::load_deployment_info(&project_root) {
+            println!("✅ Found existing deployment:");
+            println!("   Server ID: {}", id);
+            println!("   Endpoint: {}", ep);
+            println!();
+            (Some(id), Some(ep))
+        } else {
+            (None, None)
+        };
 
     // Create default configuration
     let mut config = LandingConfig::default_for_server(server_name.clone());
@@ -90,11 +89,10 @@ pub async fn init_landing_page(
     );
     vars.insert(
         "DESCRIPTION".to_string(),
-        config
-            .landing
-            .description
-            .clone()
-            .unwrap_or_else(|| "This MCP server provides tools and resources for Claude and other AI assistants.".to_string()),
+        config.landing.description.clone().unwrap_or_else(|| {
+            "This MCP server provides tools and resources for Claude and other AI assistants."
+                .to_string()
+        }),
     );
     vars.insert(
         "PRIMARY_COLOR".to_string(),
