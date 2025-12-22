@@ -35,4 +35,4 @@ tiny_http = "0.12"                      # OAuth callback server
 open = "5.0"                            # Browser launch
 chrono = "0.4"                          # Token expiry handling
 rpassword = "7.3"                       # Secret input (for other features)
-zip = "6.0"                             # Zip file creation for landing page deployment
+zip = "7.0"                             # Zip file creation for landing page deployment
