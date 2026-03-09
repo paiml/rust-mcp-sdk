@@ -740,7 +740,9 @@ mod tests {
             "descriptor keys should be kept"
         );
         assert!(
-            !transformed.metadata.contains_key("openai/widgetPrefersBorder"),
+            !transformed
+                .metadata
+                .contains_key("openai/widgetPrefersBorder"),
             "display keys should be stripped"
         );
     }

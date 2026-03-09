@@ -593,8 +593,7 @@ impl CallToolResult {
     /// the tool actually has widget metadata.
     pub fn with_widget_enrichment(self, info: &ToolInfo, structured_value: Value) -> Self {
         if let Some(meta) = info.widget_meta() {
-            let filtered =
-                crate::types::ui::filter_meta_by_prefix(meta, "openai/toolInvocation/");
+            let filtered = crate::types::ui::filter_meta_by_prefix(meta, "openai/toolInvocation/");
             self.with_structured_content(structured_value)
                 .with_meta(filtered)
         } else {
