@@ -40,11 +40,9 @@
 //!         _context: RequestContext,
 //!     ) -> Result<ReadResourceResult> {
 //!         let id = params.get("id").unwrap();
-//!         Ok(ReadResourceResult {
-//!             contents: vec![Content::Text {
-//!                 text: format!("Schema for dataset {}", id),
-//!             }],
-//!         })
+//!         Ok(ReadResourceResult::new(vec![Content::Text {
+//!             text: format!("Schema for dataset {}", id),
+//!         }]))
 //!     }
 //! }
 //! ```
@@ -221,11 +219,9 @@ impl RequestContext {
 ///         let full_path = format!("{}/{}", self.base_path, path);
 ///
 ///         // Read file and return contents...
-///         Ok(ReadResourceResult {
-///             contents: vec![Content::Text {
-///                 text: format!("Contents of {}", full_path),
-///             }],
-///         })
+///         Ok(ReadResourceResult::new(vec![Content::Text {
+///             text: format!("Contents of {}", full_path),
+///         }]))
 ///     }
 /// }
 /// ```

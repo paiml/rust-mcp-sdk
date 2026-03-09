@@ -39,9 +39,8 @@ struct GameResources;
 impl ResourceHandler for GameResources {
     async fn read(&self, uri: &str, _extra: RequestHandlerExtra) -> Result<ReadResourceResult> {
         match uri {
-            "if://walkthrough/zork1" => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: r#"
+            "if://walkthrough/zork1" => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: r#"
 # Zork I Walkthrough
 
 ## West of House
@@ -63,12 +62,10 @@ Based on your progress, you're still in the early game. Focus on:
 - Collecting the brass lantern
 - Reading all available text carefully
 "#
-                    .to_string(),
-                }],
-            }),
-            "if://walkthrough/planetfall" => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: r#"
+                .to_string(),
+            }])),
+            "if://walkthrough/planetfall" => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: r#"
 # Planetfall Walkthrough
 
 ## Starting Area
@@ -82,12 +79,10 @@ You wake up in your bunk on the spaceship.
 
 Remember: Floyd is your friend!
 "#
-                    .to_string(),
-                }],
-            }),
-            "if://help/general" => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: r#"
+                .to_string(),
+            }])),
+            "if://help/general" => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: r#"
 # Interactive Fiction General Help
 
 ## Basic Commands
@@ -115,9 +110,8 @@ Remember: Floyd is your friend!
 4. Experiment with different commands
 5. If stuck, try examining everything in detail
 "#
-                    .to_string(),
-                }],
-            }),
+                .to_string(),
+            }])),
             _ => Err(pmcp::Error::validation(format!(
                 "Unknown resource: {}",
                 uri
@@ -130,29 +124,29 @@ Remember: Floyd is your friend!
         _cursor: Option<String>,
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                ResourceInfo {
-                    uri: "if://walkthrough/zork1".to_string(),
-                    name: "Zork I Walkthrough".to_string(),
-                    description: Some("Complete walkthrough for Zork I".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                },
-                ResourceInfo {
-                    uri: "if://walkthrough/planetfall".to_string(),
-                    name: "Planetfall Walkthrough".to_string(),
-                    description: Some("Complete walkthrough for Planetfall".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                },
-                ResourceInfo {
-                    uri: "if://help/general".to_string(),
-                    name: "IF General Help".to_string(),
-                    description: Some("General interactive fiction commands and tips".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                },
-            ],
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(vec![
+            ResourceInfo {
+                uri: "if://walkthrough/zork1".to_string(),
+                name: "Zork I Walkthrough".to_string(),
+                description: Some("Complete walkthrough for Zork I".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                meta: None,
+            },
+            ResourceInfo {
+                uri: "if://walkthrough/planetfall".to_string(),
+                name: "Planetfall Walkthrough".to_string(),
+                description: Some("Complete walkthrough for Planetfall".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                meta: None,
+            },
+            ResourceInfo {
+                uri: "if://help/general".to_string(),
+                name: "IF General Help".to_string(),
+                description: Some("General interactive fiction commands and tips".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                meta: None,
+            },
+        ]))
     }
 }
 

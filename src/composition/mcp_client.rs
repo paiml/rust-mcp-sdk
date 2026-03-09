@@ -272,6 +272,7 @@ impl FoundationClient for McpFoundationClient {
                     uri,
                     text,
                     mime_type,
+                    ..
                 } => Ok(ResourceContent {
                     uri: uri.clone(),
                     mime_type: mime_type.clone(),
@@ -350,6 +351,7 @@ impl FoundationClient for McpFoundationClient {
                         uri,
                         text,
                         mime_type,
+                        ..
                     } => PromptContent::Resource {
                         resource: super::types::EmbeddedResource {
                             uri,

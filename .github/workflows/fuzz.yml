@@ -62,14 +62,14 @@ jobs:
       
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
       
       - name: Upload corpus
         if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}/
@@ -127,7 +127,7 @@ jobs:
           done
       
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-coverage
           path: fuzz/coverage/
@@ -162,7 +162,7 @@ jobs:
         timeout-minutes: 1440  # 24 hours
       
       - name: Upload results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-24h-results
           path: |

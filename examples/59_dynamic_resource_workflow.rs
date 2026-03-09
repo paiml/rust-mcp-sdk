@@ -32,9 +32,8 @@ struct WalkthroughResources;
 impl ResourceHandler for WalkthroughResources {
     async fn read(&self, uri: &str, _extra: RequestHandlerExtra) -> Result<ReadResourceResult> {
         match uri {
-            "if://walkthrough/zork1" => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: r#"
+            "if://walkthrough/zork1" => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: r#"
 # Zork I Walkthrough
 
 ## West of House
@@ -51,14 +50,11 @@ You are standing in an open field west of a white house, with a boarded front do
 - Entering the house: +10 points
 - Finding the lamp: +10 points
 "#
-                    .to_string(),
-                }],
-            }),
-            "if://walkthrough/planetfall" => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: "# Planetfall Walkthrough\n\nYour adventure in space...".to_string(),
-                }],
-            }),
+                .to_string(),
+            }])),
+            "if://walkthrough/planetfall" => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: "# Planetfall Walkthrough\n\nYour adventure in space...".to_string(),
+            }])),
             _ => Err(pmcp::Error::validation(format!(
                 "Unknown resource: {}",
                 uri
@@ -71,23 +67,22 @@ You are standing in an open field west of a white house, with a boarded front do
         _cursor: Option<String>,
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                ResourceInfo {
-                    uri: "if://walkthrough/zork1".to_string(),
-                    name: "Zork I Walkthrough".to_string(),
-                    description: Some("Complete walkthrough for Zork I".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                },
-                ResourceInfo {
-                    uri: "if://walkthrough/planetfall".to_string(),
-                    name: "Planetfall Walkthrough".to_string(),
-                    description: Some("Complete walkthrough for Planetfall".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                },
-            ],
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(vec![
+            ResourceInfo {
+                uri: "if://walkthrough/zork1".to_string(),
+                name: "Zork I Walkthrough".to_string(),
+                description: Some("Complete walkthrough for Zork I".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                meta: None,
+            },
+            ResourceInfo {
+                uri: "if://walkthrough/planetfall".to_string(),
+                name: "Planetfall Walkthrough".to_string(),
+                description: Some("Complete walkthrough for Planetfall".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                meta: None,
+            },
+        ]))
     }
 }
 

@@ -4,7 +4,6 @@ use colored::*;
 use std::time::Duration;
 
 mod diagnostics;
-mod oauth;
 mod report;
 mod scenario;
 mod scenario_executor;
@@ -12,7 +11,7 @@ mod scenario_generator;
 mod tester;
 mod validators;
 
-use oauth::{OAuthConfig, OAuthHelper};
+use pmcp::client::oauth::{default_cache_path, OAuthConfig, OAuthHelper};
 use report::{OutputFormat, TestReport};
 use tester::ServerTester;
 
@@ -536,7 +535,7 @@ async fn create_oauth_middleware(
     let cache_file = if no_cache {
         None
     } else {
-        Some(oauth::default_cache_path())
+        Some(default_cache_path())
     };
 
     let config = OAuthConfig {

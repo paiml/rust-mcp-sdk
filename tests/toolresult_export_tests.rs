@@ -71,6 +71,7 @@ fn test_toolresult_content_types() {
             uri: "file://test.txt".to_string(),
             text: Some("resource content".to_string()),
             mime_type: Some("text/plain".to_string()),
+            meta: None,
         }],
         is_error: false,
         ..Default::default()

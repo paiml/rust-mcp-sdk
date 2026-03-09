@@ -103,6 +103,7 @@ fn bench_message_sizes(c: &mut Criterion) {
         uri: "file://large-document.pdf".to_string(),
         text: Some("This is a large document with extensive content...".repeat(100)),
         mime_type: Some("application/pdf".to_string()),
+        meta: None,
     };
 
     let contents = vec![

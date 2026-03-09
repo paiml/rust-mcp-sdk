@@ -46,17 +46,18 @@ pub enum SchemaCommand {
 }
 
 impl SchemaCommand {
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
+        let quiet = global_flags.quiet;
         runtime.block_on(async {
             match self {
                 SchemaCommand::Export {
                     endpoint,
                     server,
                     output,
-                } => export(endpoint, server, output).await,
-                SchemaCommand::Validate { schema } => validate(&schema).await,
-                SchemaCommand::Diff { schema, endpoint } => diff(&schema, &endpoint).await,
+                } => export(endpoint, server, output, quiet).await,
+                SchemaCommand::Validate { schema } => validate(&schema, quiet).await,
+                SchemaCommand::Diff { schema, endpoint } => diff(&schema, &endpoint, quiet).await,
             }
         })
     }
@@ -120,6 +121,13 @@ pub struct ToolSchema {
         skip_serializing_if = "Option::is_none"
     )]
     pub input_schema: Option<Value>,
+    /// Output schema - top-level per MCP spec 2025-06-18
+    #[serde(
+        default,
+        alias = "outputSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
 }
@@ -131,8 +139,9 @@ pub struct ToolSchema {
 /// - `destructiveHint` -> `destructive`
 /// - `idempotentHint` -> `idempotent`
 /// - `openWorldHint` -> `open_world`
-/// - `pmcp:outputSchema` -> `output_schema` (PMCP extension)
 /// - `pmcp:outputTypeName` -> `output_type_name` (PMCP extension)
+///
+/// Note: `outputSchema` is now a top-level field on `ToolSchema` per MCP spec 2025-06-18.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolAnnotations {
@@ -159,12 +168,6 @@ pub struct ToolAnnotations {
     // -------------------------------------------------------------------------
     // PMCP Extensions for Type-Safe Composition
     // -------------------------------------------------------------------------
-    /// JSON Schema for the tool's output type (PMCP extension).
-    ///
-    /// When present, code generators can create typed return structs.
-    #[serde(rename = "pmcp:outputSchema", skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<Value>,
-
     /// Name of the output type for code generation (PMCP extension).
     ///
     /// Example: "QueryResult" generates `struct QueryResult { ... }`
@@ -239,6 +242,7 @@ async fn export(
     endpoint: Option<String>,
     server: Option<String>,
     output: Option<String>,
+    quiet: bool,
 ) -> Result<()> {
     // Determine endpoint URL
     let endpoint_url = match (&endpoint, &server) {
@@ -257,11 +261,13 @@ async fn export(
         },
     };
 
-    println!(
-        "{} Exporting schema from {}",
-        style("->").cyan().bold(),
-        style(&endpoint_url).yellow()
-    );
+    if !quiet {
+        println!(
+            "{} Exporting schema from {}",
+            style("->").cyan().bold(),
+            style(&endpoint_url).yellow()
+        );
+    }
 
     // Create HTTP client
     let client = reqwest::Client::builder()
@@ -270,7 +276,9 @@ async fn export(
         .context("Failed to create HTTP client")?;
 
     // Initialize MCP session
-    println!("  {} Initializing MCP session...", style("*").dim());
+    if !quiet {
+        println!("  {} Initializing MCP session...", style("*").dim());
+    }
     let init_response = send_mcp_request(
         &client,
         &endpoint_url,
@@ -318,45 +326,57 @@ async fn export(
         .await;
 
     // Fetch tools
-    println!("  {} Fetching tools...", style("*").dim());
+    if !quiet {
+        println!("  {} Fetching tools...", style("*").dim());
+    }
     let tools_response = send_mcp_request(&client, &endpoint_url, "tools/list", None).await?;
     let tools: Vec<ToolSchema> = tools_response
         .get("tools")
         .and_then(|t| serde_json::from_value(t.clone()).ok())
         .unwrap_or_default();
-    println!(
-        "    {} Found {} tools",
-        style("OK").green(),
-        style(tools.len()).bold()
-    );
+    if !quiet {
+        println!(
+            "    {} Found {} tools",
+            style("OK").green(),
+            style(tools.len()).bold()
+        );
+    }
 
     // Fetch resources
-    println!("  {} Fetching resources...", style("*").dim());
+    if !quiet {
+        println!("  {} Fetching resources...", style("*").dim());
+    }
     let resources_response = send_mcp_request(&client, &endpoint_url, "resources/list", None).await;
     let resources: Vec<ResourceSchema> = resources_response
         .ok()
         .and_then(|r| r.get("resources").cloned())
         .and_then(|r| serde_json::from_value(r).ok())
         .unwrap_or_default();
-    println!(
-        "    {} Found {} resources",
-        style("OK").green(),
-        style(resources.len()).bold()
-    );
+    if !quiet {
+        println!(
+            "    {} Found {} resources",
+            style("OK").green(),
+            style(resources.len()).bold()
+        );
+    }
 
     // Fetch prompts
-    println!("  {} Fetching prompts...", style("*").dim());
+    if !quiet {
+        println!("  {} Fetching prompts...", style("*").dim());
+    }
     let prompts_response = send_mcp_request(&client, &endpoint_url, "prompts/list", None).await;
     let prompts: Vec<PromptSchema> = prompts_response
         .ok()
         .and_then(|r| r.get("prompts").cloned())
         .and_then(|r| serde_json::from_value(r).ok())
         .unwrap_or_default();
-    println!(
-        "    {} Found {} prompts",
-        style("OK").green(),
-        style(prompts.len()).bold()
-    );
+    if !quiet {
+        println!(
+            "    {} Found {} prompts",
+            style("OK").green(),
+            style(prompts.len()).bold()
+        );
+    }
 
     // Build schema
     let schema = McpSchema {
@@ -388,42 +408,46 @@ async fn export(
     std::fs::write(&output_path, &schema_json)
         .with_context(|| format!("Failed to write schema to {}", output_path))?;
 
-    println!();
-    println!(
-        "{} Schema exported to {}",
-        style("OK").green().bold(),
-        style(&output_path).cyan()
-    );
-    println!();
-    println!(
-        "  Server: {} v{}",
-        style(&schema.name).bold(),
-        style(schema.version.as_deref().unwrap_or("?")).dim()
-    );
-    println!("  Tools: {}", style(schema.tools.len()).bold());
-    println!("  Resources: {}", style(schema.resources.len()).bold());
-    println!("  Prompts: {}", style(schema.prompts.len()).bold());
-    println!();
-    println!("Next steps:");
-    println!(
-        "  1. Review and customize: {}",
-        style(&output_path).yellow()
-    );
-    println!(
-        "  2. Generate typed client: {}",
-        style(format!("cargo pmcp generate foundation {}", output_path)).yellow()
-    );
+    if !quiet {
+        println!();
+        println!(
+            "{} Schema exported to {}",
+            style("OK").green().bold(),
+            style(&output_path).cyan()
+        );
+        println!();
+        println!(
+            "  Server: {} v{}",
+            style(&schema.name).bold(),
+            style(schema.version.as_deref().unwrap_or("?")).dim()
+        );
+        println!("  Tools: {}", style(schema.tools.len()).bold());
+        println!("  Resources: {}", style(schema.resources.len()).bold());
+        println!("  Prompts: {}", style(schema.prompts.len()).bold());
+        println!();
+        println!("Next steps:");
+        println!(
+            "  1. Review and customize: {}",
+            style(&output_path).yellow()
+        );
+        println!(
+            "  2. Generate typed client: {}",
+            style(format!("cargo pmcp generate foundation {}", output_path)).yellow()
+        );
+    }
 
     Ok(())
 }
 
 /// Validate a schema file
-async fn validate(schema_path: &str) -> Result<()> {
-    println!(
-        "{} Validating schema: {}",
-        style("->").cyan().bold(),
-        style(schema_path).yellow()
-    );
+async fn validate(schema_path: &str, quiet: bool) -> Result<()> {
+    if !quiet {
+        println!(
+            "{} Validating schema: {}",
+            style("->").cyan().bold(),
+            style(schema_path).yellow()
+        );
+    }
 
     // Read schema file
     let content = std::fs::read_to_string(schema_path)
@@ -454,7 +478,7 @@ async fn validate(schema_path: &str) -> Result<()> {
         }
     }
 
-    // Report results
+    // Report results -- validation errors are important output (always show)
     if !warnings.is_empty() {
         for warning in &warnings {
             println!("  {} {}", style("WARN").yellow(), warning);
@@ -471,30 +495,35 @@ async fn validate(schema_path: &str) -> Result<()> {
         ));
     }
 
-    println!("{} Schema is valid", style("OK").green().bold());
-    println!(
-        "  Server: {} ({})",
-        style(&schema.name).bold(),
-        schema.server_id
-    );
-    println!(
-        "  Tools: {}, Resources: {}, Prompts: {}",
-        schema.tools.len(),
-        schema.resources.len(),
-        schema.prompts.len()
-    );
+    // Success output is decorative
+    if !quiet {
+        println!("{} Schema is valid", style("OK").green().bold());
+        println!(
+            "  Server: {} ({})",
+            style(&schema.name).bold(),
+            schema.server_id
+        );
+        println!(
+            "  Tools: {}, Resources: {}, Prompts: {}",
+            schema.tools.len(),
+            schema.resources.len(),
+            schema.prompts.len()
+        );
+    }
 
     Ok(())
 }
 
 /// Compare local schema with live server
-async fn diff(schema_path: &str, endpoint: &str) -> Result<()> {
-    println!(
-        "{} Comparing {} with {}",
-        style("->").cyan().bold(),
-        style(schema_path).yellow(),
-        style(endpoint).yellow()
-    );
+async fn diff(schema_path: &str, endpoint: &str, quiet: bool) -> Result<()> {
+    if !quiet {
+        println!(
+            "{} Comparing {} with {}",
+            style("->").cyan().bold(),
+            style(schema_path).yellow(),
+            style(endpoint).yellow()
+        );
+    }
 
     // Read local schema
     let local_content = std::fs::read_to_string(schema_path)
@@ -551,15 +580,17 @@ async fn diff(schema_path: &str, endpoint: &str) -> Result<()> {
                 println!("  {} {}", style("-").red(), name);
             }
         }
-        println!();
-        println!(
-            "Run {} to update local schema",
-            style(format!(
-                "cargo pmcp schema export --endpoint {} --output {}",
-                endpoint, schema_path
-            ))
-            .yellow()
-        );
+        if !quiet {
+            println!();
+            println!(
+                "Run {} to update local schema",
+                style(format!(
+                    "cargo pmcp schema export --endpoint {} --output {}",
+                    endpoint, schema_path
+                ))
+                .yellow()
+            );
+        }
     }
 
     Ok(())

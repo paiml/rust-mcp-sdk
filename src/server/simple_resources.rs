@@ -39,6 +39,7 @@ impl StaticResource {
                 uri,
                 text: Some(content.into()),
                 mime_type: Some("text/plain".to_string()),
+                meta: None,
             },
         }
     }
@@ -58,6 +59,7 @@ impl StaticResource {
                 uri,
                 text: Some(base64::prelude::BASE64_STANDARD.encode(data)),
                 mime_type: Some(mime_type),
+                meta: None,
             },
         }
     }
@@ -87,6 +89,7 @@ impl StaticResource {
             name: self.name.clone(),
             description: self.description.clone(),
             mime_type: self.mime_type.clone(),
+            meta: None,
         }
     }
 
@@ -242,11 +245,9 @@ impl ResourceCollection {
     ///         _context: RequestContext,
     ///     ) -> pmcp::Result<ReadResourceResult> {
     ///         let id = params.get("id").unwrap();
-    ///         Ok(ReadResourceResult {
-    ///             contents: vec![Content::Text {
-    ///                 text: format!("Schema for dataset {}", id),
-    ///             }],
-    ///         })
+    ///         Ok(ReadResourceResult::new(vec![Content::Text {
+    ///             text: format!("Schema for dataset {}", id),
+    ///         }]))
     ///     }
     /// }
     ///
@@ -278,6 +279,7 @@ impl ResourceCollection {
                 name: ui_resource.name.clone(),
                 description: ui_resource.description.clone(),
                 mime_type: Some(ui_resource.mime_type.clone()),
+                meta: None,
             });
         }
 
@@ -288,6 +290,7 @@ impl ResourceCollection {
                 name: template.name,
                 description: template.description,
                 mime_type: template.mime_type,
+                meta: None,
             });
         }
 
@@ -312,6 +315,7 @@ impl ResourceHandler for ResourceCollection {
                     uri: contents.uri.clone(),
                     text: contents.text.clone(),
                     mime_type: Some(contents.mime_type.clone()),
+                    meta: contents.meta.clone(),
                 }],
             });
         }
@@ -459,6 +463,7 @@ mod tests {
                 uri,
                 text,
                 mime_type,
+                ..
             } => {
                 assert_eq!(uri, "test://doc");
                 assert_eq!(text.as_ref().unwrap(), "Hello world");
@@ -481,6 +486,7 @@ mod tests {
                 uri,
                 text,
                 mime_type,
+                ..
             } => {
                 assert_eq!(uri, "test://image.png");
 
@@ -503,6 +509,7 @@ mod tests {
                 uri,
                 text,
                 mime_type,
+                ..
             } => {
                 assert_eq!(uri, "test://data");
                 assert_eq!(text.as_ref().unwrap(), "{ \"key\": \"value\" }");
@@ -536,6 +543,7 @@ mod tests {
                 uri,
                 text,
                 mime_type,
+                ..
             } => {
                 assert_eq!(uri, "maps://instructions");
                 assert_eq!(text.as_ref().unwrap(), "Game instructions");
@@ -566,6 +574,7 @@ mod tests {
                 uri,
                 text,
                 mime_type,
+                ..
             } => {
                 assert_eq!(uri, "test://logo.png");
                 let expected_base64 = base64::prelude::BASE64_STANDARD.encode(image_data);

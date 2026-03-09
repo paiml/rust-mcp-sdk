@@ -571,6 +571,8 @@ export class McpServerStack extends cdk.Stack {{
         MCP_SERVERS_TABLE: mcpServersTable,
       }},
       tracing: lambda.Tracing.ACTIVE,
+      // Structured JSON logging so CloudWatch correctly parses log levels
+      loggingFormat: lambda.LoggingFormat.JSON,
     }});
 
     // Log group with 7-day retention (cost optimization)
@@ -662,6 +664,8 @@ export class McpServerStack extends cdk.Stack {{
         RUST_LOG: 'info',
       }},
       tracing: lambda.Tracing.ACTIVE,
+      // Structured JSON logging so CloudWatch correctly parses log levels
+      loggingFormat: lambda.LoggingFormat.JSON,
     }});
 
     // Log group
@@ -1380,6 +1384,8 @@ export class McpServerStack extends cdk.Stack {{
         COGNITO_REGION: this.region,
       }},
       tracing: lambda.Tracing.ACTIVE,
+      // Structured JSON logging so CloudWatch correctly parses log levels
+      loggingFormat: lambda.LoggingFormat.JSON,
     }});
 
     // Log group for MCP server
@@ -1406,6 +1412,7 @@ export class McpServerStack extends cdk.Stack {{
         COGNITO_REGION: this.region,
         DCR_TABLE_NAME: clientsTable.tableName,
       }},
+      loggingFormat: lambda.LoggingFormat.JSON,
     }});
 
     // OAuth proxy needs access to Cognito and DynamoDB
@@ -1443,6 +1450,7 @@ export class McpServerStack extends cdk.Stack {{
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_REGION: this.region,
       }},
+      loggingFormat: lambda.LoggingFormat.JSON,
     }});
 
     // Log group for authorizer

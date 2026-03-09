@@ -375,14 +375,13 @@ impl ServerCapabilities {
     /// # #[async_trait]
     /// # impl PromptHandler for GreetingPrompt {
     /// #     async fn handle(&self, args: std::collections::HashMap<String, String>, _extra: pmcp::RequestHandlerExtra) -> Result<GetPromptResult, pmcp::Error> {
-    /// #         Ok(GetPromptResult {
-    /// #             description: Some("Greeting prompt".to_string()),
-    /// #             messages: vec![PromptMessage {
+    /// #         Ok(GetPromptResult::new(
+    /// #             vec![PromptMessage {
     /// #                 role: Role::System,
     /// #                 content: Content::Text { text: "Hello!".to_string() },
     /// #             }],
-    /// #             _meta: None,
-    /// #         })
+    /// #             Some("Greeting prompt".to_string()),
+    /// #         ))
     /// #     }
     /// # }
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -430,15 +429,10 @@ impl ServerCapabilities {
     /// # #[async_trait]
     /// # impl ResourceHandler for FileResource {
     /// #     async fn read(&self, uri: &str, _extra: pmcp::RequestHandlerExtra) -> Result<ReadResourceResult, pmcp::Error> {
-    /// #         Ok(ReadResourceResult {
-    /// #             contents: vec![Content::Text { text: "File contents".to_string() }],
-    /// #         })
+    /// #         Ok(ReadResourceResult::new(vec![Content::Text { text: "File contents".to_string() }]))
     /// #     }
     /// #     async fn list(&self, _path: Option<String>, _extra: pmcp::RequestHandlerExtra) -> Result<ListResourcesResult, pmcp::Error> {
-    /// #         Ok(ListResourcesResult {
-    /// #             resources: vec![],
-    /// #             next_cursor: None,
-    /// #         })
+    /// #         Ok(ListResourcesResult::new(vec![]))
     /// #     }
     /// # }
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

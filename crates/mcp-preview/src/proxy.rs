@@ -68,6 +68,8 @@ pub struct ToolInfo {
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Option<Value>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<Value>,
 }
 
 /// Tool call result
@@ -78,6 +80,8 @@ pub struct ToolCallResult {
     pub content: Option<Vec<ContentItem>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
 }
@@ -107,6 +111,8 @@ pub struct ResourceInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<Value>,
 }
 
 /// Content item within a resource read response
@@ -119,12 +125,16 @@ pub struct ResourceContentItem {
     pub text: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<Value>,
 }
 
 /// Result of reading a resource via `resources/read`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceReadResult {
     pub contents: Vec<ResourceContentItem>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
+    pub meta: Option<Value>,
 }
 
 /// MCP HTTP Proxy with session-once initialization
@@ -374,11 +384,13 @@ impl McpProxy {
                 .unwrap_or_default();
 
                 let meta = value.get("_meta").cloned();
+                let structured_content = value.get("structuredContent").cloned();
 
                 Ok(ToolCallResult {
                     success: true,
                     content: Some(content),
                     error: None,
+                    structured_content,
                     meta,
                 })
             },
@@ -386,6 +398,7 @@ impl McpProxy {
                 success: false,
                 content: None,
                 error: Some(e.to_string()),
+                structured_content: None,
                 meta: None,
             }),
         }
@@ -427,6 +440,8 @@ impl McpProxy {
                 .unwrap_or(Value::Array(vec![])),
         )?;
 
-        Ok(ResourceReadResult { contents })
+        let meta = result.get("_meta").cloned();
+
+        Ok(ResourceReadResult { contents, meta })
     }
 }

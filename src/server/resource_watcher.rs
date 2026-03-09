@@ -511,6 +511,7 @@ mod tests {
             name: "test.txt".to_string(),
             description: None,
             mime_type: Some("text/plain".to_string()),
+            meta: None,
         };
 
         watcher

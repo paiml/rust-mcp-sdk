@@ -66,14 +66,10 @@ fn create_code_review_prompt() -> SimplePrompt<AsyncPromptHandler> {
                     },
                 });
 
-                Ok(GetPromptResult {
-                    messages,
-                    description: Some(format!(
+                Ok(GetPromptResult::new(messages, Some(format!(
                         "Code review for {} code focusing on {}",
                         language, focus
-                    )),
-                    _meta: None,
-                })
+                    ))))
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = pmcp::Result<GetPromptResult>> + Send>>
         }) as AsyncPromptHandler,
     )
@@ -125,11 +121,10 @@ fn create_data_analysis_prompt(
             content: MessageContent::Text { text: user_text },
         });
 
-        Ok(GetPromptResult {
+        Ok(GetPromptResult::new(
             messages,
-            description: Some(format!("Data analysis for {} data", data_type)),
-            _meta: None,
-        })
+            Some(format!("Data analysis for {} data", data_type)),
+        ))
     })
     .with_description("Generate a data analysis prompt for the provided data")
     .with_argument("data_type", "Type of data (CSV, JSON, etc.)", false)
@@ -183,14 +178,10 @@ fn create_writing_assistant_prompt(
                 },
             });
 
-            Ok(GetPromptResult {
-                messages,
-                description: Some(format!(
+            Ok(GetPromptResult::new(messages, Some(format!(
                     "Writing assistance for '{}' in {} style",
                     topic, style
-                )),
-                _meta: None,
-            })
+                ))))
         },
     )
     .with_description("Generate written content on any topic")

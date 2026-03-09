@@ -3,17 +3,22 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 
+use crate::commands::GlobalFlags;
 use crate::deployment::targets::pmcp_run::{auth, graphql};
 
 /// List test scenarios for an MCP server on pmcp.run
-pub async fn execute(server_id: String, show_all: bool) -> Result<()> {
-    println!("\n{}", "Test scenarios on pmcp.run".bright_cyan().bold());
-    println!("{}", "─────────────────────────────────────".bright_cyan());
+pub async fn execute(server_id: String, show_all: bool, global_flags: &GlobalFlags) -> Result<()> {
+    if global_flags.should_output() {
+        println!("\n{}", "Test scenarios on pmcp.run".bright_cyan().bold());
+        println!("{}", "─────────────────────────────────────".bright_cyan());
+    }
 
     // Get credentials
     let credentials = auth::get_credentials().await?;
 
-    println!("  {} Server ID: {}", "→".blue(), server_id);
+    if global_flags.should_output() {
+        println!("  {} Server ID: {}", "→".blue(), server_id);
+    }
 
     let result = graphql::list_test_scenarios(&credentials.access_token, &server_id)
         .await
@@ -23,16 +28,18 @@ pub async fn execute(server_id: String, show_all: bool) -> Result<()> {
 
     if result.scenarios.is_empty() {
         println!("{}", "No test scenarios found".yellow());
-        println!();
-        println!("{}", "To add scenarios:".bright_white().bold());
-        println!("  1. Generate scenarios locally:");
-        println!("     cargo pmcp test generate --url <server-url>");
-        println!();
-        println!("  2. Upload to pmcp.run:");
-        println!(
-            "     cargo pmcp test upload --server-id {} scenarios/",
-            server_id
-        );
+        if global_flags.should_output() {
+            println!();
+            println!("{}", "To add scenarios:".bright_white().bold());
+            println!("  1. Generate scenarios locally:");
+            println!("     cargo pmcp test generate --url <server-url>");
+            println!();
+            println!("  2. Upload to pmcp.run:");
+            println!(
+                "     cargo pmcp test upload --server {} scenarios/",
+                server_id
+            );
+        }
         return Ok(());
     }
 
@@ -40,6 +47,7 @@ pub async fn execute(server_id: String, show_all: bool) -> Result<()> {
     let enabled_count = result.scenarios.iter().filter(|s| s.enabled).count();
     let disabled_count = result.scenarios.len() - enabled_count;
 
+    // Requested output: scenario listing
     println!(
         "{} {} scenario(s) ({} enabled, {} disabled)",
         "📋".to_string(),
@@ -115,26 +123,28 @@ pub async fn execute(server_id: String, show_all: bool) -> Result<()> {
         }
     }
 
-    println!();
-    println!(
-        "{}",
-        "═════════════════════════════════════════════════════════════════".bright_cyan()
-    );
-    println!();
-    println!("{}", "Commands:".bright_white().bold());
-    println!("  Download a scenario:  cargo pmcp test download --scenario-id <id>");
-    println!(
-        "  Upload scenarios:     cargo pmcp test upload --server-id {} <path>",
-        server_id
-    );
-
-    if disabled_count > 0 && !show_all {
+    if global_flags.should_output() {
         println!();
         println!(
-            "  {} {} disabled scenario(s) hidden. Use --all to show all.",
-            "ℹ".blue(),
-            disabled_count
+            "{}",
+            "═════════════════════════════════════════════════════════════════".bright_cyan()
         );
+        println!();
+        println!("{}", "Commands:".bright_white().bold());
+        println!("  Download a scenario:  cargo pmcp test download --scenario-id <id>");
+        println!(
+            "  Upload scenarios:     cargo pmcp test upload --server {} <path>",
+            server_id
+        );
+
+        if disabled_count > 0 && !show_all {
+            println!();
+            println!(
+                "  {} {} disabled scenario(s) hidden. Use --all to show all.",
+                "ℹ".blue(),
+                disabled_count
+            );
+        }
     }
 
     Ok(())

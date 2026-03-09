@@ -57,7 +57,7 @@ jobs:
           mdbook build
 
       - name: Upload book artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: course-book
           path: pmcp-course/book
@@ -89,7 +89,7 @@ jobs:
           ls -lh course-content.tar.gz
 
       - name: Upload content artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: course-content
           path: course-content.tar.gz
@@ -102,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download content artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: course-content
 

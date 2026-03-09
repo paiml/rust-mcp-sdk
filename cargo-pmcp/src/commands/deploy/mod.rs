@@ -343,12 +343,12 @@ pub enum OAuthAction {
 }
 
 impl DeployCommand {
-    pub fn execute(&self) -> Result<()> {
+    pub fn execute(&self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
         // Run async code in tokio runtime
-        tokio::runtime::Runtime::new()?.block_on(self.execute_async())
+        tokio::runtime::Runtime::new()?.block_on(self.execute_async(global_flags))
     }
 
-    async fn execute_async(&self) -> Result<()> {
+    async fn execute_async(&self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
         let project_root = Self::find_project_root()?;
 
         // Get target from flag or config
@@ -435,20 +435,22 @@ impl DeployCommand {
                     DeployAction::Metrics { period } => {
                         let config = crate::deployment::DeployConfig::load(&project_root)?;
                         let metrics = target.metrics(&config, period).await?;
-                        println!("📊 Metrics for {}: {}", target.name(), metrics.period);
+                        // Requested data -- always show
+                        println!("Metrics for {}: {}", target.name(), metrics.period);
                         Ok(())
                     },
                     DeployAction::Test { verbose } => {
                         let config = crate::deployment::DeployConfig::load(&project_root)?;
                         let results = target.test(&config, *verbose).await?;
+                        // Test results are requested output
                         if results.success {
                             println!(
-                                "✅ All tests passed ({}/{})",
+                                "All tests passed ({}/{})",
                                 results.tests_passed, results.tests_run
                             );
                         } else {
                             println!(
-                                "❌ Some tests failed ({}/{})",
+                                "Some tests failed ({}/{})",
                                 results.tests_passed, results.tests_run
                             );
                         }
@@ -466,7 +468,7 @@ impl DeployCommand {
                         let config = crate::deployment::DeployConfig::load(&project_root)?;
 
                         if !yes {
-                            println!("⚠️  This will destroy deployment on {}", target.name());
+                            println!("WARNING: This will destroy deployment on {}", target.name());
                             print!("Type '{}' to confirm: ", config.server.name);
                             use std::io::{self, Write};
                             io::stdout().flush()?;
@@ -475,7 +477,7 @@ impl DeployCommand {
                             io::stdin().read_line(&mut input)?;
 
                             if input.trim() != config.server.name {
-                                println!("❌ Confirmation failed. Aborting.");
+                                println!("Confirmation failed. Aborting.");
                                 return Ok(());
                             }
                         }
@@ -484,13 +486,15 @@ impl DeployCommand {
                         if *no_wait && target.supports_async_operations() {
                             let result = target.destroy_async(&config, *clean).await?;
                             if let Some(op) = result.async_operation {
-                                println!();
-                                println!("⏳ {}", op.message);
-                                println!();
-                                println!("ℹ️  Destruction initiated. Use the following to check progress:");
-                                println!("   cargo pmcp deploy status {}", op.operation_id);
-                            } else {
-                                println!("✅ {}", result.message);
+                                if global_flags.should_output() {
+                                    println!();
+                                    println!("{}", op.message);
+                                    println!();
+                                    println!("Destruction initiated. Use the following to check progress:");
+                                    println!("   cargo pmcp deploy status {}", op.operation_id);
+                                }
+                            } else if global_flags.should_output() {
+                                println!("{}", result.message);
                             }
                             Ok(())
                         } else {
@@ -566,26 +570,29 @@ impl DeployCommand {
                             );
                         }
 
-                        println!("🔍 Checking operation status...");
-                        println!();
+                        if global_flags.should_output() {
+                            println!("Checking operation status...");
+                            println!();
+                        }
 
                         let status = target.get_operation_status(operation_id).await?;
 
+                        // Status output is requested data
                         match status.status {
                             crate::deployment::OperationStatus::Initiated => {
-                                println!("⏳ Status: Initiated");
+                                println!("Status: Initiated");
                                 println!("   {}", status.message);
                             },
                             crate::deployment::OperationStatus::Running => {
-                                println!("🔄 Status: Running");
+                                println!("Status: Running");
                                 println!("   {}", status.message);
                             },
                             crate::deployment::OperationStatus::Completed => {
-                                println!("✅ Status: Completed");
+                                println!("Status: Completed");
                                 println!("   {}", status.message);
                             },
                             crate::deployment::OperationStatus::Failed => {
-                                println!("❌ Status: Failed");
+                                println!("Status: Failed");
                                 println!("   {}", status.message);
                             },
                         }
@@ -607,8 +614,10 @@ impl DeployCommand {
                 let artifact = target.build(&config).await?;
                 let outputs = target.deploy(&config, artifact).await?;
 
-                println!();
-                outputs.display();
+                if global_flags.should_output() {
+                    println!();
+                    outputs.display();
+                }
 
                 // Save deployment info for pmcp-run target (for landing page integration)
                 if target_id == "pmcp-run" {
@@ -616,8 +625,10 @@ impl DeployCommand {
 
                     // Handle OAuth configuration if --shared-pool was provided
                     if let Some(ref pool_name) = self.shared_pool {
-                        println!();
-                        println!("🔐 Configuring OAuth with shared pool: {}", pool_name);
+                        if global_flags.should_output() {
+                            println!();
+                            println!("Configuring OAuth with shared pool: {}", pool_name);
+                        }
 
                         // Get the server ID from outputs
                         let server_id = outputs
@@ -644,7 +655,7 @@ impl DeployCommand {
                         };
 
                         handle_oauth_action(&oauth_action).await?;
-                    } else if !self.no_oauth {
+                    } else if !self.no_oauth && global_flags.should_output() {
                         // Check if OAuth is already enabled (from backend query)
                         let oauth_already_enabled = outputs
                             .custom
@@ -655,7 +666,7 @@ impl DeployCommand {
                         if !oauth_already_enabled {
                             // Show hint about OAuth options only if not already configured
                             println!();
-                            println!("💡 OAuth not configured. To add authentication:");
+                            println!("OAuth not configured. To add authentication:");
                             if let Some(server_id) =
                                 outputs.custom.get("server_id").and_then(|v| v.as_str())
                             {
@@ -769,8 +780,10 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
             public_clients,
             shared_pool,
         } => {
-            println!("🔐 Enabling OAuth for server: {}", server);
-            println!();
+            if std::env::var("PMCP_QUIET").is_err() {
+                println!("Enabling OAuth for server: {}", server);
+                println!();
+            }
 
             // Resolve final configuration values
             // Priority: explicit params > copied values > defaults
@@ -786,8 +799,10 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
                 .await?;
 
             // Display what configuration will be applied
-            if copy_from.is_some() || shared_pool.is_some() {
-                println!("📋 OAuth Configuration:");
+            if (copy_from.is_some() || shared_pool.is_some())
+                && std::env::var("PMCP_QUIET").is_err()
+            {
+                println!("OAuth Configuration:");
                 println!("   Scopes:         {}", final_scopes.join(", "));
                 println!(
                     "   DCR:            {}",
@@ -818,9 +833,12 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
             .await
             .context("Failed to configure OAuth")?;
 
-            println!("✅ OAuth enabled successfully!");
+            let not_quiet = std::env::var("PMCP_QUIET").is_err();
+            if not_quiet {
+                println!("OAuth enabled successfully!");
+            }
             println!();
-            println!("🔐 OAuth Endpoints:");
+            println!("OAuth Endpoints:");
             if let Some(ref discovery) = oauth_config.discovery_url {
                 println!("   Discovery:     {}", discovery);
             }
@@ -842,37 +860,42 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
             }
 
             // Show helpful next steps for SSO
-            if copy_from.is_some() || shared_pool.is_some() {
+            if (copy_from.is_some() || shared_pool.is_some()) && not_quiet {
                 println!();
-                println!("🔗 SSO enabled: Users from the shared pool can access this server");
+                println!("SSO enabled: Users from the shared pool can access this server");
             }
 
             Ok(())
         },
         OAuthAction::Disable { server } => {
-            println!("🔐 Disabling OAuth for server: {}", server);
-            println!();
+            let not_quiet = std::env::var("PMCP_QUIET").is_err();
+            if not_quiet {
+                println!("Disabling OAuth for server: {}", server);
+                println!();
+            }
 
             graphql::disable_server_oauth(&credentials.access_token, server)
                 .await
                 .context("Failed to disable OAuth")?;
 
-            println!("✅ OAuth disabled successfully!");
-            println!();
-            println!("⚠️  Note: The Cognito User Pool was NOT deleted.");
-            println!("   You can re-enable OAuth at any time with:");
-            println!("   cargo pmcp deploy oauth enable --server {}", server);
+            if not_quiet {
+                println!("OAuth disabled successfully!");
+                println!();
+                println!("Note: The Cognito User Pool was NOT deleted.");
+                println!("   You can re-enable OAuth at any time with:");
+                println!("   cargo pmcp deploy oauth enable --server {}", server);
+            }
 
             Ok(())
         },
         OAuthAction::Status { server } => {
-            println!("🔐 OAuth Status for server: {}", server);
+            println!("OAuth Status for server: {}", server);
             println!();
 
             match graphql::fetch_server_oauth_endpoints(&credentials.access_token, server).await {
                 Ok(endpoints) => {
                     if endpoints.oauth_enabled {
-                        println!("   Status: ✅ Enabled");
+                        println!("   Status: Enabled");
                         if let Some(provider) = endpoints.provider {
                             println!("   Provider: {}", provider);
                         }
@@ -883,7 +906,7 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
                             println!("   Scopes: {}", scopes.join(", "));
                         }
                         println!();
-                        println!("🔐 OAuth Endpoints:");
+                        println!("OAuth Endpoints:");
                         if let Some(ref discovery) = endpoints.discovery_url {
                             println!("   Discovery:     {}", discovery);
                         }
@@ -897,7 +920,7 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
                             println!("   Token:         {}", token);
                         }
                         println!();
-                        println!("📋 Cognito Details:");
+                        println!("Cognito Details:");
                         if let Some(ref pool_id) = endpoints.user_pool_id {
                             println!("   User Pool ID:  {}", pool_id);
                         }
@@ -905,17 +928,21 @@ async fn handle_oauth_action(action: &OAuthAction) -> Result<()> {
                             println!("   Region:        {}", region);
                         }
                     } else {
-                        println!("   Status: ❌ Disabled");
-                        println!();
-                        println!("💡 Enable OAuth with:");
-                        println!("   cargo pmcp deploy oauth enable --server {}", server);
+                        println!("   Status: Disabled");
+                        if std::env::var("PMCP_QUIET").is_err() {
+                            println!();
+                            println!("Enable OAuth with:");
+                            println!("   cargo pmcp deploy oauth enable --server {}", server);
+                        }
                     }
                 },
                 Err(_) => {
-                    println!("   Status: ❌ Not configured");
-                    println!();
-                    println!("💡 Enable OAuth with:");
-                    println!("   cargo pmcp deploy oauth enable --server {}", server);
+                    println!("   Status: Not configured");
+                    if std::env::var("PMCP_QUIET").is_err() {
+                        println!();
+                        println!("Enable OAuth with:");
+                        println!("   cargo pmcp deploy oauth enable --server {}", server);
+                    }
                 },
             }
 
@@ -950,7 +977,9 @@ async fn resolve_oauth_config(
     // If copy_from is specified, fetch config from source server
     let (copied_scopes, copied_dcr, copied_public_clients, copied_pool) =
         if let Some(source_server) = copy_from {
-            println!("📥 Copying OAuth configuration from: {}", source_server);
+            if std::env::var("PMCP_QUIET").is_err() {
+                println!("Copying OAuth configuration from: {}", source_server);
+            }
 
             match graphql::fetch_server_oauth_endpoints(access_token, source_server).await {
                 Ok(endpoints) => {
@@ -970,11 +999,13 @@ async fn resolve_oauth_config(
                         )
                     })?;
 
-                    println!("   Found User Pool: {}", pool_id);
-                    if let Some(ref scopes) = endpoints.scopes {
-                        println!("   Found scopes: {}", scopes.join(", "));
+                    if std::env::var("PMCP_QUIET").is_err() {
+                        println!("   Found User Pool: {}", pool_id);
+                        if let Some(ref scopes) = endpoints.scopes {
+                            println!("   Found scopes: {}", scopes.join(", "));
+                        }
+                        println!();
                     }
-                    println!();
 
                     (
                         endpoints.scopes,

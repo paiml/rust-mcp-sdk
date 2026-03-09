@@ -1,348 +1,409 @@
-# Tool-UI Association
+# Bridge Communication and Adapters
 
-Once you have UI resources, you need to link them to tools. This chapter covers how tools reference their associated UIs.
+In this section, you'll learn how widgets talk to your server through the bridge API, and how adapters let you deploy the same widget to ChatGPT, standard MCP hosts, and MCP-UI hosts without changing a line of widget code.
 
-## The `.with_ui()` Method
+## Learning Objectives
 
-PMCP's `TypedTool` provides a fluent method for UI association:
+By the end of this section, you will be able to:
 
-```rust
-use pmcp::TypedTool;
+- Use `window.mcpBridge.callTool()` to call server tools from widget JavaScript
+- Handle bridge initialization, errors, and async responses
+- Understand how different hosts (ChatGPT, MCP Apps, MCP-UI) use different bridge mechanisms
+- Choose the right adapter for your target host
+- Use `MultiPlatformResource` to serve all hosts from a single server
 
-let tool = TypedTool::new("get_room_images", get_room_images)
-    .with_description("Get photo gallery for a hotel room")
-    .with_ui("ui://hotel/room-gallery");  // Link to UI resource
+## The Bridge API
+
+Your widget needs to talk to your MCP server. The bridge makes this simple -- one API that works everywhere.
+
+### window.mcpBridge
+
+When the adapter injects the bridge script into your widget HTML, it creates a `window.mcpBridge` object with four core methods:
+
+| Method                           | Returns    | Description                           |
+|----------------------------------|------------|---------------------------------------|
+| `mcpBridge.callTool(name, args)` | `Promise`  | Call an MCP tool, get the result      |
+| `mcpBridge.readResource(uri)`    | `Promise`  | Read an MCP resource                  |
+| `mcpBridge.getPrompt(name, args)`| `Promise`  | Get a prompt                          |
+| `mcpBridge.notify(method, params)` | `void`   | Send a notification (fire-and-forget) |
+
+These four methods work on ALL hosts. Write them once, they work everywhere -- ChatGPT, MCP Apps, MCP-UI.
+
+### Hands-On: Making Your First Bridge Call
+
+Here is a minimal widget that calls a tool and displays the result. You saw a version of this in the scaffolded `hello.html`, but let's break down exactly what's happening:
+
+```html
+<button id="greet">Say Hello</button>
+<div id="result"></div>
+
+<script>
+    document.getElementById('greet').addEventListener('click', async () => {
+        const name = document.getElementById('name').value.trim();
+        if (!name) return;
+
+        try {
+            // Call the "hello" tool via the MCP bridge
+            const result = await window.mcpBridge.callTool('hello', { name });
+
+            // The result is the JSON object your tool handler returned
+            document.getElementById('result').textContent = result.greeting;
+        } catch (err) {
+            document.getElementById('result').textContent = 'Error: ' + err.message;
+        }
+    });
+</script>
 ```
 
-This adds metadata to the tool that MCP hosts can use to render the UI when the tool is called.
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Tool-UI Association Flow                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. SERVER INITIALIZATION                                               │
-│     ══════════════════════                                              │
-│     Server declares:                                                    │
-│     • UI Resource: ui://hotel/gallery with HTML content                │
-│     • Tool: get_room_images with _meta["ui/resourceUri"] = ui://...    │
-│                                                                         │
-│  2. TOOL DISCOVERY (tools/list)                                        │
-│     ═══════════════════════════                                        │
-│     Client receives tool definition:                                    │
-│     {                                                                   │
-│       "name": "get_room_images",                                       │
-│       "description": "Get photo gallery for a hotel room",             │
-│       "_meta": {                                                       │
-│         "ui/resourceUri": "ui://hotel/room-gallery"  ← UI link        │
-│       }                                                                │
-│     }                                                                   │
-│                                                                         │
-│  3. TOOL INVOCATION (tools/call)                                       │
-│     ═══════════════════════════                                        │
-│     a. Client calls tool → gets JSON result                            │
-│     b. Client sees ui/resourceUri → fetches ui://hotel/room-gallery    │
-│     c. Client renders HTML in sandboxed iframe                          │
-│     d. Client sends result to iframe via postMessage                   │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## ToolUIMetadata Structure
-
-Under the hood, `.with_ui()` populates the tool's `_meta` field:
-
-```rust
-use pmcp::types::ui::ToolUIMetadata;
-use std::collections::HashMap;
-
-// What .with_ui() does internally
-let mut meta = HashMap::new();
-meta.insert(
-    "ui/resourceUri".to_string(),
-    serde_json::Value::String("ui://hotel/room-gallery".to_string())
-);
-
-// Reading UI metadata back
-let ui_meta = ToolUIMetadata::from_metadata(&meta);
-assert_eq!(ui_meta.ui_resource_uri, Some("ui://hotel/room-gallery".to_string()));
-
-// Creating metadata manually
-let ui_meta = ToolUIMetadata::new()
-    .with_ui_resource("ui://hotel/room-gallery");
-
-let meta_map = ui_meta.to_metadata();
-// Now meta_map["ui/resourceUri"] = "ui://hotel/room-gallery"
-```
-
-## Complete Tool Definition
-
-Here's a full example showing tool creation with UI association:
-
-```rust
-use pmcp::{TypedTool, RequestHandlerExtra};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-// Input type with schema generation
-#[derive(Debug, Deserialize, JsonSchema)]
-struct GetVenuesArgs {
-    /// Conference ID to get venues for
-    conference_id: String,
-}
-
-// Output type
-#[derive(Debug, Serialize)]
-struct Venue {
-    id: String,
-    name: String,
-    description: String,
-    lat: f64,
-    lon: f64,
-    capacity: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct VenuesResult {
-    conference: String,
-    venues: Vec<Venue>,
-}
-
-// Tool handler
-async fn get_conference_venues(
-    args: GetVenuesArgs,
-    _extra: RequestHandlerExtra,
-) -> pmcp::Result<serde_json::Value> {
-    // Fetch venues from database/API
-    let venues = fetch_venues(&args.conference_id).await?;
-
-    let result = VenuesResult {
-        conference: args.conference_id,
-        venues,
-    };
-
-    Ok(serde_json::to_value(result)?)
-}
-
-// Create tool with full configuration
-let tool = TypedTool::new("get_conference_venues", |args, extra| {
-    Box::pin(get_conference_venues(args, extra))
-})
-    .with_description("Get all venues for a conference with location data")
-    .with_ui("ui://conference/venue-map");
-```
-
-## Multiple Tools, Multiple UIs
-
-A server can have multiple tools with different UIs:
-
-```rust
-use pmcp::{Server, ServerCapabilities, TypedTool, ResourceCollection, UIResourceBuilder};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create multiple UI resources
-    let (gallery_ui, gallery_contents) = UIResourceBuilder::new(
-        "ui://hotel/gallery",
-        "Photo Gallery"
-    )
-        .html_template(GALLERY_HTML)
-        .build_with_contents()?;
-
-    let (map_ui, map_contents) = UIResourceBuilder::new(
-        "ui://hotel/map",
-        "Property Map"
-    )
-        .html_template(MAP_HTML)
-        .build_with_contents()?;
-
-    let (amenities_ui, amenities_contents) = UIResourceBuilder::new(
-        "ui://hotel/amenities",
-        "Amenities Chart"
-    )
-        .html_template(AMENITIES_HTML)
-        .build_with_contents()?;
-
-    // Resource collection with all UIs
-    let resources = ResourceCollection::new()
-        .add_ui_resource(gallery_ui, gallery_contents)
-        .add_ui_resource(map_ui, map_contents)
-        .add_ui_resource(amenities_ui, amenities_contents);
-
-    // Each tool links to its appropriate UI
-    let gallery_tool = TypedTool::new("get_room_images", get_room_images)
-        .with_description("Get room photos")
-        .with_ui("ui://hotel/gallery");
-
-    let map_tool = TypedTool::new("get_property_location", get_property_location)
-        .with_description("Get hotel location for map")
-        .with_ui("ui://hotel/map");
-
-    let amenities_tool = TypedTool::new("get_amenities", get_amenities)
-        .with_description("Get hotel amenities breakdown")
-        .with_ui("ui://hotel/amenities");
-
-    // Build server with all tools and resources
-    let server = Server::builder()
-        .name("hotel-server")
-        .version("1.0.0")
-        .capabilities(ServerCapabilities {
-            resources: Some(Default::default()),
-            tools: Some(Default::default()),
-            ..Default::default()
-        })
-        .resources(resources)
-        .tool("get_room_images", gallery_tool)
-        .tool("get_property_location", map_tool)
-        .tool("get_amenities", amenities_tool)
-        .build()?;
-
-    server.run_stdio().await?;
-    Ok(())
-}
-```
-
-## Shared UIs
-
-Multiple tools can share the same UI if their output formats are compatible:
-
-```rust
-// One UI for multiple search results
-let (results_ui, results_contents) = UIResourceBuilder::new(
-    "ui://search/results-grid",
-    "Search Results Grid"
-)
-    .html_template(RESULTS_GRID_HTML)
-    .build_with_contents()?;
-
-// Multiple tools use the same UI
-let search_rooms_tool = TypedTool::new("search_rooms", search_rooms)
-    .with_ui("ui://search/results-grid");
-
-let search_restaurants_tool = TypedTool::new("search_restaurants", search_restaurants)
-    .with_ui("ui://search/results-grid");
-
-let search_activities_tool = TypedTool::new("search_activities", search_activities)
-    .with_ui("ui://search/results-grid");
-```
-
-The UI needs to handle different data shapes:
+The key line is:
 
 ```javascript
-window.addEventListener('message', (event) => {
-    if (event.data.type === 'mcp-tool-result') {
-        const result = event.data.result;
-
-        // Handle different result types
-        if (result.rooms) {
-            renderRooms(result.rooms);
-        } else if (result.restaurants) {
-            renderRestaurants(result.restaurants);
-        } else if (result.activities) {
-            renderActivities(result.activities);
-        }
-    }
-});
+const result = await window.mcpBridge.callTool('hello', { name });
 ```
 
-## Tools Without UIs
+This calls the `hello` tool on your MCP server with `{ name: "World" }` as the argument. The bridge handles all the protocol plumbing -- you just get a Promise that resolves to the tool's return value.
 
-Not every tool needs a UI. Tools that return simple data work fine without one:
+**Try this:** Modify the hello widget from Ch 20-01 to make a second tool call. Add a `callTool('counter', { count: 1 })` call after the greeting and display both results.
 
-```rust
-// Simple status check - no UI needed
-let status_tool = TypedTool::new("get_server_status", get_status)
-    .with_description("Check server health");
-// No .with_ui() - client displays result as text
+### Error Handling
 
-// Configuration retrieval - no UI needed
-let config_tool = TypedTool::new("get_config", get_config)
-    .with_description("Get current configuration");
-// No .with_ui() - AI describes config in natural language
-```
+Always wrap bridge calls in try/catch. The bridge throws if the tool returns an error, the server is unreachable, or the request times out:
 
-## Checking UI Association
-
-You can verify a tool's UI metadata:
-
-```rust
-use pmcp::types::ui::ToolUIMetadata;
-
-// Get tool metadata from server (after building)
-let tool_list = server.list_tools().await?;
-
-for tool in tool_list.tools {
-    if let Some(meta) = &tool._meta {
-        let ui_meta = ToolUIMetadata::from_metadata(meta);
-        if let Some(uri) = ui_meta.ui_resource_uri {
-            println!("Tool '{}' has UI: {}", tool.name, uri);
-        } else {
-            println!("Tool '{}' has no UI", tool.name);
-        }
+```javascript
+async function greet(name) {
+    try {
+        const result = await window.mcpBridge.callTool('hello', { name });
+        document.getElementById('result').textContent = result.greeting;
+    } catch (err) {
+        // err.message contains the error description
+        document.getElementById('result').textContent =
+            'Error: ' + (err.message || String(err));
     }
 }
 ```
 
-## URI Matching
+Common errors you'll encounter during development:
 
-The UI resource URI in the tool must exactly match a declared UI resource:
+| Error                      | Cause                                | Fix                                  |
+|----------------------------|--------------------------------------|--------------------------------------|
+| Tool not found             | Tool name doesn't match server       | Check the name in `.tool()` registration |
+| Server unreachable         | Server not running                   | Start the server with `cargo run`    |
+| Timeout (30s)              | Tool takes too long                  | Optimize the tool or increase timeout |
+| Invalid arguments          | Schema mismatch                      | Check the tool's input types         |
 
-```rust
-// ✅ Correct: URIs match exactly
-let (ui, contents) = UIResourceBuilder::new(
-    "ui://hotel/gallery",  // ← Declared URI
-    "Gallery"
-).html_template(HTML).build_with_contents()?;
+### Bridge Initialization
 
-let tool = TypedTool::new("get_images", handler)
-    .with_ui("ui://hotel/gallery");  // ← Same URI
+In most cases, the bridge is available immediately when your widget loads. But for widgets that load asynchronously (e.g., dynamic imports), use the `mcpBridgeReady` event:
 
-// ❌ Wrong: Trailing slash mismatch
-let tool = TypedTool::new("get_images", handler)
-    .with_ui("ui://hotel/gallery/");  // ← Won't match!
+```javascript
+// Pattern: Wait for bridge, then initialize
+window.addEventListener('mcpBridgeReady', () => {
+    // Bridge is ready -- safe to call mcpBridge methods
+    loadInitialData();
+});
 
-// ❌ Wrong: Case mismatch
-let tool = TypedTool::new("get_images", handler)
-    .with_ui("ui://Hotel/Gallery");  // ← Won't match!
+// If bridge is already ready (script loaded synchronously)
+if (window.mcpBridge) {
+    loadInitialData();
+}
 ```
 
-## Capability Requirements
+The `mcpBridgeReady` event is dispatched by the injected bridge script after it sets up `window.mcpBridge`. For most widgets, you can call `mcpBridge` methods directly in a `<script>` tag without listening for this event.
 
-For UI resources to work, declare the resources capability:
+### ChatGPT-Only Extras
 
-```rust
-use pmcp::{Server, ServerCapabilities, ResourceCapabilities};
+When your widget runs inside ChatGPT, the bridge provides additional capabilities beyond the four core methods. These are not available on other hosts.
 
-let server = Server::builder()
-    .name("my-server")
-    .version("1.0.0")
-    .capabilities(ServerCapabilities {
-        // Must have resources capability for UI resources
-        resources: Some(ResourceCapabilities {
-            subscribe: Some(false),
-            list_changed: Some(false),
-        }),
-        tools: Some(Default::default()),
-        ..Default::default()
-    })
-    .resources(resources)  // Contains UI resources
-    .build()?;
+**State management:**
+
+| Method                      | Returns   | Description                                |
+|-----------------------------|-----------|--------------------------------------------|
+| `mcpBridge.setState(state)` | `void`    | Update widget state (persists in session)  |
+| `mcpBridge.getState()`      | `Object`  | Read current widget state                  |
+
+**Communication:**
+
+| Method                            | Returns  | Description                                 |
+|-----------------------------------|----------|---------------------------------------------|
+| `mcpBridge.sendMessage(message)`  | `void`   | Send a follow-up message to the conversation |
+| `mcpBridge.openExternal(url)`     | `void`   | Open an external URL                         |
+
+**Display modes:**
+
+| Method                                | Returns   | Description                            |
+|---------------------------------------|-----------|----------------------------------------|
+| `mcpBridge.requestDisplayMode(mode)`  | `Promise` | Request inline, pip, or fullscreen     |
+| `mcpBridge.requestClose()`            | `void`    | Close the widget                       |
+| `mcpBridge.notifyIntrinsicHeight(h)`  | `void`    | Report the widget's content height     |
+| `mcpBridge.setOpenInAppUrl(href)`     | `void`    | Set the "Open in App" button URL       |
+
+**Environment properties (read-only):**
+
+| Property                 | Type     | Description                                   |
+|--------------------------|----------|-----------------------------------------------|
+| `mcpBridge.theme`        | `string` | Current theme (`'light'` or `'dark'`)         |
+| `mcpBridge.locale`       | `string` | Current locale (e.g., `'en-US'`)              |
+| `mcpBridge.displayMode`  | `string` | Current display mode                          |
+| `mcpBridge.toolInput`    | `object` | Arguments supplied when the tool was invoked  |
+| `mcpBridge.toolOutput`   | `object` | The structuredContent returned by the tool    |
+
+These extras are available when running inside ChatGPT. On other hosts, stick to the four core methods (`callTool`, `readResource`, `getPrompt`, `notify`).
+
+## Communication Flow
+
+Let's trace exactly what happens when your widget calls `mcpBridge.callTool('hello', { name: 'World' })`:
+
+```
+Widget (iframe)                    Host                      MCP Server
+     |                              |                            |
+     |  mcpBridge.callTool(         |                            |
+     |    'hello', { name: 'World' }|                            |
+     |  )                           |                            |
+     |                              |                            |
+     |  ---- bridge script ---->    |                            |
+     |       (postMessage or        |                            |
+     |        window.openai)        |                            |
+     |                              |                            |
+     |                              |  -- tools/call -------->   |
+     |                              |     { name: 'hello',       |
+     |                              |       arguments: {...} }   |
+     |                              |                            |
+     |                              |  <-- result -----------    |
+     |                              |     { greeting: '...' }    |
+     |                              |                            |
+     |  <-- response ----------     |                            |
+     |      Promise resolves        |                            |
+     |      with { greeting: '...' }|                            |
+     v                              v                            v
 ```
 
-## Summary
+Here is each step in detail:
 
-| Concept | Description |
-|---------|-------------|
-| `.with_ui(uri)` | Associates a tool with a UI resource |
-| `ui/resourceUri` | The metadata key in tool's `_meta` |
-| `ToolUIMetadata` | Type for reading/writing UI metadata |
-| URI matching | Tool URI must exactly match declared resource |
-| Shared UIs | Multiple tools can reference the same UI |
-| Optional | Tools work without UI for simple responses |
+1. **Widget calls bridge:** Your JavaScript calls `window.mcpBridge.callTool('hello', { name: 'World' })`. The bridge creates a Promise and assigns a unique request ID.
+
+2. **Bridge script forwards to host:** The bridge script translates the call into the host's native mechanism. On ChatGPT, it calls `window.openai.callTool()`. On MCP Apps and MCP-UI hosts, it sends a `postMessage` with JSON-RPC 2.0 framing.
+
+3. **Host sends MCP request:** The host sends a `tools/call` request to your MCP server using the standard MCP protocol.
+
+4. **Server processes and responds:** Your tool handler runs, returns a result, and the response flows back through the host to the bridge.
+
+5. **Promise resolves:** The bridge matches the response to the pending Promise by request ID, and your widget's `await` completes with the tool's return value.
+
+The key insight is that platform differences are hidden by the bridge. ChatGPT uses `window.openai` under the hood. MCP Apps uses `postMessage` with JSON-RPC. You don't need to know this -- the bridge handles it.
+
+## The Adapter Pattern
+
+One widget. Three hosts. Zero code changes. Here is how.
+
+### Why Adapters?
+
+Different hosts use different communication mechanisms to talk to widgets:
+
+| Host         | Native Mechanism      | MIME Type             | Bridge Script Wraps              |
+|--------------|-----------------------|-----------------------|----------------------------------|
+| ChatGPT      | `window.openai`       | `text/html+skybridge` | `window.openai` -> `mcpBridge`  |
+| MCP Apps     | `postMessage` JSON-RPC| `text/html+mcp`       | `postMessage` -> `mcpBridge`    |
+| MCP-UI       | `postMessage` JSON-RPC| `text/html`           | `postMessage` -> `mcpBridge`    |
+
+Without adapters, you'd need three versions of every widget. With adapters, you write ONE widget using `window.mcpBridge`, and the adapter injects the right bridge script at serve time.
+
+### The UIAdapter Trait
+
+The `UIAdapter` trait defines what every adapter must do:
+
+```rust
+pub trait UIAdapter: Send + Sync {
+    /// Which host platform this adapter targets
+    fn host_type(&self) -> HostType;
+
+    /// The MIME type this adapter produces
+    fn mime_type(&self) -> ExtendedUIMimeType;
+
+    /// Transform HTML content for this host platform
+    fn transform(&self, uri: &str, name: &str, html: &str) -> TransformedResource;
+
+    /// Inject platform-specific bridge script into HTML
+    fn inject_bridge(&self, html: &str) -> String;
+
+    /// Get CSP headers required by this platform
+    fn required_csp(&self) -> Option<WidgetCSP>;
+}
+```
+
+The `transform()` method is what you call in your `ResourceHandler`. It reads the widget HTML, calls `inject_bridge()` to insert the platform-specific bridge script, and returns a `TransformedResource` with the correct MIME type and metadata.
+
+The `TransformedResource` struct carries everything needed to serve the widget:
+
+| Field      | Type                       | Description                                  |
+|------------|----------------------------|----------------------------------------------|
+| `uri`      | `String`                   | Original resource URI                        |
+| `name`     | `String`                   | Display name                                 |
+| `mime_type`| `ExtendedUIMimeType`       | Platform-specific MIME type                  |
+| `content`  | `String`                   | Transformed HTML with bridge script injected |
+| `metadata` | `HashMap<String, Value>`   | Platform-specific metadata (e.g., WidgetMeta)|
+
+### ChatGptAdapter
+
+The `ChatGptAdapter` targets ChatGPT Apps (OpenAI Apps SDK). It injects a bridge script that wraps `window.openai` behind the universal `window.mcpBridge` API.
+
+```rust
+use pmcp::server::mcp_apps::ChatGptAdapter;
+use pmcp::types::mcp_apps::WidgetMeta;
+
+let adapter = ChatGptAdapter::new()
+    .with_widget_meta(
+        WidgetMeta::new()
+            .prefers_border(true)
+            .description("Interactive chess board")
+    );
+```
+
+**MIME type:** `text/html+skybridge` (`ExtendedUIMimeType::HtmlSkybridge`)
+
+This is what all three shipped examples (chess, map, dataviz) use -- ChatGPT is the most mature host for interactive widgets.
+
+**WidgetMeta fields:**
+
+| Field            | Serde Key                    | Description                                    |
+|------------------|------------------------------|------------------------------------------------|
+| `prefers_border` | `openai/widgetPrefersBorder` | Whether the widget should have a border        |
+| `domain`         | `openai/widgetDomain`        | Dedicated origin for the widget sandbox        |
+| `description`    | `openai/widgetDescription`   | Widget self-description                        |
+| `csp`            | `openai/widgetCSP`           | Content Security Policy configuration          |
+
+### McpAppsAdapter
+
+The `McpAppsAdapter` targets the SEP-1865 standard for MCP Apps. It injects a `postMessage`-based JSON-RPC 2.0 bridge.
+
+```rust
+use pmcp::server::mcp_apps::McpAppsAdapter;
+use pmcp::types::mcp_apps::WidgetCSP;
+
+let adapter = McpAppsAdapter::new()
+    .with_csp(
+        WidgetCSP::new()
+            .connect("https://api.example.com")
+            .resources("https://cdn.example.com")
+    );
+```
+
+**MIME type:** `text/html+mcp` (`ExtendedUIMimeType::HtmlMcp`)
+
+The McpAppsAdapter bridge is intentionally minimal -- it supports the four core MCP operations (`callTool`, `readResource`, `getPrompt`, `notify`) without platform-specific features like state management or display modes. The bridge automatically sends a `ui/ready` notification when the widget loads.
+
+### McpUiAdapter
+
+The `McpUiAdapter` targets MCP-UI community hosts (Nanobot, MCPJam, and others). It supports three output formats, not just HTML.
+
+```rust
+use pmcp::server::mcp_apps::{McpUiAdapter, McpUiFormat};
+
+// HTML format with postMessage bridge (default)
+let adapter = McpUiAdapter::new();
+
+// URL format -- returns a URL reference instead of HTML
+let adapter = McpUiAdapter::new().with_format(McpUiFormat::Url);
+
+// Remote DOM -- non-iframe rendering
+let adapter = McpUiAdapter::new().with_format(McpUiFormat::RemoteDom);
+```
+
+**Three output formats:**
+
+| Format      | MIME Type                                          | Description                         |
+|-------------|----------------------------------------------------|-------------------------------------|
+| `Html`      | `text/html`                                        | HTML with postMessage bridge        |
+| `Url`       | `text/uri-list`                                    | URL reference (CDN-hosted widget)   |
+| `RemoteDom` | `application/vnd.mcp-ui.remote-dom+javascript`     | Non-iframe JavaScript rendering     |
+
+MCP-UI hosts have extra bridge methods not available on other platforms:
+
+| Method                          | Description                              |
+|---------------------------------|------------------------------------------|
+| `sendIntent(action, data)`      | Send a high-level intent to the host     |
+| `openLink(url)`                 | Open a URL in the host                   |
+| `notify(level, message)`        | Send a notification with severity level  |
+
+### Choosing an Adapter
+
+Here is a comparison to help you decide:
+
+| Adapter          | Host          | MIME Type              | Bridge API               | Best For                    |
+|------------------|---------------|------------------------|---------------------------|-----------------------------|
+| `ChatGptAdapter` | ChatGPT       | `text/html+skybridge`  | `window.openai` wrapper   | ChatGPT Apps deployment     |
+| `McpAppsAdapter` | Generic MCP   | `text/html+mcp`        | postMessage JSON-RPC      | Standard MCP hosts          |
+| `McpUiAdapter`   | MCP-UI hosts  | `text/html` (or URL/RemoteDom) | postMessage JSON-RPC | Community MCP-UI hosts      |
+
+**Start with `ChatGptAdapter`.** It's the most mature, and all three shipped examples use it. Switch to `MultiPlatformResource` when you need to support multiple hosts from a single server.
+
+## Hands-On: Multi-Platform Support
+
+Let's serve the same widget to multiple hosts. The `MultiPlatformResource` struct wraps your widget HTML with all three adapters and serves the right version based on the requesting host.
+
+### Construction
+
+```rust
+use pmcp::server::mcp_apps::{
+    MultiPlatformResource, ChatGptAdapter, McpAppsAdapter, McpUiAdapter,
+};
+
+// Add adapters individually
+let multi = MultiPlatformResource::new(
+    "ui://app/board.html",
+    "Chess Board",
+    html,
+)
+.with_adapter(ChatGptAdapter::new())
+.with_adapter(McpAppsAdapter::new())
+.with_adapter(McpUiAdapter::new());
+
+// Or add all standard adapters at once
+let multi = MultiPlatformResource::new(uri, name, html)
+    .with_all_adapters();
+```
+
+### Getting Host-Specific Content
+
+Use `for_host()` to get the transformed content for a specific host:
+
+```rust
+use pmcp::types::mcp_apps::HostType;
+
+if let Some(transformed) = multi.for_host(HostType::ChatGpt) {
+    // transformed.content has the bridge-injected HTML
+    // transformed.mime_type is text/html+skybridge
+    println!("MIME: {}", transformed.mime_type);
+}
+
+// Or get all transformations at once
+let all = multi.all_transforms();
+for t in &all {
+    println!("{}: {}", t.mime_type, t.uri);
+}
+```
+
+`MultiPlatformResource` caches transformations -- calling `for_host()` with the same host type twice reuses the cached result.
+
+### Using MultiPlatformResource in a ResourceHandler
+
+In your `ResourceHandler`, you can detect the requesting host from the request headers or URI parameters, then call `for_host()` with the appropriate `HostType`. For most projects today, using `ChatGptAdapter` directly (as all the shipped examples do) is the simplest path.
+
+**Try this:** Modify the hello server from Ch 20-01 to use `McpAppsAdapter` instead of `ChatGptAdapter`. Change the adapter construction in `AppResources::new()` and update the MIME type in the `ResourceHandler`. Run the preview and notice that the widget still works -- the bridge API (`window.mcpBridge`) is identical. The only difference is the MIME type and the underlying transport mechanism.
+
+## Summary and Next Steps
+
+Let's recap what you've learned:
+
+- **`window.mcpBridge`** provides four core methods (`callTool`, `readResource`, `getPrompt`, `notify`) that work on all hosts
+- **Error handling** requires try/catch around every bridge call
+- **Bridge initialization** is usually immediate; use `mcpBridgeReady` for async-loading widgets
+- **ChatGPT extras** add state management, display modes, and environment properties
+- **The communication flow** goes: widget -> bridge script -> host -> MCP server -> response
+- **Three adapters** target different hosts: `ChatGptAdapter` (ChatGPT), `McpAppsAdapter` (generic MCP), `McpUiAdapter` (community hosts)
+- **`MultiPlatformResource`** serves the same widget to all hosts with host-specific bridge injection
+
+In the next section, you'll walk through the chess, map, and dataviz examples hands-on to see these patterns in real-world applications.
 
 ---
 
-*Continue to [PostMessage Communication](./ch20-03-postmessage.md) →*
-
+*Continue to [Example Walkthroughs](./ch20-03-postmessage.md) ->*

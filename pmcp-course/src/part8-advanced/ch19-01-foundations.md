@@ -186,19 +186,19 @@ impl DynamicResourceProvider for TableResourceProvider {
             ResourceTemplate {
                 uri_template: "tables://{table}/schema".to_string(),
                 name: "Table Schema".to_string(),
-                description: Some("Schema definition for a database table".to_string()),
+                Some("Schema definition for a database table".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
             ResourceTemplate {
                 uri_template: "tables://{table}/sample".to_string(),
                 name: "Sample Rows".to_string(),
-                description: Some("Sample rows from the table (first 10)".to_string()),
+                Some("Sample rows from the table (first 10)".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
             ResourceTemplate {
                 uri_template: "tables://{table}/count".to_string(),
                 name: "Row Count".to_string(),
-                description: Some("Number of rows in the table".to_string()),
+                Some("Number of rows in the table".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
         ]
@@ -253,9 +253,7 @@ impl DynamicResourceProvider for TableResourceProvider {
             ));
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![content],
-        })
+        Ok(ReadResourceResult::new(vec![content]))
     }
 
     fn priority(&self) -> i32 {

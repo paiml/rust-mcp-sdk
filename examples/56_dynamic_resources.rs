@@ -206,9 +206,7 @@ impl DynamicResourceProvider for DatasetResourceProvider {
             ));
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![content],
-        })
+        Ok(ReadResourceResult::new(vec![content]))
     }
 
     fn priority(&self) -> i32 {
@@ -256,9 +254,9 @@ impl DynamicResourceProvider for FileSystemProvider {
         // In a real application, read the file here
         let content = format!("File contents from: {}/{}", self.base_path, path);
 
-        Ok(ReadResourceResult {
-            contents: vec![Content::Text { text: content }],
-        })
+        Ok(ReadResourceResult::new(vec![Content::Text {
+            text: content,
+        }]))
     }
 
     fn priority(&self) -> i32 {

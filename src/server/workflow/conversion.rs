@@ -60,6 +60,7 @@ impl PromptContent {
                 uri: uri.clone(),
                 text: None,
                 mime_type: None,
+                meta: None,
             }),
 
             // Strict mode - expand handles
@@ -99,6 +100,7 @@ impl PromptContent {
                     uri: handle.uri().to_string(),
                     text: None,
                     mime_type: None,
+                    meta: None,
                 })
             },
 

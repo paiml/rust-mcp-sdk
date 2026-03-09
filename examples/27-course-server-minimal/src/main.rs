@@ -331,11 +331,9 @@ impl ResourceHandler for ChapterResources {
                     )
                 })?;
 
-            Ok(ReadResourceResult {
-                contents: vec![Content::Text {
+            Ok(ReadResourceResult::new(vec![Content::Text {
                     text: chapter.content.clone(),
-                }],
-            })
+                }]))
         } else {
             Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
@@ -358,13 +356,11 @@ impl ResourceHandler for ChapterResources {
                 name: c.title.clone(),
                 description: Some(format!("Chapter: {}", c.title)),
                 mime_type: Some("text/markdown".to_string()),
+                meta: None,
             })
             .collect();
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(resources))
     }
 }
 
@@ -399,9 +395,8 @@ async fn main() -> anyhow::Result<()> {
         let chapters = &content_for_prompt.chapters;
         let first_chapter = chapters.first();
 
-        Ok(GetPromptResult {
-            description: Some("Start your MCP learning journey".to_string()),
-            messages: vec![PromptMessage {
+        Ok(GetPromptResult::new(
+            vec![PromptMessage {
                 role: Role::User,
                 content: MessageContent::Text {
                     text: format!(
@@ -419,8 +414,8 @@ async fn main() -> anyhow::Result<()> {
                     ),
                 },
             }],
-            _meta: None,
-        })
+            Some("Start your MCP learning journey".to_string()),
+        ))
     })
     .with_description("Begin your MCP learning journey");
 
@@ -436,9 +431,8 @@ async fn main() -> anyhow::Result<()> {
             .find(|c| c.id == *chapter_id)
             .ok_or_else(|| pmcp::Error::validation("Chapter not found"))?;
 
-        Ok(GetPromptResult {
-            description: Some(format!("Review: {}", chapter.title)),
-            messages: vec![PromptMessage {
+        Ok(GetPromptResult::new(
+            vec![PromptMessage {
                 role: Role::User,
                 content: MessageContent::Text {
                     text: format!(
@@ -450,8 +444,8 @@ async fn main() -> anyhow::Result<()> {
                     ),
                 },
             }],
-            _meta: None,
-        })
+            Some(format!("Review: {}", chapter.title)),
+        ))
     })
     .with_description("Review key concepts from a chapter")
     .with_argument("chapter_id", "Chapter to review", true);

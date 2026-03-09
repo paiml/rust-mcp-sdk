@@ -232,6 +232,7 @@ mod tests {
                             name: Some("Resource 1".to_string()),
                             mime_type: None,
                             description: None,
+                            meta: None,
                         }],
                         next_cursor: Some("page2".to_string()),
                     })
@@ -242,6 +243,7 @@ mod tests {
                             name: Some("Resource 2".to_string()),
                             mime_type: None,
                             description: None,
+                            meta: None,
                         }],
                         next_cursor: None,
                     })

@@ -99,6 +99,28 @@ pub trait ProtocolHandler {
     fn info(&self) -> &Implementation;
 }
 
+/// Build a URI-to-tool-meta index from registered tool metadata.
+///
+/// Maps resource URIs (from `openai/outputTemplate`) to the linked tool's
+/// `openai/*` `_meta` keys. Used to auto-propagate widget descriptor keys
+/// onto `ResourceInfo` during `resources/list` and `resources/read`.
+/// When multiple tools share the same URI, first tool registered wins.
+pub(crate) fn build_uri_to_tool_meta(
+    tool_infos: &HashMap<String, ToolInfo>,
+) -> HashMap<String, serde_json::Map<String, serde_json::Value>> {
+    let mut map = HashMap::new();
+    for info in tool_infos.values() {
+        if let Some(meta) = info.widget_meta() {
+            if let Some(serde_json::Value::String(uri)) = meta.get("openai/outputTemplate") {
+                // First tool registered wins (per user decision)
+                map.entry(uri.clone())
+                    .or_insert_with(|| crate::types::ui::filter_to_descriptor_keys(meta));
+            }
+        }
+    }
+    map
+}
+
 /// Core server implementation without transport dependencies.
 ///
 /// This struct contains all the business logic for an MCP server without
@@ -118,6 +140,16 @@ pub struct ServerCore {
 
     /// Registered prompt handlers
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
+
+    /// Cached tool metadata (populated at registration, immutable)
+    tool_infos: HashMap<String, ToolInfo>,
+
+    /// Cached URI-to-tool-meta index for widget resource `_meta` propagation.
+    /// Maps resource URIs to their linked tool's `openai/*` `_meta` keys.
+    uri_to_tool_meta: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+
+    /// Cached prompt metadata (populated at registration, immutable)
+    prompt_infos: HashMap<String, PromptInfo>,
 
     /// Resource handler (optional)
     resources: Option<Arc<dyn ResourceHandler>>,
@@ -177,6 +209,8 @@ impl ServerCore {
         capabilities: ServerCapabilities,
         tools: HashMap<String, Arc<dyn ToolHandler>>,
         prompts: HashMap<String, Arc<dyn PromptHandler>>,
+        tool_infos: HashMap<String, ToolInfo>,
+        prompt_infos: HashMap<String, PromptInfo>,
         resources: Option<Arc<dyn ResourceHandler>>,
         sampling: Option<Arc<dyn SamplingHandler>>,
         auth_provider: Option<Arc<dyn AuthProvider>>,
@@ -186,11 +220,15 @@ impl ServerCore {
         #[cfg(not(target_arch = "wasm32"))] task_router: Option<Arc<dyn TaskRouter>>,
         stateless_mode: bool,
     ) -> Self {
+        let uri_to_tool_meta = build_uri_to_tool_meta(&tool_infos);
         Self {
             info,
             capabilities,
             tools,
             prompts,
+            tool_infos,
+            uri_to_tool_meta,
+            prompt_infos,
             resources,
             sampling,
             client_capabilities: Arc::new(RwLock::new(None)),
@@ -243,20 +281,7 @@ impl ServerCore {
 
     /// Handle list tools request.
     async fn handle_list_tools(&self, _req: &ListToolsParams) -> Result<ListToolsResult> {
-        let tools = self
-            .tools
-            .iter()
-            .map(|(name, handler)| {
-                // Use tool metadata if provided, otherwise use defaults
-                if let Some(mut info) = handler.metadata() {
-                    // Ensure the name matches the registered name
-                    info.name.clone_from(name);
-                    info
-                } else {
-                    ToolInfo::new(name.clone(), None, serde_json::json!({}))
-                }
-            })
-            .collect();
+        let tools: Vec<ToolInfo> = self.tool_infos.values().cloned().collect();
 
         Ok(ListToolsResult {
             tools,
@@ -350,57 +375,20 @@ impl ServerCore {
 
         // Convert result to CallToolResult
         let value = result?;
-        Ok(CallToolResult {
-            content: vec![Content::Text {
-                text: serde_json::to_string_pretty(&value)?,
-            }],
-            is_error: false,
-            ..Default::default()
-        })
+        let text = serde_json::to_string_pretty(&value)?;
+        let mut call_result = CallToolResult::new(vec![Content::Text { text }]);
+
+        // Enrich with widget metadata so widgets can access data via toolOutput.
+        if let Some(info) = self.tool_infos.get(&req.name) {
+            call_result = call_result.with_widget_enrichment(info, value);
+        }
+
+        Ok(call_result)
     }
 
     /// Handle list prompts request.
     async fn handle_list_prompts(&self, _req: &ListPromptsParams) -> Result<ListPromptsResult> {
-        let prompts: Vec<PromptInfo> = self
-            .prompts
-            .iter()
-            .map(|(name, handler)| {
-                // Use prompt metadata if provided, otherwise use defaults
-                if let Some(mut info) = handler.metadata() {
-                    tracing::debug!(
-                        target: "mcp.prompts",
-                        prompt = %name,
-                        description = ?info.description,
-                        arguments_count = ?info.arguments.as_ref().map(|a| a.len()),
-                        "Prompt metadata retrieved"
-                    );
-
-                    // Ensure the name matches the registered name
-                    info.name.clone_from(name);
-
-                    tracing::debug!(
-                        target: "mcp.prompts",
-                        prompt = %info.name,
-                        has_description = info.description.is_some(),
-                        has_arguments = info.arguments.is_some(),
-                        "Final PromptInfo"
-                    );
-
-                    info
-                } else {
-                    tracing::debug!(
-                        target: "mcp.prompts",
-                        prompt = %name,
-                        "Prompt has no metadata"
-                    );
-                    PromptInfo {
-                        name: name.clone(),
-                        description: None,
-                        arguments: None,
-                    }
-                }
-            })
-            .collect();
+        let prompts: Vec<PromptInfo> = self.prompt_infos.values().cloned().collect();
 
         tracing::debug!(
             target: "mcp.prompts",
@@ -444,7 +432,7 @@ impl ServerCore {
         req: &ListResourcesParams,
         auth_context: Option<AuthContext>,
     ) -> Result<ListResourcesResult> {
-        match &self.resources {
+        let mut result = match &self.resources {
             Some(handler) => {
                 let request_id = "list_resources".to_string();
                 let extra = RequestHandlerExtra::new(
@@ -454,13 +442,28 @@ impl ServerCore {
                         .await,
                 )
                 .with_auth_context(auth_context);
-                handler.list(req.cursor.clone(), extra).await
+                handler.list(req.cursor.clone(), extra).await?
             },
-            None => Ok(ListResourcesResult {
+            None => ListResourcesResult {
                 resources: vec![],
                 next_cursor: None,
-            }),
+            },
+        };
+
+        // Enrich ResourceInfo items with tool _meta for widget resources.
+        // Only resources with URIs in the uri_to_tool_meta index (built from
+        // tool _meta at construction) receive _meta -- non-widget resources
+        // are unaffected.
+        if !self.uri_to_tool_meta.is_empty() {
+            for resource in &mut result.resources {
+                if let Some(tool_meta) = self.uri_to_tool_meta.get(&resource.uri) {
+                    let meta = resource.meta.get_or_insert_with(serde_json::Map::new);
+                    crate::types::ui::deep_merge(meta, tool_meta.clone());
+                }
+            }
         }
+
+        Ok(result)
     }
 
     /// Handle read resource request.
@@ -482,7 +485,24 @@ impl ServerCore {
         )
         .with_auth_context(auth_context);
 
-        handler.read(&req.uri, extra).await
+        let mut result = handler.read(&req.uri, extra).await?;
+
+        // Merge tool descriptor keys into content _meta for widget resources.
+        // Display keys (from ChatGptAdapter/WidgetMeta) are already in content
+        // meta. Descriptor keys (openai/outputTemplate, openai/widgetAccessible,
+        // etc.) come from the linked tool's _meta via the uri_to_tool_meta index.
+        if !self.uri_to_tool_meta.is_empty() {
+            for content in &mut result.contents {
+                if let Content::Resource { uri, meta, .. } = content {
+                    if let Some(tool_meta) = self.uri_to_tool_meta.get(uri.as_str()) {
+                        let content_meta = meta.get_or_insert_with(serde_json::Map::new);
+                        crate::types::ui::deep_merge(content_meta, tool_meta.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Handle list resource templates request.
@@ -727,13 +747,11 @@ impl ServerCore {
                         if let Some(ref task_router) = self.task_router {
                             // Determine if this tool requires task augmentation
                             let tool_execution = self
-                                .tools
+                                .tool_infos
                                 .get(&req.name)
-                                .and_then(|h| h.metadata())
-                                .and_then(|m| m.execution);
+                                .and_then(|m| m.execution.as_ref());
                             let needs_task = req.task.is_some()
-                                || task_router
-                                    .tool_requires_task(&req.name, tool_execution.as_ref());
+                                || task_router.tool_requires_task(&req.name, tool_execution);
                             if needs_task {
                                 let owner_id = self
                                     .resolve_task_owner(auth_context.as_ref())
@@ -943,6 +961,22 @@ mod tests {
         }
     }
 
+    /// Build `tool_infos` cache from a tools `HashMap` (mirrors builder logic).
+    fn build_tool_infos(
+        tools: &HashMap<String, Arc<dyn ToolHandler>>,
+    ) -> HashMap<String, ToolInfo> {
+        tools
+            .iter()
+            .map(|(name, handler)| {
+                let mut info = handler
+                    .metadata()
+                    .unwrap_or_else(|| ToolInfo::new(name.clone(), None, serde_json::json!({})));
+                info.name.clone_from(name);
+                (name.clone(), info)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_server_core_initialization() {
         let mut tools = HashMap::new();
@@ -950,6 +984,7 @@ mod tests {
             "test-tool".to_string(),
             Arc::new(TestTool) as Arc<dyn ToolHandler>,
         );
+        let tool_infos = build_tool_infos(&tools);
 
         let server = ServerCore::new(
             Implementation {
@@ -958,6 +993,8 @@ mod tests {
             },
             ServerCapabilities::tools_only(),
             tools,
+            HashMap::new(),
+            tool_infos,
             HashMap::new(),
             None,
             None,
@@ -999,6 +1036,7 @@ mod tests {
             "test-tool".to_string(),
             Arc::new(TestTool) as Arc<dyn ToolHandler>,
         );
+        let tool_infos = build_tool_infos(&tools);
 
         let server = ServerCore::new(
             Implementation {
@@ -1007,6 +1045,8 @@ mod tests {
             },
             ServerCapabilities::tools_only(),
             tools,
+            HashMap::new(),
+            tool_infos,
             HashMap::new(),
             None,
             None,
@@ -1057,6 +1097,7 @@ mod tests {
             "test-tool".to_string(),
             Arc::new(TestTool) as Arc<dyn ToolHandler>,
         );
+        let tool_infos = build_tool_infos(&tools);
 
         let server = ServerCore::new(
             Implementation {
@@ -1065,6 +1106,8 @@ mod tests {
             },
             ServerCapabilities::tools_only(),
             tools,
+            HashMap::new(),
+            tool_infos,
             HashMap::new(),
             None,
             None,
@@ -1106,6 +1149,7 @@ mod tests {
             "test-tool".to_string(),
             Arc::new(TestTool) as Arc<dyn ToolHandler>,
         );
+        let tool_infos = build_tool_infos(&tools);
 
         let server = ServerCore::new(
             Implementation {
@@ -1114,6 +1158,8 @@ mod tests {
             },
             ServerCapabilities::tools_only(),
             tools,
+            HashMap::new(),
+            tool_infos,
             HashMap::new(),
             None,
             None,

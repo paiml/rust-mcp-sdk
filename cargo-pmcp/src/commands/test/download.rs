@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::PathBuf;
 
+use crate::commands::GlobalFlags;
 use crate::deployment::targets::pmcp_run::{auth, graphql};
 
 /// Download test scenarios from pmcp.run
@@ -11,22 +12,27 @@ pub async fn execute(
     scenario_id: String,
     output: Option<PathBuf>,
     format: Option<String>,
+    global_flags: &GlobalFlags,
 ) -> Result<()> {
-    println!(
-        "\n{}",
-        "Downloading test scenario from pmcp.run"
-            .bright_cyan()
-            .bold()
-    );
-    println!(
-        "{}",
-        "─────────────────────────────────────────".bright_cyan()
-    );
+    if global_flags.should_output() {
+        println!(
+            "\n{}",
+            "Downloading test scenario from pmcp.run"
+                .bright_cyan()
+                .bold()
+        );
+        println!(
+            "{}",
+            "─────────────────────────────────────────".bright_cyan()
+        );
+    }
 
     // Get credentials
     let credentials = auth::get_credentials().await?;
 
-    println!("  {} Scenario ID: {}", "→".blue(), scenario_id);
+    if global_flags.should_output() {
+        println!("  {} Scenario ID: {}", "→".blue(), scenario_id);
+    }
 
     let format_str = format.as_deref().unwrap_or("yaml");
 
@@ -54,33 +60,35 @@ pub async fn execute(
     std::fs::write(&output_path, &result.content)
         .with_context(|| format!("Failed to write scenario to {}", output_path.display()))?;
 
-    println!();
-    println!(
-        "{}",
-        "═════════════════════════════════════════".bright_cyan()
-    );
-    println!(
-        "{} Downloaded '{}' (v{}) to {}",
-        "✓".green().bold(),
-        result.name,
-        result.version,
-        output_path.display()
-    );
-    println!(
-        "{}",
-        "═════════════════════════════════════════".bright_cyan()
-    );
-    println!();
-    println!("{}", "Next steps:".bright_white().bold());
-    println!("  - Edit the scenario locally: {}", output_path.display());
-    println!(
-        "  - Run tests: cargo pmcp test run --scenarios {}",
-        output_path.display()
-    );
-    println!(
-        "  - Upload changes: cargo pmcp test upload --server-id <id> {}",
-        output_path.display()
-    );
+    if global_flags.should_output() {
+        println!();
+        println!(
+            "{}",
+            "═════════════════════════════════════════".bright_cyan()
+        );
+        println!(
+            "{} Downloaded '{}' (v{}) to {}",
+            "✓".green().bold(),
+            result.name,
+            result.version,
+            output_path.display()
+        );
+        println!(
+            "{}",
+            "═════════════════════════════════════════".bright_cyan()
+        );
+        println!();
+        println!("{}", "Next steps:".bright_white().bold());
+        println!("  - Edit the scenario locally: {}", output_path.display());
+        println!(
+            "  - Run tests: cargo pmcp test run --scenarios {}",
+            output_path.display()
+        );
+        println!(
+            "  - Upload changes: cargo pmcp test upload --server <id> {}",
+            output_path.display()
+        );
+    }
 
     Ok(())
 }

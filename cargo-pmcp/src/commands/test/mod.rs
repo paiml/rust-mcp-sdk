@@ -19,6 +19,8 @@ use anyhow::Result;
 use clap::Subcommand;
 use std::path::PathBuf;
 
+use super::GlobalFlags;
+
 #[derive(Debug, Subcommand)]
 pub enum TestCommand {
     /// Quick sanity check of an MCP server
@@ -122,9 +124,9 @@ pub enum TestCommand {
     /// Upload local scenario files to pmcp.run for scheduled testing
     /// and cloud-based test execution.
     Upload {
-        /// Server ID (deployment ID) on pmcp.run
+        /// Server name (deployment ID) on pmcp.run
         #[arg(long)]
-        server_id: String,
+        server: String,
 
         /// Path(s) to scenario files or directories
         #[arg(required = true)]
@@ -160,9 +162,9 @@ pub enum TestCommand {
     ///
     /// Show all scenarios configured for an MCP server on pmcp.run.
     List {
-        /// Server ID (deployment ID) on pmcp.run
+        /// Server name (deployment ID) on pmcp.run
         #[arg(long)]
-        server_id: String,
+        server: String,
 
         /// Show all scenarios including disabled ones
         #[arg(long)]
@@ -171,7 +173,7 @@ pub enum TestCommand {
 }
 
 impl TestCommand {
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, global_flags: &GlobalFlags) -> Result<()> {
         match self {
             TestCommand::Check {
                 url,
@@ -180,7 +182,13 @@ impl TestCommand {
                 timeout,
             } => {
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(check::execute(url, transport, verbose, timeout))
+                runtime.block_on(check::execute(
+                    url,
+                    transport,
+                    verbose,
+                    timeout,
+                    global_flags,
+                ))
             },
 
             TestCommand::Run {
@@ -190,7 +198,15 @@ impl TestCommand {
                 scenarios,
                 transport,
                 detailed,
-            } => run::execute(server, url, port, scenarios, transport, detailed),
+            } => run::execute(
+                server,
+                url,
+                port,
+                scenarios,
+                transport,
+                detailed,
+                global_flags,
+            ),
 
             TestCommand::Generate {
                 server,
@@ -210,16 +226,23 @@ impl TestCommand {
                 all_tools,
                 with_resources,
                 with_prompts,
+                global_flags,
             ),
 
             TestCommand::Upload {
-                server_id,
+                server,
                 paths,
                 name,
                 description,
             } => {
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(upload::execute(server_id, paths, name, description))
+                runtime.block_on(upload::execute(
+                    server,
+                    paths,
+                    name,
+                    description,
+                    global_flags,
+                ))
             },
 
             TestCommand::Download {
@@ -228,12 +251,12 @@ impl TestCommand {
                 format,
             } => {
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(download::execute(scenario_id, output, format))
+                runtime.block_on(download::execute(scenario_id, output, format, global_flags))
             },
 
-            TestCommand::List { server_id, all } => {
+            TestCommand::List { server, all } => {
                 let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(list::execute(server_id, all))
+                runtime.block_on(list::execute(server, all, global_flags))
             },
         }
     }
@@ -247,6 +270,11 @@ pub fn execute(
     do_generate_scenarios: bool,
     detailed: bool,
 ) -> Result<()> {
+    let gf = GlobalFlags {
+        verbose: false,
+        no_color: false,
+        quiet: false,
+    };
     if do_generate_scenarios {
         generate::execute(
             Some(server.clone()),
@@ -257,8 +285,9 @@ pub fn execute(
             true,
             true,
             true,
+            &gf,
         )?;
     }
 
-    run::execute(Some(server), None, port, None, None, detailed) // transport = None
+    run::execute(Some(server), None, port, None, None, detailed, &gf) // transport = None
 }

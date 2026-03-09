@@ -289,7 +289,7 @@ impl DocumentationResources {
                     info: ResourceInfo {
                         uri: "docs://policies/refunds".to_string(),
                         name: "Refund Policy".to_string(),
-                        description: Some(
+                        Some(
                             "[PRIORITY: HIGH] Customer refund rules. \
                              Updated on 2025-01-15.".to_string()
                         ),
@@ -304,7 +304,7 @@ impl DocumentationResources {
                     info: ResourceInfo {
                         uri: "docs://policies/shipping".to_string(),
                         name: "Shipping Policy".to_string(),
-                        description: Some(
+                        Some(
                             "[PRIORITY: NORMAL] Shipping timeframes and costs. \
                              Updated on 2025-01-10.".to_string()
                         ),
@@ -319,7 +319,7 @@ impl DocumentationResources {
                     info: ResourceInfo {
                         uri: "config://app/settings.json".to_string(),
                         name: "App Settings".to_string(),
-                        description: Some(
+                        Some(
                             "[PRIORITY: HIGH] Application configuration. \
                              Updated on 2025-01-20.".to_string()
                         ),
@@ -365,10 +365,7 @@ impl ResourceHandler for DocumentationResources {
             .map(|annotated| annotated.info.clone())
             .collect();
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None, // No pagination for small lists
-        })
+        Ok(ListResourcesResult::new(resources)) // No pagination for small lists
     }
 
     async fn read(
@@ -409,8 +406,8 @@ async fn list(
         None
     };
 
-    Ok(ListResourcesResult {
-        resources: page_resources,
+    Ok(ListResourcesResult::new(
+        page_resources,
         next_cursor,
     })
 }
@@ -506,9 +503,7 @@ impl ResourceHandler for DocumentationResources {
             }
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![content],
-        })
+        Ok(ReadResourceResult::new(vec![content]))
     }
 
     async fn list(
@@ -517,10 +512,8 @@ impl ResourceHandler for DocumentationResources {
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
         // ... (from Step 4)
-        Ok(ListResourcesResult {
-            resources: self.resources.clone(),
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(
+            self.resources.clone())
     }
 }
 ```
@@ -755,10 +748,7 @@ impl ResourceHandler for DatabaseResources {
             mime_type: Some("application/json".to_string()),
         }).collect();
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(resources))
     }
 
     async fn read(
@@ -793,11 +783,9 @@ impl ResourceHandler for DatabaseResources {
             "stock": product.stock,
         });
 
-        Ok(ReadResourceResult {
-            contents: vec![Content::Text {
+        Ok(ReadResourceResult::new(vec![Content::Text {
                 text: serde_json::to_string_pretty(&json)?,
-            }],
-        })
+            }]))
     }
 }
 ```
@@ -842,9 +830,7 @@ impl ResourceHandler for ApiResources {
         let body = response.text().await
             .map_err(|e| Error::internal(format!("Failed to read response: {}", e)))?;
 
-        Ok(ReadResourceResult {
-            contents: vec![Content::Text { text: body }],
-        })
+        Ok(ReadResourceResult::new(vec![Content::Text { text: body }]))
     }
 
     async fn list(
@@ -853,17 +839,15 @@ impl ResourceHandler for ApiResources {
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
         // Could query API for available endpoints
-        Ok(ListResourcesResult {
-            resources: vec![
+        Ok(ListResourcesResult::new(
+            vec![
                 ResourceInfo {
                     uri: "api://users/{id}".to_string(),
                     name: "User API".to_string(),
-                    description: Some("Fetch user data by ID".to_string()),
+                    Some("Fetch user data by ID".to_string()),
                     mime_type: Some("application/json".to_string()),
                 },
-            ],
-            next_cursor: None,
-        })
+            ])
     }
 }
 ```
@@ -904,11 +888,9 @@ impl ResourceHandler for TemplateResources {
                     format!("User '{}' not found", user_id)
                 ))?;
 
-            return Ok(ReadResourceResult {
-                contents: vec![Content::Text {
+            return Ok(ReadResourceResult::new(vec![Content::Text {
                     text: data.clone(),
-                }],
-            });
+                }]));
         }
 
         Err(Error::protocol(
@@ -923,15 +905,13 @@ impl ResourceHandler for TemplateResources {
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
         // List template pattern
-        Ok(ListResourcesResult {
-            resources: vec![ResourceInfo {
+        Ok(ListResourcesResult::new(
+            vec![ResourceInfo {
                 uri: "users://{userId}".to_string(),
                 name: "User Template".to_string(),
-                description: Some("User data by ID".to_string()),
+                Some("User data by ID".to_string()),
                 mime_type: Some("application/json".to_string()),
-            }],
-            next_cursor: None,
-        })
+            }])
     }
 }
 ```
@@ -1003,9 +983,7 @@ impl ResourceHandler for FileSystemResources {
                 format!("Failed to read file: {}", e)
             ))?;
 
-        Ok(ReadResourceResult {
-            contents: vec![Content::Text { text: content }],
-        })
+        Ok(ReadResourceResult::new(vec![Content::Text { text: content }]))
     }
 
     async fn list(
@@ -1028,17 +1006,14 @@ impl ResourceHandler for FileSystemResources {
                     resources.push(ResourceInfo {
                         uri: format!("file://{}", name),
                         name: name.to_string(),
-                        description: Some(format!("File: {}", name)),
+                        Some(format!("File: {}", name)),
                         mime_type: guess_mime_type(name),
                     });
                 }
             }
         }
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(resources))
     }
 }
 
@@ -1158,10 +1133,8 @@ impl ResourceHandler for CombinedResources {
         let file_list = self.file_resources.list(None, extra).await?;
         all_resources.extend(file_list.resources);
 
-        Ok(ListResourcesResult {
-            resources: all_resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(
+            all_resources)
     }
 
     async fn read(
@@ -1271,7 +1244,7 @@ AnnotatedResource {
     info: ResourceInfo {
         uri: "docs://ordering/policies".to_string(),  // Stable URI
         name: "Ordering Policies".to_string(),
-        description: Some(
+        Some(
             "[PRIORITY: HIGH] Updated on 2025-01-20 with new fraud rules.".to_string()
         ),
         mime_type: Some("text/markdown".to_string()),
@@ -1287,7 +1260,7 @@ AnnotatedResource {
     info: ResourceInfo {
         uri: "docs://ordering/policies/v2".to_string(),  // New URI for breaking change
         name: "Ordering Policies (v2)".to_string(),
-        description: Some(
+        Some(
             "[PRIORITY: CRITICAL] New 2025 policy framework. Replaces v1. \
              Updated on 2025-01-20.".to_string()
         ),
@@ -1304,7 +1277,7 @@ AnnotatedResource {
     info: ResourceInfo {
         uri: "docs://ordering/policies/v1".to_string(),
         name: "Ordering Policies (v1 - Deprecated)".to_string(),
-        description: Some(
+        Some(
             "[DEPRECATED] Use v2. Kept for historical reference. \
              Last updated 2024-12-01.".to_string()
         ),
@@ -1379,16 +1352,12 @@ async fn list(
 
     let resources = self.get_resources(offset, MAX_RESOURCES_PER_PAGE).await?;
 
-    let next_cursor = if resources.len() == MAX_RESOURCES_PER_PAGE {
-        Some((offset + MAX_RESOURCES_PER_PAGE).to_string())
-    } else {
-        None
-    };
+    let mut result = ListResourcesResult::new(resources);
+    if result.resources.len() == MAX_RESOURCES_PER_PAGE {
+        result = result.with_next_cursor((offset + MAX_RESOURCES_PER_PAGE).to_string());
+    }
 
-    Ok(ListResourcesResult {
-        resources,
-        next_cursor,
-    })
+    Ok(result)
 }
 ```
 

@@ -44,6 +44,8 @@ pub enum OperationType {
     ResourcesList,
     /// prompts/list discovery request.
     PromptsList,
+    /// code_mode two-step flow (validate_code + execute_code).
+    CodeMode,
 }
 
 impl fmt::Display for OperationType {
@@ -56,6 +58,7 @@ impl fmt::Display for OperationType {
             Self::ToolsList => "tools/list",
             Self::ResourcesList => "resources/list",
             Self::PromptsList => "prompts/list",
+            Self::CodeMode => "code_mode",
         };
         f.write_str(s)
     }

@@ -58,6 +58,10 @@ pub struct WasmMcpServer {
     tools: HashMap<String, Box<dyn WasmTool>>,
     resources: HashMap<String, Box<dyn WasmResource>>,
     prompts: HashMap<String, Box<dyn WasmPrompt>>,
+    /// Cached tool metadata (populated at registration, avoids per-request cloning)
+    tool_infos: HashMap<String, ToolInfo>,
+    /// Cached prompt metadata (populated at registration, avoids per-request cloning)
+    prompt_infos: HashMap<String, PromptInfo>,
 }
 
 impl WasmMcpServer {
@@ -139,7 +143,7 @@ impl WasmMcpServer {
     }
 
     fn handle_list_tools(&self, _params: ListToolsParams) -> Result<Value> {
-        let tools: Vec<ToolInfo> = self.tools.values().map(|tool| tool.info()).collect();
+        let tools: Vec<ToolInfo> = self.tool_infos.values().cloned().collect();
 
         let result = ListToolsResult {
             tools,
@@ -261,7 +265,7 @@ impl WasmMcpServer {
     }
 
     fn handle_list_prompts(&self, _params: ListPromptsParams) -> Result<Value> {
-        let prompts: Vec<PromptInfo> = self.prompts.values().map(|prompt| prompt.info()).collect();
+        let prompts: Vec<PromptInfo> = self.prompt_infos.values().cloned().collect();
 
         let result = ListPromptsResult {
             prompts,
@@ -291,6 +295,10 @@ pub struct WasmMcpServerBuilder {
     tools: HashMap<String, Box<dyn WasmTool>>,
     resources: HashMap<String, Box<dyn WasmResource>>,
     prompts: HashMap<String, Box<dyn WasmPrompt>>,
+    /// Cached tool metadata (populated at registration, avoids per-request cloning)
+    tool_infos: HashMap<String, ToolInfo>,
+    /// Cached prompt metadata (populated at registration, avoids per-request cloning)
+    prompt_infos: HashMap<String, PromptInfo>,
 }
 
 impl WasmMcpServerBuilder {
@@ -303,6 +311,8 @@ impl WasmMcpServerBuilder {
             tools: HashMap::new(),
             resources: HashMap::new(),
             prompts: HashMap::new(),
+            tool_infos: HashMap::new(),
+            prompt_infos: HashMap::new(),
         }
     }
 
@@ -326,7 +336,11 @@ impl WasmMcpServerBuilder {
 
     /// Add a tool to the server.
     pub fn tool<T: WasmTool + 'static>(mut self, name: impl Into<String>, tool: T) -> Self {
-        self.tools.insert(name.into(), Box::new(tool));
+        let name = name.into();
+        // Cache metadata at registration time before moving ownership
+        let info = tool.info();
+        self.tool_infos.insert(name.clone(), info);
+        self.tools.insert(name, Box::new(tool));
         self.capabilities.tools = Some(Default::default());
         self
     }
@@ -344,7 +358,11 @@ impl WasmMcpServerBuilder {
 
     /// Add a prompt to the server.
     pub fn prompt<P: WasmPrompt + 'static>(mut self, name: impl Into<String>, prompt: P) -> Self {
-        self.prompts.insert(name.into(), Box::new(prompt));
+        let name = name.into();
+        // Cache metadata at registration time before moving ownership
+        let info = prompt.info();
+        self.prompt_infos.insert(name.clone(), info);
+        self.prompts.insert(name, Box::new(prompt));
         self.capabilities.prompts = Some(Default::default());
         self
     }
@@ -360,6 +378,8 @@ impl WasmMcpServerBuilder {
             tools: self.tools,
             resources: self.resources,
             prompts: self.prompts,
+            tool_infos: self.tool_infos,
+            prompt_infos: self.prompt_infos,
         }
     }
 }
@@ -410,6 +430,7 @@ where
             name: self.name.clone(),
             description: Some(self.description.clone()),
             input_schema: self.input_schema.clone(),
+            output_schema: None,
             annotations: None,
             _meta: None,
             execution: None,

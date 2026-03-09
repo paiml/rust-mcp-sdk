@@ -87,3 +87,30 @@
 
 ---
 
+
+## v1.4 Book & Course Update (Shipped: 2026-02-28)
+
+**Phases completed:** 5 phases, 10 plans
+**Content changes:** +8,140 / -2,066 across 40 files
+**Timeline:** 2026-02-27 → 2026-02-28
+
+**Delivered:** Complete documentation update for pmcp-book and pmcp-course — load testing chapters, MCP Apps chapter refreshes, quizzes, exercises, and cross-references wiring book and course content together.
+
+**Key accomplishments:**
+1. Book Ch 14 (Performance & Load Testing): 961-line comprehensive chapter covering `cargo pmcp loadtest` CLI, TOML config, flat/staged execution, HdrHistogram metrics, breaking point detection, coordinated omission, and CI/CD integration
+2. Book Ch 12.5 (MCP Apps): 1294-line complete rewrite with WidgetDir file-based authoring, `cargo pmcp app` workflow, multi-platform adapter pattern, and chess/map/dataviz example walkthroughs
+3. Course Ch 18-03: 952-line hands-on load testing tutorial with progressive difficulty from first test through capacity planning
+4. Course Ch 20: 4 sub-chapters (1,646 lines total) rewritten with WidgetDir/mcpBridge paradigm, bridge communication, adapter pattern, and example walkthroughs
+5. Course quizzes and exercises: ch18 quiz (10 questions), ch18 AI-guided exercise (6 phases), ch20 quiz refreshed (12→14 questions), SUMMARY.md updated
+
+**Requirements:** 19/19 satisfied (BKLT-01..04, BKAP-01..04, CRLT-01..04, CRAP-01..03, CRQE-01..04)
+
+### Known Tech Debt
+- ch18-operations.toml quiz not embedded via `{{#quiz}}` in any course page
+- loadtest.ai.toml exercise not embedded via `{{#exercise}}` in ch18-exercises.md
+- ch19-exercises.md links to old ch20-applications.md instead of ch20-mcp-apps.md
+- Orphaned ch20-applications.md still exists with stale sub-chapter links
+- ch18-operations.md is a 1-line stub
+
+---
+

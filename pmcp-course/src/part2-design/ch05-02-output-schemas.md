@@ -110,9 +110,8 @@ let top_customers_tool = TypedToolWithOutput::new(
 
 The PMCP SDK automatically:
 1. Generates `inputSchema` from `TopCustomersInput`
-2. Generates `outputSchema` from `TopCustomersOutput`
-3. Stores the output schema in tool annotations (`pmcp:outputSchema`)
-4. Provides a type name for code generation (`pmcp:outputTypeName`)
+2. Generates `outputSchema` from `TopCustomersOutput` as a top-level field on `ToolInfo`
+3. Sets `pmcp:outputTypeName` in annotations for code generation
 
 ### Doc Comments → Schema Descriptions
 
@@ -428,7 +427,7 @@ pub struct QueryArgs {
     pub sql: String,
 }
 
-/// Result from query tool (from pmcp:outputSchema)
+/// Result from query tool (from top-level outputSchema)
 #[derive(Debug, Deserialize)]
 pub struct QueryResult {
     /// Column names from the result set
@@ -465,18 +464,19 @@ for row in &result.rows {
 }
 ```
 
-### Output Schema Annotations
+### Output Schema on ToolInfo
 
-PMCP stores output schemas in tool annotations using `pmcp:` prefixed fields:
+Per MCP spec 2025-06-18, output schemas are top-level fields on `ToolInfo`:
 
 ```rust
-use pmcp::types::ToolAnnotations;
+use pmcp::types::{ToolInfo, ToolAnnotations};
 
-let annotations = ToolAnnotations::new()
-    .with_read_only(true)
-    .with_output_schema(
-        schemars::schema_for!(QueryResult),
-        "QueryResult"  // Type name for code generation
+let tool = ToolInfo::new("query", Some("Execute SQL".into()), input_schema)
+    .with_output_schema(schemars::schema_for!(QueryResult))
+    .with_annotations(
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_output_type_name("QueryResult")  // PMCP codegen extension
     );
 ```
 
@@ -486,15 +486,15 @@ The exported tool metadata includes:
 {
   "name": "query",
   "inputSchema": { ... },
+  "outputSchema": { ... },
   "annotations": {
     "readOnlyHint": true,
-    "pmcp:outputSchema": { ... },
     "pmcp:outputTypeName": "QueryResult"
   }
 }
 ```
 
-Standard MCP clients ignore `pmcp:*` annotations (per MCP spec), while PMCP tools leverage them for code generation.
+The `pmcp:outputTypeName` annotation is a PMCP codegen extension. Standard MCP clients ignore `pmcp:*` annotations per the spec.
 
 ## Schema Validation Best Practices
 

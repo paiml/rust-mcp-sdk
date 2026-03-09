@@ -10,6 +10,7 @@ By the end of this chapter, you will:
 - Build regression test suites that catch breaking changes
 - Implement canary deployments for MCP servers
 - Monitor production server health with automated tests
+- Know where to find hands-on load testing guidance for deployed servers
 
 ## Why Remote Testing?
 
@@ -608,6 +609,42 @@ jobs:
             --threshold 20%  # Fail if >20% slower
 ```
 
+## Load Testing Your Deployed Servers
+
+Beyond functional correctness, you'll also want to know how your deployed server performs under realistic load. A server that passes every smoke and regression test can still fall over when fifty clients connect at once or when a traffic spike hits during peak hours.
+
+The `cargo pmcp loadtest` command gives you a k6-inspired load testing workflow built specifically for MCP servers. It understands the MCP protocol natively, so it can automatically discover your server's tools and resources, generate realistic traffic patterns, and report percentile-accurate latency metrics using HdrHistogram. You can run a quick baseline check with a single command:
+
+```bash
+cargo pmcp loadtest run --server https://mcp.example.com/mcp --vus 10 --duration 30s
+```
+
+With load testing, you can discover:
+
+- **Concurrent client capacity** - How many simultaneous clients your server handles before response times degrade
+- **Tail latency** - What P99 latency looks like at different load levels (the metric that matters most for user experience)
+- **Breaking points** - Where your server starts dropping requests or returning errors (automatic detection)
+- **Performance regressions** - Whether a new deployment made things slower compared to your baseline
+
+Here's a quick taste of what a load test run looks like:
+
+```bash
+cargo pmcp loadtest run \
+  --server https://staging.mcp.example.com/mcp \
+  --vus 10 \
+  --duration 30s
+
+# Output (k6-style):
+#   scenarios: 1, max VUs: 10, duration: 30s
+#   requests .......... 1,247  (41.6/s)
+#   latency p50 ...... 12ms
+#   latency p95 ...... 34ms
+#   latency p99 ...... 87ms
+#   errors ........... 0     (0.00%)
+```
+
+> **Hands-on tutorial:** This section gives you a taste of what's possible. For the full load testing walkthrough -- including TOML configuration, schema-driven scenario discovery, staged load profiles, breaking point detection, and capacity planning -- see [Chapter 18-03: Performance Optimization](../part7-observability/ch18-03-performance.md).
+
 ## Chapter Summary
 
 Remote testing validates that your MCP server works in production conditions. Key strategies:
@@ -617,6 +654,7 @@ Remote testing validates that your MCP server works in production conditions. Ke
 3. **Environment configs** - Separate settings per environment
 4. **Regression suites** - Catch breaking changes
 5. **Canary deployments** - Test in production safely
+6. **Load Testing** - Use `cargo pmcp loadtest` to validate performance under load (see [Ch 18-03](../part7-observability/ch18-03-performance.md))
 
 The following sub-chapters dive deeper into each topic:
 
@@ -638,6 +676,7 @@ These informal exercises help reinforce the concepts. For structured exercises w
 2. **Build a smoke suite** - Create 5 smoke tests covering critical paths
 3. **Add CI integration** - Integrate mcp-tester into your GitHub Actions workflow
 4. **Create a regression test** - Document a bug and create a regression test for it
+5. **Run a quick Load Testing session** - Use `cargo pmcp loadtest run` against your deployed server with 5 VUs for 30 seconds and review the P99 latency
 
 ---
 

@@ -14,8 +14,11 @@ pub async fn deploy_landing_page(
     target: String,
     server_id: Option<String>,
 ) -> Result<()> {
-    println!("🚀 Deploying landing page...");
-    println!();
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("Deploying landing page...");
+        println!();
+    }
 
     // Validate target
     if target != "pmcp-run" && target != "pmcp.run" {
@@ -73,7 +76,7 @@ pub async fn deploy_landing_page(
                     cargo pmcp deploy --target pmcp-run\n\
                  \n\
                  2. Or manually specify server ID:\n\
-                    cargo pmcp landing deploy --target pmcp-run --server-id YOUR_SERVER_ID\n\
+                    cargo pmcp landing deploy --target pmcp-run --server YOUR_SERVER_ID\n\
                  \n\
                  3. Or add to pmcp-landing.toml:\n\
                     [deployment]\n\
@@ -93,33 +96,41 @@ pub async fn deploy_landing_page(
         .or_else(|| config.deployment.endpoint.clone())
         .unwrap_or_else(|| format!("https://pmcp.run/{}", server_id));
 
-    println!("📝 Configuration:");
-    println!("   Server: {}", config.display_title());
-    println!("   Server ID: {}", server_id);
-    println!("   Endpoint: {}", endpoint);
-    println!("   Target: {}", target);
-    println!();
+    if not_quiet {
+        println!("Configuration:");
+        println!("   Server: {}", config.display_title());
+        println!("   Server ID: {}", server_id);
+        println!("   Endpoint: {}", endpoint);
+        println!("   Target: {}", target);
+        println!();
 
-    // Authenticate with pmcp.run
-    println!("🔐 Authenticating with pmcp.run...");
+        // Authenticate with pmcp.run
+        println!("Authenticating with pmcp.run...");
+    }
     let credentials = auth::get_credentials().await.context(
         "Failed to get pmcp.run credentials. Run: cargo pmcp deploy login --target pmcp-run",
     )?;
-    println!("   ✅ Authenticated");
-    println!();
+    if not_quiet {
+        println!("   Authenticated");
+        println!();
 
-    // Install dependencies
-    println!("📦 Installing dependencies...");
+        // Install dependencies
+        println!("Installing dependencies...");
+    }
     check_node_installed(&dir)?;
     run_npm_install(&dir)?;
-    println!("   ✅ Dependencies installed");
-    println!();
+    if not_quiet {
+        println!("   Dependencies installed");
+        println!();
 
-    // Build the landing page with environment variables
-    println!("🔨 Building landing page...");
+        // Build the landing page with environment variables
+        println!("Building landing page...");
+    }
     run_npm_build(&dir, &endpoint, &config)?;
-    println!("   ✅ Build completed");
-    println!();
+    if not_quiet {
+        println!("   Build completed");
+        println!();
+    }
 
     // Verify out/ directory exists
     let out_dir = dir.join("out");
@@ -134,37 +145,43 @@ pub async fn deploy_landing_page(
     }
 
     // Create zip file from out/ directory CONTENTS (not the directory itself)
-    println!("📦 Creating deployment package...");
+    if not_quiet {
+        println!("Creating deployment package...");
+    }
     let zip_path = create_deployment_zip(&out_dir)?;
     let zip_size = std::fs::metadata(&zip_path)?.len();
-    println!(
-        "   ✅ Created {} ({} KB)",
-        zip_path.display(),
-        zip_size / 1024
-    );
-    println!();
+    if not_quiet {
+        println!("   Created {} ({} KB)", zip_path.display(), zip_size / 1024);
+        println!();
 
-    // Upload to pmcp.run via GraphQL (same as server deployment)
-    println!("☁️  Uploading to pmcp.run...");
+        // Upload to pmcp.run via GraphQL (same as server deployment)
+        println!("Uploading to pmcp.run...");
+    }
     let (landing_id, landing_url) =
         upload_landing_via_graphql(&zip_path, &server_id, &config, &credentials.access_token)
             .await?;
-    println!("   ✅ Uploaded (ID: {})", landing_id);
-    println!();
+    if not_quiet {
+        println!("   Uploaded (ID: {})", landing_id);
+        println!();
+    }
 
     // Clean up zip file
     std::fs::remove_file(&zip_path)?;
 
     // Poll for deployment status
-    println!("⏳ Building landing page...");
+    if not_quiet {
+        println!("Building landing page...");
+    }
     poll_landing_status(&landing_id, &credentials.access_token).await?;
 
-    println!();
-    println!("✅ Landing page deployed successfully!");
-    println!();
-    println!("🌐 URL: {}", landing_url);
-    println!();
-    println!("💡 Tip: You can update your landing page by running this command again");
+    if not_quiet {
+        println!();
+        println!("Landing page deployed successfully!");
+        println!();
+        println!("URL: {}", landing_url);
+        println!();
+        println!("Tip: You can update your landing page by running this command again");
+    }
 
     Ok(())
 }
@@ -188,6 +205,7 @@ fn create_deployment_zip(out_dir: &PathBuf) -> Result<PathBuf> {
 
     // Walk the out/ directory and add ALL files (no filtering!)
     // This includes _next/, .html files, etc.
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
     walkdir::WalkDir::new(out_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -205,7 +223,9 @@ fn create_deployment_zip(out_dir: &PathBuf) -> Result<PathBuf> {
                 .replace('\\', "/");
 
             // Debug: print what we're adding
-            println!("      Adding: {}", zip_path);
+            if not_quiet {
+                println!("      Adding: {}", zip_path);
+            }
 
             zip.start_file(&zip_path, options)?;
             let mut file = File::open(path)?;
@@ -232,18 +252,27 @@ async fn upload_landing_via_graphql(
     let zip_bytes = std::fs::read(zip_path)?;
     let zip_size = zip_bytes.len();
 
-    println!("   Zip size: {} KB", zip_size / 1024);
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("   Zip size: {} KB", zip_size / 1024);
+    }
 
     // Step 1: Get presigned S3 URL from GraphQL
-    println!("   Getting upload URL from pmcp.run...");
+    if not_quiet {
+        println!("   Getting upload URL from pmcp.run...");
+    }
     let upload_info = graphql::get_landing_upload_url(access_token, server_id, zip_size)
         .await
         .context("Failed to get upload URL")?;
 
-    println!("   URL expires in {} seconds", upload_info.expires_in);
+    if not_quiet {
+        println!("   URL expires in {} seconds", upload_info.expires_in);
+    }
 
     // Step 2: Upload zip to S3
-    println!("   Uploading to S3...");
+    if not_quiet {
+        println!("   Uploading to S3...");
+    }
     graphql::upload_to_s3(
         &upload_info.upload_url,
         zip_bytes,
@@ -254,7 +283,9 @@ async fn upload_landing_via_graphql(
     .context("Failed to upload to S3")?;
 
     // Step 3: Deploy landing page via GraphQL
-    println!("   Deploying landing page...");
+    if not_quiet {
+        println!("   Deploying landing page...");
+    }
     let config_json = serde_json::to_string(config)?;
     let landing_info = graphql::deploy_landing_page(
         access_token,
@@ -328,8 +359,10 @@ fn check_node_installed(dir: &PathBuf) -> Result<()> {
 
     match output {
         Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            println!("   Node.js: {}", version.trim());
+            if std::env::var("PMCP_QUIET").is_err() {
+                let version = String::from_utf8_lossy(&output.stdout);
+                println!("   Node.js: {}", version.trim());
+            }
             Ok(())
         },
         _ => {
@@ -345,8 +378,10 @@ fn check_node_installed(dir: &PathBuf) -> Result<()> {
 fn run_npm_install(dir: &PathBuf) -> Result<()> {
     use std::io::Write;
 
-    print!("   Running npm install...");
-    std::io::stdout().flush()?;
+    if std::env::var("PMCP_QUIET").is_err() {
+        print!("   Running npm install...");
+        std::io::stdout().flush()?;
+    }
 
     let output = std::process::Command::new("npm")
         .arg("install")
@@ -355,12 +390,13 @@ fn run_npm_install(dir: &PathBuf) -> Result<()> {
         .context("Failed to run npm install")?;
 
     if !output.status.success() {
-        println!(" ❌");
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("npm install failed:\n{}", stderr);
     }
 
-    println!(" done");
+    if std::env::var("PMCP_QUIET").is_err() {
+        println!(" done");
+    }
     Ok(())
 }
 
@@ -368,10 +404,12 @@ fn run_npm_install(dir: &PathBuf) -> Result<()> {
 fn run_npm_build(dir: &PathBuf, endpoint: &str, config: &LandingConfig) -> Result<()> {
     use std::io::Write;
 
-    println!("   Server: {}", config.landing.server_name);
-    println!("   Endpoint: {}", endpoint);
-    print!("   Building...");
-    std::io::stdout().flush()?;
+    if std::env::var("PMCP_QUIET").is_err() {
+        println!("   Server: {}", config.landing.server_name);
+        println!("   Endpoint: {}", endpoint);
+        print!("   Building...");
+        std::io::stdout().flush()?;
+    }
 
     let output = std::process::Command::new("npm")
         .arg("run")
@@ -383,12 +421,13 @@ fn run_npm_build(dir: &PathBuf, endpoint: &str, config: &LandingConfig) -> Resul
         .context("Failed to run npm run build")?;
 
     if !output.status.success() {
-        println!(" ❌");
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         anyhow::bail!("npm run build failed:\n{}\n{}", stdout, stderr);
     }
 
-    println!(" done");
+    if std::env::var("PMCP_QUIET").is_err() {
+        println!(" done");
+    }
     Ok(())
 }

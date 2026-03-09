@@ -20,6 +20,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 
 mod commands;
 mod deployment;
@@ -28,6 +29,8 @@ mod publishing;
 mod secrets;
 mod templates;
 mod utils;
+
+use commands::GlobalFlags;
 
 /// Production-grade MCP server development toolkit
 #[derive(Parser)]
@@ -39,6 +42,14 @@ struct Cli {
     /// Enable verbose output for debugging
     #[arg(long, short, global = true)]
     verbose: bool,
+
+    /// Suppress colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Suppress all non-error output
+    #[arg(long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -199,6 +210,10 @@ enum Commands {
         /// server restart.
         #[arg(long)]
         widgets_dir: Option<String>,
+
+        /// Preview mode: standard (default) or chatgpt (strict ChatGPT protocol validation)
+        #[arg(long, default_value = "standard")]
+        mode: String,
     },
 }
 
@@ -264,15 +279,45 @@ fn main() -> Result<()> {
         std::env::set_var("PMCP_VERBOSE", "1");
     }
 
-    execute_command(cli.command)?;
+    // Determine effective no_color: explicit flag, NO_COLOR env (no-color.org), or non-TTY
+    let effective_no_color =
+        cli.no_color || std::env::var("NO_COLOR").is_ok() || !std::io::stdout().is_terminal();
+
+    if effective_no_color {
+        // Suppress colored crate output globally
+        colored::control::set_override(false);
+        // Suppress console crate output globally
+        console::set_colors_enabled(false);
+        console::set_colors_enabled_stderr(false);
+    }
+
+    // Verbose wins over quiet (per user decision):
+    // If both --verbose and --quiet are passed, quiet is disabled.
+    let effective_quiet = cli.quiet && !cli.verbose;
+
+    // Set global flag env vars for subprocess consumption
+    if effective_no_color {
+        std::env::set_var("PMCP_NO_COLOR", "1");
+    }
+    if effective_quiet {
+        std::env::set_var("PMCP_QUIET", "1");
+    }
+
+    let global_flags = GlobalFlags {
+        verbose: cli.verbose,
+        no_color: effective_no_color,
+        quiet: effective_quiet,
+    };
+
+    execute_command(cli.command, &global_flags)?;
 
     Ok(())
 }
 
-fn execute_command(command: Commands) -> Result<()> {
+fn execute_command(command: Commands, global_flags: &GlobalFlags) -> Result<()> {
     match command {
         Commands::New { name, path } => {
-            commands::new::execute(name, path, None)?;
+            commands::new::execute(name, path, None, global_flags)?;
         },
         Commands::Add { component } => match component {
             AddCommands::Server {
@@ -281,54 +326,54 @@ fn execute_command(command: Commands) -> Result<()> {
                 port,
                 replace,
             } => {
-                commands::add::server(name, template, port, replace)?;
+                commands::add::server(name, template, port, replace, global_flags)?;
             },
             AddCommands::Tool { name, server } => {
-                commands::add::tool(name, server)?;
+                commands::add::tool(name, server, global_flags)?;
             },
             AddCommands::Workflow { name, server } => {
-                commands::add::workflow(name, server)?;
+                commands::add::workflow(name, server, global_flags)?;
             },
         },
         Commands::Test { command } => {
-            command.execute()?;
+            command.execute(global_flags)?;
         },
         Commands::Dev {
             server,
             port,
             connect,
         } => {
-            commands::dev::execute(server, port, connect)?;
+            commands::dev::execute(server, port, connect, global_flags)?;
         },
         Commands::Connect {
             server,
             client,
             url,
         } => {
-            commands::connect::execute(server, client, url)?;
+            commands::connect::execute(server, client, url, global_flags)?;
         },
         Commands::Deploy(deploy_cmd) => {
-            deploy_cmd.execute()?;
+            deploy_cmd.execute(global_flags)?;
         },
         Commands::Landing { command } => {
             let runtime = tokio::runtime::Runtime::new()?;
             let project_root = std::env::current_dir()?;
-            runtime.block_on(command.execute(project_root))?;
+            runtime.block_on(command.execute(project_root, global_flags))?;
         },
         Commands::Schema { command } => {
-            command.execute()?;
+            command.execute(global_flags)?;
         },
         Commands::Validate { command } => {
-            command.execute()?;
+            command.execute(global_flags)?;
         },
         Commands::Secret(secret_cmd) => {
-            secret_cmd.execute()?;
+            secret_cmd.execute(global_flags)?;
         },
         Commands::Loadtest { command } => {
-            command.execute()?;
+            command.execute(global_flags)?;
         },
         Commands::App { command } => {
-            command.execute()?;
+            command.execute(global_flags)?;
         },
         Commands::Preview {
             url,
@@ -338,6 +383,7 @@ fn execute_command(command: Commands) -> Result<()> {
             theme,
             locale,
             widgets_dir,
+            mode,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(commands::preview::execute(
@@ -348,6 +394,8 @@ fn execute_command(command: Commands) -> Result<()> {
                 theme,
                 locale,
                 widgets_dir,
+                mode,
+                global_flags,
             ))?;
         },
     }

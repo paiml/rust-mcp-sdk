@@ -5,12 +5,18 @@ use std::time::Duration;
 
 use cargo_pmcp::loadtest::client::McpClient;
 
+use crate::commands::GlobalFlags;
+
 /// Execute the `loadtest init` command.
 ///
 /// Creates `.pmcp/loadtest.toml` with sensible defaults. If a server URL
 /// is provided, connects to discover tools/resources/prompts and populates
 /// the scenario with real names.
-pub async fn execute_init(url: Option<String>, force: bool) -> Result<()> {
+pub async fn execute_init(
+    url: Option<String>,
+    force: bool,
+    global_flags: &GlobalFlags,
+) -> Result<()> {
     let config_dir = std::env::current_dir()?.join(".pmcp");
     let config_path = config_dir.join("loadtest.toml");
 
@@ -25,15 +31,19 @@ pub async fn execute_init(url: Option<String>, force: bool) -> Result<()> {
 
     // Generate config content
     let content = if let Some(server_url) = url {
-        eprintln!("Discovering server schema at {}...", server_url);
+        if global_flags.should_output() {
+            eprintln!("Discovering server schema at {}...", server_url);
+        }
         match discover_schema(&server_url).await {
             Ok(schema) => generate_discovered_template(&server_url, &schema),
             Err(e) => {
-                eprintln!(
-                    "Warning: Could not discover server schema: {}\n\
-                     Generating default template instead.",
-                    e
-                );
+                if global_flags.should_output() {
+                    eprintln!(
+                        "Warning: Could not discover server schema: {}\n\
+                         Generating default template instead.",
+                        e
+                    );
+                }
                 generate_default_template()
             },
         }
@@ -48,8 +58,10 @@ pub async fn execute_init(url: Option<String>, force: bool) -> Result<()> {
 
     // Write config file
     std::fs::write(&config_path, &content)?;
-    eprintln!("Created {}", config_path.display());
-    eprintln!("Edit the file to customize your load test scenario.");
+    if global_flags.should_output() {
+        eprintln!("Created {}", config_path.display());
+        eprintln!("Edit the file to customize your load test scenario.");
+    }
 
     Ok(())
 }
@@ -77,7 +89,7 @@ struct DiscoveredPrompt {
 async fn discover_schema(url: &str) -> Result<DiscoveredSchema> {
     let http = reqwest::Client::new();
     let timeout = Duration::from_secs(10);
-    let mut client = McpClient::new(http, url.to_owned(), timeout);
+    let mut client = McpClient::new(http, url.to_owned(), timeout, None);
 
     // Initialize session
     client
@@ -220,9 +232,34 @@ async fn discover_prompts(url: &str, session_id: Option<&str>) -> Vec<Discovered
         .unwrap_or_default()
 }
 
+/// Default ramp-up stage block appended to all generated loadtest configs.
+///
+/// Provides a 3-phase profile: ramp to 5 VUs (10s), ramp to 10 VUs (10s),
+/// hold at 10 VUs (60s). Prevents cold-start thundering herd on cloud execution.
+const DEFAULT_STAGES_TOML: &str = r#"
+# Ramp-up stages: gradual VU increase avoids cold-start thundering herd.
+# Critical for cloud load testing (cargo pmcp loadtest upload) where distributed
+# workers amplify cold-start effects across multiple service layers.
+# Without stages, all VUs launch simultaneously (flat load).
+# Modify target_vus/duration_secs to match your capacity, or delete to use flat load.
+
+[[stage]]
+target_vus = 5
+duration_secs = 10
+
+[[stage]]
+target_vus = 10
+duration_secs = 10
+
+# Hold at peak
+[[stage]]
+target_vus = 10
+duration_secs = 60
+"#;
+
 /// Generate a default TOML template without server discovery.
 fn generate_default_template() -> String {
-    r#"# Load test configuration for cargo-pmcp
+    let mut content = r#"# Load test configuration for cargo-pmcp
 # See: https://github.com/paiml/rust-mcp-sdk/tree/main/cargo-pmcp#load-testing
 
 [settings]
@@ -237,6 +274,10 @@ timeout_ms = 5000
 
 # Expected interval between requests (ms) for coordinated omission correction
 # expected_interval_ms = 100
+
+# Optional delay between requests per VU (ms). Omit for closed-loop (fire as fast as possible).
+# Example: 15000 = one request every 15s per VU (50 VUs x 4 req/min = ~200 req/min)
+# request_interval_ms = 15000
 
 # Define your scenario steps below. Each step has a type, weight, and parameters.
 # Weights determine the relative frequency of each operation.
@@ -258,7 +299,9 @@ tool = "your-tool-name"
 # prompt = "your-prompt-name"
 # arguments = { key = "value" }
 "#
-    .to_string()
+    .to_string();
+    content.push_str(DEFAULT_STAGES_TOML);
+    content
 }
 
 /// Generate a TOML template populated from discovered server schema.
@@ -280,6 +323,10 @@ timeout_ms = 5000
 
 # Expected interval between requests (ms) for coordinated omission correction
 # expected_interval_ms = 100
+
+# Optional delay between requests per VU (ms). Omit for closed-loop (fire as fast as possible).
+# Example: 15000 = one request every 15s per VU (50 VUs x 4 req/min = ~200 req/min)
+# request_interval_ms = 15000
 
 # Scenario steps discovered from server capabilities.
 # Adjust weights to control the mix of operations.
@@ -352,6 +399,9 @@ prompt = "{}"
         ));
     }
 
+    // Add default ramp-up stages
+    content.push_str(DEFAULT_STAGES_TOML);
+
     content
 }
 
@@ -368,6 +418,10 @@ mod tests {
         assert!(template.contains("timeout_ms"));
         assert!(template.contains("[[scenario]]"));
         assert!(template.contains("tools/call"));
+        assert!(template.contains("[[stage]]"));
+        assert!(template.contains("target_vus = 5"));
+        assert!(template.contains("target_vus = 10"));
+        assert!(template.contains("cold-start thundering herd"));
     }
 
     #[test]
@@ -388,6 +442,8 @@ mod tests {
         assert!(template.contains("echo"));
         assert!(template.contains("calculate"));
         assert!(template.contains("[settings]"));
+        assert!(template.contains("[[stage]]"));
+        assert!(template.contains("target_vus = 5"));
     }
 
     #[test]
@@ -410,5 +466,7 @@ mod tests {
         assert!(template.contains("tools/call"));
         assert!(template.contains("resources/read"));
         assert!(template.contains("prompts/get"));
+        assert!(template.contains("[[stage]]"));
+        assert!(template.contains("cold-start thundering herd"));
     }
 }

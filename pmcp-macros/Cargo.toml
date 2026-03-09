@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-macros"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "Procedural macros for PMCP SDK - Model Context Protocol"
@@ -24,7 +24,7 @@ darling = "0.23"
 heck = "0.5"
 
 [dev-dependencies]
-pmcp = { version = "1.11.0", path = "..", features = ["full"] }
+pmcp = { version = "1.11.1", path = "..", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 schemars = "1.0"

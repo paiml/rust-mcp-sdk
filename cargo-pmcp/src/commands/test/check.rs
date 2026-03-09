@@ -12,27 +12,32 @@ use colored::Colorize;
 use mcp_tester::{ServerTester, TestStatus};
 use std::time::Duration;
 
+use crate::commands::GlobalFlags;
+
 /// Execute the check command
 pub async fn execute(
     url: String,
     transport: Option<String>,
     verbose: bool,
     timeout: u64,
+    global_flags: &GlobalFlags,
 ) -> Result<()> {
-    println!();
-    println!("{}", "MCP Server Check".bright_cyan().bold());
-    println!(
-        "{}",
-        "────────────────────────────────────────".bright_cyan()
-    );
-    println!("  URL: {}", url.bright_white());
+    if global_flags.should_output() {
+        println!();
+        println!("{}", "MCP Server Check".bright_cyan().bold());
+        println!(
+            "{}",
+            "────────────────────────────────────────".bright_cyan()
+        );
+        println!("  URL: {}", url.bright_white());
 
-    if let Some(ref t) = transport {
-        println!("  Transport: {}", t.bright_white());
-    } else {
-        println!("  Transport: {} (auto-detect)", "default".bright_white());
+        if let Some(ref t) = transport {
+            println!("  Transport: {}", t.bright_white());
+        } else {
+            println!("  Transport: {} (auto-detect)", "default".bright_white());
+        }
+        println!();
     }
-    println!();
 
     // Create the server tester
     let mut tester = ServerTester::new(
@@ -46,17 +51,19 @@ pub async fn execute(
     .context("Failed to create server tester")?;
 
     // Step 1: Connection and Initialize
-    println!(
-        "{}",
-        "1. Testing connectivity and initialization...".bright_white()
-    );
+    if global_flags.should_output() {
+        println!(
+            "{}",
+            "1. Testing connectivity and initialization...".bright_white()
+        );
+    }
 
     let report = tester
         .run_quick_test()
         .await
         .context("Failed to run connectivity test")?;
 
-    // Check results
+    // Check results -- test results are requested output, always show
     let mut has_failures = false;
     for result in &report.tests {
         let status_icon = match result.status {
@@ -90,77 +97,83 @@ pub async fn execute(
     }
 
     if has_failures {
-        println!();
-        println!(
-            "{} {}",
-            "✗".red().bold(),
-            "Server check failed".red().bold()
-        );
-        println!();
-
-        // Analyze errors to provide specific hints
-        let error_messages: Vec<&str> = report
-            .tests
-            .iter()
-            .filter_map(|r| r.error.as_deref())
-            .collect();
-
-        let has_transport_error = error_messages.iter().any(|e| {
-            e.contains("untagged enum RequestId")
-                || e.contains("Invalid message format")
-                || e.contains("missing field `id`")
-                || e.contains("Invalid response")
-        });
-
-        let transport_was_auto = transport.is_none();
-
-        // Provide specific hint for transport mismatch
-        if has_transport_error && transport_was_auto {
+        if global_flags.should_output() {
+            println!();
             println!(
                 "{} {}",
-                "💡".bright_yellow(),
-                "Transport mismatch detected!".bright_yellow().bold()
+                "✗".red().bold(),
+                "Server check failed".red().bold()
             );
             println!();
-            println!("   The server response format doesn't match the auto-detected transport.");
-            println!("   This commonly happens with serverless deployments (Lambda, API Gateway).");
-            println!();
-            println!("   {} Try using JSON-RPC transport:", "→".bright_cyan());
-            println!(
-                "     cargo pmcp test check --url {} {}",
-                url,
-                "--transport jsonrpc".bright_green()
-            );
-            println!();
-            println!("   {} Or try SSE streaming transport:", "→".bright_cyan());
-            println!(
-                "     cargo pmcp test check --url {} {}",
-                url,
-                "--transport http".bright_green()
-            );
-            println!();
-        } else {
-            println!("{}", "Troubleshooting tips:".bright_white().bold());
-            println!("  1. Verify the server is running at the URL");
-            println!("  2. Check if the URL requires authentication");
-            println!("  3. Try a different transport: --transport jsonrpc or --transport http");
-            println!("  4. Use --verbose to see detailed error messages");
-            println!();
-        }
 
-        // Show raw error details in verbose mode
-        if verbose {
-            println!("{}", "Detailed error information:".bright_white().bold());
-            for result in &report.tests {
-                if result.status == TestStatus::Failed {
-                    println!("  Test: {}", result.name);
-                    if let Some(ref error) = result.error {
-                        println!("  Error: {}", error);
+            // Analyze errors to provide specific hints
+            let error_messages: Vec<&str> = report
+                .tests
+                .iter()
+                .filter_map(|r| r.error.as_deref())
+                .collect();
+
+            let has_transport_error = error_messages.iter().any(|e| {
+                e.contains("untagged enum RequestId")
+                    || e.contains("Invalid message format")
+                    || e.contains("missing field `id`")
+                    || e.contains("Invalid response")
+            });
+
+            let transport_was_auto = transport.is_none();
+
+            // Provide specific hint for transport mismatch
+            if has_transport_error && transport_was_auto {
+                println!(
+                    "{} {}",
+                    "💡".bright_yellow(),
+                    "Transport mismatch detected!".bright_yellow().bold()
+                );
+                println!();
+                println!(
+                    "   The server response format doesn't match the auto-detected transport."
+                );
+                println!(
+                    "   This commonly happens with serverless deployments (Lambda, API Gateway)."
+                );
+                println!();
+                println!("   {} Try using JSON-RPC transport:", "→".bright_cyan());
+                println!(
+                    "     cargo pmcp test check --url {} {}",
+                    url,
+                    "--transport jsonrpc".bright_green()
+                );
+                println!();
+                println!("   {} Or try SSE streaming transport:", "→".bright_cyan());
+                println!(
+                    "     cargo pmcp test check --url {} {}",
+                    url,
+                    "--transport http".bright_green()
+                );
+                println!();
+            } else {
+                println!("{}", "Troubleshooting tips:".bright_white().bold());
+                println!("  1. Verify the server is running at the URL");
+                println!("  2. Check if the URL requires authentication");
+                println!("  3. Try a different transport: --transport jsonrpc or --transport http");
+                println!("  4. Use --verbose to see detailed error messages");
+                println!();
+            }
+
+            // Show raw error details in verbose mode
+            if verbose {
+                println!("{}", "Detailed error information:".bright_white().bold());
+                for result in &report.tests {
+                    if result.status == TestStatus::Failed {
+                        println!("  Test: {}", result.name);
+                        if let Some(ref error) = result.error {
+                            println!("  Error: {}", error);
+                        }
+                        if let Some(ref details) = result.details {
+                            println!("  Details: {}", details);
+                        }
+                        println!();
                     }
-                    if let Some(ref details) = result.details {
-                        println!("  Details: {}", details);
-                    }
-                    println!();
                 }
             }
         }
@@ -168,12 +181,14 @@ pub async fn execute(
         anyhow::bail!("Server check failed - see errors above");
     }
 
-    println!();
+    if global_flags.should_output() {
+        println!();
 
-    // Step 2: Discover capabilities
-    println!("{}", "2. Discovering server capabilities...".bright_white());
+        // Step 2: Discover capabilities
+        println!("{}", "2. Discovering server capabilities...".bright_white());
+    }
 
-    // Try to list tools
+    // Try to list tools -- results are requested output
     match tester.list_tools().await {
         Ok(tools_result) => {
             let count = tools_result.tools.len();
@@ -257,25 +272,27 @@ pub async fn execute(
         },
     }
 
-    println!();
-    println!(
-        "{} {}",
-        "✓".green().bold(),
-        "Server check passed".green().bold()
-    );
-    println!();
+    if global_flags.should_output() {
+        println!();
+        println!(
+            "{} {}",
+            "✓".green().bold(),
+            "Server check passed".green().bold()
+        );
+        println!();
 
-    // Next steps
-    println!("{}", "Next steps:".bright_white().bold());
-    println!(
-        "  • Generate test scenarios: cargo pmcp test generate --url {}",
-        url
-    );
-    println!(
-        "  • Run full test suite:    cargo pmcp test run --url {} --scenarios <path>",
-        url
-    );
-    println!();
+        // Next steps
+        println!("{}", "Next steps:".bright_white().bold());
+        println!(
+            "  • Generate test scenarios: cargo pmcp test generate --url {}",
+            url
+        );
+        println!(
+            "  • Run full test suite:    cargo pmcp test run --url {} --scenarios <path>",
+            url
+        );
+        println!();
+    }
 
     Ok(())
 }

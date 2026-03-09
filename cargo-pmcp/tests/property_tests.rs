@@ -19,6 +19,7 @@ fn arb_settings() -> impl Strategy<Value = Settings> {
             duration_secs,
             timeout_ms,
             expected_interval_ms,
+            request_interval_ms: None,
         },
     )
 }
@@ -133,6 +134,7 @@ tool = "{tool_name}"
             duration_secs: 1,
             timeout_ms,
             expected_interval_ms: 100,
+            request_interval_ms: None,
         };
         prop_assert_eq!(
             settings.timeout_as_duration().as_millis(),

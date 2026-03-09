@@ -358,14 +358,10 @@ pub fn build_calculator_server() -> Result<Server> {
                     });
                 }
 
-                Ok(GetPromptResult {
-                    description: Some(format!(
+                Ok(GetPromptResult::new(messages, Some(format!(
                         "Solution for {}x² + {}x + {} = 0",
                         a, b, c
-                    )),
-                    messages,
-                    _meta: None,
-                })
+                    ))))
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<GetPromptResult>> + Send>>
         })
     )

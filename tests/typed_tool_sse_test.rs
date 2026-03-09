@@ -77,10 +77,7 @@ mod tests {
         // Create ListToolsResult as would be sent over SSE
         let tools = vec![metadata];
 
-        let result = ListToolsResult {
-            tools,
-            next_cursor: None,
-        };
+        let result = ListToolsResult::new(tools);
 
         // Verify we have our tool
         assert_eq!(result.tools.len(), 1);
@@ -179,10 +176,7 @@ mod tests {
         let metadata = tool.metadata().unwrap();
         let tools = vec![metadata];
 
-        let result = ListToolsResult {
-            tools,
-            next_cursor: None,
-        };
+        let result = ListToolsResult::new(tools);
 
         // Create JSON-RPC response as would be sent over SSE
         let response =

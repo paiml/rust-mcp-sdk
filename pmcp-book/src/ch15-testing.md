@@ -27,6 +27,10 @@ Just as you would thoroughly test a REST API before deploying it, MCP servers ne
 **Testing Pyramid for MCP Servers:**
 
 ```
+      ┌───────────────────────┐
+      │     Load Testing      │  ← Performance & capacity validation
+      │  (cargo pmcp loadtest)│
+      └───────────────────────┘
          ┌─────────────────┐
          │  E2E Scenarios  │  ← Full workflows with real clients
          │  (mcp-tester)   │
@@ -1152,6 +1156,32 @@ echo "MCP server tests passed!"
 exit 0
 ```
 
+## Load Testing
+
+While functional testing verifies that your MCP server behaves correctly, **load testing** answers a different set of critical questions: How many concurrent clients can your server handle? At what point does latency degrade? Where is the breaking point? Answering these questions before production deployment prevents outages and helps you plan capacity with confidence.
+
+The PMCP SDK includes a purpose-built load testing engine accessible via the `cargo pmcp` CLI. Inspired by k6's developer-friendly design, it provides HdrHistogram-grade metrics, TOML-based scenario definitions, and self-calibrating breaking point detection — all without leaving the Rust toolchain.
+
+```bash
+# Run a quick load test against your MCP server
+cargo pmcp loadtest run http://your-server:8080
+```
+
+**Key capabilities at a glance:**
+
+- **TOML-based scenario definition** with weighted MCP operations (tool calls, resource reads, prompt fetches)
+- **Flat load and staged load** execution modes for steady-state and ramp-up testing
+- **HdrHistogram metrics** with coordinated omission correction for accurate latency percentiles
+- **Self-calibrating breaking point detection** that automatically finds your server's limits
+- **JSON reports** for CI/CD integration and trend analysis
+- **Schema discovery** via `loadtest init` to auto-generate scenario files from your server's capabilities
+
+> **Full documentation in Chapter 14:** The load testing engine is covered comprehensively in
+> [Chapter 14: Performance & Load Testing](ch14-performance.md), including the complete CLI
+> reference, TOML configuration format, metrics interpretation guide, breaking point analysis,
+> and CI/CD workflow integration. This section provides a brief introduction — see Chapter 14
+> for the full treatment.
+
 ## Testing Best Practices
 
 ### 1. Test Pyramid Strategy
@@ -1402,7 +1432,8 @@ Effective MCP server testing requires a layered approach:
 1. **Interactive Testing** - Use MCP Inspector for exploration and manual debugging
 2. **Automated Testing** - Use mcp-tester for comprehensive, reproducible tests
 3. **Scenario Testing** - Define complex workflows in YAML for regression testing
-4. **CI/CD Integration** - Automate testing in your deployment pipeline
+4. **Load Testing** - Use `cargo pmcp loadtest` for performance validation and capacity planning (see [Chapter 14](ch14-performance.md))
+5. **CI/CD Integration** - Automate testing in your deployment pipeline
 
 **Key Takeaways:**
 
@@ -1413,6 +1444,7 @@ Effective MCP server testing requires a layered approach:
 - ✅ **OAuth support** - Test authenticated servers with automatic token management
 - ✅ **Multi-transport** - Test HTTP, HTTPS, WebSocket, and stdio servers
 - ✅ **Schema validation** - Catch incomplete tool definitions early
+- ✅ **Load testing** - Built-in load testing engine for performance validation and capacity planning
 - ✅ **CI/CD ready** - JSON output, exit codes, and headless operation
 
 **Next Steps:**
@@ -1422,5 +1454,6 @@ Effective MCP server testing requires a layered approach:
 3. Add mcp-tester to your CI/CD pipeline
 4. Build comprehensive regression test suite
 5. Add pre-commit hooks for fast feedback
+6. Set up load testing for performance baselines (see [Chapter 14](ch14-performance.md))
 
 With comprehensive testing in place, you can confidently deploy MCP servers that work reliably with Claude and other MCP clients.

@@ -14,6 +14,7 @@
 //! virtual_users = 10
 //! duration_secs = 60
 //! timeout_ms = 5000
+//! # request_interval_ms = 15000  # optional pacing delay per VU
 //!
 //! [[scenario]]
 //! type = "tools/call"
@@ -114,6 +115,14 @@ pub struct Settings {
     /// `record_correct()`. Defaults to 100ms if not specified.
     #[serde(default = "default_expected_interval")]
     pub expected_interval_ms: u64,
+    /// Optional delay between consecutive requests from a single VU (ms).
+    ///
+    /// When set, each VU sleeps this long after completing a request before
+    /// starting the next one. This enables realistic steady-state load patterns
+    /// (e.g., 15000ms = 4 requests/minute per VU). When `None` (the default),
+    /// VUs fire requests as fast as possible (closed-loop).
+    #[serde(default)]
+    pub request_interval_ms: Option<u64>,
 }
 
 /// Default expected interval for coordinated omission correction: 100ms.
@@ -124,7 +133,8 @@ fn default_expected_interval() -> u64 {
 /// A single scenario step representing an MCP operation with a scheduling weight.
 ///
 /// The `type` field in TOML determines the variant via serde's internally tagged
-/// enum support. Supported types: `"tools/call"`, `"resources/read"`, `"prompts/get"`.
+/// enum support. Supported types: `"tools/call"`, `"resources/read"`, `"prompts/get"`,
+/// `"code_mode"`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum ScenarioStep {
@@ -158,6 +168,24 @@ pub enum ScenarioStep {
         #[serde(default)]
         arguments: HashMap<String, String>,
     },
+    /// A `code_mode` two-step flow: `validate_code` then `execute_code`.
+    ///
+    /// Used for servers that support Code Mode (e.g., GraphQL, SQL).
+    /// The code is first validated, then executed if approved.
+    #[serde(rename = "code_mode")]
+    CodeMode {
+        /// Scheduling weight relative to other steps.
+        weight: u32,
+        /// The code to validate and execute.
+        code: String,
+        /// Code format (e.g., "graphql", "sql", "javascript").
+        #[serde(default = "default_code_format")]
+        format: String,
+    },
+}
+
+fn default_code_format() -> String {
+    "graphql".to_string()
 }
 
 impl LoadTestConfig {
@@ -266,6 +294,7 @@ impl ScenarioStep {
             Self::ToolCall { weight, .. } => *weight,
             Self::ResourceRead { weight, .. } => *weight,
             Self::PromptGet { weight, .. } => *weight,
+            Self::CodeMode { weight, .. } => *weight,
         }
     }
 }
@@ -354,6 +383,64 @@ arguments = { text = "Hello world" }
     }
 
     #[test]
+    fn test_parse_code_mode_scenario() {
+        let toml_str = r#"
+[settings]
+virtual_users = 5
+duration_secs = 30
+timeout_ms = 5000
+
+[[scenario]]
+type = "tools/call"
+weight = 50
+tool = "list-agents"
+
+[[scenario]]
+type = "code_mode"
+weight = 10
+code = """
+query ListAgents {
+  listAgentsFromRegistry { id name }
+}
+"""
+format = "graphql"
+"#;
+        let config = LoadTestConfig::from_toml(toml_str).unwrap();
+        assert_eq!(config.scenario.len(), 2);
+        assert!(matches!(
+            &config.scenario[1],
+            ScenarioStep::CodeMode {
+                weight: 10,
+                format,
+                ..
+            } if format == "graphql"
+        ));
+    }
+
+    #[test]
+    fn test_parse_code_mode_default_format() {
+        let toml_str = r#"
+[settings]
+virtual_users = 5
+duration_secs = 30
+timeout_ms = 5000
+
+[[scenario]]
+type = "code_mode"
+weight = 5
+code = "SELECT 1"
+"#;
+        let config = LoadTestConfig::from_toml(toml_str).unwrap();
+        assert!(matches!(
+            &config.scenario[0],
+            ScenarioStep::CodeMode {
+                format,
+                ..
+            } if format == "graphql"
+        ));
+    }
+
+    #[test]
     fn test_parse_default_expected_interval() {
         let toml_str = r#"
 [settings]
@@ -396,6 +483,7 @@ tool = "ping"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![],
             stage: vec![],
@@ -416,6 +504,7 @@ tool = "ping"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![
                 ScenarioStep::ToolCall {
@@ -446,6 +535,7 @@ tool = "ping"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -496,6 +586,7 @@ tool = "echo"
             duration_secs: 60,
             timeout_ms: 5000,
             expected_interval_ms: 100,
+            request_interval_ms: None,
         };
         assert_eq!(settings.timeout_as_duration(), Duration::from_millis(5000));
     }
@@ -561,6 +652,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -595,6 +687,7 @@ tool = "echo"
                 duration_secs: 10,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -617,6 +710,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -633,6 +727,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -655,6 +750,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -684,6 +780,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -704,6 +801,7 @@ tool = "echo"
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -730,6 +828,7 @@ tool = "echo"
                 duration_secs: 120,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,

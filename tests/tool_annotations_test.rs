@@ -1,8 +1,8 @@
-//! Tests for `ToolAnnotations` and output schema support.
+//! Tests for `ToolAnnotations`, `ToolInfo.output_schema`, and output schema support.
 //!
 //! These tests verify that:
 //! 1. `ToolAnnotations` serialize correctly with PMCP extensions
-//! 2. Output schemas round-trip through JSON properly
+//! 2. Output schemas are top-level on `ToolInfo` (MCP spec 2025-06-18)
 //! 3. Standard MCP annotations work as expected
 //! 4. Unknown annotations are preserved (forward compatibility)
 
@@ -26,7 +26,7 @@ fn test_tool_annotations_builder_pattern() {
 }
 
 #[test]
-fn test_output_schema_annotation() {
+fn test_output_schema_on_tool_info() {
     let output_schema = json!({
         "type": "object",
         "properties": {
@@ -38,41 +38,57 @@ fn test_output_schema_annotation() {
 
     let annotations = ToolAnnotations::new()
         .with_read_only(true)
-        .with_output_schema(output_schema.clone(), "SearchResult");
+        .with_output_type_name("SearchResult");
 
-    assert_eq!(annotations.output_schema, Some(output_schema));
-    assert_eq!(
-        annotations.output_type_name,
-        Some("SearchResult".to_string())
-    );
+    let tool = ToolInfo::with_annotations(
+        "search",
+        Some("Search items".to_string()),
+        json!({"type": "object"}),
+        annotations,
+    )
+    .with_output_schema(output_schema.clone());
+
+    assert_eq!(tool.output_schema, Some(output_schema));
+    let ann = tool.annotations.as_ref().unwrap();
+    assert_eq!(ann.output_type_name, Some("SearchResult".to_string()));
 }
 
 #[test]
-fn test_tool_annotations_json_serialization() {
+fn test_tool_info_json_serialization_with_output_schema() {
+    let output_schema = json!({
+        "type": "object",
+        "properties": {
+            "result": { "type": "string" }
+        }
+    });
+
     let annotations = ToolAnnotations::new()
         .with_read_only(true)
-        .with_output_schema(
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "type": "string" }
-                }
-            }),
-            "MyResult",
-        );
+        .with_output_type_name("MyResult");
 
-    let json = serde_json::to_value(&annotations).unwrap();
+    let tool = ToolInfo::with_annotations(
+        "echo",
+        Some("Echo input".to_string()),
+        json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+        annotations,
+    )
+    .with_output_schema(output_schema);
 
-    // Check standard MCP annotation
-    assert_eq!(json["readOnlyHint"], true);
+    let json = serde_json::to_value(&tool).unwrap();
 
-    // Check PMCP extensions use correct key names
-    assert!(json["pmcp:outputSchema"].is_object());
-    assert_eq!(json["pmcp:outputTypeName"], "MyResult");
+    // outputSchema is top-level sibling to inputSchema
+    assert!(json["outputSchema"].is_object());
+    assert_eq!(
+        json["outputSchema"]["properties"]["result"]["type"],
+        "string"
+    );
 
-    // Ensure camelCase serialization
-    assert!(json.get("read_only_hint").is_none()); // Should be camelCase
-    assert!(json.get("output_schema").is_none()); // Should use pmcp: prefix
+    // annotations still has pmcp:outputTypeName
+    assert_eq!(json["annotations"]["pmcp:outputTypeName"], "MyResult");
+    assert_eq!(json["annotations"]["readOnlyHint"], true);
+
+    // outputSchema should NOT be in annotations
+    assert!(json["annotations"].get("pmcp:outputSchema").is_none());
 }
 
 #[test]
@@ -80,12 +96,6 @@ fn test_tool_annotations_json_deserialization() {
     let json = json!({
         "readOnlyHint": true,
         "destructiveHint": false,
-        "pmcp:outputSchema": {
-            "type": "object",
-            "properties": {
-                "data": { "type": "array" }
-            }
-        },
         "pmcp:outputTypeName": "QueryResult"
     });
 
@@ -93,7 +103,6 @@ fn test_tool_annotations_json_deserialization() {
 
     assert_eq!(annotations.read_only_hint, Some(true));
     assert_eq!(annotations.destructive_hint, Some(false));
-    assert!(annotations.output_schema.is_some());
     assert_eq!(
         annotations.output_type_name,
         Some("QueryResult".to_string())
@@ -102,15 +111,14 @@ fn test_tool_annotations_json_deserialization() {
 
 #[test]
 fn test_tool_info_with_annotations() {
+    let output_schema = json!({
+        "type": "object",
+        "properties": { "count": { "type": "integer" } }
+    });
+
     let annotations = ToolAnnotations::new()
         .with_read_only(true)
-        .with_output_schema(
-            json!({
-                "type": "object",
-                "properties": { "count": { "type": "integer" } }
-            }),
-            "CountResult",
-        );
+        .with_output_type_name("CountResult");
 
     let tool = ToolInfo::with_annotations(
         "count_items",
@@ -123,14 +131,14 @@ fn test_tool_info_with_annotations() {
             "required": ["collection"]
         }),
         annotations,
-    );
+    )
+    .with_output_schema(output_schema.clone());
 
     assert_eq!(tool.name, "count_items");
-    assert!(tool.annotations.is_some());
+    assert_eq!(tool.output_schema, Some(output_schema));
 
     let ann = tool.annotations.as_ref().unwrap();
     assert_eq!(ann.read_only_hint, Some(true));
-    assert!(ann.output_schema.is_some());
     assert_eq!(ann.output_type_name, Some("CountResult".to_string()));
 }
 
@@ -138,14 +146,15 @@ fn test_tool_info_with_annotations() {
 fn test_tool_info_serialization_with_annotations() {
     let annotations = ToolAnnotations::new()
         .with_read_only(true)
-        .with_output_schema(json!({"type": "string"}), "StringResult");
+        .with_output_type_name("StringResult");
 
     let tool = ToolInfo::with_annotations(
         "echo",
         Some("Echo input".to_string()),
         json!({"type": "object", "properties": {"input": {"type": "string"}}}),
         annotations,
-    );
+    )
+    .with_output_schema(json!({"type": "string"}));
 
     let json = serde_json::to_value(&tool).unwrap();
 
@@ -153,6 +162,7 @@ fn test_tool_info_serialization_with_annotations() {
     assert_eq!(json["name"], "echo");
     assert_eq!(json["description"], "Echo input");
     assert!(json["inputSchema"].is_object());
+    assert_eq!(json["outputSchema"], json!({"type": "string"}));
 
     // Verify annotations are nested correctly
     assert!(json["annotations"].is_object());
@@ -172,6 +182,8 @@ fn test_tool_info_without_annotations() {
 
     // annotations should not be serialized when None
     assert!(json.get("annotations").is_none());
+    // outputSchema should not be serialized when None
+    assert!(json.get("outputSchema").is_none());
 }
 
 #[test]
@@ -185,34 +197,43 @@ fn test_empty_annotations_not_serialized() {
 
 #[test]
 fn test_round_trip_serialization() {
-    let original = ToolAnnotations::new()
+    let output_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "values": { "type": "array", "items": { "type": "number" } }
+        },
+        "required": ["id"]
+    });
+
+    let original_annotations = ToolAnnotations::new()
         .with_title("Test Tool")
         .with_read_only(true)
         .with_destructive(false)
         .with_idempotent(true)
         .with_open_world(true)
-        .with_output_schema(
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "values": { "type": "array", "items": { "type": "number" } }
-                },
-                "required": ["id"]
-            }),
-            "ComplexResult",
-        );
+        .with_output_type_name("ComplexResult");
+
+    let original = ToolInfo::with_annotations(
+        "test",
+        Some("Test tool".to_string()),
+        json!({"type": "object"}),
+        original_annotations,
+    )
+    .with_output_schema(output_schema.clone());
 
     let json = serde_json::to_string(&original).unwrap();
-    let restored: ToolAnnotations = serde_json::from_str(&json).unwrap();
+    let restored: ToolInfo = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(original.title, restored.title);
-    assert_eq!(original.read_only_hint, restored.read_only_hint);
-    assert_eq!(original.destructive_hint, restored.destructive_hint);
-    assert_eq!(original.idempotent_hint, restored.idempotent_hint);
-    assert_eq!(original.open_world_hint, restored.open_world_hint);
     assert_eq!(original.output_schema, restored.output_schema);
-    assert_eq!(original.output_type_name, restored.output_type_name);
+    let orig_ann = original.annotations.as_ref().unwrap();
+    let rest_ann = restored.annotations.as_ref().unwrap();
+    assert_eq!(orig_ann.title, rest_ann.title);
+    assert_eq!(orig_ann.read_only_hint, rest_ann.read_only_hint);
+    assert_eq!(orig_ann.destructive_hint, rest_ann.destructive_hint);
+    assert_eq!(orig_ann.idempotent_hint, rest_ann.idempotent_hint);
+    assert_eq!(orig_ann.open_world_hint, rest_ann.open_world_hint);
+    assert_eq!(orig_ann.output_type_name, rest_ann.output_type_name);
 }
 
 #[test]
@@ -227,13 +248,67 @@ fn test_partial_annotations_deserialization() {
 
     assert_eq!(annotations.read_only_hint, Some(true));
     assert_eq!(annotations.destructive_hint, None);
-    assert_eq!(annotations.output_schema, None);
     assert_eq!(annotations.output_type_name, None);
 }
 
 #[test]
+fn test_output_schema_json_format() {
+    // Verify JSON format matches MCP spec 2025-06-18:
+    // outputSchema is a top-level sibling to inputSchema, NOT inside annotations
+    let input_schema = json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string" }
+        },
+        "required": ["query"]
+    });
+
+    let output_schema = json!({
+        "type": "object",
+        "properties": {
+            "rows": { "type": "array" },
+            "count": { "type": "integer" }
+        },
+        "required": ["rows", "count"]
+    });
+
+    let tool = ToolInfo::with_annotations(
+        "search",
+        Some("Search items".to_string()),
+        input_schema.clone(),
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_output_type_name("SearchResult"),
+    )
+    .with_output_schema(output_schema.clone());
+
+    let json = serde_json::to_value(&tool).unwrap();
+
+    // outputSchema at top level (sibling to inputSchema)
+    assert_eq!(json["inputSchema"], input_schema);
+    assert_eq!(json["outputSchema"], output_schema);
+
+    // pmcp:outputTypeName in annotations
+    assert_eq!(json["annotations"]["pmcp:outputTypeName"], "SearchResult");
+    assert_eq!(json["annotations"]["readOnlyHint"], true);
+
+    // outputSchema must NOT appear inside annotations
+    assert!(json["annotations"].get("outputSchema").is_none());
+    assert!(json["annotations"].get("pmcp:outputSchema").is_none());
+
+    // When output_schema is None, outputSchema key should NOT appear
+    let tool_no_output = ToolInfo::new(
+        "simple",
+        Some("Simple tool".to_string()),
+        json!({"type": "object"}),
+    );
+    let json_no_output = serde_json::to_value(&tool_no_output).unwrap();
+    assert!(json_no_output.get("outputSchema").is_none());
+}
+
+#[test]
 fn test_output_schema_complex_types() {
-    // Test with a complex nested schema
+    // Test with a complex nested schema on ToolInfo
     let schema = json!({
         "type": "object",
         "properties": {
@@ -259,15 +334,21 @@ fn test_output_schema_complex_types() {
         "required": ["users", "total_count", "has_more"]
     });
 
-    let annotations = ToolAnnotations::new().with_output_schema(schema.clone(), "UserListResponse");
+    let annotations = ToolAnnotations::new().with_output_type_name("UserListResponse");
 
-    let json = serde_json::to_value(&annotations).unwrap();
-    let restored: ToolAnnotations = serde_json::from_value(json).unwrap();
+    let tool = ToolInfo::with_annotations(
+        "list_users",
+        Some("List users".to_string()),
+        json!({"type": "object"}),
+        annotations,
+    )
+    .with_output_schema(schema.clone());
+
+    let json = serde_json::to_value(&tool).unwrap();
+    let restored: ToolInfo = serde_json::from_value(json).unwrap();
 
     // Verify the complex schema round-trips correctly
     assert_eq!(restored.output_schema, Some(schema));
-    assert_eq!(
-        restored.output_type_name,
-        Some("UserListResponse".to_string())
-    );
+    let ann = restored.annotations.as_ref().unwrap();
+    assert_eq!(ann.output_type_name, Some("UserListResponse".to_string()));
 }

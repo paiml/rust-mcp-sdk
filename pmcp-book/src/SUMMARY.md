@@ -35,8 +35,8 @@
 ## Part IV: Real-World Applications
 
 - [Chapter 13: Building Production Servers](ch13-production.md)
-- [Chapter 14: Performance & Optimization](ch14-performance.md)
-- [Chapter 15: Testing & Quality Assurance](ch15-testing.md)
+- [Chapter 14: Performance and Load Testing](ch14-performance.md)
+- [Chapter 15: Testing MCP Servers](ch15-testing.md)
 - [Chapter 16: Deployment Strategies](ch16-deployment.md)
 
 ## Part V: Examples & Patterns

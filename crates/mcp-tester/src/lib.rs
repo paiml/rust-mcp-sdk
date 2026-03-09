@@ -47,7 +47,6 @@
 
 // Re-export key modules
 pub mod diagnostics;
-pub mod oauth;
 pub mod report;
 pub mod scenario;
 pub mod scenario_executor;
@@ -55,8 +54,9 @@ pub mod scenario_generator;
 pub mod tester;
 pub mod validators;
 
-// Re-export commonly used types
-pub use oauth::{OAuthConfig, OAuthHelper};
+// OAuth support -- re-exported from core SDK
+pub use pmcp::client::oauth;
+pub use pmcp::client::oauth::{OAuthConfig, OAuthHelper};
 pub use report::{OutputFormat, TestReport, TestResult, TestStatus};
 pub use scenario::TestScenario;
 pub use scenario_executor::ScenarioExecutor;

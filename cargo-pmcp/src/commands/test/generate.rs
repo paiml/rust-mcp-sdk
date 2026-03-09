@@ -5,6 +5,8 @@ use colored::Colorize;
 use mcp_tester::{generate_scenarios_with_transport, GenerateOptions};
 use std::path::PathBuf;
 
+use crate::commands::GlobalFlags;
+
 /// Generate test scenarios from server capabilities
 pub fn execute(
     server: Option<String>,
@@ -15,9 +17,12 @@ pub fn execute(
     all_tools: bool,
     with_resources: bool,
     with_prompts: bool,
+    global_flags: &GlobalFlags,
 ) -> Result<()> {
-    println!("\n{}", "Generating test scenarios".bright_cyan().bold());
-    println!("{}", "─────────────────────────────────────".bright_cyan());
+    if global_flags.should_output() {
+        println!("\n{}", "Generating test scenarios".bright_cyan().bold());
+        println!("{}", "─────────────────────────────────────".bright_cyan());
+    }
 
     // Determine target URL
     let target_url = if let Some(url) = url {
@@ -44,7 +49,9 @@ pub fn execute(
         std::fs::create_dir_all(parent)?;
     }
 
-    println!("  {} Connecting to server at {}...", "→".blue(), target_url);
+    if global_flags.should_output() {
+        println!("  {} Connecting to server at {}...", "→".blue(), target_url);
+    }
 
     let options = GenerateOptions {
         all_tools,
@@ -65,26 +72,28 @@ pub fn execute(
 
     match generation_result {
         Ok(_) => {
-            println!(
-                "  {} Scenarios generated at {}",
-                "✓".green(),
-                output_path.display()
-            );
-            println!();
-            println!("{}", "Next steps:".bright_white().bold());
-            println!(
-                "  1. Edit {} to customize test values",
-                output_path.display()
-            );
-            println!("  2. Add assertions to validate responses");
-            println!("  3. Run tests with: cargo pmcp test run --server <name>");
-            println!();
-            println!("{}", "Tip:".bright_cyan().bold());
-            println!("  Upload scenarios to pmcp.run for scheduled testing:");
-            println!(
-                "    cargo pmcp test upload --server-id <id> {}",
-                output_path.display()
-            );
+            if global_flags.should_output() {
+                println!(
+                    "  {} Scenarios generated at {}",
+                    "✓".green(),
+                    output_path.display()
+                );
+                println!();
+                println!("{}", "Next steps:".bright_white().bold());
+                println!(
+                    "  1. Edit {} to customize test values",
+                    output_path.display()
+                );
+                println!("  2. Add assertions to validate responses");
+                println!("  3. Run tests with: cargo pmcp test run --server <name>");
+                println!();
+                println!("{}", "Tip:".bright_cyan().bold());
+                println!("  Upload scenarios to pmcp.run for scheduled testing:");
+                println!(
+                    "    cargo pmcp test upload --server <id> {}",
+                    output_path.display()
+                );
+            }
             Ok(())
         },
         Err(e) => {

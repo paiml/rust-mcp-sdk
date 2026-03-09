@@ -1023,7 +1023,7 @@ var App = class {
       return;
     }
     try {
-      await this._transport.send("ui/sendMessage", params);
+      await this._transport.send("ui/message", params);
     } catch (err) {
       console.warn("[App] sendMessage not supported by host:", err);
     }
@@ -1039,7 +1039,7 @@ var App = class {
       return;
     }
     try {
-      await this._transport.send("ui/openLink", params);
+      await this._transport.send("ui/open-link", params);
     } catch (err) {
       console.warn("[App] openLink not supported by host:", err);
     }
@@ -1113,22 +1113,26 @@ var App = class {
   }
   _handleNotification(method, params) {
     switch (method) {
-      case "ui/toolInput":
+      case "ui/notifications/tool-input":
+      case "ui/toolInput":  // backward compat
         if (this.ontoolinput && params) {
           this.ontoolinput(params);
         }
         break;
-      case "ui/toolResult":
+      case "ui/notifications/tool-result":
+      case "ui/toolResult":  // backward compat
         if (this.ontoolresult && params) {
           this.ontoolresult(params);
         }
         break;
-      case "ui/toolCancelled":
+      case "ui/notifications/tool-cancelled":
+      case "ui/toolCancelled":  // backward compat
         if (this.ontoolcancelled) {
           this.ontoolcancelled();
         }
         break;
-      case "ui/hostContextChanged":
+      case "ui/notifications/context-changed":
+      case "ui/hostContextChanged":  // backward compat
         if (params) {
           this._hostContext = params;
           if (this.onhostcontextchanged) {
@@ -1136,7 +1140,8 @@ var App = class {
           }
         }
         break;
-      case "ui/teardown":
+      case "ui/resource-teardown":
+      case "ui/teardown":  // backward compat
         this.destroy();
         break;
     }
@@ -1187,7 +1192,7 @@ var AppBridge = class {
       console.warn("[AppBridge] Not initialized.");
       return;
     }
-    this._transport.notify("ui/toolInput", params);
+    this._transport.notify("ui/notifications/tool-input", params);
   }
   /**
    * Send a tool result notification to the widget.
@@ -1199,7 +1204,7 @@ var AppBridge = class {
       console.warn("[AppBridge] Not initialized.");
       return;
     }
-    this._transport.notify("ui/toolResult", result);
+    this._transport.notify("ui/notifications/tool-result", result);
   }
   /**
    * Send a host context changed notification to the widget.
@@ -1212,7 +1217,7 @@ var AppBridge = class {
       console.warn("[AppBridge] Not initialized.");
       return;
     }
-    this._transport.notify("ui/hostContextChanged", ctx);
+    this._transport.notify("ui/notifications/context-changed", ctx);
   }
   /**
    * Send a teardown notification to the widget.
@@ -1221,7 +1226,7 @@ var AppBridge = class {
     if (!this._transport) {
       return;
     }
-    this._transport.notify("ui/teardown");
+    this._transport.notify("ui/resource-teardown");
   }
   /**
    * Whether the bridge has been initialized.
@@ -1251,8 +1256,16 @@ var AppBridge = class {
   // ===========================================================================
   async _handleRequest(method, params) {
     switch (method) {
-      case "ui/initialize":
-        return this._hostContext;
+      case "ui/initialize": {
+        const ctx = this._hostContext;
+        // Send initialized notification after responding
+        setTimeout(() => {
+          if (this._transport) {
+            this._transport.notify("ui/notifications/initialized", {});
+          }
+        }, 0);
+        return ctx;
+      }
       case "tools/call": {
         const name = params?.name;
         const args = params?.arguments;
@@ -1261,10 +1274,12 @@ var AppBridge = class {
         }
         return await this._toolCallHandler(name, args);
       }
-      case "ui/sendMessage":
+      case "ui/message":
+      case "ui/sendMessage":  // backward compat
         console.log("[AppBridge] Widget sent message:", params);
         return {};
-      case "ui/openLink": {
+      case "ui/open-link":
+      case "ui/openLink": {  // backward compat
         const url = params?.url;
         if (url) {
           window.open(url, "_blank", "noopener,noreferrer");

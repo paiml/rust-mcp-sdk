@@ -256,10 +256,7 @@ mod tests {
         let metadata = tool.metadata().unwrap();
         let tools = vec![metadata];
 
-        let result = ListToolsResult {
-            tools,
-            next_cursor: None,
-        };
+        let result = ListToolsResult::new(tools);
 
         // WebSocket messages are JSON text frames
         // Verify the response can be serialized for WebSocket

@@ -1,12 +1,12 @@
-# Output Schema Annotations for Type-Safe Composition
+# Output Schema for Type-Safe Composition
 
 ## Overview
 
-PMCP extends MCP tool annotations to enable **full type safety** in server composition workflows. While MCP provides type-safe input schemas, tool outputs are typically `serde_json::Value` - losing type safety at composition boundaries.
+PMCP supports MCP's top-level `outputSchema` field on tools (per MCP spec 2025-06-18) to enable **full type safety** in server composition workflows. While MCP provides type-safe input schemas, tool outputs are typically `serde_json::Value` - losing type safety at composition boundaries.
 
-PMCP solves this with two annotation extensions:
-- `pmcp:outputSchema` - JSON Schema describing the tool's return type
-- `pmcp:outputTypeName` - Name for code-generated output struct
+PMCP provides:
+- `outputSchema` - Top-level JSON Schema on `ToolInfo` describing the tool's return type (MCP spec 2025-06-18)
+- `pmcp:outputTypeName` - Annotation extension naming the code-generated output struct
 
 ## Why This Matters
 
@@ -25,9 +25,9 @@ let rows = result["rows"].as_array().ok_or("expected rows")?;
 let columns = result["columns"].as_array().ok_or("expected columns")?;
 ```
 
-### The Solution: Output Schema Annotations
+### The Solution: Top-Level Output Schema
 
-With PMCP output schema annotations, code generators produce typed clients:
+With output schemas on `ToolInfo`, code generators produce typed clients:
 
 ```rust
 // Generated from schema - full type safety!
@@ -50,11 +50,11 @@ for col in &result.columns {
 }
 ```
 
-## Using Output Schema Annotations
+## Using Output Schemas
 
 ### In Tool Definitions
 
-Add annotations when defining tools:
+Set output schema as a top-level field on `ToolInfo`:
 
 ```rust
 use pmcp::types::{ToolInfo, ToolAnnotations};
@@ -72,21 +72,19 @@ let tool = ToolInfo::new(
         "required": ["sql"]
     }),
 )
+.with_output_schema(json!({
+    "type": "object",
+    "properties": {
+        "columns": { "type": "array", "items": { "type": "string" } },
+        "rows": { "type": "array" },
+        "row_count": { "type": "integer" }
+    },
+    "required": ["columns", "rows", "row_count"]
+}))
 .with_annotations(
     ToolAnnotations::new()
         .with_read_only(true)
-        .with_output_schema(
-            json!({
-                "type": "object",
-                "properties": {
-                    "columns": { "type": "array", "items": { "type": "string" } },
-                    "rows": { "type": "array" },
-                    "row_count": { "type": "integer" }
-                },
-                "required": ["columns", "rows", "row_count"]
-            }),
-            "QueryResult"  // Generated struct name
-        )
+        .with_output_type_name("QueryResult")  // PMCP codegen extension
 );
 ```
 
@@ -144,7 +142,7 @@ cargo pmcp schema export --endpoint https://my-server.pmcp.run/mcp \
     --output my-server-schema.json
 ```
 
-The exported schema includes output annotations:
+The exported schema includes output schema at the top level per MCP spec 2025-06-18:
 
 ```json
 {
@@ -155,16 +153,16 @@ The exported schema includes output annotations:
       "name": "query",
       "description": "Execute SQL query",
       "inputSchema": { ... },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "columns": { "type": "array", "items": { "type": "string" } },
+          "rows": { "type": "array" },
+          "row_count": { "type": "integer" }
+        }
+      },
       "annotations": {
         "readOnlyHint": true,
-        "pmcp:outputSchema": {
-          "type": "object",
-          "properties": {
-            "columns": { "type": "array", "items": { "type": "string" } },
-            "rows": { "type": "array" },
-            "row_count": { "type": "integer" }
-          }
-        },
         "pmcp:outputTypeName": "QueryResult"
       }
     }]
@@ -204,7 +202,7 @@ pub struct QueryArgs {
 }
 
 // ============================================================================
-// Output Types (from pmcp:outputSchema annotations)
+// Output Types (from top-level outputSchema)
 // ============================================================================
 
 /// Result from query tool
@@ -244,28 +242,33 @@ impl<'a> SqliteExplorerClient<'a> {
 
 ## MCP Protocol Compatibility
 
-### Annotations Are the Extension Mechanism
+### outputSchema Is a Top-Level Tool Field
 
-MCP explicitly supports custom annotations:
+Per MCP spec 2025-06-18, `outputSchema` is a top-level field on the Tool object, as a sibling to `inputSchema`:
+
+```json
+{
+  "name": "query",
+  "inputSchema": { ... },
+  "outputSchema": { ... },
+  "annotations": {
+    "readOnlyHint": true,
+    "pmcp:outputTypeName": "QueryResult"
+  }
+}
+```
+
+### PMCP Extension: pmcp:outputTypeName
+
+The `pmcp:outputTypeName` annotation remains in `annotations` as a PMCP codegen extension. It provides the struct name for code generation. Standard MCP clients ignore `pmcp:*` annotations per the spec:
 
 > "Clients SHOULD ignore annotations they don't understand." - MCP Specification
-
-This means:
-- Standard MCP clients work normally (ignore `pmcp:*` annotations)
-- PMCP-aware tools leverage annotations for code generation
-- No protocol version conflicts
-
-### Namespace Convention
-
-PMCP uses the `pmcp:` prefix for all extensions:
-- `pmcp:outputSchema` - JSON Schema for output
-- `pmcp:outputTypeName` - Name for generated type
 
 This follows the established pattern of vendor-prefixed extensions (like `x-*` in OpenAPI).
 
 ## Standard MCP Annotations
 
-In addition to PMCP extensions, tools can use standard MCP annotations:
+In addition to the top-level outputSchema and PMCP extensions, tools can use standard MCP annotations:
 
 | Annotation | Type | Description |
 |------------|------|-------------|
@@ -275,12 +278,16 @@ In addition to PMCP extensions, tools can use standard MCP annotations:
 | `idempotentHint` | boolean | Multiple calls with same args have same effect |
 | `openWorldHint` | boolean | Tool interacts with external systems |
 
-Example with all annotations:
+Example with annotations and top-level output schema:
 
 ```rust
-ToolAnnotations::new()
-    .with_read_only(true)
-    .with_output_schema(schema, "ResultType")
+let tool = ToolInfo::new("query", Some("Execute SQL".into()), input_schema)
+    .with_output_schema(output_schema)
+    .with_annotations(
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_output_type_name("QueryResult")
+    );
 ```
 
 Or directly in JSON:
@@ -288,11 +295,15 @@ Or directly in JSON:
 ```json
 {
   "name": "delete_record",
+  "inputSchema": { ... },
+  "outputSchema": {
+    "type": "object",
+    "properties": { "deleted": { "type": "boolean" } }
+  },
   "annotations": {
     "readOnlyHint": false,
     "destructiveHint": true,
     "idempotentHint": true,
-    "pmcp:outputSchema": { "type": "object", "properties": { "deleted": { "type": "boolean" } } },
     "pmcp:outputTypeName": "DeleteResult"
   }
 }
@@ -306,10 +317,8 @@ If your server will be called by other servers, add output schemas:
 
 ```rust
 // Good: Output schema enables type-safe composition
-.with_annotations(
-    ToolAnnotations::new()
-        .with_output_schema(result_schema, "MyResult")
-)
+let tool = ToolInfo::new("query", Some("Execute SQL".into()), input_schema)
+    .with_output_schema(result_schema);
 ```
 
 ### 2. Use Descriptive Type Names
@@ -318,10 +327,10 @@ The `pmcp:outputTypeName` becomes the generated struct name:
 
 ```rust
 // Good: Clear, descriptive name
-.with_output_schema(schema, "OrderQueryResult")
+ToolAnnotations::new().with_output_type_name("OrderQueryResult")
 
 // Bad: Generic name
-.with_output_schema(schema, "Result")
+ToolAnnotations::new().with_output_type_name("Result")
 ```
 
 ### 3. Document Schema Fields
@@ -370,52 +379,53 @@ TypedToolWithOutput::new("my_tool", |args: Input, _| {
 ## Workflow Summary
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                     Type-Safe Composition Flow                      │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  1. Define Tool with Output Schema                                 │
-│     ┌─────────────────────────────────────┐                       │
-│     │ TypedToolWithOutput<Input, Output>  │                       │
-│     │ - Auto-generates inputSchema        │                       │
-│     │ - Auto-generates outputSchema       │                       │
-│     │ - Stored in annotations             │                       │
-│     └─────────────────────────────────────┘                       │
-│                         │                                          │
-│                         ▼                                          │
-│  2. Export Schema                                                  │
-│     ┌─────────────────────────────────────┐                       │
-│     │ cargo pmcp schema export            │                       │
-│     │ --endpoint https://server/mcp       │                       │
-│     │ --output schema.json                │                       │
-│     └─────────────────────────────────────┘                       │
-│                         │                                          │
-│                         ▼                                          │
-│  3. Generate Typed Client                                          │
-│     ┌─────────────────────────────────────┐                       │
-│     │ cargo pmcp generate                 │                       │
-│     │ --schema schema.json                │                       │
-│     │ --output src/clients/server.rs      │                       │
-│     │                                     │                       │
-│     │ Produces:                           │                       │
-│     │ - InputArgs structs (from input)    │                       │
-│     │ - OutputResult structs (from output)│                       │
-│     │ - Typed client methods              │                       │
-│     └─────────────────────────────────────┘                       │
-│                         │                                          │
-│                         ▼                                          │
-│  4. Use in Domain Server                                           │
-│     ┌─────────────────────────────────────┐                       │
-│     │ let result: QueryResult = client    │                       │
-│     │     .query(QueryArgs { ... })       │                       │
-│     │     .await?;                        │                       │
-│     │                                     │                       │
-│     │ // Full type safety!                │                       │
-│     │ result.columns.len()                │                       │
-│     │ result.rows.iter()                  │                       │
-│     └─────────────────────────────────────┘                       │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
++--------------------------------------------------------------------+
+|                     Type-Safe Composition Flow                      |
++--------------------------------------------------------------------+
+|                                                                    |
+|  1. Define Tool with Output Schema                                 |
+|     +-------------------------------------+                       |
+|     | TypedToolWithOutput<Input, Output>  |                       |
+|     | - Auto-generates inputSchema        |                       |
+|     | - Auto-generates outputSchema       |                       |
+|     | - outputSchema on ToolInfo          |                       |
+|     | - outputTypeName in annotations     |                       |
+|     +-------------------------------------+                       |
+|                         |                                          |
+|                         v                                          |
+|  2. Export Schema                                                  |
+|     +-------------------------------------+                       |
+|     | cargo pmcp schema export            |                       |
+|     | --endpoint https://server/mcp       |                       |
+|     | --output schema.json                |                       |
+|     +-------------------------------------+                       |
+|                         |                                          |
+|                         v                                          |
+|  3. Generate Typed Client                                          |
+|     +-------------------------------------+                       |
+|     | cargo pmcp generate                 |                       |
+|     | --schema schema.json                |                       |
+|     | --output src/clients/server.rs      |                       |
+|     |                                     |                       |
+|     | Produces:                           |                       |
+|     | - InputArgs structs (from input)    |                       |
+|     | - OutputResult structs (from output)|                       |
+|     | - Typed client methods              |                       |
+|     +-------------------------------------+                       |
+|                         |                                          |
+|                         v                                          |
+|  4. Use in Domain Server                                           |
+|     +-------------------------------------+                       |
+|     | let result: QueryResult = client    |                       |
+|     |     .query(QueryArgs { ... })       |                       |
+|     |     .await?;                        |                       |
+|     |                                     |                       |
+|     | // Full type safety!                |                       |
+|     | result.columns.len()                |                       |
+|     | result.rows.iter()                  |                       |
+|     +-------------------------------------+                       |
+|                                                                    |
++--------------------------------------------------------------------+
 ```
 
 ## Related Documentation

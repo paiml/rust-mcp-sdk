@@ -24,6 +24,7 @@ fn content_strategy() -> impl Strategy<Value = Content> {
                     uri,
                     text,
                     mime_type,
+                    meta: None,
                 }
             })
     ]
@@ -88,8 +89,8 @@ mod toolresult_properties {
                     (Content::Text { text: t1 }, Content::Text { text: t2 }) => {
                         prop_assert_eq!(t1, t2);
                     }
-                    (Content::Resource { uri: uri1, mime_type: mime1, text: text1 },
-                     Content::Resource { uri: uri2, mime_type: mime2, text: text2 }) => {
+                    (Content::Resource { uri: uri1, mime_type: mime1, text: text1, .. },
+                     Content::Resource { uri: uri2, mime_type: mime2, text: text2, .. }) => {
                         prop_assert_eq!(uri1, uri2);
                         prop_assert_eq!(mime1, mime2);
                         prop_assert_eq!(text1, text2);

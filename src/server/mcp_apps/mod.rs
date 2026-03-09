@@ -22,7 +22,8 @@
 //! │   └──────────────┘    └──────────────┘    └──────────────────┘ │
 //! │           │                   │                    │            │
 //! │           ▼                   ▼                    ▼            │
-//! │   text/html+skybridge   text/html+mcp        text/html         │
+//! │   text/html;profile=   text/html+mcp        text/html           │
+//! │     mcp-app                                                    │
 //! │   window.openai         postMessage          postMessage        │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```

@@ -65,7 +65,8 @@ pub enum AppCommand {
 
 impl AppCommand {
     /// Execute the app subcommand.
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
+        let _ = global_flags; // quiet mode conveyed via PMCP_QUIET env var
         match self {
             AppCommand::New { name, path } => create_app(name, path),
             AppCommand::Manifest { url, logo, output } => run_manifest(url, logo, output),
@@ -86,8 +87,11 @@ impl AppCommand {
 /// `Cargo.toml`, and `README.md`. Errors if the target directory already exists,
 /// matching `cargo new` semantics.
 fn create_app(name: String, path: Option<String>) -> Result<()> {
-    println!("\n{}", "Creating MCP Apps project".bright_cyan().bold());
-    println!("{}", "------------------------------------".bright_cyan());
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("\n{}", "Creating MCP Apps project".bright_cyan().bold());
+        println!("{}", "------------------------------------".bright_cyan());
+    }
 
     // Determine project directory
     let project_dir = if let Some(p) = path {
@@ -109,19 +113,23 @@ fn create_app(name: String, path: Option<String>) -> Result<()> {
     fs::create_dir_all(project_dir.join("widgets"))
         .context("Failed to create widgets/ directory")?;
 
-    println!("  {} Created project structure", "ok".green());
+    if not_quiet {
+        println!("  {} Created project structure", "ok".green());
+    }
 
     // Generate all template files
     templates::mcp_app::generate(&project_dir, &name)?;
 
-    println!(
-        "\n{} Created MCP Apps project '{}'",
-        "ok".green().bold(),
-        name
-    );
+    if not_quiet {
+        println!(
+            "\n{} Created MCP Apps project '{}'",
+            "ok".green().bold(),
+            name
+        );
 
-    // Print next steps
-    print_next_steps(&name);
+        // Print next steps
+        print_next_steps(&name);
+    }
 
     Ok(())
 }
@@ -131,8 +139,11 @@ fn create_app(name: String, path: Option<String>) -> Result<()> {
 /// Detects the MCP Apps project in the current directory, auto-discovers
 /// widgets, and writes `manifest.json` to the output directory.
 fn run_manifest(url: String, logo: Option<String>, output: String) -> Result<()> {
-    println!("\n{}", "Generating manifest".bright_cyan().bold());
-    println!("{}", "------------------------------------".bright_cyan());
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("\n{}", "Generating manifest".bright_cyan().bold());
+        println!("{}", "------------------------------------".bright_cyan());
+    }
 
     let cwd = std::env::current_dir().context("Failed to read current directory")?;
     let project = publishing::detect::detect_project(&cwd)?;
@@ -141,12 +152,14 @@ fn run_manifest(url: String, logo: Option<String>, output: String) -> Result<()>
     let json = publishing::manifest::generate_manifest(&project, &url, logo.as_deref())?;
     publishing::manifest::write_manifest(&output, &json)?;
 
-    println!("  {} Found {} widget(s)", "ok".green(), widget_count);
-    println!(
-        "\n{} Manifest written to {}/manifest.json",
-        "ok".green().bold(),
-        output
-    );
+    if not_quiet {
+        println!("  {} Found {} widget(s)", "ok".green(), widget_count);
+        println!(
+            "\n{} Manifest written to {}/manifest.json",
+            "ok".green().bold(),
+            output
+        );
+    }
 
     Ok(())
 }
@@ -157,8 +170,11 @@ fn run_manifest(url: String, logo: Option<String>, output: String) -> Result<()>
 /// page with the widget embedded in an iframe using a mock bridge, and
 /// writes it to the output directory.
 fn create_landing(widget: Option<String>, output: String) -> Result<()> {
-    println!("\n{}", "Generating landing page".bright_cyan().bold());
-    println!("{}", "------------------------------------".bright_cyan());
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("\n{}", "Generating landing page".bright_cyan().bold());
+        println!("{}", "------------------------------------".bright_cyan());
+    }
 
     let cwd = std::env::current_dir().context("Failed to read current directory")?;
     let project = publishing::detect::detect_project(&cwd)?;
@@ -166,11 +182,13 @@ fn create_landing(widget: Option<String>, output: String) -> Result<()> {
     let html = publishing::landing::generate_landing(&project, &mock_data, widget.as_deref())?;
     publishing::landing::write_landing(&output, &html)?;
 
-    println!(
-        "\n{} Landing page written to {}/landing.html",
-        "ok".green().bold(),
-        output
-    );
+    if not_quiet {
+        println!(
+            "\n{} Landing page written to {}/landing.html",
+            "ok".green().bold(),
+            output
+        );
+    }
 
     Ok(())
 }
@@ -185,8 +203,11 @@ fn build_all(
     widget: Option<String>,
     output: String,
 ) -> Result<()> {
-    println!("\n{}", "Building MCP App".bright_cyan().bold());
-    println!("{}", "------------------------------------".bright_cyan());
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("\n{}", "Building MCP App".bright_cyan().bold());
+        println!("{}", "------------------------------------".bright_cyan());
+    }
 
     let cwd = std::env::current_dir().context("Failed to read current directory")?;
     let project = publishing::detect::detect_project(&cwd)?;
@@ -201,13 +222,15 @@ fn build_all(
         publishing::landing::generate_landing(&project, &mock_data, widget.as_deref())?;
     publishing::landing::write_landing(&output, &landing_html)?;
 
-    println!(
-        "\n{} Built MCP App artifacts in {}/",
-        "ok".green().bold(),
-        output
-    );
-    println!("    - manifest.json");
-    println!("    - landing.html");
+    if not_quiet {
+        println!(
+            "\n{} Built MCP App artifacts in {}/",
+            "ok".green().bold(),
+            output
+        );
+        println!("    - manifest.json");
+        println!("    - landing.html");
+    }
 
     Ok(())
 }

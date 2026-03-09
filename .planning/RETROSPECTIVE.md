@@ -47,6 +47,45 @@
 
 ---
 
+## Milestone: v1.4 — Book & Course Update
+
+**Shipped:** 2026-02-28
+**Phases:** 5 | **Plans:** 10
+
+### What Was Built
+- Book Ch 14 (961 lines): complete load testing documentation from CLI through CI/CD
+- Book Ch 12.5 (1294 lines): full MCP Apps rewrite with WidgetDir, adapters, examples
+- Course Ch 18-03 (952 lines): hands-on load testing tutorial with progressive difficulty
+- Course Ch 20 (1646 lines across 4 files): MCP Apps sub-chapters with WidgetDir/mcpBridge paradigm
+- Course quizzes (ch18 new, ch20 refreshed) and AI-guided exercise for load testing
+
+### What Worked
+- **Documentation-only milestone was fast**: 1 day for 5 phases because no code compilation, no test suites, no CI — pure markdown content
+- **Parallel phase execution**: Phases 20/21 and 22/23 ran independently, maximizing throughput
+- **Source-faithful content**: Verification reports confirmed all CLI flags, API signatures, and struct fields matched actual Rust source code
+- **Cross-reference wiring**: Book→Course and Course→Book links established in both directions for both topics
+
+### What Was Inefficient
+- **Quiz/exercise embed gap**: Created ch18-operations.toml and loadtest.ai.toml but forgot to wire `{{#quiz}}` and `{{#exercise}}` preprocessor embeds — integration checker caught this as tech debt
+- **Stale file cleanup**: Old ch20-applications.md and its inbound link from ch19-exercises.md were not cleaned up during the Ch 20 rewrite
+- **ch18-operations.md stub**: The parent chapter for Ch 18 is a 1-line stub, limiting where quiz embeds can live
+
+### Patterns Established
+- **Documentation milestone pattern**: content writing → cross-reference wiring → quiz/exercise generation → SUMMARY.md update
+- **3-source requirements cross-reference**: VERIFICATION.md + SUMMARY.md frontmatter + REQUIREMENTS.md traceability table — catches discrepancies that any single source would miss
+
+### Key Lessons
+1. **Wire embed tags when creating content files** — creating a quiz TOML without a `{{#quiz}}` embed in a content page leaves the quiz unreachable from the learner flow
+2. **Clean up replaced files during rewrites** — when replacing ch20-applications.md with ch20-mcp-apps.md, also update all inbound links and delete the old file
+3. **Documentation milestones benefit from integration checking** — content cross-references are the "API contracts" of documentation; integration checker found 2 broken flows that phase-level verification missed
+
+### Cost Observations
+- Entire milestone completed in ~1 day
+- 10 plans across 5 phases, all executed by subagents
+- Documentation content is much faster than code: no compile cycles, no test failures, no CI
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -57,6 +96,7 @@
 | v1.1 | 5 | 10 | Composition over modification — TaskWorkflowPromptHandler wraps without changing |
 | v1.2 | 5 | 9 | GenericTaskStore<B> — domain logic once, backends are dumb KV |
 | v1.3 | 6 | 12 | Full-stack DX — Rust + TypeScript + HTML + CLI toolchain |
+| v1.4 | 5 | 10 | Documentation-only — content writing + cross-reference wiring |
 
 ### Cumulative Quality
 
@@ -66,6 +106,7 @@
 | v1.1 | 19/19 | n/a | Zero backward-compat issues |
 | v1.2 | 22/22 | n/a | 4 feature-flag combinations verified in CI |
 | v1.3 | 26/26 | 26/26 req, 24/26 integration | 20 E2E browser tests |
+| v1.4 | 19/19 | 19/19 req, 14/16 integration | 3-source cross-reference |
 
 ### Top Lessons (Verified Across Milestones)
 

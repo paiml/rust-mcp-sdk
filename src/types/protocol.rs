@@ -118,27 +118,6 @@ pub struct ToolAnnotations {
     // =========================================================================
     // PMCP Extensions for Type-Safe Composition
     // =========================================================================
-    /// JSON Schema for the tool's output type (PMCP extension).
-    ///
-    /// When present, code generators can create typed return structs instead of
-    /// falling back to `serde_json::Value`. This enables full type safety in
-    /// MCP server composition workflows.
-    ///
-    /// Example:
-    /// ```json
-    /// {
-    ///   "type": "object",
-    ///   "properties": {
-    ///     "columns": { "type": "array", "items": { "type": "string" } },
-    ///     "rows": { "type": "array" },
-    ///     "row_count": { "type": "integer" }
-    ///   },
-    ///   "required": ["columns", "rows", "row_count"]
-    /// }
-    /// ```
-    #[serde(rename = "pmcp:outputSchema", skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<Value>,
-
     /// Name of the output type for code generation (PMCP extension).
     ///
     /// Used by code generators to name the generated struct.
@@ -199,36 +178,36 @@ impl ToolAnnotations {
         self
     }
 
-    /// Set output schema (PMCP extension for type-safe composition).
+    /// Set output type name (PMCP extension for code generation).
     ///
-    /// This enables code generators to create typed return structs for
-    /// server-to-server composition. The `type_name` is used as the
-    /// generated struct name (e.g., `"QueryResult"` becomes `struct QueryResult`).
+    /// Used by code generators to name the generated struct for the tool's
+    /// output type (e.g., `"QueryResult"` becomes `struct QueryResult`).
+    ///
+    /// The actual output schema is set on [`ToolInfo::with_output_schema`]
+    /// as a top-level field (MCP spec 2025-06-18).
     ///
     /// # Example
     ///
     /// ```rust
     /// use pmcp::types::ToolAnnotations;
-    /// use serde_json::json;
     ///
     /// let annotations = ToolAnnotations::new()
     ///     .with_read_only(true)
-    ///     .with_output_schema(
-    ///         json!({
-    ///             "type": "object",
-    ///             "properties": {
-    ///                 "count": { "type": "integer" },
-    ///                 "items": { "type": "array" }
-    ///             },
-    ///             "required": ["count", "items"]
-    ///         }),
-    ///         "SearchResult"
-    ///     );
+    ///     .with_output_type_name("SearchResult");
     /// ```
-    pub fn with_output_schema(mut self, schema: Value, type_name: impl Into<String>) -> Self {
-        self.output_schema = Some(schema);
-        self.output_type_name = Some(type_name.into());
+    pub fn with_output_type_name(mut self, name: impl Into<String>) -> Self {
+        self.output_type_name = Some(name.into());
         self
+    }
+
+    /// Returns `true` if all fields are `None` (no meaningful content).
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.read_only_hint.is_none()
+            && self.destructive_hint.is_none()
+            && self.idempotent_hint.is_none()
+            && self.open_world_hint.is_none()
+            && self.output_type_name.is_none()
     }
 }
 
@@ -244,11 +223,18 @@ pub struct ToolInfo {
     pub description: Option<String>,
     /// JSON Schema for tool parameters
     pub input_schema: Value,
+    /// JSON Schema for the tool's output type (MCP spec 2025-06-18).
+    ///
+    /// When present, clients can validate and type-check the tool's structured
+    /// output. Code generators can create typed return structs instead of
+    /// falling back to `serde_json::Value`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     /// Tool annotations (hints and PMCP extensions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
     /// Optional metadata (e.g., for UI resource association in MCP Apps Extension)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none", default)]
     #[allow(clippy::pub_underscore_fields)] // _meta is part of MCP protocol spec
     pub _meta: Option<serde_json::Map<String, Value>>,
     /// Execution metadata declaring task support level (experimental MCP Tasks).
@@ -267,16 +253,17 @@ impl ToolInfo {
             name: name.into(),
             description,
             input_schema,
+            output_schema: None,
             annotations: None,
             _meta: None,
             execution: None,
         }
     }
 
-    /// Create a new `ToolInfo` with annotations (including PMCP output schema).
+    /// Create a new `ToolInfo` with annotations.
     ///
-    /// Use this constructor when your tool has output type information for
-    /// type-safe composition workflows.
+    /// Use this constructor when your tool has annotation hints. For output
+    /// schema, chain [`ToolInfo::with_output_schema`] on the result.
     ///
     /// # Example
     ///
@@ -286,22 +273,14 @@ impl ToolInfo {
     ///
     /// let annotations = ToolAnnotations::new()
     ///     .with_read_only(true)
-    ///     .with_output_schema(
-    ///         json!({
-    ///             "type": "object",
-    ///             "properties": {
-    ///                 "result": { "type": "string" }
-    ///             }
-    ///         }),
-    ///         "MyResult"
-    ///     );
+    ///     .with_output_type_name("MyResult");
     ///
     /// let tool = ToolInfo::with_annotations(
     ///     "my_tool",
     ///     Some("My tool description".to_string()),
     ///     json!({"type": "object"}),
     ///     annotations,
-    /// );
+    /// ).with_output_schema(json!({"type": "object", "properties": {"result": {"type": "string"}}}));
     /// ```
     pub fn with_annotations(
         name: impl Into<String>,
@@ -313,6 +292,7 @@ impl ToolInfo {
             name: name.into(),
             description,
             input_schema,
+            output_schema: None,
             annotations: Some(annotations),
             _meta: None,
             execution: None,
@@ -320,31 +300,135 @@ impl ToolInfo {
     }
 
     /// Create a new `ToolInfo` with UI resource metadata.
+    ///
+    /// Produces nested `_meta` format compatible with both MCP standard and `ChatGPT`:
+    /// - `_meta.ui.resourceUri` - MCP standard nested format
+    /// - `_meta["openai/outputTemplate"]` - `ChatGPT` alias for the same URI
     pub fn with_ui(
         name: impl Into<String>,
         description: Option<String>,
         input_schema: Value,
         ui_resource_uri: impl Into<String>,
     ) -> Self {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "ui/resourceUri".to_string(),
-            Value::String(ui_resource_uri.into()),
-        );
+        let uri: String = ui_resource_uri.into();
+        let meta = crate::types::ui::ToolUIMetadata::build_meta_map(&uri);
 
         Self {
             name: name.into(),
             description,
             input_schema,
+            output_schema: None,
             annotations: None,
             _meta: Some(meta),
             execution: None,
         }
     }
+
+    /// Set the output schema for this tool (MCP spec 2025-06-18).
+    ///
+    /// The output schema declares the JSON Schema that the tool's structured
+    /// output conforms to, enabling clients to validate and type-check results.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pmcp::types::ToolInfo;
+    /// use serde_json::json;
+    ///
+    /// let tool = ToolInfo::new("my_tool", None, json!({"type": "object"}))
+    ///     .with_output_schema(json!({
+    ///         "type": "object",
+    ///         "properties": { "count": { "type": "integer" } }
+    ///     }));
+    /// ```
+    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
+    /// Add widget metadata, deep-merging into existing `_meta`.
+    ///
+    /// This merges `WidgetMeta::to_meta_map()` into the tool's `_meta`,
+    /// correctly combining nested `ui` objects so that `ui.resourceUri`
+    /// and widget fields like `ui.prefersBorder` coexist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pmcp::types::ToolInfo;
+    /// use pmcp::types::mcp_apps::WidgetMeta;
+    /// use serde_json::json;
+    ///
+    /// let tool = ToolInfo::with_ui("my_tool", None, json!({"type": "object"}), "ui://w/app.html")
+    ///     .with_widget_meta(WidgetMeta::new().prefers_border(true));
+    /// // _meta.ui = { "resourceUri": "ui://w/app.html", "prefersBorder": true }
+    /// ```
+    #[cfg(feature = "mcp-apps")]
+    #[allow(clippy::used_underscore_binding, clippy::needless_pass_by_value)]
+    pub fn with_widget_meta(mut self, widget: crate::types::mcp_apps::WidgetMeta) -> Self {
+        let meta = self._meta.get_or_insert_with(serde_json::Map::new);
+        let overlay = widget.to_meta_map();
+        crate::types::ui::deep_merge(meta, overlay);
+        self
+    }
+
+    /// Add a single key-value pair to `_meta`, merging with existing entries.
+    ///
+    /// If the key already exists and both values are objects, they are
+    /// deep-merged. Otherwise the new value replaces the old (last-in wins).
+    ///
+    /// This is the composable counterpart to [`ToolInfo::with_ui`] --
+    /// multiple calls can be chained without overwriting each other's keys.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pmcp::types::ToolInfo;
+    /// use serde_json::json;
+    ///
+    /// let tool = ToolInfo::new("my_tool", None, json!({"type": "object"}))
+    ///     .with_meta_entry("ui", json!({"resourceUri": "ui://x"}))
+    ///     .with_meta_entry("execution", json!({"mode": "async"}));
+    /// ```
+    #[allow(clippy::used_underscore_binding)]
+    pub fn with_meta_entry(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        let meta = self._meta.get_or_insert_with(serde_json::Map::new);
+        let mut overlay = serde_json::Map::with_capacity(1);
+        overlay.insert(key.into(), value);
+        crate::types::ui::deep_merge(meta, overlay);
+        self
+    }
+
+    /// Return a reference to `_meta` if this tool has widget metadata.
+    ///
+    /// Single-pass check: returns `Some` only when `_meta` contains a
+    /// recognised widget key, `None` otherwise.
+    #[allow(clippy::used_underscore_binding)]
+    pub fn widget_meta(&self) -> Option<&serde_json::Map<String, Value>> {
+        self._meta.as_ref().filter(|meta| {
+            meta.contains_key("openai/outputTemplate")
+                || meta.contains_key("ui/resourceUri")
+                || meta.get("ui").and_then(|v| v.get("resourceUri")).is_some()
+        })
+    }
 }
 
 /// List tools response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::ListToolsResult;
+///
+/// let result = ListToolsResult::new(vec![]);
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListToolsResult {
     /// Available tools
@@ -352,6 +436,22 @@ pub struct ListToolsResult {
     /// Pagination cursor for next page
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+}
+
+impl ListToolsResult {
+    /// Create a new list tools result.
+    pub fn new(tools: Vec<ToolInfo>) -> Self {
+        Self {
+            tools,
+            next_cursor: None,
+        }
+    }
+
+    /// Set the pagination cursor for the next page.
+    pub fn with_next_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.next_cursor = Some(cursor.into());
+        self
+    }
 }
 
 /// Tool call request.
@@ -485,6 +585,21 @@ impl CallToolResult {
         self._meta = Some(meta);
         self
     }
+
+    /// Enrich with widget metadata from a [`ToolInfo`] if it has widget meta.
+    ///
+    /// Sets `structured_content` and `_meta` so widgets can access tool
+    /// output data. No-op for non-widget tools. Only clones `_meta` when
+    /// the tool actually has widget metadata.
+    pub fn with_widget_enrichment(self, info: &ToolInfo, structured_value: Value) -> Self {
+        if let Some(meta) = info.widget_meta() {
+            let filtered = crate::types::ui::filter_meta_by_prefix(meta, "openai/toolInvocation/");
+            self.with_structured_content(structured_value)
+                .with_meta(filtered)
+        } else {
+            self
+        }
+    }
 }
 
 /// Message content type alias.
@@ -519,6 +634,9 @@ pub enum Content {
         /// MIME type
         #[serde(skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+        /// Optional metadata for resource content (e.g., widget metadata for MCP Apps)
+        #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
     },
 }
 
@@ -620,7 +738,21 @@ pub struct PromptArgument {
 }
 
 /// List prompts response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::ListPromptsResult;
+///
+/// let result = ListPromptsResult::new(vec![]);
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListPromptsResult {
     /// Available prompts
@@ -628,6 +760,22 @@ pub struct ListPromptsResult {
     /// Pagination cursor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+}
+
+impl ListPromptsResult {
+    /// Create a new list prompts result.
+    pub fn new(prompts: Vec<PromptInfo>) -> Self {
+        Self {
+            prompts,
+            next_cursor: None,
+        }
+    }
+
+    /// Set the pagination cursor for the next page.
+    pub fn with_next_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.next_cursor = Some(cursor.into());
+        self
+    }
 }
 
 /// Get prompt request.
@@ -649,7 +797,21 @@ pub struct GetPromptRequest {
 pub type GetPromptParams = GetPromptRequest;
 
 /// Get prompt result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::GetPromptResult;
+///
+/// let result = GetPromptResult::new(vec![], Some("A prompt".to_string()));
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetPromptResult {
     /// Prompt description
@@ -667,6 +829,24 @@ pub struct GetPromptResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[allow(clippy::pub_underscore_fields)]
     pub _meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl GetPromptResult {
+    /// Create a new get prompt result.
+    pub fn new(messages: Vec<PromptMessage>, description: Option<String>) -> Self {
+        Self {
+            description,
+            messages,
+            _meta: None,
+        }
+    }
+
+    /// Add metadata to the prompt result.
+    #[allow(clippy::used_underscore_binding)] // _meta is valid MCP protocol field name
+    pub fn with_meta(mut self, meta: serde_json::Map<String, serde_json::Value>) -> Self {
+        self._meta = Some(meta);
+        self
+    }
 }
 
 /// Message in a prompt.
@@ -727,10 +907,27 @@ pub struct ResourceInfo {
     /// MIME type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Optional metadata (e.g., widget descriptor keys for `ChatGPT` MCP Apps)
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// List resources response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::ListResourcesResult;
+///
+/// let result = ListResourcesResult::new(vec![]);
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResourcesResult {
     /// Available resources
@@ -738,6 +935,22 @@ pub struct ListResourcesResult {
     /// Pagination cursor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+}
+
+impl ListResourcesResult {
+    /// Create a new list resources result.
+    pub fn new(resources: Vec<ResourceInfo>) -> Self {
+        Self {
+            resources,
+            next_cursor: None,
+        }
+    }
+
+    /// Set the pagination cursor for the next page.
+    pub fn with_next_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.next_cursor = Some(cursor.into());
+        self
+    }
 }
 
 /// Read resource request.
@@ -781,7 +994,21 @@ pub struct ResourceTemplate {
 }
 
 /// List resource templates result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::ListResourceTemplatesResult;
+///
+/// let result = ListResourceTemplatesResult::new(vec![]);
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResourceTemplatesResult {
     /// Available resource templates
@@ -789,6 +1016,22 @@ pub struct ListResourceTemplatesResult {
     /// Pagination cursor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+}
+
+impl ListResourceTemplatesResult {
+    /// Create a new list resource templates result.
+    pub fn new(resource_templates: Vec<ResourceTemplate>) -> Self {
+        Self {
+            resource_templates,
+            next_cursor: None,
+        }
+    }
+
+    /// Set the pagination cursor for the next page.
+    pub fn with_next_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.next_cursor = Some(cursor.into());
+        self
+    }
 }
 
 /// Subscribe to resource request.
@@ -884,11 +1127,32 @@ pub enum LoggingLevel {
 }
 
 /// Read resource result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Backward Compatibility
+///
+/// This struct is `#[non_exhaustive]`. Use the constructor to remain
+/// forward-compatible:
+///
+/// ```rust
+/// use pmcp::types::ReadResourceResult;
+///
+/// let result = ReadResourceResult::new(vec![]);
+/// ```
+///
+/// Within the same crate, struct literal syntax with `..Default::default()` also works.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadResourceResult {
     /// Resource contents
     pub contents: Vec<Content>,
+}
+
+impl ReadResourceResult {
+    /// Create a new read resource result.
+    pub fn new(contents: Vec<Content>) -> Self {
+        Self { contents }
+    }
 }
 
 /// Model preferences for sampling.
@@ -1373,6 +1637,7 @@ mod tests {
             name: "test.txt".to_string(),
             description: Some("Test file".to_string()),
             mime_type: Some("text/plain".to_string()),
+            meta: None,
         };
 
         let json = serde_json::to_value(&resource).unwrap();
@@ -1693,6 +1958,37 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_info_with_ui_nested_format() {
+        let tool = ToolInfo::with_ui("my_tool", None, json!({"type": "object"}), "ui://w/x.html");
+
+        let meta = tool._meta.as_ref().unwrap();
+
+        // Must use nested format: {"ui": {"resourceUri": "..."}}
+        let ui_obj = meta.get("ui").expect("must have nested 'ui' key");
+        assert_eq!(ui_obj["resourceUri"], "ui://w/x.html");
+
+        // Must also have legacy flat "ui/resourceUri" key for backward compat
+        assert_eq!(
+            meta.get("ui/resourceUri"),
+            Some(&json!("ui://w/x.html")),
+            "must have legacy flat ui/resourceUri key"
+        );
+    }
+
+    #[test]
+    fn test_tool_info_with_ui_openai_output_template() {
+        let tool = ToolInfo::with_ui("my_tool", None, json!({"type": "object"}), "ui://w/x.html");
+
+        let meta = tool._meta.as_ref().unwrap();
+
+        // Must have openai/outputTemplate as ChatGPT alias
+        assert_eq!(
+            meta.get("openai/outputTemplate").unwrap(),
+            &serde_json::Value::String("ui://w/x.html".to_string())
+        );
+    }
+
+    #[test]
     fn get_prompt_result_serde_round_trip_with_meta() {
         let mut meta = serde_json::Map::new();
         meta.insert(
@@ -1726,5 +2022,178 @@ mod tests {
             rt_meta.get("taskId").unwrap(),
             &serde_json::Value::String("task-456".to_string())
         );
+    }
+
+    #[test]
+    fn test_with_meta_entry_on_empty_meta() {
+        let tool = ToolInfo::new("t", None, json!({"type": "object"}))
+            .with_meta_entry("ui", json!({"resourceUri": "ui://x"}));
+        let meta = tool._meta.unwrap();
+        assert_eq!(meta["ui"]["resourceUri"], "ui://x");
+    }
+
+    #[test]
+    fn test_with_meta_entry_merges_with_existing() {
+        let mut initial = serde_json::Map::new();
+        initial.insert("ui".into(), json!({"resourceUri": "ui://x"}));
+        let tool = ToolInfo::new("t", None, json!({"type": "object"}));
+        let tool = ToolInfo {
+            _meta: Some(initial),
+            ..tool
+        };
+        let tool = tool.with_meta_entry("execution", json!({"mode": "async"}));
+        let meta = tool._meta.unwrap();
+        assert_eq!(meta["ui"]["resourceUri"], "ui://x");
+        assert_eq!(meta["execution"]["mode"], "async");
+    }
+
+    #[test]
+    fn test_with_meta_entry_deep_merges_nested() {
+        let mut initial = serde_json::Map::new();
+        initial.insert("ui".into(), json!({"resourceUri": "ui://x"}));
+        let tool = ToolInfo::new("t", None, json!({"type": "object"}));
+        let tool = ToolInfo {
+            _meta: Some(initial),
+            ..tool
+        };
+        let tool = tool.with_meta_entry("ui", json!({"prefersBorder": true}));
+        let meta = tool._meta.unwrap();
+        assert_eq!(meta["ui"]["resourceUri"], "ui://x");
+        assert_eq!(meta["ui"]["prefersBorder"], true);
+    }
+
+    #[test]
+    fn test_with_meta_entry_chained() {
+        let tool = ToolInfo::new("t", None, json!({"type": "object"}))
+            .with_meta_entry("a", json!(1))
+            .with_meta_entry("b", json!(2));
+        let meta = tool._meta.unwrap();
+        assert_eq!(meta["a"], 1);
+        assert_eq!(meta["b"], 2);
+    }
+
+    #[test]
+    fn test_existing_with_meta_replace_all_unchanged() {
+        // Ensure the existing with_ui constructor still works (replace-all semantics)
+        let tool = ToolInfo::with_ui("t", None, json!({"type": "object"}), "ui://y");
+        let meta = tool._meta.unwrap();
+        assert_eq!(meta["ui"]["resourceUri"], "ui://y");
+        assert!(meta.contains_key("openai/outputTemplate"));
+    }
+
+    #[test]
+    #[cfg(feature = "mcp-apps")]
+    fn test_with_widget_meta_merges_with_ui() {
+        use crate::types::mcp_apps::WidgetMeta;
+
+        let tool = ToolInfo::with_ui("t", None, json!({"type": "object"}), "ui://w/app.html")
+            .with_widget_meta(WidgetMeta::new().prefers_border(true).domain("x.com"));
+        let meta = tool._meta.unwrap();
+
+        // URI keys preserved from with_ui
+        assert_eq!(meta["ui"]["resourceUri"], "ui://w/app.html");
+        assert_eq!(meta["ui/resourceUri"], "ui://w/app.html");
+        assert_eq!(meta["openai/outputTemplate"], "ui://w/app.html");
+
+        // Widget fields deep-merged into the same ui object
+        assert_eq!(meta["ui"]["prefersBorder"], true);
+        assert_eq!(meta["ui"]["domain"], "x.com");
+
+        // Flat widget keys also present
+        assert_eq!(meta["openai/widgetPrefersBorder"], true);
+        assert_eq!(meta["openai/widgetDomain"], "x.com");
+    }
+
+    #[test]
+    #[cfg(feature = "mcp-apps")]
+    fn test_with_widget_meta_on_empty_meta() {
+        use crate::types::mcp_apps::WidgetMeta;
+
+        let tool = ToolInfo::new("t", None, json!({"type": "object"})).with_widget_meta(
+            WidgetMeta::new()
+                .resource_uri("ui://w/app.html")
+                .prefers_border(true),
+        );
+        let meta = tool._meta.unwrap();
+
+        // All keys produced from WidgetMeta alone
+        assert_eq!(meta["ui"]["resourceUri"], "ui://w/app.html");
+        assert_eq!(meta["ui"]["prefersBorder"], true);
+        assert_eq!(meta["ui/resourceUri"], "ui://w/app.html");
+        assert_eq!(meta["openai/outputTemplate"], "ui://w/app.html");
+        assert_eq!(meta["openai/widgetPrefersBorder"], true);
+    }
+
+    #[test]
+    fn test_content_resource_meta_serialization() {
+        let mut meta_map = serde_json::Map::new();
+        meta_map.insert(
+            "widgetDescription".to_string(),
+            serde_json::Value::String("A chess board widget".to_string()),
+        );
+        let content = Content::Resource {
+            uri: "ui://chess/board".to_string(),
+            text: Some("<html>chess</html>".to_string()),
+            mime_type: Some("text/html;profile=mcp-app".to_string()),
+            meta: Some(meta_map),
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["_meta"]["widgetDescription"], "A chess board widget");
+        assert_eq!(json["uri"], "ui://chess/board");
+    }
+
+    #[test]
+    fn test_content_resource_no_meta_serialization() {
+        let content = Content::Resource {
+            uri: "file:///test.txt".to_string(),
+            text: Some("hello".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            meta: None,
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.get("_meta").is_none());
+        assert_eq!(json["uri"], "file:///test.txt");
+    }
+
+    #[test]
+    fn test_content_resource_meta_deserialization() {
+        let json = json!({
+            "type": "resource",
+            "uri": "ui://widget",
+            "text": "<html></html>",
+            "mimeType": "text/html",
+            "_meta": {
+                "widgetDescription": "test widget",
+                "csp": { "connectDomains": ["https://api.example.com"] }
+            }
+        });
+        let content: Content = serde_json::from_value(json).unwrap();
+        match content {
+            Content::Resource { uri, meta, .. } => {
+                assert_eq!(uri, "ui://widget");
+                let meta = meta.unwrap();
+                assert_eq!(meta["widgetDescription"], "test widget");
+                assert!(meta.contains_key("csp"));
+            },
+            _ => panic!("Expected Content::Resource"),
+        }
+    }
+
+    #[test]
+    fn test_content_resource_backward_compat() {
+        let json = json!({
+            "type": "resource",
+            "uri": "file:///old.txt",
+            "text": "old content",
+            "mimeType": "text/plain"
+        });
+        let content: Content = serde_json::from_value(json).unwrap();
+        match content {
+            Content::Resource { uri, meta, .. } => {
+                assert_eq!(uri, "file:///old.txt");
+                assert!(meta.is_none());
+            },
+            _ => panic!("Expected Content::Resource"),
+        }
     }
 }

@@ -1,8 +1,11 @@
 //! Structured Output Schema Example
 //!
 //! This example demonstrates how to create MCP tools with structured output schemas.
-//! It shows how to define tools that return well-structured data with strong typing,
-//! similar to TypeScript SDK's mcpServerOutputSchema.ts example.
+//! Per MCP spec 2025-06-18, `outputSchema` is a top-level field on `ToolInfo`
+//! (sibling to `inputSchema`), enabling type-safe server composition.
+//!
+//! For typed tools, use `TypedToolWithOutput` which automatically generates
+//! the top-level `outputSchema` from Rust types deriving `JsonSchema`.
 //!
 //! Run with: cargo run --example 48_structured_output_schema --features full
 

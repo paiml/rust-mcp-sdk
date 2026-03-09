@@ -77,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         uri,
                         text: Some(text),
                         ref mime_type,
+                        ..
                     } => {
                         println!("   URI: {}", uri);
                         if let Some(mime) = mime_type {
@@ -100,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         uri,
                         text: None,
                         mime_type,
+                        ..
                     } => {
                         println!("   URI: {} (no text content)", uri);
                         if let Some(mime) = mime_type {

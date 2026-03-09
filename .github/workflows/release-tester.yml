@@ -38,7 +38,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build binary
-        run: cargo build --release --package mcp-server-tester --target ${{ matrix.target }}
+        run: cargo build --release --package mcp-tester --target ${{ matrix.target }}
 
       - name: Prepare artifact for upload
         shell: bash

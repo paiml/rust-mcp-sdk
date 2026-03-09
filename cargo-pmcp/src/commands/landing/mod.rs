@@ -71,7 +71,12 @@ pub enum LandingCommand {
 }
 
 impl LandingCommand {
-    pub async fn execute(self, project_root: PathBuf) -> Result<()> {
+    pub async fn execute(
+        self,
+        project_root: PathBuf,
+        global_flags: &crate::commands::GlobalFlags,
+    ) -> Result<()> {
+        let _ = global_flags; // quiet handled via PMCP_QUIET in sub-modules
         match self {
             LandingCommand::Init {
                 template,
@@ -85,8 +90,10 @@ impl LandingCommand {
 
             LandingCommand::Build { dir, output: _ } => {
                 // TODO: Implement in P1
-                println!("🚧 Build command coming in Phase 1!");
-                println!("   For now, use: cd {} && npm run build", dir.display());
+                if std::env::var("PMCP_QUIET").is_err() {
+                    println!("Build command coming in Phase 1!");
+                    println!("   For now, use: cd {} && npm run build", dir.display());
+                }
                 Ok(())
             },
 

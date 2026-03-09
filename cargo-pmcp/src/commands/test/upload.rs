@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::PathBuf;
 
+use crate::commands::GlobalFlags;
 use crate::deployment::targets::pmcp_run::{auth, graphql};
 
 /// Upload test scenarios to pmcp.run for scheduled testing
@@ -12,15 +13,18 @@ pub async fn execute(
     paths: Vec<PathBuf>,
     name: Option<String>,
     description: Option<String>,
+    global_flags: &GlobalFlags,
 ) -> Result<()> {
-    println!(
-        "\n{}",
-        "Uploading test scenarios to pmcp.run".bright_cyan().bold()
-    );
-    println!(
-        "{}",
-        "─────────────────────────────────────────".bright_cyan()
-    );
+    if global_flags.should_output() {
+        println!(
+            "\n{}",
+            "Uploading test scenarios to pmcp.run".bright_cyan().bold()
+        );
+        println!(
+            "{}",
+            "─────────────────────────────────────────".bright_cyan()
+        );
+    }
 
     // Get credentials
     let credentials = auth::get_credentials().await?;
@@ -51,12 +55,14 @@ pub async fn execute(
         anyhow::bail!("No scenario files found");
     }
 
-    println!(
-        "  {} Found {} scenario file(s)",
-        "→".blue(),
-        scenario_files.len()
-    );
-    println!("  {} Server ID: {}", "→".blue(), server_id);
+    if global_flags.should_output() {
+        println!(
+            "  {} Found {} scenario file(s)",
+            "→".blue(),
+            scenario_files.len()
+        );
+        println!("  {} Server ID: {}", "→".blue(), server_id);
+    }
 
     let mut uploaded = 0;
     let mut failed = 0;
@@ -70,7 +76,9 @@ pub async fn execute(
 
         let scenario_name = name.clone().unwrap_or(file_name);
 
-        println!("\n  Uploading: {}", file_path.display());
+        if global_flags.should_output() {
+            println!("\n  Uploading: {}", file_path.display());
+        }
 
         // Read scenario content
         let content = std::fs::read_to_string(&file_path)
@@ -94,12 +102,14 @@ pub async fn execute(
         .await
         {
             Ok(result) => {
-                println!(
-                    "    {} Uploaded as '{}' (v{})",
-                    "✓".green(),
-                    scenario_name,
-                    result.version
-                );
+                if global_flags.should_output() {
+                    println!(
+                        "    {} Uploaded as '{}' (v{})",
+                        "✓".green(),
+                        scenario_name,
+                        result.version
+                    );
+                }
                 uploaded += 1;
             },
             Err(e) => {
@@ -109,42 +119,44 @@ pub async fn execute(
         }
     }
 
-    println!();
-    println!(
-        "{}",
-        "═════════════════════════════════════════".bright_cyan()
-    );
-
-    if failed == 0 {
-        println!(
-            "{} Uploaded {} scenario(s) successfully!",
-            "✓".green().bold(),
-            uploaded
-        );
+    if global_flags.should_output() {
         println!();
-        println!("{}", "Next steps:".bright_white().bold());
         println!(
-            "  - View scenarios at: https://pmcp.run/servers/{}",
-            server_id
+            "{}",
+            "═════════════════════════════════════════".bright_cyan()
         );
-        println!("  - Configure scheduled testing in the dashboard");
+
+        if failed == 0 {
+            println!(
+                "{} Uploaded {} scenario(s) successfully!",
+                "✓".green().bold(),
+                uploaded
+            );
+            println!();
+            println!("{}", "Next steps:".bright_white().bold());
+            println!(
+                "  - View scenarios at: https://pmcp.run/servers/{}",
+                server_id
+            );
+            println!("  - Configure scheduled testing in the dashboard");
+            println!(
+                "  - Or run tests manually: cargo pmcp test remote --server {}",
+                server_id
+            );
+        } else {
+            println!(
+                "{} Uploaded {} scenario(s), {} failed",
+                "⚠".yellow().bold(),
+                uploaded,
+                failed
+            );
+        }
+
         println!(
-            "  - Or run tests manually: cargo pmcp test remote --server-id {}",
-            server_id
-        );
-    } else {
-        println!(
-            "{} Uploaded {} scenario(s), {} failed",
-            "⚠".yellow().bold(),
-            uploaded,
-            failed
+            "{}",
+            "═════════════════════════════════════════".bright_cyan()
         );
     }
-
-    println!(
-        "{}",
-        "═════════════════════════════════════════".bright_cyan()
-    );
 
     if failed > 0 && uploaded == 0 {
         anyhow::bail!("All scenario uploads failed");

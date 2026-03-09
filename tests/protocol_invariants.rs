@@ -123,6 +123,7 @@ prop_compose! {
                 uri,
                 text: if text.is_empty() { None } else { Some(text) },
                 mime_type: if choice % 2 == 0 { Some(mime_type.to_string()) } else { None },
+                meta: None,
             },
         }
     }

@@ -61,11 +61,9 @@ impl ResourceHandler for FileSystemResources {
         _extra: pmcp::RequestHandlerExtra,
     ) -> pmcp::Result<ReadResourceResult> {
         match self.files.get(uri) {
-            Some(content) => Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: content.clone(),
-                }],
-            }),
+            Some(content) => Ok(ReadResourceResult::new(vec![Content::Text {
+                text: content.clone(),
+            }])),
             None => Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
                 format!("Resource not found: {}", uri),
@@ -86,13 +84,11 @@ impl ResourceHandler for FileSystemResources {
                 name: uri.rsplit('/').next().unwrap_or("").to_string(),
                 description: Some(format!("Mock file at {}", uri)),
                 mime_type: Some(guess_mime_type(uri)),
+                meta: None,
             })
             .collect();
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(resources))
     }
 }
 
@@ -122,23 +118,19 @@ impl ResourceHandler for TemplateResources {
         if uri.starts_with("template://greeting/") {
             let name = uri.strip_prefix("template://greeting/").unwrap_or("World");
 
-            Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: format!("Hello, {}! Welcome to MCP resources.", name),
-                }],
-            })
+            Ok(ReadResourceResult::new(vec![Content::Text {
+                text: format!("Hello, {}! Welcome to MCP resources.", name),
+            }]))
         } else if uri.starts_with("template://time/") {
             let timezone = uri.strip_prefix("template://time/").unwrap_or("UTC");
 
-            Ok(ReadResourceResult {
-                contents: vec![Content::Text {
-                    text: format!(
-                        "Current time in {}: {}",
-                        timezone,
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-                    ),
-                }],
-            })
+            Ok(ReadResourceResult::new(vec![Content::Text {
+                text: format!(
+                    "Current time in {}: {}",
+                    timezone,
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                ),
+            }]))
         } else {
             Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
@@ -152,23 +144,22 @@ impl ResourceHandler for TemplateResources {
         _cursor: Option<String>,
         _extra: pmcp::RequestHandlerExtra,
     ) -> pmcp::Result<ListResourcesResult> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                ResourceInfo {
-                    uri: "template://greeting/{name}".to_string(),
-                    name: "Greeting Template".to_string(),
-                    description: Some("Personalized greeting message".to_string()),
-                    mime_type: Some("text/plain".to_string()),
-                },
-                ResourceInfo {
-                    uri: "template://time/{timezone}".to_string(),
-                    name: "Time Template".to_string(),
-                    description: Some("Current time in specified timezone".to_string()),
-                    mime_type: Some("text/plain".to_string()),
-                },
-            ],
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(vec![
+            ResourceInfo {
+                uri: "template://greeting/{name}".to_string(),
+                name: "Greeting Template".to_string(),
+                description: Some("Personalized greeting message".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                meta: None,
+            },
+            ResourceInfo {
+                uri: "template://time/{timezone}".to_string(),
+                name: "Time Template".to_string(),
+                description: Some("Current time in specified timezone".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                meta: None,
+            },
+        ]))
     }
 }
 
@@ -214,10 +205,7 @@ impl ResourceHandler for CombinedResources {
                 // Then list template resources
                 self.templates.list(None, _extra).await
             },
-            _ => Ok(ListResourcesResult {
-                resources: vec![],
-                next_cursor: None,
-            }),
+            _ => Ok(ListResourcesResult::new(vec![])),
         }
     }
 }

@@ -10,7 +10,7 @@ use crate::types::{
     Implementation, InitializeResult, JSONRPCResponse, ListPromptsRequest, ListPromptsResult,
     ListResourceTemplatesRequest, ListResourceTemplatesResult, ListResourcesRequest,
     ListResourcesResult, ListToolsRequest, ListToolsResult, Notification, ProtocolVersion,
-    ReadResourceRequest, Request, RequestId, ServerCapabilities, ServerNotification,
+    ReadResourceRequest, Request, RequestId, ServerCapabilities, ServerNotification, ToolInfo,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use async_trait::async_trait;
@@ -276,6 +276,9 @@ pub struct Server {
     info: Implementation,
     capabilities: ServerCapabilities,
     tools: HashMap<String, Arc<dyn ToolHandler>>,
+    tool_infos: HashMap<String, ToolInfo>,
+    /// Cached URI-to-tool-meta index for widget resource `_meta` propagation.
+    uri_to_tool_meta: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
     resources: Option<Arc<dyn ResourceHandler>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
@@ -964,23 +967,7 @@ impl Server {
     }
 
     fn handle_list_tools(&self, _req: ListToolsRequest) -> Result<Value> {
-        let tools = self
-            .tools
-            .iter()
-            .map(|(name, handler)| {
-                // Try to get metadata from the handler, otherwise use defaults
-                handler.metadata().unwrap_or_else(|| {
-                    crate::types::ToolInfo::new(
-                        name.clone(),
-                        None,
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {}
-                        }),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        let tools: Vec<ToolInfo> = self.tool_infos.values().cloned().collect();
 
         Ok(serde_json::to_value(ListToolsResult {
             tools,
@@ -1119,13 +1106,15 @@ impl Server {
                 Err(e)
             },
         }?;
-        Ok(serde_json::to_value(CallToolResult {
-            content: vec![crate::types::Content::Text {
-                text: result.to_string(),
-            }],
-            is_error: false,
-            ..Default::default()
-        })?)
+        // Build CallToolResult, adding structured_content for widget tools
+        let text = result.to_string();
+        let mut call_result = CallToolResult::new(vec![crate::types::Content::Text { text }]);
+
+        if let Some(info) = self.tool_infos.get(&req.name) {
+            call_result = call_result.with_widget_enrichment(info, result);
+        }
+
+        Ok(serde_json::to_value(call_result)?)
     }
 
     fn handle_list_prompts(&self, _req: ListPromptsRequest) -> Result<Value> {
@@ -1230,7 +1219,7 @@ impl Server {
                 cancellation_token,
             )
             .with_auth_context(auth_context);
-            let result = match handler.list(req.cursor, extra).await {
+            let mut result = match handler.list(req.cursor, extra).await {
                 Ok(v) => {
                     self.cancellation_manager
                         .remove_token(&request_id_str)
@@ -1244,6 +1233,15 @@ impl Server {
                     Err(e)
                 },
             }?;
+            // Enrich ResourceInfo with tool _meta for widget resources
+            if !self.uri_to_tool_meta.is_empty() {
+                for resource in &mut result.resources {
+                    if let Some(tool_meta) = self.uri_to_tool_meta.get(&resource.uri) {
+                        let meta = resource.meta.get_or_insert_with(serde_json::Map::new);
+                        crate::types::ui::deep_merge(meta, tool_meta.clone());
+                    }
+                }
+            }
             Ok(serde_json::to_value(result)?)
         } else {
             Ok(serde_json::to_value(ListResourcesResult {
@@ -1295,7 +1293,7 @@ impl Server {
         )
         .with_auth_context(auth_context)
         .with_progress_reporter(progress_reporter);
-        let result = match handler.read(&req.uri, extra).await {
+        let mut result = match handler.read(&req.uri, extra).await {
             Ok(v) => {
                 self.cancellation_manager
                     .remove_token(&request_id_str)
@@ -1309,6 +1307,17 @@ impl Server {
                 Err(e)
             },
         }?;
+        // Merge tool descriptor keys into content _meta for widget resources
+        if !self.uri_to_tool_meta.is_empty() {
+            for content in &mut result.contents {
+                if let crate::types::protocol::Content::Resource { uri, meta, .. } = content {
+                    if let Some(tool_meta) = self.uri_to_tool_meta.get(uri.as_str()) {
+                        let content_meta = meta.get_or_insert_with(serde_json::Map::new);
+                        crate::types::ui::deep_merge(content_meta, tool_meta.clone());
+                    }
+                }
+            }
+        }
         Ok(serde_json::to_value(result)?)
     }
 
@@ -2267,16 +2276,15 @@ impl ServerBuilder {
     /// impl PromptHandler for CodeReviewPrompt {
     ///     async fn handle(&self, args: HashMap<String, String>, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<GetPromptResult> {
     ///         let language = args.get("language").map(|s| s.as_str()).unwrap_or("unknown");
-    ///         Ok(GetPromptResult {
-    ///             description: Some(format!("Code review prompt for {}", language)),
-    ///             messages: vec![PromptMessage {
+    ///         Ok(GetPromptResult::new(
+    ///             vec![PromptMessage {
     ///                 role: pmcp::Role::User,
     ///                 content: pmcp::Content::Text {
     ///                     text: format!("Please review this {} code:", language),
     ///                 },
     ///             }],
-    ///             _meta: None,
-    ///         })
+    ///             Some(format!("Code review prompt for {}", language)),
+    ///         ))
     ///     }
     /// }
     ///
@@ -2424,23 +2432,19 @@ impl ServerBuilder {
     /// impl ResourceHandler for FileResourceHandler {
     ///     async fn read(&self, uri: &str, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<ReadResourceResult> {
     ///         // Read file content...
-    ///         Ok(ReadResourceResult {
-    ///             contents: vec![pmcp::Content::Text {
-    ///                 text: "File content here".to_string(),
-    ///             }],
-    ///         })
+    ///         Ok(ReadResourceResult::new(vec![pmcp::Content::Text {
+    ///             text: "File content here".to_string(),
+    ///         }]))
     ///     }
     ///
     ///     async fn list(&self, _cursor: Option<String>, _extra: pmcp::RequestHandlerExtra) -> pmcp::Result<ListResourcesResult> {
-    ///         Ok(ListResourcesResult {
-    ///             resources: vec![pmcp::ResourceInfo {
-    ///                 uri: "file://example.txt".to_string(),
-    ///                 name: "example.txt".to_string(),
-    ///                 description: Some("Example file".to_string()),
-    ///                 mime_type: Some("text/plain".to_string()),
-    ///             }],
-    ///             next_cursor: None,
-    ///         })
+    ///         Ok(ListResourcesResult::new(vec![pmcp::ResourceInfo {
+    ///             uri: "file://example.txt".to_string(),
+    ///             name: "example.txt".to_string(),
+    ///             description: Some("Example file".to_string()),
+    ///             mime_type: Some("text/plain".to_string()),
+    ///             meta: None,
+    ///         }]))
     ///     }
     /// }
     ///
@@ -3021,10 +3025,31 @@ impl ServerBuilder {
             Arc::new(RwLock::new(chain))
         };
 
+        // Build tool_infos cache at construction time (mirrors ServerCore pattern)
+        let tool_infos: HashMap<String, ToolInfo> = self
+            .tools
+            .iter()
+            .map(|(name, handler)| {
+                let info = handler.metadata().unwrap_or_else(|| {
+                    ToolInfo::new(
+                        name.clone(),
+                        None,
+                        serde_json::json!({"type": "object", "properties": {}}),
+                    )
+                });
+                (name.clone(), info)
+            })
+            .collect();
+
+        // Build URI-to-tool-meta index for widget resource _meta propagation
+        let uri_to_tool_meta = core::build_uri_to_tool_meta(&tool_infos);
+
         Ok(Server {
             info: Implementation { name, version },
             capabilities: self.capabilities,
             tools: self.tools,
+            tool_infos,
+            uri_to_tool_meta,
             prompts: self.prompts,
             resources: self.resources,
             sampling: self.sampling,

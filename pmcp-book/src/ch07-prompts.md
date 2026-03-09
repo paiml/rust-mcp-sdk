@@ -18,8 +18,8 @@ async fn main() -> pmcp::Result<()> {
         let code = args.get("code").and_then(|v| v.as_str())
             .ok_or_else(|| pmcp::Error::validation("'code' required"))?;
 
-        Ok(GetPromptResult {
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: MessageContent::Text {
@@ -33,7 +33,7 @@ async fn main() -> pmcp::Result<()> {
                     },
                 },
             ],
-            description: Some("Code review prompt".to_string()),
+            Some("Code review prompt".to_string()),
         })
     })
     .with_description("Generate a code review prompt")
@@ -380,9 +380,9 @@ fn create_blog_post_prompt() -> SyncPrompt<
             },
         ];
 
-        Ok(GetPromptResult {
+        Ok(GetPromptResult::new(
             messages,
-            description: Some(format!("Generate {} blog post about {}", style, topic)),
+            Some(format!("Generate {} blog post about {}", style, topic)),
         })
     })
     .with_description("Generate a complete blog post on any topic")
@@ -446,8 +446,8 @@ fn create_code_review_prompt() -> SyncPrompt<
             .map(|s| s.as_str())
             .unwrap_or("general");
 
-        Ok(GetPromptResult {
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: MessageContent::Text {
@@ -465,7 +465,7 @@ fn create_code_review_prompt() -> SyncPrompt<
                     },
                 },
             ],
-            description: Some(format!("Code review for {} focusing on {}", language, focus)),
+            Some(format!("Code review for {} focusing on {}", language, focus)),
         })
     })
     .with_description("Generate a code review prompt")
@@ -495,8 +495,8 @@ fn create_docs_prompt() -> SyncPrompt<
             )));
         }
 
-        Ok(GetPromptResult {
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: MessageContent::Text {
@@ -520,7 +520,7 @@ fn create_docs_prompt() -> SyncPrompt<
                     },
                 },
             ],
-            description: Some("Generate code documentation".to_string()),
+            Some("Generate code documentation".to_string()),
         })
     })
     .with_description("Generate documentation for code")
@@ -545,8 +545,8 @@ fn create_task_prompt() -> SyncPrompt<
             .map(|s| s.as_str())
             .unwrap_or("normal");
 
-        Ok(GetPromptResult {
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: MessageContent::Text {
@@ -578,7 +578,7 @@ fn create_task_prompt() -> SyncPrompt<
                     },
                 },
             ],
-            description: Some(format!("Create task in {}", project)),
+            Some(format!("Create task in {}", project)),
         })
     })
     .with_description("Create a new task in a project")
@@ -677,7 +677,7 @@ fn create_prompt() -> SyncPrompt<
             .unwrap_or("normal"); // Default: normal
 
         // ... use format and verbosity
-        Ok(GetPromptResult { messages: vec![], description: None })
+        Ok(GetPromptResult::new(vec![], None))
     })
     // Document defaults in argument descriptions
     .with_argument("format", "Output format (markdown, html). Default: markdown", false)
@@ -700,8 +700,8 @@ let prompt = SyncPrompt::new("simple", |args| {
     // Synchronous logic only
     let topic = args.get("topic").unwrap_or(&"default".to_string());
 
-    Ok(GetPromptResult {
-        messages: vec![
+    Ok(GetPromptResult::new(
+        vec![
             PromptMessage {
                 role: Role::System,
                 content: MessageContent::Text {
@@ -709,7 +709,7 @@ let prompt = SyncPrompt::new("simple", |args| {
                 },
             },
         ],
-        description: None,
+        None,
     })
 });
 ```
@@ -730,9 +730,9 @@ let prompt = SimplePrompt::new("async-example", Box::new(
             let data = fetch_from_database(&args["id"]).await?;
             let template = generate_messages(&data).await?;
 
-            Ok(GetPromptResult {
-                messages: template,
-                description: Some("Generated from database".to_string()),
+            Ok(GetPromptResult::new(
+                template,
+                Some("Generated from database".to_string()),
             })
         }) as Pin<Box<dyn Future<Output = pmcp::Result<GetPromptResult>> + Send>>
     }

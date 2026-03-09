@@ -13,8 +13,11 @@ pub async fn init_landing_page(
     output: PathBuf,
     server_name: Option<String>,
 ) -> Result<()> {
-    println!("🎨 Initializing landing page...");
-    println!();
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    if not_quiet {
+        println!("Initializing landing page...");
+        println!();
+    }
 
     // Validate template
     if template_name != "nextjs" {
@@ -30,7 +33,9 @@ pub async fn init_landing_page(
         None => {
             // Try to read from pmcp.toml or Cargo.toml
             let name = detect_server_name(&project_root)?;
-            println!("📝 Detected server name: {}", name);
+            if not_quiet {
+                println!("Detected server name: {}", name);
+            }
             name
         },
     };
@@ -48,16 +53,20 @@ pub async fn init_landing_page(
     std::fs::create_dir_all(&output)
         .with_context(|| format!("Failed to create directory: {}", output.display()))?;
 
-    println!("📁 Creating landing page in: {}", output.display());
-    println!();
+    if not_quiet {
+        println!("Creating landing page in: {}", output.display());
+        println!();
+    }
 
     // Check for existing deployment info
     let (server_id, endpoint) =
         if let Some((id, ep)) = crate::landing::config::load_deployment_info(&project_root) {
-            println!("✅ Found existing deployment:");
-            println!("   Server ID: {}", id);
-            println!("   Endpoint: {}", ep);
-            println!();
+            if not_quiet {
+                println!("Found existing deployment:");
+                println!("   Server ID: {}", id);
+                println!("   Endpoint: {}", ep);
+                println!();
+            }
             (Some(id), Some(ep))
         } else {
             (None, None)
@@ -113,18 +122,20 @@ pub async fn init_landing_page(
     // Write pmcp-landing.toml with deployment info
     let config_path = output.join("pmcp-landing.toml");
     config.save(&config_path)?;
-    println!("   ✓ Created pmcp-landing.toml with deployment info");
+    if not_quiet {
+        println!("   ok Created pmcp-landing.toml with deployment info");
 
-    println!();
-    println!("✅ Landing page initialized successfully!");
-    println!();
-    println!("📖 Next steps:");
-    println!("   1. cd {}", output.display());
-    println!("   2. Customize pmcp-landing.toml to update content");
-    println!("   3. Run: cargo pmcp landing dev");
-    println!("   4. Deploy: cargo pmcp landing deploy --target pmcp-run");
-    println!();
-    println!("💡 Tip: Add your logo to public/assets/ and reference it in pmcp-landing.toml");
+        println!();
+        println!("Landing page initialized successfully!");
+        println!();
+        println!("Next steps:");
+        println!("   1. cd {}", output.display());
+        println!("   2. Customize pmcp-landing.toml to update content");
+        println!("   3. Run: cargo pmcp landing dev");
+        println!("   4. Deploy: cargo pmcp landing deploy --target pmcp-run");
+        println!();
+        println!("Tip: Add your logo to public/assets/ and reference it in pmcp-landing.toml");
+    }
 
     Ok(())
 }

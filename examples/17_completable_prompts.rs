@@ -35,12 +35,8 @@ impl PromptHandler for DatabaseQueryPrompt {
             _ => format!("-- Unknown operation: {}", operation),
         };
 
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "Database query for {} on {}.{}",
-                operation, database, table
-            )),
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: Content::Text {
@@ -54,8 +50,11 @@ impl PromptHandler for DatabaseQueryPrompt {
                     },
                 },
             ],
-            _meta: None,
-        })
+            Some(format!(
+                "Database query for {} on {}.{}",
+                operation, database, table
+            )),
+        ))
     }
 }
 
@@ -96,12 +95,8 @@ impl PromptHandler for DeploymentPrompt {
             _ => json!({}),
         };
 
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "Deploy {} version {} to {}",
-                service, version, environment
-            )),
-            messages: vec![
+        Ok(GetPromptResult::new(
+            vec![
                 PromptMessage {
                     role: Role::System,
                     content: Content::Text {
@@ -116,8 +111,11 @@ impl PromptHandler for DeploymentPrompt {
                     },
                 },
             ],
-            _meta: None,
-        })
+            Some(format!(
+                "Deploy {} version {} to {}",
+                service, version, environment
+            )),
+        ))
     }
 }
 

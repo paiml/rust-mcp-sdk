@@ -123,20 +123,22 @@ let tool = ToolInfo::with_annotations(
 
 ### Combining with Output Schema
 
-For tools that need both behavioral hints and output schemas:
+For tools that need both behavioral hints and output schemas, set the output schema
+on `ToolInfo` (top-level per MCP spec 2025-06-18) and the type name in annotations:
 
 ```rust
-let annotations = ToolAnnotations::new()
-    .with_read_only(true)
-    .with_output_schema(
-        json!({
-            "type": "object",
-            "properties": {
-                "rows": { "type": "array" },
-                "count": { "type": "integer" }
-            }
-        }),
-        "QueryResult"
+let tool = ToolInfo::new("query", Some("Execute SQL".into()), input_schema)
+    .with_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "rows": { "type": "array" },
+            "count": { "type": "integer" }
+        }
+    }))
+    .with_annotations(
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_output_type_name("QueryResult")
     );
 ```
 
@@ -253,8 +255,8 @@ let tool = TypedToolWithOutput::new("query", |args: QueryInput, _| {
 .idempotent();    // User-provided: idempotentHint: true
 
 // The tool now has BOTH:
-// - User annotations: readOnlyHint, idempotentHint
-// - Auto-generated: pmcp:outputSchema, pmcp:outputTypeName
+// - User annotations: readOnlyHint, idempotentHint, pmcp:outputTypeName
+// - Auto-generated top-level: outputSchema on ToolInfo
 ```
 
 ### TypedSyncTool for Synchronous Handlers
@@ -494,7 +496,7 @@ Tool annotations provide behavioral metadata that:
 | `destructiveHint` | Irreversible changes | Requires confirmation |
 | `idempotentHint` | Safe to retry | Retry on failure |
 | `openWorldHint` | External systems | Expects latency/limits |
-| `pmcp:outputSchema` | Output type | Enables composition |
+| `outputSchema` (top-level) | Output type | Enables composition |
 
 ### PMCP SDK Annotation Support
 

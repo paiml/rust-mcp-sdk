@@ -27,6 +27,7 @@ where
     name: String,
     description: Option<String>,
     input_schema: Value,
+    ui_resource_uri: Option<String>,
     handler: F,
     _phantom: PhantomData<T>,
 }
@@ -47,6 +48,7 @@ where
             name: name.into(),
             description: None,
             input_schema: schema,
+            ui_resource_uri: None,
             handler,
             _phantom: PhantomData,
         }
@@ -58,6 +60,7 @@ where
             name: name.into(),
             description: None,
             input_schema: schema,
+            ui_resource_uri: None,
             handler,
             _phantom: PhantomData,
         }
@@ -73,6 +76,15 @@ where
     #[cfg(feature = "schema-generation")]
     pub fn with_schema_from<S: JsonSchema>(mut self) -> Self {
         self.input_schema = generate_schema::<S>();
+        self
+    }
+
+    /// Associate this tool with a UI resource (MCP Apps Extension).
+    ///
+    /// Sets `_meta.ui.resourceUri` and `openai/outputTemplate` in the tool's
+    /// `ToolInfo` metadata for MCP and ChatGPT host compatibility.
+    pub fn with_ui(mut self, ui_resource_uri: impl Into<String>) -> Self {
+        self.ui_resource_uri = Some(ui_resource_uri.into());
         self
     }
 }
@@ -97,8 +109,9 @@ where
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: self.input_schema.clone(),
+            output_schema: None,
             annotations: None,
-            _meta: None,
+            _meta: crate::types::ui::build_ui_meta(self.ui_resource_uri.as_deref()),
             execution: None,
         }
     }
@@ -192,6 +205,7 @@ where
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: self.input_schema.clone(),
+            output_schema: None,
             annotations: None,
             _meta: None,
             execution: None,
@@ -394,6 +408,41 @@ mod tests {
 
         let result = tool.execute(args).unwrap();
         assert_eq!(result["result"], "hello, hello, hello");
+    }
+
+    #[test]
+    fn test_wasm_typed_tool_info_with_ui_has_openai_output_template() {
+        let tool = WasmTypedTool::new_with_schema(
+            "test_wasm_tool",
+            serde_json::json!({"type": "object"}),
+            |_args: serde_json::Value| Ok(serde_json::json!({})),
+        )
+        .with_ui("ui://widgets/chart.html");
+
+        let info = tool.info();
+        let meta = info._meta.as_ref().expect("_meta should be present");
+
+        // Must have nested ui.resourceUri
+        let ui_obj = meta.get("ui").expect("must have nested 'ui' key");
+        assert_eq!(ui_obj["resourceUri"], "ui://widgets/chart.html");
+
+        // Must have openai/outputTemplate
+        assert_eq!(
+            meta.get("openai/outputTemplate").unwrap(),
+            &serde_json::Value::String("ui://widgets/chart.html".to_string())
+        );
+    }
+
+    #[test]
+    fn test_wasm_typed_tool_info_without_ui_has_no_meta() {
+        let tool = WasmTypedTool::new_with_schema(
+            "test_wasm_tool",
+            serde_json::json!({"type": "object"}),
+            |_args: serde_json::Value| Ok(serde_json::json!({})),
+        );
+
+        let info = tool.info();
+        assert!(info._meta.is_none(), "_meta should be None without UI");
     }
 
     #[test]

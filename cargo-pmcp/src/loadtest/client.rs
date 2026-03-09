@@ -5,9 +5,11 @@
 //! `mcp-session-id` header, and classifies errors into distinct categories.
 
 use crate::loadtest::error::McpError;
+use pmcp::client::http_middleware::HttpMiddlewareChain;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// MCP protocol version used in the initialize handshake.
@@ -37,6 +39,7 @@ pub struct McpClient {
     session_id: Option<String>,
     request_timeout: Duration,
     next_request_id: u64,
+    http_middleware_chain: Option<Arc<HttpMiddlewareChain>>,
 }
 
 impl McpClient {
@@ -47,13 +50,19 @@ impl McpClient {
     /// and a per-request timeout duration.
     ///
     /// Starts with no session and request ID counter at 1.
-    pub fn new(http: Client, base_url: String, timeout: Duration) -> Self {
+    pub fn new(
+        http: Client,
+        base_url: String,
+        timeout: Duration,
+        http_middleware_chain: Option<Arc<HttpMiddlewareChain>>,
+    ) -> Self {
         Self {
             http,
             base_url,
             session_id: None,
             request_timeout: timeout,
             next_request_id: 1,
+            http_middleware_chain,
         }
     }
 
@@ -237,6 +246,44 @@ impl McpClient {
         Self::parse_response(&response_bytes)
     }
 
+    /// Executes a code_mode two-step flow: `validate_code` then `execute_code`.
+    ///
+    /// Step 1: Calls `validate_code` tool with the code and format.
+    /// Step 2: Extracts the `approval_token` from the response and calls
+    /// `execute_code` with the same code and the token.
+    pub async fn execute_code_mode(&mut self, code: &str, format: &str) -> Result<Value, McpError> {
+        // Step 1: validate_code
+        let validate_args = json!({
+            "code": code,
+            "format": format
+        });
+        let validate_result = self.call_tool("validate_code", &validate_args).await?;
+
+        // Extract approval_token from the validate_code response
+        let approval_token = validate_result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|item| item.get("type") == Some(&json!("text")))
+            })
+            .and_then(|item| item.get("text"))
+            .and_then(|text| serde_json::from_str::<Value>(text.as_str().unwrap_or("")).ok())
+            .and_then(|parsed| parsed.get("approval_token").cloned())
+            .and_then(|t| t.as_str().map(|s| s.to_string()))
+            .ok_or_else(|| McpError::JsonRpc {
+                code: -1,
+                message: "validate_code response missing approval_token".to_string(),
+            })?;
+
+        // Step 2: execute_code
+        let execute_args = json!({
+            "code": code,
+            "approval_token": approval_token
+        });
+        self.call_tool("execute_code", &execute_args).await
+    }
+
     /// Sends an HTTP POST request with the given JSON-RPC body.
     ///
     /// Attaches the `mcp-session-id` header if a session has been established.
@@ -251,43 +298,94 @@ impl McpClient {
         &mut self,
         body: &Value,
     ) -> Result<(reqwest::header::HeaderMap, Vec<u8>), McpError> {
-        let mut request = self
-            .http
-            .post(&self.base_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .timeout(self.request_timeout)
-            .json(body);
+        if let Some(ref chain) = self.http_middleware_chain {
+            use pmcp::client::http_middleware::{HttpMiddlewareContext, HttpRequest as MwRequest};
 
-        if let Some(ref sid) = self.session_id {
-            request = request.header(SESSION_HEADER, sid.as_str());
+            let body_bytes = serde_json::to_vec(body).map_err(|e| McpError::Connection {
+                message: format!("JSON serialize: {e}"),
+            })?;
+            let mut http_req =
+                MwRequest::new("POST".to_string(), self.base_url.clone(), body_bytes);
+            http_req.add_header("Content-Type", "application/json");
+            http_req.add_header("Accept", "application/json, text/event-stream");
+            if let Some(ref sid) = self.session_id {
+                http_req.add_header(SESSION_HEADER, sid);
+            }
+
+            let context = HttpMiddlewareContext::new(self.base_url.clone(), "POST".to_string());
+            chain
+                .process_request(&mut http_req, &context)
+                .await
+                .map_err(|e| McpError::Connection {
+                    message: format!("Middleware error: {e}"),
+                })?;
+
+            let mut request = self.http.post(&self.base_url).timeout(self.request_timeout);
+            for (key, value) in &http_req.headers {
+                request = request.header(key, value);
+            }
+            request = request.body(http_req.body);
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| McpError::classify_reqwest(&e))?;
+
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| McpError::classify_reqwest(&e))?;
+
+            if !status.is_success() {
+                let body_text = String::from_utf8_lossy(&bytes).into_owned();
+                return Err(McpError::Http {
+                    status: status.as_u16(),
+                    body: body_text,
+                });
+            }
+
+            Ok((headers, bytes.to_vec()))
+        } else {
+            let mut request = self
+                .http
+                .post(&self.base_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .timeout(self.request_timeout)
+                .json(body);
+
+            if let Some(ref sid) = self.session_id {
+                request = request.header(SESSION_HEADER, sid.as_str());
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| McpError::classify_reqwest(&e))?;
+
+            let status = response.status();
+            let headers = response.headers().clone();
+
+            // CRITICAL timing boundary: capture bytes BEFORE any JSON parsing.
+            // The caller uses the time before send_request() and after it returns
+            // to compute latency. JSON parse time must NOT be included.
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| McpError::classify_reqwest(&e))?;
+
+            if !status.is_success() {
+                let body_text = String::from_utf8_lossy(&bytes).into_owned();
+                return Err(McpError::Http {
+                    status: status.as_u16(),
+                    body: body_text,
+                });
+            }
+
+            Ok((headers, bytes.to_vec()))
         }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| McpError::classify_reqwest(&e))?;
-
-        let status = response.status();
-        let headers = response.headers().clone();
-
-        // CRITICAL timing boundary: capture bytes BEFORE any JSON parsing.
-        // The caller uses the time before send_request() and after it returns
-        // to compute latency. JSON parse time must NOT be included.
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| McpError::classify_reqwest(&e))?;
-
-        if !status.is_success() {
-            let body_text = String::from_utf8_lossy(&bytes).into_owned();
-            return Err(McpError::Http {
-                status: status.as_u16(),
-                body: body_text,
-            });
-        }
-
-        Ok((headers, bytes.to_vec()))
     }
 }
 
@@ -301,6 +399,7 @@ mod tests {
             Client::new(),
             "http://localhost:3000".to_string(),
             Duration::from_secs(5),
+            None,
         )
     }
 
@@ -442,6 +541,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_client_accepts_middleware_chain() {
+        let chain = Arc::new(HttpMiddlewareChain::new());
+        let client = McpClient::new(
+            Client::new(),
+            "http://localhost:3000".to_string(),
+            Duration::from_secs(5),
+            Some(chain),
+        );
+        assert!(client.http_middleware_chain.is_some());
+    }
+
     #[tokio::test]
     async fn test_timeout_fires_on_slow_server() {
         use tokio::net::TcpListener;
@@ -462,6 +573,7 @@ mod tests {
             Client::new(),
             format!("http://{}", addr),
             Duration::from_millis(200),
+            None,
         );
 
         let start = std::time::Instant::now();

@@ -343,6 +343,8 @@ mod tests {
             ServerCapabilities::tools_only(),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             None,
             None,
             None,

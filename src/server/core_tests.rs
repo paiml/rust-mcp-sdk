@@ -114,6 +114,7 @@ mod tests {
                     name: "Resource 1".to_string(),
                     description: Some("Test resource 1".to_string()),
                     mime_type: Some("text/plain".to_string()),
+                    meta: None,
                 }],
             }
         }

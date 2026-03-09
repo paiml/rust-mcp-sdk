@@ -200,6 +200,7 @@ pub use types::{
 ///         uri: "file:///tmp/output.txt".to_string(),
 ///         text: Some("File contents here...".to_string()),
 ///         mime_type: Some("text/plain".to_string()),
+///         meta: None,
 ///     }],
 ///     is_error: false,
 ///     ..Default::default()

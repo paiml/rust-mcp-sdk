@@ -30,12 +30,13 @@ prompt.distractors = [
     "file:// for local HTML files stored on the client machine",
     "mcp:// for MCP-specific resources following the protocol standard"
 ]
-answer.answer = "ui:// followed by a path identifier (e.g., ui://hotel/gallery)"
+answer.answer = "ui:// followed by a path identifier (e.g., ui://app/board)"
 answer.position = 1
 context = """
 UI resources use the 'ui://' scheme, similar to how 'http://' identifies web resources
-and 'file://' identifies local files. The URI format is ui://namespace/resource-name.
-The scheme identifies MCP UI resources that hosts should render in sandboxed iframes.
+and 'file://' identifies local files. With WidgetDir the URI format is ui://app/{name}
+where {name} is the HTML filename without the extension. The scheme identifies MCP UI
+resources that hosts should render in sandboxed iframes.
 """
 id = "f20a1b2c-d3e4-5678-abcd-123456800002"
 
@@ -53,21 +54,22 @@ id = "f20a1b2c-d3e4-5678-abcd-123456800003"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "How do tools associate with UI resources in PMCP?"
+prompt.prompt = "What is WidgetDir and how does it serve widgets?"
 prompt.distractors = [
-    "By naming the tool the same as the UI resource identifier string",
-    "By placing the HTML file next to the Rust source file in directory",
-    "By registering a callback in the server configuration initialization code"
+    "A Rust macro that compiles HTML templates into static binary resources",
+    "A REST API endpoint that proxies widget requests to external CDNs",
+    "A build tool that converts React components into MCP-compatible bundles"
 ]
-answer.answer = "Using the .with_ui(\"ui://...\") method on TypedTool"
+answer.answer = "A file-based convention that serves HTML files directly from a directory on disk, with no Rust code needed to define UI content"
 answer.position = 2
 context = """
-TypedTool provides a fluent .with_ui() method that sets the 'ui/resourceUri' metadata.
-When the tool is discovered via tools/list, clients see this metadata and know to fetch
-and render the associated UI when the tool is called. Example:
-TypedTool::new('get_images', handler).with_ui('ui://hotel/gallery')
+WidgetDir is the file-based convention for authoring widgets. You place .html files in
+a widgets/ directory and WidgetDir automatically maps them to ui://app/{name} URIs.
+For example, widgets/board.html becomes ui://app/board. No configuration files, no
+registration code. One HTML file equals one widget. The server reads files fresh on
+every request, enabling the hot-reload development workflow.
 """
-id = "f20a1b2c-d3e4-5678-abcd-123456800004"
+id = "f20a1b2c-d3e4-5678-abcd-123456800020"
 
 [[questions]]
 type = "MultipleChoice"
@@ -107,23 +109,6 @@ id = "f20a1b2c-d3e4-5678-abcd-123456800006"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "What message type does the MCP host send when returning tool results to a UI?"
-prompt.distractors = [
-    "mcp-response for general MCP protocol messages",
-    "tool-result for direct tool execution responses",
-    "jsonrpc-result for standard JSON-RPC response format"
-]
-answer.answer = "mcp-tool-result"
-answer.position = 1
-context = """
-When the host executes a tool and has results, it sends a message with type 'mcp-tool-result'
-to the iframe via postMessage. The message structure is: { type: 'mcp-tool-result',
-result: {...}, requestId: 1 }. UIs listen for this with window.addEventListener('message', ...).
-"""
-id = "f20a1b2c-d3e4-5678-abcd-123456800007"
-
-[[questions]]
-type = "MultipleChoice"
 prompt.prompt = "What should MCP servers do to handle clients that don't support UI resources?"
 prompt.distractors = [
     "Return an error when UI is not supported by the connected client",
@@ -142,39 +127,76 @@ id = "f20a1b2c-d3e4-5678-abcd-123456800008"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "Can multiple tools share the same UI resource?"
+prompt.prompt = "What does `cargo pmcp app new <name>` generate?"
 prompt.distractors = [
-    "No, each tool must have its own unique UI resource for isolation",
-    "Only if they are in the same server module and share namespace",
-    "Only if they have identical input schemas defined in their parameters"
+    "A Rust binary crate with a pre-built UI framework and React dependencies",
+    "A Docker container image ready for deployment to cloud platforms",
+    "An npm package with TypeScript bindings for the MCP protocol"
 ]
-answer.answer = "Yes, if their output formats are compatible for the shared UI to render"
-answer.position = 3
+answer.answer = "A scaffolded widget project with HTML template, manifest, and development configuration ready for preview"
+answer.position = 1
 context = """
-Multiple tools can reference the same ui:// resource. For example, search_rooms,
-search_restaurants, and search_activities could all use ui://search/results-grid if
-the UI handles all three result types. The UI checks the result structure and renders
-appropriately: if (result.rooms) {...} else if (result.restaurants) {...}.
+'cargo pmcp app new' scaffolds a new MCP Apps project. It generates an HTML template
+(widgets/hello.html) with mcpBridge usage, a project manifest, and development
+configuration. The scaffolded project is immediately ready for 'cargo pmcp app preview'
+so developers can start iterating on their widget right away.
 """
-id = "f20a1b2c-d3e4-5678-abcd-123456800010"
+id = "f20a1b2c-d3e4-5678-abcd-123456800021"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "Which capability must a server declare to support UI resources?"
+prompt.prompt = "What does `cargo pmcp app build` produce?"
 prompt.distractors = [
-    "tools capability only for basic tool registration and discovery",
-    "ui capability (new in MCP Apps) specifically for user interfaces",
-    "experimental.ui capability flag to enable experimental UI features"
+    "A standalone executable binary that embeds a web server and all assets",
+    "A WebAssembly module that runs in the browser without a server",
+    "A JSON manifest file listing all widgets and their dependencies"
 ]
-answer.answer = "resources capability (UI resources are a type of resource)"
+answer.answer = "Compiled and bundled widget HTML/assets in the format expected by the MCP server for production serving"
+answer.position = 3
+context = """
+'cargo pmcp app build' compiles and bundles the widget HTML and assets into the format
+expected by the MCP server for production deployment. This is the build step that
+prepares widgets for distribution, as opposed to the development workflow where
+widgets are served directly from disk with hot-reload.
+"""
+id = "f20a1b2c-d3e4-5678-abcd-123456800022"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What does the `cargo pmcp app preview` workflow provide?"
+prompt.distractors = [
+    "A static screenshot of the widget rendered on a white background",
+    "An automated test runner that validates widget behavior against test cases",
+    "A deployment preview URL hosted on a remote staging server"
+]
+answer.answer = "A hot-reload development server that re-serves the widget on file changes so developers can iterate without restarting the MCP server"
 answer.position = 0
 context = """
-UI resources are a specialized type of MCP resource, so servers must declare the
-resources capability in ServerCapabilities. This allows clients to discover and
-fetch UI resources alongside regular resources. Tools capability is also typically
-needed since UIs are associated with tools.
+'cargo pmcp app preview' launches a local development server that watches for file
+changes and automatically re-serves the widget HTML. Developers can edit their HTML,
+save, and refresh the browser to see changes instantly. This hot-reload workflow
+eliminates the need to restart the MCP server during widget development.
 """
-id = "f20a1b2c-d3e4-5678-abcd-123456800011"
+id = "f20a1b2c-d3e4-5678-abcd-123456800023"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What is window.mcpBridge and when is it available?"
+prompt.distractors = [
+    "A Node.js module that must be imported with require() in server-side code",
+    "A browser extension API available on all websites after installing the MCP plugin",
+    "A WebSocket connection object created by calling navigator.mcpBridge.connect()"
+]
+answer.answer = "A convenience API injected by MCP-aware hosts that wraps postMessage calls; available in Claude Desktop and MCP Apps hosts but NOT in raw iframe embedding"
+answer.position = 2
+context = """
+window.mcpBridge is a JavaScript object injected by the adapter layer into widget HTML.
+It provides four core methods: callTool(), readResource(), getPrompt(), and notify().
+These wrap the underlying postMessage JSON-RPC communication. The bridge is available
+in hosts that run an adapter (Claude Desktop, ChatGPT via window.openai, MCP Apps hosts)
+but is NOT available in raw iframe embedding without an adapter.
+"""
+id = "f20a1b2c-d3e4-5678-abcd-123456800024"
 
 [[questions]]
 type = "MultipleChoice"
@@ -196,36 +218,38 @@ id = "f20a1b2c-d3e4-5678-abcd-123456800013"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "What happens if a tool's .with_ui() URI doesn't match any declared UI resource?"
+prompt.prompt = "What problem does the multi-platform adapter pattern solve?"
 prompt.distractors = [
-    "The server fails to start with an error during initialization phase",
-    "A default placeholder UI is automatically generated for missing resources",
-    "The tool is automatically hidden from clients during capability negotiation"
+    "It compresses widget HTML to reduce network transfer size across platforms",
+    "It translates MCP tool schemas into platform-specific API documentation",
+    "It encrypts bridge communication to prevent man-in-the-middle attacks"
 ]
-answer.answer = "The client receives the metadata but may fail or skip rendering when fetching the UI"
-answer.position = 2
+answer.answer = "Different hosts have different APIs (ChatGPT via window.openai, Claude via window.mcpBridge, generic MCP via postMessage) and the adapter provides a single interface that delegates to the correct host API at runtime"
+answer.position = 3
 context = """
-PMCP doesn't validate at server startup that all ui:// references match declared resources
-(though this could be added). At runtime, if the client tries to fetch a non-existent
-UI resource, it will fail. The tool still works for data, but the visual UI won't render.
-Always ensure URIs match exactly (case-sensitive, no trailing slashes).
+The adapter pattern solves the ecosystem fragmentation problem. ChatGPT uses window.openai,
+Claude Desktop uses window.mcpBridge, and generic MCP hosts use raw postMessage. Without
+adapters, widget authors would need to write host-specific code. The adapter detects the
+host environment at runtime and delegates to the correct underlying API, giving widget
+code a single consistent interface (window.mcpBridge) regardless of host.
 """
-id = "f20a1b2c-d3e4-5678-abcd-123456800014"
+id = "f20a1b2c-d3e4-5678-abcd-123456800025"
 
 [[questions]]
 type = "MultipleChoice"
-prompt.prompt = "Which of these is a BAD practice for MCP UI development?"
+prompt.prompt = "What are the four steps of the common MCP Apps architecture pattern?"
 prompt.distractors = [
-    "Showing loading states while waiting for data from tool calls",
-    "Using system fonts for host consistency and native appearance",
-    "Handling the 'mcp-tool-result' message event for tool responses"
+    "1) compile Rust, 2) generate HTML, 3) deploy to CDN, 4) register with host",
+    "1) authenticate user, 2) validate schema, 3) execute tool, 4) log result",
+    "1) open WebSocket, 2) negotiate protocol, 3) exchange capabilities, 4) stream data"
 ]
-answer.answer = "Using localStorage for persistent data (may not work in sandboxed iframe)"
-answer.position = 3
+answer.answer = "1) detect host environment, 2) create platform adapter, 3) call tools through adapter, 4) render results in HTML"
+answer.position = 0
 context = """
-Sandboxed iframes have restricted access - localStorage, cookies, and sessionStorage
-may not work or persist. UIs should: show loading states, use postMessage for data,
-handle errors gracefully, and not assume any persistent storage. All state should come
-from tool calls, not browser storage.
+All three example walkthroughs (chess, map, dataviz) follow the same 4-step pattern:
+First, detect which host environment the widget is running in (ChatGPT, Claude Desktop,
+generic MCP). Second, create the appropriate platform adapter. Third, call MCP tools
+through the adapter's unified API (window.mcpBridge.callTool). Fourth, render the
+tool results in the widget's HTML. This pattern ensures widgets work across all hosts.
 """
-id = "f20a1b2c-d3e4-5678-abcd-123456800016"
+id = "f20a1b2c-d3e4-5678-abcd-123456800026"

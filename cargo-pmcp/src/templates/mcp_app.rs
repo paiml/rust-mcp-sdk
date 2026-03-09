@@ -93,7 +93,7 @@ use pmcp::server::ServerBuilder;
 use pmcp::types::mcp_apps::{{ExtendedUIMimeType, WidgetMeta}};
 use pmcp::types::protocol::Content;
 use pmcp::types::{{ListResourcesResult, ReadResourceResult, ResourceInfo}};
-use pmcp::{{RequestHandlerExtra, ResourceHandler, Result}};
+use pmcp::{{RequestHandlerExtra, ResourceHandler, Result, TypedSyncTool}};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -177,15 +177,15 @@ impl ResourceHandler for AppResources {{
 
         if let Some(widget_name) = name {{
             let html = self.widget_dir.read_widget(widget_name);
-            let transformed = self.chatgpt_adapter.transform(uri, widget_name, &html);
+            let mut transformed = self.chatgpt_adapter.transform(uri, widget_name, &html);
+            let meta = transformed.take_meta();
 
-            Ok(ReadResourceResult {{
-                contents: vec![Content::Resource {{
+            Ok(ReadResourceResult::new(vec![Content::Resource {{
                     uri: uri.to_string(),
                     text: Some(transformed.content),
-                    mime_type: Some(ExtendedUIMimeType::HtmlSkybridge.to_string()),
-                }}],
-            }})
+                    mime_type: Some(ExtendedUIMimeType::HtmlMcpApp.to_string()),
+                    meta,
+                }}]))
         }} else {{
             Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
@@ -206,14 +206,12 @@ impl ResourceHandler for AppResources {{
                 uri: entry.uri,
                 name: entry.filename.clone(),
                 description: Some(format!("Interactive {{}} widget", entry.filename)),
-                mime_type: Some(ExtendedUIMimeType::HtmlSkybridge.to_string()),
+                mime_type: Some(ExtendedUIMimeType::HtmlMcpApp.to_string()),
+                meta: None,
             }})
             .collect();
 
-        Ok(ListResourcesResult {{
-            resources,
-            next_cursor: None,
-        }})
+        Ok(ListResourcesResult::new(resources))
     }}
 }}
 
@@ -229,15 +227,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {{
     // Resolve widgets directory relative to the project root
     let widgets_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
 
-    // Build server with tools and widget resources
+    // Build the hello tool with UI resource link
+    let hello_tool = TypedSyncTool::<HelloInput, _>::new("hello", hello_handler)
+        .with_description("Greet someone by name. Returns a friendly greeting.")
+        .with_ui("ui://app/hello.html");
+
     let server = ServerBuilder::new()
         .name("{name}")
         .version("0.1.0")
-        .tool_typed_sync_with_description(
-            "hello",
-            "Greet someone by name. Returns a friendly greeting.",
-            hello_handler,
-        )
+        .tool("hello", hello_tool)
         .resources(AppResources::new(widgets_path))
         .build()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -615,6 +613,14 @@ mod tests {
         assert!(main.contains("hello_handler"));
         assert!(main.contains("StreamableHttpServer"));
         assert!(main.contains("WidgetCSP"));
+        // Must use HtmlMcpApp (not HtmlSkybridge)
+        assert!(main.contains("HtmlMcpApp"));
+        assert!(!main.contains("HtmlSkybridge"));
+        // Must use .with_ui() on tool registration
+        assert!(main.contains(".with_ui("));
+        assert!(main.contains("TypedSyncTool"));
+        // Must forward _meta from adapter via take_meta()
+        assert!(main.contains("transformed.take_meta()"));
     }
 
     #[test]

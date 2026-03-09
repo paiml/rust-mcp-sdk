@@ -423,9 +423,8 @@ impl PromptHandler for AnalysisWorkflowPrompt {
         }
 
         // Return prompt result
-        Ok(GetPromptResult {
-            description: Some(format!("Multi-step analysis workflow for: {}", topic)),
-            messages: vec![PromptMessage {
+        Ok(GetPromptResult::new(
+            vec![PromptMessage {
                 role: Role::User,
                 content: Content::Text {
                     text: format!(
@@ -435,7 +434,8 @@ impl PromptHandler for AnalysisWorkflowPrompt {
                     ),
                 },
             }],
-        })
+            Some(format!("Multi-step analysis workflow for: {}", topic)),
+        ))
     }
 }
 ```

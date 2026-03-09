@@ -1,0 +1,210 @@
+# AI Tutor Instructions for: Load Testing Exercise
+# Exercise ID: ch18-03-loadtest
+
+[tutor]
+exercise_id = "ch18-03-loadtest"
+title = "Load Testing Your MCP Server"
+
+[tutor.context]
+student_level = "intermediate"
+prior_knowledge = [
+    "Completed ch17 observability exercises (logging, metrics)",
+    "Understanding of metrics concepts (counters, histograms, percentiles)",
+    "Basic performance testing concepts",
+    "Familiarity with TOML configuration files",
+]
+
+objective = """
+Guide the student to load test an MCP server using cargo pmcp loadtest:
+1. Run a first load test using schema discovery and auto-generated config
+2. Write TOML config files manually with different scenario types
+3. Design staged load profiles for capacity planning
+4. Interpret HdrHistogram percentiles and understand coordinated omission
+5. Find a server's breaking point under load
+6. Calculate a production capacity target with safety margins
+
+This builds on observability to enable proactive capacity planning.
+"""
+
+[tutor.pedagogy]
+approach = "progressive_load_testing"
+
+phases = [
+    { name = "connect", duration_minutes = 3, focus = "Why load test MCP servers? Protocol-aware vs generic HTTP tools like wrk or ab" },
+    { name = "first_test", duration_minutes = 8, focus = "Start an MCP server, run cargo pmcp loadtest init to discover schema, execute first load test" },
+    { name = "config_authoring", duration_minutes = 10, focus = "Write TOML config manually -- scenario types (tools/call, resources/read, prompts/get), weights, settings" },
+    { name = "staged_profiles", duration_minutes = 10, focus = "Design multi-stage ramp-up profiles, understand VU lifecycle (spawn, ramp, cancel in LIFO order)" },
+    { name = "metrics_interpretation", duration_minutes = 10, focus = "Read HdrHistogram output -- P50, P95, P99 percentiles, coordinated omission correction, expected_interval_ms" },
+    { name = "breaking_point", duration_minutes = 8, focus = "Find server limits using the rolling window detector, capacity planning with 2x headroom rule" },
+]
+
+[tutor.scaffolding]
+starter_guidance = """
+Before running load tests, establish context:
+
+1. Ask: "Your unit tests pass and integration tests are green. How do you
+   know if your server can handle 50 AI clients hitting it simultaneously?"
+
+2. Connect to their experience: "Metrics tell you how your server is doing
+   right now. Load testing tells you how it will do under pressure -- before
+   your users find out the hard way."
+
+3. Explain why MCP-specific tooling matters:
+   - Generic HTTP tools don't perform MCP initialize handshakes
+   - They can't send typed tools/call or resources/read requests
+   - Per-operation metrics (which tool is slow?) require protocol awareness
+"""
+
+hint_progression = [
+    { trigger = "stuck_on_init", response = "Start your server in one terminal, then in another run: cargo pmcp loadtest init http://localhost:3000/mcp -- this discovers your tools and generates .pmcp/loadtest.toml automatically." },
+    { trigger = "stuck_on_config", response = "A minimal config needs [settings] with virtual_users, duration_secs, timeout_ms, and at least one [[scenario]] with type, weight, and tool/uri/prompt fields. Check the three types: tools/call, resources/read, prompts/get." },
+    { trigger = "stuck_on_stages", response = "Add [[stage]] blocks with target_vus and duration_secs. Example: stage 1 ramps to 20 VUs over 30s, stage 2 holds at 20 for 60s, stage 3 ramps down to 0 over 30s. When stages are present, settings.virtual_users is ignored." },
+    { trigger = "stuck_on_percentiles", response = "P50 is the median (typical experience). P99 is what 1% of users see (worst case). Average hides outliers -- 99 requests at 10ms plus 1 at 4500ms gives average 460ms but P50 of 11ms." },
+    { trigger = "stuck_on_breaking_point", response = "The detector uses a rolling window: if recent error rate is >10% AND >2x baseline, or P99 exceeds 3x baseline, it triggers. Create a staged ramp from 10 to 100+ VUs to find it." },
+    { trigger = "stuck_on_capacity", response = "Plan for 2x your expected peak concurrent users. If you expect 15 peak clients, ensure 30 VUs runs comfortably. Keep error rate <1% and P99 within your budget (500ms for interactive tools)." },
+]
+
+[tutor.common_mistakes]
+mistakes = [
+    { pattern = "testing_debug_build", symptom = "Unrealistically slow results, misleading P99 values", fix = "Always build and run the server with --release for accurate performance numbers. Debug builds include extra checks and skip optimizations." },
+    { pattern = "flat_only_testing", symptom = "Misses the degradation curve -- no visibility into how performance changes under increasing load", fix = "Use staged profiles with [[stage]] blocks to ramp VUs gradually. This reveals the exact point where performance degrades." },
+    { pattern = "ignoring_coordinated_omission", symptom = "Latency looks better than reality because stalls hide missed requests", fix = "cargo pmcp loadtest corrects automatically via HdrHistogram's record_correct(). Set expected_interval_ms to match your server's typical response time." },
+    { pattern = "too_many_vus_immediately", symptom = "Server crashes on startup, test produces no useful performance data", fix = "Start with 1-2 VUs to establish a baseline, then ramp gradually with staged profiles to find the performance curve." },
+    { pattern = "ignoring_error_rate", symptom = "Throughput looks good but errors are high -- a fast error is still an error", fix = "Always check error_rate alongside throughput and latency. High throughput with high errors means the server is failing fast, not performing well." },
+]
+
+[tutor.assessment]
+success_criteria = [
+    "Ran first load test using cargo pmcp loadtest init and run",
+    "Wrote a TOML config manually with at least two scenario types",
+    "Used a staged profile with ramp-up, hold, and ramp-down stages",
+    "Interpreted P50, P95, P99 percentiles from test output",
+    "Found a server's breaking point using staged ramp-up",
+    "Calculated a capacity target using the 2x headroom rule",
+]
+
+mastery_indicators = [
+    "Student explains why P99 is more useful than average for capacity planning",
+    "Student describes coordinated omission and why correction matters",
+    "Student designs staged profiles for different goals (capacity, soak, stress)",
+    "Student applies the decision framework: breaking point vs expected peak users",
+]
+
+[tutor.discussion_prompts]
+opening = [
+    "Your integration tests pass. How do you know your server is ready for production traffic?",
+    "What's the difference between 'my server works' and 'my server works under load'?",
+]
+
+during_implementation = [
+    "Looking at your P50 vs P99 -- what's causing the gap? Is that acceptable?",
+    "If your breaking point is at 42 VUs and you expect 20 peak clients, is that enough headroom?",
+    "How would you integrate this load test into a CI/CD pipeline as a quality gate?",
+]
+
+closing = [
+    "How would you use these results to make a scaling decision (vertical vs horizontal)?",
+    "What load test would you run the night before a major launch?",
+    "How do load test results complement the metrics and logging from Chapter 17?",
+]
+
+[tutor.knowledge_connections]
+builds_on = [
+    "Metrics and histograms from ch17 (counters, gauges, percentiles)",
+    "Remote server testing from ch12 (testing against deployed servers)",
+    "Server architecture from ch02-ch03 (tool handlers, request lifecycle)",
+]
+
+leads_to = [
+    "CI/CD integration -- load tests as automated quality gates",
+    "Capacity planning and autoscaling decisions for production",
+    "Performance optimization -- identifying and fixing bottlenecks",
+]
+
+real_world_applications = [
+    "Pre-launch capacity validation before deploying to production",
+    "Regression detection -- catching performance degradation between releases",
+    "Infrastructure sizing -- choosing the right instance type and count",
+    "SLA validation -- proving your server meets latency and error rate guarantees",
+]
+
+[tutor.code_examples]
+basic_config = """
+# Minimal loadtest config -- one tool, flat load
+[settings]
+virtual_users = 10
+duration_secs = 60
+timeout_ms = 5000
+
+[[scenario]]
+type = "tools/call"
+weight = 100
+tool = "add"
+arguments = { a = 42, b = 17 }
+"""
+
+staged_config = """
+# Staged load profile -- ramp up, hold, ramp down
+[settings]
+virtual_users = 1       # Ignored when stages are present
+duration_secs = 10      # Ignored when stages are present
+timeout_ms = 5000
+
+[[scenario]]
+type = "tools/call"
+weight = 70
+tool = "search"
+arguments = { query = "test" }
+
+[[scenario]]
+type = "resources/read"
+weight = 30
+uri = "config://settings"
+
+# Warm up: 0 to 20 VUs over 30 seconds
+[[stage]]
+target_vus = 20
+duration_secs = 30
+
+# Hold at 20 VUs for 60 seconds (measure steady state)
+[[stage]]
+target_vus = 20
+duration_secs = 60
+
+# Ramp to 50 VUs over 60 seconds (find limits)
+[[stage]]
+target_vus = 50
+duration_secs = 60
+
+# Cool down: 50 to 0 VUs over 30 seconds
+[[stage]]
+target_vus = 0
+duration_secs = 30
+"""
+
+capacity_planning = """
+# Capacity planning from load test results:
+#
+# Step 1: Run tests at increasing VU counts
+#   cargo pmcp loadtest run http://localhost:3000/mcp --vus 5 --duration 60
+#   cargo pmcp loadtest run http://localhost:3000/mcp --vus 10 --duration 60
+#   cargo pmcp loadtest run http://localhost:3000/mcp --vus 20 --duration 60
+#   cargo pmcp loadtest run http://localhost:3000/mcp --vus 50 --duration 60
+#
+# Step 2: Record results in a table
+#   VUs | P99    | Error Rate | Throughput | Verdict
+#   5   | 120ms  | 0.0%       | 10 req/s   | Comfortable
+#   10  | 180ms  | 0.1%       | 18 req/s   | Good
+#   20  | 350ms  | 0.5%       | 32 req/s   | Acceptable
+#   50  | 2500ms | 12%        | 35 req/s   | BREAKING POINT
+#
+# Step 3: Apply the 2x headroom rule
+#   Breaking point: ~30 VUs (before degradation)
+#   Expected peak:  15 concurrent clients
+#   Headroom:       30 / 15 = 2x -- sufficient!
+#
+# Step 4: Set capacity target
+#   Target: 70% of breaking point = ~21 VUs
+#   P99 budget: < 500ms for interactive tool calls
+#   Error rate ceiling: < 1% at expected peak
+"""

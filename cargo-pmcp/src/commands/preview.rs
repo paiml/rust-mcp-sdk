@@ -12,23 +12,38 @@ pub async fn execute(
     theme: String,
     locale: String,
     widgets_dir: Option<String>,
+    mode: String,
+    global_flags: &crate::commands::GlobalFlags,
 ) -> Result<()> {
-    println!("\n{}", "Starting MCP Apps Preview".bright_cyan().bold());
-    println!("{}", "─────────────────────────────────".bright_cyan());
-    println!("  {} MCP Server: {}", "→".blue(), url.bright_yellow());
-    println!(
-        "  {} Preview URL: {}",
-        "→".blue(),
-        format!("http://localhost:{}", port).bright_green()
-    );
-    if let Some(ref dir) = widgets_dir {
+    let preview_mode = if mode == "chatgpt" {
+        mcp_preview::PreviewMode::ChatGpt
+    } else {
+        mcp_preview::PreviewMode::Standard
+    };
+
+    if global_flags.should_output() {
+        println!("\n{}", "Starting MCP Apps Preview".bright_cyan().bold());
+        println!("{}", "─────────────────────────────────".bright_cyan());
+        println!("  {} MCP Server: {}", "→".blue(), url.bright_yellow());
         println!(
-            "  {} Widgets Dir: {} (hot-reload)",
+            "  {} Preview URL: {}",
             "→".blue(),
-            dir.bright_magenta()
+            format!("http://localhost:{}", port).bright_green()
         );
+        if let Some(ref dir) = widgets_dir {
+            println!(
+                "  {} Widgets Dir: {} (hot-reload)",
+                "→".blue(),
+                dir.bright_magenta()
+            );
+        }
+        let mode_display = match preview_mode {
+            mcp_preview::PreviewMode::ChatGpt => "ChatGPT Strict".bright_red().bold(),
+            mcp_preview::PreviewMode::Standard => "Standard".bright_green().bold(),
+        };
+        println!("  {} Mode:        {}", "→".blue(), mode_display);
+        println!();
     }
-    println!();
 
     let widgets_path = widgets_dir.map(std::path::PathBuf::from);
 
@@ -39,6 +54,7 @@ pub async fn execute(
         theme,
         locale,
         widgets_dir: widgets_path,
+        mode: preview_mode,
     };
 
     // Open browser if requested

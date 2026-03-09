@@ -104,12 +104,8 @@ impl PromptHandler for AnalysisWorkflowPrompt {
         // Build the final prompt result
         let workflow_summary = results.join("\n");
 
-        Ok(GetPromptResult {
-            description: Some(format!(
-                "Multi-step analysis workflow for: {}",
-                topic
-            )),
-            messages: vec![PromptMessage {
+        Ok(GetPromptResult::new(
+            vec![PromptMessage {
                 role: Role::User,
                 content: Content::Text {
                     text: format!(
@@ -118,8 +114,11 @@ impl PromptHandler for AnalysisWorkflowPrompt {
                     ),
                 },
             }],
-            _meta: None,
-        })
+            Some(format!(
+                "Multi-step analysis workflow for: {}",
+                topic
+            )),
+        ))
     }
 }
 

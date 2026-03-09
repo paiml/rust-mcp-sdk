@@ -1,6 +1,6 @@
 [package]
 name = "pmcp"
-version = "1.11.0"
+version = "1.16.0"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "High-quality Rust SDK for Model Context Protocol (MCP) with full TypeScript SDK compatibility"
@@ -59,7 +59,7 @@ parking_lot = "0.12"
 dashmap = "6.1"
 bytes = { version = "1.10", optional = true }
 futures = "0.3"
-pmcp-widget-utils = { path = "crates/pmcp-widget-utils" }
+pmcp-widget-utils = { path = "crates/pmcp-widget-utils", version = "0.1.0" }
 futures-util = { version = "0.3", optional = true }
 futures-channel = { version = "0.3", optional = true }
 futures-locks = { version = "0.7", optional = true, default-features = false }
@@ -70,6 +70,11 @@ http-body-util = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
 jsonwebtoken = { version = "10.3", optional = true }
+
+# OAuth CLI helper dependencies (feature-gated)
+webbrowser = { version = "1", optional = true }
+dirs = { version = "6", optional = true }
+rand = { version = "0.10", optional = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 # Transport dependencies (optional, feature-gated)
@@ -135,6 +140,7 @@ composition = ["streamable-http"]
 # MCP Apps Extension - Interactive UI support for ChatGPT Apps, MCP-UI, and standard MCP hosts
 mcp-apps = []
 jwt-auth = ["dep:jsonwebtoken"]
+oauth = ["dep:webbrowser", "dep:dirs", "dep:rand"]
 sse = ["dep:bytes"]
 websocket = ["dep:tokio-tungstenite"]
 http = ["dep:hyper", "dep:hyper-util", "dep:bytes"]

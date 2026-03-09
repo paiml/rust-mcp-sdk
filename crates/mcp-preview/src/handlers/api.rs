@@ -15,6 +15,9 @@ pub struct ConfigResponse {
     pub theme: String,
     pub locale: String,
     pub initial_tool: Option<String>,
+    pub mode: String,
+    pub descriptor_keys: Vec<String>,
+    pub invocation_keys: Vec<String>,
 }
 
 /// Get preview configuration
@@ -24,6 +27,18 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
         theme: state.config.theme.clone(),
         locale: state.config.locale.clone(),
         initial_tool: state.config.initial_tool.clone(),
+        mode: state.config.mode.to_string(),
+        // Mirror of pmcp::types::ui::CHATGPT_DESCRIPTOR_KEYS
+        descriptor_keys: vec![
+            "openai/outputTemplate".into(),
+            "openai/toolInvocation/invoking".into(),
+            "openai/toolInvocation/invoked".into(),
+            "openai/widgetAccessible".into(),
+        ],
+        invocation_keys: vec![
+            "openai/toolInvocation/invoking".into(),
+            "openai/toolInvocation/invoked".into(),
+        ],
     })
 }
 
@@ -143,7 +158,8 @@ pub async fn list_resources(State(state): State<Arc<AppState>>) -> Json<Value> {
                         "uri": r.uri,
                         "name": r.name,
                         "description": r.description,
-                        "mimeType": r.mime_type
+                        "mimeType": r.mime_type,
+                        "_meta": r.meta
                     }));
                 }
             }
@@ -202,7 +218,10 @@ pub async fn read_resource(
 
     // Fall through to proxy for non-widget or non-configured resources
     match state.proxy.read_resource(&params.uri).await {
-        Ok(result) => json_response(json!({ "contents": result.contents })),
+        Ok(result) => json_response(json!({
+            "contents": result.contents,
+            "_meta": result.meta
+        })),
         Err(e) => json_response(json!({ "contents": null, "error": e.to_string() })),
     }
 }

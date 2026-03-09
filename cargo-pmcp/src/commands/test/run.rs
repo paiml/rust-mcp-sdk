@@ -5,6 +5,8 @@ use colored::Colorize;
 use mcp_tester::run_scenario_with_transport;
 use std::path::PathBuf;
 
+use crate::commands::GlobalFlags;
+
 /// Run test scenarios against a local or remote MCP server
 pub fn execute(
     server: Option<String>,
@@ -13,9 +15,12 @@ pub fn execute(
     scenarios: Option<PathBuf>,
     transport: Option<String>,
     detailed: bool,
+    global_flags: &GlobalFlags,
 ) -> Result<()> {
-    println!("\n{}", "Running MCP server tests".bright_cyan().bold());
-    println!("{}", "─────────────────────────────────────".bright_cyan());
+    if global_flags.should_output() {
+        println!("\n{}", "Running MCP server tests".bright_cyan().bold());
+        println!("{}", "─────────────────────────────────────".bright_cyan());
+    }
 
     // Determine the target URL
     let target_url = if let Some(url) = url {
@@ -36,19 +41,21 @@ pub fn execute(
         PathBuf::from("scenarios")
     };
 
-    if let Some(server) = &server {
-        println!("\n{}", "Prerequisites:".bright_white().bold());
-        println!("  {} Server must be running on port {}", "→".blue(), port);
-        println!(
-            "  {} Run in another terminal: {}",
-            "→".blue(),
-            format!("cargo pmcp dev --server {}", server).bright_cyan()
-        );
-    }
+    if global_flags.should_output() {
+        if let Some(server) = &server {
+            println!("\n{}", "Prerequisites:".bright_white().bold());
+            println!("  {} Server must be running on port {}", "→".blue(), port);
+            println!(
+                "  {} Run in another terminal: {}",
+                "→".blue(),
+                format!("cargo pmcp dev --server {}", server).bright_cyan()
+            );
+        }
 
-    // Run tests
-    println!("\n{}", "Running tests".bright_white().bold());
-    println!("  {} Target: {}", "→".blue(), target_url);
+        // Run tests
+        println!("\n{}", "Running tests".bright_white().bold());
+        println!("  {} Target: {}", "→".blue(), target_url);
+    }
 
     // Try scenario-based testing if scenarios exist
     let test_result = if scenarios_dir.exists() && scenarios_dir.read_dir()?.next().is_some() {
@@ -65,18 +72,22 @@ pub fn execute(
             .collect();
 
         if !scenarios.is_empty() {
-            println!(
-                "  {} Running {} scenario file(s) from {}",
-                "→".blue(),
-                scenarios.len(),
-                scenarios_dir.display()
-            );
+            if global_flags.should_output() {
+                println!(
+                    "  {} Running {} scenario file(s) from {}",
+                    "→".blue(),
+                    scenarios.len(),
+                    scenarios_dir.display()
+                );
+            }
 
             // Run each scenario using library
             let mut all_passed = true;
             for scenario in scenarios {
                 let scenario_path = scenario.path();
-                println!("\n  Testing: {}", scenario_path.display());
+                if global_flags.should_output() {
+                    println!("\n  Testing: {}", scenario_path.display());
+                }
 
                 let result = tokio::runtime::Runtime::new()?.block_on(async {
                     run_scenario_with_transport(
@@ -102,41 +113,51 @@ pub fn execute(
             Ok(all_passed)
         } else {
             // No scenarios found
-            println!(
-                "  {} No scenarios found in {}",
-                "⚠".yellow(),
-                scenarios_dir.display()
-            );
-            println!("    Run 'cargo pmcp test generate' to create test scenarios");
+            if global_flags.should_output() {
+                println!(
+                    "  {} No scenarios found in {}",
+                    "⚠".yellow(),
+                    scenarios_dir.display()
+                );
+                println!("    Run 'cargo pmcp test generate' to create test scenarios");
+            }
             Ok(true)
         }
     } else {
         // No scenarios directory
-        println!(
-            "  {} No scenarios directory found at {}",
-            "⚠".yellow(),
-            scenarios_dir.display()
-        );
-        println!("    Run 'cargo pmcp test generate' to create test scenarios");
+        if global_flags.should_output() {
+            println!(
+                "  {} No scenarios directory found at {}",
+                "⚠".yellow(),
+                scenarios_dir.display()
+            );
+            println!("    Run 'cargo pmcp test generate' to create test scenarios");
+        }
         Ok(true)
     };
 
-    println!();
-    println!("{}", "═════════════════════════════════════".bright_cyan());
+    if global_flags.should_output() {
+        println!();
+        println!("{}", "═════════════════════════════════════".bright_cyan());
+    }
 
     match test_result {
         Ok(true) => {
-            println!("{} All tests passed!", "✓".green().bold());
-            println!("{}", "═════════════════════════════════════".bright_cyan());
+            if global_flags.should_output() {
+                println!("{} All tests passed!", "✓".green().bold());
+                println!("{}", "═════════════════════════════════════".bright_cyan());
+            }
             Ok(())
         },
         Ok(false) => {
             println!("{} Some tests failed", "✗".red().bold());
-            println!("{}", "═════════════════════════════════════".bright_cyan());
-            println!("\n{}", "Troubleshooting:".bright_white().bold());
-            println!("  - Review scenario files in {}", scenarios_dir.display());
-            println!("  - Check server logs for errors");
-            println!("  - Run with --detailed for more output");
+            if global_flags.should_output() {
+                println!("{}", "═════════════════════════════════════".bright_cyan());
+                println!("\n{}", "Troubleshooting:".bright_white().bold());
+                println!("  - Review scenario files in {}", scenarios_dir.display());
+                println!("  - Check server logs for errors");
+                println!("  - Run with --detailed for more output");
+            }
             anyhow::bail!("Tests failed");
         },
         Err(e) => Err(e),

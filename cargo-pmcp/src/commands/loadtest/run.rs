@@ -1,13 +1,16 @@
 //! `cargo pmcp loadtest run` command implementation.
 
 use anyhow::Result;
-use std::io::IsTerminal;
+use pmcp::client::http_middleware::HttpMiddlewareChain;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cargo_pmcp::loadtest::config::LoadTestConfig;
 use cargo_pmcp::loadtest::engine::LoadTestEngine;
 use cargo_pmcp::loadtest::report::{write_report, LoadTestReport};
 use cargo_pmcp::loadtest::summary::render_summary;
+
+use crate::commands::GlobalFlags;
 
 /// Execute the `loadtest run` command.
 ///
@@ -20,8 +23,15 @@ pub async fn execute_run(
     duration: Option<u64>,
     iterations: Option<u64>,
     no_report: bool,
-    no_color: bool,
+    global_flags: &GlobalFlags,
+    api_key: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_issuer: Option<String>,
+    oauth_scopes: Option<Vec<String>>,
+    oauth_no_cache: bool,
+    oauth_redirect_port: u16,
 ) -> Result<()> {
+    let no_color = global_flags.no_color;
     // Step 1: Load config
     let config_file = match config_path {
         Some(path) => {
@@ -45,13 +55,36 @@ pub async fn execute_run(
         },
     };
 
-    eprintln!("Loading config from: {}", config_file.display());
+    if global_flags.should_output() {
+        eprintln!("Loading config from: {}", config_file.display());
+    }
 
     let mut config = LoadTestConfig::load(&config_file)
         .map_err(|e| anyhow::anyhow!("Failed to load config '{}': {}", config_file.display(), e))?;
 
     // Step 2: Apply CLI overrides
-    apply_overrides(&mut config, vus, duration);
+    apply_overrides(&mut config, vus, duration, global_flags);
+
+    // Step 2.5: Set up authentication middleware (acquire token ONCE before spawning VUs)
+    let is_oauth = oauth_client_id.is_some();
+    let http_middleware_chain = resolve_auth_middleware(
+        &url,
+        api_key,
+        oauth_client_id,
+        oauth_issuer,
+        oauth_scopes,
+        oauth_no_cache,
+        oauth_redirect_port,
+    )
+    .await?;
+
+    if global_flags.should_output() {
+        match &http_middleware_chain {
+            Some(_) if is_oauth => eprintln!("Authentication: OAuth 2.0 (token acquired)"),
+            Some(_) => eprintln!("Authentication: API key"),
+            None => eprintln!("Authentication: none"),
+        }
+    }
 
     // Step 3: Build and run the engine
     let mut engine = LoadTestEngine::new(config, url.clone());
@@ -59,6 +92,7 @@ pub async fn execute_run(
         engine = engine.with_iterations(n);
     }
     engine = engine.with_no_color(no_color);
+    engine = engine.with_http_middleware(http_middleware_chain);
 
     let result = engine
         .run()
@@ -66,11 +100,7 @@ pub async fn execute_run(
         .map_err(|e| anyhow::anyhow!("Load test failed: {}", e))?;
 
     // Step 4: Output k6-style terminal summary
-    // Set color override based on --no-color flag and TTY detection
-    if no_color || !std::io::stdout().is_terminal() {
-        colored::control::set_override(false);
-    }
-
+    // Color override is already set globally in main() — no local override needed
     let summary = render_summary(&result, engine.config(), &url);
     println!("{summary}");
 
@@ -80,12 +110,16 @@ pub async fn execute_run(
         let cwd = std::env::current_dir()?;
         match write_report(&report, &cwd) {
             Ok(path) => {
-                eprintln!();
-                eprintln!("Report written to: {}", path.display());
+                if global_flags.should_output() {
+                    eprintln!();
+                    eprintln!("Report written to: {}", path.display());
+                }
             },
             Err(e) => {
-                eprintln!();
-                eprintln!("Warning: Failed to write report: {}", e);
+                if global_flags.should_output() {
+                    eprintln!();
+                    eprintln!("Warning: Failed to write report: {}", e);
+                }
                 // Non-fatal -- the test still completed successfully
             },
         }
@@ -97,13 +131,21 @@ pub async fn execute_run(
 /// Apply CLI flag overrides to a loaded config.
 ///
 /// When stages are present, `--vus` is ignored (stages define VU targets)
-/// and a warning is logged. Duration override still applies as safety ceiling.
-fn apply_overrides(config: &mut LoadTestConfig, vus: Option<u32>, duration: Option<u64>) {
+/// and a warning is logged if not in quiet mode. Duration override still
+/// applies as safety ceiling.
+fn apply_overrides(
+    config: &mut LoadTestConfig,
+    vus: Option<u32>,
+    duration: Option<u64>,
+    global_flags: &GlobalFlags,
+) {
     if let Some(v) = vus {
         if config.has_stages() {
-            eprintln!(
-                "Warning: --vus={v} ignored because config contains [[stage]] blocks (stages define VU targets)"
-            );
+            if global_flags.should_output() {
+                eprintln!(
+                    "Warning: --vus={v} ignored because config contains [[stage]] blocks (stages define VU targets)"
+                );
+            }
         } else {
             config.settings.virtual_users = v;
         }
@@ -131,6 +173,73 @@ fn discover_config() -> Option<PathBuf> {
     }
 }
 
+/// Resolve authentication middleware from CLI flags.
+///
+/// Checks for API key (simpler, takes precedence) or OAuth client ID
+/// (triggers full OAuth flow). Returns `None` when no auth is configured.
+/// OAuth token acquisition happens once at startup (fail-fast on bad config).
+async fn resolve_auth_middleware(
+    mcp_server_url: &str,
+    api_key: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_issuer: Option<String>,
+    oauth_scopes: Option<Vec<String>>,
+    oauth_no_cache: bool,
+    oauth_redirect_port: u16,
+) -> Result<Option<Arc<HttpMiddlewareChain>>> {
+    // API key takes precedence (simpler, no flow needed)
+    if let Some(key) = api_key {
+        use pmcp::client::oauth_middleware::{BearerToken, OAuthClientMiddleware};
+
+        if std::env::var("PMCP_QUIET").is_err() {
+            eprintln!("Using API key authentication");
+        }
+        let bearer_token = BearerToken::new(key);
+        let middleware = OAuthClientMiddleware::new(bearer_token);
+        let mut chain = HttpMiddlewareChain::new();
+        chain.add(Arc::new(middleware));
+        return Ok(Some(Arc::new(chain)));
+    }
+
+    // OAuth flow if client_id is provided
+    if let Some(client_id) = oauth_client_id {
+        use pmcp::client::oauth::{default_cache_path, OAuthConfig, OAuthHelper};
+
+        let scopes = oauth_scopes.unwrap_or_else(|| vec!["openid".to_string()]);
+        let cache_file = if oauth_no_cache {
+            None
+        } else {
+            Some(default_cache_path())
+        };
+
+        let config = OAuthConfig {
+            issuer: oauth_issuer.clone(),
+            mcp_server_url: Some(mcp_server_url.to_string()),
+            client_id,
+            scopes,
+            cache_file,
+            redirect_port: oauth_redirect_port,
+        };
+
+        let helper =
+            OAuthHelper::new(config).map_err(|e| anyhow::anyhow!("OAuth setup failed: {e}"))?;
+        let chain = helper
+            .create_middleware_chain()
+            .await
+            .map_err(|e| anyhow::anyhow!("OAuth authentication failed: {e}"))?;
+        return Ok(Some(chain));
+    }
+
+    // Warn if issuer provided without client_id
+    if oauth_issuer.is_some() && std::env::var("PMCP_QUIET").is_err() {
+        eprintln!(
+            "Warning: --oauth-issuer provided but --oauth-client-id missing. OAuth disabled."
+        );
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +261,7 @@ mod tests {
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -161,7 +271,12 @@ mod tests {
             stage: vec![],
         };
 
-        apply_overrides(&mut config, Some(50), None);
+        let gf = GlobalFlags {
+            verbose: false,
+            no_color: false,
+            quiet: false,
+        };
+        apply_overrides(&mut config, Some(50), None, &gf);
         assert_eq!(config.settings.virtual_users, 50);
         assert_eq!(config.settings.duration_secs, 60);
     }
@@ -174,6 +289,7 @@ mod tests {
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -183,7 +299,12 @@ mod tests {
             stage: vec![],
         };
 
-        apply_overrides(&mut config, None, Some(120));
+        let gf = GlobalFlags {
+            verbose: false,
+            no_color: false,
+            quiet: false,
+        };
+        apply_overrides(&mut config, None, Some(120), &gf);
         assert_eq!(config.settings.virtual_users, 10);
         assert_eq!(config.settings.duration_secs, 120);
     }
@@ -196,6 +317,7 @@ mod tests {
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -205,7 +327,12 @@ mod tests {
             stage: vec![],
         };
 
-        apply_overrides(&mut config, Some(25), Some(300));
+        let gf = GlobalFlags {
+            verbose: false,
+            no_color: false,
+            quiet: false,
+        };
+        apply_overrides(&mut config, Some(25), Some(300), &gf);
         assert_eq!(config.settings.virtual_users, 25);
         assert_eq!(config.settings.duration_secs, 300);
     }
@@ -218,6 +345,7 @@ mod tests {
                 duration_secs: 60,
                 timeout_ms: 5000,
                 expected_interval_ms: 100,
+                request_interval_ms: None,
             },
             scenario: vec![ScenarioStep::ToolCall {
                 weight: 100,
@@ -227,7 +355,12 @@ mod tests {
             stage: vec![],
         };
 
-        apply_overrides(&mut config, None, None);
+        let gf = GlobalFlags {
+            verbose: false,
+            no_color: false,
+            quiet: false,
+        };
+        apply_overrides(&mut config, None, None, &gf);
         assert_eq!(config.settings.virtual_users, 10);
         assert_eq!(config.settings.duration_secs, 60);
     }

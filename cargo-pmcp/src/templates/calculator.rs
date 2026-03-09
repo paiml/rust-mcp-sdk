@@ -21,7 +21,7 @@ pub const CALCULATOR_LIB: &str = r####"//! Simple Calculator MCP Server
 //! ## Output Schema Feature
 //!
 //! This server uses `TypedToolWithOutput` which automatically generates
-//! output schema annotations (`pmcp:outputSchema`, `pmcp:outputTypeName`).
+//! a top-level `outputSchema` on ToolInfo and `pmcp:outputTypeName` in annotations.
 //! This enables code generators to create typed clients for server composition:
 //!
 //! ```rust,ignore
@@ -63,7 +63,7 @@ pub struct AddInput {
 ///
 /// This type is used for:
 /// 1. Type-safe return values from the tool handler
-/// 2. Automatic output schema generation (`pmcp:outputSchema` annotation)
+/// 2. Automatic output schema generation (top-level `outputSchema` on ToolInfo)
 /// 3. Enabling typed client generation for server composition
 ///
 /// When this server is composed by another MCP server, the code generator
@@ -95,7 +95,7 @@ async fn add_tool(input: AddInput, _extra: pmcp::RequestHandlerExtra) -> Result<
 /// This server demonstrates the PMCP output schema feature:
 /// - Tools are registered with `TypedToolWithOutput` instead of `TypedTool`
 /// - Both input AND output types derive `JsonSchema`
-/// - The tool's `ToolInfo` includes `pmcp:outputSchema` and `pmcp:outputTypeName`
+/// - The tool's `ToolInfo` includes top-level `outputSchema` and `pmcp:outputTypeName` in annotations
 ///
 /// When you run `cargo pmcp schema export`, the exported schema will include
 /// the output type information, enabling `cargo pmcp generate` to create
@@ -113,7 +113,7 @@ pub fn build_calculator_server() -> Result<Server> {
         // Using TypedToolWithOutput for full input/output type safety
         // This automatically generates:
         // - Input schema from AddInput (as inputSchema)
-        // - Output schema from AddResult (as pmcp:outputSchema annotation)
+        // - Output schema from AddResult (as top-level outputSchema on ToolInfo)
         .tool(
             "add",
             TypedToolWithOutput::new("add", |input: AddInput, extra| {

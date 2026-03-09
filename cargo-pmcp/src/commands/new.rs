@@ -26,7 +26,13 @@ impl ServerTier {
     }
 }
 
-pub fn execute(name: String, path: Option<String>, tier: Option<String>) -> Result<()> {
+pub fn execute(
+    name: String,
+    path: Option<String>,
+    tier: Option<String>,
+    global_flags: &crate::commands::GlobalFlags,
+) -> Result<()> {
+    let not_quiet = global_flags.should_output();
     let tier = tier.as_deref().and_then(ServerTier::from_str);
 
     let tier_label = match tier {
@@ -35,13 +41,15 @@ pub fn execute(name: String, path: Option<String>, tier: Option<String>) -> Resu
         None => "",
     };
 
-    println!(
-        "\n{}",
-        format!("Creating MCP workspace{}", tier_label)
-            .bright_cyan()
-            .bold()
-    );
-    println!("{}", "────────────────────────────────────".bright_cyan());
+    if not_quiet {
+        println!(
+            "\n{}",
+            format!("Creating MCP workspace{}", tier_label)
+                .bright_cyan()
+                .bold()
+        );
+        println!("{}", "────────────────────────────────────".bright_cyan());
+    }
 
     // Determine workspace directory
     let workspace_dir = if let Some(p) = path {
@@ -69,13 +77,15 @@ pub fn execute(name: String, path: Option<String>, tier: Option<String>) -> Resu
         create_domain_composition_structure(&workspace_dir, &name)?;
     }
 
-    println!("\n{} Workspace created successfully!", "✓".green().bold());
+    if not_quiet {
+        println!("\n{} Workspace created successfully!", "✓".green().bold());
 
-    // Print tier-specific next steps
-    match tier {
-        Some(ServerTier::Domain) => print_domain_next_steps(&name),
-        Some(ServerTier::Foundation) => print_foundation_next_steps(&name),
-        None => print_default_next_steps(&name),
+        // Print tier-specific next steps
+        match tier {
+            Some(ServerTier::Domain) => print_domain_next_steps(&name),
+            Some(ServerTier::Foundation) => print_foundation_next_steps(&name),
+            None => print_default_next_steps(&name),
+        }
     }
 
     Ok(())
@@ -104,7 +114,9 @@ fn create_workspace_structure(
             .context("Failed to create schemas directory")?;
     }
 
-    println!("  {} Generated workspace structure", "✓".green());
+    if std::env::var("PMCP_QUIET").is_err() {
+        println!("  {} Generated workspace structure", "✓".green());
+    }
 
     Ok(())
 }
@@ -135,10 +147,12 @@ fn create_domain_composition_structure(workspace_dir: &Path, name: &str) -> Resu
     fs::write(foundations_dir.join("mod.rs"), mod_content)
         .context("Failed to create foundations/mod.rs")?;
 
-    println!(
-        "  {} Created composition structure for domain server",
-        "✓".green()
-    );
+    if std::env::var("PMCP_QUIET").is_err() {
+        println!(
+            "  {} Created composition structure for domain server",
+            "✓".green()
+        );
+    }
 
     Ok(())
 }

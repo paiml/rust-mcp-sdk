@@ -32,7 +32,9 @@ pub enum ValidateCommand {
 }
 
 impl ValidateCommand {
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
+        // quiet mode conveyed via PMCP_QUIET env var for downstream functions
+        let _ = global_flags;
         match self {
             ValidateCommand::Workflows {
                 generate,
@@ -45,22 +47,28 @@ impl ValidateCommand {
 
 /// Main validation entry point
 fn validate_workflows(generate: bool, verbose: bool, server: Option<String>) -> Result<()> {
-    println!("\n{}", style("🔍 PMCP Workflow Validation").cyan().bold());
-    println!("{}", style("━".repeat(50)).dim());
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+
+    if not_quiet {
+        println!("\n{}", style("PMCP Workflow Validation").cyan().bold());
+        println!("{}", style("━".repeat(50)).dim());
+    }
 
     // Change to server directory if specified
     let original_dir = std::env::current_dir()?;
     if let Some(ref server_dir) = server {
         std::env::set_current_dir(server_dir)
             .with_context(|| format!("Failed to change to server directory: {}", server_dir))?;
-        println!(
-            "  {} Validating in: {}",
-            style("→").dim(),
-            style(server_dir).yellow()
-        );
+        if not_quiet {
+            println!(
+                "  {} Validating in: {}",
+                style("→").dim(),
+                style(server_dir).yellow()
+            );
+        }
     }
 
-    let result = run_validation(generate, verbose);
+    let result = run_validation(generate, verbose, not_quiet);
 
     // Restore original directory
     std::env::set_current_dir(original_dir)?;
@@ -68,9 +76,11 @@ fn validate_workflows(generate: bool, verbose: bool, server: Option<String>) -> 
     result
 }
 
-fn run_validation(generate: bool, verbose: bool) -> Result<()> {
+fn run_validation(generate: bool, verbose: bool, not_quiet: bool) -> Result<()> {
     // Step 1: Run cargo check
-    println!("\n{} Checking compilation...", style("Step 1:").bold());
+    if not_quiet {
+        println!("\n{} Checking compilation...", style("Step 1:").bold());
+    }
 
     let check_status = Command::new("cargo")
         .args(["check", "--message-format=short"])
@@ -94,53 +104,67 @@ fn run_validation(generate: bool, verbose: bool) -> Result<()> {
         );
         return Err(anyhow::anyhow!("Compilation failed"));
     }
-    println!("  {} Compilation successful", style("✓").green());
+    if not_quiet {
+        println!("  {} Compilation successful", style("✓").green());
+    }
 
     // Step 2: Check for workflow tests
-    println!(
-        "\n{} Looking for workflow validation tests...",
-        style("Step 2:").bold()
-    );
+    if not_quiet {
+        println!(
+            "\n{} Looking for workflow validation tests...",
+            style("Step 2:").bold()
+        );
+    }
 
     let test_patterns = find_workflow_tests()?;
 
     if test_patterns.is_empty() {
         if generate {
-            println!(
-                "  {} No workflow tests found. Generating scaffolding...",
-                style("!").yellow()
-            );
-            generate_validation_scaffolding()?;
-            println!(
-                "  {} Generated validation test scaffolding",
-                style("✓").green()
-            );
-            println!(
-                "\n  Run {} again to validate",
-                style("cargo pmcp validate workflows").cyan()
-            );
+            if not_quiet {
+                println!(
+                    "  {} No workflow tests found. Generating scaffolding...",
+                    style("!").yellow()
+                );
+            }
+            generate_validation_scaffolding(not_quiet)?;
+            if not_quiet {
+                println!(
+                    "  {} Generated validation test scaffolding",
+                    style("✓").green()
+                );
+                println!(
+                    "\n  Run {} again to validate",
+                    style("cargo pmcp validate workflows").cyan()
+                );
+            }
             return Ok(());
         } else {
-            println!(
-                "  {} No workflow validation tests found",
-                style("!").yellow()
-            );
-            print_test_guidance();
+            if not_quiet {
+                println!(
+                    "  {} No workflow validation tests found",
+                    style("!").yellow()
+                );
+                print_test_guidance(not_quiet);
+            }
             return Ok(());
         }
     }
 
-    println!(
-        "  {} Found {} workflow test pattern(s)",
-        style("✓").green(),
-        test_patterns.len()
-    );
+    if not_quiet {
+        println!(
+            "  {} Found {} workflow test pattern(s)",
+            style("✓").green(),
+            test_patterns.len()
+        );
+    }
 
     // Step 3: Run workflow tests
-    println!(
-        "\n{} Running workflow validation tests...",
-        style("Step 3:").bold()
-    );
+    if not_quiet {
+        println!(
+            "\n{} Running workflow validation tests...",
+            style("Step 3:").bold()
+        );
+    }
 
     let mut all_passed = true;
     let mut total_tests = 0;
@@ -169,26 +193,30 @@ fn run_validation(generate: bool, verbose: bool) -> Result<()> {
 
         if tests_failed > 0 {
             all_passed = false;
-            println!(
-                "  {} Pattern '{}': {} passed, {} failed",
-                style("✗").red(),
-                pattern,
-                tests_passed,
-                style(tests_failed).red()
-            );
+            if not_quiet {
+                println!(
+                    "  {} Pattern '{}': {} passed, {} failed",
+                    style("✗").red(),
+                    pattern,
+                    tests_passed,
+                    style(tests_failed).red()
+                );
+            }
 
             // Show failure details
             if !verbose {
                 print_failure_summary(&stdout, &stderr);
             }
         } else if tests_run > 0 {
-            println!(
-                "  {} Pattern '{}': {} passed",
-                style("✓").green(),
-                pattern,
-                tests_passed
-            );
-        } else {
+            if not_quiet {
+                println!(
+                    "  {} Pattern '{}': {} passed",
+                    style("✓").green(),
+                    pattern,
+                    tests_passed
+                );
+            }
+        } else if not_quiet {
             println!(
                 "  {} Pattern '{}': no tests matched",
                 style("-").dim(),
@@ -198,21 +226,27 @@ fn run_validation(generate: bool, verbose: bool) -> Result<()> {
     }
 
     // Summary
-    println!("\n{}", style("━".repeat(50)).dim());
+    if not_quiet {
+        println!("\n{}", style("━".repeat(50)).dim());
+    }
 
     if all_passed && total_tests > 0 {
-        println!(
-            "{} All {} workflow validation tests passed!",
-            style("✓").green().bold(),
-            passed_tests
-        );
-        println!("\n  Your workflows are structurally valid and ready for use.");
+        if not_quiet {
+            println!(
+                "{} All {} workflow validation tests passed!",
+                style("✓").green().bold(),
+                passed_tests
+            );
+            println!("\n  Your workflows are structurally valid and ready for use.");
+        }
     } else if total_tests == 0 {
-        println!(
-            "{} No workflow tests were executed",
-            style("!").yellow().bold()
-        );
-        print_test_guidance();
+        if not_quiet {
+            println!(
+                "{} No workflow tests were executed",
+                style("!").yellow().bold()
+            );
+            print_test_guidance(not_quiet);
+        }
     } else {
         println!(
             "{} Workflow validation failed: {} of {} tests passed",
@@ -327,7 +361,7 @@ fn print_failure_summary(stdout: &str, stderr: &str) {
 }
 
 /// Generate validation test scaffolding
-fn generate_validation_scaffolding() -> Result<()> {
+fn generate_validation_scaffolding(not_quiet: bool) -> Result<()> {
     let test_dir = std::path::Path::new("tests");
     if !test_dir.exists() {
         std::fs::create_dir(test_dir)?;
@@ -335,11 +369,13 @@ fn generate_validation_scaffolding() -> Result<()> {
 
     let test_file = test_dir.join("workflow_validation.rs");
     if test_file.exists() {
-        println!(
-            "    {} Test file already exists: {}",
-            style("!").yellow(),
-            test_file.display()
-        );
+        if not_quiet {
+            println!(
+                "    {} Test file already exists: {}",
+                style("!").yellow(),
+                test_file.display()
+            );
+        }
         return Ok(());
     }
 
@@ -414,54 +450,58 @@ async fn test_workflow_execution() {
 "#;
 
     std::fs::write(&test_file, test_content)?;
-    println!(
-        "    {} Created: {}",
-        style("→").dim(),
-        style(test_file.display()).cyan()
-    );
+    if not_quiet {
+        println!(
+            "    {} Created: {}",
+            style("→").dim(),
+            style(test_file.display()).cyan()
+        );
+    }
 
     Ok(())
 }
 
 /// Print guidance on creating workflow tests
-fn print_test_guidance() {
-    println!(
-        "\n{}",
-        style("How to create workflow validation tests:").bold()
-    );
-    println!();
-    println!(
-        "  1. Run {} to generate scaffolding",
-        style("cargo pmcp validate workflows --generate").cyan()
-    );
-    println!();
-    println!("  2. Or manually add tests like:");
-    println!();
-    println!(
-        "     {}",
-        style("// In tests/workflow_validation.rs or your lib.rs").dim()
-    );
-    println!("     {}", style("#[test]").yellow());
-    println!(
-        "     {} test_my_workflow_is_valid() {{",
-        style("fn").yellow()
-    );
-    println!("         let workflow = create_my_workflow();");
-    println!("         workflow.validate().expect(\"Workflow should be valid\");");
-    println!("         assert_eq!(workflow.name(), \"my_workflow\");");
-    println!("     }}");
-    println!();
-    println!(
-        "  3. Run {} to validate",
-        style("cargo pmcp validate workflows").cyan()
-    );
-    println!();
-    println!(
-        "  {} Validation is automatic when you call .prompt_workflow(),",
-        style("Note:").bold()
-    );
-    println!(
-        "        but tests let you catch errors at {} time.",
-        style("cargo test").cyan()
-    );
+fn print_test_guidance(not_quiet: bool) {
+    if not_quiet {
+        println!(
+            "\n{}",
+            style("How to create workflow validation tests:").bold()
+        );
+        println!();
+        println!(
+            "  1. Run {} to generate scaffolding",
+            style("cargo pmcp validate workflows --generate").cyan()
+        );
+        println!();
+        println!("  2. Or manually add tests like:");
+        println!();
+        println!(
+            "     {}",
+            style("// In tests/workflow_validation.rs or your lib.rs").dim()
+        );
+        println!("     {}", style("#[test]").yellow());
+        println!(
+            "     {} test_my_workflow_is_valid() {{",
+            style("fn").yellow()
+        );
+        println!("         let workflow = create_my_workflow();");
+        println!("         workflow.validate().expect(\"Workflow should be valid\");");
+        println!("         assert_eq!(workflow.name(), \"my_workflow\");");
+        println!("     }}");
+        println!();
+        println!(
+            "  3. Run {} to validate",
+            style("cargo pmcp validate workflows").cyan()
+        );
+        println!();
+        println!(
+            "  {} Validation is automatic when you call .prompt_workflow(),",
+            style("Note:").bold()
+        );
+        println!(
+            "        but tests let you catch errors at {} time.",
+            style("cargo test").cyan()
+        );
+    }
 }

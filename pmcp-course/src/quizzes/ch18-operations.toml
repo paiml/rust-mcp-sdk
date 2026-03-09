@@ -1,0 +1,189 @@
+# Quiz: Operations and Performance
+
+id = "ch18-operations"
+title = "Operations, Monitoring, and Load Testing"
+lesson_id = "ch18"
+pass_threshold = 0.7
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "Why use cargo pmcp loadtest instead of generic HTTP tools like wrk or ab for MCP servers?"
+prompt.distractors = [
+    "It runs faster than wrk because it uses Rust instead of C for the request engine",
+    "It automatically fixes performance issues it discovers during the test run",
+    "It generates API documentation from the server schema during the load test"
+]
+answer.answer = "It understands MCP protocol semantics -- performing initialize handshakes, sending typed tools/call requests, and tracking per-operation HdrHistogram metrics"
+answer.position = 0
+context = """
+Generic HTTP tools like wrk or ab send raw HTTP requests without understanding MCP.
+cargo pmcp loadtest performs proper initialize handshakes, sends typed tools/call,
+resources/read, and prompts/get requests, and tracks per-operation metrics with
+HdrHistogram percentile accuracy. You don't need to manually construct JSON-RPC
+payloads -- the tool handles MCP protocol semantics for you.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800001"
+
+[[questions]]
+type = "ShortAnswer"
+prompt.prompt = "What does cargo pmcp loadtest init <url> do?"
+answer.answer = "Connects to a running server, discovers its tools/resources/prompts via schema discovery, and generates a TOML config file automatically"
+answer.alternatives = [
+    "discovers tools and generates a TOML config",
+    "schema discovery and config generation",
+    "connects to server and generates loadtest config",
+]
+context = """
+The init command performs schema discovery: it connects to the running MCP server,
+calls tools/list to discover available tools, resources, and prompts, then generates
+a .pmcp/loadtest.toml configuration file with balanced weights and sensible defaults.
+This saves you from manually writing JSON-RPC payloads or guessing tool names.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800002"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What are the three scenario types supported in a loadtest TOML config?"
+prompt.distractors = [
+    "http/get, http/post, and websocket/send for transport-level testing",
+    "unit/test, integration/test, and stress/test for different testing modes",
+    "connect, handshake, and disconnect for connection lifecycle testing"
+]
+answer.answer = "tools/call, resources/read, and prompts/get -- matching MCP protocol operations"
+answer.position = 1
+context = """
+The loadtest config supports three MCP operation types as scenario types: tools/call
+(invoke a tool with arguments), resources/read (read a resource by URI), and
+prompts/get (fetch a prompt with arguments). Each [[scenario]] block specifies a type
+and a weight that controls how often that operation is selected relative to others.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800003"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What is the difference between flat and staged load profiles?"
+prompt.distractors = [
+    "Flat runs on localhost only while staged runs against remote deployed servers",
+    "Flat tests one tool at a time while staged tests multiple tools simultaneously",
+    "Flat uses HTTP transport while staged uses WebSocket transport for load testing"
+]
+answer.answer = "Flat holds constant VUs for a fixed duration; staged ramps VUs through multiple stages for progressive load increase"
+answer.position = 2
+context = """
+Flat load starts all virtual users immediately and holds constant pressure for the
+entire duration. Staged load uses [[stage]] blocks to ramp VUs up and down over time --
+each stage specifies a target_vus and duration_secs, and the engine linearly ramps
+between levels. Staged profiles are essential for finding breaking points and
+simulating realistic traffic patterns like morning ramp-ups.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800004"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "Why is P99 latency more useful than average latency for load testing?"
+prompt.distractors = [
+    "P99 is faster to calculate than average because it requires fewer samples",
+    "P99 is the industry standard metric required by all cloud provider SLAs",
+    "P99 uses less memory to track than computing a running average value"
+]
+answer.answer = "Average hides tail latency -- P99 shows the worst-case experience for 1% of requests, revealing problems the average would obscure"
+answer.position = 3
+context = """
+An average of 50ms might mean all requests took ~50ms (great) or 99% took 10ms and
+1% took 4000ms (terrible). The average hides the truth. P99 reveals that 1% of users
+waited 4 seconds. At scale, 1% means thousands of bad experiences daily. Always focus
+on P95 and P99 when load testing MCP servers -- they show the worst-case user experience.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800005"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What is coordinated omission and why does cargo pmcp loadtest correct for it?"
+prompt.distractors = [
+    "When multiple VUs accidentally send identical requests, skewing throughput numbers upward",
+    "When the test client omits error responses from the final metrics report",
+    "When the server coordinates request scheduling to avoid resource contention"
+]
+answer.answer = "When slow responses cause the test to send fewer requests, hiding true latency; correction records synthetic samples for requests that would have been sent on schedule"
+answer.position = 0
+context = """
+When a server stalls (GC pause, pool exhaustion), a naive load tester stops sending
+new requests because the current one hasn't returned. During a 10-second stall, only
+ONE slow sample is recorded instead of the ~100 that would have been sent. The engine
+uses HdrHistogram's record_correct() to fill in synthetic samples at expected_interval_ms
+intervals, so percentiles reflect the true user experience during stalls.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800006"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "How does the loadtest tool detect a server's breaking point?"
+prompt.distractors = [
+    "It sends a special MCP ping request and checks if the response time exceeds 1 second",
+    "It monitors the server's CPU usage via an admin endpoint and alerts at 90%",
+    "It counts total requests and triggers when throughput drops below 10 requests per second"
+]
+answer.answer = "It uses a rolling window detector that triggers when error rate exceeds 10% AND 2x baseline, OR when P99 latency exceeds 3x baseline"
+answer.position = 1
+context = """
+The self-calibrating breaking point detector maintains a rolling window of 10 samples
+(taken every 2 seconds). It splits the window into older (baseline) and newer (recent)
+halves. Detection triggers on either: (1) error rate spike -- recent error rate is both
+>10% absolute AND >2x baseline, or (2) latency degradation -- recent P99 exceeds 3x
+baseline P99. The detector fires once per test run, then the test continues for full data.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800007"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What does the virtual_users parameter control in a loadtest config?"
+prompt.distractors = [
+    "The maximum number of requests that can be queued before the test starts dropping them",
+    "The number of CPU threads allocated to the load testing engine for parallel execution",
+    "The number of unique user credentials rotated during authentication testing"
+]
+answer.answer = "The number of concurrent simulated clients, each maintaining its own connection and sending requests independently"
+answer.position = 2
+context = """
+Virtual users (VUs) are concurrent simulated MCP clients. Each VU maintains its own
+connection to the server and sends requests independently in a loop. With 10 VUs,
+the server sees 10 simultaneous clients. When [[stage]] blocks are present, the
+virtual_users setting is ignored and VU count is controlled by the stage ramp instead.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800008"
+
+[[questions]]
+type = "ShortAnswer"
+prompt.prompt = "What command generates a ready-to-run loadtest config from a running server?"
+answer.answer = "cargo pmcp loadtest init <url>"
+answer.alternatives = [
+    "cargo pmcp loadtest init",
+    "loadtest init",
+    "cargo pmcp loadtest init <URL>",
+]
+context = """
+The command cargo pmcp loadtest init <url> connects to the running server, performs
+schema discovery (calling tools/list, resources/list, prompts/list), and generates
+a .pmcp/loadtest.toml config file with discovered operations and sensible defaults.
+Without a URL, it generates a default template. With --force, it overwrites existing configs.
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800009"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What is the recommended approach to determine production capacity from load test results?"
+prompt.distractors = [
+    "Use the P50 latency as the capacity target since it represents the median experience",
+    "Run the test for exactly 24 hours to simulate a full day of production traffic",
+    "Set capacity to the maximum VU count that produces any successful response"
+]
+answer.answer = "Find the breaking point, then plan for 2x your expected peak concurrent users to ensure sufficient headroom"
+answer.position = 3
+context = """
+The capacity planning framework: run tests at increasing VU counts, record P99 and
+error rate for each, and find where degradation begins (the breaking point). Then apply
+the 2x headroom rule -- if you expect 15 peak concurrent clients, ensure the server
+handles 30 VUs comfortably. Keep error rate below 1% at expected peak, and set a P99
+budget based on your use case (500ms for interactive tool calls is common).
+"""
+id = "f18a1b2c-d3e4-5678-abcd-123456800010"

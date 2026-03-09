@@ -10,6 +10,7 @@ use crate::loadtest::config::{LoadTestConfig, ScenarioStep};
 use crate::loadtest::error::McpError;
 use crate::loadtest::metrics::{OperationType, RequestSample};
 
+use pmcp::client::http_middleware::HttpMiddlewareChain;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use reqwest::Client;
@@ -68,6 +69,7 @@ pub fn step_to_operation_type(step: &ScenarioStep) -> OperationType {
         ScenarioStep::ToolCall { .. } => OperationType::ToolsCall,
         ScenarioStep::ResourceRead { .. } => OperationType::ResourcesRead,
         ScenarioStep::PromptGet { .. } => OperationType::PromptsGet,
+        ScenarioStep::CodeMode { .. } => OperationType::CodeMode,
     }
 }
 
@@ -94,6 +96,10 @@ async fn execute_step(
         } => {
             let result = client.get_prompt(prompt, arguments).await;
             (OperationType::PromptsGet, result.map(|_| ()))
+        },
+        ScenarioStep::CodeMode { code, format, .. } => {
+            let result = client.execute_code_mode(code, format).await;
+            (OperationType::CodeMode, result.map(|_| ()))
         },
     }
 }
@@ -132,6 +138,7 @@ fn is_session_fatal(err: &McpError) -> bool {
 ///
 /// Returns the initialized client and the request sample for the initialize call,
 /// or `None` if initialization failed after all respawn attempts.
+#[allow(clippy::too_many_arguments)]
 async fn try_initialize(
     vu_id: u32,
     http_client: &Client,
@@ -140,13 +147,19 @@ async fn try_initialize(
     sample_tx: &mpsc::Sender<RequestSample>,
     cancel: &CancellationToken,
     max_attempts: u32,
+    http_middleware_chain: Option<Arc<HttpMiddlewareChain>>,
 ) -> Option<McpClient> {
     for attempt in 0..max_attempts {
         if cancel.is_cancelled() {
             return None;
         }
 
-        let mut client = McpClient::new(http_client.clone(), base_url.to_owned(), timeout);
+        let mut client = McpClient::new(
+            http_client.clone(),
+            base_url.to_owned(),
+            timeout,
+            http_middleware_chain.clone(),
+        );
         let start = Instant::now();
         let result = client.initialize().await;
         let duration = start.elapsed();
@@ -198,6 +211,7 @@ pub async fn vu_loop(
     iteration_counter: Option<Arc<AtomicU64>>,
     max_iterations: Option<u64>,
     active_vus: ActiveVuCounter,
+    http_middleware_chain: Option<Arc<HttpMiddlewareChain>>,
 ) {
     active_vus.increment();
 
@@ -211,6 +225,7 @@ pub async fn vu_loop(
         &cancel,
         iteration_counter.as_ref(),
         max_iterations,
+        http_middleware_chain,
     )
     .await;
 
@@ -234,6 +249,7 @@ async fn vu_loop_inner(
     cancel: &CancellationToken,
     iteration_counter: Option<&Arc<AtomicU64>>,
     max_iterations: Option<u64>,
+    http_middleware_chain: Option<Arc<HttpMiddlewareChain>>,
 ) -> Result<(), String> {
     let timeout = config.settings.timeout_as_duration();
 
@@ -246,6 +262,7 @@ async fn vu_loop_inner(
         sample_tx,
         cancel,
         MAX_RESPAWN_ATTEMPTS,
+        http_middleware_chain.clone(),
     )
     .await
     .ok_or_else(|| "all initialize attempts failed".to_string())?;
@@ -285,6 +302,7 @@ async fn vu_loop_inner(
             ScenarioStep::ToolCall { tool, .. } => Some(tool.clone()),
             ScenarioStep::ResourceRead { uri, .. } => Some(uri.clone()),
             ScenarioStep::PromptGet { prompt, .. } => Some(prompt.clone()),
+            ScenarioStep::CodeMode { format, .. } => Some(format!("code_mode/{format}")),
         };
 
         // Build and send the metrics sample
@@ -309,9 +327,18 @@ async fn vu_loop_inner(
                     sample_tx,
                     cancel,
                     MAX_RESPAWN_ATTEMPTS,
+                    http_middleware_chain.clone(),
                 )
                 .await
                 .ok_or_else(|| "all respawn attempts failed".to_string())?;
+            }
+        }
+
+        // Pace requests when request_interval_ms is configured
+        if let Some(interval_ms) = config.settings.request_interval_ms {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                _ = cancel.cancelled() => return Ok(()),
             }
         }
     }

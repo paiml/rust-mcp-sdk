@@ -784,11 +784,147 @@
       background: var(--bg-tertiary);
       color: var(--text-primary);
     }
+
+    /* Mode Badge */
+    .mode-badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .mode-badge.standard {
+      background: var(--success-color);
+      color: white;
+    }
+
+    .mode-badge.chatgpt {
+      background: var(--error-color);
+      color: white;
+    }
+
+    /* Protocol Tab */
+    .protocol-checks {
+      font-size: 12px;
+    }
+
+    .protocol-empty {
+      color: var(--text-secondary);
+      font-size: 12px;
+      text-align: center;
+      padding: 20px;
+    }
+
+    .protocol-check {
+      margin-bottom: 8px;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .protocol-check.pass {
+      border-left: 3px solid var(--success-color);
+    }
+
+    .protocol-check.fail {
+      border-left: 3px solid var(--error-color);
+    }
+
+    .protocol-check.fail.chatgpt-mode {
+      background: rgba(239, 68, 68, 0.08);
+    }
+
+    .protocol-check.fail.standard-mode {
+      background: rgba(245, 158, 11, 0.08);
+      border-left-color: var(--warning-color);
+    }
+
+    .protocol-check-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 10px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 11px;
+    }
+
+    .protocol-check-header:hover {
+      background: var(--bg-tertiary);
+    }
+
+    .protocol-check-name {
+      font-weight: 500;
+      flex: 1;
+    }
+
+    .protocol-check-status {
+      font-weight: 600;
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 3px;
+    }
+
+    .protocol-check-status.pass {
+      color: var(--success-color);
+    }
+
+    .protocol-check-status.fail {
+      color: var(--error-color);
+    }
+
+    .protocol-check-details {
+      display: none;
+      padding: 8px 10px;
+      border-top: 1px solid var(--border-color);
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 10px;
+      background: var(--bg-primary);
+    }
+
+    .protocol-check.expanded .protocol-check-details {
+      display: block;
+    }
+
+    .protocol-diff {
+      margin-top: 4px;
+    }
+
+    .protocol-diff-extra {
+      color: var(--warning-color);
+    }
+
+    .protocol-diff-missing {
+      color: var(--error-color);
+    }
+
+    .protocol-diff-label {
+      font-weight: 600;
+      font-size: 10px;
+      color: var(--text-secondary);
+      margin-top: 6px;
+      margin-bottom: 2px;
+    }
+
+    .protocol-diff-label:first-child {
+      margin-top: 0;
+    }
+
+    .protocol-keys-list {
+      padding: 4px 6px;
+      background: var(--bg-tertiary);
+      border-radius: 3px;
+      word-break: break-all;
+    }
   </style>
 </head>
 <body data-theme="light">
   <header class="header">
     <h1>MCP Apps Preview</h1>
+    <span id="mode-badge" class="mode-badge"></span>
     <div class="status-indicator">
       <span class="status-dot" id="status-dot"></span>
       <span id="status-text">Connecting...</span>
@@ -876,6 +1012,7 @@
         <button class="devtools-tab" data-tab="console">Console</button>
         <button class="devtools-tab" data-tab="network">Network</button>
         <button class="devtools-tab" data-tab="events">Events</button>
+        <button class="devtools-tab" data-tab="protocol">Protocol</button>
       </div>
       <div class="devtools-content">
         <div class="devtools-section active" id="tab-state">
@@ -906,6 +1043,12 @@
           <button class="clear-btn" data-clear="events">Clear</button>
           <div id="events-log">
             <div class="empty-state">Events will appear here</div>
+          </div>
+        </div>
+        <div class="devtools-section" id="tab-protocol">
+          <button class="clear-btn" data-clear="protocol">Clear</button>
+          <div id="protocol-checks" class="protocol-checks">
+            <div class="protocol-empty">Run a tool call to see protocol validation results</div>
           </div>
         </div>
       </div>
@@ -940,6 +1083,12 @@
 
         // Network badge
         this.networkUnreadCount = 0;
+
+        // Protocol validation
+        this.mode = 'standard';
+        this.descriptorKeys = [];
+        this.invocationKeys = [];
+        this.protocolResults = [];
 
         // Environment
         this.theme = 'light';
@@ -983,6 +1132,21 @@
           if (config.mcp_url) {
             this.mcpUrl = config.mcp_url;
           }
+
+          // Mode and protocol keys
+          this.mode = config.mode || 'standard';
+          this.descriptorKeys = config.descriptor_keys || config.descriptorKeys || [];
+          this.invocationKeys = config.invocation_keys || config.invocationKeys || [];
+
+          // Populate mode badge
+          const badge = document.getElementById('mode-badge');
+          if (this.mode === 'chatgpt') {
+            badge.textContent = 'ChatGPT Strict';
+            badge.className = 'mode-badge chatgpt';
+          } else {
+            badge.textContent = 'Standard';
+            badge.className = 'mode-badge standard';
+          }
         } catch (e) {
           console.error('Failed to load config:', e);
         }
@@ -1007,6 +1171,17 @@
             this.tools = toolsData.tools;
             this.renderToolList();
 
+            // Validate tools/list _meta keys
+            if (this.descriptorKeys.length > 0) {
+              for (const tool of this.tools) {
+                this.validateProtocol(
+                  `tools/list [${tool.name}]`,
+                  tool._meta || tool.meta,
+                  this.descriptorKeys
+                );
+              }
+            }
+
             // Auto-select initial tool if specified
             if (this.initialTool) {
               const tool = this.tools.find(t => t.name === this.initialTool);
@@ -1020,6 +1195,18 @@
           } else {
             this.uiResources = [];
           }
+
+          // Validate resources/list _meta keys
+          if (this.descriptorKeys.length > 0) {
+            for (const res of this.uiResources) {
+              this.validateProtocol(
+                `resources/list [${res.name || res.uri}]`,
+                res._meta || res.meta,
+                this.descriptorKeys
+              );
+            }
+          }
+
           this.renderResourcePicker();
 
           // Auto-load first resource widget
@@ -1109,6 +1296,23 @@
           const htmlContent = contents.find(item =>
             item.mimeType && item.mimeType.includes('html')
           );
+
+          // Protocol validation for resources/read (warn-only)
+          if (this.descriptorKeys.length > 0) {
+            for (const item of contents) {
+              const extras = {};
+              extras['mimeType'] = {
+                pass: item.mimeType === 'text/html+skybridge',
+                detail: item.mimeType ? `"${item.mimeType}"` : 'MISSING'
+              };
+              this.validateProtocol(
+                `resources/read [${uri}]`,
+                item._meta || item.meta,
+                this.descriptorKeys,
+                extras
+              );
+            }
+          }
 
           if (htmlContent && htmlContent.text) {
             this.loadWidget(htmlContent.text);
@@ -1302,6 +1506,10 @@
             } else if (target === 'events') {
               document.getElementById('events-log').innerHTML =
                 '<div class="empty-state">Events will appear here</div>';
+            } else if (target === 'protocol') {
+              this.protocolResults = [];
+              document.getElementById('protocol-checks').innerHTML =
+                '<div class="protocol-empty">Run a tool call to see protocol validation results</div>';
             }
           });
         });
@@ -1377,7 +1585,7 @@
           this.logNetwork('response', this.selectedTool.name, result, duration, result.success);
 
           if (result.success && result.content) {
-            this.handleToolResponse(result);
+            await this.handleToolResponse(result);
           } else if (result.error) {
             this.logConsole('error', result.error);
           }
@@ -1387,12 +1595,87 @@
         }
       }
 
-      handleToolResponse(result) {
-        this.toolOutput = result.content;
-        this.toolResponseMetadata = result.meta || {};
+      async handleToolResponse(result) {
+        this.toolOutput = result.structuredContent || result.content;
+        const responseMeta = result._meta || result.meta || {};
+        this.toolResponseMetadata = responseMeta;
         this.updateStateView();
 
-        // Find widget HTML in content
+        // Protocol validation for tools/call (warn-only)
+        if (this.invocationKeys.length > 0) {
+          const toolName = this.selectedTool ? this.selectedTool.name : 'unknown';
+          const extras = {};
+          extras['structuredContent'] = {
+            pass: !!result.structuredContent,
+            detail: result.structuredContent ? 'present' : 'MISSING'
+          };
+          this.validateProtocol(
+            `tools/call [${toolName}]`,
+            responseMeta,
+            this.invocationKeys,
+            extras
+          );
+        }
+
+        // Look up widget URI from the TOOL DEFINITION's _meta (tools/list),
+        // not from the tool call response _meta. The SDK filters tool call _meta
+        // to only invocation keys (openai/toolInvocation/*), so outputTemplate
+        // is only available on the tool definition.
+        const toolDefMeta = this.selectedTool?._meta || this.selectedTool?.meta || {};
+        const widgetUri = toolDefMeta['openai/outputTemplate']
+                       || toolDefMeta['ui/resourceUri']
+                       || toolDefMeta['ui']?.['resourceUri'];
+        if (widgetUri) {
+          const iframe = document.getElementById('widget-frame');
+          const widgetAlreadyLoaded = this.activeResourceUri === widgetUri
+            && this.appBridge
+            && iframe
+            && iframe.style.display !== 'none';
+
+          // Helper: deliver tool result data to the widget via AppBridge + ChatGPT postMessage
+          const deliverToolResult = () => {
+            // AppBridge delivery (always active for ui/initialize handshake)
+            if (this.appBridge) {
+              this.appBridge.sendToolInput(this.toolInput);
+              this.appBridge.sendToolResult({
+                structuredContent: result.structuredContent,
+                _meta: responseMeta,
+              });
+            }
+
+            // ChatGPT mode: supplemental postMessage delivery with JSON-RPC envelope
+            const fr = document.getElementById('widget-frame');
+            if (this.mode === 'chatgpt' && fr && fr.contentWindow) {
+              fr.contentWindow.postMessage({
+                jsonrpc: '2.0',
+                method: 'ui/notifications/tool-result',
+                params: { structuredContent: result.structuredContent }
+              }, '*');
+
+              // Also set window.openai properties directly (same-origin srcdoc)
+              try {
+                fr.contentWindow.openai.toolOutput = result.structuredContent;
+                fr.contentWindow.openai.toolInput = this.toolInput || null;
+              } catch(e) { /* srcdoc cross-origin guard */ }
+            }
+          };
+
+          if (widgetAlreadyLoaded) {
+            // Widget is already loaded with the same URI -- send data immediately
+            // without reloading the iframe (which would destroy widget state)
+            deliverToolResult();
+          } else {
+            // First load or different URI -- load widget template then deliver data
+            await this.loadResourceWidget(widgetUri);
+            // Give widget time to initialize its bridge listener
+            setTimeout(deliverToolResult, 300);
+          }
+
+          this.logEvent('toolResponse', { tool: this.selectedTool.name, widget: widgetUri });
+          return;
+        }
+
+        // Fallback: look for inline HTML in content (legacy pattern)
         const widgetContent = result.content.find(c =>
           c.type === 'resource' &&
           c.mimeType &&
@@ -1526,6 +1809,21 @@
        */
       wrapWidgetHtml(html) {
         const sc = '<' + '/script>';
+
+        // In ChatGPT mode, inject window.openai stub BEFORE widget-runtime.mjs
+        // so _detectHost() identifies host as "chatgpt"
+        const openaiStub = this.mode === 'chatgpt' ? `
+  <script>
+    window.openai = {
+      toolOutput: null,
+      toolInput: null,
+      theme: '${this.theme || 'light'}',
+      callTool: async (name, args) => {
+        return window.parent.previewRuntime.handleWidgetToolCall(name, args);
+      }
+    };
+  ${sc}` : '';
+
         return `<!DOCTYPE html>
 <html>
 <head>
@@ -1534,6 +1832,7 @@
   <style>
     body { margin: 0; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
   </style>
+${openaiStub}
   <script type="module">
     // Load bridge from shared library via dynamic import
     const { App, installCompat } = await import('/assets/widget-runtime.mjs');
@@ -1777,6 +2076,101 @@ ${html}
         // Update badge count
         this.networkUnreadCount++;
         this.updateNetworkBadge();
+      }
+
+      // =========================================================================
+      // ChatGPT Mode: widget-to-host tool call bridge
+      // =========================================================================
+
+      async handleWidgetToolCall(name, args) {
+        this.logConsole('log', `[ChatGPT] callTool from widget: ${name}`);
+        this.logEvent('chatgptCallTool', { name, args });
+
+        try {
+          const response = await fetch('/api/tools/call', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, arguments: args || {} })
+          });
+          const result = await response.json();
+          if (result.success) {
+            return result.structuredContent || result.content;
+          }
+          throw new Error(result.error || 'Tool call failed');
+        } catch (e) {
+          this.logConsole('error', `[ChatGPT] callTool failed: ${e.message}`);
+          throw e;
+        }
+      }
+
+      // =========================================================================
+      // Protocol Validation (warn-only, never blocks)
+      // =========================================================================
+
+      validateProtocol(checkName, meta, expectedKeys, extras) {
+        const actual = meta ? Object.keys(meta) : [];
+        const expected = expectedKeys || [];
+        const extra = actual.filter(k => !expected.includes(k) && !k.startsWith('_'));
+        const missing = expected.filter(k => !actual.includes(k));
+        const pass = missing.length === 0;
+
+        const result = { checkName, pass, actual, expected, extra, missing, extras: extras || {} };
+        this.protocolResults.push(result);
+        this.renderProtocolTab();
+        return result;
+      }
+
+      renderProtocolTab() {
+        const container = document.getElementById('protocol-checks');
+        if (this.protocolResults.length === 0) {
+          container.innerHTML = '<div class="protocol-empty">Run a tool call to see protocol validation results</div>';
+          return;
+        }
+
+        container.innerHTML = this.protocolResults.map((r, i) => {
+          const modeClass = this.mode === 'chatgpt' ? 'chatgpt-mode' : 'standard-mode';
+          const statusIcon = r.pass ? 'PASS' : 'FAIL';
+          const statusClass = r.pass ? 'pass' : 'fail';
+
+          let detailsHtml = '';
+          if (r.expected.length > 0 || r.actual.length > 0) {
+            detailsHtml += `<div class="protocol-diff-label">Expected keys</div>`;
+            detailsHtml += `<div class="protocol-keys-list">${r.expected.length > 0 ? r.expected.join(', ') : '(none)'}</div>`;
+            detailsHtml += `<div class="protocol-diff-label">Actual keys</div>`;
+            detailsHtml += `<div class="protocol-keys-list">${r.actual.length > 0 ? r.actual.join(', ') : '(none)'}</div>`;
+          }
+          if (r.missing.length > 0) {
+            detailsHtml += `<div class="protocol-diff"><span class="protocol-diff-missing">Missing: ${r.missing.join(', ')}</span></div>`;
+          }
+          if (r.extra.length > 0) {
+            detailsHtml += `<div class="protocol-diff"><span class="protocol-diff-extra">Extra: ${r.extra.join(', ')}</span></div>`;
+          }
+
+          // Extras (e.g., structuredContent check, mimeType check)
+          if (r.extras) {
+            for (const [label, value] of Object.entries(r.extras)) {
+              const extraPass = value.pass;
+              detailsHtml += `<div class="protocol-diff"><span class="${extraPass ? 'protocol-diff-extra' : 'protocol-diff-missing'}">${label}: ${value.detail}</span></div>`;
+            }
+          }
+
+          return `
+            <div class="protocol-check ${statusClass} ${r.pass ? '' : modeClass}" data-index="${i}">
+              <div class="protocol-check-header">
+                <span class="protocol-check-name">${r.checkName}</span>
+                <span class="protocol-check-status ${statusClass}">${statusIcon}</span>
+              </div>
+              <div class="protocol-check-details">${detailsHtml}</div>
+            </div>
+          `;
+        }).join('');
+
+        // Add click-to-expand handlers
+        container.querySelectorAll('.protocol-check-header').forEach(header => {
+          header.addEventListener('click', () => {
+            header.parentElement.classList.toggle('expanded');
+          });
+        });
       }
 
       updateNetworkBadge() {

@@ -250,10 +250,10 @@ fn generate_definition_code(
                     }
                 };
 
-                // Build annotations with output schema
+                // Build annotations with output type name
                 let annotations_with_output = quote! {
                     #(#annotation_chain)*
-                        .with_output_schema(Self::output_schema(), #output_type_name)
+                        .with_output_type_name(#output_type_name)
                 };
 
                 let def = quote! {
@@ -266,11 +266,13 @@ fn generate_definition_code(
                             Self::input_schema(),
                             annotations,
                         )
+                        .with_output_schema(Self::output_schema())
                     }
                     #[cfg(not(feature = "schema-generation"))]
                     {
-                        // Without schema-generation, fall back to simple ToolInfo
-                        let annotations = #(#annotation_chain)*;
+                        // Without schema-generation, fall back to ToolInfo with annotations only
+                        let annotations = #(#annotation_chain)*
+                            .with_output_type_name(#output_type_name);
                         pmcp::types::ToolInfo::with_annotations(
                             #tool_name,
                             Some(#description.to_string()),

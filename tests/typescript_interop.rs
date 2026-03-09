@@ -48,11 +48,11 @@ impl ResourceHandler for TestResourceHandler {
         _extra: pmcp::RequestHandlerExtra,
     ) -> PmcpResult<pmcp::types::ReadResourceResult> {
         if uri == "test://example.txt" {
-            Ok(pmcp::types::ReadResourceResult {
-                contents: vec![pmcp::types::Content::Text {
+            Ok(pmcp::types::ReadResourceResult::new(vec![
+                pmcp::types::Content::Text {
                     text: "Hello from Rust server!".to_string(),
-                }],
-            })
+                },
+            ]))
         } else {
             Err(Error::not_found(uri))
         }
@@ -63,15 +63,15 @@ impl ResourceHandler for TestResourceHandler {
         _cursor: Option<String>,
         _extra: pmcp::RequestHandlerExtra,
     ) -> PmcpResult<pmcp::types::ListResourcesResult> {
-        Ok(pmcp::types::ListResourcesResult {
-            resources: vec![pmcp::types::ResourceInfo {
+        Ok(pmcp::types::ListResourcesResult::new(vec![
+            pmcp::types::ResourceInfo {
                 uri: "test://example.txt".to_string(),
                 name: "Example Text File".to_string(),
                 description: Some("A test resource from Rust".to_string()),
                 mime_type: Some("text/plain".to_string()),
-            }],
-            next_cursor: None,
-        })
+                meta: None,
+            },
+        ]))
     }
 }
 
@@ -88,16 +88,15 @@ impl PromptHandler for TestPromptHandler {
     ) -> PmcpResult<pmcp::types::GetPromptResult> {
         let name = args.get("name").map_or("User", |s| s.as_str());
 
-        Ok(pmcp::types::GetPromptResult {
-            description: Some(format!("Greeting for {}", name)),
-            messages: vec![pmcp::types::PromptMessage {
+        Ok(pmcp::types::GetPromptResult::new(
+            vec![pmcp::types::PromptMessage {
                 role: pmcp::types::Role::User,
                 content: pmcp::types::Content::Text {
                     text: format!("Please greet {}", name),
                 },
             }],
-            _meta: None,
-        })
+            Some(format!("Greeting for {}", name)),
+        ))
     }
 }
 

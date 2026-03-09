@@ -1187,3 +1187,51 @@ pub async fn list_test_scenarios(
 
     Ok(ListScenariosResult { scenarios })
 }
+
+// ========== Loadtest Scenario Upload GraphQL Functions ==========
+
+/// Upload a loadtest scenario to pmcp.run
+pub async fn upload_loadtest_scenario(
+    access_token: &str,
+    server_id: &str,
+    name: &str,
+    description: Option<&str>,
+    content: &str,
+) -> Result<UploadScenarioResult> {
+    let query = r#"
+        mutation UploadLoadTestScenario(
+            $serverId: String!
+            $name: String!
+            $description: String
+            $content: String!
+        ) {
+            uploadLoadTestScenario(
+                serverId: $serverId
+                name: $name
+                description: $description
+                content: $content
+            ) {
+                scenarioId
+                version
+            }
+        }
+    "#;
+
+    let variables = serde_json::json!({
+        "serverId": server_id,
+        "name": name,
+        "description": description,
+        "content": content,
+    });
+
+    #[derive(Debug, Deserialize)]
+    struct UploadLoadTestScenarioResponse {
+        #[serde(rename = "uploadLoadTestScenario")]
+        upload_loadtest_scenario: UploadScenarioResult,
+    }
+
+    let response: UploadLoadTestScenarioResponse =
+        execute_graphql(access_token, query, variables).await?;
+
+    Ok(response.upload_loadtest_scenario)
+}

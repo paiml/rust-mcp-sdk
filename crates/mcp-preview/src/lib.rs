@@ -23,4 +23,4 @@ mod proxy;
 mod server;
 pub mod wasm_builder;
 
-pub use server::{PreviewConfig, PreviewServer};
+pub use server::{PreviewConfig, PreviewMode, PreviewServer};

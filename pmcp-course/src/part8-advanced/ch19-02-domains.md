@@ -280,19 +280,19 @@ impl DynamicResourceProvider for FinanceResourceProvider {
             ResourceTemplate {
                 uri_template: "finance://expenses/{user_id}/summary".to_string(),
                 name: "Expense Summary".to_string(),
-                description: Some("Monthly expense summary for a user".to_string()),
+                Some("Monthly expense summary for a user".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
             ResourceTemplate {
                 uri_template: "finance://budgets/{department}/current".to_string(),
                 name: "Department Budget".to_string(),
-                description: Some("Current budget status for a department".to_string()),
+                Some("Current budget status for a department".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
             ResourceTemplate {
                 uri_template: "finance://invoices/{invoice_id}".to_string(),
                 name: "Invoice Details".to_string(),
-                description: Some("Detailed invoice information".to_string()),
+                Some("Detailed invoice information".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
         ]
@@ -326,9 +326,7 @@ impl DynamicResourceProvider for FinanceResourceProvider {
             ));
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![Content::Text { text: content }],
-        })
+        Ok(ReadResourceResult::new(vec![Content::Text { text: content }]))
     }
 
     fn priority(&self) -> i32 {

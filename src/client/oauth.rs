@@ -1,4 +1,4 @@
-//! OAuth authentication support for CLI
+//! OAuth authentication support for CLI tools.
 //!
 //! This module implements multiple OAuth 2.0 flows for CLI authentication:
 //! - Authorization Code Flow with PKCE (RFC 7636) - browser-based, most compatible
@@ -7,14 +7,16 @@
 //! Supports automatic OAuth discovery via:
 //! - OpenID Connect Discovery (/.well-known/openid-configuration)
 //! - OAuth 2.0 Server Metadata (/.well-known/oauth-authorization-server)
+//!
+//! # Feature Gate
+//!
+//! This module is only available when the `oauth` feature is enabled:
+//!
+//! ```toml
+//! pmcp = { version = "1.11", features = ["oauth"] }
+//! ```
 
-use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use colored::*;
-use pmcp::client::auth::{OidcDiscoveryClient, TokenExchangeClient};
-use pmcp::client::http_middleware::HttpMiddlewareChain;
-use pmcp::client::oauth_middleware::{BearerToken, OAuthClientMiddleware};
-use pmcp::server::auth::oauth2::OidcDiscoveryMetadata;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,25 +29,31 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use url::Url;
 
-/// OAuth configuration for device code flow
+use crate::client::auth::{OidcDiscoveryClient, TokenExchangeClient};
+use crate::client::http_middleware::HttpMiddlewareChain;
+use crate::client::oauth_middleware::{BearerToken, OAuthClientMiddleware};
+use crate::error::{Error, Result};
+use crate::server::auth::oauth2::OidcDiscoveryMetadata;
+
+/// OAuth configuration for CLI authentication flows.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
-    /// OAuth issuer URL (e.g., https://auth.example.com)
-    /// If None, will auto-discover from MCP server URL
+    /// OAuth issuer URL (e.g., `https://auth.example.com`).
+    /// If `None`, will auto-discover from MCP server URL.
     pub issuer: Option<String>,
-    /// MCP server URL for auto-discovery (required if issuer is None)
+    /// MCP server URL for auto-discovery (required if issuer is `None`).
     pub mcp_server_url: Option<String>,
-    /// OAuth client ID
+    /// OAuth client ID.
     pub client_id: String,
-    /// OAuth scopes to request
+    /// OAuth scopes to request.
     pub scopes: Vec<String>,
-    /// Cache file path for storing tokens
+    /// Cache file path for storing tokens.
     pub cache_file: Option<PathBuf>,
-    /// Redirect port for localhost callback (default: 8080)
+    /// Redirect port for localhost callback (default: 8080).
     pub redirect_port: u16,
 }
 
-/// Token cache stored on disk
+/// Token cache stored on disk.
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenCache {
     access_token: String,
@@ -54,7 +62,7 @@ struct TokenCache {
     scopes: Vec<String>,
 }
 
-/// Device code authorization response
+/// Device code authorization response.
 #[derive(Debug, Deserialize)]
 struct DeviceAuthResponse {
     device_code: String,
@@ -66,7 +74,7 @@ struct DeviceAuthResponse {
     interval: Option<u64>,
 }
 
-/// Token response
+/// Token response from the OAuth token endpoint.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct TokenResponse {
@@ -78,27 +86,33 @@ struct TokenResponse {
     token_type: String,
 }
 
-/// OAuth helper for device code flow authentication
+/// OAuth helper for CLI authentication flows.
+///
+/// Supports both Authorization Code Flow with PKCE and Device Code Flow,
+/// with automatic discovery of OAuth endpoints from the MCP server URL.
+#[derive(Debug)]
 pub struct OAuthHelper {
     config: OAuthConfig,
     client: reqwest::Client,
 }
 
 impl OAuthHelper {
-    /// Create a new OAuth helper
+    /// Create a new OAuth helper with the given configuration.
     pub fn new(config: OAuthConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .context("Failed to create HTTP client")?;
+            .map_err(|e| Error::internal(format!("Failed to create HTTP client: {e}")))?;
 
         Ok(Self { config, client })
     }
 
-    /// Extract base URL from MCP server URL
-    /// e.g., "https://api.example.com/mcp" -> "https://api.example.com"
+    /// Extract base URL from MCP server URL.
+    ///
+    /// For example, `https://api.example.com/mcp` becomes `https://api.example.com`.
     fn extract_base_url(mcp_url: &str) -> Result<String> {
-        let parsed = Url::parse(mcp_url).context("Invalid MCP server URL")?;
+        let parsed = Url::parse(mcp_url)
+            .map_err(|e| Error::internal(format!("Invalid MCP server URL: {e}")))?;
 
         // Build base URL with scheme, host, and port
         let mut base = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
@@ -114,78 +128,65 @@ impl OAuthHelper {
         Ok(base)
     }
 
-    /// Discover OAuth metadata from MCP server URL using OIDC discovery
+    /// Discover OAuth metadata from MCP server URL using OIDC discovery.
     async fn discover_metadata(&self, mcp_url: &str) -> Result<OidcDiscoveryMetadata> {
         let base_url = Self::extract_base_url(mcp_url)?;
 
-        eprintln!(
-            "{}",
-            format!("Discovering OAuth configuration from {}...", base_url).cyan()
-        );
+        tracing::info!("Discovering OAuth configuration from {}...", base_url);
 
         let discovery_client = OidcDiscoveryClient::new();
 
         match discovery_client.discover(&base_url).await {
             Ok(metadata) => {
-                eprintln!("{}", "✓ OAuth discovery successful!".green());
-                eprintln!("  Issuer: {}", metadata.issuer.dimmed());
+                tracing::info!("OAuth discovery successful");
+                tracing::debug!("Issuer: {}", metadata.issuer);
                 if let Some(ref device_endpoint) = metadata.device_authorization_endpoint {
-                    eprintln!("  Device endpoint: {}", device_endpoint.dimmed());
+                    tracing::debug!("Device endpoint: {}", device_endpoint);
                 }
                 Ok(metadata)
             },
-            Err(e) => {
-                anyhow::bail!(
-                    "Failed to discover OAuth configuration at {}: {}\n\
-                     \n\
-                     Please provide --oauth-issuer explicitly, or ensure the server\n\
-                     exposes OAuth metadata at {}/.well-known/openid-configuration",
-                    base_url,
-                    e,
-                    base_url
-                )
-            },
+            Err(e) => Err(Error::internal(format!(
+                "Failed to discover OAuth configuration at {}: {}\n\
+                 \n\
+                 Please provide --oauth-issuer explicitly, or ensure the server\n\
+                 exposes OAuth metadata at {}/.well-known/openid-configuration",
+                base_url, e, base_url
+            ))),
         }
     }
 
-    /// Get OAuth metadata (either by discovering or constructing from issuer)
+    /// Get OAuth metadata (either by discovering or constructing from issuer).
     async fn get_metadata(&self) -> Result<OidcDiscoveryMetadata> {
         if let Some(ref mcp_url) = self.config.mcp_server_url {
             // Discover from MCP server URL
             self.discover_metadata(mcp_url).await
         } else if let Some(ref issuer) = self.config.issuer {
             // Manually provided issuer - try to discover from it
-            eprintln!(
-                "{}",
-                format!("Discovering OAuth configuration from {}...", issuer).cyan()
-            );
+            tracing::info!("Discovering OAuth configuration from {}...", issuer);
 
             let discovery_client = OidcDiscoveryClient::new();
             match discovery_client.discover(issuer).await {
                 Ok(metadata) => {
-                    eprintln!("{}", "✓ OAuth discovery successful!".green());
+                    tracing::info!("OAuth discovery successful");
                     Ok(metadata)
                 },
-                Err(e) => {
-                    anyhow::bail!(
-                        "Failed to discover OAuth configuration from issuer {}: {}\n\
-                         \n\
-                         Please ensure the issuer URL exposes OAuth metadata at\n\
-                         {}/.well-known/openid-configuration",
-                        issuer,
-                        e,
-                        issuer
-                    )
-                },
+                Err(e) => Err(Error::internal(format!(
+                    "Failed to discover OAuth configuration from issuer {}: {}\n\
+                     \n\
+                     Please ensure the issuer URL exposes OAuth metadata at\n\
+                     {}/.well-known/openid-configuration",
+                    issuer, e, issuer
+                ))),
             }
         } else {
-            anyhow::bail!(
+            Err(Error::internal(
                 "Either oauth_issuer or mcp_server_url must be provided for OAuth authentication"
-            )
+                    .to_string(),
+            ))
         }
     }
 
-    /// Get or refresh access token, performing device code flow if needed
+    /// Get or refresh access token, performing OAuth flow if needed.
     pub async fn get_access_token(&self) -> Result<String> {
         // Try to load cached token first
         if let Some(ref cache_file) = self.config.cache_file {
@@ -197,14 +198,14 @@ impl OAuthHelper {
                         .unwrap()
                         .as_secs();
                     if now < expires_at {
-                        eprintln!("{}", "✓ Using cached OAuth token".green());
+                        tracing::info!("Using cached OAuth token");
                         return Ok(cached.access_token);
                     }
                 }
 
                 // Try to refresh if we have a refresh token
                 if let Some(refresh_token) = cached.refresh_token {
-                    eprintln!("{}", "Refreshing OAuth token...".yellow());
+                    tracing::warn!("OAuth token expired, refreshing...");
                     if let Ok(new_token) = self.refresh_token(&refresh_token).await {
                         self.cache_token(&new_token, cache_file).await?;
                         return Ok(new_token.access_token);
@@ -214,7 +215,7 @@ impl OAuthHelper {
         }
 
         // No valid cached token, try authorization code flow first
-        eprintln!("{}", "No cached token found. Starting OAuth flow...".cyan());
+        tracing::info!("No cached token found, starting OAuth flow...");
 
         // Get metadata to see what flows are supported
         let metadata = self.get_metadata().await?;
@@ -223,35 +224,32 @@ impl OAuthHelper {
         match self.authorization_code_flow(&metadata).await {
             Ok(token) => Ok(token),
             Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!("Authorization code flow failed: {}", e).yellow()
-                );
+                tracing::warn!("Authorization code flow failed: {}", e);
 
                 // Fall back to device code flow if available
                 if metadata.device_authorization_endpoint.is_some() {
-                    eprintln!("{}", "Trying device code flow...".cyan());
+                    tracing::info!("Trying device code flow...");
                     return self.device_code_flow_with_metadata(&metadata).await;
-                } else {
-                    anyhow::bail!(
-                        "No supported OAuth flow available.\n\
-                         \n\
-                         The server must support either:\n\
-                         - Authorization code flow (authorization_endpoint), or\n\
-                         - Device code flow (device_authorization_endpoint)"
-                    );
                 }
+                Err(Error::internal(
+                    "No supported OAuth flow available.\n\
+                     \n\
+                     The server must support either:\n\
+                     - Authorization code flow (authorization_endpoint), or\n\
+                     - Device code flow (device_authorization_endpoint)"
+                        .to_string(),
+                ))
             },
         }
     }
 
-    /// Generate PKCE code verifier (RFC 7636)
+    /// Generate PKCE code verifier (RFC 7636).
     fn generate_code_verifier() -> String {
         let random_bytes: [u8; 32] = rand::rng().random();
         URL_SAFE_NO_PAD.encode(random_bytes)
     }
 
-    /// Generate PKCE code challenge from verifier (RFC 7636)
+    /// Generate PKCE code challenge from verifier (RFC 7636).
     fn generate_code_challenge(verifier: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(verifier.as_bytes());
@@ -259,13 +257,9 @@ impl OAuthHelper {
         URL_SAFE_NO_PAD.encode(hash)
     }
 
-    /// Perform OAuth authorization code flow with PKCE
+    /// Perform OAuth authorization code flow with PKCE.
     async fn authorization_code_flow(&self, metadata: &OidcDiscoveryMetadata) -> Result<String> {
-        eprintln!(
-            "{}",
-            "Starting OAuth authorization code flow...".cyan().bold()
-        );
-        eprintln!();
+        tracing::info!("Starting OAuth authorization code flow...");
 
         // Generate PKCE challenge
         let code_verifier = Self::generate_code_verifier();
@@ -277,34 +271,27 @@ impl OAuthHelper {
 
         let listener = TcpListener::bind(format!("127.0.0.1:{}", redirect_port))
             .await
-            .with_context(|| {
-                format!(
+            .map_err(|e| {
+                Error::internal(format!(
                     "Failed to bind to localhost:{}.\n\
                      \n\
                      This port may already be in use. Try a different port with:\n\
-                     --oauth-redirect-port PORT",
+                     --oauth-redirect-port PORT\n\
+                     \n\
+                     Error: {e}",
                     redirect_port
-                )
+                ))
             })?;
 
-        eprintln!(
-            "{}",
-            format!("Local callback server listening on port {}", redirect_port).dimmed()
+        tracing::debug!("Local callback server listening on port {}", redirect_port);
+        tracing::warn!(
+            "Ensure the redirect URI is registered in your OAuth provider: {}",
+            redirect_uri
         );
-        eprintln!();
-        eprintln!(
-            "{}",
-            "IMPORTANT: Ensure the redirect URI is registered in your OAuth provider:"
-                .to_string()
-                .yellow()
-                .bold()
-        );
-        eprintln!("{}", format!("  {}", redirect_uri).yellow());
-        eprintln!();
 
         // Build authorization URL
         let mut auth_url = Url::parse(&metadata.authorization_endpoint)
-            .context("Invalid authorization endpoint")?;
+            .map_err(|e| Error::internal(format!("Invalid authorization endpoint: {e}")))?;
 
         auth_url
             .query_pairs_mut()
@@ -316,38 +303,16 @@ impl OAuthHelper {
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &Self::generate_code_verifier()); // Random state for CSRF protection
 
-        eprintln!();
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!("{}", "  OAuth Authentication Required".cyan().bold());
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!();
-        eprintln!("  {}", "Opening browser for authentication...".bold());
-        eprintln!();
-        eprintln!(
-            "  {}",
-            "If the browser doesn't open automatically, visit:".dimmed()
-        );
-        eprintln!("  {}", auth_url.as_str().yellow());
-        eprintln!();
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!();
+        tracing::info!("OAuth Authentication Required");
+        tracing::info!("Opening browser for authentication...");
+        tracing::info!("If the browser doesn't open, visit: {}", auth_url.as_str());
 
         // Open browser
         if let Err(e) = webbrowser::open(auth_url.as_str()) {
-            eprintln!(
-                "{}",
-                format!("Warning: Failed to open browser: {}", e).yellow()
+            tracing::warn!(
+                "Failed to open browser: {}. Please open the URL manually.",
+                e
             );
-            eprintln!("{}", "Please open the URL above manually.".yellow());
         }
 
         // Wait for OAuth callback
@@ -370,13 +335,13 @@ impl OAuthHelper {
                             let response = if code.is_some() {
                                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
                                  <html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>\
-                                 <h1 style='color: green;'>✓ Authentication Successful!</h1>\
+                                 <h1 style='color: green;'>Authentication Successful!</h1>\
                                  <p>You can close this window and return to the terminal.</p>\
                                  </body></html>"
                             } else {
                                 "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
                                  <html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>\
-                                 <h1 style='color: red;'>✗ Authentication Failed</h1>\
+                                 <h1 style='color: red;'>Authentication Failed</h1>\
                                  <p>No authorization code received. Please try again.</p>\
                                  </body></html>"
                             };
@@ -393,24 +358,22 @@ impl OAuthHelper {
             }
         });
 
-        print!("  Waiting for authorization...");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        tracing::info!("Waiting for authorization...");
 
         // Wait for callback with timeout
         let authorization_code = tokio::time::timeout(Duration::from_secs(300), rx)
             .await
-            .context("Timeout waiting for OAuth callback (5 minutes)")??;
+            .map_err(|_| {
+                Error::internal("Timeout waiting for OAuth callback (5 minutes)".to_string())
+            })?
+            .map_err(|e| Error::internal(format!("OAuth callback channel error: {e}")))?;
 
         callback_task.abort();
 
-        eprintln!("\r{}", "✓ Authorization code received!        ".green());
-        eprintln!();
+        tracing::info!("Authorization code received");
 
         // Exchange authorization code for access token
-        eprintln!(
-            "{}",
-            "Exchanging authorization code for access token...".dimmed()
-        );
+        tracing::debug!("Exchanging authorization code for access token...");
 
         let token_exchange = TokenExchangeClient::new();
         let token_response = token_exchange
@@ -423,10 +386,13 @@ impl OAuthHelper {
                 Some(&code_verifier), // PKCE verifier
             )
             .await
-            .context("Failed to exchange authorization code for token")?;
+            .map_err(|e| {
+                Error::internal(format!(
+                    "Failed to exchange authorization code for token: {e}"
+                ))
+            })?;
 
-        eprintln!("{}", "✓ Authentication successful!".green().bold());
-        eprintln!();
+        tracing::info!("Authentication successful");
 
         // Cache the token
         if let Some(ref cache_file) = self.config.cache_file {
@@ -437,13 +403,12 @@ impl OAuthHelper {
         Ok(token_response.access_token)
     }
 
-    /// Perform OAuth device code flow (with pre-fetched metadata)
+    /// Perform OAuth device code flow (with pre-fetched metadata).
     async fn device_code_flow_with_metadata(
         &self,
         metadata: &OidcDiscoveryMetadata,
     ) -> Result<String> {
-        eprintln!("{}", "Starting OAuth device code flow...".cyan().bold());
-        eprintln!();
+        tracing::info!("Starting OAuth device code flow...");
 
         // Check if device flow is supported
         let device_auth_endpoint =
@@ -451,10 +416,11 @@ impl OAuthHelper {
                 .device_authorization_endpoint
                 .as_ref()
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    Error::internal(
                         "Device authorization endpoint not found in OAuth metadata.\n\
-                     \n\
-                     The OAuth server does not support device code flow (RFC 8628)."
+                         \n\
+                         The OAuth server does not support device code flow (RFC 8628)."
+                            .to_string(),
                     )
                 })?;
 
@@ -463,7 +429,7 @@ impl OAuthHelper {
             .await
     }
 
-    /// Internal implementation of device code flow
+    /// Internal implementation of device code flow.
     async fn device_code_flow_internal(
         &self,
         metadata: &OidcDiscoveryMetadata,
@@ -481,54 +447,29 @@ impl OAuthHelper {
             ])
             .send()
             .await
-            .context("Failed to request device code")?;
+            .map_err(|e| Error::internal(format!("Failed to request device code: {e}")))?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
+            return Err(Error::internal(format!(
                 "Device authorization failed: {}",
                 response.text().await.unwrap_or_default()
-            );
+            )));
         }
 
-        let device_auth: DeviceAuthResponse = response
-            .json()
-            .await
-            .context("Failed to parse device authorization response")?;
+        let device_auth: DeviceAuthResponse = response.json().await.map_err(|e| {
+            Error::internal(format!(
+                "Failed to parse device authorization response: {e}"
+            ))
+        })?;
 
         // Step 2: Display user code and verification URL
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!("{}", "  OAuth Authentication Required".cyan().bold());
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!();
-        eprintln!(
-            "  {}  {}",
-            "1. Visit:".bold(),
-            device_auth.verification_uri.yellow()
-        );
-        eprintln!(
-            "  {}  {}",
-            "2. Enter code:".bold(),
-            device_auth.user_code.green().bold()
-        );
+        tracing::info!("OAuth device code flow");
+        tracing::info!("1. Visit: {}", device_auth.verification_uri);
+        tracing::info!("2. Enter code: {}", device_auth.user_code);
 
         if let Some(complete_uri) = &device_auth.verification_uri_complete {
-            eprintln!();
-            eprintln!("  {} Or scan this URL:", "Shortcut:".bold());
-            eprintln!("  {}", complete_uri.yellow());
+            tracing::info!("Or visit directly: {}", complete_uri);
         }
-
-        eprintln!();
-        eprintln!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".cyan()
-        );
-        eprintln!();
 
         // Step 3: Poll for token
         let poll_interval = Duration::from_secs(device_auth.interval.unwrap_or(5));
@@ -537,12 +478,13 @@ impl OAuthHelper {
 
         loop {
             if SystemTime::now() > expires_at {
-                anyhow::bail!("Device code expired. Please try again.");
+                return Err(Error::internal(
+                    "Device code expired. Please try again.".to_string(),
+                ));
             }
 
             sleep(poll_interval).await;
-            print!("  Waiting for authorization...\r");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            tracing::debug!("Polling for authorization...");
 
             let response = self
                 .client
@@ -554,17 +496,19 @@ impl OAuthHelper {
                 ])
                 .send()
                 .await
-                .context("Failed to poll for token")?;
+                .map_err(|e| Error::internal(format!("Failed to poll for token: {e}")))?;
 
             let status = response.status();
-            let body = response.text().await?;
+            let body = response
+                .text()
+                .await
+                .map_err(|e| Error::internal(format!("Failed to read token response body: {e}")))?;
 
             if status.is_success() {
-                let token_response: TokenResponse =
-                    serde_json::from_str(&body).context("Failed to parse token response")?;
+                let token_response: TokenResponse = serde_json::from_str(&body)
+                    .map_err(|e| Error::internal(format!("Failed to parse token response: {e}")))?;
 
-                eprintln!("{}", "✓ Authentication successful!".green().bold());
-                eprintln!();
+                tracing::info!("Authentication successful");
 
                 // Cache the token
                 if let Some(ref cache_file) = self.config.cache_file {
@@ -584,13 +528,13 @@ impl OAuthHelper {
                             continue;
                         },
                         "access_denied" => {
-                            anyhow::bail!("User denied authorization");
+                            return Err(Error::internal("User denied authorization".to_string()));
                         },
                         "expired_token" => {
-                            anyhow::bail!("Device code expired");
+                            return Err(Error::internal("Device code expired".to_string()));
                         },
                         _ => {
-                            anyhow::bail!("OAuth error: {}", error_code);
+                            return Err(Error::internal(format!("OAuth error: {}", error_code)));
                         },
                     }
                 }
@@ -598,7 +542,7 @@ impl OAuthHelper {
         }
     }
 
-    /// Refresh an existing token
+    /// Refresh an existing token.
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse> {
         let metadata = self.get_metadata().await?;
         let token_endpoint = &metadata.token_endpoint;
@@ -613,30 +557,31 @@ impl OAuthHelper {
             ])
             .send()
             .await
-            .context("Failed to refresh token")?;
+            .map_err(|e| Error::internal(format!("Failed to refresh token: {e}")))?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
+            return Err(Error::internal(format!(
                 "Token refresh failed: {}",
                 response.text().await.unwrap_or_default()
-            );
+            )));
         }
 
         response
             .json()
             .await
-            .context("Failed to parse token response")
+            .map_err(|e| Error::internal(format!("Failed to parse token response: {e}")))
     }
 
-    /// Load cached token from disk
+    /// Load cached token from disk.
     async fn load_cached_token(&self, cache_file: &PathBuf) -> Result<TokenCache> {
         let content = tokio::fs::read_to_string(cache_file)
             .await
-            .context("Failed to read token cache")?;
-        serde_json::from_str(&content).context("Failed to parse token cache")
+            .map_err(|e| Error::internal(format!("Failed to read token cache: {e}")))?;
+        serde_json::from_str(&content)
+            .map_err(|e| Error::internal(format!("Failed to parse token cache: {e}")))
     }
 
-    /// Cache token to disk
+    /// Cache token to disk.
     async fn cache_token(&self, token: &TokenResponse, cache_file: &PathBuf) -> Result<()> {
         let expires_at = token.expires_in.map(|secs| {
             SystemTime::now()
@@ -657,26 +602,24 @@ impl OAuthHelper {
         if let Some(parent) = cache_file.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .context("Failed to create cache directory")?;
+                .map_err(|e| Error::internal(format!("Failed to create cache directory: {e}")))?;
         }
 
-        let json = serde_json::to_string_pretty(&cache).context("Failed to serialize cache")?;
+        let json = serde_json::to_string_pretty(&cache)
+            .map_err(|e| Error::internal(format!("Failed to serialize cache: {e}")))?;
         tokio::fs::write(cache_file, json)
             .await
-            .context("Failed to write token cache")?;
+            .map_err(|e| Error::internal(format!("Failed to write token cache: {e}")))?;
 
-        eprintln!(
-            "{}",
-            format!("Token cached to: {}", cache_file.display()).dimmed()
-        );
+        tracing::debug!("Token cached to: {}", cache_file.display());
 
         Ok(())
     }
 
-    /// Cache token from pmcp::client::auth::TokenResponse
+    /// Cache token from the SDK's auth `TokenResponse` type.
     async fn cache_token_from_response(
         &self,
-        token: &pmcp::client::auth::TokenResponse,
+        token: &crate::client::auth::TokenResponse,
         cache_file: &PathBuf,
     ) -> Result<()> {
         // Convert to internal TokenResponse
@@ -689,17 +632,16 @@ impl OAuthHelper {
         self.cache_token(&internal_token, cache_file).await
     }
 
-    /// Create HTTP middleware chain with OAuth
+    /// Create HTTP middleware chain with OAuth bearer token.
+    ///
+    /// Obtains an access token (from cache, refresh, or interactive flow)
+    /// and wraps it in a middleware chain suitable for HTTP transports.
     pub async fn create_middleware_chain(&self) -> Result<Arc<HttpMiddlewareChain>> {
         let access_token = self.get_access_token().await?;
 
-        eprintln!(
-            "{}",
-            format!(
-                "Creating OAuth middleware with token: {}...",
-                &access_token[..20]
-            )
-            .dimmed()
+        tracing::debug!(
+            "Creating OAuth middleware with token: {}...",
+            &access_token[..access_token.len().min(20)]
         );
 
         let bearer_token = BearerToken::new(access_token);
@@ -708,16 +650,43 @@ impl OAuthHelper {
         let mut chain = HttpMiddlewareChain::new();
         chain.add(Arc::new(oauth_middleware));
 
-        eprintln!("{}", "OAuth middleware added to chain".green());
+        tracing::info!("OAuth middleware added to chain");
 
         Ok(Arc::new(chain))
     }
 }
 
-/// Get default cache file path (~/.mcp-tester/tokens.json)
+/// Get default cache file path (`~/.pmcp/oauth-tokens.json`).
+///
+/// Uses the user's home directory to store cached OAuth tokens.
+/// Falls back to the current directory if the home directory cannot be determined.
 pub fn default_cache_path() -> PathBuf {
     let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".mcp-tester");
-    path.push("tokens.json");
+    path.push(".pmcp");
+    path.push("oauth-tokens.json");
     path
+}
+
+/// Create an OAuth middleware chain from configuration.
+///
+/// This is a one-liner convenience for tools that just need a middleware chain:
+/// ```no_run
+/// # use pmcp::client::oauth::{OAuthConfig, create_oauth_middleware};
+/// # async fn example() -> pmcp::Result<()> {
+/// let config = OAuthConfig {
+///     issuer: Some("https://auth.example.com".to_string()),
+///     mcp_server_url: None,
+///     client_id: "my-client".to_string(),
+///     scopes: vec!["openid".to_string()],
+///     cache_file: None,
+///     redirect_port: 8080,
+/// };
+/// let chain = create_oauth_middleware(config).await?;
+/// // Pass chain to HttpClient or transport
+/// # Ok(())
+/// # }
+/// ```
+pub async fn create_oauth_middleware(config: OAuthConfig) -> Result<Arc<HttpMiddlewareChain>> {
+    let helper = OAuthHelper::new(config)?;
+    helper.create_middleware_chain().await
 }

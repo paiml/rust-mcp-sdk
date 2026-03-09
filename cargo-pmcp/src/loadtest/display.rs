@@ -37,14 +37,12 @@ pub struct LiveDisplay {
 impl LiveDisplay {
     /// Create a new live display.
     ///
-    /// If `no_color` is true or stderr is not a terminal (piped),
-    /// color output is disabled.
+    /// Color suppression is handled globally in `main()` via
+    /// `colored::control::set_override(false)`. The `no_color` parameter
+    /// is retained for indicatif draw target decisions (e.g., hiding
+    /// progress bars when color is disabled).
     pub fn new(no_color: bool) -> Self {
-        // Detect piped output
         let is_terminal = std::io::stderr().is_terminal();
-        if no_color || !is_terminal {
-            colored::control::set_override(false);
-        }
 
         let multi = MultiProgress::new();
         let status_bar = multi.add(ProgressBar::new_spinner());

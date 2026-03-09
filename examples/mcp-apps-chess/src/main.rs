@@ -456,15 +456,15 @@ impl ResourceHandler for ChessResources {
 
         if let Some(widget_name) = name {
             let html = self.widget_dir.read_widget(widget_name);
-            let transformed = self.chatgpt_adapter.transform(uri, widget_name, &html);
+            let mut transformed = self.chatgpt_adapter.transform(uri, widget_name, &html);
+            let meta = transformed.take_meta();
 
-            Ok(ReadResourceResult {
-                contents: vec![Content::Resource {
+            Ok(ReadResourceResult::new(vec![Content::Resource {
                     uri: uri.to_string(),
                     text: Some(transformed.content),
-                    mime_type: Some(ExtendedUIMimeType::HtmlSkybridge.to_string()),
-                }],
-            })
+                    mime_type: Some(ExtendedUIMimeType::HtmlMcpApp.to_string()),
+                    meta,
+                }]))
         } else {
             Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
@@ -485,14 +485,12 @@ impl ResourceHandler for ChessResources {
                 uri: entry.uri,
                 name: entry.filename.clone(),
                 description: Some(format!("Interactive {} widget", entry.filename)),
-                mime_type: Some(ExtendedUIMimeType::HtmlSkybridge.to_string()),
+                mime_type: Some(ExtendedUIMimeType::HtmlMcpApp.to_string()),
+                meta: None,
             })
             .collect();
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::new(resources))
     }
 }
 

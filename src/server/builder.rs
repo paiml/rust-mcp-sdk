@@ -14,7 +14,7 @@ use crate::server::tasks::TaskRouter;
 use crate::server::tool_middleware::{ToolMiddleware, ToolMiddlewareChain};
 use crate::server::{PromptHandler, ResourceHandler, SamplingHandler, ToolHandler};
 use crate::shared::middleware::EnhancedMiddlewareChain;
-use crate::types::{Implementation, ServerCapabilities};
+use crate::types::{Implementation, PromptInfo, ServerCapabilities, ToolInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,6 +58,10 @@ pub struct ServerCoreBuilder {
     capabilities: ServerCapabilities,
     tools: HashMap<String, Arc<dyn ToolHandler>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
+    /// Cached tool metadata (populated at registration, avoids per-request cloning)
+    tool_infos: HashMap<String, ToolInfo>,
+    /// Cached prompt metadata (populated at registration, avoids per-request cloning)
+    prompt_infos: HashMap<String, PromptInfo>,
     resources: Option<Arc<dyn ResourceHandler>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
@@ -87,6 +91,8 @@ impl ServerCoreBuilder {
             capabilities: ServerCapabilities::default(),
             tools: HashMap::new(),
             prompts: HashMap::new(),
+            tool_infos: HashMap::new(),
+            prompt_infos: HashMap::new(),
             resources: None,
             sampling: None,
             auth_provider: None,
@@ -128,8 +134,15 @@ impl ServerCoreBuilder {
     ///
     /// Tools are functions that can be called by the client.
     pub fn tool(mut self, name: impl Into<String>, handler: impl ToolHandler + 'static) -> Self {
-        self.tools
-            .insert(name.into(), Arc::new(handler) as Arc<dyn ToolHandler>);
+        let name = name.into();
+        let handler = Arc::new(handler) as Arc<dyn ToolHandler>;
+        // Cache metadata at registration time to avoid per-request cloning
+        let mut info = handler
+            .metadata()
+            .unwrap_or_else(|| ToolInfo::new(name.clone(), None, serde_json::json!({})));
+        info.name.clone_from(&name);
+        self.tool_infos.insert(name.clone(), info);
+        self.tools.insert(name, handler);
 
         // Update capabilities to include tools
         // Use Some(false) instead of None to ensure the field serializes properly
@@ -146,7 +159,14 @@ impl ServerCoreBuilder {
     ///
     /// This variant is useful when you need to share the handler across multiple servers.
     pub fn tool_arc(mut self, name: impl Into<String>, handler: Arc<dyn ToolHandler>) -> Self {
-        self.tools.insert(name.into(), handler);
+        let name = name.into();
+        // Cache metadata at registration time to avoid per-request cloning
+        let mut info = handler
+            .metadata()
+            .unwrap_or_else(|| ToolInfo::new(name.clone(), None, serde_json::json!({})));
+        info.name.clone_from(&name);
+        self.tool_infos.insert(name.clone(), info);
+        self.tools.insert(name, handler);
 
         // Update capabilities to include tools
         // Use Some(false) instead of None to ensure the field serializes properly
@@ -167,8 +187,17 @@ impl ServerCoreBuilder {
         name: impl Into<String>,
         handler: impl PromptHandler + 'static,
     ) -> Self {
-        self.prompts
-            .insert(name.into(), Arc::new(handler) as Arc<dyn PromptHandler>);
+        let name = name.into();
+        let handler = Arc::new(handler) as Arc<dyn PromptHandler>;
+        // Cache metadata at registration time to avoid per-request cloning
+        let mut info = handler.metadata().unwrap_or_else(|| PromptInfo {
+            name: name.clone(),
+            description: None,
+            arguments: None,
+        });
+        info.name.clone_from(&name);
+        self.prompt_infos.insert(name.clone(), info);
+        self.prompts.insert(name, handler);
 
         // Update capabilities to include prompts
         // Use Some(false) instead of None to ensure the field serializes properly
@@ -185,7 +214,16 @@ impl ServerCoreBuilder {
     ///
     /// This variant is useful when you need to share the handler across multiple servers.
     pub fn prompt_arc(mut self, name: impl Into<String>, handler: Arc<dyn PromptHandler>) -> Self {
-        self.prompts.insert(name.into(), handler);
+        let name = name.into();
+        // Cache metadata at registration time to avoid per-request cloning
+        let mut info = handler.metadata().unwrap_or_else(|| PromptInfo {
+            name: name.clone(),
+            description: None,
+            arguments: None,
+        });
+        info.name.clone_from(&name);
+        self.prompt_infos.insert(name.clone(), info);
+        self.prompts.insert(name, handler);
 
         // Update capabilities to include prompts
         // Use Some(false) instead of None to ensure the field serializes properly
@@ -631,19 +669,17 @@ impl ServerCoreBuilder {
             .validate()
             .map_err(|e| Error::validation(format!("Workflow validation failed: {}", e)))?;
 
-        // Build tool registry from registered tools
+        // Build tool registry from cached metadata (avoids per-request handler.metadata() calls)
         let mut tool_registry = std::collections::HashMap::new();
-        for (name, handler) in &self.tools {
-            if let Some(metadata) = handler.metadata() {
-                tool_registry.insert(
-                    Arc::from(name.as_str()),
-                    workflow::conversion::ToolInfo {
-                        name: metadata.name.clone(),
-                        description: metadata.description.unwrap_or_default(),
-                        input_schema: metadata.input_schema.clone(),
-                    },
-                );
-            }
+        for (name, info) in &self.tool_infos {
+            tool_registry.insert(
+                Arc::from(name.as_str()),
+                workflow::conversion::ToolInfo {
+                    name: info.name.clone(),
+                    description: info.description.clone().unwrap_or_default(),
+                    input_schema: info.input_schema.clone(),
+                },
+            );
         }
 
         // Create builder-scoped middleware executor
@@ -676,9 +712,27 @@ impl ServerCoreBuilder {
 
             let task_handler =
                 workflow::TaskWorkflowPromptHandler::new(handler, task_router.clone(), workflow);
-            self.prompts.insert(name, Arc::new(task_handler));
+            let prompt_handler: Arc<dyn PromptHandler> = Arc::new(task_handler);
+            // Cache metadata at registration time
+            let mut info = prompt_handler.metadata().unwrap_or_else(|| PromptInfo {
+                name: name.clone(),
+                description: None,
+                arguments: None,
+            });
+            info.name.clone_from(&name);
+            self.prompt_infos.insert(name.clone(), info);
+            self.prompts.insert(name, prompt_handler);
         } else {
-            self.prompts.insert(name, Arc::new(handler));
+            let prompt_handler: Arc<dyn PromptHandler> = Arc::new(handler);
+            // Cache metadata at registration time
+            let mut info = prompt_handler.metadata().unwrap_or_else(|| PromptInfo {
+                name: name.clone(),
+                description: None,
+                arguments: None,
+            });
+            info.name.clone_from(&name);
+            self.prompt_infos.insert(name.clone(), info);
+            self.prompts.insert(name, prompt_handler);
         }
 
         // Update capabilities to include prompts
@@ -728,6 +782,8 @@ impl ServerCoreBuilder {
             self.capabilities,
             self.tools,
             self.prompts,
+            self.tool_infos,
+            self.prompt_infos,
             self.resources,
             self.sampling,
             self.auth_provider,

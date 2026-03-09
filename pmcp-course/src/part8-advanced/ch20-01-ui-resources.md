@@ -1,388 +1,497 @@
-# UI Resources
+# Widget Authoring and Developer Workflow
 
-UI resources are the foundation of MCP Apps. They define reusable interface templates that MCP hosts can render when tools are invoked.
+In this section, you'll build widgets using the `WidgetDir` file-based convention and learn the full `cargo pmcp` development cycle -- from scaffolding a new project to building distribution artifacts.
 
-## The `ui://` URI Scheme
+## Learning Objectives
 
-Just as `http://` identifies web resources and `file://` identifies local files, `ui://` identifies MCP UI resources:
+By the end of this section, you will be able to:
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        UI Resource URI Anatomy                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│      ui://hotel/room-gallery                                           │
-│      │    │     │                                                      │
-│      │    │     └─── Resource name (the specific UI)                   │
-│      │    └───────── Namespace (organizational grouping)               │
-│      └────────────── Scheme (always "ui")                              │
-│                                                                         │
-│  Good URI Examples:              Bad URI Examples:                      │
-│  ═════════════════               ════════════════                       │
-│  ui://charts/sales-dashboard     http://mysite.com/ui    (wrong scheme) │
-│  ui://maps/venue-locator         ui://                   (no path)      │
-│  ui://forms/user-profile         file:///ui/form.html    (wrong scheme) │
-│  ui://hotel/room-gallery         ui:/hotel/gallery       (missing /)    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+- Create a new MCP Apps project with `cargo pmcp app new`
+- Author widgets as standalone HTML files in the `widgets/` directory
+- Use the hot-reload development workflow (edit HTML, refresh browser)
+- Implement the `ResourceHandler` pattern that connects widgets to the MCP protocol
+- Build distribution artifacts with `cargo pmcp app build`
 
-The URI scheme serves two purposes:
-1. **Identification**: Uniquely identifies the UI within your server
-2. **Tool Association**: Links tools to their UIs via the `.with_ui()` method
+## The WidgetDir Convention
 
-## UIResource Structure
+Widgets are just HTML files. Drop them in a folder. The server does the rest.
 
-The core type for declaring UI resources:
+### File-to-URI Mapping
 
-```rust
-use pmcp::types::ui::{UIResource, UIMimeType};
+Every `.html` file you place in the `widgets/` directory automatically becomes an MCP resource. The filename (without extension) maps directly to a `ui://app/{name}` URI:
 
-// Manual construction
-let resource = UIResource {
-    uri: "ui://hotel/room-gallery".to_string(),
-    name: "Hotel Room Gallery".to_string(),
-    description: Some("Interactive photo gallery for hotel rooms".to_string()),
-    mime_type: "text/html+mcp".to_string(),
-};
+| File on Disk             | MCP Resource URI      |
+|--------------------------|-----------------------|
+| `widgets/hello.html`    | `ui://app/hello`      |
+| `widgets/board.html`    | `ui://app/board`      |
+| `widgets/map.html`      | `ui://app/map`        |
+| `widgets/dashboard.html`| `ui://app/dashboard`  |
 
-// Or using the constructor
-let resource = UIResource::new(
-    "ui://hotel/room-gallery",
-    "Hotel Room Gallery",
-    UIMimeType::HtmlMcp
-)
-.with_description("Interactive photo gallery for hotel rooms");
-```
+That's the entire convention. No configuration files. No registration code. One HTML file equals one widget.
 
-### Fields Explained
+### WidgetDir API Walkthrough
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `uri` | Yes | Must start with `ui://`, identifies the resource |
-| `name` | Yes | Human-readable display name |
-| `description` | No | Explains what the UI does |
-| `mime_type` | Yes | Currently only `text/html+mcp` |
+The `WidgetDir` struct lives in `pmcp::server::mcp_apps` and provides three operations. Let's walk through each one.
 
-## UIResourceBuilder
-
-For a more ergonomic API, use the builder pattern:
+**Construction:**
 
 ```rust
-use pmcp::UIResourceBuilder;
+use pmcp::server::mcp_apps::WidgetDir;
 
-// Build just the resource declaration
-let resource = UIResourceBuilder::new("ui://charts/sales", "Sales Dashboard")
-    .description("Real-time sales analytics dashboard")
-    .html_template(DASHBOARD_HTML)
-    .build()?;
+// Point at the widgets directory
+let widget_dir = WidgetDir::new("widgets");
 
-// Build both resource and contents (most common pattern)
-let (resource, contents) = UIResourceBuilder::new("ui://charts/sales", "Sales Dashboard")
-    .description("Real-time sales analytics dashboard")
-    .html_template(DASHBOARD_HTML)
-    .build_with_contents()?;
+// The path does not need to exist at construction time.
+// Errors surface when you call discover() or read_widget().
 ```
 
-### Builder Methods
+**Discovery:**
 
 ```rust
-use pmcp::UIResourceBuilder;
-use pmcp::types::ui::UIMimeType;
+// Scan for .html files -- returns Vec<WidgetEntry> sorted by filename
+let entries = widget_dir.discover()?;
 
-let builder = UIResourceBuilder::new("ui://example", "Example UI")
-    // Set description (optional)
-    .description("What this UI does")
-
-    // Set MIME type (defaults to HtmlMcp)
-    .mime_type(UIMimeType::HtmlMcp)
-
-    // Provide HTML content - choose one:
-    .html_template(r#"<html>...</html>"#)  // Inline string
-    // OR
-    .html_file(include_str!("../ui/dashboard.html"));  // From file
-```
-
-### Validation
-
-The builder validates your UI resource:
-
-```rust
-// Error: URI doesn't start with ui://
-let result = UIResourceBuilder::new("http://wrong", "Test")
-    .html_template("<html></html>")
-    .build();
-assert!(result.is_err());  // "must start with 'ui://'"
-
-// Error: No content provided
-let result = UIResourceBuilder::new("ui://test", "Test")
-    .build();  // Missing html_template or html_file
-assert!(result.is_err());  // "content must be set"
-
-// Error: Empty path
-let result = UIResourceBuilder::new("ui://", "Test")
-    .html_template("<html></html>")
-    .build();
-assert!(result.is_err());  // "must have a path after 'ui://'"
-```
-
-## HTML Templates
-
-UI resources use HTML with the `text/html+mcp` MIME type. This is standard HTML with some conventions for MCP communication:
-
-```rust
-const GALLERY_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Photo Gallery</title>
-    <style>
-        /* Your CSS here */
-        .gallery {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 16px;
-        }
-    </style>
-</head>
-<body>
-    <div id="content">Loading...</div>
-
-    <script>
-        // MCP communication (covered in ch20-03)
-        window.addEventListener('message', (event) => {
-            if (event.data.type === 'mcp-tool-result') {
-                renderData(event.data.result);
-            }
-        });
-
-        function renderData(data) {
-            // Update the UI with tool results
-        }
-    </script>
-</body>
-</html>"#;
-```
-
-### Template Best Practices
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    HTML Template Guidelines                             │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ✓ DO:                                                                  │
-│  ═════                                                                  │
-│  • Include viewport meta tag for responsive design                      │
-│  • Use system fonts for consistency with host application               │
-│  • Handle the 'mcp-tool-result' message event                          │
-│  • Show loading states while waiting for data                           │
-│  • Use relative units (rem, %) instead of fixed pixels                 │
-│  • Test in multiple MCP clients                                         │
-│                                                                         │
-│  ✗ DON'T:                                                               │
-│  ═══════                                                                │
-│  • Rely on cookies (sandboxed iframe restrictions)                      │
-│  • Access parent window directly (security blocked)                     │
-│  • Use localStorage (may not persist)                                   │
-│  • Make assumptions about iframe size                                   │
-│  • Include sensitive data in the template                               │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-## Loading from External Files
-
-For larger UIs, store HTML in separate files:
-
-```rust
-// In your Rust code, use include_str! at compile time
-const DASHBOARD_HTML: &str = include_str!("../ui/dashboard.html");
-
-let (resource, contents) = UIResourceBuilder::new("ui://dashboard", "Dashboard")
-    .html_template(DASHBOARD_HTML)  // Content embedded at compile time
-    .build_with_contents()?;
-```
-
-Project structure:
-
-```
-my-server/
-├── src/
-│   └── main.rs
-├── ui/
-│   ├── dashboard.html      ← Complex HTML/CSS/JS
-│   ├── gallery.html
-│   └── map.html
-└── Cargo.toml
-```
-
-This keeps your Rust code clean while allowing full IDE support for HTML/CSS/JS development.
-
-## UIResourceContents
-
-When the MCP host requests a UI resource, you provide `UIResourceContents`:
-
-```rust
-use pmcp::types::ui::UIResourceContents;
-
-// For HTML content
-let contents = UIResourceContents::html(
-    "ui://hotel/room-gallery",
-    "<html><body>Gallery content</body></html>"
-);
-
-// The struct fields:
-// contents.uri        - The resource URI
-// contents.mime_type  - "text/html+mcp"
-// contents.text       - Some(html_string) for text content
-// contents.blob       - None (used for future binary formats like WASM)
-```
-
-## Adding to Resource Collection
-
-UI resources integrate with PMCP's resource system:
-
-```rust
-use pmcp::{ResourceCollection, UIResourceBuilder};
-
-// Build the UI resource
-let (gallery_resource, gallery_contents) = UIResourceBuilder::new(
-    "ui://hotel/gallery",
-    "Room Gallery"
-)
-    .html_template(GALLERY_HTML)
-    .build_with_contents()?;
-
-let (map_resource, map_contents) = UIResourceBuilder::new(
-    "ui://hotel/map",
-    "Property Map"
-)
-    .html_template(MAP_HTML)
-    .build_with_contents()?;
-
-// Add to resource collection
-let resources = ResourceCollection::new()
-    .add_ui_resource(gallery_resource, gallery_contents)
-    .add_ui_resource(map_resource, map_contents);
-
-// Use in server
-let server = Server::builder()
-    .name("hotel-server")
-    .version("1.0.0")
-    .resources(resources)
-    // ... tools, etc.
-    .build()?;
-```
-
-## Complete Example
-
-Putting it all together:
-
-```rust
-use pmcp::{Server, ServerCapabilities, ResourceCollection, UIResourceBuilder};
-
-const SALES_CHART_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sales Chart</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: system-ui; padding: 20px; }
-        .chart-container { max-width: 800px; margin: 0 auto; }
-    </style>
-</head>
-<body>
-    <div class="chart-container">
-        <canvas id="salesChart"></canvas>
-    </div>
-    <script>
-        let chart = null;
-
-        window.addEventListener('message', (event) => {
-            if (event.data.type === 'mcp-tool-result') {
-                const data = event.data.result;
-                renderChart(data.labels, data.values);
-            }
-        });
-
-        function renderChart(labels, values) {
-            const ctx = document.getElementById('salesChart');
-            if (chart) chart.destroy();
-
-            chart = new Chart(ctx, {
-                type: 'bar',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Sales',
-                        data: values,
-                        backgroundColor: 'rgba(54, 162, 235, 0.5)',
-                        borderColor: 'rgba(54, 162, 235, 1)',
-                        borderWidth: 1
-                    }]
-                }
-            });
-        }
-
-        // Request data from the tool
-        window.parent.postMessage({
-            jsonrpc: '2.0',
-            method: 'tools/call',
-            params: { name: 'get_sales_data', arguments: {} },
-            id: 1
-        }, '*');
-    </script>
-</body>
-</html>"#;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create the UI resource
-    let (ui_resource, ui_contents) = UIResourceBuilder::new(
-        "ui://analytics/sales-chart",
-        "Sales Analytics Chart"
-    )
-        .description("Interactive bar chart showing sales by category")
-        .html_template(SALES_CHART_HTML)
-        .build_with_contents()?;
-
-    // Build resource collection
-    let resources = ResourceCollection::new()
-        .add_ui_resource(ui_resource, ui_contents);
-
-    // Server needs resources capability
-    let server = Server::builder()
-        .name("analytics-server")
-        .version("1.0.0")
-        .capabilities(ServerCapabilities {
-            resources: Some(Default::default()),
-            tools: Some(Default::default()),
-            ..Default::default()
-        })
-        .resources(resources)
-        // Tools added here...
-        .build()?;
-
-    server.run_stdio().await?;
-    Ok(())
+for entry in &entries {
+    println!("{} -> {}", entry.filename, entry.uri);
+    // "board" -> "ui://app/board"
+    // "hello" -> "ui://app/hello"
+    // "map"   -> "ui://app/map"
 }
 ```
 
-## Summary
+Each `WidgetEntry` has three fields:
 
-| Component | Purpose |
-|-----------|---------|
-| `UIResource` | Declares a UI with URI, name, description, MIME type |
-| `UIResourceBuilder` | Fluent API for creating UI resources |
-| `UIResourceContents` | The actual HTML content delivered to hosts |
-| `ResourceCollection` | Container for integrating UIs into servers |
-| `ui://` scheme | Standard URI format for UI resources |
+| Field      | Type       | Description                                   |
+|------------|------------|-----------------------------------------------|
+| `filename` | `String`   | Stem of the HTML file (e.g., `"board"`)       |
+| `uri`      | `String`   | MCP resource URI (e.g., `"ui://app/board"`)   |
+| `path`     | `PathBuf`  | Absolute path to the `.html` file on disk     |
+
+**Reading:**
+
+```rust
+// Read widget HTML from disk -- fresh on every call
+let html = widget_dir.read_widget("board");
+```
+
+`read_widget` reads from disk on every call. There is no cache. This is intentional -- it enables the hot-reload development workflow you'll use throughout this chapter.
+
+If the file does not exist, `read_widget` returns a styled HTML error page with a hint: "Create or fix the widget file and refresh the browser to retry."
+
+**Bridge injection:**
+
+```rust
+// Insert a <script> tag into widget HTML
+let html_with_bridge = WidgetDir::inject_bridge_script(
+    &html,
+    "/assets/widget-runtime.mjs",
+);
+```
+
+The injection inserts the script tag just before `</head>` if present, at the start of `<body>` otherwise, or at the very beginning of the document if neither tag is found. In practice, you rarely call this directly -- the adapter handles injection for you.
+
+**Try this:** Create a second `.html` file in your `widgets/` directory (even an empty `<html></html>` will work) and call `widget_dir.discover()`. Verify that it appears in the returned list alongside the original widget.
+
+## Hands-On: Scaffold Your First MCP App
+
+### Step 1: Create the Project
+
+```bash
+cargo pmcp app new my-widget-app
+cd my-widget-app
+```
+
+You'll see the following project structure:
+
+```
+my-widget-app/
+  src/
+    main.rs          # MCP server with tool handlers and ResourceHandler
+  widgets/
+    hello.html       # Starter widget demonstrating bridge pattern
+  mock-data/
+    hello.json       # Mock tool response for landing page generation
+  Cargo.toml         # pmcp dependency with mcp-apps feature enabled
+  README.md          # Getting started guide with bridge API docs
+```
+
+Each file has a purpose:
+
+| File               | Purpose                                                    |
+|--------------------|------------------------------------------------------------|
+| `src/main.rs`      | Your MCP server -- registers tools and serves widgets      |
+| `widgets/hello.html` | A starter widget that calls the `hello` tool via the bridge |
+| `mock-data/hello.json` | Hardcoded response for the landing page demo            |
+| `Cargo.toml`       | Dependencies including `pmcp` with `mcp-apps` feature      |
+
+### Step 2: Explore the Generated Code
+
+Open `src/main.rs`. You'll see the three-part pattern that every MCP Apps server uses. Let's walk through the key sections.
+
+**The tool handler:**
+
+```rust
+// Tool input type
+#[derive(Deserialize, JsonSchema)]
+struct HelloInput {
+    name: String,
+}
+
+// Tool handler -- a pure function
+fn hello_handler(input: HelloInput, _extra: RequestHandlerExtra) -> Result<serde_json::Value> {
+    Ok(json!({
+        "greeting": format!("Hello, {}!", input.name),
+        "name": input.name
+    }))
+}
+```
+
+This is a standard MCP tool. It takes a name and returns a greeting. Nothing widget-specific here.
+
+**The resource handler:**
+
+```rust
+struct AppResources {
+    chatgpt_adapter: ChatGptAdapter,   // Injects the bridge script
+    widget_dir: WidgetDir,             // Discovers and reads widgets
+}
+
+impl AppResources {
+    fn new(widgets_path: PathBuf) -> Self {
+        let widget_meta = WidgetMeta::new()
+            .prefers_border(true)
+            .description("my widget app widget");
+        let chatgpt_adapter = ChatGptAdapter::new().with_widget_meta(widget_meta);
+        let widget_dir = WidgetDir::new(widgets_path);
+        Self { chatgpt_adapter, widget_dir }
+    }
+}
+```
+
+This struct holds the adapter (which injects the bridge script) and the `WidgetDir` (which discovers and reads widget files). Together, they connect your HTML widgets to the MCP protocol.
+
+**The server builder:**
+
+```rust
+let server = ServerBuilder::new()
+    .name("my-widget-app")
+    .version("0.1.0")
+    .tool_typed_sync_with_description("hello", "Greet someone by name", hello_handler)
+    .resources(AppResources::new(widgets_path))
+    .build()?;
+```
+
+The builder registers the tool and the resource handler together. When a client requests `ui://app/hello`, the `AppResources` handler reads `widgets/hello.html` from disk and serves it with the bridge script injected.
+
+**Now open `widgets/hello.html`.** Notice there is no bridge `<script>` tag in the file. The adapter injects it for you at serve time. Your widget code is clean HTML with `window.mcpBridge` calls:
+
+```javascript
+// Call the "hello" tool via the MCP bridge
+const response = await window.mcpBridge.callTool('hello', { name });
+document.getElementById('result').textContent = response.greeting;
+```
+
+### Step 3: Run and Preview
+
+Open two terminal windows:
+
+```bash
+# Terminal 1: Start the MCP server
+cargo run
+```
+
+```bash
+# Terminal 2: Open the browser-based preview
+cargo pmcp preview --url http://localhost:3000 --open
+```
+
+The preview opens in your browser. Type a name, click the button -- the widget calls your `hello` tool and displays the greeting response.
+
+**Try this:** Edit the CSS in `widgets/hello.html` -- change the background color, the font size, anything. Refresh your browser. Your changes appear instantly. No server restart needed.
+
+### Step 4: Add a Second Widget
+
+Let's create a counter widget. Create `widgets/counter.html`:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Counter</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #f0f4f8;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            text-align: center;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+        #count { font-size: 3rem; margin: 16px 0; }
+        button { padding: 8px 24px; font-size: 1rem; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Counter</h1>
+        <div id="count">0</div>
+        <button id="increment">Increment</button>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        let count = 0;
+
+        document.getElementById('increment').addEventListener('click', async () => {
+            count++;
+            document.getElementById('count').textContent = count;
+
+            try {
+                // Call the counter tool to log the count
+                const result = await window.mcpBridge.callTool('counter', { count });
+                document.getElementById('status').textContent = result.message;
+            } catch (err) {
+                document.getElementById('status').textContent = 'Error: ' + err.message;
+            }
+        });
+    </script>
+</body>
+</html>
+```
+
+Then add a `counter` tool handler in `src/main.rs`:
+
+```rust
+#[derive(Deserialize, JsonSchema)]
+struct CounterInput {
+    count: u64,
+}
+
+fn counter_handler(input: CounterInput, _extra: RequestHandlerExtra) -> Result<serde_json::Value> {
+    Ok(json!({
+        "message": format!("Count is now {}", input.count),
+        "count": input.count
+    }))
+}
+```
+
+Register it with the server builder:
+
+```rust
+.tool_typed_sync_with_description("counter", "Track a counter value", counter_handler)
+```
+
+Restart the server (you changed Rust code, so a restart is required), then refresh the preview. Your new counter widget appears in the widget selector.
+
+## The ResourceHandler Pattern
+
+Every MCP Apps server needs this pattern. Learn it once, use it everywhere.
+
+The `ResourceHandler` trait connects `WidgetDir` and the adapter to the MCP protocol. It has two methods: `read()` for serving a specific widget, and `list()` for discovering all available widgets.
+
+### The read() Method
+
+The `read()` method follows three steps every time:
+
+```rust
+#[async_trait]
+impl ResourceHandler for AppResources {
+    async fn read(&self, uri: &str, _extra: RequestHandlerExtra)
+        -> Result<ReadResourceResult>
+    {
+        // Step 1: Extract widget name from URI
+        let name = uri
+            .strip_prefix("ui://app/")
+            .and_then(|s| s.strip_suffix(".html").or(Some(s)));
+
+        if let Some(widget_name) = name {
+            // Step 2: Read HTML from disk (fresh every time -- hot-reload)
+            let html = self.widget_dir.read_widget(widget_name);
+
+            // Step 3: Transform for target host (injects bridge script)
+            let transformed = self.chatgpt_adapter
+                .transform(uri, widget_name, &html);
+
+            Ok(ReadResourceResult::new(vec![Content::Resource {
+                    uri: uri.to_string(),
+                    text: Some(transformed.content),
+                    mime_type: Some(
+                        ExtendedUIMimeType::HtmlSkybridge.to_string()
+                    ),
+                }]))
+        } else {
+            Err(pmcp::Error::protocol(
+                pmcp::ErrorCode::METHOD_NOT_FOUND,
+                format!("Resource not found: {}", uri),
+            ))
+        }
+    }
+```
+
+The three steps are always the same:
+
+| Step | What Happens                                | Code                                    |
+|------|---------------------------------------------|-----------------------------------------|
+| 1    | Extract widget name from `ui://app/{name}`  | `uri.strip_prefix("ui://app/")`         |
+| 2    | Read HTML from disk (no cache, hot-reload)   | `widget_dir.read_widget(widget_name)`   |
+| 3    | Transform via adapter (inject bridge script) | `adapter.transform(uri, name, &html)`  |
+
+### The list() Method
+
+The `list()` method calls `widget_dir.discover()` and maps each `WidgetEntry` to a `ResourceInfo`:
+
+```rust
+    async fn list(
+        &self,
+        _cursor: Option<String>,
+        _extra: RequestHandlerExtra,
+    ) -> Result<ListResourcesResult> {
+        let entries = self.widget_dir.discover().unwrap_or_default();
+        let resources = entries
+            .into_iter()
+            .map(|entry| ResourceInfo {
+                uri: entry.uri,
+                name: entry.filename.clone(),
+                Some(format!("Interactive {} widget", entry.filename)),
+                mime_type: Some(
+                    ExtendedUIMimeType::HtmlSkybridge.to_string()
+                ),
+            })
+            .collect();
+
+        Ok(ListResourcesResult::new(resources))
+    }
+}
+```
+
+This exact `ResourceHandler` pattern appears in the chess, map, and dataviz examples. Once you understand it, you can build any widget-based MCP server.
+
+## Hot-Reload Development
+
+MCP Apps development feels like frontend development. Here is the workflow:
+
+```
+  1. Start server        2. Open preview         3. Edit HTML         4. Refresh browser
+  ================       =================       ==============       ==================
+  cargo run              cargo pmcp preview      vim widgets/         Browser refresh
+                         --url ... --open        hello.html           -> instant update
+```
+
+1. Start your server: `cargo run`
+2. Open the preview: `cargo pmcp preview --url http://localhost:3000 --open`
+3. Edit your HTML file in `widgets/`
+4. Refresh the browser -- your changes appear instantly
+
+Why does this work? `WidgetDir` reads from disk on every request. There is no cache. The server re-reads the file each time a client requests the widget resource.
+
+**When do you need to restart the server?** Only when you change Rust code (tool handlers, `main.rs`). Widget HTML changes are always instant -- just refresh the browser.
+
+**Try this:** With the server running and preview open, add a `<p>` tag to your widget. Refresh the browser. Then delete it and refresh again. Get a feel for the instant feedback loop.
+
+## Building for Distribution
+
+Ready to share your widget? The build command produces two deployment artifacts.
+
+### cargo pmcp app build
+
+```bash
+cargo pmcp app build --url https://my-server.example.com
+```
+
+This generates:
+
+```
+dist/
+  manifest.json    # ChatGPT-compatible app directory listing
+  landing.html     # Standalone demo page with mock bridge
+```
+
+**What each artifact is for:**
+
+| Artifact         | Purpose                                                                  |
+|------------------|--------------------------------------------------------------------------|
+| `manifest.json`  | ChatGPT-compatible app directory listing following the `ai-plugin.json` schema. Upload this to make your server discoverable. |
+| `landing.html`   | Standalone demo page that embeds your widget with a mock bridge. Uses hardcoded responses from `mock-data/*.json`. Works without a running server. |
+
+### Individual Commands
+
+If you only need one artifact, use the subcommands directly:
+
+```bash
+# Generate only manifest.json
+cargo pmcp app manifest --url https://my-server.example.com
+
+# Generate only manifest.json with a logo
+cargo pmcp app manifest --url https://my-server.example.com --logo https://example.com/logo.png
+
+# Generate only landing.html
+cargo pmcp app landing
+
+# Generate landing.html for a specific widget
+cargo pmcp app landing --widget board --output build
+```
+
+### CLI Flags Reference
+
+| Flag              | Description                                     | Default              |
+|-------------------|-------------------------------------------------|----------------------|
+| `--url <URL>`     | Server URL for manifest (required for build/manifest) | --              |
+| `--logo <URL>`    | Logo URL for the manifest                       | --                   |
+| `--widget <NAME>` | Widget to showcase in landing page              | First alphabetically |
+| `--output <DIR>`  | Output directory for generated files            | `dist`               |
+
+**Try this:** Run `cargo pmcp app build --url http://localhost:3000` and then open `dist/landing.html` in your browser. The landing page shows your widget running with mock data -- no server needed.
+
+## Preview Command Deep Dive
+
+The `cargo pmcp preview` command connects to a running MCP server and renders widgets in a browser-based testing environment.
+
+```bash
+cargo pmcp preview --url http://localhost:3000 --open
+```
+
+### Flags Reference
+
+| Flag                     | Description                                      | Default   |
+|--------------------------|--------------------------------------------------|-----------|
+| `--url <URL>`            | URL of the running MCP server (required)         | --        |
+| `--port <PORT>`          | Port for the preview server                      | `8765`    |
+| `--open`                 | Open browser automatically                       | `false`   |
+| `--tool <NAME>`          | Auto-select this tool on start                   | --        |
+| `--theme <light\|dark>`  | Initial theme for the preview environment        | `light`   |
+| `--locale <LOCALE>`      | Initial locale (e.g., `en-US`, `ja-JP`)          | `en-US`   |
+| `--widgets-dir <PATH>`   | Path to widgets directory for hot-reload         | --        |
+
+**Environment simulation:** The `--theme` and `--locale` flags let you test how your widget behaves in different environments without switching hosts. The `--tool` flag auto-selects a specific tool when the preview loads, which is useful when your server has many tools.
+
+**Try this:** Test your widget with dark mode and Japanese locale:
+
+```bash
+cargo pmcp preview --url http://localhost:3000 --open --theme dark --locale ja-JP
+```
+
+## Summary and Next Steps
+
+Let's recap what you've learned:
+
+- **WidgetDir** maps `.html` files in `widgets/` to `ui://app/{name}` URIs automatically
+- **`cargo pmcp app new`** scaffolds a complete project with server, widget, and mock data
+- **The ResourceHandler pattern** connects widgets to MCP: extract name, read from disk, transform with adapter
+- **Hot-reload** works because `WidgetDir` reads from disk on every request -- no cache
+- **`cargo pmcp app build`** produces `manifest.json` and `landing.html` for distribution
+- **`cargo pmcp preview`** opens a browser-based testing environment with theme and locale simulation
+
+In the next section, you'll learn how widgets communicate with your server through the bridge API, and how adapters make your widgets work across different hosts.
 
 ---
 
-*Continue to [Tool-UI Association](./ch20-02-tool-ui-association.md) →*
-
+*Continue to [Bridge Communication and Adapters](./ch20-02-tool-ui-association.md) ->*

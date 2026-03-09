@@ -147,11 +147,14 @@ pub enum SecretAction {
 }
 
 impl SecretCommand {
-    pub fn execute(&self) -> Result<()> {
-        tokio::runtime::Runtime::new()?.block_on(self.execute_async())
+    pub fn execute(&self, global_flags: &crate::commands::GlobalFlags) -> Result<()> {
+        // The secret module already has its own --quiet flag.
+        // Merge with global --quiet so either suppresses output.
+        let effective_quiet = self.quiet || global_flags.quiet;
+        tokio::runtime::Runtime::new()?.block_on(self.execute_async_with_quiet(effective_quiet))
     }
 
-    async fn execute_async(&self) -> Result<()> {
+    async fn execute_async_with_quiet(&self, quiet: bool) -> Result<()> {
         let project_root = std::env::current_dir()?;
         let config = SecretsConfig::load(&project_root)?;
 
@@ -186,7 +189,7 @@ impl SecretCommand {
                     println!("{}", serde_json::to_string_pretty(&result.secrets)?);
                 } else {
                     if result.secrets.is_empty() {
-                        if !self.quiet {
+                        if !quiet {
                             println!("No secrets found.");
                         }
                     } else {
@@ -210,7 +213,7 @@ impl SecretCommand {
                 no_newline,
             } => {
                 // Security warning for terminal output
-                if output.is_none() && io::stdout().is_terminal() && !self.quiet {
+                if output.is_none() && io::stdout().is_terminal() && !quiet {
                     eprintln!("⚠️  Warning: Outputting secret to terminal.");
                     eprintln!("   Consider using --output <file> or piping.");
                     eprintln!();
@@ -232,7 +235,7 @@ impl SecretCommand {
                         std::fs::set_permissions(output_path, perms)?;
                     }
 
-                    if !self.quiet {
+                    if !quiet {
                         println!("Secret written to: {}", output_path.display());
                     }
                 } else {
@@ -277,7 +280,7 @@ impl SecretCommand {
                     SecretValue::new(val.trim_end().to_string())
                 } else if let Some(direct_value) = value {
                     // Warn about direct value
-                    if !self.quiet {
+                    if !quiet {
                         eprintln!("⚠️  SECURITY WARNING: Passing secrets via --value is insecure!");
                         eprintln!("   The value may appear in:");
                         eprintln!("     - Shell history");
@@ -311,7 +314,7 @@ impl SecretCommand {
 
                 let metadata = provider.set(&secret_name, secret_value, options).await?;
 
-                if !self.quiet {
+                if !quiet {
                     println!("✅ Secret '{}' set successfully.", secret_name);
                     if let Some(version) = metadata.version {
                         println!("   Version: {}", version);
@@ -341,7 +344,7 @@ impl SecretCommand {
 
                 provider.delete(&secret_name, *force).await?;
 
-                if !self.quiet {
+                if !quiet {
                     println!("✅ Secret '{}' deleted.", secret_name);
                 }
             },

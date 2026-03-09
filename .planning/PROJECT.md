@@ -47,12 +47,26 @@ Tool handlers can manage long-running operations through a durable task lifecycl
 - ✓ Standalone demo landing pages with mock bridge — v1.3
 - ✓ Chess, map, and dataviz MCP App examples shipping — v1.3
 - ✓ 20 chromiumoxide CDP E2E browser tests across 3 widget suites — v1.3
+- ✓ Book Ch 14 (Performance & Load Testing) — 961-line comprehensive chapter with CLI, config, metrics, CI/CD — v1.4
+- ✓ Book Ch 15 Load Testing cross-reference section — v1.4
+- ✓ Book Ch 12.5 (MCP Apps) rewritten with WidgetDir, cargo pmcp app, adapter pattern — v1.4
+- ✓ Course Ch 18-03 hands-on load testing tutorial (952 lines) — v1.4
+- ✓ Course Ch 12 Load Testing cross-reference section — v1.4
+- ✓ Course Ch 20 sub-chapters rewritten with WidgetDir/mcpBridge/adapter paradigm — v1.4
+- ✓ Course quizzes and exercises for load testing and MCP Apps content — v1.4
 
 ### Active
 
-<!-- No active milestone — planning next -->
+## Current Milestone: v1.6 CLI DX Overhaul
 
-(None — planning next milestone)
+**Goal:** Normalize the cargo pmcp CLI for consistency and developer experience ahead of course recording — fix flag inconsistencies, propagate auth to all server-facing commands, surface mcp-tester via cargo pmcp test, and add doctor/completions commands.
+
+**Target features:**
+- Flag consistency: positional URL, unified --server, --verbose/-v, --yes, -o, --format
+- Auth propagation: OAuth + API key flags on test check/run/generate, preview, schema export
+- Tester integration: surface mcp-tester commands through cargo pmcp test with aligned flags
+- New commands: cargo pmcp doctor (workspace health), cargo pmcp completions (shell completions)
+- Help polish: consistent help text, usage examples, global --no-color/--quiet
 
 ### Future
 
@@ -63,16 +77,21 @@ Tool handlers can manage long-running operations through a durable task lifecycl
 - [ ] Workflow resume from task state (re-invoke prompt with task ID to continue from last step)
 - [ ] StepExecution user API for runtime step mode customization
 - [ ] Examples: code mode, DynamoDB backend
+- [ ] Loadtest provider trait abstraction (when second provider appears)
+- [ ] Remote execution trigger from CLI (`cargo pmcp loadtest run --remote`)
+- [ ] Result download/polling from CLI
 
 ## Current State
 
-Shipped v1.3 with complete MCP Apps developer experience. All 4 milestones (v1.0-v1.3) shipped.
+v1.6 in progress. All prior milestones (v1.0-v1.5) shipped.
 
 **Shipped milestones:**
 - v1.0: MCP Tasks Foundation (types, store, server integration)
 - v1.1: Task-Prompt Bridge (workflow execution, handoff, continuation)
 - v1.2: Pluggable Storage Backends (DynamoDB, Redis, feature flags)
 - v1.3: MCP Apps Developer Experience (preview, WASM, authoring, publishing, examples, E2E)
+- v1.4: Book & Course Update (load testing docs, MCP Apps chapter refresh, quizzes, exercises)
+- v1.5: Cloud Load Testing Upload (loadtest config upload, OAuth for load testing)
 
 ### Out of Scope
 
@@ -90,7 +109,7 @@ Shipped v1.3 with complete MCP Apps developer experience. All 4 milestones (v1.0
 
 ## Context
 
-Shipped v1.3 with ~41,000+ Rust LOC across the workspace (v1.0: ~11,500 + v1.1: +10,697 + v1.2: +9,802 + v1.3: +9,197).
+Shipped v1.4 with ~41,000+ Rust LOC across the workspace (v1.0: ~11,500 + v1.1: +10,697 + v1.2: +9,802 + v1.3: +9,197) plus 8,140 lines of documentation content in v1.4.
 Tech stack: `pmcp-tasks` (serde, async-trait, dashmap, uuid, chrono, tokio, parking_lot; optional: aws-sdk-dynamodb, redis) + `pmcp` core (protocol types, ServerCore routing, workflow system, MCP Apps) + `cargo-pmcp` (CLI tooling) + `mcp-preview` (browser preview) + `mcp-e2e-tests` (chromiumoxide CDP) + `packages/widget-runtime` (TypeScript bridge library).
 
 - The MCP Tasks spec is experimental (2025-11-25). Most MCP clients don't support it yet, so the feature is optional and isolated in `pmcp-tasks`.
@@ -146,4 +165,4 @@ Tech stack: `pmcp-tasks` (serde, async-trait, dashmap, uuid, chrono, tokio, park
 | Standalone examples (workspace exclude) (v1.3) | Avoids feature flag unification conflicts | ✓ Good — each example builds independently |
 
 ---
-*Last updated: 2026-02-26 after v1.3 milestone*
+*Last updated: 2026-03-03 after v1.6 milestone start*
