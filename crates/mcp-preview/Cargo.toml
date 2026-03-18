@@ -1,6 +1,6 @@
 [package]
 name = "mcp-preview"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "MCP Apps Preview Server - Browser-based UI testing for MCP widgets"
 license = "MIT OR Apache-2.0"

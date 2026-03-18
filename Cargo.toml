@@ -1,6 +1,6 @@
 [package]
 name = "pmcp"
-version = "1.19.0"
+version = "1.20.0"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "High-quality Rust SDK for Model Context Protocol (MCP) with full TypeScript SDK compatibility"
@@ -49,9 +49,8 @@ glob = "0.3"
 url = "2.5"
 toml = "1.0"
 uuid = { version = "1.17", features = ["v4", "serde", "js"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 regex = "1.11"
-lazy_static = "1.5"
 urlencoding = "2.1"
 indexmap = { version = "2.10", features = ["serde"] }
 smallvec = { version = "1.13", features = ["serde", "union"] }
@@ -63,7 +62,6 @@ pmcp-widget-utils = { path = "crates/pmcp-widget-utils", version = "0.1.0" }
 futures-util = { version = "0.3", optional = true }
 futures-channel = { version = "0.3", optional = true }
 futures-locks = { version = "0.7", optional = true, default-features = false }
-pin-project = "1.1"
 http-body-util = "0.1"
 
 # OAuth dependencies
@@ -75,12 +73,12 @@ jsonwebtoken = { version = "10.3", optional = true }
 webbrowser = { version = "1", optional = true }
 dirs = { version = "6", optional = true }
 rand = { version = "0.10", optional = true }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"], optional = true }
 
 # Transport dependencies (optional, feature-gated)
 tokio-tungstenite = { version = "0.28", optional = true }
-hyper = { version = "1.6", features = ["full"], optional = true }
-hyper-util = { version = "0.1", features = ["full"], optional = true }
+hyper = { version = "1.6", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server-auto", "client-legacy"], optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "native-tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 axum = { version = "0.8.5", optional = true }
@@ -90,7 +88,7 @@ notify = { version = "8.2", optional = true }
 glob-match = { version = "0.2", optional = true }
 
 # Validation (optional, feature-gated)
-jsonschema = { version = "0.45", optional = true }
+jsonschema = { version = "0.45", optional = true, default-features = false }
 garde = { version = "0.22", optional = true }
 
 # SIMD support (optional)
@@ -98,10 +96,10 @@ rayon = { version = "1.10", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.46", features = ["full"] }
+tokio = { version = "1.46", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "fs", "sync", "time", "process", "signal"] }
 tokio-stream = { version = "0.1.15" }
 tokio-util = { version = "0.7", features = ["rt"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls", "form"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -134,14 +132,16 @@ dashmap = "6.1"  # Already in main deps but needed for examples
 pmcp-tasks = { path = "crates/pmcp-tasks" }  # For task examples (60_tasks_*)
 
 [features]
-default = ["validation"]
-full = ["websocket", "http", "streamable-http", "sse", "validation", "resource-watcher", "rayon", "schema-generation", "jwt-auth", "composition", "mcp-apps"]
+default = ["logging"]
+full = ["websocket", "http", "streamable-http", "sse", "validation", "resource-watcher", "rayon", "schema-generation", "jwt-auth", "composition", "mcp-apps", "http-client", "logging"]
 composition = ["streamable-http"]
 # MCP Apps Extension - Interactive UI support for ChatGPT Apps, MCP-UI, and standard MCP hosts
 mcp-apps = []
-jwt-auth = ["dep:jsonwebtoken"]
-oauth = ["dep:webbrowser", "dep:dirs", "dep:rand"]
-sse = ["dep:bytes"]
+jwt-auth = ["http-client", "dep:jsonwebtoken"]
+http-client = ["dep:reqwest"]
+logging = ["dep:tracing-subscriber"]
+oauth = ["http-client", "dep:webbrowser", "dep:dirs", "dep:rand"]
+sse = ["http-client", "dep:bytes"]
 websocket = ["dep:tokio-tungstenite"]
 http = ["dep:hyper", "dep:hyper-util", "dep:bytes"]
 streamable-http = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls", "dep:futures-util", "dep:bytes", "dep:axum"]

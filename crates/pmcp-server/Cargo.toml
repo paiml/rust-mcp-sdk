@@ -18,7 +18,7 @@ name = "pmcp-server"
 path = "src/main.rs"
 
 [dependencies]
-pmcp = { version = "1.19.0", path = "../../", features = ["streamable-http"] }
+pmcp = { version = "1.20.0", path = "../../", features = ["streamable-http"] }
 mcp-tester = { version = "0.3.4", path = "../mcp-tester" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }

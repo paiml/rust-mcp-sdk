@@ -146,6 +146,7 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
         Body::Empty => Vec::new(),
         Body::Text(s) => s.into_bytes(),
         Body::Binary(b) => b,
+        _ => Vec::new(),
     };
     req = req.body(body_bytes);
 

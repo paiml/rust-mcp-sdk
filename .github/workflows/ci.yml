@@ -139,6 +139,10 @@ jobs:
               echo "Skipping example: $example_name (requires schema-generation feature)"
               continue
             fi
+            if [[ "$example_name" == "20_oidc_discovery" ]]; then
+              echo "Skipping example: $example_name (requires http-client feature)"
+              continue
+            fi
             if [[ "$example_name" == "28_sse_optimized" ]]; then
               echo "Skipping example: $example_name (requires sse feature)"
               continue

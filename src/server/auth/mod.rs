@@ -45,12 +45,15 @@
 //! - Generic OIDC (custom [`ClaimMappings`])
 
 pub mod config;
+#[cfg(feature = "http-client")]
 pub mod jwt;
+#[cfg(feature = "http-client")]
 pub mod jwt_validator;
 pub mod middleware;
 pub mod mock;
 pub mod oauth2;
 pub mod provider;
+#[cfg(feature = "http-client")]
 pub mod providers;
 pub mod proxy;
 pub mod traits;
@@ -66,9 +69,11 @@ pub use config::TokenValidatorConfig;
 
 // Re-export JWT validators
 // Legacy single-tenant validator (for backward compatibility)
+#[cfg(feature = "http-client")]
 pub use jwt::JwtValidator;
 
 // New multi-tenant validator (recommended for Lambda authorizers)
+#[cfg(feature = "http-client")]
 pub use jwt_validator::{JwtValidator as MultiTenantJwtValidator, ValidationConfig};
 
 // Re-export mock validator for testing
@@ -84,6 +89,7 @@ pub use provider::{
 };
 
 // Re-export concrete provider implementations
+#[cfg(feature = "http-client")]
 pub use providers::{CognitoProvider, GenericOidcConfig, GenericOidcProvider};
 
 // Keep existing OAuth2 exports for compatibility

@@ -28,7 +28,7 @@ use futures_channel::{mpsc, oneshot};
 #[cfg(target_arch = "wasm32")]
 use futures_locks::RwLock;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "http-client"))]
 pub mod auth;
 pub mod http_logging_middleware;
 pub mod http_middleware;

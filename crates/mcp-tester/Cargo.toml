@@ -1,6 +1,6 @@
 [package]
 name = "mcp-tester"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Comprehensive MCP server testing tool - library and CLI"
@@ -18,7 +18,7 @@ name = "mcp-tester"
 path = "src/main.rs"
 
 [dependencies]
-pmcp = { version = "1.19.0", path = "../../", features = ["streamable-http", "oauth"] }
+pmcp = { version = "1.20.0", path = "../../", features = ["streamable-http", "oauth"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }

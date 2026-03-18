@@ -53,7 +53,7 @@ pub use event_store::{
     EventStore, EventStoreConfig, InMemoryEventStore, MessageDirection, ResumptionManager,
     ResumptionState, ResumptionToken, StoredEvent,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "logging"))]
 pub use logging::init_logging;
 pub use logging::{CorrelatedLogger, LogConfig, LogEntry, LogFormat, LogLevel};
 pub use middleware::{

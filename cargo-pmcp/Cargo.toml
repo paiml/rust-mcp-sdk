@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"
@@ -33,9 +33,9 @@ glob = "0.3"
 hdrhistogram = "7.5"
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-pmcp = { version = "1.19.0", path = "..", features = ["streamable-http", "oauth"] }
-mcp-tester = { version = "0.3.4", path = "../crates/mcp-tester" }
-mcp-preview = { version = "0.2.3", path = "../crates/mcp-preview" }
+pmcp = { version = "1.20.0", path = "..", features = ["streamable-http", "oauth"] }
+mcp-tester = { version = "0.3.5", path = "../crates/mcp-tester" }
+mcp-preview = { version = "0.2.4", path = "../crates/mcp-preview" }
 urlencoding = "2"
 async-trait = "0.1.89"
 pathdiff = "0.2.3"
