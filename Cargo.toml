@@ -76,7 +76,7 @@ rand = { version = "0.10", optional = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"], optional = true }
 
 # Transport dependencies (optional, feature-gated)
-tokio-tungstenite = { version = "0.28", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 hyper = { version = "1.6", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "server-auto", "client-legacy"], optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "native-tokio"], optional = true }
