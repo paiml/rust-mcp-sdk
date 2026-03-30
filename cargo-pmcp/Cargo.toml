@@ -68,7 +68,7 @@ aws-sdk-secretsmanager = { version = "1", optional = true }
 # For security penetration testing
 serde-sarif = "0.8"
 governor = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 
 [dev-dependencies]

@@ -65,7 +65,7 @@ futures-locks = { version = "0.7", optional = true, default-features = false }
 http-body-util = "0.1"
 
 # OAuth dependencies
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 jsonwebtoken = { version = "10.3", optional = true }
 
