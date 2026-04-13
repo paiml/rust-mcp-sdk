@@ -112,7 +112,7 @@ jobs:
           ls -lh course-content-*.tar.gz
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: course-content-${{ github.ref_name }}.tar.gz
         env:
