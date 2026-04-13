@@ -32,7 +32,7 @@ chrono = "0.4"
 graphql-parser = "0.4"
 
 # JavaScript parsing (optional, for OpenAPI Code Mode)
-swc_ecma_parser = { version = "32", optional = true }
+swc_ecma_parser = { version = "38", optional = true }
 swc_ecma_ast = { version = "19", optional = true }
 swc_ecma_visit = { version = "19", optional = true }
 swc_common = { version = "18", optional = true }
