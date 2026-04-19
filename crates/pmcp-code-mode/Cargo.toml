@@ -36,7 +36,7 @@ toml = "1.0"
 swc_ecma_parser = { version = "38", optional = true }
 swc_ecma_ast = { version = "19", optional = true }
 swc_ecma_visit = { version = "23", optional = true }
-swc_common = { version = "18", optional = true }
+swc_common = { version = "21", optional = true }
 
 # SQL parsing (optional, for SQL Code Mode)
 sqlparser = { version = "0.61", optional = true }
