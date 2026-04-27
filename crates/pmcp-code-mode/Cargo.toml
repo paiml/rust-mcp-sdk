@@ -33,7 +33,7 @@ graphql-parser = "0.4"
 toml = "1.0"
 
 # JavaScript parsing (optional, for OpenAPI Code Mode)
-swc_ecma_parser = { version = "38", optional = true }
+swc_ecma_parser = { version = "39", optional = true }
 swc_ecma_ast = { version = "23", optional = true }
 swc_ecma_visit = { version = "23", optional = true }
 swc_common = { version = "21", optional = true }
