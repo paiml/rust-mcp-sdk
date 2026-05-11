@@ -39,7 +39,7 @@ swc_ecma_visit = { version = "23", optional = true }
 swc_common = { version = "21", optional = true }
 
 # SQL parsing (optional, for SQL Code Mode)
-sqlparser = { version = "0.61", optional = true }
+sqlparser = { version = "0.62", optional = true }
 
 # Local Cedar policy evaluation (optional)
 cedar-policy = { version = "4.9", optional = true }
