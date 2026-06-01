@@ -37,7 +37,7 @@ toml = "1.0"
 # 24.0.0, common 22.0.0) was YANKED wholesale from crates.io, which made the prior
 # mixed pins (parser "40" + visit "24") unresolvable. This 39-gen set is non-yanked
 # and is the generation this crate's code compiles against.
-swc_ecma_parser = { version = "39", optional = true }
+swc_ecma_parser = { version = "41", optional = true }
 swc_ecma_ast = { version = "23", optional = true }
 swc_ecma_visit = { version = "23", optional = true }
 swc_common = { version = "21", optional = true }
