@@ -52,7 +52,7 @@ aws-sdk-ssm = { version = "1", default-features = false, features = ["default-ht
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
 
 jsonschema = { version = "0.46", default-features = false, optional = true }
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 # Why: Phase 90 OpenAPI HTTP backend (OAPI-01 / OAPI-03). These optional deps are
 # gated under the `http` feature and own ALL toolkit dependency changes for the
