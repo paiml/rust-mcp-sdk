@@ -39,7 +39,7 @@ toml = "1.0"
 # and is the generation this crate's code compiles against.
 swc_ecma_parser = { version = "39", optional = true }
 swc_ecma_ast = { version = "23", optional = true }
-swc_ecma_visit = { version = "23", optional = true }
+swc_ecma_visit = { version = "25", optional = true }
 swc_common = { version = "21", optional = true }
 
 # SQL parsing (optional, for SQL Code Mode)
