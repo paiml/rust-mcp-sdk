@@ -9,7 +9,7 @@ description = "End-to-end browser tests for MCP App widgets"
 chromiumoxide = { version = "0.9", features = ["fetcher", "rustls", "zip0"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"

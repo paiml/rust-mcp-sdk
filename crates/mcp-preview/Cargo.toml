@@ -12,7 +12,7 @@ categories = ["development-tools", "web-programming"]
 # Web server
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 
 # Embedded assets
 rust-embed = "8"
