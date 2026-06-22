@@ -27,7 +27,7 @@ jobs:
           - auth_flows
     
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Remove rust-toolchain.toml to allow nightly
         run: rm -f rust-toolchain.toml
@@ -86,7 +86,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Remove rust-toolchain.toml to allow nightly
         run: rm -f rust-toolchain.toml
@@ -144,7 +144,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Remove rust-toolchain.toml to allow nightly
         run: rm -f rust-toolchain.toml

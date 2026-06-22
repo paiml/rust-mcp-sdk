@@ -19,7 +19,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Free Disk Space
       uses: jlumbroso/free-disk-space@main
@@ -136,7 +136,7 @@ jobs:
     name: Feature Flag Verification
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -165,7 +165,7 @@ jobs:
     # semantics stay aligned. See .planning/phases/75-fix-pmat-issues/
     # 75-W0-SPIKE-RESULTS.md for the empirical justification (D-09).
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Free Disk Space
       uses: jlumbroso/free-disk-space@main
@@ -239,7 +239,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -262,7 +262,7 @@ jobs:
     name: Minimum Supported Rust Version (1.91)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install Rust 1.91
       uses: dtolnay/rust-toolchain@1.91
@@ -290,7 +290,7 @@ jobs:
     name: Purity Gate
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
