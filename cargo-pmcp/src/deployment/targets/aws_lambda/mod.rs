@@ -110,7 +110,12 @@ impl DeploymentTarget for AwsLambdaTarget {
         config: &DeployConfig,
         _artifact: BuildArtifact,
     ) -> Result<DeploymentOutputs> {
-        deploy::deploy_aws_lambda(config, config.secrets.clone()).await
+        // Thread developer-declared [environment] alongside resolved [secrets]
+        // through the same transient CDK-process-env path (fix for
+        // deploy-toml-inert-for-preserved-stack, FIX #2). `deploy_env_vars()`
+        // merges both maps (secrets win on collision); the stack.ts decides
+        // which keys it consumes via process.env.
+        deploy::deploy_aws_lambda(config, config.deploy_env_vars()).await
     }
 
     async fn destroy(&self, config: &DeployConfig, clean: bool) -> Result<()> {

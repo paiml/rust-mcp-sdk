@@ -5,8 +5,11 @@ use crate::deployment::{DeployConfig, DeploymentOutputs};
 
 /// Deploy to AWS Lambda (calls the original DeployExecutor).
 ///
-/// Resolved secrets are passed via `extra_env` and forwarded as transient
-/// process env vars to the CDK child process. They are **never** written
+/// `extra_env` carries the merged transient env-var map from
+/// [`DeployConfig::deploy_env_vars`] — developer-declared `[environment]`
+/// values plus deploy-time-resolved `[secrets]` (secrets win on collision).
+/// Both are forwarded as transient process env vars to the CDK child process
+/// and consumed by the stack.ts via `process.env`. They are **never** written
 /// to `deploy.toml` (per D-05/D-06).
 pub async fn deploy_aws_lambda(
     config: &DeployConfig,

@@ -109,9 +109,15 @@ pub async fn deploy_to_pmcp_run(
         m
     });
 
-    // Step 1: Synthesize CloudFormation template with metadata context
+    // Step 1: Synthesize CloudFormation template with metadata context.
+    // FIX #2 (deploy-toml-inert-for-preserved-stack): pass developer-declared
+    // [environment] to the `cdk synth` child process — the pmcp-run equivalent
+    // of the aws-lambda `extra_env` path. The stack.ts consumes matching
+    // process.env.<KEY> reads, so [environment] is no longer globally inert.
+    // Secrets are intentionally NOT passed here (pmcp.run injects them
+    // server-side per D-08); only non-sensitive [environment] flows to synth.
     println!("📝 Synthesizing CloudFormation template...");
-    run_cdk_synth(&deploy_dir, metadata.as_ref())?;
+    run_cdk_synth(&deploy_dir, metadata.as_ref(), &config.environment)?;
     println!("✅ CloudFormation template synthesized");
 
     // Step 2: Find the synthesized template
@@ -211,7 +217,39 @@ fn extract_metadata_with_log(project_root: &Path) -> Option<McpMetadata> {
 }
 
 /// Run `npx cdk synth --quiet` with optional metadata context args.
-fn run_cdk_synth(deploy_dir: &Path, metadata: Option<&McpMetadata>) -> Result<()> {
+///
+/// `environment` carries developer-declared `[environment]` values from
+/// `.pmcp/deploy.toml`; they are set as process env vars on the `cdk synth`
+/// child process so the stack.ts can consume matching `process.env.<KEY>`
+/// reads (FIX #2, `deploy-toml-inert-for-preserved-stack`). This is the
+/// pmcp-run equivalent of the aws-lambda `DeployExecutor.extra_env` path.
+fn run_cdk_synth(
+    deploy_dir: &Path,
+    metadata: Option<&McpMetadata>,
+    environment: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let synth_output = build_cdk_synth_command(deploy_dir, metadata, environment)
+        .output()
+        .context("Failed to run cdk synth. Make sure Node.js and npm are installed")?;
+
+    if !synth_output.status.success() {
+        let stderr = String::from_utf8_lossy(&synth_output.stderr);
+        bail!("CDK synthesis failed:\n{}", stderr);
+    }
+    Ok(())
+}
+
+/// Build (but do not run) the `npx cdk synth` child-process command, with the
+/// developer-declared `[environment]` set as process env vars.
+///
+/// Factored out of [`run_cdk_synth`] so the env-var threading (FIX #2) is
+/// unit-testable via [`std::process::Command::get_envs`] without spawning a
+/// real `cdk synth`.
+fn build_cdk_synth_command(
+    deploy_dir: &Path,
+    metadata: Option<&McpMetadata>,
+    environment: &std::collections::HashMap<String, String>,
+) -> std::process::Command {
     let shell_cmd = if cfg!(target_os = "windows") {
         "cmd"
     } else {
@@ -233,18 +271,12 @@ fn run_cdk_synth(deploy_dir: &Path, metadata: Option<&McpMetadata>) -> Result<()
         format!("npx cdk synth --quiet {}", cdk_context_args)
     };
 
-    let synth_output = std::process::Command::new(shell_cmd)
-        .current_dir(deploy_dir)
+    let mut cmd = std::process::Command::new(shell_cmd);
+    cmd.current_dir(deploy_dir)
+        .envs(environment)
         .arg(shell_arg)
-        .arg(&synth_command)
-        .output()
-        .context("Failed to run cdk synth. Make sure Node.js and npm are installed")?;
-
-    if !synth_output.status.success() {
-        let stderr = String::from_utf8_lossy(&synth_output.stderr);
-        bail!("CDK synthesis failed:\n{}", stderr);
-    }
-    Ok(())
+        .arg(&synth_command);
+    cmd
 }
 
 /// Payload prepared for upload to S3: raw bytes, content-type, whether the
@@ -754,6 +786,16 @@ fn validate_and_regenerate_stack_ts(config: &DeployConfig) -> Result<()> {
     )?;
     if !wrote {
         println!("{}", crate::deployment::config::STACK_TS_PRESERVED_NOTICE);
+        // FIX #1 (deploy-toml-inert-for-preserved-stack): warn loudly when the
+        // preserved stack.ts means declared [iam]/[environment] are not
+        // auto-applied. Mirrors the aws-lambda path
+        // (commands/deploy/deploy.rs) so the signal is target-uniform.
+        if let Some(warning) = crate::deployment::config::stack_ts_preserved_inert_warning(
+            config.iam.is_empty(),
+            config.environment.is_empty(),
+        ) {
+            eprintln!("{warning}");
+        }
     }
 
     Ok(())
@@ -896,6 +938,29 @@ mod tests {
         assert!(
             after.contains("pmcp-${serverId}-McpRoleArn"),
             "overwritten stack.ts must carry the pmcp-run rendered template signature"
+        );
+    }
+
+    /// FIX #2 (deploy-toml-inert-for-preserved-stack): developer-declared
+    /// `[environment]` must be threaded onto the `cdk synth` child process as
+    /// env vars, so a preserved-or-generated stack.ts can consume it via
+    /// `process.env.<KEY>`. Inspect the built command's env without spawning.
+    #[test]
+    fn cdk_synth_command_carries_deploy_toml_environment() {
+        use std::ffi::OsStr;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut env = std::collections::HashMap::new();
+        env.insert("GRAPHRAG_ENDPOINT".to_string(), "https://x".to_string());
+
+        let cmd = build_cdk_synth_command(tmp.path(), None, &env);
+
+        let found = cmd.get_envs().any(|(k, v)| {
+            k == OsStr::new("GRAPHRAG_ENDPOINT") && v == Some(OsStr::new("https://x"))
+        });
+        assert!(
+            found,
+            "[environment] entry must be set on the cdk synth child process (FIX #2)"
         );
     }
 }

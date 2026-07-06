@@ -222,6 +222,73 @@ pub(crate) fn write_stack_ts_guarded(
     Ok(true)
 }
 
+/// Build the prominent, multi-line warning emitted by both deploy targets when
+/// an operator-curated `deploy/lib/stack.ts` was PRESERVED (the regeneration
+/// guard skipped the write) yet `.pmcp/deploy.toml` still declares `[iam]`
+/// and/or `[environment]` sections whose delivery depends on the stack.ts.
+///
+/// Returns `None` when both sections are empty (nothing surprising to warn
+/// about). Callers only invoke this on the preserve path, so a `Some` result
+/// always corresponds to a preserved custom stack.ts.
+///
+/// Why this exists (Phase 98 follow-up — `deploy-toml-inert-for-preserved-stack`):
+/// the `#279`/DSTK-01 exists-guard preserves a curated stack.ts by existence
+/// alone, which silently severs the `{iam_block}` splice (IAM is only injected
+/// when stack.ts is (re)generated) and means `[environment]` reaches the Lambda
+/// only if the curated stack.ts reads `process.env`. Both were previously
+/// silent no-ops that surfaced as a fail-closed 500 at runtime. This warning
+/// makes the gap loud at deploy time without blocking the deploy (the operator
+/// may have deliberately inlined the equivalents directly in stack.ts).
+//
+// Why allow(dead_code): identical rationale to STACK_TS_PRESERVED_NOTICE — the
+// production callers live in the bin-only tree, while config.rs is also mounted
+// into the lib via `#[path]` (see lib.rs) where no caller exists. Exercised by
+// the in-crate `stack_ts_guard_tests` and used by the bin build.
+#[allow(dead_code)]
+pub(crate) fn stack_ts_preserved_inert_warning(
+    iam_is_empty: bool,
+    environment_is_empty: bool,
+) -> Option<String> {
+    if iam_is_empty && environment_is_empty {
+        return None;
+    }
+
+    let mut lines = vec![
+        "⚠️  stack.ts PRESERVED — some .pmcp/deploy.toml sections are NOT auto-applied:"
+            .to_string(),
+    ];
+    if !iam_is_empty {
+        lines.push(
+            "   • [iam] / [[iam.statements]]: spliced into stack.ts ONLY when it is (re)generated."
+                .to_string(),
+        );
+        lines.push(
+            "     A preserved custom stack.ts keeps its own role policy. To apply the deploy.toml"
+                .to_string(),
+        );
+        lines.push(
+            "     IAM, run `cargo pmcp deploy --regenerate-stack`, or add the addToRolePolicy(...)"
+                .to_string(),
+        );
+        lines.push("     statements directly in stack.ts.".to_string());
+    }
+    if !environment_is_empty {
+        lines.push(
+            "   • [environment]: exported to the deploy-time CDK process env and reaches the Lambda"
+                .to_string(),
+        );
+        lines.push(
+            "     ONLY if stack.ts reads it via process.env.<KEY> in its environment:{} block."
+                .to_string(),
+        );
+        lines.push(
+            "     Otherwise set the value directly in the stack.ts environment:{} block."
+                .to_string(),
+        );
+    }
+    Some(lines.join("\n"))
+}
+
 /// Composition configuration for MCP server-to-server communication.
 ///
 /// Enables servers to be composed in a tiered architecture:
@@ -1058,6 +1125,38 @@ impl DeployConfig {
             "deploy.toml is missing the required [aws] block — \
              this code path requires an AWS target (aws-lambda or pmcp-run)",
         )
+    }
+
+    /// Build the transient env-var map handed to the CDK child process
+    /// (`DeployExecutor.extra_env` on the aws-lambda path).
+    ///
+    /// Combines developer-declared `[environment]` values with the deploy-time
+    /// resolved `[secrets]`. Both flow identically as CDK process env vars; the
+    /// generated/curated `stack.ts` decides which keys it consumes via
+    /// `process.env`, so a hardcoded literal in the stack.ts `environment:{}`
+    /// block still takes final precedence — `[environment]` is additive-fill,
+    /// exactly like `[secrets]` behave today (fix for
+    /// `deploy-toml-inert-for-preserved-stack`, FIX #2).
+    ///
+    /// # Precedence
+    ///
+    /// On a key collision between `[environment]` and `[secrets]`, the
+    /// **secret wins**: a resolved `[secrets]` value is the authoritative,
+    /// sensitive value and must not be shadowed by a plain `[environment]`
+    /// default. (This mirrors the pre-fix behaviour where `[secrets]` were the
+    /// sole contents of `extra_env`.)
+    ///
+    /// This map is transient (per D-05/D-06): never written back to
+    /// `deploy.toml`.
+    #[must_use]
+    pub fn deploy_env_vars(&self) -> HashMap<String, String> {
+        let mut env = self.environment.clone();
+        // Secrets overlay environment: a resolved secret is authoritative and
+        // must win on key collision (see # Precedence above).
+        for (key, value) in &self.secrets {
+            env.insert(key.clone(), value.clone());
+        }
+        env
     }
 
     /// Create config with OAuth enabled using Cognito
@@ -2231,5 +2330,92 @@ mod stack_ts_guard_tests {
         let on_disk =
             std::fs::read_to_string(lib_dir.join("stack.ts")).expect("read stack.ts back");
         assert_eq!(on_disk, "REGENERATED TEMPLATE");
+    }
+
+    // ── FIX #1: preserved-stack inert-section warning ───────────────────────
+    // (deploy-toml-inert-for-preserved-stack)
+
+    #[test]
+    fn inert_warning_silent_when_both_sections_empty() {
+        assert!(
+            stack_ts_preserved_inert_warning(true, true).is_none(),
+            "no warning when both [iam] and [environment] are empty"
+        );
+    }
+
+    #[test]
+    fn inert_warning_fires_for_non_empty_iam() {
+        let w = stack_ts_preserved_inert_warning(false, true)
+            .expect("warning must fire when [iam] is non-empty on a preserved stack");
+        assert!(w.contains("PRESERVED"), "warning names the preserve cause");
+        assert!(
+            w.contains("--regenerate-stack"),
+            "IAM remedy names the opt-in flag"
+        );
+        assert!(w.contains("[iam]"), "warning calls out the [iam] section");
+    }
+
+    #[test]
+    fn inert_warning_fires_for_non_empty_environment() {
+        let w = stack_ts_preserved_inert_warning(true, false)
+            .expect("warning must fire when [environment] is non-empty on a preserved stack");
+        assert!(
+            w.contains("[environment]"),
+            "warning calls out the [environment] section"
+        );
+        assert!(
+            w.contains("process.env"),
+            "warning explains the process.env delivery caveat"
+        );
+    }
+
+    #[test]
+    fn inert_warning_fires_for_both_sections() {
+        let w = stack_ts_preserved_inert_warning(false, false)
+            .expect("warning must fire when both sections are non-empty");
+        assert!(w.contains("[iam]"));
+        assert!(w.contains("[environment]"));
+    }
+
+    // ── FIX #2: [environment] threaded into the CDK env-injection path ───────
+
+    #[test]
+    fn deploy_env_vars_includes_environment_entries() {
+        let mut cfg = DeployConfig::default_for_server(
+            "demo".to_string(),
+            "us-east-1".to_string(),
+            std::path::PathBuf::from("/tmp/deploy-env-vars"),
+        );
+        cfg.environment
+            .insert("MY_FLAG".to_string(), "on".to_string());
+
+        let env = cfg.deploy_env_vars();
+        assert_eq!(
+            env.get("MY_FLAG").map(String::as_str),
+            Some("on"),
+            "[environment] entries must reach the deploy env-var map (FIX #2)"
+        );
+        // Built-in RUST_LOG from default_for_server survives the merge.
+        assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn deploy_env_vars_secret_wins_over_environment_on_collision() {
+        let mut cfg = DeployConfig::default_for_server(
+            "demo".to_string(),
+            "us-east-1".to_string(),
+            std::path::PathBuf::from("/tmp/deploy-env-vars-precedence"),
+        );
+        cfg.environment
+            .insert("SHARED".to_string(), "env-default".to_string());
+        cfg.secrets
+            .insert("SHARED".to_string(), "resolved-secret".to_string());
+
+        let env = cfg.deploy_env_vars();
+        assert_eq!(
+            env.get("SHARED").map(String::as_str),
+            Some("resolved-secret"),
+            "resolved [secrets] must win over [environment] on key collision"
+        );
     }
 }

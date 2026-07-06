@@ -113,6 +113,16 @@ impl DeployExecutor {
         )?;
         if !wrote {
             println!("{}", crate::deployment::config::STACK_TS_PRESERVED_NOTICE);
+            // FIX #1 (deploy-toml-inert-for-preserved-stack): warn loudly when
+            // the preserved stack.ts means declared [iam]/[environment] are not
+            // auto-applied, so the silent no-op never surfaces only as a
+            // runtime 500.
+            if let Some(warning) = crate::deployment::config::stack_ts_preserved_inert_warning(
+                config.iam.is_empty(),
+                config.environment.is_empty(),
+            ) {
+                eprintln!("{warning}");
+            }
         }
         Ok(())
     }

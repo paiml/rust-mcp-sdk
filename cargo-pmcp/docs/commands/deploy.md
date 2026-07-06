@@ -90,6 +90,22 @@ Both keys are optional. **Absent the `[metadata]` block, behavior is unchanged**
 
 > See `cargo run -p cargo-pmcp --example deploy_stack_metadata` for a runnable walkthrough of the guard + `[metadata]` workflow.
 
+### Environment variables (`[environment]`)
+
+Non-sensitive runtime configuration goes in the `[environment]` block of `.pmcp/deploy.toml`:
+
+```toml
+[environment]
+RUST_LOG = "info"
+GRAPHRAG_ENDPOINT = "https://graphrag.internal"
+```
+
+At deploy time these values are exported as env vars onto the CDK child process (`cdk deploy` for `aws-lambda`, `cdk synth` for `pmcp-run`) — the **same transient path** resolved `[secrets]` already use, so they are **never written back to disk** and are immune to the `stack.ts` preserve guard. A value reaches the deployed Lambda when `stack.ts` reads it via `process.env.<KEY>` inside its `environment: {}` block.
+
+**Precedence** (consistent with `[secrets]`): a hardcoded literal in the `stack.ts` `environment: {}` block **wins** over a `.pmcp/deploy.toml` `[environment]` entry with the same key — `[environment]` is *additive-fill*, supplying keys the stack does not already set. If a key appears in **both** `[environment]` and `[secrets]`, the resolved **secret wins** (it is the authoritative, sensitive value).
+
+> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` now prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`), and `[environment]` reaches the Lambda only if the curated `stack.ts` reads the matching `process.env.<KEY>`. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
+
 ---
 
 ## deploy init
