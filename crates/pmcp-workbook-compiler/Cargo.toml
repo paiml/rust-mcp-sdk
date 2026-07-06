@@ -88,7 +88,7 @@ tempfile = "3"
 # cached `<v>` results via `Formula::set_result` — the Plan 04 reconcile oracle.
 # Dev-only: the compiler never links a writer at runtime. Version mirrors the
 # runtime crate's pin (0.95, default-features off).
-rust_xlsxwriter = { version = "0.95", default-features = false }
+rust_xlsxwriter = { version = "0.96", default-features = false }
 # The CONSUMER contract: the direct toolkit loader round-trip test
 # (`emitted_bundle_loads_via_toolkit`) loads an emitted temp bundle through the
 # Phase 92 served loader. The `workbook` feature pulls the LocalDirSource + the

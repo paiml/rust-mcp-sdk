@@ -35,7 +35,7 @@ hex = "0.4"                        # match pmcp-code-mode pin
 # github.com/jmcnamara/rust_xlsxwriter), `cargo tree -i` writer-only confirmation
 # (zip enters ONLY via this crate; no reader leaks), and `cargo audit` clean —
 # mirroring the umya 3.0.0 / csv 1.4 supply-chain discipline of record.
-rust_xlsxwriter = { version = "0.95", default-features = false }
+rust_xlsxwriter = { version = "0.96", default-features = false }
 
 # EMBEDDED-BUNDLE support (Phase 92, Plan 01 — WBSV-09, T-92-SC). Optional +
 # behind the `embedded` feature so the default build never pulls it. It bakes a
