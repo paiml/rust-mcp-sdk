@@ -98,12 +98,91 @@ fn normalize_api_url(s: &str) -> String {
     s.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// Get the base API URL from environment or use default.
-/// Supports both PMCP_API_URL (preferred) and PMCP_RUN_API_URL (legacy).
+/// Get the base API URL, honoring (in order):
+/// 1. `PMCP_API_URL` env var (preferred one-off override)
+/// 2. `PMCP_RUN_API_URL` env var (legacy alias)
+/// 3. The `api_url` persisted for a `pmcp-run` target via `cargo pmcp configure`
+///    (`~/.pmcp/config.toml`) — this is what lets private deployments on a custom
+///    domain be reached without exporting an env var on every command
+/// 4. `DEFAULT_API_URL` (`https://api.pmcp.run`)
+///
+/// Step 3 closes the gap for non-target-consuming commands (e.g. `secret set`),
+/// which never run the Phase 77 resolver that would otherwise inject the configured
+/// `api_url` into `PMCP_API_URL`. Without it, `cargo pmcp configure`'s custom base
+/// URL is silently ignored and discovery always hits `api.pmcp.run`.
 fn get_api_base_url() -> String {
-    std::env::var("PMCP_API_URL")
-        .or_else(|_| std::env::var("PMCP_RUN_API_URL"))
-        .unwrap_or_else(|_| DEFAULT_API_URL.to_string())
+    if let Some(url) = nonempty_env("PMCP_API_URL") {
+        return url;
+    }
+    if let Some(url) = nonempty_env("PMCP_RUN_API_URL") {
+        return url;
+    }
+    if let Some(url) = configured_api_base_url() {
+        return url;
+    }
+    DEFAULT_API_URL.to_string()
+}
+
+/// Read an env var, returning `Some(trimmed)` only when set and non-empty.
+fn nonempty_env(key: &str) -> Option<String> {
+    let v = std::env::var(key).ok()?;
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Resolve the `api_url` a user configured for a `pmcp-run` target via
+/// `cargo pmcp configure add <name> --type pmcp-run --api-url <url>`, stored in
+/// `~/.pmcp/config.toml`.
+///
+/// Resolution:
+/// 1. The active named target (`PMCP_TARGET` env > `.pmcp/active-target` marker),
+///    when it is a `pmcp-run` target carrying a non-empty `api_url`.
+/// 2. Otherwise, when exactly one `pmcp-run` target with an `api_url` is defined,
+///    use it — a single-deployment convenience so `configure use` is not required.
+///
+/// Returns `None` (→ caller falls back to the default) on any read/parse error or
+/// when no unambiguous configured base URL exists.
+fn configured_api_base_url() -> Option<String> {
+    use crate::commands::configure::config::{
+        default_user_config_path, TargetConfigV1, TargetEntry,
+    };
+    use crate::commands::configure::resolver::resolve_active_target_name;
+
+    let cfg = TargetConfigV1::read(&default_user_config_path()).ok()?;
+
+    // 1. Explicitly selected named target (PMCP_TARGET env > active-target marker).
+    if let Ok(Some((name, _src))) = resolve_active_target_name(None) {
+        return match cfg.targets.get(&name) {
+            Some(TargetEntry::PmcpRun(e)) => e
+                .api_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string),
+            _ => None,
+        };
+    }
+
+    // 2. No target selected, but exactly one pmcp-run target defines an api_url.
+    let mut urls = cfg.targets.values().filter_map(|entry| match entry {
+        TargetEntry::PmcpRun(e) => e
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string),
+        _ => None,
+    });
+    let first = urls.next()?;
+    if urls.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 /// Get the config cache file path
@@ -320,12 +399,15 @@ pub async fn get_pmcp_config() -> Result<PmcpRunConfig> {
                     "❌ Could not retrieve pmcp.run configuration\n\n\
                      Discovery endpoint failed: {}\n\n\
                      💡 Options:\n\
-                     1. Set PMCP_API_URL to your deployment base URL\n\
-                     2. Check your internet connection\n\
-                     3. Set legacy environment variables manually:\n\
+                     1. Configure a custom deployment base URL (private/custom-domain deployments):\n\
+                        cargo pmcp configure add <name> --type pmcp-run --api-url https://your.domain\n\
+                        cargo pmcp configure use <name>\n\
+                     2. Or set PMCP_API_URL to your deployment base URL for a one-off override\n\
+                     3. Check your internet connection\n\
+                     4. Set legacy environment variables manually:\n\
                         PMCP_RUN_COGNITO_CLIENT_ID=<client_id>\n\
                         PMCP_RUN_COGNITO_DOMAIN=<domain>\n\
-                     4. Visit https://pmcp.run/settings for configuration values\n",
+                     5. Visit https://pmcp.run/settings for configuration values\n",
                     e
                 )
             }
@@ -947,5 +1029,59 @@ mod cache_tests {
                 "legacy cache (missing source_api_url) must miss so it gets refreshed"
             );
         });
+    }
+
+    /// Write `~/.pmcp/config.toml` (HOME must already be an isolated tempdir) with a
+    /// single `pmcp-run` target carrying `api_url`.
+    fn write_single_pmcp_run_target(name: &str, api_url: &str) {
+        let home = std::env::var("HOME").expect("HOME must be set by the test harness");
+        let pmcp_dir = std::path::Path::new(&home).join(".pmcp");
+        std::fs::create_dir_all(&pmcp_dir).unwrap();
+        let body = format!(
+            "schema_version = 1\n\n[targets.{name}]\ntype = \"pmcp-run\"\napi_url = \"{api_url}\"\n"
+        );
+        std::fs::write(pmcp_dir.join("config.toml"), body).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn env_pmcp_api_url_overrides_configured_target() {
+        // PMCP_API_URL (one-off override) must win over the persisted configure api_url.
+        let home_tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home_tmp.path());
+        let _target = EnvGuard::remove("PMCP_TARGET");
+        let _legacy = EnvGuard::remove("PMCP_RUN_API_URL");
+        let _api = EnvGuard::set("PMCP_API_URL", "https://env.example.com");
+        write_single_pmcp_run_target("prod", "https://configured.example.com");
+
+        assert_eq!(get_api_base_url(), "https://env.example.com");
+    }
+
+    #[test]
+    #[serial]
+    fn configured_target_base_url_used_when_no_env() {
+        // With no env override, the api_url from `cargo pmcp configure` (selected via
+        // PMCP_TARGET) must be honored instead of the hardcoded api.pmcp.run default.
+        let home_tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home_tmp.path());
+        let _api = EnvGuard::remove("PMCP_API_URL");
+        let _legacy = EnvGuard::remove("PMCP_RUN_API_URL");
+        let _target = EnvGuard::set("PMCP_TARGET", "prod");
+        write_single_pmcp_run_target("prod", "https://private.customer.example");
+
+        assert_eq!(get_api_base_url(), "https://private.customer.example");
+    }
+
+    #[test]
+    #[serial]
+    fn falls_back_to_default_when_nothing_configured() {
+        // No env vars, no config file → the hardcoded default remains the behavior.
+        let home_tmp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home_tmp.path());
+        let _api = EnvGuard::remove("PMCP_API_URL");
+        let _legacy = EnvGuard::remove("PMCP_RUN_API_URL");
+        let _target = EnvGuard::remove("PMCP_TARGET");
+
+        assert_eq!(get_api_base_url(), DEFAULT_API_URL);
     }
 }
