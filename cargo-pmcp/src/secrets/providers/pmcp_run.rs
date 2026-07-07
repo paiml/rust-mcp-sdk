@@ -216,7 +216,7 @@ impl SecretProvider for PmcpRunSecretProvider {
         })?;
 
         let query = r#"
-            query ListServerSecrets($serverId: String!, $audience: ServerSecretAudience) {
+            query ListServerSecrets($serverId: String!, $audience: ListServerSecretsAudience) {
                 listServerSecrets(serverId: $serverId, audience: $audience) {
                     serverId
                     secrets
@@ -303,7 +303,7 @@ impl SecretProvider for PmcpRunSecretProvider {
         let (server_id, secret_name) = parse_secret_name(name)?;
 
         let query = r#"
-            query GetServerSecret($serverId: String!, $secretName: String!, $audience: ServerSecretAudience) {
+            query GetServerSecret($serverId: String!, $secretName: String!, $audience: GetServerSecretAudience) {
                 getServerSecret(serverId: $serverId, secretName: $secretName, audience: $audience) {
                     serverId
                     secretName
@@ -367,7 +367,7 @@ impl SecretProvider for PmcpRunSecretProvider {
         let (server_id, secret_name) = parse_secret_name(name)?;
 
         let query = r#"
-            mutation SetServerSecret($serverId: String!, $secretName: String!, $secretValue: String!, $description: String, $audience: ServerSecretAudience) {
+            mutation SetServerSecret($serverId: String!, $secretName: String!, $secretValue: String!, $description: String, $audience: SetServerSecretAudience) {
                 setServerSecret(serverId: $serverId, secretName: $secretName, secretValue: $secretValue, description: $description, audience: $audience) {
                     success
                     serverId
@@ -445,7 +445,7 @@ impl SecretProvider for PmcpRunSecretProvider {
         let (server_id, secret_name) = parse_secret_name(name)?;
 
         let query = r#"
-            mutation DeleteServerSecret($serverId: String!, $secretName: String!, $audience: ServerSecretAudience) {
+            mutation DeleteServerSecret($serverId: String!, $secretName: String!, $audience: DeleteServerSecretAudience) {
                 deleteServerSecret(serverId: $serverId, secretName: $secretName, audience: $audience) {
                     success
                     error

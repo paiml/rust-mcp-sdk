@@ -29,7 +29,11 @@ pub enum Audience {
 }
 
 impl Audience {
-    /// GraphQL enum variant string for the `ServerSecretAudience` type.
+    /// GraphQL enum variant string for the audience argument. Note: the platform
+    /// generates a DISTINCT enum type per operation (`ListServerSecretsAudience`,
+    /// `GetServerSecretAudience`, `SetServerSecretAudience`, `DeleteServerSecretAudience`)
+    /// rather than a single shared `ServerSecretAudience` type — see the per-query
+    /// `$audience` variable declarations in `providers/pmcp_run.rs`.
     pub fn as_graphql(self) -> &'static str {
         match self {
             Self::Mcp => "mcp",
