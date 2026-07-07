@@ -234,11 +234,14 @@ pub(crate) fn write_stack_ts_guarded(
 /// Why this exists (Phase 98 follow-up — `deploy-toml-inert-for-preserved-stack`):
 /// the `#279`/DSTK-01 exists-guard preserves a curated stack.ts by existence
 /// alone, which silently severs the `{iam_block}` splice (IAM is only injected
-/// when stack.ts is (re)generated) and means `[environment]` reaches the Lambda
-/// only if the curated stack.ts reads `process.env`. Both were previously
-/// silent no-ops that surfaced as a fail-closed 500 at runtime. This warning
-/// makes the gap loud at deploy time without blocking the deploy (the operator
-/// may have deliberately inlined the equivalents directly in stack.ts).
+/// when stack.ts is (re)generated). Previously `[environment]` had the same
+/// hazard, but the pmcp-run target now merges `[environment]` construct-
+/// agnostically into the synthesized template post-synth
+/// (`environment-inert-for-shared-cdk-constructs`), so a preserved stack.ts no
+/// longer blocks it there; the aws-lambda `cdk deploy` path still relies on the
+/// curated stack.ts reading `process.env`. This warning makes the remaining gap
+/// loud at deploy time without blocking the deploy (the operator may have
+/// deliberately inlined the equivalents directly in stack.ts).
 //
 // Why allow(dead_code): identical rationale to STACK_TS_PRESERVED_NOTICE — the
 // production callers live in the bin-only tree, while config.rs is also mounted
@@ -274,17 +277,22 @@ pub(crate) fn stack_ts_preserved_inert_warning(
     }
     if !environment_is_empty {
         lines.push(
-            "   • [environment]: exported to the deploy-time CDK process env and reaches the Lambda"
+            "   • [environment]: on the pmcp-run target it is merged construct-agnostically into"
                 .to_string(),
         );
         lines.push(
-            "     ONLY if stack.ts reads it via process.env.<KEY> in its environment:{} block."
+            "     every AWS::Lambda::Function's Environment.Variables in the synthesized template,"
                 .to_string(),
         );
         lines.push(
-            "     Otherwise set the value directly in the stack.ts environment:{} block."
+            "     so a preserved stack.ts no longer blocks it (declared keys override construct"
                 .to_string(),
         );
+        lines.push(
+            "     defaults). On the aws-lambda target it still reaches the Lambda only if stack.ts"
+                .to_string(),
+        );
+        lines.push("     reads it via process.env.<KEY> in its environment:{} block.".to_string());
     }
     Some(lines.join("\n"))
 }

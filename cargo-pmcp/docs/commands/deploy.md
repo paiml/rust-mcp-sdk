@@ -100,11 +100,22 @@ RUST_LOG = "info"
 GRAPHRAG_ENDPOINT = "https://graphrag.internal"
 ```
 
-At deploy time these values are exported as env vars onto the CDK child process (`cdk deploy` for `aws-lambda`, `cdk synth` for `pmcp-run`) — the **same transient path** resolved `[secrets]` already use, so they are **never written back to disk** and are immune to the `stack.ts` preserve guard. A value reaches the deployed Lambda when `stack.ts` reads it via `process.env.<KEY>` inside its `environment: {}` block.
+How `[environment]` reaches the deployed Lambda depends on the target:
 
-**Precedence** (consistent with `[secrets]`): a hardcoded literal in the `stack.ts` `environment: {}` block **wins** over a `.pmcp/deploy.toml` `[environment]` entry with the same key — `[environment]` is *additive-fill*, supplying keys the stack does not already set. If a key appears in **both** `[environment]` and `[secrets]`, the resolved **secret wins** (it is the authoritative, sensitive value).
+- **`pmcp-run`** — after `cdk synth`, `cargo pmcp deploy` merges every `[environment]` key **directly into each `AWS::Lambda::Function`'s `Environment.Variables`** in the synthesized CloudFormation template before upload. This is **construct-agnostic**: it lands the keys regardless of how the `stack.ts` was authored, including shared/managed constructs (e.g. `OpenApiMcpServerStack`) that hardcode `environment: {}` and read no `process.env`. Secrets are **excluded** from this merge (they keep their server-side injection path) and never enter the template.
+- **`aws-lambda`** — deploys via `cdk deploy` (no pre-upload template file), so `[environment]` is passed as env vars onto the CDK child process (the **same transient path** resolved `[secrets]` use) and reaches the Lambda only when `stack.ts` reads it via `process.env.<KEY>` inside its `environment: {}` block.
 
-> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` now prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`), and `[environment]` reaches the Lambda only if the curated `stack.ts` reads the matching `process.env.<KEY>`. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
+Either way, `[environment]` values are **never written back to disk** and are immune to the `stack.ts` preserve guard.
+
+**Precedence:**
+
+- **`pmcp-run` (template merge):** a declared `[environment]` entry **OVERRIDES** the construct's hardcoded value on key collision — e.g. `RUST_LOG = "warn"` beats a construct default of `info`. This is a locked product decision so `deploy.toml` is the single source of truth for runtime configuration.
+- **`aws-lambda` (process.env pass-through):** a hardcoded literal in the `stack.ts` `environment: {}` block wins over a same-key `[environment]` entry unless the stack reads `process.env.<KEY>` — the mechanism is *additive-fill* on that target.
+- **Secrets always win:** if a key appears in **both** `[environment]` and `[secrets]`, the resolved **secret wins** (it is excluded from the `pmcp-run` merge and injected as the authoritative sensitive value).
+
+**Fail-loud (`pmcp-run`).** If `[environment]` is non-empty but the synthesized template contains **no** `AWS::Lambda::Function` resource to inject into, `cargo pmcp deploy` prints a prominent stderr warning naming the affected keys instead of silently dropping them.
+
+> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`). For `[environment]`, the `pmcp-run` target now applies it construct-agnostically via the post-synth template merge (a preserved stack.ts no longer blocks it); the `aws-lambda` target still needs the curated `stack.ts` to read the matching `process.env.<KEY>`. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
 
 ---
 

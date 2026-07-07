@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -131,6 +132,20 @@ pub async fn deploy_to_pmcp_run(
     // Step 4: Read template file
     let template = std::fs::read_to_string(&template_path)
         .context("Failed to read CloudFormation template")?;
+
+    // Step 4b: Construct-agnostic `[environment]` delivery
+    // (`environment-inert-for-shared-cdk-constructs`). FIX #2 exported
+    // `[environment]` only as `process.env` to the `cdk synth` child, so
+    // shared/managed constructs that ignore `process.env` (e.g.
+    // `OpenApiMcpServerStack`) silently dropped the declared keys. Merge the
+    // declared `[environment]` directly into every `AWS::Lambda::Function`'s
+    // `Environment.Variables` in the synthesized template — construct-agnostic,
+    // guaranteed delivery regardless of how the stack.ts was authored. Secrets
+    // are EXCLUDED (they keep their server-side injection path per D-08).
+    // Precedence: `[environment]` OVERRIDES a construct's hardcoded value on
+    // key collision (locked product decision).
+    let template = apply_environment_merge(template, &config.environment, &config.secrets)?;
+
     log_upload_sizes(template.len(), upload.data.len(), upload.has_assets);
     println!();
 
@@ -760,6 +775,189 @@ fn find_template_file(cdk_out: &PathBuf) -> Result<PathBuf> {
     bail!("No CloudFormation template found in {}", cdk_out.display());
 }
 
+/// Outcome of merging `[environment]` into a synthesized CloudFormation
+/// template. See [`merge_environment_into_template`].
+#[derive(Debug)]
+struct TemplateMergeOutcome {
+    /// The re-serialized template JSON with `[environment]` applied.
+    template: String,
+    /// Sorted logical IDs of the `AWS::Lambda::Function` resources that were
+    /// visited (and thus available to inject into). Empty means the template
+    /// contained no Lambda function — the caller uses this for the fail-loud
+    /// warning.
+    lambdas_updated: Vec<String>,
+}
+
+/// Merge the synthesized template with the declared `[environment]` and emit
+/// operator feedback.
+///
+/// Thin deploy-time wrapper around the pure [`merge_environment_into_template`]
+/// helper: it computes the secret-key exclusion set, prints either a success
+/// summary or the fail-loud "no Lambda resource" warning, and returns the
+/// (possibly modified) template string. When `[environment]` is empty the
+/// template is returned unchanged.
+fn apply_environment_merge(
+    template: String,
+    environment: &HashMap<String, String>,
+    secrets: &HashMap<String, String>,
+) -> Result<String> {
+    if environment.is_empty() {
+        return Ok(template);
+    }
+
+    let secret_keys: HashSet<String> = secrets.keys().cloned().collect();
+    let outcome = merge_environment_into_template(&template, environment, &secret_keys)?;
+
+    if outcome.lambdas_updated.is_empty() {
+        // FIX (fail-loud): `[environment]` was declared but the synthesized
+        // template has no Lambda to inject into. Warn prominently instead of
+        // silently dropping the keys.
+        eprintln!(
+            "{}",
+            environment_no_lambda_warning(environment, &secret_keys)
+        );
+    } else {
+        println!(
+            "   ✅ Applied [environment] to {} Lambda function(s): {}",
+            outcome.lambdas_updated.len(),
+            outcome.lambdas_updated.join(", ")
+        );
+    }
+
+    Ok(outcome.template)
+}
+
+/// Merge developer-declared `[environment]` values into every
+/// `AWS::Lambda::Function` resource's `Properties.Environment.Variables` in a
+/// synthesized CloudFormation template. Pure and unit-testable — no synth, no
+/// I/O.
+///
+/// This is the construct-agnostic delivery mechanism for `[environment]`
+/// (`environment-inert-for-shared-cdk-constructs`). FIX #2 passed
+/// `[environment]` only as `process.env` to the `cdk synth` child, which lands
+/// the keys only when the stack.ts explicitly reads `process.env.<KEY>`.
+/// Shared/managed constructs hardcode their `environment: {}` and read no
+/// arbitrary process env, so declared keys were silently dropped. Merging
+/// directly into the post-synth template guarantees delivery regardless of how
+/// the stack.ts was authored.
+///
+/// # Precedence
+/// `environment` OVERRIDES a construct's hardcoded value on key collision
+/// (e.g. `RUST_LOG=warn` beats a construct default of `info`) — a locked
+/// product decision. `secret_keys` are EXCLUDED from the merge entirely:
+/// secrets keep their existing server-side injection path and never appear in
+/// the template.
+///
+/// # Returns
+/// A [`TemplateMergeOutcome`] carrying the re-serialized template JSON plus the
+/// sorted logical IDs of the Lambda resources visited. An empty
+/// `lambdas_updated` means no Lambda resource was present (fail-loud signal).
+fn merge_environment_into_template(
+    template_json: &str,
+    environment: &HashMap<String, String>,
+    secret_keys: &HashSet<String>,
+) -> Result<TemplateMergeOutcome> {
+    let mut template: serde_json::Value = serde_json::from_str(template_json)
+        .context("Failed to parse synthesized CloudFormation template JSON")?;
+
+    // Effective merge set = declared `[environment]` minus any secret keys.
+    let effective: Vec<(String, String)> = environment
+        .iter()
+        .filter(|(k, _)| !secret_keys.contains(*k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let mut lambdas_updated: Vec<String> = Vec::new();
+
+    if let Some(resources) = template
+        .get_mut("Resources")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (logical_id, resource) in resources.iter_mut() {
+            if !is_lambda_function(resource) {
+                continue;
+            }
+            apply_env_to_lambda(resource, &effective);
+            lambdas_updated.push(logical_id.clone());
+        }
+    }
+
+    lambdas_updated.sort();
+
+    let merged = serde_json::to_string_pretty(&template)
+        .context("Failed to re-serialize merged CloudFormation template")?;
+
+    Ok(TemplateMergeOutcome {
+        template: merged,
+        lambdas_updated,
+    })
+}
+
+/// True when `resource` has `Type == "AWS::Lambda::Function"`.
+fn is_lambda_function(resource: &serde_json::Value) -> bool {
+    resource.get("Type").and_then(serde_json::Value::as_str) == Some("AWS::Lambda::Function")
+}
+
+/// Insert each `effective` key/value into a Lambda resource's
+/// `Properties.Environment.Variables`, creating the nested objects if absent.
+/// Existing values for the same key are OVERWRITTEN (precedence: declared
+/// `[environment]` wins over the construct default). A no-op when `effective`
+/// is empty.
+fn apply_env_to_lambda(resource: &mut serde_json::Value, effective: &[(String, String)]) {
+    if effective.is_empty() {
+        return;
+    }
+    let variables = resource
+        .as_object_mut()
+        .and_then(|r| ensure_object(r, "Properties"))
+        .and_then(|p| ensure_object(p, "Environment"))
+        .and_then(|e| ensure_object(e, "Variables"));
+    if let Some(vars) = variables {
+        for (key, value) in effective {
+            vars.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
+    }
+}
+
+/// Get or create a JSON object at `key` within `parent`, returning a mutable
+/// reference to it. Returns `None` only when an existing non-object value
+/// occupies `key` (we never clobber a non-object).
+fn ensure_object<'a>(
+    parent: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    parent
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+}
+
+/// Build the fail-loud warning shown when `[environment]` is declared but the
+/// synthesized template contains no `AWS::Lambda::Function` to inject into.
+fn environment_no_lambda_warning(
+    environment: &HashMap<String, String>,
+    secret_keys: &HashSet<String>,
+) -> String {
+    let mut applied: Vec<&str> = environment
+        .keys()
+        .filter(|k| !secret_keys.contains(*k))
+        .map(String::as_str)
+        .collect();
+    applied.sort_unstable();
+    let keys = if applied.is_empty() {
+        "(none — all declared keys are secrets)".to_string()
+    } else {
+        applied.join(", ")
+    };
+    format!(
+        "⚠️  [environment] declared but NOT applied — the synthesized CloudFormation \
+         template contains no AWS::Lambda::Function resource to inject into.\n     \
+         Affected keys: {keys}\n     \
+         If your server runs on Lambda, verify the CDK stack synthesized a Lambda \
+         function; otherwise these keys will not reach the runtime."
+    )
+}
+
 /// Run the fail-closed IAM validator and rewrite `deploy/lib/stack.ts` from
 /// the loaded [`DeployConfig`], so `[iam]` declared in `.pmcp/deploy.toml`
 /// lands in the synthesized CloudFormation template. Mirrors
@@ -961,6 +1159,283 @@ mod tests {
         assert!(
             found,
             "[environment] entry must be set on the cdk synth child process (FIX #2)"
+        );
+    }
+}
+
+// ── FIX #1: construct-agnostic post-synth [environment] template merge ───────
+// (environment-inert-for-shared-cdk-constructs)
+#[cfg(test)]
+mod env_merge_tests {
+    use super::{
+        apply_env_to_lambda, environment_no_lambda_warning, is_lambda_function,
+        merge_environment_into_template,
+    };
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn secret_keys(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    fn merged_value(
+        template: &str,
+        env: &HashMap<String, String>,
+        secrets: &HashSet<String>,
+    ) -> Value {
+        let out = merge_environment_into_template(template, env, secrets)
+            .expect("merge must parse and re-serialize valid template JSON");
+        serde_json::from_str(&out.template).expect("merged template must be valid JSON")
+    }
+
+    fn variables(v: &Value, logical_id: &str) -> Value {
+        v["Resources"][logical_id]["Properties"]["Environment"]["Variables"].clone()
+    }
+
+    /// Branch (a): a key is added to a Lambda that has no existing
+    /// `Environment` block — the nested objects are created.
+    #[test]
+    fn branch_a_adds_key_to_lambda_without_environment() {
+        let template = json!({
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": { "Runtime": "provided.al2023" }
+                }
+            }
+        })
+        .to_string();
+
+        let out = merge_environment_into_template(
+            &template,
+            &env(&[("RUST_LOG", "warn")]),
+            &secret_keys(&[]),
+        )
+        .expect("merge succeeds");
+
+        assert_eq!(out.lambdas_updated, vec!["Fn".to_string()]);
+        let parsed: Value = serde_json::from_str(&out.template).unwrap();
+        assert_eq!(variables(&parsed, "Fn"), json!({ "RUST_LOG": "warn" }));
+    }
+
+    /// Branch (b): a key is added alongside existing `Variables` without
+    /// clobbering the construct's other entries.
+    #[test]
+    fn branch_b_adds_key_alongside_existing_variables() {
+        let template = json!({
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Environment": { "Variables": { "EXISTING": "kept" } }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = merged_value(&template, &env(&[("NEW_KEY", "added")]), &secret_keys(&[]));
+        assert_eq!(
+            variables(&parsed, "Fn"),
+            json!({ "EXISTING": "kept", "NEW_KEY": "added" })
+        );
+    }
+
+    /// Branch (c): on key collision the declared `[environment]` value OVERRIDES
+    /// the construct's hardcoded value (locked precedence).
+    #[test]
+    fn branch_c_environment_overrides_construct_value() {
+        let template = json!({
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "Environment": { "Variables": { "RUST_LOG": "info" } }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = merged_value(&template, &env(&[("RUST_LOG", "warn")]), &secret_keys(&[]));
+        assert_eq!(
+            variables(&parsed, "Fn")["RUST_LOG"],
+            json!("warn"),
+            "declared [environment] must override the construct default"
+        );
+    }
+
+    /// Branch (d): keys present in the secret-key set are EXCLUDED from the
+    /// merge — secret values never enter the template.
+    #[test]
+    fn branch_d_secret_keys_excluded_from_merge() {
+        let template = json!({
+            "Resources": {
+                "Fn": { "Type": "AWS::Lambda::Function", "Properties": {} }
+            }
+        })
+        .to_string();
+
+        let parsed = merged_value(
+            &template,
+            &env(&[("PUBLIC_URL", "https://x"), ("API_TOKEN", "shhh")]),
+            &secret_keys(&["API_TOKEN"]),
+        );
+
+        let vars = variables(&parsed, "Fn");
+        assert_eq!(vars["PUBLIC_URL"], json!("https://x"));
+        assert!(
+            vars.get("API_TOKEN").is_none(),
+            "secret key must NOT be merged into the template"
+        );
+    }
+
+    /// Branch (e): every `AWS::Lambda::Function` resource is updated when the
+    /// template declares more than one.
+    #[test]
+    fn branch_e_multiple_lambdas_all_updated() {
+        let template = json!({
+            "Resources": {
+                "FnA": { "Type": "AWS::Lambda::Function", "Properties": {} },
+                "FnB": { "Type": "AWS::Lambda::Function", "Properties": {} }
+            }
+        })
+        .to_string();
+
+        let out = merge_environment_into_template(
+            &template,
+            &env(&[("RUST_LOG", "warn")]),
+            &secret_keys(&[]),
+        )
+        .expect("merge succeeds");
+
+        assert_eq!(
+            out.lambdas_updated,
+            vec!["FnA".to_string(), "FnB".to_string()],
+            "logical IDs must be reported sorted"
+        );
+        let parsed: Value = serde_json::from_str(&out.template).unwrap();
+        assert_eq!(variables(&parsed, "FnA"), json!({ "RUST_LOG": "warn" }));
+        assert_eq!(variables(&parsed, "FnB"), json!({ "RUST_LOG": "warn" }));
+    }
+
+    /// Branch (f): non-Lambda resources are left untouched.
+    #[test]
+    fn branch_f_non_lambda_resources_untouched() {
+        let template = json!({
+            "Resources": {
+                "Fn": { "Type": "AWS::Lambda::Function", "Properties": {} },
+                "Bucket": {
+                    "Type": "AWS::S3::Bucket",
+                    "Properties": { "BucketName": "assets" }
+                }
+            }
+        })
+        .to_string();
+
+        let out = merge_environment_into_template(
+            &template,
+            &env(&[("RUST_LOG", "warn")]),
+            &secret_keys(&[]),
+        )
+        .expect("merge succeeds");
+
+        assert_eq!(out.lambdas_updated, vec!["Fn".to_string()]);
+        let parsed: Value = serde_json::from_str(&out.template).unwrap();
+        assert_eq!(
+            parsed["Resources"]["Bucket"],
+            json!({ "Type": "AWS::S3::Bucket", "Properties": { "BucketName": "assets" } }),
+            "non-Lambda resource must be byte-preserved"
+        );
+    }
+
+    /// Branch (g): fail-loud path — a non-empty `[environment]` but zero Lambda
+    /// resources yields an empty `lambdas_updated` list (the caller's warning
+    /// trigger) and a warning naming the affected keys.
+    #[test]
+    fn branch_g_fail_loud_when_no_lambda_resource() {
+        let template = json!({
+            "Resources": {
+                "Bucket": { "Type": "AWS::S3::Bucket", "Properties": {} }
+            }
+        })
+        .to_string();
+
+        let environment = env(&[("RUST_LOG", "warn"), ("PUBLIC_URL", "https://x")]);
+        let secrets = secret_keys(&[]);
+        let out = merge_environment_into_template(&template, &environment, &secrets)
+            .expect("merge succeeds even with no Lambda");
+
+        assert!(
+            out.lambdas_updated.is_empty(),
+            "no Lambda resource must yield an empty updated list (fail-loud trigger)"
+        );
+
+        let warning = environment_no_lambda_warning(&environment, &secrets);
+        assert!(warning.contains("NOT applied"), "warning is prominent");
+        assert!(
+            warning.contains("PUBLIC_URL"),
+            "warning names affected keys"
+        );
+        assert!(warning.contains("RUST_LOG"), "warning names affected keys");
+    }
+
+    /// Fail-loud wording when every declared key is a secret (nothing to apply).
+    #[test]
+    fn fail_loud_all_secret_keys_notes_none() {
+        let environment = env(&[("API_TOKEN", "shhh")]);
+        let secrets = secret_keys(&["API_TOKEN"]);
+        let warning = environment_no_lambda_warning(&environment, &secrets);
+        assert!(
+            warning.contains("all declared keys are secrets"),
+            "warning explains there is nothing non-secret to apply"
+        );
+    }
+
+    /// Guard: `is_lambda_function` matches only the exact CFN type.
+    #[test]
+    fn is_lambda_function_type_matching() {
+        assert!(is_lambda_function(
+            &json!({ "Type": "AWS::Lambda::Function" })
+        ));
+        assert!(!is_lambda_function(&json!({ "Type": "AWS::Lambda::Url" })));
+        assert!(!is_lambda_function(&json!({ "Properties": {} })));
+    }
+
+    /// Guard: an empty effective set is a no-op — the Lambda is unchanged.
+    #[test]
+    fn apply_env_to_lambda_empty_effective_is_noop() {
+        let mut resource = json!({
+            "Type": "AWS::Lambda::Function",
+            "Properties": { "Runtime": "provided.al2023" }
+        });
+        apply_env_to_lambda(&mut resource, &[]);
+        assert!(
+            resource["Properties"].get("Environment").is_none(),
+            "empty effective set must not create an Environment block"
+        );
+    }
+
+    /// Invalid template JSON surfaces a parse error rather than silently
+    /// dropping the merge.
+    #[test]
+    fn invalid_template_json_errors() {
+        let err = merge_environment_into_template(
+            "{ not valid json",
+            &env(&[("K", "v")]),
+            &secret_keys(&[]),
+        )
+        .expect_err("invalid JSON must error");
+        assert!(
+            err.to_string().contains("parse synthesized CloudFormation"),
+            "error must name the parse failure"
         );
     }
 }
