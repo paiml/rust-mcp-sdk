@@ -24,7 +24,7 @@ tracing = "0.1"
 # Literal pins (the repo has NO [workspace.dependencies] table). jsonschema is
 # for `evaluate_submit_result` output-schema validation in plan 108-03; uuid is
 # for run-id minting in the 108-06 adapter.
-jsonschema = { version = "0.46", default-features = false }
+jsonschema = { version = "0.48", default-features = false }
 uuid = { version = "1.17", features = ["v4"] }
 # Optional HTTP client for the feature-gated completion sources (108-04).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
