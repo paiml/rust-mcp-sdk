@@ -85,7 +85,7 @@ umya-spreadsheet = "=3.0.0"
 # 0.37.x, zip 8.6.x via `cargo tree -p umya-spreadsheet`) so Cargo.lock keeps ONE
 # copy each (no forked second version). The reader stays pub(crate)-quarantined:
 # no quick-xml/zip type ever crosses a public signature (T-93-02-LEAK).
-quick-xml = "0.37"
+quick-xml = "0.41"
 zip = "8.6"
 
 [dev-dependencies]
