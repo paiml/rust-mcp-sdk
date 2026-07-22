@@ -37,7 +37,7 @@ toml = "1.0"
 # common 23). These four crates share generated AST/visitor types and MUST move
 # together — a mixed set (e.g. parser 41 + ast 23) resolves two copies of
 # swc_ecma_ast and breaks the `Visit` impl in javascript.rs with E0053.
-swc_ecma_parser = { version = "41", optional = true }
+swc_ecma_parser = { version = "42", optional = true }
 swc_ecma_ast = { version = "25", optional = true }
 swc_ecma_visit = { version = "25", optional = true }
 swc_common = { version = "23", optional = true }
