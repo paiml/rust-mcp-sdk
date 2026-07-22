@@ -39,7 +39,7 @@ toml = "1.0"
 # swc_ecma_ast and breaks the `Visit` impl in javascript.rs with E0053.
 swc_ecma_parser = { version = "41", optional = true }
 swc_ecma_ast = { version = "25", optional = true }
-swc_ecma_visit = { version = "25", optional = true }
+swc_ecma_visit = { version = "26", optional = true }
 swc_common = { version = "23", optional = true }
 
 # SQL parsing (optional, for SQL Code Mode)
