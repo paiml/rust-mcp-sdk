@@ -67,7 +67,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 url = { version = "2.5", optional = true }
 openapiv3 = { version = "2", optional = true }
 serde_yaml = { version = "0.9", optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 regex = { version = "1.11", optional = true }
 
 # Why: Phase 92 governed-Excel workbook served-tool module (WBSV-08/09). The

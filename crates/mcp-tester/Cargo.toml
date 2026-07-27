@@ -36,7 +36,7 @@ url = "2"
 reqwest = { version = "0.13", features = ["json", "stream", "rustls"], default-features = false }
 chrono = "0.4"
 prettytable-rs = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 http = "1"
 
 [dev-dependencies]

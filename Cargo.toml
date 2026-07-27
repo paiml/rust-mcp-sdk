@@ -83,7 +83,7 @@ http-body-util = "0.1"
 
 # OAuth dependencies
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 jsonwebtoken = { version = "10.3", optional = true }
 
 # Cross-target CSPRNG for the wasm-safe PKCE helper (src/shared/pkce.rs).
