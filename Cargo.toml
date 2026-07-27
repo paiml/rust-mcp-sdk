@@ -121,7 +121,7 @@ notify = { version = "8.2", optional = true }
 glob-match = { version = "0.2", optional = true }
 
 # Validation (optional, feature-gated)
-jsonschema = { version = "0.46", optional = true, default-features = false }
+jsonschema = { version = "0.49", optional = true, default-features = false }
 garde = { version = "0.23", optional = true }
 
 # SIMD support (optional)
