@@ -321,31 +321,53 @@ one-per-reference-server, and a comment in the test says why.
 | `cargo fmt --all -- --check` | clean |
 | Four negative controls (fixture removed; RULE 1; RULE 2; vacuous scan) | all executed, recorded above, all reverted |
 
-### Deferred: full `make quality-gate`
+### `make quality-gate` — partial (3 steps PASSED, run stopped under disk pressure)
 
-`make quality-gate` was **not** run to completion. Mid-execution the machine hit
-**ENOSPC** — `df -h /` reported **1.0 GiB free of 926 GiB**, and the Bash tool
-itself could not open its output file for several minutes. Recovery: removed
-this worktree's `target/debug/incremental`, restoring free space to 2.3 GiB.
+`make quality-gate` was started for real (not `-n`) and **passed its first three
+steps**, then was deliberately terminated during `build`:
 
-`make quality-gate` compiles the whole workspace under `--features full` plus
-every test target and example; at 2.3 GiB free it would re-exhaust the volume.
-Per `project_disk_exhaustion_fake_test_failures`, a full volume produces
-failures that *look like code regressions* (keychain `ioErr -36` panics,
-`extern location ... does not exist`), so running it in this state would have
-produced a misleading red result rather than a signal — and would have risked
-blocking the SUMMARY commit entirely (#2070).
+| Gate step | Result |
+|-----------|--------|
+| `lint-plans` (**new**) | **PASSED** — reached and executed as the gate's first step |
+| `fmt-check` | **PASSED** |
+| `lint` (clippy, root `pmcp`, `--features full`, pedantic + nursery) | **PASSED** — `Finished dev profile in 1m 04s` |
+| `build` | terminated by me (SIGTERM, exit 144) |
+| `test-all` and later steps | not reached |
 
-What was verified instead, per component of the gate that this plan can affect:
-`fmt-check` (via `cargo fmt --all -- --check`, clean), clippy with
-`-D warnings` on the touched crate including its test targets (no issues), the
-crate build with `RUSTFLAGS="-D warnings"` (exit 0), the full conformance test
-binary (10 passed), `comply-bindings-check` (pass), and the new `lint-plans`
-step itself (pass, and reached by the gate per `make -n`).
+The captured log (`target/118-10-quality-gate.log`, 339 lines at termination)
+contained **zero** `warning` lines and zero compiler errors.
 
-**Required follow-up:** run `make quality-gate` on a machine with adequate free
-disk before this branch is pushed or merged. This is the CLAUDE.md pre-push
-requirement and it is NOT satisfied by the above.
+**Why it was stopped.** The volume was exhausting. Earlier in this plan the
+machine hit **ENOSPC** outright — `df -h /` reported **1.0 GiB free of 926 GiB**
+and the shell could not open its own output file for several minutes; recovery
+was removing this worktree's `target/debug/incremental`. During this gate run
+free space fell 5.5 → 5.0 → 4.3 → 3.8 → **2.7 GiB** while `build` was still
+running, with `test-all` (every test target plus every example) still ahead.
+
+The cause is contention, not this plan: `pgrep` showed **two** concurrent
+`make quality-gate` invocations — mine (PID 30984) and a **sibling agent's**
+(PID 4349, writing to `qg2.log`). I killed only my own three PIDs and confirmed
+the sibling's run survived. Continuing would have re-exhausted the volume for
+both, and per `project_disk_exhaustion_fake_test_failures` a full volume
+produces failures that *look like code regressions* (keychain `ioErr -36`
+panics, `extern location ... does not exist`) — a misleading red, not a signal.
+A second ENOSPC did in fact hit immediately afterwards, blocking even a text
+edit, until this worktree's 4.8 GB `target/` was removed (16 GB now free).
+
+**Why the residual risk is low.** The three steps that this plan could
+plausibly break all passed above. The remaining steps are workspace-wide, and
+this plan changes only: doc comments in one crate, test-only constants and
+tests in that same crate, a new shell script, and a Makefile target. Those were
+verified directly and precisely — `cargo fmt --all -- --check` (clean),
+`cargo clippy -p pmcp-team-servers --all-features --tests -- -D warnings`
+(no issues), `RUSTFLAGS="-D warnings" cargo build -p pmcp-team-servers
+--all-features` (exit 0), the conformance test binary (10 passed, 0 failed),
+and `make comply-bindings-check` (pass).
+
+**Required follow-up:** run `make quality-gate` to completion on a machine with
+adequate free disk and no concurrent workspace build, before this branch is
+pushed or merged. That is the CLAUDE.md pre-push requirement and it is NOT
+satisfied by the partial run above.
 
 ## Self-Check: PASSED
 
