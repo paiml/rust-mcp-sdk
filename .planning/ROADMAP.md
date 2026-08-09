@@ -2731,32 +2731,41 @@ Plans:
   2. The Phase-109 Rust conformance harness gains v2 fixtures while v1 fixtures stay green (dual conformance), verified with a dev-dependency-free build to avoid feature-unification false-greens (CONF-02)
   3. Deprecated Roots/Sampling/Logging capabilities remain fully functional under v2 negotiation (advisory-only deprecation, 12-month window) (CONF-03)
 
-**Plans**: 9 plans
+**Plans**: 10 plans
+
+*Replanned 2026-08-09 after `/gsd-review --codex --gemini` (`118-REVIEWS.md`). Codex, reading
+repository source, found three architectural blockers that invalidated the CONF-02/CONF-03 track;
+all three were confirmed against source and locked as D-16/D-17/D-18. The era comparison now runs on
+the PORTED Phase-117 probe machinery over real streamable HTTP (both eras, same transport); the 33
+in-process fixtures become a v1-only regression guard; CONF-03 is proved by probes plus typed
+completion round trips, not by an extended fixture format. Plan 118-10 was added for the D-08 rename,
+the exact-count regression guard and the D-19 plan-lint.*
 
 Plans:
 **Wave 1**
 
-- [ ] 118-01-PLAN.md — Wave 1. D-13: relax `Mcp-Name` to name-bearing methods only, reversing the Phase-113 DRIFT-1 adjudication in rustdoc, with a live-HTTP proof of the new matrix (CONF-01)
-- [ ] 118-02-PLAN.md — Wave 1. D-01: the pinned `conformance/` Node manifest + lockfile (Node 22 floor, exact pin, slopcheck re-check) and the ship-both-or-exclude-both packaging disposition (CONF-01)
-- [ ] 118-03-PLAN.md — Wave 1. The team-servers expected-difference baseline: model, total parser, spec-artifact YAML seeded with D-12's CONF-03 rows, non-vacuity schema gate, ALWAYS fuzz target (CONF-02/CONF-03)
+- [ ] 118-01-PLAN.md — Wave 1. D-13 + **D-18**: relax `Mcp-Name` to name-bearing methods only AND route the predicate through the COMBINED `name_bearing_key` table so `tasks/*` is validated as well as emitted; live-HTTP proof, byte-level FUZZ arm, contract-first equation (CONF-01)
+- [ ] 118-02-PLAN.md — Wave 1. D-01: the pinned `conformance/` Node manifest + lockfile + `.npmrc` `engine-strict`, `--ignore-scripts`, the ship-both-or-exclude-both packaging disposition, and the ONE canonical zero-check policy + two-pin reconciliation in `conformance/README.md` (CONF-01)
+- [ ] 118-03-PLAN.md — Wave 1. **D-16**: port the Phase-117 era substrate into team-servers — typed observations (`ObservationId`/`ObservedValue`/`PROBE_REGISTRY`, 14 ids), the baseline model + total parser + bidirectional `compare_eras`, the spec-artifact YAML, the schema gate with BOTH coverage directions, and the ALWAYS fuzz target (CONF-02/CONF-03)
+- [ ] 118-10-PLAN.md — Wave 1. D-08's prose-only fixture-format rename, the v1 regression guard tightened to EXACT counts (`failed == 0`, 33 total, exact per-directory + an on-disk file fence), and the **D-19** plan-lint that fails a piped build/test verification without `pipefail` (CONF-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 118-04-PLAN.md — Wave 2. D-05: the dual-version conformance example `s54_v2_dual_conformance` and the full 2025-11-25 fixture surface, measured green (CONF-01)
-- [ ] 118-06-PLAN.md — Wave 2. D-07/D-08: the era dimension on the existing `ConformanceTarget` seam, the 33-fixture matrix with a bidirectional baseline join, and the prose-only fixture-format rename (CONF-02)
+- [ ] 118-04-PLAN.md — Wave 2. D-05: the dual-version conformance example `s54_v2_dual_conformance` **registered as a `[[example]]` with `required-features`**, the full 2025-11-25 fixture surface measured green, output under `target/conformance-results/` (CONF-01)
+- [ ] 118-06-PLAN.md — Wave 2. **D-16/D-17**: the raw streamable-HTTP probe client, the dual-accept-list era target on an ephemeral port (incl. the three deprecated-capability tools), and `observe()` — fourteen ESTABLISHED observations under both eras over ONE endpoint (CONF-02/CONF-03)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 118-05-PLAN.md — Wave 3. D-13's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process (CONF-01)
-- [ ] 118-07-PLAN.md — Wave 3. D-10/D-11/D-12: Roots/Sampling/Logging fixtures IN the matrix, a coverage test that fails on deletion, and the 12-month advisory window reconciled into `docs/v1-sunset-policy.md` (CONF-03)
+- [ ] 118-05-PLAN.md — Wave 3. D-13/D-18's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process started from the BUILT binary, with a cross-era bleed probe (CONF-01)
+- [ ] 118-07-PLAN.md — Wave 3. D-10/D-11/D-12 via **D-17**: the era matrix with a bidirectional baseline join, Roots/Sampling/Logging COMPLETING under both eras through a `StreamableHttpTransport` typed client, the baseline reconciled from measurement, and the 12-month advisory MECHANISM window reconciled into `docs/v1-sunset-policy.md` (CONF-02/CONF-03)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 118-08-PLAN.md — Wave 4. The two driver scripts (one process, two runs, readiness poll, trap teardown; dev-dependency-free fence + nonzero-count guard) with commands as DATA, plus the two Makefile targets (CONF-01/CONF-02)
+- [ ] 118-08-PLAN.md — Wave 4. The two driver scripts (one process from the built binary, two runs, readiness poll, process-GROUP teardown, per-run + total timeouts, the EXECUTABLE zero-check gate and the check floors; two dev-dependency-free build fences + nonzero-count guards for all three harness targets) with commands as DATA, plus the two Makefile targets (CONF-01/CONF-02/CONF-03)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 118-09-PLAN.md — Wave 5. D-02/D-15: two BLOCKING CI jobs, all FOUR `gate` wirings each, and a `serde_yaml` structural tripwire with a live negative control and four executed failure demonstrations (CONF-01/CONF-02/CONF-03)
+- [ ] 118-09-PLAN.md — Wave 5. D-02/D-15: two BLOCKING CI jobs (Node 22 + lockfile-keyed npm cache + `timeout-minutes`), all FOUR `gate` wirings each, and a `serde_yaml` structural tripwire proving a **BIJECTIVE** job→env→conditional→echo mapping, with a live negative control, the two-pin binding, and seven executed failure demonstrations (CONF-01/CONF-02/CONF-03)
 
 ### Phase 119: Documentation — Three Shapes + v2 Migration
 
