@@ -41,9 +41,9 @@
 //!
 //! # The Tasks extension is deliberately ABSENT (D-14)
 //!
-//! `test_tool_with_task` and the ten `tasks-*` scenarios are `not_scored` at
-//! BOTH revisions, so implementing them would add surface without adding
-//! evidence. Their absence is a decision, not an omission.
+//! The suite's task-bearing fixture tool and the ten `tasks-*` scenarios are
+//! `not_scored` at BOTH revisions, so implementing them would add surface
+//! without adding evidence. Their absence is a decision, not an omission.
 //!
 //! # Divergence from `s47_v2_stateless_mrtr`: `PMCP_REQUEST_STATE_KEY`
 //!
@@ -66,11 +66,13 @@ use pmcp::types::capabilities::{
 use pmcp::types::protocol::{
     ProtocolVersion, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28,
 };
+use pmcp::types::sampling::{CreateMessageParams, SamplingMessage, SamplingMessageContent};
 use pmcp::types::{
-    Content, GetPromptResult, ListResourcesResult, PromptArgument, PromptInfo, PromptMessage,
-    ReadResourceResult, ResourceInfo, Role,
+    CallToolResult, Content, GetPromptResult, ListResourcesResult, PromptArgument, PromptInfo,
+    PromptMessage, ReadResourceResult, ResourceInfo, Role, ToolInfo,
 };
 use pmcp::{PromptHandler, RequestHandlerExtra, ResourceHandler, Server};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -115,6 +117,10 @@ const TEMPLATE_PREFIX: &str = "test://template/";
 /// The suffix that closes the template's single path parameter.
 const TEMPLATE_SUFFIX: &str = "/data";
 
+/// A minimal 44-byte WAV header with no samples, base64. The suite asks only
+/// for "a minimal test audio file".
+const TINY_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
 /// Every prompt name the suite names, in `prompts/list` order.
 const PROMPT_NAMES: [&str; 5] = [
     "test_prompt",
@@ -122,6 +128,38 @@ const PROMPT_NAMES: [&str; 5] = [
     "test_prompt_with_arguments",
     "test_prompt_with_embedded_resource",
     "test_prompt_with_image",
+];
+
+/// Every tool name the suite names.
+///
+/// The first fifteen are the surface Phase 118's plan enumerates. The last two
+/// were added after MEASURING `conformance list --server --requirements
+/// 2025-11-25`: `elicitation-sep1034-defaults` and `elicitation-sep1330-enums`
+/// are SCORED at 2025-11-25 and name their own tools, which the plan's list
+/// omitted. Registering them costs nothing and makes those two scenarios
+/// reachable rather than failing on a missing tool.
+///
+/// The suite's task-bearing fixture tool and every other Tasks-extension tool
+/// are deliberately ABSENT (D-14) — they are `not_scored` at both revisions, so
+/// implementing them would add surface without adding evidence.
+const TOOL_NAMES: [&str; 17] = [
+    "test_simple_text",
+    "test_image_content",
+    "test_audio_content",
+    "test_embedded_resource",
+    "test_multiple_content_types",
+    "test_error_handling",
+    "test_tool_with_progress",
+    "test_tool_with_logging",
+    "test_logging_tool",
+    "test_complete",
+    "test_missing_capability",
+    "test_headers",
+    "test_custom_headers",
+    "test_sampling",
+    "test_elicitation",
+    "test_elicitation_sep1034_defaults",
+    "test_elicitation_sep1330_enums",
 ];
 
 /// Where the server binds when `argv[1]` is absent.
@@ -401,6 +439,262 @@ fn required_argument(name: &str, description: &str) -> PromptArgument {
         .required()
 }
 
+/// Every fixture tool the 2025-11-25 scored set names.
+///
+/// One struct backs all of them: they differ only in their metadata and in the
+/// exact `CallToolResult` they return, so keeping the seventeen contracts in a
+/// single `match` puts them side by side where a reviewer can compare them
+/// against the suite's requirement blocks.
+struct ConformanceTool {
+    /// The suite-dictated tool name. Load-bearing — renaming it breaks the
+    /// scenario that calls it.
+    name: &'static str,
+}
+
+#[async_trait]
+impl pmcp::ToolHandler for ConformanceTool {
+    async fn handle(&self, _args: Value, _extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        // Every tool owns its full envelope, so the plain-`Value` path is never
+        // the one that runs. `handle_output` below is the real entry point;
+        // this exists only to satisfy the trait.
+        Err(pmcp::Error::internal(format!(
+            "{} is served through handle_output, not handle",
+            self.name
+        )))
+    }
+
+    async fn handle_output(
+        &self,
+        args: Value,
+        extra: RequestHandlerExtra,
+    ) -> pmcp::Result<pmcp::server::ToolOutput> {
+        // `ToolOutput::Result` rather than `::Payload`: the suite compares the
+        // `content` array element by element, and the `Payload` tail would
+        // text-wrap the value into a single text block instead.
+        let result = self.call(args, extra).await?;
+        Ok(pmcp::server::ToolOutput::Result(result))
+    }
+
+    fn metadata(&self) -> Option<ToolInfo> {
+        // `tools-list` is SCORED at BOTH revisions and asserts that every tool
+        // carries a name, a description AND an inputSchema — RESEARCH measured
+        // it failing against s47 for a missing `description` alone. So no tool
+        // may fall back to the empty default.
+        let (description, schema) = match self.name {
+            "test_simple_text" => ("Returns a single simple text content block", no_args()),
+            "test_image_content" => ("Returns an image content block", no_args()),
+            "test_audio_content" => ("Returns an audio content block", no_args()),
+            "test_embedded_resource" => ("Returns an embedded-resource content block", no_args()),
+            "test_multiple_content_types" => (
+                "Returns several content blocks of different types",
+                no_args(),
+            ),
+            "test_error_handling" => ("Always returns a tool result with isError: true", no_args()),
+            "test_tool_with_progress" => (
+                "Emits progress notifications against the request's progress token",
+                no_args(),
+            ),
+            "test_tool_with_logging" => (
+                "Emits notifications/message log records during the call",
+                no_args(),
+            ),
+            "test_logging_tool" => ("The tool the logging scenarios drive", no_args()),
+            "test_complete" => ("Backs the completion/complete endpoint", no_args()),
+            "test_missing_capability" => (
+                "Negative case for a capability the server does not advertise",
+                no_args(),
+            ),
+            "test_headers" => ("Echoes the request's standard HTTP headers back", no_args()),
+            "test_custom_headers" => ("Echoes custom request headers back", no_args()),
+            "test_sampling" => (
+                "Requests sampling/createMessage from the client",
+                one_required_string("prompt", "The prompt to send to the LLM"),
+            ),
+            "test_elicitation" => (
+                "Requests elicitation/create from the client",
+                one_required_string("message", "The message to show the user"),
+            ),
+            "test_elicitation_sep1034_defaults" => (
+                "Requests elicitation with SEP-1034 default values for every primitive type",
+                no_args(),
+            ),
+            "test_elicitation_sep1330_enums" => (
+                "Requests elicitation with all five SEP-1330 enum variants",
+                no_args(),
+            ),
+            _ => ("", no_args()),
+        };
+        Some(ToolInfo::new(
+            self.name,
+            Some(description.to_string()),
+            schema,
+        ))
+    }
+}
+
+impl ConformanceTool {
+    /// Build the exact `CallToolResult` this tool's scenario expects.
+    ///
+    /// Each literal string below is quoted from that scenario's
+    /// `**Server Implementation Requirements:**` block character for
+    /// character — they are contract, not prose.
+    async fn call(&self, args: Value, extra: RequestHandlerExtra) -> pmcp::Result<CallToolResult> {
+        match self.name {
+            "test_simple_text" => Ok(CallToolResult::new(vec![Content::text(
+                "This is a simple text response for testing.",
+            )])),
+
+            "test_image_content" => Ok(CallToolResult::new(vec![Content::image(
+                TINY_PNG_BASE64,
+                "image/png",
+            )])),
+
+            "test_audio_content" => Ok(CallToolResult::new(vec![Content::audio(
+                TINY_WAV_BASE64,
+                "audio/wav",
+            )])),
+
+            "test_embedded_resource" => Ok(CallToolResult::new(vec![Content::resource_with_text(
+                "test://embedded-resource",
+                "This is an embedded resource content.",
+                "text/plain",
+            )])),
+
+            "test_multiple_content_types" => Ok(CallToolResult::new(vec![
+                Content::text("Multiple content types test:"),
+                Content::image(TINY_PNG_BASE64, "image/png"),
+                Content::resource_with_text(
+                    "test://mixed-content-resource",
+                    r#"{"test":"data","value":123}"#,
+                    "application/json",
+                ),
+            ])),
+
+            // `isError: true` on a RESULT, not a JSON-RPC error: the scenario
+            // asserts the tool-level error shape specifically.
+            "test_error_handling" => Ok(CallToolResult::error(vec![Content::text(
+                "This tool intentionally returns an error for testing",
+            )])),
+
+            "test_tool_with_progress" => {
+                // The scenario requires at least three notifications with
+                // non-decreasing progress, and the delays are what let a client
+                // observe them as separate messages rather than one burst.
+                for step in [0.0_f64, 50.0, 100.0] {
+                    extra.report_progress(step, Some(100.0), None).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok(CallToolResult::new(vec![Content::text(
+                    "Tool with progress completed",
+                )]))
+            },
+
+            "test_tool_with_logging" | "test_logging_tool" => {
+                // Three info-level records, spaced so a client can receive them
+                // DURING the call rather than all at completion.
+                for message in [
+                    "Tool execution started",
+                    "Tool processing data",
+                    "Tool execution completed",
+                ] {
+                    tracing::info!("{message}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Ok(CallToolResult::new(vec![Content::text(
+                    "Tool with logging completed",
+                )]))
+            },
+
+            "test_complete" => Ok(CallToolResult::new(vec![Content::text(
+                "Completion fixture tool",
+            )])),
+
+            // The negative case: this tool exists so a scenario can prove the
+            // server refuses a capability it never advertised.
+            "test_missing_capability" => Err(pmcp::Error::validation(
+                "this server does not advertise the capability this tool needs",
+            )),
+
+            "test_headers" | "test_custom_headers" => {
+                // pmcp's streamable-HTTP transport does not surface inbound
+                // request headers to a handler (no header plumbing into
+                // `RequestHandlerExtra::extensions`), so this reports what it
+                // CAN see rather than fabricating an echo. Recorded as an SDK
+                // gap in this plan's SUMMARY; the scenarios that consume these
+                // two are v2-only and belong to plan 118-05.
+                let seen = extra.request_meta.clone().unwrap_or(Value::Null);
+                Ok(CallToolResult::new(vec![Content::text(format!(
+                    "{}: request _meta = {seen}",
+                    self.name
+                ))]))
+            },
+
+            "test_sampling" => {
+                let prompt = args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pmcp::Error::validation("test_sampling requires prompt"))?;
+                // `extra.peer()` is the SDK's server->client back-channel. It is
+                // `None` on this transport (see the SUMMARY's SDK-gap note), so
+                // the refusal is explicit rather than a silent empty result.
+                let peer = extra.peer().ok_or_else(|| {
+                    pmcp::Error::internal(
+                        "no server->client channel on this transport: sampling/createMessage \
+                         cannot be issued",
+                    )
+                })?;
+                let response = peer
+                    .sample(sampling_params(prompt))
+                    .await
+                    .map_err(|error| pmcp::Error::internal(error.to_string()))?;
+                let text = match &response.content {
+                    Content::Text { text } => text.clone(),
+                    other => format!("{other:?}"),
+                };
+                Ok(CallToolResult::new(vec![Content::text(format!(
+                    "LLM response: {text}"
+                ))]))
+            },
+
+            // All three elicitation tools hit the same wall: pmcp's
+            // `PeerHandle` exposes `sample`, `sample_with_tools`, `list_roots`
+            // and `progress_notify` — there is no `elicit`, and the
+            // `ElicitationManager` that would issue one is not reachable from a
+            // handler. Recorded as an SDK gap in this plan's SUMMARY.
+            "test_elicitation"
+            | "test_elicitation_sep1034_defaults"
+            | "test_elicitation_sep1330_enums" => Err(pmcp::Error::internal(
+                "no server->client channel on this transport: elicitation/create cannot be issued",
+            )),
+
+            other => Err(pmcp::Error::validation(format!("unknown tool: {other}"))),
+        }
+    }
+}
+
+/// The sampling request shape the `tools-call-sampling` scenario specifies.
+fn sampling_params(prompt: &str) -> CreateMessageParams {
+    CreateMessageParams::new(vec![SamplingMessage::new(
+        Role::User,
+        SamplingMessageContent::from_content(Content::text(prompt)),
+    )])
+    .with_max_tokens(100)
+}
+
+/// The input schema for a tool that takes no arguments.
+fn no_args() -> Value {
+    serde_json::json!({ "type": "object", "properties": {} })
+}
+
+/// The input schema for a tool with exactly one required string argument.
+fn one_required_string(name: &str, description: &str) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { name: { "type": "string", "description": description } },
+        "required": [name],
+    })
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // WARN is deliberately NOT part of this server's startup contract, so the
@@ -435,6 +729,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     for name in PROMPT_NAMES {
         builder = builder.prompt(name, ConformancePrompt { name });
+    }
+    for name in TOOL_NAMES {
+        builder = builder.tool(name, ConformanceTool { name });
     }
 
     let server = builder.build()?;
