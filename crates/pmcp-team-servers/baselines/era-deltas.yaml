@@ -120,9 +120,7 @@ deltas:
     v2: absent
     kind: method-removed
     source: "src/client/mod.rs:592 and :761 (v2_synthetic_initialize_result); .planning/REQUIREMENTS.md CLNT-01"
-    note: >-
-      Phase 118 plan 07 owns the measurement. A v2 client's InitializeResult is
-      LOCAL AND SYNTHETIC — no byte of it came from the server.
+    note: "Phase 118 plan 07 owns the measurement. A v2 client's InitializeResult is LOCAL AND SYNTHETIC — no byte of it came from the server."
     provisional: true
 
   - id: ERA-02
@@ -132,9 +130,7 @@ deltas:
     v2: served
     kind: method-added
     source: "src/server/core.rs:1944 (build_discover_response answers -32601 for any non-V2 request); :1180 (project_capabilities_for_v2)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. v2 replaces the initialize
-      handshake with a read-only capability projection.
+    note: "Phase 118 plan 07 owns the measurement. v2 replaces the initialize handshake with a read-only capability projection."
     provisional: true
 
   - id: ERA-03
@@ -144,8 +140,7 @@ deltas:
     v2: never-minted-inbound-ignored
     kind: header-removed
     source: "src/server/streamable_http_server/v1_session.rs:333 (sessions_active_for); :552 (spec quote: \"ignore it, and do not mint or echo session IDs\")"
-    note: >-
-      Phase 118 plan 07 owns the measurement against the live era target.
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
     provisional: true
 
   - id: ERA-04
@@ -155,11 +150,7 @@ deltas:
     v2: required-and-cross-checked
     kind: header-required-on-v2
     source: "src/shared/http_constants.rs:65,73 (MCP_METHOD, MCP_NAME); .planning/REQUIREMENTS.md VERS-05"
-    note: >-
-      Phase 118 plan 07 owns the measurement. Phase 118 D-13 relaxes the
-      Mcp-Name arm to name-bearing methods only; the strict header/body
-      cross-check is kept where the header IS present, because a desync is a
-      smuggling signal and is rejected fail-closed.
+    note: "Phase 118 plan 07 owns the measurement. Phase 118 D-13 relaxes the Mcp-Name arm to name-bearing methods only; the strict header/body cross-check is kept where the header IS present, because a desync is a smuggling signal and is rejected fail-closed."
     provisional: true
 
   - id: ERA-05
@@ -169,8 +160,7 @@ deltas:
     v2: ignored
     kind: feature-removed
     source: "src/server/streamable_http_server/v1_session.rs:433 (resumability_active_for — the resumability era gate); .planning/REQUIREMENTS.md (standing out-of-scope ruling on v2 resumability)"
-    note: >-
-      Phase 118 plan 07 owns the measurement against the live era target.
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
     provisional: true
 
   - id: ERA-06
@@ -180,9 +170,7 @@ deltas:
     v2: "status:405"
     kind: verb-rejected-on-v2
     source: "src/server/streamable_http_server.rs:1709 (v2_method_not_allowed) and :1720 (v2_verb_rejection)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. Also gated on the server's v2
-      accept-list, so a v1-only server never answers 405 to a legitimate v1 GET.
+    note: "Phase 118 plan 07 owns the measurement. Also gated on the server's v2 accept-list, so a v1-only server never answers 405 to a legitimate v1 GET."
     provisional: true
 
   - id: ERA-07
@@ -192,9 +180,7 @@ deltas:
     v2: present
     kind: field-added-on-v2
     source: "src/server/core.rs:1570 (the v2-only response envelope injects resultType + serverInfo); :1307 (the disposition discriminator)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. Discriminator values are
-      complete / input_required / task, defaulting to complete when absent.
+    note: "Phase 118 plan 07 owns the measurement. Discriminator values are complete / input_required / task, defaulting to complete when absent."
     provisional: true
 
   - id: ERA-08
@@ -204,10 +190,7 @@ deltas:
     v2: present
     kind: field-added-on-v2
     source: "src/server/core.rs:1568 (RESERVED_SERVER_INFO_KEY = io.modelcontextprotocol/serverInfo); :1570 (v2 envelope injection)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. v2 results carry serverInfo
-      because there is no initialize response to carry it; the probe accepts it
-      at the top of the result OR under the result's `_meta`.
+    note: "Phase 118 plan 07 owns the measurement. v2 results carry serverInfo because there is no initialize response to carry it; the probe accepts it at the top of the result OR under the result's `_meta`."
     provisional: true
 
   - id: ERA-09
@@ -217,11 +200,7 @@ deltas:
     v2: required
     kind: field-required-on-v2
     source: "src/server/core.rs:1583-1613 (the 2026-07-28 CacheableResult hints); .planning/phases/115-json-schema-2020-12-structured-output-caching-hints/115-CONTEXT.md D-07 (AMENDED 2026-08-01) and D-08"
-    note: >-
-      Phase 118 plan 07 owns the measurement. REQUIRED, not optional — the
-      schema declares CacheableResult with no `?` on either field. SDK default
-      is ttlMs 0 / cacheScope private, the SAFE default rather than the
-      convenient one.
+    note: "Phase 118 plan 07 owns the measurement. REQUIRED, not optional — the schema declares CacheableResult with no `?` on either field. SDK default is ttlMs 0 / cacheScope private, the SAFE default rather than the convenient one."
     provisional: true
 
   - id: ERA-10
@@ -231,8 +210,7 @@ deltas:
     v2: era-gated-table
     kind: status-mapping-era-gated
     source: "src/server/streamable_http_server.rs:735 (v2_status_for_code); the era-gating test status_mapping_is_era_gated_so_v1_is_untouched at :4742"
-    note: >-
-      Phase 118 plan 07 owns the measurement against the live era target.
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
     provisional: true
 
   # ---------------------------------------------------------------------------
@@ -248,10 +226,7 @@ deltas:
     v2: "error:-32601"
     kind: method-removed
     source: "MCP 2026-07-28 schema, io.modelcontextprotocol/logLevel description: \"Replaces the former `logging/setLevel` RPC\"; 118-RESEARCH.md:900 quotes it verbatim; the suite's server-stateless scenario expects 404 + -32601 for removed methods"
-    note: >-
-      Phase 118 plan 07 owns the measurement. Under D-12 the v1 RPC shape stays
-      green under v1 negotiation ONLY; reading (b) — v1 RPCs answering under v2
-      — was explicitly rejected because it contradicts the official suite.
+    note: "Phase 118 plan 07 owns the measurement. Under D-12 the v1 RPC shape stays green under v1 negotiation ONLY; reading (b) — v1 RPCs answering under v2 — was explicitly rejected because it contradicts the official suite."
     provisional: true
 
   - id: ERA-12
@@ -261,10 +236,7 @@ deltas:
     v2: honored
     kind: mechanism-replaced
     source: "MCP 2026-07-28 schema key io.modelcontextprotocol/logLevel (per-request log level, replacing the RPC); 118-RESEARCH.md:899-901; 118-CONTEXT.md:137 (D-12)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. This row and ERA-11 are one
-      capability seen from both ends: the RPC goes away and the `_meta` key
-      takes over. Deprecation is per-MECHANISM, not per-capability.
+    note: "Phase 118 plan 07 owns the measurement. This row and ERA-11 are one capability seen from both ends: the RPC goes away and the `_meta` key takes over. Deprecation is per-MECHANISM, not per-capability."
     provisional: true
 
   - id: ERA-13
@@ -274,10 +246,7 @@ deltas:
     v2: present
     kind: mechanism-replaced
     source: "src/types/mrtr.rs:686 (InputRequiredResult: resultType + inputRequests + requestState); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-sampling)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. v2 is stateless with no
-      server->client request channel mid-call, so the spec-blessed shape for
-      Sampling is an InputRequiredResult continuation, not a nested request.
+    note: "Phase 118 plan 07 owns the measurement. v2 is stateless with no server->client request channel mid-call, so the spec-blessed shape for Sampling is an InputRequiredResult continuation, not a nested request."
     provisional: true
 
   - id: ERA-14
@@ -287,8 +256,5 @@ deltas:
     v2: present
     kind: mechanism-replaced
     source: "src/types/mrtr.rs:686 (InputRequiredResult); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-list-roots)"
-    note: >-
-      Phase 118 plan 07 owns the measurement. Same mechanism as ERA-13, applied
-      to Roots: the server asks for roots by RETURNING an input_required result
-      rather than by issuing a roots/list request.
+    note: "Phase 118 plan 07 owns the measurement. Same mechanism as ERA-13, applied to Roots: the server asks for roots by RETURNING an input_required result rather than by issuing a roots/list request."
     provisional: true

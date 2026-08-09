@@ -52,6 +52,21 @@ features = ["openapi-code-mode"]
 [dependencies.mcp-tester]
 path = "../crates/mcp-tester"
 
+# Phase 118 (CONF-02): reaches
+# `pmcp_team_servers::conformance::era_diff::parse_baseline`.
+#
+# `default-features = false` plus ONLY `conformance` is deliberate. The crate's
+# default feature set attaches all four reference servers, and its `http`
+# feature pulls `pmcp/streamable-http` + `pmcp/http` + `member-llm`, which drags
+# reqwest and a native-only HTTP stack into a build that only ever hands a
+# `&str` to a YAML parser. `conformance` alone gives the parser and nothing
+# else, mirroring how `[dependencies.pmcp]` above narrows its own feature list
+# to exactly the seams its targets reach.
+[dependencies.pmcp-team-servers]
+path = "../crates/pmcp-team-servers"
+default-features = false
+features = ["conformance"]
+
 [[bin]]
 name = "protocol_parsing"
 path = "fuzz_targets/protocol_parsing.rs"
@@ -236,6 +251,20 @@ bench = false
 [[bin]]
 name = "era_deltas_parser"
 path = "fuzz_targets/era_deltas_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 118 (CONF-02): the pmcp-team-servers sibling of the target above. The
+# same class of defect on a different crate's baseline — arbitrary file bytes
+# flow into `pmcp_team_servers::conformance::era_diff::parse_baseline` through
+# `era_diff::load_baseline`, and a panic there is a reachable unwind (T-118-10).
+# It reaches the parser through the `[dependencies.pmcp-team-servers]` path
+# entry declared above, which enables ONLY the `conformance` feature so this
+# build pulls no reqwest and no HTTP stack.
+[[bin]]
+name = "team_era_deltas_parser"
+path = "fuzz_targets/team_era_deltas_parser.rs"
 test = false
 doc = false
 bench = false
