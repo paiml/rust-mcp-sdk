@@ -3,7 +3,31 @@
 //! Drives the exportable [`run_fixtures`] runner against all four reference
 //! servers over an in-memory [`DuplexTransport`], proving **advertised ==
 //! enforced** at the wire for every advertised tool and every guard, using the
-//! v2 fixtures under `contracts/team-servers/fixtures/**`.
+//! format-rev-2 fixtures under `contracts/team-servers/fixtures/**`. (`rev 2`
+//! is the FIXTURE FORMAT revision; a bare `v2` means the MCP ERA — Phase 118
+//! D-08.)
+//!
+//! # Role under Phase 118: this is the v1-only REGRESSION GUARD (D-16)
+//!
+//! These 33 in-process cases are **no longer the era-comparison surface**.
+//! Under Phase 118 D-16 they are the guard that proves *the v1 corpus stayed
+//! green while the era work happened*; the era comparison lives in
+//! `crates/pmcp-team-servers/tests/era_matrix.rs` over real streamable HTTP
+//! (plan 118-07).
+//!
+//! Why the era dimension cannot live here: `DuplexTransport`
+//! (`crates/pmcp-team-servers/src/transport.rs:47`) never overrides
+//! `supports_negotiated_protocol_version` — the trait default is `false`
+//! (`src/shared/transport.rs:351`) — so an in-process v2 arm is **INERT**;
+//! `ClientBuilder::build` (`src/client/mod.rs:5213`) says exactly that in a
+//! `tracing::warn!`. A matrix built here would have compared v1 against v1 and
+//! reported green. Do NOT add an era dimension to this file.
+//!
+//! The guard is EXACT in two independent dimensions: the replayed per-server
+//! case counts (`EXPECTED_CASES_*`, summing to `EXPECTED_TOTAL_CASES`) and the
+//! on-disk `*.json` file counts (`EXPECTED_FIXTURE_FILES_*`, summing to
+//! `EXPECTED_TOTAL_FIXTURE_FILES`). One deleted fixture therefore fails TWO
+//! independent assertions.
 //!
 //! Each independent case runs against a FRESH deterministic server instance (so
 //! the `mem-001…`/`appr-001…` id seams replay exactly); stateful sequences
@@ -34,7 +58,7 @@ use pmcp::types::sampling::{
 use pmcp::types::{CallToolResult, Role, ToolInfo};
 
 use pmcp_team_servers::conformance::runner::{
-    assert_conformant, run_fixtures, CallError, ClientTarget, ConformanceTarget,
+    assert_conformant, run_fixtures, CallError, ClientTarget, ConformanceReport, ConformanceTarget,
 };
 use pmcp_team_servers::DuplexTransport;
 
@@ -68,6 +92,138 @@ use pmcp_team_servers::team::server::build_team_mcp_server;
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/team-servers/fixtures")
+}
+
+// ===========================================================================
+// The v1 regression guard's EXACT corpus size (Phase 118 D-16).
+//
+// Two independent dimensions, both hard-coded and NEVER length-derived
+// (`115-REVIEW.md` WR-01): the replayed CASE counts and the on-disk FILE
+// counts. `run_fixtures` records exactly one `report.record(fx.case_id, …)`
+// per loaded `Fixture` (`src/conformance/runner.rs`), whether the case is
+// independent or part of an ordered scenario group, so on an all-green run a
+// directory's case count EQUALS its `*.json` file count. Measured 2026-08-09;
+// all four matched exactly (see `118-10-SUMMARY.md`).
+//
+// These replaced four `assert!` FLOORS (11 / 6 / 5 / 7 respectively) that were
+// each exactly one BELOW today's count: stale lower bounds, never raised as
+// fixtures were added. A floor cannot notice a shrinking corpus, and it did not
+// notice a growing one either — that is the whole defect (118-REVIEWS.md,
+// verified MEDIUM: "118-06's v1 guarantee uses floors, not the claimed exact
+// corpus").
+//
+// THE REMEDY FOR A FAILURE IS NEVER TO ADJUST THE NUMBER TO MATCH. Either
+// restore the fixture, or — if the corpus legitimately changed — change the
+// constant IN THE SAME COMMIT as the fixture and say why in the message.
+// ===========================================================================
+
+/// Exact number of conformance cases `team-fs` replays. See the block comment
+/// above for the remedy rule: never lower this to match an observation.
+const EXPECTED_CASES_TEAM_FS: usize = 12;
+/// Exact number of conformance cases `mem-mcp` replays. See the block comment
+/// above for the remedy rule: never lower this to match an observation.
+const EXPECTED_CASES_MEM_MCP: usize = 7;
+/// Exact number of conformance cases `approval-mcp` replays. See the block
+/// comment above for the remedy rule: never lower this to match an observation.
+const EXPECTED_CASES_APPROVAL_MCP: usize = 6;
+/// Exact number of conformance cases `team-mcp` replays. See the block comment
+/// above for the remedy rule: never lower this to match an observation.
+const EXPECTED_CASES_TEAM_MCP: usize = 8;
+
+/// Exact total across all four servers, written as a LITERAL.
+///
+/// Deliberately NOT `EXPECTED_CASES_TEAM_FS + …`: a sum expression cannot
+/// catch a coordinated edit that moves a case between two servers, because it
+/// would be recomputed from the very constants that changed. A literal can.
+/// Same remedy rule as above — never adjust it to match an observation.
+const EXPECTED_TOTAL_CASES: usize = 33;
+
+/// Exact number of `*.json` fixture files on disk under `team-fs`. Restore a
+/// deleted file rather than lowering this.
+const EXPECTED_FIXTURE_FILES_TEAM_FS: usize = 12;
+/// Exact number of `*.json` fixture files on disk under `mem-mcp`. Restore a
+/// deleted file rather than lowering this.
+const EXPECTED_FIXTURE_FILES_MEM_MCP: usize = 7;
+/// Exact number of `*.json` fixture files on disk under `approval-mcp`.
+/// Restore a deleted file rather than lowering this.
+const EXPECTED_FIXTURE_FILES_APPROVAL_MCP: usize = 6;
+/// Exact number of `*.json` fixture files on disk under `team-mcp`. Restore a
+/// deleted file rather than lowering this.
+const EXPECTED_FIXTURE_FILES_TEAM_MCP: usize = 8;
+
+/// Exact on-disk corpus size, written as a LITERAL for the same reason
+/// [`EXPECTED_TOTAL_CASES`] is. This is the SECOND, INDEPENDENT arm of the
+/// guard: the case counts could in principle be satisfied by a corpus that
+/// lost one file and gained another; this cannot. Same remedy rule.
+const EXPECTED_TOTAL_FIXTURE_FILES: usize = 33;
+
+// ---------------------------------------------------------------------------
+// Guard messages: three-part `FAILURE MODE:` / `CONSEQUENCE:` / `WHAT TO DO:`,
+// echoing BOTH the expected and the observed value so a reader never has to
+// re-run to learn the delta. Built as a `String` first so the assertion itself
+// stays on one line and reads as the guarantee it is.
+// ---------------------------------------------------------------------------
+
+/// Message for the "this server recorded zero failures" assertion.
+fn zero_failures_msg(server: &str, report: &ConformanceReport) -> String {
+    let passed = report.passed;
+    let failed = report.failed;
+    format!(
+        "FAILURE MODE: {server} recorded {failed} FAILED conformance case(s) \
+         (observed {passed} passed / {failed} failed).\n\
+         CONSEQUENCE: the v1 corpus is no longer green, so every Phase-118 era \
+         claim resting on \"the v1 fixtures stayed green\" is void.\n\
+         WHAT TO DO: fix the server or the fixture that drifted. Never relax \
+         this assertion, and never delete the offending fixture to restore \
+         green — the file-count fence would fail too, by design."
+    )
+}
+
+/// Message for an exact CASE-count assertion (one server, or the total).
+fn exact_cases_msg(scope: &str, expected: usize, observed: usize) -> String {
+    format!(
+        "FAILURE MODE: {scope} replayed {observed} conformance case(s); the \
+         committed v1 corpus is exactly {expected}.\n\
+         CONSEQUENCE: a shrinking corpus produces a SMALLER green run, so \
+         \"the v1 fixtures stayed green\" quietly means less than it did last \
+         commit; a growing one means an unreviewed fixture landed.\n\
+         WHAT TO DO: the remedy is NEVER to change {expected} to {observed}. \
+         Restore the fixture, or — if the corpus legitimately changed — update \
+         the EXPECTED_CASES_* constant (and the EXPECTED_TOTAL_CASES literal) \
+         IN THE SAME COMMIT as the fixture, and say why in the message."
+    )
+}
+
+/// Message for an exact on-disk FILE-count assertion (the independent arm).
+fn exact_files_msg(scope: &str, expected: usize, observed: usize) -> String {
+    format!(
+        "FAILURE MODE: {scope} holds {observed} `*.json` fixture file(s); the \
+         committed corpus is exactly {expected}.\n\
+         CONSEQUENCE: this is the SECOND, INDEPENDENT arm of the v1 guard. The \
+         case-count assertions could be satisfied by a corpus that lost one \
+         file and gained another; this one cannot.\n\
+         WHAT TO DO: the remedy is NEVER to change {expected} to {observed}. \
+         Restore the file, or update the EXPECTED_FIXTURE_FILES_* constant \
+         (and the EXPECTED_TOTAL_FIXTURE_FILES literal) IN THE SAME COMMIT as \
+         the fixture, and say why in the message."
+    )
+}
+
+/// Count the `*.json` fixture files on disk for one server directory.
+///
+/// Deliberately a directory read, not a length derived from anything the
+/// conformance run itself loaded — the point is to be an arm that fails
+/// independently of the replay.
+fn count_fixture_files(server: &str) -> usize {
+    let dir = fixtures_root().join(server);
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {server} dir: {e}")) {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|x| x.to_str()) == Some("json") {
+            count += 1;
+        }
+    }
+    count
 }
 
 // ===========================================================================
@@ -235,7 +391,10 @@ async fn team_target() -> ClientTarget<DuplexTransport> {
 }
 
 // ===========================================================================
-// Conformance runs: every server proven at zero failures.
+// Conformance runs: every server proven at ZERO failures and an EXACT case
+// count. `assert_conformant` already panics on any failure; the explicit
+// `report.failed == 0` assertion is kept anyway so the guarantee is legible at
+// the call site rather than only inside the runner.
 // ===========================================================================
 
 #[tokio::test]
@@ -243,10 +402,10 @@ async fn team_fs_is_conformant() {
     let dir = fixtures_root().join("team-fs");
     let report = run_fixtures(|| async { fs_target() }, &dir).await;
     assert_conformant(&report);
-    assert!(
-        report.passed >= 11,
-        "expected ≥11 team-fs cases: {report:?}"
-    );
+    let msg = zero_failures_msg("team-fs", &report);
+    assert_eq!(report.failed, 0, "{msg}");
+    let msg = exact_cases_msg("team-fs", EXPECTED_CASES_TEAM_FS, report.passed);
+    assert_eq!(report.passed, EXPECTED_CASES_TEAM_FS, "{msg}");
 }
 
 #[tokio::test]
@@ -254,7 +413,10 @@ async fn mem_mcp_is_conformant() {
     let dir = fixtures_root().join("mem-mcp");
     let report = run_fixtures(|| async { mem_target() }, &dir).await;
     assert_conformant(&report);
-    assert!(report.passed >= 6, "expected ≥6 mem-mcp cases: {report:?}");
+    let msg = zero_failures_msg("mem-mcp", &report);
+    assert_eq!(report.failed, 0, "{msg}");
+    let msg = exact_cases_msg("mem-mcp", EXPECTED_CASES_MEM_MCP, report.passed);
+    assert_eq!(report.passed, EXPECTED_CASES_MEM_MCP, "{msg}");
 }
 
 #[tokio::test]
@@ -262,10 +424,10 @@ async fn approval_mcp_is_conformant() {
     let dir = fixtures_root().join("approval-mcp");
     let report = run_fixtures(|| async { approval_target() }, &dir).await;
     assert_conformant(&report);
-    assert!(
-        report.passed >= 5,
-        "expected ≥5 approval-mcp cases: {report:?}"
-    );
+    let msg = zero_failures_msg("approval-mcp", &report);
+    assert_eq!(report.failed, 0, "{msg}");
+    let msg = exact_cases_msg("approval-mcp", EXPECTED_CASES_APPROVAL_MCP, report.passed);
+    assert_eq!(report.passed, EXPECTED_CASES_APPROVAL_MCP, "{msg}");
 }
 
 #[tokio::test]
@@ -273,7 +435,67 @@ async fn team_mcp_is_conformant() {
     let dir = fixtures_root().join("team-mcp");
     let report = run_fixtures(|| async { team_target().await }, &dir).await;
     assert_conformant(&report);
-    assert!(report.passed >= 7, "expected ≥7 team-mcp cases: {report:?}");
+    let msg = zero_failures_msg("team-mcp", &report);
+    assert_eq!(report.failed, 0, "{msg}");
+    let msg = exact_cases_msg("team-mcp", EXPECTED_CASES_TEAM_MCP, report.passed);
+    assert_eq!(report.passed, EXPECTED_CASES_TEAM_MCP, "{msg}");
+}
+
+/// The whole-corpus case fence: all four servers replayed in one test so the
+/// EXACT total can be asserted against the [`EXPECTED_TOTAL_CASES`] literal.
+///
+/// The per-server tests above cannot see each other's counts, so a coordinated
+/// edit that moved a case from one server to another would pass none of them
+/// but would also never be summed. This test does the summing.
+#[tokio::test]
+async fn all_servers_replay_exactly_the_expected_total() {
+    let root = fixtures_root();
+    let fs = run_fixtures(|| async { fs_target() }, &root.join("team-fs")).await;
+    let mem = run_fixtures(|| async { mem_target() }, &root.join("mem-mcp")).await;
+    let appr = run_fixtures(|| async { approval_target() }, &root.join("approval-mcp")).await;
+    let team = run_fixtures(|| async { team_target().await }, &root.join("team-mcp")).await;
+
+    // `assert_conformant` panics (with the per-case diff) on any failure. The
+    // explicit `report.failed == 0` spelling is reserved for the four
+    // `*_is_conformant` tests, so a `grep` for it counts exactly four call
+    // sites — one per reference server.
+    for report in [&fs, &mem, &appr, &team] {
+        assert_conformant(report);
+    }
+
+    let observed = fs.passed + mem.passed + appr.passed + team.passed;
+    let msg = exact_cases_msg("the whole v1 corpus", EXPECTED_TOTAL_CASES, observed);
+    assert_eq!(observed, EXPECTED_TOTAL_CASES, "{msg}");
+}
+
+/// The SECOND, INDEPENDENT arm of the v1 guard: the on-disk corpus size.
+///
+/// A deleted fixture fails BOTH this test and its server's `*_is_conformant`
+/// case count; an added one fails both too — which is correct, because growing
+/// the corpus is a deliberate act that updates the constants in the same
+/// commit. Unlike the case counts, this arm reads the directory directly, so a
+/// compensating edit (one file removed, one added, in DIFFERENT directories)
+/// still fails here.
+#[test]
+fn fixture_corpus_is_exactly_thirty_three() {
+    let mut total = 0;
+    for (server, expected) in [
+        ("team-fs", EXPECTED_FIXTURE_FILES_TEAM_FS),
+        ("mem-mcp", EXPECTED_FIXTURE_FILES_MEM_MCP),
+        ("approval-mcp", EXPECTED_FIXTURE_FILES_APPROVAL_MCP),
+        ("team-mcp", EXPECTED_FIXTURE_FILES_TEAM_MCP),
+    ] {
+        let observed = count_fixture_files(server);
+        let msg = exact_files_msg(server, expected, observed);
+        assert_eq!(observed, expected, "{msg}");
+        total += observed;
+    }
+    let msg = exact_files_msg(
+        "the whole fixture corpus",
+        EXPECTED_TOTAL_FIXTURE_FILES,
+        total,
+    );
+    assert_eq!(total, EXPECTED_TOTAL_FIXTURE_FILES, "{msg}");
 }
 
 // ===========================================================================
