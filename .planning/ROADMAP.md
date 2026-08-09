@@ -2734,14 +2734,28 @@ Plans:
 **Plans**: 9 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 118-01-PLAN.md — Wave 1. D-13: relax `Mcp-Name` to name-bearing methods only, reversing the Phase-113 DRIFT-1 adjudication in rustdoc, with a live-HTTP proof of the new matrix (CONF-01)
 - [ ] 118-02-PLAN.md — Wave 1. D-01: the pinned `conformance/` Node manifest + lockfile (Node 22 floor, exact pin, slopcheck re-check) and the ship-both-or-exclude-both packaging disposition (CONF-01)
 - [ ] 118-03-PLAN.md — Wave 1. The team-servers expected-difference baseline: model, total parser, spec-artifact YAML seeded with D-12's CONF-03 rows, non-vacuity schema gate, ALWAYS fuzz target (CONF-02/CONF-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 118-04-PLAN.md — Wave 2. D-05: the dual-version conformance example `s54_v2_dual_conformance` and the full 2025-11-25 fixture surface, measured green (CONF-01)
-- [ ] 118-05-PLAN.md — Wave 3. D-13's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process (CONF-01)
 - [ ] 118-06-PLAN.md — Wave 2. D-07/D-08: the era dimension on the existing `ConformanceTarget` seam, the 33-fixture matrix with a bidirectional baseline join, and the prose-only fixture-format rename (CONF-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 118-05-PLAN.md — Wave 3. D-13's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process (CONF-01)
 - [ ] 118-07-PLAN.md — Wave 3. D-10/D-11/D-12: Roots/Sampling/Logging fixtures IN the matrix, a coverage test that fails on deletion, and the 12-month advisory window reconciled into `docs/v1-sunset-policy.md` (CONF-03)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 118-08-PLAN.md — Wave 4. The two driver scripts (one process, two runs, readiness poll, trap teardown; dev-dependency-free fence + nonzero-count guard) with commands as DATA, plus the two Makefile targets (CONF-01/CONF-02)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 118-09-PLAN.md — Wave 5. D-02/D-15: two BLOCKING CI jobs, all FOUR `gate` wirings each, and a `serde_yaml` structural tripwire with a live negative control and four executed failure demonstrations (CONF-01/CONF-02/CONF-03)
 
 ### Phase 119: Documentation — Three Shapes + v2 Migration
