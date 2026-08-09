@@ -40,7 +40,7 @@
 //! One probe per baseline `observation_id`, each recording what it saw as an
 //! [`ObservedValue`] whose [`ObservedValue::token`] is drawn from the SAME short
 //! vocabulary the baseline's `v1:` / `v2:` columns use. That is what lets
-//! `crate::conformance::era_diff` join an observation against a delta and
+//! [`crate::conformance::era_diff`] join an observation against a delta and
 //! check not merely that the eras DIFFERED but that they differed in the
 //! RECORDED way.
 //!
@@ -216,7 +216,7 @@ pub enum ObservedValue {
 impl ObservedValue {
     /// The canonical token this observation compares as.
     ///
-    /// This is what `crate::conformance::era_diff` matches against an
+    /// This is what [`crate::conformance::era_diff`] matches against an
     /// `EraDelta`'s `v1:` / `v2:` column, so the vocabulary here and the
     /// vocabulary in `baselines/era-deltas.yaml` are ONE vocabulary.
     ///
