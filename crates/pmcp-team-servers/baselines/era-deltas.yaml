@@ -1,0 +1,260 @@
+# =============================================================================
+# EXPECTED-DIFFERENCE BASELINE — MCP 2025-11-25 (v1) vs MCP 2026-07-28 (v2)
+# for the pmcp-team-servers ERA TARGET
+# =============================================================================
+#
+# THIS FILE IS THE WRITTEN STATEMENT OF WHAT "DUAL-VERSION" MEANS FOR THE
+# PHASE-118 ERA TARGET.
+#
+# Every entry below is a difference that is CORRECT BY DESIGN.
+#
+#   * Any observed v1/v2 difference NOT listed here is a FINDING.
+#   * Any entry here that no longer reproduces is ALSO a FINDING — either the
+#     spec moved, or we regressed.
+#
+# REVIEW THIS FILE LIKE A SPEC, NOT LIKE CONFIG. It is the adjudication surface
+# for CONF-02 and CONF-03, and maintaining it IS the dual-version contract, not
+# overhead on top of it.
+#
+# -----------------------------------------------------------------------------
+# THE ID CONTRACT (this is what makes the file non-vacuous)
+# -----------------------------------------------------------------------------
+# Every `observation_id` here has a matching entry in
+# `src/conformance/era_observations.rs::PROBE_REGISTRY`, AND every registry
+# entry has a row here. BOTH DIRECTIONS are asserted by
+# `tests/era_baseline.rs` (`every_baseline_entry_has_a_probe` and
+# `every_probe_has_a_baseline_entry`). Adding a row without a probe, or a probe
+# without a row, fails a test.
+#
+# That pairing is not bureaucracy. A row nothing observes can only ever be
+# reported MISSING, in every run, forever; a probe with no row would report
+# every run of it as UNEXPECTED. Either one trains a reviewer to ignore the
+# gate, which is the failure mode this whole design exists to prevent.
+#
+# The REGISTRY is the authority, not this file: adding a row for a wire fact no
+# probe reads fails `every_baseline_entry_has_a_probe`.
+#
+# -----------------------------------------------------------------------------
+# WHY YAML AND NOT TOML
+# -----------------------------------------------------------------------------
+# `serde_yaml = "0.9"` is ALREADY resolved in this workspace — the root
+# `Cargo.toml` carries it as a dev-dependency and `crates/mcp-tester/Cargo.toml`
+# as a regular one — so reading this file costs ZERO new third-party packages.
+# Adding the `toml` crate would be a NEW dependency on an already-published
+# crate, which the CLAUDE.md package discipline requires justifying, and it
+# would buy nothing. Comment support is the only property "legible enough to
+# review as a spec artifact" actually needs, and YAML has it.
+#
+# -----------------------------------------------------------------------------
+# THE FIELDS
+# -----------------------------------------------------------------------------
+#   id             Stable human-facing label, `ERA-NN`. Unique. Never reused.
+#
+#   observation_id The STABLE, MACHINE-FACING name of the WIRE FACT this entry
+#                  is about — namespaced, lowercase, dot-separated. It is NOT a
+#                  human-facing test name and MUST NEVER be renamed for
+#                  readability.
+#
+#                  Its reason: `src/conformance/era_diff.rs::compare_eras` joins
+#                  the observed v1/v2 difference set against this field.
+#                  `CaseResult` (`src/conformance/runner.rs:306`) carries only
+#                  `{case_id, passed, detail}` — no header, no session id, no
+#                  result-envelope key, no HTTP status — so a comparison keyed on
+#                  fixture pass/fail could never OBSERVE most of the entries
+#                  below, and two eras both passing the same expected response
+#                  would emit no observation at all. That is exactly the defect
+#                  Phase 118 D-16 removed by porting the Phase-117 probe
+#                  substrate instead.
+#
+#                  TEN of the fourteen values below are REUSED BYTE-IDENTICALLY
+#                  from `crates/mcp-tester/baselines/era-deltas.yaml` because
+#                  they name the SAME wire fact. Reusing the string is what lets
+#                  the two baselines be read side by side.
+#
+#   subject        Human-readable wire surface the entry concerns.
+#   v1 / v2        What each era does. Short tokens, not prose. The vocabulary
+#                  here IS `ObservedValue::token()`'s vocabulary — one
+#                  vocabulary, two files.
+#   kind           Difference class, for grouping in a report.
+#
+#   source         Citation a reviewer can check WITHOUT READING RUST. A label
+#                  ("D-07", "spec") is not a citation; `tests/era_baseline.rs`
+#                  enforces a `MIN_SOURCE_CHARS` floor precisely so a label
+#                  cannot pass for one.
+#
+#   note           Optional prose. REQUIRED on provisional entries, where it
+#                  must name the phase that owns the entry.
+#
+#   provisional    `true` when the owning phase is not signed off, so a change
+#                  there produces a LEGIBLE BASELINE EDIT rather than a mystery
+#                  test failure.
+#
+# -----------------------------------------------------------------------------
+# WHAT `provisional` MEANS HERE
+# -----------------------------------------------------------------------------
+# A claim AWAITING MEASUREMENT, owned by a NAMED phase. Every row below is
+# seeded provisional and owned by **Phase 118 plan 07**: the v1/v2 tokens are
+# the DECISION, and plan 07 is where measurement against the live era target
+# either confirms them or produces a legible edit to this file.
+#
+# `compare_eras` still classifies a provisional entry as MISSING, exactly like a
+# non-provisional one — the flag is carried on the classified row and changes
+# only the RENDER (`[PROVISIONAL]` instead of nothing). Any exemption is applied
+# by the CONSUMING test, where it is visible, and never by the comparator, where
+# a stale provisional row would become permanently invisible.
+# =============================================================================
+
+schema_version: 1
+v1_protocol: "2025-11-25"
+v2_protocol: "2026-07-28"
+
+deltas:
+  # ---------------------------------------------------------------------------
+  # ERA-01 … ERA-10 — the TEN ids reused byte-identically from
+  # `crates/mcp-tester/baselines/era-deltas.yaml`.
+  # ---------------------------------------------------------------------------
+  - id: ERA-01
+    observation_id: method.initialize
+    subject: "method:initialize"
+    v1: served
+    v2: absent
+    kind: method-removed
+    source: "src/client/mod.rs:592 and :761 (v2_synthetic_initialize_result); .planning/REQUIREMENTS.md CLNT-01"
+    note: "Phase 118 plan 07 owns the measurement. A v2 client's InitializeResult is LOCAL AND SYNTHETIC — no byte of it came from the server."
+    provisional: true
+
+  - id: ERA-02
+    observation_id: method.server_discover
+    subject: "method:server/discover"
+    v1: "error:-32601"
+    v2: served
+    kind: method-added
+    source: "src/server/core.rs:1944 (build_discover_response answers -32601 for any non-V2 request); :1180 (project_capabilities_for_v2)"
+    note: "Phase 118 plan 07 owns the measurement. v2 replaces the initialize handshake with a read-only capability projection."
+    provisional: true
+
+  - id: ERA-03
+    observation_id: header.mcp_session_id
+    subject: "header:Mcp-Session-Id"
+    v1: minted-and-echoed
+    v2: never-minted-inbound-ignored
+    kind: header-removed
+    source: "src/server/streamable_http_server/v1_session.rs:333 (sessions_active_for); :552 (spec quote: \"ignore it, and do not mint or echo session IDs\")"
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
+    provisional: true
+
+  - id: ERA-04
+    observation_id: header.mcp_method_and_name
+    subject: "header:Mcp-Method,Mcp-Name"
+    v1: not-sent
+    v2: required-and-cross-checked
+    kind: header-required-on-v2
+    source: "src/shared/http_constants.rs:65,73 (MCP_METHOD, MCP_NAME); .planning/REQUIREMENTS.md VERS-05"
+    note: "Phase 118 plan 07 owns the measurement. Phase 118 D-13 relaxes the Mcp-Name arm to name-bearing methods only; the strict header/body cross-check is kept where the header IS present, because a desync is a smuggling signal and is rejected fail-closed."
+    provisional: true
+
+  - id: ERA-05
+    observation_id: header.last_event_id
+    subject: "header:Last-Event-ID / SSE resumability"
+    v1: supported
+    v2: ignored
+    kind: feature-removed
+    source: "src/server/streamable_http_server/v1_session.rs:433 (resumability_active_for — the resumability era gate); .planning/REQUIREMENTS.md (standing out-of-scope ruling on v2 resumability)"
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
+    provisional: true
+
+  - id: ERA-06
+    observation_id: http.verb.get_delete
+    subject: "http-verb:GET,DELETE on the MCP endpoint"
+    v1: sse-stream-or-session-teardown
+    v2: "status:405"
+    kind: verb-rejected-on-v2
+    source: "src/server/streamable_http_server.rs:1709 (v2_method_not_allowed) and :1720 (v2_verb_rejection)"
+    note: "Phase 118 plan 07 owns the measurement. Also gated on the server's v2 accept-list, so a v1-only server never answers 405 to a legitimate v1 GET."
+    provisional: true
+
+  - id: ERA-07
+    observation_id: result.result_type
+    subject: "result-field:resultType"
+    v1: absent
+    v2: present
+    kind: field-added-on-v2
+    source: "src/server/core.rs:1570 (the v2-only response envelope injects resultType + serverInfo); :1307 (the disposition discriminator)"
+    note: "Phase 118 plan 07 owns the measurement. Discriminator values are complete / input_required / task, defaulting to complete when absent."
+    provisional: true
+
+  - id: ERA-08
+    observation_id: result.server_info
+    subject: "result-field:serverInfo"
+    v1: absent
+    v2: present
+    kind: field-added-on-v2
+    source: "src/server/core.rs:1568 (RESERVED_SERVER_INFO_KEY = io.modelcontextprotocol/serverInfo); :1570 (v2 envelope injection)"
+    note: "Phase 118 plan 07 owns the measurement. v2 results carry serverInfo because there is no initialize response to carry it; the probe accepts it at the top of the result OR under the result's `_meta`."
+    provisional: true
+
+  - id: ERA-09
+    observation_id: result.cache_scope
+    subject: "result-field:ttlMs,cacheScope on the 5 list/read results"
+    v1: absent
+    v2: required
+    kind: field-required-on-v2
+    source: "src/server/core.rs:1583-1613 (the 2026-07-28 CacheableResult hints); .planning/phases/115-json-schema-2020-12-structured-output-caching-hints/115-CONTEXT.md D-07 (AMENDED 2026-08-01) and D-08"
+    note: "Phase 118 plan 07 owns the measurement. REQUIRED, not optional — the schema declares CacheableResult with no `?` on either field. SDK default is ttlMs 0 / cacheScope private, the SAFE default rather than the convenient one."
+    provisional: true
+
+  - id: ERA-10
+    observation_id: http.status.error_code_mapping
+    subject: "http-status:JSON-RPC error code to HTTP status"
+    v1: unchanged-legacy-table
+    v2: era-gated-table
+    kind: status-mapping-era-gated
+    source: "src/server/streamable_http_server.rs:735 (v2_status_for_code); the era-gating test status_mapping_is_era_gated_so_v1_is_untouched at :4742"
+    note: "Phase 118 plan 07 owns the measurement against the live era target."
+    provisional: true
+
+  # ---------------------------------------------------------------------------
+  # ERA-11 … ERA-14 — the FOUR NEW CONF-03 rows, encoding D-12's settled
+  # reading: a deprecated capability is proved REACHABLE VIA ITS v2 MECHANISM,
+  # not by the v1 RPC answering under v2. Added under D-17, which closed off
+  # extending the fixture format to carry them.
+  # ---------------------------------------------------------------------------
+  - id: ERA-11
+    observation_id: method.logging_set_level
+    subject: "method:logging/setLevel"
+    v1: served
+    v2: "error:-32601"
+    kind: method-removed
+    source: "MCP 2026-07-28 schema, io.modelcontextprotocol/logLevel description: \"Replaces the former `logging/setLevel` RPC\"; 118-RESEARCH.md:900 quotes it verbatim; the suite's server-stateless scenario expects 404 + -32601 for removed methods"
+    note: "Phase 118 plan 07 owns the measurement. Under D-12 the v1 RPC shape stays green under v1 negotiation ONLY; reading (b) — v1 RPCs answering under v2 — was explicitly rejected because it contradicts the official suite."
+    provisional: true
+
+  - id: ERA-12
+    observation_id: meta.log_level
+    subject: "_meta:io.modelcontextprotocol/logLevel"
+    v1: ignored
+    v2: honored
+    kind: mechanism-replaced
+    source: "MCP 2026-07-28 schema key io.modelcontextprotocol/logLevel (per-request log level, replacing the RPC); 118-RESEARCH.md:899-901; 118-CONTEXT.md:137 (D-12)"
+    note: "Phase 118 plan 07 owns the measurement. This row and ERA-11 are one capability seen from both ends: the RPC goes away and the `_meta` key takes over. Deprecation is per-MECHANISM, not per-capability."
+    provisional: true
+
+  - id: ERA-13
+    observation_id: result.input_required.sampling
+    subject: "result-field:resultType=input_required + inputRequests (sampling)"
+    v1: absent
+    v2: present
+    kind: mechanism-replaced
+    source: "src/types/mrtr.rs:686 (InputRequiredResult: resultType + inputRequests + requestState); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-sampling)"
+    note: "Phase 118 plan 07 owns the measurement. v2 is stateless with no server->client request channel mid-call, so the spec-blessed shape for Sampling is an InputRequiredResult continuation, not a nested request."
+    provisional: true
+
+  - id: ERA-14
+    observation_id: result.input_required.roots
+    subject: "result-field:resultType=input_required + inputRequests (roots)"
+    v1: absent
+    v2: present
+    kind: mechanism-replaced
+    source: "src/types/mrtr.rs:686 (InputRequiredResult); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-list-roots)"
+    note: "Phase 118 plan 07 owns the measurement. Same mechanism as ERA-13, applied to Roots: the server asks for roots by RETURNING an input_required result rather than by issuing a roots/list request."
+    provisional: true
