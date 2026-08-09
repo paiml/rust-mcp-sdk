@@ -56,6 +56,7 @@
 //!
 //! Phase 119's DOCS-06 cites this example rather than adding a second one.
 
+use async_trait::async_trait;
 use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpServerConfig};
 use pmcp::shared::http_constants::{ACCEPT_STREAMABLE, MCP_PROTOCOL_VERSION};
 use pmcp::types::capabilities::{
@@ -65,10 +66,63 @@ use pmcp::types::capabilities::{
 use pmcp::types::protocol::{
     ProtocolVersion, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28,
 };
-use pmcp::Server;
+use pmcp::types::{
+    Content, GetPromptResult, ListResourcesResult, PromptArgument, PromptInfo, PromptMessage,
+    ReadResourceResult, ResourceInfo, Role,
+};
+use pmcp::{PromptHandler, RequestHandlerExtra, ResourceHandler, Server};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+// ===========================================================================
+// The fixture surface, and which scenario consumes each entry.
+//
+// Every name below is DICTATED by the official suite. The scenario named in
+// the right-hand column is the one that breaks if the entry is renamed or
+// dropped, so this table is the blast radius of any edit here.
+//
+//   test://static-text             -> resources-read-text
+//   test://static-binary           -> resources-read-binary
+//   test://example-resource        -> resources-list (a plain listed entry)
+//   test://embedded-resource       -> tools-call-embedded-resource
+//   test://mixed-content-resource  -> tools-call-mixed-content
+//   test://template/{id}/data      -> resources-templates-read
+//   test://watched-resource        -> resources-subscribe / resources-unsubscribe
+//
+//   test_prompt                        -> (listed only; no scored scenario reads it)
+//   test_simple_prompt                 -> prompts-get-simple
+//   test_prompt_with_arguments         -> prompts-get-with-args, completion-complete
+//   test_prompt_with_embedded_resource -> prompts-get-embedded-resource
+//   test_prompt_with_image             -> prompts-get-with-image
+//
+// `resources-list` validates STRUCTURE across every listed entry, so each one
+// declares a name, a description and a mimeType — RESEARCH measured tools-list
+// failing against s47 purely for a missing `description`, and the same class of
+// structural gap applies here.
+// ===========================================================================
+
+/// A 1x1 red-pixel PNG, base64. The suite asks only for "a minimal test image".
+const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// The URI template the suite reads through with `{id}` substituted.
+///
+/// Spelled as `test://template/{id}/data` in the suite's requirements; matched
+/// here by prefix + suffix because pmcp's [`ResourceHandler`] has no template
+/// seam (see the SDK-gap note in this plan's SUMMARY).
+const TEMPLATE_PREFIX: &str = "test://template/";
+/// The suffix that closes the template's single path parameter.
+const TEMPLATE_SUFFIX: &str = "/data";
+
+/// Every prompt name the suite names, in `prompts/list` order.
+const PROMPT_NAMES: [&str; 5] = [
+    "test_prompt",
+    "test_simple_prompt",
+    "test_prompt_with_arguments",
+    "test_prompt_with_embedded_resource",
+    "test_prompt_with_image",
+];
 
 /// Where the server binds when `argv[1]` is absent.
 ///
@@ -84,6 +138,268 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8149";
 /// Read for PRESENCE only — the value is never logged, printed or echoed
 /// (T-118-15).
 const REQUEST_STATE_KEY_VAR: &str = "PMCP_REQUEST_STATE_KEY";
+
+/// Serves every `test://` URI the 2025-11-25 scored set names.
+///
+/// One handler covers both `list` and `read` because [`ResourceHandler`] is a
+/// single trait with both methods; the template URI is matched by prefix in
+/// `read` rather than being listed, which is exactly what
+/// `resources-templates-read` exercises (it reads `test://template/123/data`
+/// directly and asserts the `123` reaches the body).
+struct ConformanceResources;
+
+impl ConformanceResources {
+    /// Split `test://template/<id>/data` into its `<id>`, or `None`.
+    fn template_id(uri: &str) -> Option<&str> {
+        uri.strip_prefix(TEMPLATE_PREFIX)?
+            .strip_suffix(TEMPLATE_SUFFIX)
+    }
+}
+
+#[async_trait]
+impl ResourceHandler for ConformanceResources {
+    async fn read(
+        &self,
+        uri: &str,
+        _extra: RequestHandlerExtra,
+    ) -> pmcp::Result<ReadResourceResult> {
+        // The template arm first: it is a PREFIX match, not an equality match.
+        if let Some(id) = Self::template_id(uri) {
+            // The suite asserts the substituted id appears in the body, so the
+            // id is interpolated rather than echoed from a fixed string.
+            let text = serde_json::json!({
+                "id": id,
+                "templateTest": true,
+                "data": format!("Data for ID: {id}"),
+            })
+            .to_string();
+            return Ok(ReadResourceResult::new(vec![Content::resource_with_text(
+                uri,
+                text,
+                "application/json",
+            )]));
+        }
+
+        let contents = match uri {
+            "test://static-text" => vec![Content::resource_with_text(
+                uri,
+                "This is the content of the static text resource.",
+                "text/plain",
+            )],
+            // NOTE: the suite requires `{uri, mimeType, blob}` here. pmcp's
+            // `Content` enum has no blob-bearing resource variant, so this arm
+            // cannot express the required shape — see the SDK-gap note in this
+            // plan's SUMMARY. The closest expressible value is emitted so the
+            // resource still exists and still reads.
+            "test://static-binary" => vec![Content::image(TINY_PNG_BASE64, "image/png")],
+            "test://example-resource" => vec![Content::resource_with_text(
+                uri,
+                "This is an example resource for testing.",
+                "text/plain",
+            )],
+            "test://embedded-resource" => vec![Content::resource_with_text(
+                uri,
+                "This is an embedded resource content.",
+                "text/plain",
+            )],
+            "test://mixed-content-resource" => vec![Content::resource_with_text(
+                uri,
+                r#"{"test":"data","value":123}"#,
+                "application/json",
+            )],
+            "test://watched-resource" => vec![Content::resource_with_text(
+                uri,
+                "This is the watched resource's current content.",
+                "text/plain",
+            )],
+            unknown => {
+                return Err(pmcp::Error::validation(format!(
+                    "unknown resource URI: {unknown}"
+                )))
+            },
+        };
+
+        Ok(ReadResourceResult::new(contents))
+    }
+
+    async fn list(
+        &self,
+        _cursor: Option<String>,
+        _extra: RequestHandlerExtra,
+    ) -> pmcp::Result<ListResourcesResult> {
+        // `resources/list` returns DIRECT resources only — the template URI is
+        // deliberately absent, because the suite distinguishes the two and a
+        // template listed here would be a structural error.
+        let listed = [
+            (
+                "test://static-text",
+                "Static Text Resource",
+                "A plain-text resource read by resources-read-text",
+                "text/plain",
+            ),
+            (
+                "test://static-binary",
+                "Static Binary Resource",
+                "A binary resource read by resources-read-binary",
+                "image/png",
+            ),
+            (
+                "test://example-resource",
+                "Example Resource",
+                "A general-purpose example resource",
+                "text/plain",
+            ),
+            (
+                "test://embedded-resource",
+                "Embedded Resource",
+                "The resource test_embedded_resource embeds",
+                "text/plain",
+            ),
+            (
+                "test://mixed-content-resource",
+                "Mixed Content Resource",
+                "The resource test_multiple_content_types embeds",
+                "application/json",
+            ),
+            (
+                "test://watched-resource",
+                "Watched Resource",
+                "The resource resources/subscribe and /unsubscribe target",
+                "text/plain",
+            ),
+        ];
+
+        let resources = listed
+            .into_iter()
+            .map(|(uri, name, description, mime_type)| {
+                let mut info = ResourceInfo::new(uri, name);
+                info.description = Some(description.to_string());
+                info.mime_type = Some(mime_type.to_string());
+                info
+            })
+            .collect();
+
+        Ok(ListResourcesResult::new(resources))
+    }
+}
+
+/// A prompt whose messages are a fixed list, built per call from its arguments.
+///
+/// One struct backs all five named prompts: they differ only in their metadata
+/// and in how their messages are assembled, so a single dispatch on the name
+/// keeps the five contracts side by side and readable.
+struct ConformancePrompt {
+    /// The suite-dictated prompt name. Load-bearing — see the table above.
+    name: &'static str,
+}
+
+#[async_trait]
+impl PromptHandler for ConformancePrompt {
+    async fn handle(
+        &self,
+        args: HashMap<String, String>,
+        _extra: RequestHandlerExtra,
+    ) -> pmcp::Result<GetPromptResult> {
+        let messages = match self.name {
+            "test_prompt" => vec![PromptMessage::new(
+                Role::User,
+                Content::text("This is a test prompt."),
+            )],
+            "test_simple_prompt" => vec![PromptMessage::new(
+                Role::User,
+                Content::text("This is a simple prompt for testing."),
+            )],
+            "test_prompt_with_arguments" => {
+                // Both arguments are declared REQUIRED in metadata, so a
+                // missing one is a client error rather than something to
+                // paper over with a default.
+                let arg1 = args.get("arg1").ok_or_else(|| {
+                    pmcp::Error::validation("test_prompt_with_arguments requires arg1")
+                })?;
+                let arg2 = args.get("arg2").ok_or_else(|| {
+                    pmcp::Error::validation("test_prompt_with_arguments requires arg2")
+                })?;
+                vec![PromptMessage::new(
+                    Role::User,
+                    Content::text(format!(
+                        "Prompt with arguments: arg1='{arg1}', arg2='{arg2}'"
+                    )),
+                )]
+            },
+            "test_prompt_with_embedded_resource" => {
+                // The URI comes from the CALLER, so the embedded block echoes
+                // whatever it named — that is the contract the scenario checks.
+                let uri = args.get("resourceUri").ok_or_else(|| {
+                    pmcp::Error::validation(
+                        "test_prompt_with_embedded_resource requires resourceUri",
+                    )
+                })?;
+                vec![
+                    PromptMessage::new(
+                        Role::User,
+                        Content::resource_with_text(
+                            uri.clone(),
+                            "Embedded resource content for testing.",
+                            "text/plain",
+                        ),
+                    ),
+                    PromptMessage::new(
+                        Role::User,
+                        Content::text("Please process the embedded resource above."),
+                    ),
+                ]
+            },
+            "test_prompt_with_image" => vec![
+                PromptMessage::new(Role::User, Content::image(TINY_PNG_BASE64, "image/png")),
+                PromptMessage::new(Role::User, Content::text("Please analyze the image above.")),
+            ],
+            other => {
+                return Err(pmcp::Error::validation(format!("unknown prompt: {other}")));
+            },
+        };
+
+        Ok(GetPromptResult::new(messages, None))
+    }
+
+    fn metadata(&self) -> Option<PromptInfo> {
+        // `prompts-list` validates that every entry carries a name and a
+        // description, so no prompt may fall back to the empty default.
+        let (description, arguments) = match self.name {
+            "test_prompt" => ("A basic test prompt", vec![]),
+            "test_simple_prompt" => ("A simple prompt with no arguments", vec![]),
+            "test_prompt_with_arguments" => (
+                "A prompt that takes two required string arguments",
+                vec![
+                    required_argument("arg1", "First test argument"),
+                    required_argument("arg2", "Second test argument"),
+                ],
+            ),
+            "test_prompt_with_embedded_resource" => (
+                "A prompt that embeds the resource named by its argument",
+                vec![required_argument(
+                    "resourceUri",
+                    "URI of the resource to embed",
+                )],
+            ),
+            "test_prompt_with_image" => ("A prompt that returns an image content block", vec![]),
+            _ => ("", vec![]),
+        };
+
+        let mut info = PromptInfo::new(self.name).with_description(description);
+        if !arguments.is_empty() {
+            info = info.with_arguments(arguments);
+        }
+        Some(info)
+    }
+}
+
+/// A required prompt argument with a description, the shape `prompts/list`
+/// validates.
+fn required_argument(name: &str, description: &str) -> PromptArgument {
+    PromptArgument::new(name)
+        .with_description(description)
+        .required()
+}
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -107,7 +423,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // working: the era is negotiated PER REQUEST, so one binary serves both.
     // Both strings come from pmcp's own constants — a retyped literal here
     // could drift from the crate without any compiler complaint.
-    let server = Server::builder()
+    let mut builder = Server::builder()
         .name("s54-v2-dual-conformance")
         .version("1.0.0")
         .capabilities(conformance_capabilities())
@@ -115,7 +431,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
             ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
         ])
-        .build()?;
+        .resources(ConformanceResources);
+
+    for name in PROMPT_NAMES {
+        builder = builder.prompt(name, ConformancePrompt { name });
+    }
+
+    let server = builder.build()?;
 
     // `StreamableHttpServerConfig::default()`, NOT `::stateless()`.
     // `tests/common/v2.rs:371-385` states the rule: `stateless()` is a
