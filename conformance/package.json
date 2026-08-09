@@ -1,0 +1,13 @@
+{
+  "name": "pmcp-conformance-suite",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pins the official @modelcontextprotocol/conformance CLI, the external referee for CONF-01. This manifest exists ONLY to pin that referee reproducibly; it contains no source code and ships in no crate.",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
