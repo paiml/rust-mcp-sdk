@@ -1051,9 +1051,23 @@ this document was run with `PATH=~/.nvm/versions/node/v22.22.2/bin:$PATH`.
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> **All five were resolved with the user on 2026-08-09, before planning.** The resolutions are
+> LOCKED decisions D-12..D-15 in `118-CONTEXT.md` § *Post-research decisions*, carrying the same
+> force as D-01..D-11. Resolution pointers are inlined per question below. Nothing here is still
+> open; this section is retained as the record of what was asked and why.
+>
+> | Q | Resolved by | One-line resolution |
+> |---|-------------|---------------------|
+> | Q1 CONF-03 semantics | **D-12** | Reading (a): the capability is reachable via its **v2 mechanism**. v1 RPC shapes stay green under v1 only. Reading (b) rejected. |
+> | Q2 `Mcp-Name` divergence | **D-13** | Option (i): relax to name-bearing methods only. The user explicitly authorized this ONE server-behaviour change. Implemented by plan **118-01**. |
+> | Q3 D-03's boundary | **D-14** | The suite's SCORED set. `extension`/`pending` report but cannot fail; `-o results/` is uploaded so they stay reviewable. Tasks NOT implemented. |
+> | Q4 CONF-02 execution wiring | **D-15** | The NEW blocking `era-matrix` job, not `workspace-test` — keeping the deferred `gate.needs` item deferred. Implemented by plan **118-09**. |
+> | Q5 v2 profile masked by the cascade | **D-13 follow-up** | Re-measure AFTER the relaxation lands, before sizing the example. Executed by plan **118-05 Task 1**; the 62/91 numbers below are a lower bound, never a baseline. |
 
 1. **What exactly does CONF-03 assert, given that v2 *replaces* rather than *keeps* the v1 shapes?**
+   **-> RESOLVED by D-12 (reading (a)).** Fixtures land in plans 118-03 (baseline rows) and 118-07.
    - What we know: measured — `logging/setLevel` is replaced by the `_meta`
      `io.modelcontextprotocol/logLevel` key ("Replaces the former `logging/setLevel` RPC", v2 schema
      verbatim); Sampling and Roots move to `InputRequiredResult` (SEP-2322); the official v2 suite
@@ -1069,6 +1083,7 @@ this document was run with `PATH=~/.nvm/versions/node/v22.22.2/bin:$PATH`.
      chosen reading into the phase's own decisions so the fixtures are unambiguous.
 
 2. **The `Mcp-Name` divergence: relax pmcp, or accept that CONF-01's v2 leg cannot be green?**
+   **-> RESOLVED by D-13: option (i), relax to name-bearing methods only. Plan 118-01.**
    - What we know: measured and reproducible. pmcp requires header *presence* on every v2 request
      (`require_three_headers`, `streamable_http_server.rs:1009`); the suite omits it for
      non-name-bearing methods. The pmcp rustdoc states the divergence is deliberate — *"pmcp
@@ -1085,6 +1100,7 @@ this document was run with `PATH=~/.nvm/versions/node/v22.22.2/bin:$PATH`.
      Do not let a plan pick silently.
 
 3. **Does D-03 ("all server-side tests must pass") mean the scored set, or literally every check?**
+   **-> RESOLVED by D-14: the suite's SCORED set. Plan 118-08 (invocation) + 118-09 (artifact).**
    - What we know: with `--requirements`, `extension` (all 10 Tasks scenarios) and `pending`
      (`json-schema-2020-12`, `http-header-validation`, `http-custom-header-server-validation`) run
      and report but cannot fail the job — the suite's own SEP-1730-derived design.
@@ -1094,6 +1110,7 @@ this document was run with `PATH=~/.nvm/versions/node/v22.22.2/bin:$PATH`.
      protects; the `-o results/` artifact upload makes them reviewable at re-pin time.
 
 4. **Where should the CONF-02 execution actually be wired?**
+   **-> RESOLVED by D-15: the NEW blocking `era-matrix` job. Plan 118-09.**
    - What we know: measured — no CI job runs `crates/pmcp-team-servers/tests/`. `workspace-test`
      exists but is `--lib --bins` **and** is not in `gate.needs` (the latter is explicitly deferred
      out of this phase).
@@ -1104,6 +1121,7 @@ this document was run with `PATH=~/.nvm/versions/node/v22.22.2/bin:$PATH`.
      owns.
 
 5. **Is the `Mcp-Name` cascade masking further v2 conformance gaps?**
+   **-> RESOLVED by D-13's follow-up clause: re-measure post-relaxation. Plan 118-05 Task 1.**
    - What we know: the v2 run reported 62 passed / 91 failed, but `server-stateless`'s failures are
      uniformly downstream of the `-32020` rejection, and some checks (e.g. the removed-method 404
      probes) reported SUCCESS in a way that may be coincidental.
