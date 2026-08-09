@@ -310,8 +310,9 @@ $ /usr/bin/grep -v '^[[:space:]]*//' src/server/streamable_http_server.rs \
 0
 ```
 
-The 3 remaining occurrences are all inside `///` doc comments recording the reversal, which
-action item 1 mandates. Flagged here so the verifier does not read the raw count as a miss.
+The 3 remaining occurrences (raw `grep -c` = 3) are all inside `///` doc comments recording
+the reversal, which action item 1 mandates. Flagged here so the verifier does not read the raw
+count as a miss.
 
 ### [Environment, not code] Disk exhaustion twice mid-execution
 
@@ -501,11 +502,11 @@ scores 12.9/100 (Lean) and `CB-304` dead code 0.6%. Nothing in the report refere
 
 ```
 grep -c 'require_three_headers'  src/server/streamable_http_server.rs   -> 0
-grep -c 'require_v2_headers'     src/server/streamable_http_server.rs   -> 13   (>= 2)
+grep -c 'require_v2_headers'     src/server/streamable_http_server.rs   -> 18   (>= 2)
 grep -c 'name_bearing_key'       src/server/streamable_http_server.rs   -> 5    (>= 1)
 grep -v '^\s*//' … | grep -c 'logical_name_key'                         -> 0
-grep -v '^\s*//' … | grep -c 'is_name_bearing_method'                   -> 9    (>= 3)
-grep -c 'DRIFT-1' -> 4 ; grep -c 'D-13' -> 17 ; grep -c 'D-18' -> 13    (each >= 1)
+grep -v '^\s*//' … | grep -c 'is_name_bearing_method'                   -> 11   (>= 3)
+grep -c 'DRIFT-1' -> 4 ; grep -c 'D-13' -> 18 ; grep -c 'D-18' -> 14    (each >= 1)
 grep -c '"tools/call"' src/server/streamable_http_server.rs             -> 30
 git show HEAD:src/server/streamable_http_server.rs | grep -c '"tools/call"' -> 32
 grep -c 'is_name_bearing_method' src/types/mrtr.rs                      -> 3    (>= 1)
