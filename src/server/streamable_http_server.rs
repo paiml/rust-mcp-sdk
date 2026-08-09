@@ -4950,6 +4950,98 @@ mod tests {
         assert!(cross_check_name(uri, "resources/read", None).is_err());
     }
 
+    /// Every method the COMBINED table ([`crate::types::mrtr::name_bearing_key`])
+    /// names, written out as a LITERAL.
+    ///
+    /// This list is a hand-written oracle on purpose. The property test below
+    /// uses `is_name_bearing_method` as ITS oracle, which cannot detect a wrong
+    /// table — the predicate under test would simply agree with itself. This
+    /// literal is what pins the table's CONTENTS, and it is the arm that catches
+    /// a regression of Phase 118 D-18 (the `tasks/*` rows silently disappearing
+    /// because the predicate drifted back to `logical_name_key`).
+    const NAME_BEARING_METHODS: [&str; 6] = [
+        "tools/call",
+        "prompts/get",
+        "resources/read",
+        "tasks/get",
+        "tasks/update",
+        "tasks/cancel",
+    ];
+
+    /// Representative v2 methods that carry NO routing name, so `Mcp-Name` is
+    /// optional and ignored on them (Phase 118 D-13).
+    const NAME_LESS_METHODS: [&str; 4] = [
+        "tools/list",
+        "ping",
+        "completion/complete",
+        "server/discover",
+    ];
+
+    /// The D-13/D-18 truth table, asserted over the composition site.
+    ///
+    /// `Mcp-Name` is required exactly where the COMBINED name table says the
+    /// method carries a routing name, and a stray value on any other method is
+    /// discarded (D-20).
+    #[test]
+    fn classify_v2_request_requires_mcp_name_only_on_name_bearing_methods() {
+        // Non-name-bearing, NO Mcp-Name at all → accepted (THE D-13 CHANGE).
+        for method in NAME_LESS_METHODS {
+            let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
+            let out = classify_v2_request(&h, true, Some(method), None);
+            assert!(
+                matches!(out, V2GateOutcome::EnforceOk { .. }),
+                "{method} carries no routing name, so a missing Mcp-Name must be accepted"
+            );
+        }
+        // Name-bearing (MRTR *and* tasks), NO Mcp-Name → rejected.
+        for method in NAME_BEARING_METHODS {
+            let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
+            let out = classify_v2_request(&h, true, Some(method), Some("x"));
+            assert!(
+                matches!(out, V2GateOutcome::Reject { .. }),
+                "{method} carries a routing name, so a missing Mcp-Name must be rejected"
+            );
+        }
+        // A tasks method with a DISAGREEING Mcp-Name is rejected (D-18: the
+        // cross-check now reaches tasks, closing the emitter/validator asymmetry).
+        let h = headers_from(&[
+            (MCP_PROTOCOL_VERSION, V2),
+            (MCP_METHOD, "tasks/get"),
+            (MCP_NAME, "task-a"),
+        ]);
+        assert!(matches!(
+            classify_v2_request(&h, true, Some("tasks/get"), Some("task-b")),
+            V2GateOutcome::Reject { .. }
+        ));
+        // A tasks method whose Mcp-Name AGREES with params.taskId passes.
+        let h = headers_from(&[
+            (MCP_PROTOCOL_VERSION, V2),
+            (MCP_METHOD, "tasks/get"),
+            (MCP_NAME, "task-a"),
+        ]);
+        assert!(matches!(
+            classify_v2_request(&h, true, Some("tasks/get"), Some("task-a")),
+            V2GateOutcome::EnforceOk { .. }
+        ));
+        // A stray Mcp-Name on a name-less method is accepted AND discarded, so it
+        // can neither branch downstream logic nor be echoed outbound (D-20).
+        let h = headers_from(&[
+            (MCP_PROTOCOL_VERSION, V2),
+            (MCP_METHOD, "tools/list"),
+            (MCP_NAME, "attacker-supplied"),
+        ]);
+        match classify_v2_request(&h, true, Some("tools/list"), None) {
+            V2GateOutcome::EnforceOk { method, name } => {
+                assert_eq!(method, "tools/list");
+                assert_eq!(name, "", "a stray Mcp-Name must be sanitized to empty");
+            },
+            V2GateOutcome::Reject { code, message, .. } => {
+                panic!("expected EnforceOk, got Reject({code}, {message})")
+            },
+            V2GateOutcome::Passthrough => panic!("expected EnforceOk, got Passthrough"),
+        }
+    }
+
     #[test]
     fn apply_v2_outbound_headers_sets_all_three_without_panic() {
         let mut h = HeaderMap::new();
