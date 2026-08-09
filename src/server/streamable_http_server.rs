@@ -5254,6 +5254,131 @@ mod tests {
         }
     }
 
+    /// A method strategy that MIXES the name-bearing table with arbitrary noise,
+    /// so the property below reaches both classes rather than exercising one.
+    ///
+    /// The name-bearing arm is drawn from `NAME_BEARING_METHODS`, the literal
+    /// list `is_name_bearing_method_matches_the_literal_contract` pins — not from
+    /// the predicate — so a wrong table cannot make the property vacuous.
+    fn any_v2_method() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::strategy::Strategy as _;
+        proptest::prop_oneof![
+            proptest::sample::select(NAME_BEARING_METHODS.as_slice()).prop_map(str::to_string),
+            proptest::sample::select(NAME_LESS_METHODS.as_slice()).prop_map(str::to_string),
+            "[a-z/]{0,20}",
+        ]
+    }
+
+    proptest::proptest! {
+        /// PROPERTY (Phase 118 D-13 / D-18), over the gate's whole TYPED input
+        /// space: `require_v2_headers` returns `Ok` **iff** the version header is
+        /// present AND `Mcp-Method` is present AND (`Mcp-Name` is present OR the
+        /// method carries no routing name).
+        ///
+        /// The oracle is `is_name_bearing_method` — the SHARED table — so the
+        /// property cannot drift from the predicate the server actually uses.
+        /// What the property therefore CANNOT catch is a wrong table; that is
+        /// `is_name_bearing_method_matches_the_literal_contract`'s job.
+        #[test]
+        fn require_v2_headers_is_exactly_its_truth_table(
+            have_version in proptest::bool::ANY,
+            have_method in proptest::bool::ANY,
+            have_name in proptest::bool::ANY,
+            method in any_v2_method(),
+            name_val in "[a-zA-Z0-9._-]{0,40}",
+        ) {
+            let mut h = HeaderMap::new();
+            if have_version {
+                h.insert(
+                    http::header::HeaderName::from_bytes(MCP_PROTOCOL_VERSION.as_bytes()).unwrap(),
+                    HeaderValue::from_static(crate::types::protocol::PROTOCOL_VERSION_2026_07_28),
+                );
+            }
+            if have_method {
+                if let Ok(v) = HeaderValue::from_str(&method) {
+                    h.insert(
+                        http::header::HeaderName::from_bytes(MCP_METHOD.as_bytes()).unwrap(),
+                        v,
+                    );
+                }
+            }
+            if have_name {
+                h.insert(
+                    http::header::HeaderName::from_bytes(MCP_NAME.as_bytes()).unwrap(),
+                    HeaderValue::from_str(&name_val).unwrap(),
+                );
+            }
+
+            let out = require_v2_headers(&h);
+            let expected_ok =
+                have_version && have_method && (have_name || !is_name_bearing_method(&method));
+            proptest::prop_assert_eq!(out.is_ok(), expected_ok);
+
+            if let Ok((got_method, got_name)) = out {
+                proptest::prop_assert_eq!(&got_method, &method);
+                if is_name_bearing_method(&got_method) {
+                    proptest::prop_assert_eq!(&got_name, &name_val);
+                } else {
+                    // The D-20 sanitization: whatever arrived is DISCARDED.
+                    proptest::prop_assert!(got_name.is_empty());
+                }
+            }
+        }
+
+        /// FUZZ, in CLAUDE.md's sanctioned proptest spelling: arbitrary header
+        /// BYTES and arbitrary raw body BYTES reach the gate, and nothing panics.
+        ///
+        /// Header values are built with `HeaderValue::from_bytes`, so non-UTF-8
+        /// and RFC 9110 delimiter bytes — which `HeaderValue::from_str` would
+        /// never produce — actually arrive at `bounded_header_str`. Bodies go in
+        /// as raw `Vec<u8>` through `extract_body_method_and_name`, so a body
+        /// that is not JSON at all, or is JSON of the wrong shape, is covered.
+        ///
+        /// A `fuzz/` target is deliberately NOT used: these are private free
+        /// functions, and reaching them from the `fuzz/` sub-workspace would mean
+        /// widening pmcp's public API for a test.
+        #[test]
+        fn v2_header_gate_never_panics_on_arbitrary_bytes(
+            version_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
+            method_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
+            name_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
+            body_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..120),
+            meta_is_v2 in proptest::bool::ANY,
+        ) {
+            let mut h = HeaderMap::new();
+            for (header_name, raw) in [
+                (MCP_PROTOCOL_VERSION, &version_bytes),
+                (MCP_METHOD, &method_bytes),
+                (MCP_NAME, &name_bytes),
+            ] {
+                // Skip only what `HeaderValue` itself refuses to represent; every
+                // byte string it accepts MUST reach the gate.
+                if let Ok(value) = HeaderValue::from_bytes(raw) {
+                    h.insert(
+                        http::header::HeaderName::from_bytes(header_name.as_bytes()).unwrap(),
+                        value,
+                    );
+                }
+            }
+
+            // Must not panic, whatever the bytes say.
+            let _ = require_v2_headers(&h);
+
+            // The raw-body reader is on the same unauthenticated path.
+            let (body_method, body_name) = extract_body_method_and_name(&body_bytes);
+            let out = classify_v2_request(
+                &h,
+                meta_is_v2,
+                body_method.as_deref(),
+                body_name.as_deref(),
+            );
+            // Every rejection is a structured outcome, never an unwind.
+            if let V2GateOutcome::Reject { code, .. } = out {
+                proptest::prop_assert_eq!(code, HEADER_MISMATCH);
+            }
+        }
+    }
+
     // ---- Phase 112 Plan 10: HttpIngress classification + raw-_meta gate ----
 
     use crate::types::ProtocolVersion;
