@@ -23,7 +23,18 @@ pub mod era_observations;
 /// bidirectional `observation_id`-keyed join (D-16).
 pub mod era_diff;
 
+/// The RAW streamable-HTTP wire seam the era probes issue their requests
+/// through (D-16). Behind the non-default `http` feature, so the DEFAULT and
+/// wasm32 builds of this crate stay reqwest-free (T-118-71).
+#[cfg(feature = "http")]
+pub mod era_probe;
+
 pub use era_observations::{EraObservations, ObservationId, ObservedValue, PROBE_REGISTRY};
+
+#[cfg(feature = "http")]
+pub use era_probe::{
+    build_probe_body, extract_jsonrpc_envelope, EraProbeClient, RawProbeOutcome, V2HeaderMode,
+};
 
 pub use era_diff::{
     compare_eras, load_default_baseline, parse_baseline, ClassifiedDifference, DifferenceClass,
