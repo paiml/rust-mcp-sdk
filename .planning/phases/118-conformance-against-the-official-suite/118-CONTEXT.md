@@ -1,0 +1,249 @@
+# Phase 118: Conformance Against the Official Suite - Context
+
+**Gathered:** 2026-08-09
+**Status:** Ready for planning
+
+<domain>
+## Phase Boundary
+
+The dual-version claim is validated **by construction**: the official
+`@modelcontextprotocol/conformance` suite and the extended Phase-109 Rust harness both run
+against what the dual-version binary actually does, with v1 fixtures kept green and the
+deprecated capabilities verified still-functional under v2.
+
+Three requirements:
+
+- **CONF-01** — the official suite, pinned, runs in CI against a dual-version pmcp server
+  example over real HTTP.
+- **CONF-02** — the Phase-109 Rust harness gains era-v2 fixtures while v1 fixtures stay green,
+  verified with a **dev-dependency-free build** so feature unification cannot produce a false green.
+- **CONF-03** — deprecated Roots/Sampling/Logging remain fully functional under v2 negotiation
+  (advisory-only, 12-month window).
+
+This phase runs LAST, over the union of 112–117. It **adds no protocol behaviour**. If a plan
+finds itself changing what the server does rather than what CI measures, that is out of scope.
+
+**The through-line:** one mechanism — the era matrix (D-07) — discharges CONF-02 and CONF-03
+together. Do not build a second parallel mechanism for CONF-03.
+
+</domain>
+
+<decisions>
+## Implementation Decisions
+
+### Official-suite CI integration (CONF-01)
+
+- **D-01: A committed `package.json` + `package-lock.json` in a subdirectory, run with `npm ci`.**
+  This is the first Node manifest in a Rust repo, accepted deliberately. Chosen over `npx` because
+  lockfile integrity hashes give commit-level reproducibility and survive a yanked or re-published
+  version; over a git submodule because submodule UX cost buys nothing `npm ci` does not already
+  give; and over a container because the rest of this repo's CI carries no image-build pipeline.
+  **Ledger context:** `project_ci_purity_gate_unpinned_tooling_drift` records the Purity Gate
+  bit-rotting from exactly this failure mode (an unpinned cargo-deny CLI plus a gitignored
+  `Cargo.lock`). Pin it or it rots.
+
+  **Two traps the planner MUST handle:** (a) the Node manifest must be EXCLUDED from the published
+  crate — `115-REVIEW.md` CR-01 was precisely this defect, a test file that shipped in the tarball
+  and panicked, caught only by `cargo package --list --allow-dirty`; verify the same way. (b) The
+  `package-content` and `Purity Gate` CI jobs both inspect the tree — confirm neither trips on a
+  Node manifest before declaring the job green.
+
+- **D-02: The job is BLOCKING and wired into `gate` in all THREE places** — `needs:`, the `env:`
+  binding, and the `if` chain. Phase 117's `v1-severance` job is the exact precedent to copy, and
+  `tests/ci_severance_gate_wiring.rs` is the precedent for proving the wiring structurally rather
+  than asserting it. A conformance claim that cannot fail is not a claim.
+
+  **Read this before assuming "in CI" means "gates":** `gate.needs` does NOT currently list
+  `security_audit` or `workspace-test`. Both were RED on PR #319 while `gate` was GREEN. Adding a
+  job to `ci.yml` does not make it block. See `<deferred>`.
+
+- **D-03: All server-side tests must pass. NO known-fail allowlist.** If a test genuinely does not
+  apply, that is a conversation at re-pin time, not a standing exemption. Matches the house stance
+  — 117-13 shipped `WHOLE_BODY_ALLOWLIST` as a literally EMPTY const so nothing could hide in it.
+
+- **D-04: The suite runs TWICE against one running server** — once negotiating `2025-11-25`, once
+  negotiating `2026-07-28`. Both blocking. This is the only shape that proves the milestone
+  headline ("one pmcp server binary transparently serves both"); a single v2 run would leave the
+  official suite silent about half the dual claim. Research must confirm the suite accepts a target
+  protocol version — if it cannot, that is a plan-blocking finding, not something to work around
+  quietly.
+
+### The dual-version target server (CONF-01)
+
+- **D-05: A NEW purpose-built dual-version example**, beside the existing `t04`/`t05`
+  streamable-HTTP examples. Chosen over reusing `t05_streamable_http_stateless` because an
+  overloaded example lets a change made for a docs or transport reason silently alter what
+  conformance measures — and stateless-only may not exercise the v1 session path D-04's matrix
+  needs. Chosen over a Shape-A binary because a backend failure would read as a conformance failure.
+
+  **Dual-purpose, deliberately:** this example is also the runnable v2 example DOCS-06 needs in
+  Phase 119. Build it so Phase 119 can cite it rather than write a second one.
+
+- **D-06: ONE process, per-request era negotiation.** Start the server once; each suite run
+  negotiates its own era via `MCP-Protocol-Version`. Two processes would prove "pmcp can serve v1"
+  and "pmcp can serve v2" separately — not that one binary does both, which is the actual claim.
+  A single process also catches cross-era state bleed that isolated processes hide.
+
+### Era-v2 fixtures for the Rust harness (CONF-02)
+
+- **D-07: MATRIX — every fixture is replayed under BOTH eras**, with an expected-difference
+  baseline recording where the eras legitimately diverge. Chosen over parallel `v1/`+`v2/`
+  directories (duplicating 33 fixtures invites exactly the mirror-drift defect 115 fought four
+  rounds over) and over an optional per-fixture `era` field (absence is invisible, so v2 coverage
+  would never be forced to grow).
+
+  **Reuse, do not reinvent:** 117-08 already built this shape for `mcp-tester` — a reviewable
+  14-entry YAML expected-difference baseline with a non-vacuity tripwire, added with no new
+  dependency. Read it before designing a new one.
+
+  **The baseline is bidirectional:** an unlisted difference is a finding, AND a listed difference
+  that no longer reproduces is also a finding. A baseline that only catches one direction rots.
+
+- **D-08: Rename the fixture format so bare "v2" always means MCP era.** `runner.rs:43` currently
+  reads `Fixture schema v2`, and `FixtureKind`'s rustdoc says "a v2 fixture case" — that is format
+  revision 2, NOT era v2. Rename the format (e.g. `fixture format rev 2`) and reserve `v2` for the
+  era throughout. A mechanical rename now beats downstream agents conflating the two for the rest
+  of the milestone.
+
+- **D-09 (from CONF-02, not negotiable): verify with a DEV-DEPENDENCY-FREE build.**
+  `project_cargo_feature_severance_false_greens` records the mechanism: `cargo test` sees dev-deps
+  and re-enables the feature you are severing, so the run reports `0 tests` and exits 0. Assert a
+  **NONZERO test count**, and use `cargo build` (not `cargo test`) for the severance check.
+  Related: `project_nextest_selector_binary_not_test` — `-E 'test(/foo/)'` silently selects ZERO
+  tests and does not fail. Use `binary(foo)`. This bit Phase 114 seven times.
+
+### Deprecated-capability evidence (CONF-03)
+
+- **D-10: Roots/Sampling/Logging get fixtures IN the matrix**, so D-07 replays them under both eras
+  and CONF-03 is discharged by the same mechanism as CONF-02. Chosen over dedicated Rust tests (a
+  second mechanism that rots independently) and over relying on the official suite (coverage we do
+  not control — a re-pin could drop it and CONF-03 would silently stop being proven).
+
+- **D-11: No runtime signal. The capabilities keep working and say nothing.** Advisory-only
+  deprecation over a 12-month window means no behavioural change and no new output; a warn on a
+  still-supported capability trains users to ignore warnings and would fire for a year. Deprecation
+  is documented, not emitted. Extend `docs/v1-sunset-policy.md` (created by 117-13, which already
+  carries a table of items deliberately NOT severed) with the three capabilities and their window.
+
+  Supporting evidence for "no new warn": this session's `oauth_store_wiring` flake shows
+  warn-capture assertions carry their own maintenance burden.
+
+### Claude's Discretion
+
+- The subdirectory name and layout for the Node manifest.
+- The exact renamed identifier for the fixture format (D-08) — smallest diff that removes the
+  ambiguity.
+- Job naming, cache keys, and step ordering in `ci.yml`, following the `v1-severance` precedent.
+
+</decisions>
+
+<canonical_refs>
+## Canonical References
+
+**Downstream agents MUST read these before planning or implementing.**
+
+### Phase scope and requirements
+- `.planning/ROADMAP.md` § `### Phase 118: Conformance Against the Official Suite` (line 2723) —
+  goal, dependencies, the three success criteria
+- `.planning/REQUIREMENTS.md` lines 924–926 — CONF-01/02/03 verbatim; line 991 carries the
+  "Deprecated, not removed — 12-month advisory" decision behind CONF-03
+
+### The Phase-109 Rust harness (CONF-02 / CONF-03)
+- `crates/pmcp-team-servers/src/conformance/runner.rs` — the exportable runner. **`:43` reads
+  `Fixture schema v2` — that is format revision 2, NOT MCP era v2 (see D-08).** `:180` documents
+  the `ConformanceTarget` seam: in-process over `DuplexTransport` and, behind `http`, over the
+  wire, "so the same fixtures prove conformance in-process and over the wire (D-19)"
+- `crates/pmcp-team-servers/tests/conformance.rs` — the driver; `fixtures_root()` at `:69` resolves
+  `contracts/team-servers/fixtures`; note the `regenerate_tools_list_fixtures` test
+- `contracts/team-servers/fixtures/` — 33 existing fixtures across 4 reference servers
+  (approval-mcp 6, mem-mcp 7, team-fs 12, team-mcp 8). These are the v1 corpus that must stay green
+
+### The expected-difference baseline pattern to reuse (D-07)
+- `.planning/phases/117-agents-tester-v1-severability/117-08-PLAN.md` + `117-08-SUMMARY.md` —
+  the 14-entry reviewable YAML baseline, its non-vacuity tripwire, and the no-new-dependency
+  constraint
+- `.planning/phases/117-agents-tester-v1-severability/117-11-PLAN.md` — `--dual-run`, `run_dual`,
+  era-observation probes, and the `DualRunReport` shape
+
+### CI wiring precedent (D-02)
+- `.github/workflows/ci.yml` — the `gate` job's `needs:` / `env:` / `if` chain, and the
+  `v1-severance` job above it as the blocking-job template. **`gate.needs` omits `security_audit`
+  and `workspace-test`** — see `<deferred>`
+- `tests/ci_severance_gate_wiring.rs` — proves gate wiring structurally from the workflow file
+  with a `serde_yaml` tripwire (no undeclared PyYAML); 8/8
+
+### Deprecation surface (CONF-03)
+- `docs/v1-sunset-policy.md` — created by 117-13; already carries a table of the seven items
+  deliberately NOT severed. D-11 extends it
+
+### Publishing / packaging traps (D-01)
+- `Cargo.toml` `exclude` array — `115-REVIEW.md` CR-01 is the precedent: a test file shipped in the
+  crates.io tarball and panicked. Verify with `cargo package --list --allow-dirty`
+
+</canonical_refs>
+
+<code_context>
+## Existing Code Insights
+
+### Reusable Assets
+- **`run_fixtures` / `assert_conformant` / `ConformanceTarget`** — the harness is already
+  exportable and already has BOTH an in-process and an HTTP target. The era matrix (D-07) extends
+  a working seam rather than building one.
+- **117-08's YAML expected-difference baseline + non-vacuity tripwire** — directly transferable to
+  D-07; it already solved "reviewable, no new dependency, cannot pass vacuously".
+- **`t04_streamable_http_stateful` / `t05_streamable_http_stateless`** — already launched and
+  validated in CI by mcp-tester on ports 8080/8081. The launch-and-probe CI pattern for D-05's new
+  example already exists; copy it rather than inventing one.
+- **`tests/v2_conformance_pin.rs`** — an existing v2 conformance pin worth reading before adding
+  another.
+
+### Established Patterns
+- **Blocking CI jobs are proven structurally, not asserted** (`ci_severance_gate_wiring.rs`).
+- **Allowlists ship empty or not at all** (117-13's `WHOLE_BODY_ALLOWLIST`).
+- **Fences carry their OWN literals**, never derived from the artifact under test — the standing
+  `D-115-AI(4)` rule. A conformance fence parameterised by the thing it checks cannot fire.
+- **Anti-vacuity counts are hard-coded, not length-derived** (`115-REVIEW.md` WR-01; 115-20 applied
+  this). Any "we ran N cases" assertion in the matrix must fail when the corpus shrinks.
+
+### Integration Points
+- `ci.yml` → a new conformance job + the three `gate` edits.
+- `crates/pmcp-team-servers/src/conformance/runner.rs` → era dimension + baseline loading.
+- `contracts/team-servers/fixtures/` → new Roots/Sampling/Logging cases (D-10).
+- `examples/` → the new dual-version server (D-05), which Phase 119 will cite for DOCS-06.
+
+</code_context>
+
+<specifics>
+## Specific Ideas
+
+- The official suite is currently referenced **nowhere** in the repo and there is **no root
+  `package.json`** — CONF-01 is greenfield, not an extension of something existing.
+- The MCP 2026-07-28 spec is now final, so CONF-01's "re-pinned after the final spec" is
+  actionable in this phase rather than a follow-up.
+- The era matrix should make it cheap to answer "what actually differs between the eras for this
+  server?" — the baseline is a deliverable a reader consults, not just a gate artifact.
+
+</specifics>
+
+<deferred>
+## Deferred Ideas
+
+- **Add `security_audit` and `workspace-test` to `gate.needs`.** Both were RED on PR #319 while
+  `gate` was GREEN, so they would have merged silently. Thematically close to this phase (CI telling
+  the truth) but concerns jobs unrelated to conformance — a separate capability, so out of scope
+  per the phase-boundary rule. Owner unassigned. Recorded in
+  `project_pr319_ci_findings`.
+- **Root-cause the intermittent `oauth_store_wiring` DCR issuer-change test.** CI record is 3 pass
+  / 2 fail on identical code; passes locally at every thread count. The tracing interest-cache and
+  thread-migration hypotheses were both DISPROVEN by measurement. Its assertion is now
+  self-diagnosing (`bf1c2261`) — read that output on the next failure rather than re-deriving.
+  Belongs to Phase 116's surface, not conformance.
+- **`SMPL-F1` — actual v1 removal.** A future pmcp 3.0, gated on public-client v2 adoption. v2.5
+  only makes removal cheap. Carried forward from 117.
+
+</deferred>
+
+---
+
+*Phase: 118-Conformance Against the Official Suite*
+*Context gathered: 2026-08-09*
