@@ -8,11 +8,12 @@
 //!    [`common::v2::v2_headers`] reaches a real handler and comes back 200 with a
 //!    `result`.
 //! 2. **The empty-`Mcp-Name` header rule** — a NAME-LESS method sends
-//!    `Mcp-Name: ""` and is ACCEPTED. This is the cross-plan tripwire for the
-//!    locked rule that `Mcp-Name` is present on EVERY v2 request (Phase-112 D-05;
-//!    `113-SPEC-RECHECK.md` § `Mcp-Name Header Rule`). If a future plan relaxes
-//!    `require_three_headers`, or the harness stops emitting the empty value, this
-//!    test is what notices.
+//!    `Mcp-Name: ""` and is ACCEPTED. Since Phase 118 D-13 the header is required
+//!    only on name-bearing methods, so what this pins is the BACKWARD-COMPATIBILITY
+//!    half of that decision: a Phase-113-era client still emits the empty value,
+//!    and `require_v2_headers` must keep discarding it rather than treating it as
+//!    a name that disagrees with the body. The absent-header half is proved in
+//!    `tests/v2_mcp_name_name_bearing_only.rs`.
 //!
 //! Two name-less methods exercise (2): `server/discover` and `tools/list`. Before
 //! plan 04 closed finding D-113-B, `ListToolsRequest` carried no `_meta` field at

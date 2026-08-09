@@ -1077,13 +1077,19 @@ impl StreamableHttpTransport {
             builder = builder.header(MCP_METHOD, value);
         }
         // `Mcp-Name` is emitted on EVERY v2 request, with the EMPTY STRING for a
-        // method that carries no logical name. Provenance: `113-SPEC-RECHECK.md`
-        // § `Mcp-Name Header Rule` and Phase-112 D-05 — the server's
-        // `require_three_headers` demands PRESENCE on every v2 request and only
-        // `cross_check_name` compares the VALUE, and then only for the three
-        // name-bearing methods. Omitting the header would 400 every `tools/list`
-        // this client sends. pmcp is deliberately stricter than the draft
-        // transport spec here (Phase-113 DRIFT-1).
+        // method that carries no routing name. The value is resolved through
+        // `name_bearing_key`, so it is the task id for `tasks/get` /
+        // `tasks/update` / `tasks/cancel`, `params.name` for `tools/call` /
+        // `prompts/get` and `params.uri` for `resources/read`.
+        //
+        // Emitting it unconditionally is a SUPERSET of what the spec requires.
+        // Since Phase 118 D-13 the server requires the header only on
+        // name-bearing methods and DISCARDS a value sent on any other, so the
+        // empty string a name-less method carries is accepted and ignored — this
+        // client keeps working against both the pre- and post-D-13 rule. Phase
+        // 118 D-18 pointed the server's predicate at this same
+        // `name_bearing_key` table, so the value emitted here for a `tasks/*`
+        // method is now cross-checked against the body rather than ignored.
         if let Ok(value) = hyper::header::HeaderValue::from_str(name) {
             builder = builder.header(MCP_NAME, value);
         }
@@ -2464,9 +2470,13 @@ mod tests {
             );
         }
 
-        /// The locked cross-plan rule: PRESENT, EMPTY — never omitted. If the
-        /// client skipped the header, the server's `require_three_headers` would
-        /// 400 every `tools/list` it sends.
+        /// The client's emission rule: PRESENT, EMPTY — never omitted.
+        ///
+        /// Since Phase 118 D-13 the SERVER no longer requires the header on a
+        /// name-less method, so this is now a superset of what is demanded rather
+        /// than a necessity. It is pinned anyway: the empty value is still
+        /// accepted (and discarded) by the gate, and dropping the emission would
+        /// be a silent wire-shape change with no upside.
         #[tokio::test]
         async fn v2_nameless_method_emits_an_empty_mcp_name() {
             let transport = v2_transport(None);
@@ -2475,7 +2485,7 @@ mod tests {
             assert_eq!(header(&map, MCP_METHOD).as_deref(), Some("tools/list"));
             assert!(
                 map.contains_key(MCP_NAME),
-                "Mcp-Name must be PRESENT on every v2 request"
+                "this client emits Mcp-Name on every v2 request"
             );
             assert_eq!(header(&map, MCP_NAME).as_deref(), Some(""));
         }

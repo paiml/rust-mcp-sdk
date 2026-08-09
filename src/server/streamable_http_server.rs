@@ -1232,12 +1232,16 @@ fn method_and_name_of(value: Option<&serde_json::Value>) -> (Option<String>, Opt
     }
 }
 
-/// Emit the three required v2 headers outbound WITHOUT panicking (T-112-13).
+/// Emit the three v2 routing headers outbound WITHOUT panicking (T-112-13).
 ///
 /// Sets `Mcp-Method`, `Mcp-Name` and forces `MCP-Protocol-Version` to the v2
 /// value. Called on BOTH the success and structured-error response of an
 /// accepted v2 request. On an unrepresentable value the individual insert is
 /// skipped (caller already produced a valid response) rather than unwrapping.
+///
+/// `name` is whatever [`require_v2_headers`] carried forward, which is the EMPTY
+/// STRING for any method with no routing name — so a stray inbound `Mcp-Name` is
+/// never reflected back to its sender (Phase 118 D-20, T-118-53).
 fn apply_v2_outbound_headers(headers: &mut HeaderMap, method: &str, name: &str) {
     if let Ok(v) = HeaderValue::from_str(method) {
         headers.insert(MCP_METHOD, v);

@@ -3495,7 +3495,7 @@ pub const RESERVED_CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 /// Same sourcing rationale as [`RESERVED_PROTOCOL_VERSION_KEY`].
 pub const RESERVED_CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 
-/// Whether a v2 raw probe emits the three required v2 headers.
+/// Whether a v2 raw probe emits the v2 routing headers.
 ///
 /// `Omit` exists for exactly one observation — `header.mcp_method_and_name` —
 /// which can only be established by SENDING a request without them and seeing
@@ -3503,7 +3503,9 @@ pub const RESERVED_CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clie
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V2HeaderMode {
     /// Emit `Mcp-Method`, `Mcp-Name` and `MCP-Protocol-Version` (the conformant
-    /// shape; `Mcp-Name` is emitted even when empty, per the locked rule).
+    /// shape). `Mcp-Name` is emitted even when empty: since Phase 118 D-13 a
+    /// server requires it only on name-bearing methods and discards it
+    /// elsewhere, so emitting it unconditionally is a valid superset.
     Standard,
     /// Emit only `MCP-Protocol-Version`, deliberately omitting `Mcp-Method` and
     /// `Mcp-Name`.
