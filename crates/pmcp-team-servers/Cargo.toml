@@ -43,6 +43,14 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # gated behind the non-default `http` feature so the default/wasm build never
 # pulls it as a direct dep.
 url = { version = "2", optional = true }
+# Reader for the expected-difference baseline consumed by
+# `src/conformance/era_diff.rs` (Phase 118, CONF-02). serde_yaml 0.9 is ALREADY
+# resolved in this workspace — the root `Cargo.toml` carries it as a dev-dep and
+# `crates/mcp-tester/Cargo.toml` as a regular one — so this line costs ZERO new
+# third-party packages. Gated on `conformance` (a default feature) so a
+# single-server build (`--no-default-features --features team-fs`) does not pull
+# a YAML reader it never calls.
+serde_yaml = { version = "0.9", optional = true }
 
 [features]
 # default = the full reference-server set; this crate's purpose IS all four
@@ -54,7 +62,10 @@ team-fs = []
 mem-mcp = []
 approval-mcp = []
 team-mcp = []
-conformance = []
+# The fixture-replay harness PLUS the Phase-118 era substrate
+# (`era_observations` / `era_diff`). The latter reads the checked-in
+# `baselines/era-deltas.yaml`, hence `dep:serde_yaml`.
+conformance = ["dep:serde_yaml"]
 # Outbound approval-notification webhook (109-04) needs reqwest.
 webhook = ["dep:reqwest"]
 # team-mcp members run against a real LLM over an OpenAI-compatible endpoint

@@ -1,6 +1,21 @@
 //! Conformance harness: replay the `contracts/team-servers/fixtures/**` cases
 //! against live reference servers over an in-process [`crate::DuplexTransport`].
 //!
-//! Empty documented seam — implemented in 109-07 (TEAM-06).
+//! Two surfaces live here, and they measure DIFFERENT things:
+//!
+//! * [`runner`] — the fixture-replay harness (109-07, TEAM-06). Under Phase 118
+//!   **D-16** it is a **v1-only regression guard**: it proves advertised ==
+//!   enforced for the 33 checked-in fixtures, and it is no longer the
+//!   era-comparison surface. Its [`CaseResult`](runner::CaseResult) carries
+//!   `{case_id, passed, detail}`, which structurally cannot carry a wire fact.
+//! * [`era_observations`] — the Phase-118 era substrate, ported from
+//!   `crates/mcp-tester` (Phase 117) under D-16. Observations come from EXPLICIT
+//!   PROBE CODE keyed by a stable id, never inferred from a pass/fail bool.
 
 pub mod runner;
+
+/// The typed observation substrate for the Phase-118 era comparison (D-16):
+/// stable ids, typed observed values, and the probe registry.
+pub mod era_observations;
+
+pub use era_observations::{EraObservations, ObservationId, ObservedValue, PROBE_REGISTRY};
