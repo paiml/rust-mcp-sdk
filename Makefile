@@ -322,6 +322,30 @@ test-severance:
 	./scripts/run-severance-proofs.sh
 	@echo "$(GREEN)✓ Severance proofs ran with non-zero test counts$(NC)"
 
+# Phase 118 (D-19) — no GSD verification command may mask the exit status of the
+# thing it verifies.
+#
+# What it proves: inside every `<verify>` / `<acceptance_criteria>` element of a
+# linted phase's plans, no line pipes a build/test invocation into another
+# command without `pipefail`, compares a pipeline's `$?` against a literal, or
+# suppresses a status with `|| true`. The cross-AI review found ten such sites in
+# phase 118 alone — one of which reported PASS precisely when `cargo package`
+# FAILED. See the script header for the full rationale and the quote-awareness
+# rule that keeps it usable.
+#
+# The linted set (`LINTED_PHASES` in the script) only GROWS: phases are added as
+# they are swept and never removed, so the historical plan corpus cannot make
+# this red for reasons unrelated to the change under test.
+#
+# UNLIKE `test-severance`, this IS chained into `quality-gate` (below) — it is
+# sub-second, pure text, and has no external prerequisite, so a plan defect fails
+# fast instead of after the multi-minute build steps.
+.PHONY: lint-plans
+lint-plans:
+	@echo "$(BLUE)Linting GSD plan verification commands (D-19)...$(NC)"
+	./scripts/lint-plan-verify-commands.sh
+	@echo "$(GREEN)✓ No verification command masks the status of what it verifies$(NC)"
+
 # Feature flag verification for pmcp-tasks crate
 .PHONY: test-feature-flags
 test-feature-flags:
@@ -700,6 +724,7 @@ quality-gate:
 	@echo "$(YELLOW)        Zero Tolerance for Defects                      $(NC)"
 	@echo "$(YELLOW)═══════════════════════════════════════════════════════$(NC)"
 	@echo "$(BLUE)🏭 Jidoka: Stopping the line for quality verification$(NC)"
+	@$(MAKE) lint-plans
 	@$(MAKE) fmt-check
 	@$(MAKE) lint
 	@$(MAKE) build
