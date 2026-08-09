@@ -167,6 +167,92 @@ D-01..D-11.
   `workspace-test` would touch the explicitly-deferred `gate.needs` item. The new job owns
   the gate for the fixtures it proves.
 
+### Post-review corrections (locked 2026-08-09 after `/gsd-review --codex --gemini`)
+
+These SUPERSEDE the mechanism (not the intent) of D-06/D-07 where they conflict. Rationale and
+source citations: `118-REVIEWS.md`. All three CONF-02/CONF-03 blockers below were confirmed
+against repository source, not inferred from plan text.
+
+- **D-16: The era comparison runs on PORTED Phase-117 probe machinery over REAL streamable HTTP,
+  both eras on the same transport.** The planned in-process v2 arm is architecturally dead:
+  `DuplexTransport` (`crates/pmcp-team-servers/src/transport.rs:47`) implements only
+  `send`/`receive`/`close`/`is_connected`/`transport_type`, never overriding
+  `supports_negotiated_protocol_version` (trait default `false`,
+  `src/shared/transport.rs:351`) nor `send_raw`. `ClientBuilder::build`
+  (`src/client/mod.rs:5213`) explicitly warns such a v2 selection is **INERT** — the matrix would
+  compare v1 against v1 and report green having measured nothing.
+
+  This is not a new design. D-07 already said "reuse, do not reinvent," and Phase 117 shipped the
+  exact machinery in `mcp-tester`; plans 118-03/118-06 copied only the baseline YAML and rebuilt
+  observations from fixture pass/fail. **Port both halves:**
+
+  * `crates/mcp-tester/src/era_observations.rs` — `ObservationId`, `ObservedValue`,
+    `EraObservations`, `PROBE_REGISTRY`, and `pub async fn observe(target, era) -> EraObservations`.
+    Observations come from EXPLICIT PROBE CODE, never inferred from a bool.
+  * `crates/mcp-tester/src/era_diff.rs` — `compare_eras`, `DualRunReport`,
+    `DifferenceClass::{Unexpected, Missing}`, `EraDelta`, `EraBaseline`, `parse_baseline`,
+    `load_default_baseline`.
+
+    **CORRECTION (measured 2026-08-09, `era_diff.rs:551-603`):** an earlier draft of this decision
+    claimed `compare_eras` exempts `provisional` entries from `Missing`. It does NOT. The
+    `(false, Some(d), _)` arm classifies `Missing` unconditionally; `provisional` is carried only
+    as a field on `ClassifiedDifference` and affects RENDERING (`[PROVISIONAL]`) alone. Put the
+    exemption in the CONSUMER, not the comparator, and assert it is dead by construction once the
+    seeded rows are measured.
+
+  `CaseResult` (`runner.rs:306`) carries only `{case_id, passed, detail}` and MUST NOT be the
+  observation substrate — two eras both passing the same expected response emit no observation at
+  all. The 33 existing fixtures stay in-process and v1-only as a **regression guard**; they are no
+  longer the era-comparison surface.
+
+- **D-17: CONF-03 deprecated capabilities are proved by PROBES, not by fixtures.** The fixture
+  grammar supports only `tools_list` and a single `tool_call` — it cannot express a preceding
+  `logging/setLevel`, host-handler installation, a server→client `sampling/createMessage` or
+  `roots/list` exchange, or an MRTR gather/resend. Under D-16 this problem dissolves: add
+  Roots/Sampling/Logging observation IDs to `PROBE_REGISTRY` and prove both eras through the same
+  probe surface. **Do not extend the fixture format** — that option is now closed.
+
+- **D-18: `is_name_bearing_method` MUST delegate to `name_bearing_key`, not `logical_name_key`.**
+  `logical_name_key` (`src/types/mrtr.rs:297`) covers only tools/prompts/resources;
+  `name_bearing_key` (`src/types/mrtr.rs:313`) adds `tasks/get`, `tasks/update`, `tasks/cancel`.
+  The SDK's own rustdoc at `mrtr.rs:290-297` names `name_bearing_key` as "the function the
+  `Mcp-Name` EMITTER resolves through." As planned, 118-01 would let the client emit `Mcp-Name`
+  for `tasks/*` while the server never requires or cross-checks it — an emitter/validator
+  asymmetry contradicting D-13's own principle ("required exactly where a method carries a routing
+  name"). Add explicit wire tests for all three `tasks/*` methods, and keep at least one literal
+  contract test so the property test's oracle is not the predicate under test.
+
+- **D-19: No verification command may mask the exit code of the thing it verifies, and a lint
+  enforces it.** Confirmed masked sites: 118-01 T2, 118-02 T2, 118-03 T1/T3, 118-06 T1/T2/T3,
+  118-07 T1/T2, 118-09 T3. `cargo test … | tee … | tail` returns `tail`'s status; worse,
+  `118-02:222` runs `cargo package … | grep …` and treats `$? -eq 1` as PASS, so a FAILING
+  `cargo package` reports success. Use `bash -o pipefail -c '… | tee "$log"'` then assert against
+  `$log`, or capture-then-assert. Additionally ship a plan-lint that FAILS when a verification
+  command pipes a build/test invocation into another command without `pipefail`, so this cannot
+  recur across the rest of the milestone.
+
+- **D-20: Carry the remaining verified review findings.** Each is confirmed and in scope:
+  `results/` is not gitignored (`.gitignore:38` has only `test-results/`) and no plan owns
+  `.gitignore` — write suite output under `target/conformance-results/` instead; 118-09 T3 is
+  self-contradictory (requires documenting why PyYAML was rejected AND requires
+  `grep -ciE 'python|pyyaml|yq '` to return 0 in the same file); 118-02 T1 expects
+  `git ls-files conformance/` to list three files when Task 1 creates two and `git ls-files` does
+  not list untracked files; `engines.node` does not make npm refuse Node 20 without a committed
+  `.npmrc` `engine-strict=true`; `npm ci` runs transitive lifecycle scripts (prefer a verified
+  `--ignore-scripts`); the suite's known zero-check scenarios must be reconciled ONCE and applied
+  identically in 118-04, 118-05 and 118-08; add per-run and job-level timeouts and kill the
+  process GROUP (trapping `cargo run`'s PID can orphan the server child); register
+  `s54_v2_dual_conformance` as a `[[example]]` with `required-features` (adding `Cargo.toml` to
+  118-04's `files_modified`); assert exact counts (`failed == 0`, total 33, exact per-directory)
+  rather than the floors 11/6/5/7; reconcile `tests/v2_conformance_pin.rs`'s existing SHA pin with
+  the new npm pin; add contract-first updates + `pmat comply check` around the D-13/D-18 behavior
+  change; and drop 118-01's FUZZ exemption, which contradicts CLAUDE.md's ALWAYS rule.
+
+  Drop the two review findings that were checked and found WRONG: the `provisional: true` cleanup
+  Gemini wanted is already asserted at `118-06:384`, and `include_str!` with an absolute
+  `CARGO_MANIFEST_DIR` path is a correct, standard idiom — only the prose at `118-03:217` claiming
+  "no absolute path" needs fixing.
+
 ### Claude's Discretion
 
 - The subdirectory name and layout for the Node manifest.

@@ -2793,7 +2793,7 @@ Plans:
 | 115. JSON Schema 2020-12 + Caching Hints | 19/19 | Complete    | 2026-08-02 |
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
-| 118. Conformance Against the Official Suite | 0/9 | Planned — 9 plans in 5 waves | - |
+| 118. Conformance Against the Official Suite | 0/10 | Planned — 10 plans in 5 waves (replanned after cross-AI review) | - |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
