@@ -10,11 +10,12 @@
 //! # The assertion style is deliberate
 //!
 //! Most tests here assert only that the call SUCCEEDS. That is not a weak
-//! assertion: the server under test runs `require_three_headers` +
+//! assertion: the server under test runs `require_v2_headers` +
 //! `cross_check_method` + `cross_check_name` + the header/`_meta` era matrix and
 //! answers `-32020 HEADER_MISMATCH` at HTTP 400 for any disagreement. A success
-//! therefore proves the client emitted all three headers, with the right
-//! `Mcp-Name` derivation, and stamped `params._meta` with the v2 era signal. The
+//! therefore proves the client emitted `Mcp-Method` and `MCP-Protocol-Version`,
+//! emitted a correct `Mcp-Name` wherever the method carries a routing name
+//! (Phase 118 D-13 / D-18), and stamped `params._meta` with the v2 era signal. The
 //! two tests that need to observe what the server RECEIVED use a thin recording
 //! `ServerHttpMiddleware` rather than parsing logs.
 //!
@@ -220,11 +221,13 @@ async fn emits_required_headers() {
 
 /// The client half of the empty-`Mcp-Name` rule.
 ///
-/// `tools/list` carries no logical name. If the client OMITTED `Mcp-Name`, the
-/// server's `require_three_headers` would 400 this request; if it omitted the
-/// `_meta` era signal, the header/`_meta` matrix would 400 it as a
-/// `HEADER_MISMATCH`. Neither struct has a `_meta` field, so this only passes
-/// because the v2 frame is assembled and stamped by the client itself.
+/// `tools/list` carries no routing name, so since Phase 118 D-13 the server would
+/// accept the request with or without `Mcp-Name` — the empty value this client
+/// emits is discarded by `require_v2_headers`. What still makes this test
+/// load-bearing is the `_meta` era signal: omit it and the header/`_meta` matrix
+/// 400s the request as a `HEADER_MISMATCH`. Neither struct has a `_meta` field, so
+/// this only passes because the v2 frame is assembled and stamped by the client
+/// itself.
 #[tokio::test]
 async fn nameless_method_accepted() {
     let (addr, handle) = spawn_default_config(build_v2_server()).await;

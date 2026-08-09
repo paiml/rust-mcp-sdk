@@ -725,6 +725,90 @@ equations:
     - A schema-1 file is either migrated entry-by-entry or reported as dropped, never partially adopted
     lean_theorem: Theorems.OAuthCredentialBinding
 
+  # Phase 118 D-13 / D-18 (CONF-01). This equation REPLACES the Phase-113 DRIFT-1
+  # rule that `Mcp-Name` must be PRESENT on every v2 request. That rule was
+  # deliberately stricter than the 2026-07-28 transport spec; the official
+  # `@modelcontextprotocol/conformance` suite emits the header only for
+  # name-bearing methods, so it rejected effectively the whole v2 scored set with
+  # HEADER_MISMATCH before dispatch. D-18 then widened the server's predicate from
+  # the MRTR-only `logical_name_key` to the COMBINED `name_bearing_key` -- the same
+  # table the client's `Mcp-Name` emitter resolves through -- so `tasks/get`,
+  # `tasks/update` and `tasks/cancel` are validated as well as emitted.
+  # Implemented by the private free functions `require_v2_headers`,
+  # `is_name_bearing_method`, `cross_check_method` and `cross_check_name` in
+  # src/server/streamable_http_server.rs. No binding.yaml entry accompanies this
+  # equation: `make comply-bindings-check` resolves only
+  # contracts/team-servers/binding.yaml against crates/pmcp-team-servers/src, and
+  # these are pub(crate)-invisible root-crate functions, so an entry would be a
+  # ghost binding.
+  v2_header_gate:
+    formula: |
+      gate: (HeaderMap, meta_is_v2, body_method, body_name) -> EnforceOk | Reject | Passthrough
+
+      name_bearing(m) := name_bearing_key(m) is Some            (the COMBINED table, D-18)
+        tools/call, prompts/get -> "name"
+        resources/read          -> "uri"
+        tasks/get, tasks/update, tasks/cancel -> "taskId"
+
+      era(headers, meta_is_v2):
+        (header != v2) && !meta_is_v2 => Passthrough             (a v1 request; gate does not apply)
+        (header == v2) != meta_is_v2  => Reject(HEADER_MISMATCH) (header/_meta disagreement)
+        (header == v2) && meta_is_v2  => enforce below
+
+      enforce(headers, body_method, body_name):
+        MCP-Protocol-Version absent  => Reject(HEADER_MISMATCH)
+        Mcp-Method           absent  => Reject(HEADER_MISMATCH)
+        Mcp-Method  != body_method   => Reject(HEADER_MISMATCH)
+        name_bearing(Mcp-Method):
+          Mcp-Name absent                              => Reject(HEADER_MISMATCH)
+          decode(Mcp-Name) is None                     => Reject(HEADER_MISMATCH)
+          decode(Mcp-Name) != body_name                => Reject(HEADER_MISMATCH)
+          otherwise                                    => EnforceOk(Mcp-Method, decode-input)
+        !name_bearing(Mcp-Method):
+          any Mcp-Name, or none                        => EnforceOk(Mcp-Method, "")
+
+      SANITIZATION: on a method that is not name-bearing the carried name is
+      String::new() whatever the client sent, because that pair is echoed back
+      outbound by apply_v2_outbound_headers.
+    domain: >-
+      Attacker-controlled HTTP header maps and raw JSON-RPC request bodies arriving at the
+      2026-07-28 POST endpoint, paired with the per-request resolved era signal
+    codomain: >-
+      Exactly one of EnforceOk (with the method and the carried routing name), Reject with
+      HEADER_MISMATCH, or Passthrough
+    invariants:
+    - >-
+      Mcp-Method and MCP-Protocol-Version are REQUIRED on every v2 request. D-13 relaxed exactly
+      one header and neither of these is it
+    - >-
+      Mcp-Name is required exactly when name_bearing_key(method) is Some -- no wider, no narrower.
+      The server's predicate and the client's emitter read the SAME table, so the two ends of the
+      cross-check cannot disagree about which methods carry a name (D-18)
+    - >-
+      When Mcp-Name is present on a name-bearing method its decoded value equals the body's routing
+      name at that method's params key; a value that opens the =?base64?...?= sentinel but does not
+      decode is a rejection, never a silent pass
+    - >-
+      When the method is not name-bearing the carried name is the EMPTY STRING regardless of what
+      arrived, so an unvalidated attacker-supplied value can neither branch downstream logic nor be
+      reflected in the response headers
+    - >-
+      The gate is TOTAL: it returns Reject, never a panic, for every header byte sequence
+      HeaderValue can represent and every raw request body byte sequence
+    - >-
+      A v1 request is Passthrough. The era decision is per-request, so relaxing the v2 rule changes
+      nothing about what a v1 caller sees
+    preconditions:
+    - The raw body has already been parsed once and the same parsed value feeds the era read, this
+      cross-check and the MRTR params read, so the three cannot disagree about what the body says
+    - Header values are read through the length-bounded bounded_header_str helper
+    postconditions:
+    - A v2 request for a non-name-bearing method with no Mcp-Name reaches dispatch
+    - A v2 request for any name-bearing method with a missing or disagreeing Mcp-Name is answered
+      HEADER_MISMATCH before dispatch
+    - The response's Mcp-Name is empty for every method with no routing name
+    lean_theorem: Theorems.V2HeaderGate
+
 proof_obligations:
 - type: state_machine
   property: Session lifecycle enforces initialization

@@ -454,7 +454,11 @@ async fn v2_required_headers_rejects_v2_meta_without_version_header() {
 }
 
 // ---------------------------------------------------------------------------
-// D-05: a v2 request missing ANY of the three headers → 4xx + JSON-RPC error.
+// D-05: a v2 request missing `Mcp-Method` or `MCP-Protocol-Version`, or missing
+// `Mcp-Name` on a NAME-BEARING method → 4xx + JSON-RPC error.
+//
+// `tools/call` is name-bearing, so the `Mcp-Name` row below survives Phase 118
+// D-13 unchanged — the relaxation reaches only methods with no routing name.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn v2_required_headers_rejects_missing_mcp_name() {
@@ -962,9 +966,16 @@ async fn server_discover_rejects_mismatched_mcp_method() {
     );
 }
 
-// Missing Mcp-Name on the v2 discover → REJECT (D-05 strict all-three-headers).
+// Missing Mcp-Name on the v2 discover → ACCEPT (Phase 118 D-13).
+//
+// `server/discover` carries no routing name, so `Mcp-Name` is optional on it.
+// This test asserted a 400 until Phase 118: the Phase-113 DRIFT-1 adjudication
+// required the header on EVERY v2 request. D-13 reverses that to match the
+// transport spec and the official conformance suite, which never sends an
+// `Mcp-Name` for a name-less method. The remedy for a failure here is to fix the
+// gate, not to relax the assertion back to the old rule.
 #[tokio::test]
-async fn server_discover_rejects_missing_mcp_name() {
+async fn server_discover_accepts_missing_mcp_name() {
     let (addr, handle) = spawn(true).await;
     let r = post(
         addr,
@@ -977,10 +988,15 @@ async fn server_discover_rejects_missing_mcp_name() {
     .await;
     shutdown(handle).await;
 
-    assert_eq!(r.status, 400, "missing Mcp-Name must reject (D-05)");
     assert_eq!(
-        r.body["error"]["code"], HEADER_MISMATCH,
-        "a missing required header or a header/body disagreement is HEADER_MISMATCH"
+        r.status, 200,
+        "server/discover carries no routing name, so a missing Mcp-Name must be \
+         ACCEPTED (Phase 118 D-13)"
+    );
+    assert!(
+        r.body["error"].is_null(),
+        "a name-less v2 method with no Mcp-Name must reach dispatch, not the gate; got {}",
+        r.body
     );
 }
 

@@ -53,7 +53,7 @@ mod common;
 
 use common::v2::{
     build_v2_server, header, post, spawn_default_config, spawn_tasks_server, teardown,
-    v2_body_with_client_extensions, v2_headers, AuthPosture, Resp,
+    v2_body_with_client_extensions, v2_headers_for, AuthPosture, Resp,
 };
 use pmcp::types::capabilities::TASKS_EXTENSION_KEY;
 use pmcp::types::protocol::error_codes::{
@@ -93,7 +93,11 @@ async fn tasks_post(
     params: Value,
     auth: &[(String, String)],
 ) -> Resp {
-    let mut headers = v2_headers(method, "");
+    // `Mcp-Name` is derived from the BODY, exactly as a conformant client derives
+    // it. Since Phase 118 D-18 the server cross-checks it against `params.taskId`
+    // for every `tasks/*` method, so a hard-coded `""` here would be a genuine
+    // `-32020` header/body disagreement and would mask the gate this file measures.
+    let mut headers = v2_headers_for(method, &params);
     headers.extend_from_slice(auth);
     post(
         addr,
@@ -111,7 +115,11 @@ async fn undeclared_tasks_post(
     params: Value,
     auth: &[(String, String)],
 ) -> Resp {
-    let mut headers = v2_headers(method, "");
+    // `Mcp-Name` is derived from the BODY, exactly as a conformant client derives
+    // it. Since Phase 118 D-18 the server cross-checks it against `params.taskId`
+    // for every `tasks/*` method, so a hard-coded `""` here would be a genuine
+    // `-32020` header/body disagreement and would mask the gate this file measures.
+    let mut headers = v2_headers_for(method, &params);
     headers.extend_from_slice(auth);
     post(
         addr,

@@ -173,10 +173,13 @@ pub const CIRCUIT_BREAKER_OPEN: i32 = -32006;
 
 /// Header/body mismatch or a missing required v2 header (`-32020`).
 ///
-/// Returned on the v2 HTTP path when a required standard header
-/// (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) is missing or malformed,
-/// or when a header value does not match the corresponding value in the
-/// JSON-RPC request body.
+/// Returned on the v2 HTTP path when a required standard header is missing or
+/// malformed, or when a header value does not match the corresponding value in
+/// the JSON-RPC request body.
+///
+/// `MCP-Protocol-Version` and `Mcp-Method` are required on EVERY v2 request.
+/// `Mcp-Name` is required only on methods that carry a routing name (Phase 118
+/// D-13, as widened by D-18) — its absence on any other method is not an error.
 ///
 /// **HTTP status: `400 Bad Request`** (spec MUST). This is the single
 /// documented source for that mapping — the v2 status mapper reads it here

@@ -31,15 +31,27 @@
 //! silent interop failure in the phase, which is why `splice_mrtr_params` and
 //! `extract_mrtr_params` are the only two places the key spelling exists.
 //!
-//! # The `Mcp-Name` header rule (locked, cross-plan)
+//! # The `Mcp-Name` header rule (Phase 118 D-13, widened by D-18)
 //!
-//! `Mcp-Name` is PRESENT on EVERY v2 request. For a method that carries no logical
-//! name the value is the EMPTY STRING. The server's `require_three_headers` demands
-//! presence (Phase-112 D-05) while its `cross_check_name` skips the value comparison
-//! for non-name-bearing methods. Provenance: `113-SPEC-RECHECK.md`, section
-//! `## Mcp-Name Header Rule` (and `DRIFT-1`, which records that pmcp is deliberately
-//! STRICTER than the draft transport spec here). `encode_header_value` therefore
-//! MUST round-trip the empty string unchanged.
+//! `Mcp-Name` is REQUIRED exactly on the methods that carry a ROUTING NAME —
+//! [`name_bearing_key`]'s combined table: `tools/call` / `prompts/get`
+//! (`params.name`), `resources/read` (`params.uri`) and `tasks/get` /
+//! `tasks/update` / `tasks/cancel` (`params.taskId`). On every other v2 method it
+//! is OPTIONAL and IGNORED: the server's `require_v2_headers` discards whatever
+//! arrived, and its `cross_check_name` compares nothing.
+//!
+//! Until Phase 118 the server demanded PRESENCE on every v2 request (Phase-112
+//! D-05, `113-SPEC-RECHECK.md` § `Mcp-Name Header Rule` and its `DRIFT-1`
+//! adjudication, which chose to be deliberately STRICTER than the transport
+//! spec). **D-13 reverses that** — the official conformance suite sends the
+//! header only for name-bearing methods, so the stricter rule rejected the whole
+//! v2 scored set before dispatch. **D-18** then widened the server's predicate
+//! from [`logical_name_key`] to [`name_bearing_key`], so the validator now covers
+//! exactly what the emitter emits.
+//!
+//! The CLIENT still emits the header on every v2 request, empty for a name-less
+//! method, and that remains valid — which is why `encode_header_value` MUST still
+//! round-trip the empty string unchanged.
 //!
 //! # Visibility
 //!
@@ -236,16 +248,21 @@ pub(crate) const TASK_ID_KEY: &str = "taskId";
 /// exist on the v2 wire at all (TASK-03). Adding them would emit an `Mcp-Name`
 /// for a method no v2 server routes, which is a claim pmcp cannot support.
 ///
-/// # Server-side enforcement is deliberately OFF this phase
+/// # Server-side enforcement is ON since Phase 118 (D-18)
 ///
-/// `is_name_bearing_method` (in `streamable_http_server.rs`) keeps reading
-/// [`logical_name_key`], so a tasks request is still treated as non-name-bearing
-/// at ingress and `cross_check_name` returns `Ok(())` for it. The named
-/// tradeoff: a pmcp server accepts BOTH a conformant `Mcp-Name: <taskId>` and a
-/// legacy empty value, and does not detect a header that disagrees with the
-/// body. That tolerance is what lets pre-existing clients keep working while the
-/// ecosystem migrates; turning enforcement on is a separable hardening decision
-/// (Phase 118).
+/// Phase 114 deliberately left it off: `is_name_bearing_method` (in
+/// `streamable_http_server.rs`) read [`logical_name_key`], so a tasks request was
+/// treated as non-name-bearing at ingress and `cross_check_name` returned
+/// `Ok(())` for it. A pmcp server accepted BOTH a conformant `Mcp-Name: <taskId>`
+/// and a legacy empty value, and detected neither a missing header nor one that
+/// disagreed with the body — the migration tolerance, with the hardening named as
+/// a separable Phase-118 decision.
+///
+/// **Phase 118 D-18 took that decision.** The server's predicate now resolves
+/// through [`name_bearing_key`], so these three methods are VALIDATED as well as
+/// emitted: a `tasks/*` request with no `Mcp-Name`, or with one that disagrees
+/// with `params.taskId`, is a `HEADER_MISMATCH` rejection. A client that emitted
+/// the empty legacy value for a tasks method must now emit the task id.
 pub(crate) const TASK_NAME_BEARING_METHODS: [(&str, &str); 3] = [
     (TASKS_GET_METHOD, TASK_ID_KEY),
     (TASKS_UPDATE_METHOD, TASK_ID_KEY),
@@ -286,14 +303,19 @@ pub(crate) fn mrtr_method_static(method: &str) -> Option<&'static str> {
 ///
 /// Derived from [`MRTR_METHODS`] so the client and the server read ONE table.
 ///
-/// # Scope (Phase 114, DQ4)
+/// # Scope (Phase 114 DQ4, narrowed by Phase 118 D-18)
 ///
-/// This answers "where does an MRTR method keep its name", which is ALSO the
-/// server's name-bearing predicate (`is_name_bearing_method`) and therefore
-/// decides which methods get their `Mcp-Name` header cross-checked against the
-/// body. It is NOT the full set of methods that CARRY an `Mcp-Name`: the tasks
-/// methods do, via [`TASK_NAME_BEARING_METHODS`]. Callers that want "every
-/// method with a routing name" want [`name_bearing_key`].
+/// This answers "where does an MRTR method keep its name", and NOTHING else. It
+/// is NOT the full set of methods that carry an `Mcp-Name`: the tasks methods do
+/// too, via [`TASK_NAME_BEARING_METHODS`]. Callers that want "every method with
+/// a routing name" want [`name_bearing_key`].
+///
+/// In particular this is **no longer** the server's name-bearing predicate.
+/// Until Phase 118, `is_name_bearing_method` (in `streamable_http_server.rs`)
+/// read THIS function, so the server required and cross-checked `Mcp-Name` only
+/// for the three MRTR methods while the client emitted it for `tasks/*` as well.
+/// **Phase 118 D-18** repointed that predicate at [`name_bearing_key`], so the
+/// emitter and the validator now resolve through one table.
 pub(crate) fn logical_name_key(method: &str) -> Option<&'static str> {
     Some(mrtr_row(method)?.name_key)
 }
@@ -349,11 +371,13 @@ pub(crate) fn logical_name_of(method: &str, params: &Value) -> Option<String> {
 ///
 /// # The name resolves through [`name_bearing_key`], not [`logical_name_key`]
 ///
-/// So a `tasks/get` frame yields its `params.taskId` (Phase 114, DQ4). On the
-/// SERVER half this widening is inert by design: `cross_check_name` short-circuits
-/// on `is_name_bearing_method`, which still reads [`logical_name_key`], so a tasks
-/// request is never compared and no previously-accepted request becomes a
-/// `HEADER_MISMATCH`.
+/// So a `tasks/get` frame yields its `params.taskId` (Phase 114, DQ4).
+///
+/// On the SERVER half this widening was inert until Phase 118: `cross_check_name`
+/// short-circuits on `is_name_bearing_method`, which read [`logical_name_key`], so
+/// a tasks request was never compared. **Phase 118 D-18 repointed that predicate
+/// at [`name_bearing_key`]**, so the widening is now live on both halves and a
+/// `tasks/*` request whose header disagrees with its body IS a `HEADER_MISMATCH`.
 pub(crate) fn frame_routing_pair(frame: &Value) -> Option<(&str, Option<String>)> {
     let method = frame.get("method")?.as_str()?;
     let name = frame

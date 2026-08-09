@@ -502,11 +502,15 @@ async fn v2_nameless_method_empty_mcp_name_accepted() {
     );
 }
 
-/// ...but OMITTING the header entirely is a rejection: presence is required on
-/// EVERY v2 request (Phase-112 D-05; the Phase-113 DRIFT-1 adjudication keeps
-/// pmcp stricter than the draft transport spec, deliberately).
+/// ...and OMITTING the header entirely is ALSO accepted for a name-less method.
+///
+/// This asserted a `400` until Phase 118: the Phase-113 DRIFT-1 adjudication
+/// required `Mcp-Name` on EVERY v2 request. **Phase 118 D-13 reverses that** —
+/// the transport spec requires it only on name-bearing methods, and the official
+/// `@modelcontextprotocol/conformance` suite sends exactly the shape below. The
+/// remedy for a failure here is to fix the gate, not to relax the assertion.
 #[tokio::test]
-async fn v2_nameless_method_absent_mcp_name_rejected() {
+async fn v2_nameless_method_absent_mcp_name_accepted() {
     let (addr, handle) = spawn_default_config(build_v2_server()).await;
     let response = post(
         addr,
@@ -520,11 +524,16 @@ async fn v2_nameless_method_absent_mcp_name_rejected() {
     handle.abort();
 
     assert_eq!(
-        response.status, 400,
-        "an ABSENT Mcp-Name must be rejected even for a name-less method; body: {}",
+        response.status, 200,
+        "tools/list carries no routing name, so an ABSENT Mcp-Name must be ACCEPTED \
+         (Phase 118 D-13); body: {}",
         response.raw
     );
-    assert_eq!(response.body["error"]["code"], HEADER_MISMATCH);
+    assert!(
+        response.body["result"]["tools"].is_array(),
+        "the request must reach dispatch, not the header gate; body: {}",
+        response.raw
+    );
 }
 
 // ===========================================================================

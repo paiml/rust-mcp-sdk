@@ -187,8 +187,11 @@ fn listen_body(id: Value, filter: &Value) -> String {
     v2_body("subscriptions/listen", id, Value::Object(params))
 }
 
-/// The three required v2 headers for `subscriptions/listen` (a name-less method,
-/// so `Mcp-Name` is present and empty — the locked cross-plan rule).
+/// The v2 routing headers for `subscriptions/listen`.
+///
+/// It is a name-less method, so since Phase 118 D-13 `Mcp-Name` is OPTIONAL on it
+/// and the empty value emitted here is discarded by the gate. `Mcp-Method` and
+/// `MCP-Protocol-Version` remain mandatory.
 fn listen_headers() -> Vec<(String, String)> {
     v2_headers("subscriptions/listen", "")
 }
