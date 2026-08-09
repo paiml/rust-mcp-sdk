@@ -987,35 +987,90 @@ fn classify_era_cell(header: HeaderProtocolVersion, meta_is_v2: bool) -> V2Class
     }
 }
 
-/// Require all THREE v2 headers (VERS-05 / D-05); return `(method, name)`.
+/// Rejection when a v2 request omits one of the two UNIVERSALLY required headers.
 ///
-/// # The `Mcp-Name` header rule (locked cross-plan contract)
+/// Deliberately does NOT name `Mcp-Name`: since Phase 118 D-13 that header is
+/// required only on name-bearing methods, so a message naming it here would send
+/// an operator looking for the wrong missing header.
+const ERR_MISSING_V2_HEADERS: &str =
+    "v2 requests must carry Mcp-Method and MCP-Protocol-Version headers";
+
+/// Rejection when a NAME-BEARING v2 method omits `Mcp-Name`.
 ///
-/// > `Mcp-Name` MUST be PRESENT on every v2 request. Its VALUE is cross-checked
-/// > against the request's logical name only for the name-bearing methods
-/// > (`tools/call`, `prompts/get` → `params.name`; `resources/read` →
-/// > `params.uri`). For every other v2 method the value is the EMPTY STRING and
-/// > is not cross-checked.
+/// Distinct from [`ERR_MISSING_V2_HEADERS`] so a rejection names its actual
+/// cause. Collapsing the two back into one catch-all is a regression that
+/// `require_v2_headers_truth_table` fails on.
+const ERR_MISSING_MCP_NAME: &str =
+    "Mcp-Name header is required: this method carries a routing name";
+
+/// Require the v2 headers (VERS-05 / D-05); return `(method, name)`.
 ///
-/// Verbatim from `113-SPEC-RECHECK.md` § `Mcp-Name Header Rule`, and locked by
-/// Phase-112 D-05. This function enforces the PRESENCE half (an absent header is
-/// a rejection even when the value would be empty); [`cross_check_name`] enforces
-/// the VALUE half and returns `Ok` immediately for a non-name-bearing method.
+/// # The `Mcp-Name` header rule (Phase 118 D-13, as widened by D-18)
 ///
-/// The draft transport spec requires the header only for the three name-bearing
-/// methods. pmcp deliberately keeps the stricter, fail-closed rule (Phase-113
-/// DRIFT-1 adjudication): a header a WAF can rely on being present on every
-/// request is worth more than matching the laxer wording, and plan 05's client
-/// emits exactly this — `Mcp-Name: ""` for a name-less method.
-fn require_three_headers(
-    headers: &HeaderMap,
-) -> std::result::Result<(String, String), &'static str> {
+/// > `Mcp-Name` MUST be present on name-bearing methods — `tools/call` /
+/// > `prompts/get` → `params.name`; `resources/read` → `params.uri`;
+/// > `tasks/get` / `tasks/update` / `tasks/cancel` → `params.taskId` — and is
+/// > OPTIONAL, and IGNORED, on every other v2 method.
+///
+/// This function enforces the PRESENCE half; [`cross_check_name`] enforces the
+/// VALUE half and returns `Ok` immediately for a non-name-bearing method. Both
+/// resolve "is this method name-bearing?" through the ONE shared predicate
+/// [`is_name_bearing_method`], so the two halves cannot disagree.
+///
+/// # Phase-113 DRIFT-1 is REVERSED here (Phase 118 D-13)
+///
+/// The Phase-113 DRIFT-1 adjudication deliberately kept a STRICTER rule than the
+/// transport spec: `Mcp-Name` had to be PRESENT on every v2 request (empty for a
+/// name-less method), on the reasoning that a header a WAF can rely on always
+/// being present is worth more than matching the laxer spec wording.
+///
+/// **Phase 118 D-13 reverses that adjudication.** The 2026-07-28 transport spec
+/// requires the header only for name-bearing methods, and the official
+/// `@modelcontextprotocol/conformance` suite emits it only for those. The
+/// stricter rule therefore rejected effectively the ENTIRE v2 scored set with
+/// `-32020` **before dispatch** — a conformant `tools/list` never reached a
+/// handler (Phase 118 RESEARCH, Pitfall 1). Spec conformance won.
+///
+/// What is RETAINED: `Mcp-Method` and `MCP-Protocol-Version` stay mandatory on
+/// every v2 request ([`cross_check_method`] is unchanged), and the strict
+/// name/body cross-check in [`cross_check_name`] is unchanged wherever a name
+/// exists. The relaxation is scoped by the name table, not by the caller.
+///
+/// # The D-18 widening
+///
+/// [`is_name_bearing_method`] now resolves through the COMBINED table
+/// [`crate::types::mrtr::name_bearing_key`], so `tasks/get` / `tasks/update` /
+/// `tasks/cancel` are VALIDATED as well as emitted. Before Phase 118 the client
+/// emitted an `Mcp-Name` for those methods that the server never required and
+/// never cross-checked — an emitter/validator asymmetry that contradicted D-13's
+/// own principle.
+///
+/// # Backward compatibility with the Phase-113 client
+///
+/// A client that still emits `Mcp-Name: ""` for a name-less method is ACCEPTED:
+/// absent and empty converge on the same carried value, because a stray value on
+/// a non-name-bearing method is discarded (see the sanitization note below).
+fn require_v2_headers(headers: &HeaderMap) -> std::result::Result<(String, String), &'static str> {
     let version_present = headers.get(MCP_PROTOCOL_VERSION).is_some();
-    let method = bounded_header_str(headers, MCP_METHOD);
-    let name = bounded_header_str(headers, MCP_NAME);
-    match (version_present, method, name) {
-        (true, Some(m), Some(n)) => Ok((m, n)),
-        _ => Err("v2 requests must carry Mcp-Method, Mcp-Name and MCP-Protocol-Version headers"),
+    let Some(method) = bounded_header_str(headers, MCP_METHOD) else {
+        return Err(ERR_MISSING_V2_HEADERS);
+    };
+    if !version_present {
+        return Err(ERR_MISSING_V2_HEADERS);
+    }
+    if !is_name_bearing_method(&method) {
+        // SANITIZATION (Phase 118 D-20). The carried name is echoed straight back
+        // out by `apply_v2_outbound_headers`, so whatever a client sent on a
+        // method that carries no routing name is DISCARDED here rather than
+        // propagated downstream or reflected — echoing an unvalidated,
+        // attacker-supplied string is a pointless surface. It also makes an
+        // absent `Mcp-Name` and a Phase-113 client's `Mcp-Name: ""` converge on
+        // exactly the same carried value.
+        return Ok((method, String::new()));
+    }
+    match bounded_header_str(headers, MCP_NAME) {
+        Some(name) => Ok((method, name)),
+        None => Err(ERR_MISSING_MCP_NAME),
     }
 }
 
@@ -1030,19 +1085,36 @@ fn cross_check_method(
     }
 }
 
-/// Methods whose logical name must be cross-checked against `Mcp-Name` (D-06).
+/// Whether `method` carries a ROUTING NAME — the one predicate that decides both
+/// whether `Mcp-Name` is required and whether its value is cross-checked (D-06).
 ///
-/// The name-bearing set and the "where the logical name lives" map are ONE table,
-/// [`crate::types::mrtr::logical_name_key`] — shared with the client emitter
-/// (plan 05) so the two ends can never disagree about which methods carry a name
-/// or which params key holds it.
+/// # This is the SAME table the client's `Mcp-Name` emitter resolves through
+///
+/// [`crate::types::mrtr::name_bearing_key`] is the COMBINED table, and its own
+/// rustdoc names it as the emitter's resolver
+/// (`src/shared/streamable_http.rs`). Reading it here means the two ends of the
+/// cross-check cannot disagree about which methods carry a name or which params
+/// key holds it. It covers:
+///
+/// - `tools/call`, `prompts/get` → `params.name`
+/// - `resources/read` → `params.uri`
+/// - `tasks/get`, `tasks/update`, `tasks/cancel` → `params.taskId`
+///
+/// # Phase 118 D-18: this used to read the NARROWER table
+///
+/// Before Phase 118 this resolved through [`crate::types::mrtr::logical_name_key`],
+/// which covers only the three MRTR methods. The client already emitted an
+/// `Mcp-Name` for `tasks/*` (through `name_bearing_key`) that the server neither
+/// required nor cross-checked — an emitter/validator asymmetry that contradicted
+/// the "required exactly where a method carries a routing name" principle D-13
+/// is built on. D-18 closes it by pointing both ends at one table.
 fn is_name_bearing_method(method: &str) -> bool {
-    crate::types::mrtr::logical_name_key(method).is_some()
+    crate::types::mrtr::name_bearing_key(method).is_some()
 }
 
 /// Cross-check `Mcp-Name` against the request's logical name for name-bearing
-/// methods (D-06). Name-less methods are presence-only (enforced upstream by
-/// [`require_three_headers`]).
+/// methods (D-06). Name-less methods carry no name at all — [`require_v2_headers`]
+/// has already discarded any value a client sent for one.
 ///
 /// # The sentinel decode is load-bearing
 ///
@@ -1100,7 +1172,7 @@ fn classify_v2_request(
             data: None,
         },
         V2Classification::Enforce => {
-            let (method, name) = match require_three_headers(headers) {
+            let (method, name) = match require_v2_headers(headers) {
                 Ok(pair) => pair,
                 Err(msg) => return reject(msg),
             };
@@ -4563,21 +4635,90 @@ mod tests {
         ));
     }
 
+    /// Every row of the [`require_v2_headers`] truth table, including the two
+    /// DISTINCT error strings (Phase 118 D-13 / D-18).
+    ///
+    /// Asserting the messages is deliberate: collapsing them back into one
+    /// catch-all would make a rejection stop naming its own cause, and this test
+    /// is what fails when that happens.
     #[test]
-    fn require_three_headers_needs_all_three() {
-        // All three present → Ok
+    fn require_v2_headers_truth_table() {
+        let name_bearing = NAME_BEARING_METHODS[0];
+        // Version + method + name on a name-bearing method → Ok, name carried.
         let ok = headers_from(&[
             (MCP_PROTOCOL_VERSION, V2),
-            (MCP_METHOD, "tools/call"),
+            (MCP_METHOD, name_bearing),
             (MCP_NAME, "search"),
         ]);
         assert_eq!(
-            require_three_headers(&ok).unwrap(),
-            ("tools/call".to_string(), "search".to_string())
+            require_v2_headers(&ok).unwrap(),
+            (name_bearing.to_string(), "search".to_string())
         );
-        // Missing Mcp-Name → Err
-        let missing = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, "tools/call")]);
-        assert!(require_three_headers(&missing).is_err());
+        // Missing Mcp-Name on a name-bearing method → Err naming Mcp-Name.
+        let missing = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, name_bearing)]);
+        assert_eq!(require_v2_headers(&missing), Err(ERR_MISSING_MCP_NAME));
+        // Missing Mcp-Name on a name-LESS method → Ok (the D-13 change).
+        for method in NAME_LESS_METHODS {
+            let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
+            assert_eq!(
+                require_v2_headers(&h),
+                Ok((method.to_string(), String::new()))
+            );
+            // A stray value on the same method is accepted and DISCARDED (D-20).
+            let stray = headers_from(&[
+                (MCP_PROTOCOL_VERSION, V2),
+                (MCP_METHOD, method),
+                (MCP_NAME, "attacker-supplied"),
+            ]);
+            assert_eq!(
+                require_v2_headers(&stray),
+                Ok((method.to_string(), String::new()))
+            );
+        }
+        // Every name-bearing method — MRTR *and* tasks — still demands the header.
+        for method in NAME_BEARING_METHODS {
+            let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
+            assert_eq!(require_v2_headers(&h), Err(ERR_MISSING_MCP_NAME));
+        }
+        // Missing Mcp-Method → the OTHER error, which must not name Mcp-Name.
+        let no_method = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_NAME, "search")]);
+        assert_eq!(require_v2_headers(&no_method), Err(ERR_MISSING_V2_HEADERS));
+        // Missing MCP-Protocol-Version → same, for every method class.
+        for method in NAME_BEARING_METHODS.iter().chain(NAME_LESS_METHODS.iter()) {
+            let h = headers_from(&[(MCP_METHOD, method), (MCP_NAME, "search")]);
+            assert_eq!(require_v2_headers(&h), Err(ERR_MISSING_V2_HEADERS));
+        }
+        assert!(
+            !ERR_MISSING_V2_HEADERS.contains("Mcp-Name"),
+            "the universally-required-headers message must not name a header that is \
+             only conditionally required (Phase 118 D-13)"
+        );
+        assert!(ERR_MISSING_MCP_NAME.contains("Mcp-Name"));
+        assert!(ERR_MISSING_MCP_NAME.contains("routing name"));
+    }
+
+    /// The literal contract for the COMBINED name table (Phase 118 D-18).
+    ///
+    /// The property test below uses `is_name_bearing_method` as its oracle, which
+    /// by construction CANNOT detect a wrong table — the predicate under test
+    /// would simply agree with itself. This test's oracle is instead a
+    /// hand-written literal list, so a regression of D-18 (the predicate drifting
+    /// back to `logical_name_key` and silently dropping the three `tasks/*` rows)
+    /// fails HERE. Do not rewrite it to derive its list from the predicate.
+    #[test]
+    fn is_name_bearing_method_matches_the_literal_contract() {
+        for method in NAME_BEARING_METHODS {
+            assert!(
+                is_name_bearing_method(method),
+                "{method} carries a routing name and MUST be name-bearing (D-18)"
+            );
+        }
+        for method in NAME_LESS_METHODS {
+            assert!(
+                !is_name_bearing_method(method),
+                "{method} carries no routing name and MUST NOT be name-bearing"
+            );
+        }
     }
 
     #[test]
@@ -4624,15 +4765,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The locked `Mcp-Name` header rule, in BOTH directions (Plan 113-04).
+    // The `Mcp-Name` header rule, in BOTH directions.
     //
-    // RULE (113-SPEC-RECHECK.md § `Mcp-Name Header Rule`, Phase-112 D-05):
-    // `Mcp-Name` MUST be PRESENT on every v2 request; its VALUE is cross-checked
-    // only for the name-bearing methods. Plan 05's client emits exactly this.
+    // RULE (Phase 118 D-13, widened by D-18 — REVERSES the Phase-113 DRIFT-1
+    // adjudication): `Mcp-Name` MUST be present on the methods the COMBINED name
+    // table names, and is OPTIONAL and IGNORED on every other v2 method. Its
+    // VALUE is cross-checked wherever it is required.
     // -----------------------------------------------------------------------
 
     #[test]
     fn name_less_method_with_empty_mcp_name_is_enforce_ok() {
+        // The Phase-113 client emits `Mcp-Name: ""` for a name-less method. That
+        // client is still ACCEPTED after D-13 — this is the compatibility row.
         let h = headers_from(&[
             (MCP_PROTOCOL_VERSION, V2),
             (MCP_METHOD, "tools/list"),
@@ -4646,19 +4790,15 @@ mod tests {
     }
 
     #[test]
-    fn name_less_method_with_absent_mcp_name_is_rejected() {
-        // Header OMITTED entirely — presence is required on EVERY v2 request.
+    fn name_less_method_with_absent_mcp_name_is_accepted() {
+        // Header OMITTED entirely. Before Phase 118 this was a `-32020` rejection
+        // (the DRIFT-1 presence-on-every-request rule); D-13 reverses that,
+        // because the official conformance suite sends exactly this shape.
         let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, "tools/list")]);
         let out = classify_v2_request(&h, true, Some("tools/list"), None);
         assert!(
-            matches!(
-                out,
-                V2GateOutcome::Reject {
-                    code: HEADER_MISMATCH,
-                    ..
-                }
-            ),
-            "an ABSENT Mcp-Name must be rejected even for a name-less method"
+            matches!(out, V2GateOutcome::EnforceOk { .. }),
+            "an ABSENT Mcp-Name on a name-LESS method must be ACCEPTED (D-13)"
         );
     }
 
@@ -5095,10 +5235,17 @@ mod tests {
                     // Only when neither signal is v2.
                     proptest::prop_assert!(!header_is_v2 && !meta_is_v2);
                 },
-                V2GateOutcome::EnforceOk { .. } => {
-                    // Only when BOTH signals are v2 AND all three headers present.
+                V2GateOutcome::EnforceOk { ref name, .. } => {
+                    // Only when BOTH signals are v2, `Mcp-Method` is present, and
+                    // `Mcp-Name` is present OR the method carries no routing name
+                    // (Phase 118 D-13, widened by D-18).
                     proptest::prop_assert!(header_is_v2 && meta_is_v2);
-                    proptest::prop_assert!(have_method && have_name);
+                    proptest::prop_assert!(have_method);
+                    proptest::prop_assert!(have_name || !is_name_bearing_method(&method_val));
+                    // A name is carried ONLY for a name-bearing method (D-20).
+                    if !is_name_bearing_method(&method_val) {
+                        proptest::prop_assert!(name.is_empty());
+                    }
                 },
                 V2GateOutcome::Reject { code, .. } => {
                     proptest::prop_assert_eq!(code, HEADER_MISMATCH);

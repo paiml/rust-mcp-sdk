@@ -45,7 +45,8 @@ mod common;
 
 use common::v2::{
     build_v2_server, header, post, spawn_default_config, spawn_tasks_server, teardown, v1_body,
-    v2_body_with_client_extensions, v2_headers, AuthPosture, Resp, TASKS_TOOL_NAME, V1,
+    v2_body_with_client_extensions, v2_headers, v2_headers_for, AuthPosture, Resp, TASKS_TOOL_NAME,
+    V1,
 };
 use pmcp::testing::V2_TASKS_METHOD_RETIRED;
 use pmcp::types::capabilities::TASKS_EXTENSION_KEY;
@@ -166,17 +167,18 @@ async fn v2_task_post_as(
     task_id: &str,
     extra: &[(String, String)],
 ) -> Resp {
-    let mut headers = v2_headers(method, "");
+    let params = json!({ "taskId": task_id });
+    // `Mcp-Name` is derived from the BODY, exactly as a conformant client derives
+    // it. Since Phase 118 D-18 the server cross-checks it against `params.taskId`
+    // for every `tasks/*` method, so a hard-coded `""` here would be a genuine
+    // `-32020` header/body disagreement and would mask the era gate this file
+    // measures.
+    let mut headers = v2_headers_for(method, &params);
     headers.extend_from_slice(extra);
     post(
         addr,
         &headers,
-        &v2_body_with_client_extensions(
-            method,
-            json!(id),
-            json!({ "taskId": task_id }),
-            &[TASKS_EXTENSION_KEY],
-        ),
+        &v2_body_with_client_extensions(method, json!(id), params, &[TASKS_EXTENSION_KEY]),
     )
     .await
 }

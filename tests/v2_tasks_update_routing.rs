@@ -159,15 +159,29 @@ async fn v1_session(addr: SocketAddr) -> String {
         .unwrap_or_else(|| panic!("a v1 initialize mints a session; body was {}", init.raw))
 }
 
-/// Params that are structurally a `tasks/update` but carry NO addressable task.
+/// The distinctive value the malformed body carries, so the "does the refusal
+/// echo the caller back into the operator's logs?" assertion has something
+/// unmistakable to look for.
+const MALFORMED_MARKER: &str = "gate-ordering-marker-17";
+
+/// The addressable task id [`malformed_update_params`] carries.
 ///
-/// `taskId` is a NUMBER, so the routing-name resolution the router performs
-/// yields `None` and the answer is `-32602`. It is deliberately not "obviously
-/// broken JSON": a body that failed to PARSE would prove nothing about gate
-/// ORDERING, because a parse failure is exactly the outcome these tests exist to
-/// rule out.
+/// It must be a well-formed STRING even though the body is deliberately
+/// malformed: since Phase 118 D-18 the v2 header gate cross-checks `Mcp-Name`
+/// against `params.taskId` for every `tasks/*` method, so a body with no
+/// string task id can never reach the gates this file measures — it is answered
+/// `-32020` at the transport boundary instead. Keeping the id valid and breaking
+/// `inputResponses` is what preserves what these tests exist to measure.
+const MALFORMED_TASK_ID: &str = "malformed-update-task";
+
+/// Params that are structurally a `tasks/update` but whose `inputResponses` is
+/// not an object, so the router answers `-32602`.
+///
+/// It is deliberately not "obviously broken JSON": a body that failed to PARSE
+/// would prove nothing about gate ORDERING, because a parse failure is exactly
+/// the outcome these tests exist to rule out.
 fn malformed_update_params() -> Value {
-    json!({ "taskId": 17, "inputResponses": "not-an-object" })
+    json!({ "taskId": MALFORMED_TASK_ID, "inputResponses": MALFORMED_MARKER })
 }
 
 /// The `error` object of a JSON-RPC response, or a panic naming the raw bytes.
@@ -383,7 +397,14 @@ async fn tasks_update_is_method_not_found_on_v1() {
 async fn malformed_tasks_update_params_yield_32602_not_a_parse_error() {
     let (addr, handle) = spawn_tasks_server(AuthPosture::Optional).await;
 
-    let refused = declaring(addr, TASKS_UPDATE, "", 20, malformed_update_params()).await;
+    let refused = declaring(
+        addr,
+        TASKS_UPDATE,
+        MALFORMED_TASK_ID,
+        20,
+        malformed_update_params(),
+    )
+    .await;
 
     assert_eq!(
         code_of(&refused),
@@ -398,7 +419,7 @@ async fn malformed_tasks_update_params_yield_32602_not_a_parse_error() {
         refused.raw
     );
     assert!(
-        !message_of(&refused).contains("17"),
+        !message_of(&refused).contains(MALFORMED_MARKER),
         "the refusal must not echo the caller's value back into the operator's logs: {}",
         refused.raw
     );
@@ -417,7 +438,14 @@ async fn malformed_tasks_update_params_yield_32602_not_a_parse_error() {
 async fn an_undeclaring_v2_caller_is_refused_before_the_params_parse() {
     let (addr, handle) = spawn_tasks_server(AuthPosture::Optional).await;
 
-    let refused = non_declaring(addr, TASKS_UPDATE, "", 21, malformed_update_params()).await;
+    let refused = non_declaring(
+        addr,
+        TASKS_UPDATE,
+        MALFORMED_TASK_ID,
+        21,
+        malformed_update_params(),
+    )
+    .await;
 
     assert_eq!(
         code_of(&refused),
@@ -449,7 +477,14 @@ async fn an_undeclaring_v2_caller_is_refused_before_the_params_parse() {
 async fn malformed_params_from_an_unauthenticated_caller_yield_32003() {
     let (addr, handle) = spawn_tasks_server(AuthPosture::Optional).await;
 
-    let refused = declaring_anonymous(addr, TASKS_UPDATE, "", 22, malformed_update_params()).await;
+    let refused = declaring_anonymous(
+        addr,
+        TASKS_UPDATE,
+        MALFORMED_TASK_ID,
+        22,
+        malformed_update_params(),
+    )
+    .await;
 
     assert_eq!(
         code_of(&refused),

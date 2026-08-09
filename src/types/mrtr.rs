@@ -286,14 +286,19 @@ pub(crate) fn mrtr_method_static(method: &str) -> Option<&'static str> {
 ///
 /// Derived from [`MRTR_METHODS`] so the client and the server read ONE table.
 ///
-/// # Scope (Phase 114, DQ4)
+/// # Scope (Phase 114 DQ4, narrowed by Phase 118 D-18)
 ///
-/// This answers "where does an MRTR method keep its name", which is ALSO the
-/// server's name-bearing predicate (`is_name_bearing_method`) and therefore
-/// decides which methods get their `Mcp-Name` header cross-checked against the
-/// body. It is NOT the full set of methods that CARRY an `Mcp-Name`: the tasks
-/// methods do, via [`TASK_NAME_BEARING_METHODS`]. Callers that want "every
-/// method with a routing name" want [`name_bearing_key`].
+/// This answers "where does an MRTR method keep its name", and NOTHING else. It
+/// is NOT the full set of methods that carry an `Mcp-Name`: the tasks methods do
+/// too, via [`TASK_NAME_BEARING_METHODS`]. Callers that want "every method with
+/// a routing name" want [`name_bearing_key`].
+///
+/// In particular this is **no longer** the server's name-bearing predicate.
+/// Until Phase 118, `is_name_bearing_method` (in `streamable_http_server.rs`)
+/// read THIS function, so the server required and cross-checked `Mcp-Name` only
+/// for the three MRTR methods while the client emitted it for `tasks/*` as well.
+/// **Phase 118 D-18** repointed that predicate at [`name_bearing_key`], so the
+/// emitter and the validator now resolve through one table.
 pub(crate) fn logical_name_key(method: &str) -> Option<&'static str> {
     Some(mrtr_row(method)?.name_key)
 }

@@ -690,13 +690,39 @@ pub fn v1_body(method: &str, id: Value, params: Value) -> String {
 /// `pmcp::testing` seam and cannot drift at all.
 pub use pmcp::testing::encode_mcp_name as encode_header_value;
 
-/// The three required v2 headers, with `name` sentinel-encoded as needed.
+/// The v2 routing headers, with `name` sentinel-encoded as needed.
 ///
-/// `Mcp-Name` is ALWAYS emitted. Pass `""` for a name-less method such as
-/// `tools/list` — that is the locked cross-plan header rule, and plan 05's client
-/// does exactly the same.
+/// `Mcp-Name` is ALWAYS emitted, including the empty string for a name-less
+/// method such as `tools/list` — that is what plan 05's client does, and the
+/// server still accepts it after Phase 118 D-13 (an empty value on a method with
+/// no routing name is discarded). The header being OPTIONAL there since D-13 does
+/// not make emitting it wrong.
+///
+/// For a NAME-BEARING method the value must agree with the body, so prefer
+/// [`v2_headers_for`], which derives it from the params through the production
+/// table rather than trusting the caller to restate it.
 pub fn v2_headers(method: &str, name: &str) -> Vec<(String, String)> {
     v2_headers_raw(method, &encode_header_value(name))
+}
+
+/// [`v2_headers`] with `Mcp-Name` DERIVED FROM THE BODY, exactly as a conformant
+/// client derives it (Phase 118 D-18).
+///
+/// The routing key is resolved through the PRODUCTION combined table, via the
+/// `pmcp::testing::routing_name_key` seam — so a test cannot restate "where the
+/// name lives" and drift from the server's own predicate. A method with no
+/// routing name, or params carrying no string at its key, yields the empty
+/// string, which the gate discards.
+///
+/// Use this instead of hand-passing `""` for a `tasks/*` request: since D-18 the
+/// server cross-checks `Mcp-Name` against `params.taskId`, so an empty value on a
+/// request that HAS a `taskId` is a genuine `-32020` header/body disagreement.
+pub fn v2_headers_for(method: &str, params: &Value) -> Vec<(String, String)> {
+    let name = pmcp::testing::routing_name_key(method)
+        .and_then(|key| params.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    v2_headers(method, name)
 }
 
 /// [`v2_headers`] without the value encoder, for tests that deliberately send a
