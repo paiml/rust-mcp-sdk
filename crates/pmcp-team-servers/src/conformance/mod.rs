@@ -29,12 +29,21 @@ pub mod era_diff;
 #[cfg(feature = "http")]
 pub mod era_probe;
 
+/// The dual-accept-list ERA TARGET (D-16): a purpose-built server that
+/// advertises BOTH protocol versions and exposes the three CONF-03 deprecated
+/// capabilities as probeable tools. Not a reference server; nothing ships it.
+#[cfg(all(feature = "conformance", feature = "http"))]
+pub mod era_target;
+
 pub use era_observations::{EraObservations, ObservationId, ObservedValue, PROBE_REGISTRY};
 
 #[cfg(feature = "http")]
 pub use era_probe::{
     build_probe_body, extract_jsonrpc_envelope, EraProbeClient, RawProbeOutcome, V2HeaderMode,
 };
+
+#[cfg(all(feature = "conformance", feature = "http"))]
+pub use era_target::{build_era_target_server, spawn_era_target, EraTargetHandle};
 
 pub use era_diff::{
     compare_eras, load_default_baseline, parse_baseline, ClassifiedDifference, DifferenceClass,
