@@ -128,6 +128,45 @@ together. Do not build a second parallel mechanism for CONF-03.
   Supporting evidence for "no new warn": this session's `oauth_store_wiring` flake shows
   warn-capture assertions carry their own maintenance burden.
 
+### Post-research decisions (2026-08-09, resolved with user)
+
+Research (118-RESEARCH.md) surfaced three plan-blocking open questions. All three were
+resolved with the user before planning. These are LOCKED decisions with the same force as
+D-01..D-11.
+
+- **D-12 (resolves Open Question 1): CONF-03 asserts reading (a) — capability reachable via
+  its v2 mechanism.** Under v2 negotiation, Logging is exercised via the
+  `_meta` `io.modelcontextprotocol/logLevel` key, and Sampling/Roots via `InputRequiredResult`
+  (SEP-2322). The v1 RPC shapes (`logging/setLevel`, etc.) stay green under **v1** negotiation
+  only; under v2 the official suite's expectation (removed methods → 404 + -32601) stands.
+  Fixtures in the D-07 matrix encode this via the expected-difference baseline. Reading (b)
+  — v1 RPCs answering under v2 — is rejected; it would contradict the official suite's
+  `server-stateless` scenario.
+
+- **D-13 (resolves Open Question 2): relax the `Mcp-Name` rule to name-bearing methods only.**
+  The user explicitly authorizes this ONE server-behaviour change as an exception to the
+  "adds no protocol behaviour" phase boundary: pmcp's v2 header validation
+  (`require_three_headers`, `streamable_http_server.rs`) changes from "Mcp-Name present on
+  every v2 request" to "Mcp-Name required exactly where the method carries a name, with the
+  strict name/body cross-check kept where it is present". This deliberately reverses the
+  Phase-113 DRIFT-1 adjudication to align with the spec and the official suite; the rustdoc
+  recording the old adjudication must be updated to record the reversal and why.
+  **Follow-up (from Open Question 5):** after this relaxation lands, re-measure the v2
+  conformance profile before finalizing the example's tool/resource/prompt surface — the
+  pre-relaxation numbers (62/91) are a lower bound, not a baseline.
+
+- **D-14 (resolves Open Question 3): D-03's boundary is the suite's SCORED set.** `extension`
+  (all 10 Tasks scenarios) and `pending` checks run and report but cannot fail the job — the
+  suite's own SEP-1730-derived design. The `-o results/` artifact is uploaded so not-scored
+  results stay reviewable at re-pin time; that visibility is what D-03's no-allowlist spirit
+  protects. The Tasks extension is NOT implemented in the example.
+
+- **D-15 (adopts research recommendation, Open Question 4): CONF-02's Rust-harness execution
+  is wired into the NEW blocking conformance job (or a blocking sibling), not into
+  `workspace-test`.** Today no CI job runs `crates/pmcp-team-servers/tests/`; widening
+  `workspace-test` would touch the explicitly-deferred `gate.needs` item. The new job owns
+  the gate for the fixtures it proves.
+
 ### Claude's Discretion
 
 - The subdirectory name and layout for the Node manifest.
