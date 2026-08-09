@@ -52,6 +52,28 @@ exclude = [
     # restated copy of SUBSCHEMA_MAP_KEYWORDS, and `fuzz/` is excluded above.
     # Shipping it would make `cargo test` panic on the published crate.
     "tests/keyword_list_mirrors.rs",
+    # The pinned @modelcontextprotocol/conformance suite (Node manifest, lockfile
+    # and .npmrc) is CI tooling, never crate content — measured: without this entry
+    # `cargo package --list` shipped all three files. 115-REVIEW.md CR-01 is the
+    # precedent for what a stray CI-only artifact costs downstream.
+    # tests/ci_conformance_gate_wiring.rs reads conformance/package-lock.json and
+    # conformance/README.md at runtime to pin the suite version and the two-pin
+    # reconciliation structurally, so shipping the reader while excluding the path
+    # it reads would make `cargo test` panic on the published crate — the same
+    # disposition as tests/team_contracts_conformance.rs above. The two entries
+    # must never be split: ship both or exclude both.
+    # The other two in-tree dispositions were rejected here on purpose.
+    # tests/ci_severance_gate_wiring.rs SHIPS because everything it reads
+    # (.github/workflows/ci.yml, scripts/run-severance-proofs.sh) also ships, so
+    # consistency — not exclusion — is what keeps it honest; that option is closed
+    # here because conformance/ cannot ship. tests/v2_conformance_pin.rs SHIPS while
+    # reading the EXCLUDED .planning/ tree because it returns early on a missing
+    # path, and that tolerance is deliberate there (the pin degrades to a no-op
+    # downstream) but WRONG for the conformance reader, whose whole job is to fail
+    # when the wiring is absent — a reader that silently skips is exactly the
+    # vacuous gate Phase 118 exists to prevent.
+    "conformance/",
+    "tests/ci_conformance_gate_wiring.rs",
     # GSD phase planning (6.3MB) and presentation decks (5.6MB) — workspace
     # scaffolding, not crate content. Also blew the 10MB limit during v2.2.0.
     ".planning/",
