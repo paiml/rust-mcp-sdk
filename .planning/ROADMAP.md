@@ -2744,10 +2744,10 @@ the exact-count regression guard and the D-19 plan-lint.*
 Plans:
 **Wave 1**
 
-- [ ] 118-01-PLAN.md — Wave 1. D-13 + **D-18**: relax `Mcp-Name` to name-bearing methods only AND route the predicate through the COMBINED `name_bearing_key` table so `tasks/*` is validated as well as emitted; live-HTTP proof, byte-level FUZZ arm, contract-first equation (CONF-01)
-- [ ] 118-02-PLAN.md — Wave 1. D-01: the pinned `conformance/` Node manifest + lockfile + `.npmrc` `engine-strict`, `--ignore-scripts`, the ship-both-or-exclude-both packaging disposition, and the ONE canonical zero-check policy + two-pin reconciliation in `conformance/README.md` (CONF-01)
-- [ ] 118-03-PLAN.md — Wave 1. **D-16**: port the Phase-117 era substrate into team-servers — typed observations (`ObservationId`/`ObservedValue`/`PROBE_REGISTRY`, 14 ids), the baseline model + total parser + bidirectional `compare_eras`, the spec-artifact YAML, the schema gate with BOTH coverage directions, and the ALWAYS fuzz target (CONF-02/CONF-03)
-- [ ] 118-10-PLAN.md — Wave 1. D-08's prose-only fixture-format rename, the v1 regression guard tightened to EXACT counts (`failed == 0`, 33 total, exact per-directory + an on-disk file fence), and the **D-19** plan-lint that fails a piped build/test verification without `pipefail` (CONF-02)
+- [x] 118-01-PLAN.md — Wave 1. D-13 + **D-18**: relax `Mcp-Name` to name-bearing methods only AND route the predicate through the COMBINED `name_bearing_key` table so `tasks/*` is validated as well as emitted; live-HTTP proof, byte-level FUZZ arm, contract-first equation (CONF-01)
+- [x] 118-02-PLAN.md — Wave 1. D-01: the pinned `conformance/` Node manifest + lockfile + `.npmrc` `engine-strict`, `--ignore-scripts`, the ship-both-or-exclude-both packaging disposition, and the ONE canonical zero-check policy + two-pin reconciliation in `conformance/README.md` (CONF-01)
+- [x] 118-03-PLAN.md — Wave 1. **D-16**: port the Phase-117 era substrate into team-servers — typed observations (`ObservationId`/`ObservedValue`/`PROBE_REGISTRY`, 14 ids), the baseline model + total parser + bidirectional `compare_eras`, the spec-artifact YAML, the schema gate with BOTH coverage directions, and the ALWAYS fuzz target (CONF-02/CONF-03)
+- [x] 118-10-PLAN.md — Wave 1. D-08's prose-only fixture-format rename, the v1 regression guard tightened to EXACT counts (`failed == 0`, 33 total, exact per-directory + an on-disk file fence), and the **D-19** plan-lint that fails a piped build/test verification without `pipefail` (CONF-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -2793,7 +2793,7 @@ Plans:
 | 115. JSON Schema 2020-12 + Caching Hints | 19/19 | Complete    | 2026-08-02 |
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
-| 118. Conformance Against the Official Suite | 0/10 | Planned — 10 plans in 5 waves (replanned after cross-AI review) | - |
+| 118. Conformance Against the Official Suite | 4/10 | In Progress|  |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
