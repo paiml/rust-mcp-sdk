@@ -17,6 +17,29 @@
 # overhead on top of it.
 #
 # -----------------------------------------------------------------------------
+# RECONCILED AGAINST MEASUREMENT — Phase 118 plan 07, 2026-08-09
+# -----------------------------------------------------------------------------
+# Every row below was seeded PROVISIONAL by plan 118-03 as a CLAIM AWAITING
+# MEASUREMENT. (The literal flag spelling is deliberately not written out in
+# this prose: a grep a comment can trip is a grep nobody trusts, and the
+# release check for "no row is still provisional" is exactly such a grep.)
+#
+# Plan 118-07 measured all fourteen against the live era target over one
+# streamable-HTTP endpoint and cleared every flag: twelve rows reproduced
+# exactly as seeded, and TWO (ERA-01, ERA-11) had their v2 token corrected from
+# the seeded decision to the measured fact. NO ROW IS AWAITING MEASUREMENT ANY
+# MORE.
+#
+# The test that re-derives this file is
+# `era_matrix_is_conformant` in `crates/pmcp-team-servers/tests/era_matrix.rs`:
+#
+#     cargo test -p pmcp-team-servers --features http --test era_matrix
+#
+# (the `--features http` is load-bearing — without it the file is `cfg`-ed out
+# and the run reports zero tests). If a row here stops matching what that test
+# observes, the run FAILS in whichever direction the drift went.
+#
+# -----------------------------------------------------------------------------
 # THE ID CONTRACT (this is what makes the file non-vacuous)
 # -----------------------------------------------------------------------------
 # Every `observation_id` here has a matching entry in
@@ -75,7 +98,8 @@
 #   v1 / v2        What each era does. Short tokens, not prose. The vocabulary
 #                  here IS `ObservedValue::token()`'s vocabulary — one
 #                  vocabulary, two files.
-#   kind           Difference class, for grouping in a report.
+#   kind           Difference class, for grouping in a report. `era-agreement`
+#                  is LOAD-BEARING — see below.
 #
 #   source         Citation a reviewer can check WITHOUT READING RUST. A label
 #                  ("D-07", "spec") is not a citation; `tests/era_baseline.rs`
@@ -85,23 +109,49 @@
 #   note           Optional prose. REQUIRED on provisional entries, where it
 #                  must name the phase that owns the entry.
 #
-#   provisional    `true` when the owning phase is not signed off, so a change
+#   provisional    Set when the owning phase is not signed off, so a change
 #                  there produces a LEGIBLE BASELINE EDIT rather than a mystery
-#                  test failure.
+#                  test failure. AFTER PLAN 118-07, NO ROW CARRIES IT.
 #
 # -----------------------------------------------------------------------------
-# WHAT `provisional` MEANS HERE
+# `kind: era-agreement` — A MEASURED SAMENESS, NOT AN EXEMPTION
 # -----------------------------------------------------------------------------
-# A claim AWAITING MEASUREMENT, owned by a NAMED phase. Every row below is
-# seeded provisional and owned by **Phase 118 plan 07**: the v1/v2 tokens are
-# the DECISION, and plan 07 is where measurement against the live era target
-# either confirms them or produces a legible edit to this file.
+# Two rows (ERA-01, ERA-11) record v1 and v2 tokens that are EQUAL. They were
+# seeded as retirements — `initialize` and `logging/setLevel` disappearing on
+# v2 — and measurement showed this SDK retires neither. Rather than delete the
+# rows (which would delete their probes too, under the id contract above, and
+# with them the only thing that would ever notice the retirement landing), they
+# now record what was measured.
 #
-# `compare_eras` still classifies a provisional entry as MISSING, exactly like a
+# THIS IS NOT AN ALLOWLIST OF FAILURES, and nothing about it suppresses a suite
+# result. It is a claim that fires in BOTH directions:
+#
+#   * if the two eras ever START differing for that id, the observed pair no
+#     longer agrees with the recorded pair and the matrix reports UNEXPECTED;
+#   * if either token MOVES while the two still agree, the observed pair no
+#     longer equals the recorded pair and the matrix reports MISSING.
+#
+# Three independent conditions are required before a row is treated this way,
+# and `tests/era_baseline.rs` + `tests/era_matrix.rs` check all three: `kind`
+# must be exactly `era-agreement`, the row's own `v1` and `v2` must be equal,
+# and BOTH OBSERVED tokens must equal that recorded value. The number of such
+# rows is additionally CAPPED at the two measured here
+# (`MAXIMUM_AGREEMENT_ROWS` in `tests/era_baseline.rs`), so the mechanism cannot
+# quietly grow into a general escape hatch.
+#
+# Both are declared gaps under Phase 118 decision D-21; see
+# `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
+#
+# -----------------------------------------------------------------------------
+# WHERE THE `provisional` EXEMPTION LIVES
+# -----------------------------------------------------------------------------
+# `compare_eras` classifies a provisional entry as MISSING, exactly like a
 # non-provisional one — the flag is carried on the classified row and changes
 # only the RENDER (`[PROVISIONAL]` instead of nothing). Any exemption is applied
 # by the CONSUMING test, where it is visible, and never by the comparator, where
-# a stale provisional row would become permanently invisible.
+# a stale provisional row would become permanently invisible. After plan 118-07
+# no row carries the flag, so that exemption is dead by construction and
+# `era_matrix_is_conformant` asserts a provisional-MISSING count of zero.
 # =============================================================================
 
 schema_version: 1
@@ -117,11 +167,11 @@ deltas:
     observation_id: method.initialize
     subject: "method:initialize"
     v1: served
-    v2: absent
-    kind: method-removed
-    source: "src/client/mod.rs:592 and :761 (v2_synthetic_initialize_result); .planning/REQUIREMENTS.md CLNT-01"
-    note: "Phase 118 plan 07 owns the measurement. A v2 client's InitializeResult is LOCAL AND SYNTHETIC — no byte of it came from the server."
-    provisional: true
+    v2: served
+    kind: era-agreement
+    source: "MEASURED 2026-08-09 over the live era target: the v2 POST answers 200 with protocolVersion 2025-11-25. src/types/protocol/version.rs:22-33 (negotiate_protocol_version never returns 2026-07-28); the seeded claim cited src/client/mod.rs:592 and :761 (v2_synthetic_initialize_result), which is a CLIENT-side fact"
+    note: "TOKEN CORRECTED by Phase 118 plan 07: seeded v2 `absent`, measured v2 `served`. The seeded row's own citation is client-side — a v2 pmcp client synthesizes its InitializeResult locally and never sends the request — while this probe is server-side, and the SERVER still accepts initialize for backward tolerance. Declared under D-21 in 118-CONFORMANCE-GAPS.md."
+    provisional: false
 
   - id: ERA-02
     observation_id: method.server_discover
@@ -130,8 +180,8 @@ deltas:
     v2: served
     kind: method-added
     source: "src/server/core.rs:1944 (build_discover_response answers -32601 for any non-V2 request); :1180 (project_capabilities_for_v2)"
-    note: "Phase 118 plan 07 owns the measurement. v2 replaces the initialize handshake with a read-only capability projection."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07 against the live era target; reproduces exactly as seeded. v2 replaces the initialize handshake with a read-only capability projection."
+    provisional: false
 
   - id: ERA-03
     observation_id: header.mcp_session_id
@@ -140,8 +190,8 @@ deltas:
     v2: never-minted-inbound-ignored
     kind: header-removed
     source: "src/server/streamable_http_server/v1_session.rs:333 (sessions_active_for); :552 (spec quote: \"ignore it, and do not mint or echo session IDs\")"
-    note: "Phase 118 plan 07 owns the measurement against the live era target."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07 against the live era target; reproduces exactly as seeded."
+    provisional: false
 
   - id: ERA-04
     observation_id: header.mcp_method_and_name
@@ -150,8 +200,8 @@ deltas:
     v2: required-and-cross-checked
     kind: header-required-on-v2
     source: "src/shared/http_constants.rs:65,73 (MCP_METHOD, MCP_NAME); .planning/REQUIREMENTS.md VERS-05"
-    note: "Phase 118 plan 07 owns the measurement. Phase 118 D-13 relaxes the Mcp-Name arm to name-bearing methods only; the strict header/body cross-check is kept where the header IS present, because a desync is a smuggling signal and is rejected fail-closed."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded. Phase 118 D-13 relaxes the Mcp-Name arm to name-bearing methods only; the strict header/body cross-check is kept where the header IS present, because a desync is a smuggling signal and is rejected fail-closed."
+    provisional: false
 
   - id: ERA-05
     observation_id: header.last_event_id
@@ -160,8 +210,8 @@ deltas:
     v2: ignored
     kind: feature-removed
     source: "src/server/streamable_http_server/v1_session.rs:433 (resumability_active_for — the resumability era gate); .planning/REQUIREMENTS.md (standing out-of-scope ruling on v2 resumability)"
-    note: "Phase 118 plan 07 owns the measurement against the live era target."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07 against the live era target; reproduces exactly as seeded. Requires the pmcp `v1-compat` feature, which this crate's `http` feature now names explicitly."
+    provisional: false
 
   - id: ERA-06
     observation_id: http.verb.get_delete
@@ -170,8 +220,8 @@ deltas:
     v2: "status:405"
     kind: verb-rejected-on-v2
     source: "src/server/streamable_http_server.rs:1709 (v2_method_not_allowed) and :1720 (v2_verb_rejection)"
-    note: "Phase 118 plan 07 owns the measurement. Also gated on the server's v2 accept-list, so a v1-only server never answers 405 to a legitimate v1 GET."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded. Also gated on the server's v2 accept-list, so a v1-only server never answers 405 to a legitimate v1 GET."
+    provisional: false
 
   - id: ERA-07
     observation_id: result.result_type
@@ -180,8 +230,8 @@ deltas:
     v2: present
     kind: field-added-on-v2
     source: "src/server/core.rs:1570 (the v2-only response envelope injects resultType + serverInfo); :1307 (the disposition discriminator)"
-    note: "Phase 118 plan 07 owns the measurement. Discriminator values are complete / input_required / task, defaulting to complete when absent."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded. Discriminator values are complete / input_required / task, defaulting to complete when absent."
+    provisional: false
 
   - id: ERA-08
     observation_id: result.server_info
@@ -190,8 +240,8 @@ deltas:
     v2: present
     kind: field-added-on-v2
     source: "src/server/core.rs:1568 (RESERVED_SERVER_INFO_KEY = io.modelcontextprotocol/serverInfo); :1570 (v2 envelope injection)"
-    note: "Phase 118 plan 07 owns the measurement. v2 results carry serverInfo because there is no initialize response to carry it; the probe accepts it at the top of the result OR under the result's `_meta`."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded. v2 results carry serverInfo because there is no initialize response to carry it; the probe accepts it at the top of the result OR under the result's `_meta`."
+    provisional: false
 
   - id: ERA-09
     observation_id: result.cache_scope
@@ -200,8 +250,8 @@ deltas:
     v2: required
     kind: field-required-on-v2
     source: "src/server/core.rs:1583-1613 (the 2026-07-28 CacheableResult hints); .planning/phases/115-json-schema-2020-12-structured-output-caching-hints/115-CONTEXT.md D-07 (AMENDED 2026-08-01) and D-08"
-    note: "Phase 118 plan 07 owns the measurement. REQUIRED, not optional — the schema declares CacheableResult with no `?` on either field. SDK default is ttlMs 0 / cacheScope private, the SAFE default rather than the convenient one."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded. REQUIRED, not optional — the schema declares CacheableResult with no `?` on either field. SDK default is ttlMs 0 / cacheScope private, the SAFE default rather than the convenient one."
+    provisional: false
 
   - id: ERA-10
     observation_id: http.status.error_code_mapping
@@ -210,24 +260,24 @@ deltas:
     v2: era-gated-table
     kind: status-mapping-era-gated
     source: "src/server/streamable_http_server.rs:735 (v2_status_for_code); the era-gating test status_mapping_is_era_gated_so_v1_is_untouched at :4742"
-    note: "Phase 118 plan 07 owns the measurement against the live era target."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07 against the live era target; reproduces exactly as seeded. The probe sends the REAL method tasks/list, which both eras refuse with -32601 and which differ only in the status carrying it (200 on v1, 404 on v2)."
+    provisional: false
 
   # ---------------------------------------------------------------------------
-  # ERA-11 … ERA-14 — the FOUR NEW CONF-03 rows, encoding D-12's settled
-  # reading: a deprecated capability is proved REACHABLE VIA ITS v2 MECHANISM,
-  # not by the v1 RPC answering under v2. Added under D-17, which closed off
-  # extending the fixture format to carry them.
+  # ERA-11 … ERA-14 — the FOUR CONF-03 rows, encoding D-12's settled reading: a
+  # deprecated capability is proved REACHABLE VIA ITS v2 MECHANISM, not by the
+  # v1 RPC answering under v2. Added under D-17, which closed off extending the
+  # fixture format to carry them.
   # ---------------------------------------------------------------------------
   - id: ERA-11
     observation_id: method.logging_set_level
     subject: "method:logging/setLevel"
     v1: served
-    v2: "error:-32601"
-    kind: method-removed
-    source: "MCP 2026-07-28 schema, io.modelcontextprotocol/logLevel description: \"Replaces the former `logging/setLevel` RPC\"; 118-RESEARCH.md:900 quotes it verbatim; the suite's server-stateless scenario expects 404 + -32601 for removed methods"
-    note: "Phase 118 plan 07 owns the measurement. Under D-12 the v1 RPC shape stays green under v1 negotiation ONLY; reading (b) — v1 RPCs answering under v2 — was explicitly rejected because it contradicts the official suite."
-    provisional: true
+    v2: served
+    kind: era-agreement
+    source: "MEASURED 2026-08-09 over the live era target: both eras answer HTTP 200 with no error. src/server/mod.rs:1897-1901 lumps ClientRequest::SetLoggingLevel in with Subscribe / Unsubscribe / Complete / Ping and answers Ok(json!({})) with NO era branch anywhere in src/"
+    note: "TOKEN CORRECTED by Phase 118 plan 07: seeded v2 `error:-32601`, measured v2 `served`. The 2026-07-28 schema says io.modelcontextprotocol/logLevel \"Replaces the former `logging/setLevel` RPC\", so the retirement is MISSING in this SDK — gap G-5, declared under D-21 in 118-CONFORMANCE-GAPS.md. The REPLACEMENT works: ERA-12 (ignored -> honored) reproduces, and tests/era_matrix.rs drives the _meta key to completion under v2."
+    provisional: false
 
   - id: ERA-12
     observation_id: meta.log_level
@@ -236,8 +286,8 @@ deltas:
     v2: honored
     kind: mechanism-replaced
     source: "MCP 2026-07-28 schema key io.modelcontextprotocol/logLevel (per-request log level, replacing the RPC); 118-RESEARCH.md:899-901; 118-CONTEXT.md:137 (D-12)"
-    note: "Phase 118 plan 07 owns the measurement. This row and ERA-11 are one capability seen from both ends: the RPC goes away and the `_meta` key takes over. Deprecation is per-MECHANISM, not per-capability."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded, and is additionally driven to completion by a typed client in tests/era_matrix.rs (v2 reports levelSource `request-meta`, v1 reports `server-default`). This row and ERA-11 are one capability seen from both ends: the `_meta` key takes over, and the RPC was supposed to go away. Deprecation is per-MECHANISM, not per-capability."
+    provisional: false
 
   - id: ERA-13
     observation_id: result.input_required.sampling
@@ -246,8 +296,8 @@ deltas:
     v2: present
     kind: mechanism-replaced
     source: "src/types/mrtr.rs:686 (InputRequiredResult: resultType + inputRequests + requestState); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-sampling)"
-    note: "Phase 118 plan 07 owns the measurement. v2 is stateless with no server->client request channel mid-call, so the spec-blessed shape for Sampling is an InputRequiredResult continuation, not a nested request."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded, and the v2 continuation is driven to a COMPLETED tool result by a typed client in tests/era_matrix.rs. The v1 `absent` token additionally reflects gap G-3: over StreamableHttpServer no peer handle exists, so no server-to-client sampling/createMessage can be issued at all."
+    provisional: false
 
   - id: ERA-14
     observation_id: result.input_required.roots
@@ -256,5 +306,5 @@ deltas:
     v2: present
     kind: mechanism-replaced
     source: "src/types/mrtr.rs:686 (InputRequiredResult); SEP-2322; 118-RESEARCH.md:903-904 (the suite's v2 set carries input-required-result-basic-list-roots)"
-    note: "Phase 118 plan 07 owns the measurement. Same mechanism as ERA-13, applied to Roots: the server asks for roots by RETURNING an input_required result rather than by issuing a roots/list request."
-    provisional: true
+    note: "MEASURED 2026-08-09 by Phase 118 plan 07; reproduces exactly as seeded, and the v2 continuation is driven to a COMPLETED tool result by a typed client in tests/era_matrix.rs. Same mechanism as ERA-13, applied to Roots: the server asks for roots by RETURNING an input_required result rather than by issuing a roots/list request."
+    provisional: false

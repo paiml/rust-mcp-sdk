@@ -115,10 +115,10 @@ pub type Result<T> = std::result::Result<T, BaselineError>;
 ///
 /// let baseline = load_default_baseline().expect("the shipped baseline parses");
 /// let delta = baseline
-///     .find_by_observation_id("method.initialize")
-///     .expect("ERA-01 is seeded");
-/// assert_eq!(delta.v1, "served");
-/// assert_eq!(delta.v2, "absent");
+///     .find_by_observation_id("method.server_discover")
+///     .expect("ERA-02 is recorded");
+/// assert_eq!(delta.v1, "error:-32601");
+/// assert_eq!(delta.v2, "served");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EraDelta {
@@ -788,21 +788,21 @@ impl EraComparisonReport {
 ///     compare_eras, load_default_baseline, DifferenceClass,
 /// };
 /// use pmcp_team_servers::conformance::era_observations::{
-///     EraObservations, ObservedValue, METHOD_INITIALIZE,
+///     EraObservations, ObservedValue, METHOD_SERVER_DISCOVER,
 /// };
 ///
 /// let baseline = load_default_baseline().expect("parses");
 ///
 /// let mut v1 = BTreeMap::new();
-/// v1.insert(METHOD_INITIALIZE, ObservedValue::Text("served".into()));
+/// v1.insert(METHOD_SERVER_DISCOVER, ObservedValue::Text("error:-32601".into()));
 /// let mut v2 = BTreeMap::new();
-/// v2.insert(METHOD_INITIALIZE, ObservedValue::Text("absent".into()));
+/// v2.insert(METHOD_SERVER_DISCOVER, ObservedValue::Text("served".into()));
 ///
 /// let (differences, _suspicion) =
 ///     compare_eras(&EraObservations(v1), &EraObservations(v2), &baseline);
 /// let row = differences
 ///     .iter()
-///     .find(|d| d.observation_id == "method.initialize")
+///     .find(|d| d.observation_id == "method.server_discover")
 ///     .expect("classified");
 /// assert_eq!(row.class, DifferenceClass::Expected);
 /// ```
