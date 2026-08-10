@@ -82,7 +82,49 @@ member-llm = ["pmcp-agent/openai-compat"]
 # (the `full` dev-dep previously masked this via feature unification). The
 # HTTP-first team-mcp binary also serves members against a real LLM, so `http`
 # pulls in `member-llm`. Gated so a stdio-only build stays clean.
-http = ["pmcp/streamable-http", "pmcp/http", "member-llm", "dep:url"]
+#
+# `dep:reqwest` (Phase 118, CONF-02/CONF-03): the era probes in
+# `src/conformance/era_probe.rs` need a RAW HTTP client because the typed
+# `pmcp::Client` surface deliberately hides the wire facts the era baseline is
+# made of — response headers, HTTP statuses and raw envelope keys. `http` is
+# NON-DEFAULT and already pulls reqwest transitively via `member-llm`
+# (`pmcp-agent/openai-compat`), so naming it here costs ZERO new registry
+# packages (T-118-SC) and the DEFAULT and wasm32 builds stay reqwest-free —
+# which is the property this feature block exists to protect (T-118-71).
+#
+# `pmcp/testing` (Phase 118): a raw v2 request body cannot be built without the
+# three reserved `_meta` key spellings, because the server's era gate requires
+# the `MCP-Protocol-Version` HEADER and the `_meta` value to AGREE and rejects a
+# header-only claim with `-32020 HEADER_MISMATCH`. pmcp's own constants are
+# `pub(crate)` (`src/types/protocol/context.rs:304`) and their only public
+# re-export (`pmcp::testing::META_*`) sits behind pmcp's `testing` feature.
+# `testing = []` is a ZERO-DEPENDENCY code gate (root `Cargo.toml:311`), and the
+# in-repo `s52` example enables it for exactly this reason ("the example reads
+# the reserved `_meta` key spellings from `pmcp::testing`"), so this is the
+# sanctioned pattern rather than re-spelling the strings here and hoping they do
+# not drift.
+#
+# `pmcp/v1-compat` (Phase 118): the v1 SESSION + RESUMABILITY compatibility layer.
+# It is a member of pmcp's `default`, but this manifest pins
+# `default-features = false`, so it was OFF here and only appeared through the
+# `full` DEV-dependency — the classic feature-unification false green
+# (`cargo test` sees dev-deps, `cargo build` does not). It is load-bearing for
+# the era comparison in three separate places: `StreamableHttpServerConfig`'s
+# `session_id_generator` field and `http_constants::LAST_EVENT_ID` are both
+# `#[cfg(feature = "v1-compat")]`, and without them the era target has no v1
+# session path at all — so `header.mcp_session_id`, `header.last_event_id` and
+# `http.verb.get_delete` would report the SAME token under both eras and three
+# observations would silently collapse. `v1-compat = []` is a zero-dependency
+# code gate, so this costs no package either.
+http = [
+  "pmcp/streamable-http",
+  "pmcp/http",
+  "pmcp/testing",
+  "pmcp/v1-compat",
+  "member-llm",
+  "dep:url",
+  "dep:reqwest",
+]
 # Aggregate: all four server surfaces attached at once. compose::wiring (109-06)
 # cfg-gates its attachment branches behind this.
 runtime = ["team-fs", "mem-mcp", "approval-mcp", "team-mcp"]
