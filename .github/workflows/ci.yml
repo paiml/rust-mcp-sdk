@@ -758,7 +758,7 @@ jobs:
   # Reports as "gate" to match the org ruleset's required status check.
   gate:
     runs-on: ubuntu-latest
-    needs: [test, quality-gate, purity-check, pmcp-agent-targets, wasm32-purity, v1-severance]
+    needs: [test, quality-gate, purity-check, pmcp-agent-targets, wasm32-purity, v1-severance, conformance-suite, era-matrix]
     if: always()
     steps:
       - name: Evaluate required checks
@@ -769,14 +769,18 @@ jobs:
           AGENT_TARGETS_RESULT: ${{ needs.pmcp-agent-targets.result }}
           WASM32_RESULT: ${{ needs.wasm32-purity.result }}
           SEVERANCE_RESULT: ${{ needs.v1-severance.result }}
+          CONFORMANCE_RESULT: ${{ needs.conformance-suite.result }}
+          ERA_MATRIX_RESULT: ${{ needs.era-matrix.result }}
         run: |
           if [[ "$TEST_RESULT" != "success" ]] || \
              [[ "$QG_RESULT" != "success" ]] || \
              [[ "$PURITY_RESULT" != "success" ]] || \
              [[ "$AGENT_TARGETS_RESULT" != "success" ]] || \
              [[ "$WASM32_RESULT" != "success" ]] || \
-             [[ "$SEVERANCE_RESULT" != "success" ]]; then
-            echo "Required checks failed: test=$TEST_RESULT, quality-gate=$QG_RESULT, purity-check=$PURITY_RESULT, pmcp-agent-targets=$AGENT_TARGETS_RESULT, wasm32-purity=$WASM32_RESULT, v1-severance=$SEVERANCE_RESULT"
+             [[ "$SEVERANCE_RESULT" != "success" ]] || \
+             [[ "$CONFORMANCE_RESULT" != "success" ]] || \
+             [[ "$ERA_MATRIX_RESULT" != "success" ]]; then
+            echo "Required checks failed: test=$TEST_RESULT, quality-gate=$QG_RESULT, purity-check=$PURITY_RESULT, pmcp-agent-targets=$AGENT_TARGETS_RESULT, wasm32-purity=$WASM32_RESULT, v1-severance=$SEVERANCE_RESULT, conformance-suite=$CONFORMANCE_RESULT, era-matrix=$ERA_MATRIX_RESULT"
             exit 1
           fi
           echo "All required checks passed."
