@@ -739,20 +739,40 @@ async fn v2_capability_arm(url: &url::Url) {
         "v2 dep__log_emit",
     );
 
-    // G-5, PINNED AS MEASURED. The v2 schema retires the RPC; this SDK does
-    // not. Recorded as a tripwire so the day it IS retired, the failure names
-    // what to change.
+    // G-5, CLOSED AND PINNED. The 2026-07-28 schema retires the RPC, and since
+    // Phase 118.1 plan 05 this SDK retires it too — by method STRING at the v2
+    // ingress, so the refusal does not depend on the params parsing. The
+    // tripwire now guards the CLOSED state: it fires if the retirement is ever
+    // undone.
+    //
+    // This assertion was FLIPPED by plan 05, following the instruction its own
+    // pre-flip failure message gave verbatim. ERA-11 moved to v1 `served` / v2
+    // `error:-32601` with `kind: method-removed` in the SAME commit.
     let retired = client
         .set_logging_level(pmcp::types::notifications::LoggingLevel::Debug)
         .await;
-    assert!(
-        retired.is_ok(),
-        "FAILURE MODE: v2 `logging/setLevel` was REFUSED ({retired:?}).\n\
-         CONSEQUENCE: none — this is the CORRECT behaviour per the 2026-07-28 schema, and gap \
-         G-5 in 118-CONFORMANCE-GAPS.md has been closed.\n\
-         WHAT TO DO: flip this assertion to expect the refusal, change baseline row ERA-11 back \
-         to v1 `served` / v2 `error:-32601` with `kind: method-removed`, and strike G-5 from the \
-         gaps file. Do NOT re-open the gap to make this assertion pass."
+    let Err(error) = retired else {
+        panic!(
+            "FAILURE MODE: v2 `logging/setLevel` was SERVED, not refused.\n\
+             CONSEQUENCE: gap G-5 has REGRESSED — the SDK is answering an RPC the 2026-07-28 \
+             core schema removed, so it serves a surface the era it claims to speak does not \
+             define, and the official conformance suite's removed-methods probe will fail on it.\n\
+             WHAT TO DO: restore the v2 ingress retirement in \
+             src/server/streamable_http_server.rs (the V2_RETIRED_METHODS table). Do NOT relax \
+             this assertion, and do NOT move baseline row ERA-11 back to `era-agreement`; \
+             tests/v2_retired_methods.rs is the wire-level proof of the same fact and will be \
+             red alongside it."
+        );
+    };
+    assert_eq!(
+        error.error_code(),
+        Some(pmcp::ErrorCode::METHOD_NOT_FOUND),
+        "FAILURE MODE: v2 `logging/setLevel` was refused with {error:?}, not METHOD_NOT_FOUND.\n\
+         CONSEQUENCE: the method is unreachable, but for the wrong reason — a retirement the \
+         suite scores on the CODE (-32601) would not be credited, and the refusal could be a \
+         capability, auth or params rejection wearing a retirement's clothes.\n\
+         WHAT TO DO: check that the retirement still emits METHOD_NOT_FOUND through \
+         v2_status_for_code rather than some nearer-to-hand error."
     );
 
     // SAMPLING and ROOTS, v2 mechanism: the server answers `input_required`,

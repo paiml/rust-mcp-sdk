@@ -91,9 +91,18 @@ const AGREEMENT_KIND: &str = "era-agreement";
 
 /// Hard cap on how many rows may carry [`AGREEMENT_KIND`].
 ///
-/// Exactly the two plan 118-07 measured: ERA-01 (`initialize` still served on
+/// It has ZERO occupants, and that is the correct resting state. It was sized
+/// for the two rows plan 118-07 measured — ERA-01 (`initialize` still served on
 /// v2) and ERA-11 (`logging/setLevel` still served on v2), both declared gaps
-/// under Phase 118 decision D-21.
+/// under Phase 118 decision D-21. Phase 118.1 plan 05 CLOSED that gap by
+/// retiring all five methods the 2026-07-28 schema removes, so both rows differ
+/// across the eras again and both are back to `kind: method-removed`.
+///
+/// The cap is deliberately NOT lowered to zero along with them. A `<=` cap with
+/// no occupants keeps the mechanism available for a genuinely measured sameness
+/// without keeping a record of one that no longer exists; lowering it would turn
+/// the next legitimate use into a gate change, which is exactly the pressure
+/// that makes reviewers raise caps silently.
 ///
 /// The cap exists because an agreement row is the ONE row shape whose MISSING
 /// classification `tests/era_matrix.rs` does not treat as a finding. Capping it

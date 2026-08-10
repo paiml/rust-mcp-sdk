@@ -824,6 +824,25 @@ fn create_error_response_with_id(
 /// v2 rather than `-32602`/400. Distinguishing the two requires a method-string
 /// table this layer does not own; plan 06 (MRTR param parse errors) adds the
 /// precise per-parameter mapping.
+///
+/// # Its interaction with v2 METHOD RETIREMENT (Phase 118.1 plan 05)
+///
+/// Stated precisely, because the imprecise version is misleading in both
+/// directions. This function runs on the PARSE-FAILURE branch of the ingress, so
+/// it sits EARLIER in the pipeline than [`run_v2_header_gate`], not later — the
+/// five [`V2_RETIRED_METHODS`] do not "short-circuit before" it. What is true is
+/// that a retired method reaches `-32601`/404 on v2 by TWO disjoint routes:
+///
+/// * params that do NOT deserialize — this function, via the limitation above;
+/// * params that DO deserialize — [`retire_v2_method`] at the header gate, which
+///   is the route the variant-keyed predicate it replaced could never take.
+///
+/// Both routes emit the same code and the same status, so for those five methods
+/// the limitation above is no longer observable on the wire; only the message
+/// text differs. That coincidence is exactly why the official suite's
+/// `initialize` and `logging/setLevel` retirement checks passed for the WRONG
+/// reason before plan 05, and why `tests/v2_retired_methods.rs` — which sends
+/// WELL-FORMED params — is the artifact that actually proves the retirement.
 async fn map_unparsed_body_for_v2(
     state: &ServerState,
     raw_body: &[u8],
@@ -1189,6 +1208,129 @@ fn classify_v2_request(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v2 METHOD RETIREMENT (Phase 118.1 plan 05, CONF-05 / gap G-5).
+//
+// The 2026-07-28 core schema REMOVES five RPCs. Retirement is keyed on the
+// method NAME STRING, not on a parsed `ClientRequest` variant: the variant match
+// this replaced could only ever see requests whose params had already
+// deserialized, which is not the shape a conformance client sends.
+// ---------------------------------------------------------------------------
+
+/// The per-request `_meta` key that REPLACES the `logging/setLevel` RPC.
+///
+/// Spelled here because `src/` owns no constant for it: the key is read by
+/// APPLICATION code off the request metadata, never by a core dispatch arm, so
+/// no production module has claimed it. It exists as a named constant purely so
+/// the retirement table below has one `&'static str` per replacement and the
+/// rejection message can never be assembled from peer-supplied bytes.
+const LOG_LEVEL_REQUEST_META_KEY: &str = "io.modelcontextprotocol/logLevel";
+
+/// THE retirement set: every RPC the MCP `2026-07-28` core schema removes, paired
+/// with the mechanism that replaces it (`None` where the schema offers none).
+///
+/// # One home, deliberately
+///
+/// Both POST entrypoints reach this table through the SINGLE
+/// [`run_v2_header_gate`] call, so the fast path and the middleware path cannot
+/// disagree about which methods are gone. That single-home property is the same
+/// one the dispatch-level `dispatch_request_or_retire` seam used to provide; the
+/// predicate simply moved earlier, to where the method STRING is available.
+///
+/// # Why exactly these five
+///
+/// Corroborated two independent ways:
+///
+/// 1. The vendored `schema/vendored/core-2026-07-28/schema.ts` method inventory
+///    lists 21 methods, and all five below are ABSENT from it.
+/// 2. The pinned official conformance suite iterates exactly this list and
+///    requires HTTP `404` plus JSON-RPC `-32601` for each.
+///
+/// `notifications/initialized` is likewise absent from the schema and is
+/// deliberately NOT here: it is a NOTIFICATION, so it carries no JSON-RPC id and
+/// has no response envelope in which a `-32601` could be delivered.
+const V2_RETIRED_METHODS: [(&str, Option<&str>); 5] = [
+    (
+        "initialize",
+        Some(crate::types::protocol::SERVER_DISCOVER_METHOD),
+    ),
+    // No replacement: v2 has no liveness RPC at all. See `v2_retirement_message`.
+    ("ping", None),
+    ("logging/setLevel", Some(LOG_LEVEL_REQUEST_META_KEY)),
+    (
+        "resources/subscribe",
+        Some(crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD),
+    ),
+    (
+        "resources/unsubscribe",
+        Some(crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD),
+    ),
+];
+
+/// The [`V2_RETIRED_METHODS`] entry `method` names, matched by EXACT BYTE
+/// EQUALITY.
+///
+/// No case folding, no trimming, no prefix matching, no Unicode normalization
+/// (T-118.1-05-01). The method string arrives from an untrusted peer at a point
+/// EARLIER and less validated than typed parsing, so any leniency here is a way
+/// to force — or to dodge — a retirement the literal wire value does not ask for.
+/// `Initialize`, `` ping`` with a leading space and `logging/setlevel` are all
+/// NOT retired, and a unit test asserts it.
+///
+/// Returns the TABLE's own `&'static str`, never the caller's slice, so a
+/// rejection message built from this can never echo peer-supplied bytes
+/// (T-118.1-05-02).
+fn v2_retired_method(method: &str) -> Option<(&'static str, Option<&'static str>)> {
+    V2_RETIRED_METHODS
+        .iter()
+        .copied()
+        .find(|(retired, _)| *retired == method)
+}
+
+/// The `-32601` message a retired method answers with.
+///
+/// Both halves are `&'static str` from [`V2_RETIRED_METHODS`]. `ping` has no
+/// replacement clause because the 2026-07-28 transport removed the liveness RPC
+/// outright rather than relocating it, and inventing a substitute here would send
+/// an operator looking for a method that does not exist.
+fn v2_retirement_message(retired: &'static str, replacement: Option<&'static str>) -> String {
+    replacement.map_or_else(
+        || format!("Method not found: {retired} (retired in MCP 2026-07-28)"),
+        |replacement| {
+            format!("Method not found: {retired} (retired in MCP 2026-07-28; use {replacement})")
+        },
+    )
+}
+
+/// Turn an ACCEPTED v2 request for a retired method into its `-32601` rejection.
+///
+/// # Why this runs AFTER the header matrix, not before it
+///
+/// It consults only [`V2GateOutcome::EnforceOk`], which
+/// [`classify_v2_request`] produces only once `cross_check_method` has confirmed
+/// the `Mcp-Method` header and the JSON-RPC body method are the SAME string. A
+/// retirement decided before that cross-check would let a peer send
+/// `Mcp-Method: tools/call` with a body method of `ping` and collect a `404`
+/// instead of the `-32020` header/body disagreement — turning a smuggling signal
+/// into a routine-looking refusal. Ordering it here keeps the desync fail-closed.
+///
+/// The status is NOT chosen here: `METHOD_NOT_FOUND` reaches the wire through
+/// [`v2_status_for_code`], which maps it to `404`. A call-site status choice is
+/// exactly the drift Phase 113 removed.
+fn retire_v2_method(outcome: V2GateOutcome) -> V2GateOutcome {
+    let V2GateOutcome::EnforceOk { ref method, .. } = outcome else {
+        return outcome;
+    };
+    let Some((retired, replacement)) = v2_retired_method(method) else {
+        return outcome;
+    };
+    V2GateOutcome::Reject {
+        code: crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+        message: v2_retirement_message(retired, replacement),
+        data: None,
+    }
+}
+
 /// Extract the untrusted `(method, logical-name)` pair from the raw JSON-RPC body.
 ///
 /// Re-parses the raw bytes (the transport parse already succeeded) so the
@@ -1520,6 +1662,11 @@ async fn run_v2_header_gate(
     let (extracted_method, body_name) = method_and_name_of(body_json.as_ref());
     let body_method = body_method_override.or(extracted_method.as_deref());
     let outcome = classify_v2_request(headers, meta_is_v2, body_method, body_name.as_deref());
+    // v2 METHOD RETIREMENT (CONF-05 / G-5), keyed on the method STRING and
+    // evaluated for every accepted v2 request — including the ones whose typed
+    // parse would have succeeded and whose dispatch would therefore have SERVED
+    // them. Runs after `classify_v2_request` on purpose; see `retire_v2_method`.
+    let outcome = retire_v2_method(outcome);
     // MRTR params (HTTP-03): read on the ACCEPTED v2 path only, and only for an
     // MRTR-ELIGIBLE method; a present but unusable field becomes an
     // `INVALID_PARAMS` rejection here, BEFORE dispatch. `body_method` is the
@@ -2590,10 +2737,10 @@ async fn handle_fast_path_request(
     let live_id = id.clone();
     // Thread the ALREADY-RESOLVED ProtocolContext into dispatch — the HTTP layer
     // resolved it once for the header gate; dispatch does NOT re-resolve (Plan 06
-    // / D-11 / Pitfall 2). The shared seam also retires the v2-removed
-    // `resources/subscribe`/`unsubscribe` (HTTP-04) identically on both paths.
+    // / D-11 / Pitfall 2). Every method the 2026-07-28 schema retired was already
+    // refused by the v2 ingress gate, which ran before this.
     let json_response =
-        dispatch_request_or_retire(state, id, request, auth_context, protocol_context).await;
+        dispatch_public_request(state, id, request, auth_context, protocol_context).await;
 
     tracing::debug!(
         target: "mcp.http",
@@ -2933,7 +3080,8 @@ async fn assemble_tasks_update_with_middleware(
 // Both are GONE from the 2026-07-28 schema — the only surviving mention is the
 // "Replaces the former `resources/subscribe` RPC" comment on
 // `SubscriptionFilter.resourceSubscriptions`. On v2 they answer `404` + `-32601`
-// via [`v2_retired_method_of`]; the v1 path is completely untouched.
+// through the [`V2_RETIRED_METHODS`] table at the v2 ingress, alongside the three
+// other RPCs that era removes; the v1 path is completely untouched.
 // ===========================================================================
 
 /// Disable proxy response buffering so SSE frames reach the client immediately.
@@ -2944,60 +3092,30 @@ const X_ACCEL_BUFFERING: &str = "x-accel-buffering";
 /// How often a quiet listen stream emits an SSE comment keep-alive.
 const LISTEN_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// The `resources/*` subscription RPC this request invokes, if it is one of the
-/// two the 2026-07-28 schema retired.
+/// Dispatch a public request through the server core.
 ///
-/// Returns the WIRE method name so the `-32601` message names what the client
-/// actually sent. `None` for every other request, which is therefore dispatched
-/// exactly as before on BOTH eras.
-fn v2_retired_method_of(request: &Request) -> Option<&'static str> {
-    let Request::Client(client) = request else {
-        return None;
-    };
-    match **client {
-        ClientRequest::Subscribe(_) => Some("resources/subscribe"),
-        ClientRequest::Unsubscribe(_) => Some("resources/unsubscribe"),
-        _ => None,
-    }
-}
-
-/// Dispatch a public request, first retiring the v2-removed `resources/*`
-/// subscription RPCs (HTTP-04).
+/// THE single dispatch seam both POST entrypoints call, threading the
+/// ALREADY-RESOLVED `ProtocolContext` in rather than letting dispatch re-resolve
+/// the era (D-11).
 ///
-/// THE single dispatch seam both POST entrypoints call, so the retirement rule
-/// cannot drift between the fast and middleware paths. On a non-v2 era this is a
-/// pure pass-through — `v2_retired_method_of` is consulted only inside the era
-/// gate, so a v1 `resources/subscribe` reaches its existing handler with
-/// byte-identical behavior.
+/// # It no longer retires anything, and that is the point
 ///
-/// The `-32601` it returns flows through the SAME
-/// [`v2_dispatch_response_status`] code-driven mapper every other dispatch error
-/// uses, which is what turns it into HTTP `404` on v2.
-async fn dispatch_request_or_retire(
+/// Until Phase 118.1 plan 05 this function ALSO carried the v2 retirement rule,
+/// keyed on the parsed `ClientRequest` variant. A variant match can only ever see
+/// a request whose params already deserialized, so it was structurally incapable
+/// of retiring the shape a conformance client actually sends — `initialize` and
+/// `logging/setLevel` with `_meta`-only params never reach a typed `Request` at
+/// all. The rule therefore moved to [`retire_v2_method`], which reads the method
+/// STRING at the v2 ingress; both POST entrypoints run that gate BEFORE they
+/// reach this seam, so there is still exactly ONE place retirement is decided.
+/// Do not reintroduce a second, variant-keyed predicate here.
+async fn dispatch_public_request(
     state: &ServerState,
     id: crate::types::RequestId,
     request: Request,
     auth_context: Option<crate::server::auth::AuthContext>,
     protocol_context: Option<crate::types::protocol::ProtocolContext>,
 ) -> crate::types::JSONRPCResponse {
-    if matches!(
-        protocol_context.as_ref().map(|pc| pc.era),
-        Some(crate::types::protocol::Era::V2)
-    ) {
-        if let Some(method) = v2_retired_method_of(&request) {
-            return crate::types::JSONRPCResponse::error(
-                id,
-                crate::types::jsonrpc::JSONRPCError {
-                    code: crate::types::protocol::error_codes::METHOD_NOT_FOUND,
-                    message: format!(
-                        "Method not found: {method} (retired in MCP 2026-07-28; use {})",
-                        crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD
-                    ),
-                    data: None,
-                },
-            );
-        }
-    }
     let server = state.server.lock().await;
     server
         .handle_request_with_context(id, request, auth_context, protocol_context)
@@ -4031,11 +4149,10 @@ async fn dispatch_message_with_middleware(
             // Captured BEFORE dispatch consumes it (see the fast-path twin).
             let live_id = id.clone();
             // Thread the ALREADY-RESOLVED ProtocolContext into dispatch (Plan 06
-            // / D-11): never re-resolved downstream. The shared seam also retires
-            // the v2-removed `resources/subscribe`/`unsubscribe` (HTTP-04).
+            // / D-11): never re-resolved downstream. Every method the 2026-07-28
+            // schema retired was already refused by the v2 ingress gate.
             let json_response =
-                dispatch_request_or_retire(state, id, request, auth_context, protocol_context)
-                    .await;
+                dispatch_public_request(state, id, request, auth_context, protocol_context).await;
             // Code-driven v2 status (see the fast-path twin).
             let v2_status = v2_dispatch_response_status(era, &json_response);
             // Same structural guarantee as every other direct response (HTTP-05).
@@ -6391,6 +6508,177 @@ mod tests {
     // `cargo test --lib -- subscriptions` actually selects these tests rather
     // than passing vacuously (the plan-09 lesson).
     // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // v2 METHOD RETIREMENT (Phase 118.1 plan 05, CONF-05 / gap G-5).
+    //
+    // Nested in a module NAMED after the production surface so
+    // `cargo test --lib -- retirement` actually selects these tests rather
+    // than passing vacuously (the plan-09 lesson). A SIBLING of
+    // `subscriptions_listen`, where the two-variant predecessor lived: the
+    // rule stopped being a `resources/*` concern once it covered all five
+    // methods the 2026-07-28 schema removes.
+    // -------------------------------------------------------------------
+    mod v2_method_retirement {
+        use super::*;
+
+        /// The retirement set is EXACTLY the five methods the 2026-07-28 core
+        /// schema removes, spelled as a hand-written literal.
+        ///
+        /// The oracle is deliberately independent of `V2_RETIRED_METHODS`: a test
+        /// that iterated the table under test could only ever agree with itself,
+        /// and would keep passing if a sixth entry were added or `ping` were
+        /// dropped. This literal is what pins the CONTENTS.
+        #[test]
+        fn the_retirement_set_is_exactly_the_five_schema_removed_methods() {
+            const EXPECTED: [&str; 5] = [
+                "initialize",
+                "ping",
+                "logging/setLevel",
+                "resources/subscribe",
+                "resources/unsubscribe",
+            ];
+            for method in EXPECTED {
+                assert!(
+                    v2_retired_method(method).is_some(),
+                    "{method} is absent from the 2026-07-28 schema and MUST be retired on v2"
+                );
+            }
+            assert_eq!(
+                V2_RETIRED_METHODS.len(),
+                EXPECTED.len(),
+                "the table grew or shrank without this oracle moving with it"
+            );
+            // Methods the schema KEEPS are never retired — including
+            // `subscriptions/listen`, the replacement, which retiring would make
+            // v2 unable to subscribe at all.
+            for kept in [
+                "tools/list",
+                "tools/call",
+                "resources/read",
+                "completion/complete",
+                crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD,
+                crate::types::protocol::SERVER_DISCOVER_METHOD,
+            ] {
+                assert!(
+                    v2_retired_method(kept).is_none(),
+                    "{kept} survives in the 2026-07-28 schema and MUST NOT be retired"
+                );
+            }
+        }
+
+        /// T-118.1-05-01: the match is EXACT BYTE EQUALITY over a peer-supplied
+        /// string, so no near miss is retired.
+        ///
+        /// The method name is read at a point earlier and less validated than
+        /// typed parsing. Any case folding, trimming or prefix matching added
+        /// here would let a peer force a `404` on a method the schema keeps, or
+        /// dodge one on a method it removed.
+        #[test]
+        fn near_miss_method_strings_are_not_retired() {
+            for near_miss in [
+                "Initialize",
+                "INITIALIZE",
+                " ping",
+                "ping ",
+                "ping\n",
+                "logging/setlevel",
+                "logging/SetLevel",
+                "resources/subscribe2",
+                "xresources/subscribe",
+                "initialize\u{0}",
+                // A Unicode look-alike: Cyrillic small 'р' (U+0440), not ASCII 'p'.
+                "\u{440}ing",
+                "",
+            ] {
+                assert!(
+                    v2_retired_method(near_miss).is_none(),
+                    "{near_miss:?} is not one of the five retired methods and must not match"
+                );
+            }
+        }
+
+        /// T-118.1-05-02: the rejection names the TABLE's constant, never the
+        /// peer's bytes, and every entry's replacement is a real successor.
+        #[test]
+        fn the_retirement_message_names_the_constant_and_its_replacement() {
+            let (retired, replacement) =
+                v2_retired_method("resources/subscribe").expect("it is retired");
+            assert_eq!(
+                replacement,
+                Some(crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD)
+            );
+            let message = v2_retirement_message(retired, replacement);
+            assert!(message.contains("resources/subscribe"), "{message}");
+            assert!(message.contains("subscriptions/listen"), "{message}");
+
+            // `ping` has NO replacement, so the message must not invent one.
+            let (retired, replacement) = v2_retired_method("ping").expect("it is retired");
+            assert_eq!(replacement, None);
+            let message = v2_retirement_message(retired, replacement);
+            assert!(message.contains("ping"), "{message}");
+            assert!(
+                !message.contains("use "),
+                "ping has no successor RPC; the message must not point at one: {message}"
+            );
+
+            assert_eq!(
+                v2_retired_method("initialize").expect("it is retired").1,
+                Some(crate::types::protocol::SERVER_DISCOVER_METHOD),
+                "v2 replaces the initialize handshake with the discover projection"
+            );
+            assert_eq!(
+                v2_retired_method("logging/setLevel")
+                    .expect("it is retired")
+                    .1,
+                Some(LOG_LEVEL_REQUEST_META_KEY),
+            );
+        }
+
+        /// `retire_v2_method` converts an ACCEPTED v2 request for a retired method
+        /// into `METHOD_NOT_FOUND`, and leaves every other outcome untouched.
+        ///
+        /// The `Passthrough` row is the v1 guarantee in miniature: a v1 request
+        /// never reaches `EnforceOk`, so retirement can never fire on it.
+        #[test]
+        fn retire_v2_method_only_rewrites_an_accepted_retired_method() {
+            let retired = retire_v2_method(V2GateOutcome::EnforceOk {
+                method: "logging/setLevel".to_string(),
+                name: String::new(),
+            });
+            let V2GateOutcome::Reject { code, message, .. } = retired else {
+                panic!("an accepted v2 logging/setLevel must be REJECTED");
+            };
+            assert_eq!(code, METHOD_NOT_FOUND);
+            assert!(message.contains("logging/setLevel"), "{message}");
+
+            // A method the schema keeps stays accepted.
+            assert!(matches!(
+                retire_v2_method(V2GateOutcome::EnforceOk {
+                    method: "tools/list".to_string(),
+                    name: String::new(),
+                }),
+                V2GateOutcome::EnforceOk { .. }
+            ));
+            // A non-accepted outcome is returned verbatim: retirement must not
+            // convert a header/body disagreement into a routine-looking 404.
+            assert!(matches!(
+                retire_v2_method(V2GateOutcome::Passthrough),
+                V2GateOutcome::Passthrough
+            ));
+            assert!(matches!(
+                retire_v2_method(V2GateOutcome::Reject {
+                    code: HEADER_MISMATCH,
+                    message: "desync".to_string(),
+                    data: None,
+                }),
+                V2GateOutcome::Reject {
+                    code: HEADER_MISMATCH,
+                    ..
+                }
+            ));
+        }
+    }
+
     mod subscriptions_listen {
         use super::*;
         use crate::types::capabilities::{
@@ -6512,36 +6800,6 @@ mod tests {
                     "{method} must not classify as a listen ingress"
                 );
             }
-        }
-
-        #[test]
-        fn only_the_two_retired_resource_rpcs_are_retired() {
-            let subscribe = Request::Client(Box::new(ClientRequest::Subscribe(
-                crate::types::resources::SubscribeRequest {
-                    uri: "mem://a".to_string(),
-                },
-            )));
-            let unsubscribe = Request::Client(Box::new(ClientRequest::Unsubscribe(
-                crate::types::resources::UnsubscribeRequest {
-                    uri: "mem://a".to_string(),
-                },
-            )));
-            let list = Request::Client(Box::new(ClientRequest::ListTools(
-                crate::types::tools::ListToolsRequest { cursor: None },
-            )));
-            assert_eq!(
-                v2_retired_method_of(&subscribe),
-                Some("resources/subscribe")
-            );
-            assert_eq!(
-                v2_retired_method_of(&unsubscribe),
-                Some("resources/unsubscribe")
-            );
-            assert_eq!(
-                v2_retired_method_of(&list),
-                None,
-                "no other method is retired by HTTP-04"
-            );
         }
 
         #[test]
