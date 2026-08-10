@@ -30,6 +30,29 @@
 # the seeded decision to the measured fact. NO ROW IS AWAITING MEASUREMENT ANY
 # MORE.
 #
+# -----------------------------------------------------------------------------
+# RE-MEASURED — Phase 118.1 plan 05, 2026-08-10 (gap G-5 CLOSED)
+# -----------------------------------------------------------------------------
+# The same TWO rows moved BACK. Plan 118.1-05 widened v2 method retirement from
+# the two `resources/*` variants to all five methods the 2026-07-28 core schema
+# removes — `initialize`, `ping`, `logging/setLevel`, `resources/subscribe`,
+# `resources/unsubscribe` — keyed on the method STRING at the v2 ingress. Both
+# rows plan 118-07 had corrected TO `served` are probes of methods in that set,
+# so both re-measured at their originally seeded values:
+#
+#   * ERA-01 `initialize`       v2 `served` -> `absent`        (kind: method-removed)
+#   * ERA-11 `logging/setLevel` v2 `served` -> `error:-32601`   (kind: method-removed)
+#
+# Neither is drift. Both agree again with the independently seeded declarations
+# in `crates/mcp-tester/baselines/era-deltas.yaml`, and both are asserted from
+# the other end by `tests/v2_retired_methods.rs`, which drives all five methods
+# with WELL-FORMED params over real HTTP on both eras.
+#
+# CONSEQUENCE FOR `kind: era-agreement`: it now has ZERO occupants. The cap in
+# `tests/era_baseline.rs` is a `<=`, so the file stays conformant, and an
+# unoccupied cap is the CORRECT resting state — the two rows that held the kind
+# held it only because a gap was open.
+#
 # The test that re-derives this file is
 # `era_matrix_is_conformant` in `crates/pmcp-team-servers/tests/era_matrix.rs`:
 #
@@ -116,12 +139,21 @@
 # -----------------------------------------------------------------------------
 # `kind: era-agreement` — A MEASURED SAMENESS, NOT AN EXEMPTION
 # -----------------------------------------------------------------------------
-# Two rows (ERA-01, ERA-11) record v1 and v2 tokens that are EQUAL. They were
-# seeded as retirements — `initialize` and `logging/setLevel` disappearing on
-# v2 — and measurement showed this SDK retires neither. Rather than delete the
-# rows (which would delete their probes too, under the id contract above, and
-# with them the only thing that would ever notice the retirement landing), they
-# now record what was measured.
+# NO ROW CARRIES THIS KIND ANY MORE. Two did — ERA-01 and ERA-11, recording
+# that `initialize` and `logging/setLevel` were still SERVED on v2 even though
+# the 2026-07-28 schema removes both. Phase 118.1 plan 05 implemented the
+# retirement, so the two eras differ again and both rows are back to
+# `kind: method-removed`. The mechanism is documented here in full because it is
+# a live capability of the format, not because anything currently uses it, and
+# because the reasoning below is what a future reviewer needs before reaching
+# for it. THE BAR FOR REACHING FOR IT IS: the two eras genuinely MEASURE the
+# same token, and a phase decision records why the sameness is acceptable.
+#
+# Note the shape of what happened: the rows were NOT deleted while the gap was
+# open. Deleting them would have deleted their probes too, under the id contract
+# above, and with them the only thing that would ever have noticed the
+# retirement landing. Keeping them as measured agreements is precisely what made
+# plan 05's fix show up as a finding rather than as silence.
 #
 # THIS IS NOT AN ALLOWLIST OF FAILURES, and nothing about it suppresses a suite
 # result. It is a claim that fires in BOTH directions:
@@ -135,12 +167,16 @@
 # and `tests/era_baseline.rs` + `tests/era_matrix.rs` check all three: `kind`
 # must be exactly `era-agreement`, the row's own `v1` and `v2` must be equal,
 # and BOTH OBSERVED tokens must equal that recorded value. The number of such
-# rows is additionally CAPPED at the two measured here
-# (`MAXIMUM_AGREEMENT_ROWS` in `tests/era_baseline.rs`), so the mechanism cannot
-# quietly grow into a general escape hatch.
+# rows is additionally CAPPED (`MAXIMUM_AGREEMENT_ROWS` in
+# `tests/era_baseline.rs`), so the mechanism cannot quietly grow into a general
+# escape hatch. The cap is a `<=`, so the current occupancy of ZERO is
+# conformant — and it is the correct resting state.
 #
-# Both are declared gaps under Phase 118 decision D-21; see
+# The sameness the two rows recorded was gap G-5 under Phase 118 decision D-21;
+# see
 # `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
+# G-5 is CLOSED as of Phase 118.1 plan 05; its FIXED disposition is recorded
+# with the other eight in plan 12, per D-10.
 #
 # -----------------------------------------------------------------------------
 # WHERE THE `provisional` EXEMPTION LIVES
@@ -167,10 +203,10 @@ deltas:
     observation_id: method.initialize
     subject: "method:initialize"
     v1: served
-    v2: served
-    kind: era-agreement
-    source: "MEASURED 2026-08-09 over the live era target: the v2 POST answers 200 with protocolVersion 2025-11-25. src/types/protocol/version.rs:22-33 (negotiate_protocol_version never returns 2026-07-28); the seeded claim cited src/client/mod.rs:592 and :761 (v2_synthetic_initialize_result), which is a CLIENT-side fact"
-    note: "TOKEN CORRECTED by Phase 118 plan 07: seeded v2 `absent`, measured v2 `served`. The seeded row's own citation is client-side — a v2 pmcp client synthesizes its InitializeResult locally and never sends the request — while this probe is server-side, and the SERVER still accepts initialize for backward tolerance. Declared under D-21 in 118-CONFORMANCE-GAPS.md."
+    v2: absent
+    kind: method-removed
+    source: "MEASURED 2026-08-10 over the live era target: the v1 POST answers 200, the v2 POST answers -32601 (which this probe's rule, classify_initialize in src/conformance/era_observations.rs, tokenizes as `absent` because it classifies on presence of a `result`, not on the refusal code). src/server/streamable_http_server.rs V2_RETIRED_METHODS refuses it by method STRING at the v2 ingress; src/client/mod.rs:761 (v2_synthetic_initialize_result) is the CLIENT-side half of the same removal"
+    note: "TOKEN RE-CORRECTED by Phase 118.1 plan 05. This row was NOT named in plan 05's brief, and moved as a DIRECT consequence of closing G-5: `initialize` is one of the five methods the 2026-07-28 core schema removes, so widening the retirement past the two `resources/*` variants necessarily reaches it. History: seeded v2 `absent` / `method-removed`; Phase 118 plan 07 measured v2 `served` and corrected it to `served` / `era-agreement` because the SERVER still accepted initialize on v2; plan 05 retired it and re-measured `absent`, restoring the seeded value. That agreement with the independently-seeded row — and with crates/mcp-tester/baselines/era-deltas.yaml ERA-01, which still declares v1 `served` / v2 `absent` / `method-removed` — is why this is the fix landing rather than drift. Declared under D-21 in 118-CONFORMANCE-GAPS.md; its disposition rides with G-5's in plan 12."
     provisional: false
 
   - id: ERA-02
@@ -273,10 +309,10 @@ deltas:
     observation_id: method.logging_set_level
     subject: "method:logging/setLevel"
     v1: served
-    v2: served
-    kind: era-agreement
-    source: "MEASURED 2026-08-09 over the live era target: both eras answer HTTP 200 with no error. src/server/mod.rs:1897-1901 lumps ClientRequest::SetLoggingLevel in with Subscribe / Unsubscribe / Complete / Ping and answers Ok(json!({})) with NO era branch anywhere in src/"
-    note: "TOKEN CORRECTED by Phase 118 plan 07: seeded v2 `error:-32601`, measured v2 `served`. The 2026-07-28 schema says io.modelcontextprotocol/logLevel \"Replaces the former `logging/setLevel` RPC\", so the retirement is MISSING in this SDK — gap G-5, declared under D-21 in 118-CONFORMANCE-GAPS.md. The REPLACEMENT works: ERA-12 (ignored -> honored) reproduces, and tests/era_matrix.rs drives the _meta key to completion under v2."
+    v2: "error:-32601"
+    kind: method-removed
+    source: "MEASURED 2026-08-10 over the live era target: v1 answers HTTP 200 with no error, v2 answers -32601. src/server/streamable_http_server.rs V2_RETIRED_METHODS (the v2-ingress retirement table) refuses it by method STRING before dispatch; src/server/mod.rs:1897-1901 still serves it on v1, unchanged"
+    note: "TOKEN RE-CORRECTED by Phase 118.1 plan 05, which CLOSED gap G-5. History, kept because it is the provenance: seeded v2 `error:-32601`; Phase 118 plan 07 measured v2 `served` and corrected the token to `served` with `kind: era-agreement`, recording the retirement as MISSING; plan 05 implemented the retirement and re-measured v2 `error:-32601`, so the row returns to its seeded value and to `kind: method-removed`. This is the FIX landing, not drift — the movement is asserted from the other end by tests/v2_retired_methods.rs, which sends logging/setLevel with WELL-FORMED params on v2 and requires 404 + -32601 (the suite's own probe sends `_meta`-only params, which fail typed parsing and reach -32601 for the wrong reason). The REPLACEMENT still works: ERA-12 (ignored -> honored) reproduces, and tests/era_matrix.rs drives the _meta key to completion under v2. G-5's FIXED disposition is recorded in plan 12 with the other eight, per D-10."
     provisional: false
 
   - id: ERA-12
