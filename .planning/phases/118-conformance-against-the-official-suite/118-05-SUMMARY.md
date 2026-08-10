@@ -37,7 +37,7 @@ decisions:
 metrics:
   tasks: 3
   commits: 3
-  duration_minutes: 95
+  duration_minutes: 50
   completed: 2026-08-09
 ---
 
