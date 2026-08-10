@@ -346,6 +346,87 @@ lint-plans:
 	./scripts/lint-plan-verify-commands.sh
 	@echo "$(GREEN)✓ No verification command masks the status of what it verifies$(NC)"
 
+# Phase 118 (CONF-01) — the OFFICIAL MCP conformance suite, both spec revisions,
+# against ONE dual-version example process.
+#
+# What it proves: the pinned @modelcontextprotocol/conformance CLI grades this
+# SDK at --requirements 2025-11-25 and 2026-07-28 from a single live server, and
+# the gates hold — the MRTR surface (every `input-required-result-*` scenario) is
+# entirely green, each run's total executed check count meets its hard-coded
+# floor, and the zero-check scenario sets match their committed lists EXACTLY in
+# both directions.
+#
+# It does NOT assert that either requirement set exits 0. Neither does today, and
+# the nine structural gaps that explain it are recorded in
+# .planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md
+# (D-21). The script prints that declared non-conformance on every run. There is
+# no --expected-failures baseline and no allowlist of any shape
+# (conformance/README.md § 9).
+#
+# Deliberately NOT chained into `quality-gate`: it needs Node >= 22, an `npm ci`
+# against the pinned lockfile, and a live server on a bound TCP port, and a
+# successful invocation is 10-20 minutes. The dev loop should require none of
+# that. CONTRAST `lint-plans` above, which IS chained in precisely because it is
+# sub-second, pure text and prerequisite-free — that is the rule, and this target
+# is the exception that earns its way out.
+#
+# The BLOCKING enforcement lives in `.github/workflows/ci.yml`'s
+# `conformance-suite` job, which plan 118-09 wires into `gate.needs`, so a
+# failure is a red required check. This target is the local spelling of the same
+# command; a green run on a laptop is evidence, not a gate.
+#
+# `tests/ci_conformance_gate_wiring.rs` pins both the script's contents (its
+# REQUIREMENT_SETS, ZERO_CHECK_* lists and MIN_CHECKS_* floors) and its wiring
+# into that blocking gate.
+#
+# PMCP_REQUEST_STATE_KEY must be set in the environment (any 64-hex-character
+# NON-PRODUCTION value locally; the CI job supplies its own). The script fails
+# naming the variable — never its value — when it is missing.
+.PHONY: test-conformance
+test-conformance:
+	@echo "$(BLUE)Running the official MCP conformance suite (both revisions, one process)...$(NC)"
+	./scripts/run-conformance-suite.sh
+	@echo "$(GREEN)✓ CONF-01 gates passed (MRTR surface green, check floors met, zero-check sets exact)$(NC)"
+
+# Phase 118 (CONF-02 / CONF-03) — the era comparison, the baseline schema gate
+# and the v1 fixture regression guard, on a dev-dependency-free build.
+#
+# What it proves: `tests/era_matrix.rs` observes ONE era target under 2025-11-25
+# and then under 2026-07-28 over the SAME bound address and joins the two
+# observation maps against the checked-in `baselines/era-deltas.yaml`;
+# `tests/era_baseline.rs` gates that baseline's schema; `tests/conformance.rs`
+# replays the 33-case v1 fixture corpus against all four reference servers. Two
+# `RUSTFLAGS="-D warnings" cargo build` fences run FIRST — `--all-features` and
+# `--no-default-features --features conformance` — because `cargo test` sees this
+# crate's `pmcp = { features = ["full"] }` dev-dependency and unifies features
+# back on, so only `cargo build` can make the EXISTENCE claim. Every target is
+# guarded on a NONZERO reported test count.
+#
+# `era_matrix` and `era_baseline` are run with `--features http`. `http` is NOT
+# in the crate's default feature set and `tests/era_matrix.rs` is
+# `#![cfg(all(feature = "conformance", feature = "http"))]`, so omitting the flag
+# compiles it to nothing and prints `running 0 tests` while exiting 0. That
+# silent vacuity is the single most likely way for a future edit to switch this
+# whole gate off, which is why the flags live in the script's `MATRIX_TESTS`
+# array as data and why the zero-count guard names that cause first.
+#
+# Deliberately NOT chained into `quality-gate` — and this is the load-bearing
+# part: `quality-gate` is scoped to the ROOT `pmcp` package and does not reach
+# `crates/pmcp-team-servers/tests/` AT ALL. None of the above executes under it,
+# at any setting. That gap (RESEARCH Pitfall 4) is exactly why this target and
+# its CI job exist; the two build fences also compile the whole team-servers tree
+# under two extra feature sets, which the inner dev loop should not pay for.
+#
+# The BLOCKING enforcement lives in `.github/workflows/ci.yml`'s `era-matrix`
+# job, wired into `gate.needs` by plan 118-09.
+# `tests/ci_conformance_gate_wiring.rs` pins this script's contents and that
+# wiring.
+.PHONY: test-era-matrix
+test-era-matrix:
+	@echo "$(BLUE)Running the era matrix on a dev-dependency-free build...$(NC)"
+	./scripts/run-era-matrix.sh
+	@echo "$(GREEN)✓ CONF-02/CONF-03 targets ran with non-zero test counts$(NC)"
+
 # Feature flag verification for pmcp-tasks crate
 .PHONY: test-feature-flags
 test-feature-flags:
