@@ -187,8 +187,18 @@ EOF
   fi
 }
 
+# The FIRST `running N tests` count in a log, for the summary line.
+#
+# Deliberately ONE `awk` and no `head`. The first spelling here was
+# `grep -oE … | head -1 | awk …`, which is a latent flake under this script's
+# own `set -o pipefail`: `head` exits after one line, `grep` can then take
+# SIGPIPE (status 141), `pipefail` promotes that to the pipeline's status, and
+# the enclosing `summary="… $(reported_test_count …) …"` assignment therefore
+# returns non-zero — so `set -e` aborts a run in which every target had already
+# PASSED, with no message naming why. `awk`'s own `exit` after the first match
+# has no such race: it is the last (and only) stage.
 reported_test_count() {
-  grep -oE '^running [0-9]+ tests?$' "$1" | head -1 | awk '{print $2}'
+  awk '/^running [0-9]+ tests?$/ { print $2; exit }' "$1"
 }
 
 # ---------------------------------------------------------------------------

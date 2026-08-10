@@ -407,14 +407,42 @@ bypassed it, such as a pre-populated node_modules tree."
 fi
 echo "node $node_version (>= $MIN_NODE_MAJOR) OK"
 
+# Every OTHER external tool this script cannot proceed without, checked HERE
+# rather than discovered at the point of use.
+#
+# `jq` is the one that matters: the check floors and the whole zero-check gate
+# are computed from `checks.json` ON DISK by `scored_check_count` /
+# `checks_with_status`, which run in section 5 — AFTER the `npm ci`, the cargo
+# build, the server start and both 10-20 minute suite runs. Without this check a
+# machine with no `jq` (the ordinary state of a macOS laptop, which is exactly
+# the `make test-conformance` audience) burns all of that and then dies on a bare
+# `jq: command not found` under `set -e`, naming neither the tool nor the step.
+# `timeout` gets its own richer block above because it has a second acceptable
+# spelling (`gtimeout`); these do not.
+for tool in jq curl npm; do
+  command -v "$tool" >/dev/null 2>&1 || fail "\`$tool\` is not on PATH.
+
+CONSEQUENCE: this script needs it, and discovering that mid-run wastes an npm
+install, a cargo build and up to two full suite runs before failing on a message
+that names neither the tool nor the step it was needed for.
+
+WHAT TO DO: install it ('brew install $tool' on macOS; every Ubuntu runner image
+already carries all three). Do NOT route around the check."
+done
+echo "jq, curl and npm are on PATH OK"
+
 # The secret is consumed from the environment and its VALUE is never printed —
 # not here, not in the failure message, not in the summary (T-118-42).
 if [ -z "${PMCP_REQUEST_STATE_KEY:-}" ]; then
   fail "PMCP_REQUEST_STATE_KEY is not set in the environment.
 
 CONSEQUENCE: the target example mints and verifies MRTR request-state tokens with
-that key; without it the server cannot start, and the MRTR surface this gate
-blocks on would be untestable.
+that key. It does NOT refuse to start without one — it derives a fresh
+per-process key instead (examples/s54_v2_dual_conformance.rs reads the variable
+for PRESENCE only, to print which mode it is in) — so the failure surfaces later,
+as MRTR continuations that cannot be verified, and the MRTR surface this gate
+blocks on would be measuring a different server than CI does. Refusing here is
+what keeps the local and the CI run comparable.
 
 WHAT TO DO: export a 64-hex-character NON-PRODUCTION value before running, e.g.
   export PMCP_REQUEST_STATE_KEY=\$(openssl rand -hex 32)

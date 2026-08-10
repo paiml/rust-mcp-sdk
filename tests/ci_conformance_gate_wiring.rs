@@ -229,7 +229,20 @@ const CONFORMANCE_FORBIDDEN_FLAGS: &[&str] = &[
 ];
 
 /// Status-masking constructs that can NEVER appear in an era-matrix COMMAND.
-const ERA_MATRIX_FORBIDDEN_FLAGS: &[&str] = &["|| true", "continue-on-error"];
+///
+/// `|| :` is listed alongside `|| true` because they are the SAME construct with
+/// two spellings, and the sibling `scripts/run-conformance-suite.sh` already uses
+/// the `|| :` form — so a future edit copying that idiom into a `cargo test` line
+/// here would otherwise slip past a list that named only one of them.
+const ERA_MATRIX_FORBIDDEN_FLAGS: &[&str] = &["|| true", "|| :", "continue-on-error"];
+
+/// The workflow attribute that makes a job report `success` on a red run.
+///
+/// Read STRUCTURALLY out of the parsed workflow (see
+/// [`neither_conformance_job_tolerates_its_own_failure`]) rather than grepped, so
+/// a commented-out occurrence cannot satisfy the fence and the prose in `ci.yml`
+/// that forbids the attribute cannot trip it either.
+const ERROR_TOLERATING_ATTRIBUTE: &str = "continue-on-error";
 
 /// The Phase-113 conformance-REPOSITORY pin.
 ///
@@ -243,6 +256,23 @@ const CONFORMANCE_README_REL: &str = "conformance/README.md";
 
 /// Absolute path to [`CONFORMANCE_README_REL`].
 const CONFORMANCE_README: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/README.md");
+
+/// The npm package that IS the external referee.
+const SUITE_PACKAGE: &str = "@modelcontextprotocol/conformance";
+
+/// The manifest that declares the pinned referee version.
+const CONFORMANCE_PACKAGE_JSON_REL: &str = "conformance/package.json";
+
+/// Absolute form of [`CONFORMANCE_PACKAGE_JSON_REL`].
+const CONFORMANCE_PACKAGE_JSON: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/package.json");
+
+/// The lockfile `npm ci` actually installs from.
+const CONFORMANCE_PACKAGE_LOCK_REL: &str = "conformance/package-lock.json";
+
+/// Absolute form of [`CONFORMANCE_PACKAGE_LOCK_REL`].
+const CONFORMANCE_PACKAGE_LOCK: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/package-lock.json");
 
 /// The conformance script's own total wall-clock budget, in MINUTES.
 ///
@@ -1067,6 +1097,154 @@ fn the_two_upstream_pins_are_reconciled() {
          WHAT TO DO: re-run the comparison in § 10, record the new verdict, and update \
          SPEC_RECHECK_PINNED_SHA here in the SAME commit."
     );
+}
+
+/// Read a file this fence depends on, or fail naming it.
+fn read_conformance_file(path: &str, rel: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "FAILURE MODE: cannot read {rel}: {e}\n\
+             CONSEQUENCE: the referee's pin is then asserted against nothing.\n\
+             WHAT TO DO: restore the file. `conformance/` and this test file are BOTH listed in \
+             the root Cargo.toml `exclude` array precisely so this read is always in-tree; the \
+             two entries must never be split."
+        )
+    })
+}
+
+/// The ONE pinned referee version, taken from `conformance/package.json`, and
+/// reconciled against the lockfile and the README prose.
+///
+/// This is the read the root `Cargo.toml` `exclude` comment describes. Without
+/// it the npm PACKAGE pin was structural in name only: `package.json` could be
+/// bumped while `package-lock.json` (what `npm ci` actually installs) and the
+/// README's `§ 3` prose still named the old version, and every other fence in
+/// this file would still pass.
+#[test]
+fn the_pinned_suite_version_is_reconciled_across_all_three_files() {
+    let manifest = read_conformance_file(CONFORMANCE_PACKAGE_JSON, CONFORMANCE_PACKAGE_JSON_REL);
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap_or_else(|e| {
+        panic!("FAILURE MODE: {CONFORMANCE_PACKAGE_JSON_REL} is not valid JSON: {e}")
+    });
+    let version = manifest
+        .get("dependencies")
+        .and_then(|deps| deps.get(SUITE_PACKAGE))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "FAILURE MODE: {CONFORMANCE_PACKAGE_JSON_REL} declares no \
+                 `dependencies.{SUITE_PACKAGE}` string.\n\
+                 CONSEQUENCE: nothing pins the external referee, so `npm ci` could install \
+                 anything.\n\
+                 WHAT TO DO: restore the dependency entry."
+            )
+        })
+        .to_string();
+
+    assert!(
+        !version.starts_with(['^', '~', '>', '<', '*']),
+        "FAILURE MODE: {CONFORMANCE_PACKAGE_JSON_REL} pins {SUITE_PACKAGE} with the RANGE \
+         `{version}` rather than an exact version.\n\
+         CONSEQUENCE: a range lets a re-resolve move the referee, and a referee that moves \
+         silently makes every measured floor in scripts/run-conformance-suite.sh a claim about \
+         a different program.\n\
+         WHAT TO DO: pin the exact version."
+    );
+
+    let expected = format!("\"{SUITE_PACKAGE}\": \"{version}\"");
+    let lock = read_conformance_file(CONFORMANCE_PACKAGE_LOCK, CONFORMANCE_PACKAGE_LOCK_REL);
+    assert!(
+        lock.contains(&expected),
+        "FAILURE MODE: {CONFORMANCE_PACKAGE_LOCK_REL} does not name {SUITE_PACKAGE} at \
+         `{version}`.\n\
+         CONSEQUENCE: `npm ci` installs from the LOCKFILE, not from the manifest, so the version \
+         this repo claims to grade against and the version it actually runs would differ — and \
+         the CI cache is keyed on the lockfile, so the divergence would be stable rather than \
+         flaky.\n\
+         WHAT TO DO: re-run `npm ci --prefix conformance` (or `npm install --prefix conformance \
+         --package-lock-only`) and commit the regenerated lockfile in the SAME commit as the \
+         manifest bump."
+    );
+
+    let readme = read_conformance_file(CONFORMANCE_README, CONFORMANCE_README_REL);
+    assert!(
+        readme.contains(&version),
+        "FAILURE MODE: {CONFORMANCE_README_REL} never names the pinned version `{version}`.\n\
+         CONSEQUENCE: that README is the reviewer-facing statement of WHICH referee produced the \
+         measured check floors and zero-check lists in scripts/run-conformance-suite.sh. Prose \
+         naming an older pin than the one that runs is worse than no prose.\n\
+         WHAT TO DO: update the README's version references in the same commit as the re-pin, \
+         and re-measure the floors while you are there."
+    );
+}
+
+// ===========================================================================
+// 8b. Neither job is allowed to tolerate its own failure
+// ===========================================================================
+
+/// The `ci.yml` fence that says these two jobs carry "no error-tolerating step
+/// attribute and no status-masking shell suffix", ENFORCED.
+///
+/// Until this test existed that fence was prose only: [`ERA_MATRIX_FORBIDDEN_FLAGS`]
+/// is applied by [`no_status_masking_reaches_an_era_matrix_command`] to
+/// `scripts/run-era-matrix.sh`, and NOTHING read the workflow. A
+/// `continue-on-error: true` on either job — or on the step that invokes its
+/// driver — makes `needs.<job>.result` evaluate to `success` on a red run, so
+/// every other test in this file (in `gate.needs`, bound, read, named) still
+/// passes while the gate certifies nothing. That is precisely the false green
+/// fence 9 of the `conformance-suite` block claims to close.
+///
+/// Both LEVELS are checked: a job-level attribute rewrites the job's `result`,
+/// and a step-level one stops the failing step from failing the job. Either is
+/// sufficient on its own to make the gate vacuous.
+#[test]
+fn neither_conformance_job_tolerates_its_own_failure() {
+    for job_name in [CONFORMANCE_JOB, ERA_MATRIX_JOB] {
+        let job = job(job_name).unwrap_or_else(|| {
+            panic!(
+                "FAILURE MODE: {WORKFLOW_REL} declares no job named `{job_name}`.\n\
+                 WHAT TO DO: restore the job; a missing job cannot gate anything."
+            )
+        });
+        assert!(
+            job.get(ERROR_TOLERATING_ATTRIBUTE).is_none(),
+            "FAILURE MODE: job `{job_name}` in {WORKFLOW_REL} declares \
+             `{ERROR_TOLERATING_ATTRIBUTE}`.\n\
+             CONSEQUENCE: the job's `result` then reads `success` however the run went, so \
+             `{GATE_JOB}` goes green on a red conformance surface — while `needs:`, the `env:` \
+             binding, the `if` chain and the failure echo all still look perfectly wired.\n\
+             WHAT TO DO: remove it. If a run is genuinely allowed to fail, take the job OUT of \
+             `{GATE_JOB}.needs` and say so — a blocking job that tolerates its own failure is \
+             strictly worse than an honestly advisory one."
+        );
+
+        for (index, step) in steps_of(job_name).iter().enumerate() {
+            assert!(
+                step.get(ERROR_TOLERATING_ATTRIBUTE).is_none(),
+                "FAILURE MODE: step {index} of job `{job_name}` in {WORKFLOW_REL} declares \
+                 `{ERROR_TOLERATING_ATTRIBUTE}`.\n\
+                 CONSEQUENCE: the failing step no longer fails the job, so the job reports \
+                 success having proved nothing.\n\
+                 WHAT TO DO: remove it."
+            );
+
+            let Some(run) = step.get("run").and_then(Value::as_str) else {
+                continue;
+            };
+            for forbidden in ERA_MATRIX_FORBIDDEN_FLAGS {
+                assert!(
+                    !run.contains(forbidden),
+                    "FAILURE MODE: the `run:` of step {index} in job `{job_name}` of \
+                     {WORKFLOW_REL} contains `{forbidden}`.\n\
+                     CONSEQUENCE: a status-masking suffix on the driver invocation makes the step \
+                     exit 0 whatever the driver reported, which is the shell-level spelling of \
+                     the same false green as `{ERROR_TOLERATING_ATTRIBUTE}`.\n\
+                     WHAT TO DO: remove it.\n\
+                     run read: {run}"
+                );
+            }
+        }
+    }
 }
 
 // ===========================================================================

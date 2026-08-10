@@ -197,6 +197,42 @@ check_line() {
       ;;
   esac
 
+  # RULE 1b — the SHELL-WRAPPER case RULE 1 structurally cannot see.
+  #
+  # `strip_quoted_spans` deletes quoted spans BEFORE the pipe search, which is
+  # what makes RULE 1 usable (a `|` inside a `grep -qE` pattern is not a
+  # pipeline). But a `bash -c '...'` payload IS executed as shell, so a pipeline
+  # inside those very quotes is a real pipeline — and RULE 1 sees a stripped line
+  # with no `|` in it at all. That is precisely the spelling RULE 1's own remedy
+  # text recommends, so the highest-risk shape was the one shape the lint could
+  # not catch.
+  #
+  # Deliberately narrow, to stay clear of the two measured false positives the
+  # strip exists for: it fires only when the line invokes a shell WRAPPER
+  # (`bash -c` / `sh -c`), the RAW line still carries a pipe once `||` is
+  # removed, a build/test invocation appears, and `pipefail` appears NOWHERE on
+  # the line. Neither measured false positive invokes a shell wrapper.
+  case "$line" in
+    *"bash -c"*|*"sh -c"*)
+      depiped="${line//||/}"
+      case "$depiped" in
+        *"|"*)
+          if [[ $line =~ $BUILD_INVOCATIONS ]]; then
+            case "$line" in
+              *pipefail*) ;;
+              *)
+                report "RULE 1b — a build/test invocation is piped INSIDE a \`-c\` shell payload with no \`pipefail\`." \
+                  "$file" "$lineno" "$line" \
+                  "the quoted payload is executed as shell, so the pipe is a real pipeline and the wrapper reports the LAST stage's status — a FAILING build reports PASS, exactly as in RULE 1. RULE 1 cannot see it because quote stripping removes the payload before the pipe search." \
+                  "move the flag onto the wrapper: \`bash -o pipefail -c '... | tee \"\$log\"'\`, or capture-then-assert (run the command, THEN grep the captured file in a separate step)."
+                ;;
+            esac
+          fi
+          ;;
+      esac
+      ;;
+  esac
+
   # RULE 2 — consulting `$?` after a pipeline. Checked against the ORIGINAL
   # line: the `"$?"` spelling would be erased by quote stripping.
   case "$line" in
@@ -280,7 +316,11 @@ else
   echo "lint-plan-verify-commands: linting ${#PHASES[@]} phase(s); $EXEMPTED exempt (numbered < $PRE_RULE_CUTOFF)."
 fi
 
-for phase in "${PHASES[@]}"; do
+# `${PHASES[@]+…}` guards the EMPTY-array expansion: under `set -u` bash 3.2 —
+# still the `/bin/bash` on a stock macOS — treats `"${empty[@]}"` as an unbound
+# variable and aborts. The sibling `scripts/run-conformance-suite.sh` already
+# spells its empty-array expansions this way; this one did not.
+for phase in ${PHASES[@]+"${PHASES[@]}"}; do
   dir="$PLANNING_PHASES/$phase"
   if [ ! -d "$dir" ]; then
     fail "FAILURE MODE: linted phase directory \`$dir\` does not exist.

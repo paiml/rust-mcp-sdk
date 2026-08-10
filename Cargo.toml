@@ -56,12 +56,15 @@ exclude = [
     # and .npmrc) is CI tooling, never crate content — measured: without this entry
     # `cargo package --list` shipped all three files. 115-REVIEW.md CR-01 is the
     # precedent for what a stray CI-only artifact costs downstream.
-    # tests/ci_conformance_gate_wiring.rs reads conformance/package-lock.json and
-    # conformance/README.md at runtime to pin the suite version and the two-pin
-    # reconciliation structurally, so shipping the reader while excluding the path
-    # it reads would make `cargo test` panic on the published crate — the same
-    # disposition as tests/team_contracts_conformance.rs above. The two entries
-    # must never be split: ship both or exclude both.
+    # tests/ci_conformance_gate_wiring.rs reads all three of
+    # conformance/package.json, conformance/package-lock.json and
+    # conformance/README.md at runtime — the first two to reconcile the suite
+    # version pin across the manifest and the lockfile `npm ci` installs from, the
+    # third for that pin's prose and the two-pin reconciliation. Shipping the
+    # reader while excluding the paths it reads would make `cargo test` panic on
+    # the published crate — the same disposition as
+    # tests/team_contracts_conformance.rs above. The two entries must never be
+    # split: ship both or exclude both.
     # The other two in-tree dispositions were rejected here on purpose.
     # tests/ci_severance_gate_wiring.rs SHIPS because everything it reads
     # (.github/workflows/ci.yml, scripts/run-severance-proofs.sh) also ships, so

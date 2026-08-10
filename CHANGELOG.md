@@ -54,6 +54,33 @@ behaviour changes are called out below because both are visible to operators.
   token endpoint unconditionally, because the expiry decision now lives in the
   SDK alone rather than in two implementations. It reports which of the two
   happened rather than announcing a refresh it did not perform.
+- **`Mcp-Name` is now required on 2026-07-28 requests exactly where the method
+  carries a routing name** — `tools/call` / `prompts/get` (`params.name`),
+  `resources/read` (`params.uri`) and `tasks/get` / `tasks/update` /
+  `tasks/cancel` (`params.taskId`) — rather than on every v2 request (Phase 118
+  D-13, widened by D-18). This is one RELAXATION and one TIGHTENING, and both
+  are visible on the wire:
+  - **Relaxation.** A v2 request for a name-less method (`tools/list`, `ping`,
+    `server/discover`, `completion/complete`, `subscriptions/listen`, …) that
+    omits `Mcp-Name` is now SERVED; it was refused `-32020 HEADER_MISMATCH` at
+    HTTP 400 before dispatch. The old rule was the deliberately-stricter
+    Phase-113 DRIFT-1 adjudication, and it rejected effectively the entire
+    2026-07-28 scored set of the official `@modelcontextprotocol/conformance`
+    suite, which sends the header only for name-bearing methods. A value sent on
+    a name-less method is now accepted and DISCARDED, so it is neither branched
+    on nor reflected in the response headers.
+  - **Tightening.** A v2 `tasks/get` / `tasks/update` / `tasks/cancel` that
+    omits `Mcp-Name`, or whose `Mcp-Name` disagrees with `params.taskId`, is now
+    refused `-32020 HEADER_MISMATCH` before dispatch. Previously the server
+    neither required nor cross-checked it for those three methods while pmcp's
+    own client already emitted it — an emitter/validator asymmetry. **A
+    non-pmcp v2 client that sent an empty `Mcp-Name` for a `tasks/*` method must
+    now send the task id.** `pmcp::Client` over `StreamableHttpTransport` is
+    unaffected: it already derives the value from the request body.
+
+  `Mcp-Method` and `MCP-Protocol-Version` remain required on EVERY v2 request,
+  and the header/body cross-check is unchanged wherever a name exists. Nothing
+  about 2025-11-25 changes — the era decision is per request.
 
 ## [2.17.0] - Unreleased
 
