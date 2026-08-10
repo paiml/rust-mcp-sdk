@@ -92,6 +92,8 @@ use pmcp::types::capabilities::{
     CompletionCapabilities, LoggingCapabilities, PromptCapabilities, ResourceCapabilities,
     ServerCapabilities, ToolCapabilities,
 };
+use pmcp::types::elicitation::ElicitRequestParams;
+use pmcp::types::mrtr::{InputRequest, InputRequests, InputResponse, MrtrSignal};
 use pmcp::types::protocol::{
     ProtocolVersion, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28,
 };
@@ -171,7 +173,7 @@ const PROMPT_NAMES: [&str; 5] = [
 /// The suite's task-bearing fixture tool and every other Tasks-extension tool
 /// are deliberately ABSENT (D-14) — they are `not_scored` at both revisions, so
 /// implementing them would add surface without adding evidence.
-const TOOL_NAMES: [&str; 17] = [
+const TOOL_NAMES: [&str; 23] = [
     "test_simple_text",
     "test_image_content",
     "test_audio_content",
@@ -189,6 +191,13 @@ const TOOL_NAMES: [&str; 17] = [
     "test_elicitation",
     "test_elicitation_sep1034_defaults",
     "test_elicitation_sep1330_enums",
+    // --- The 2026-07-28 MRTR surface (SEP-2322). ---
+    "test_input_required_result_request_state",
+    "test_input_required_result_tampered_state",
+    "test_mrtr_echo_state",
+    "test_mrtr_no_state",
+    "test_mrtr_unrelated",
+    "test_mrtr_no_result_type",
 ];
 
 /// Where the server binds when `argv[1]` is absent.
@@ -551,6 +560,34 @@ impl pmcp::ToolHandler for ConformanceTool {
                 "Requests elicitation with all five SEP-1330 enum variants",
                 no_args(),
             ),
+            "test_input_required_result_request_state" => (
+                "Round-trips an AEAD-sealed requestState across one MRTR continuation",
+                no_args(),
+            ),
+            "test_input_required_result_tampered_state" => (
+                "Mints an integrity-protected requestState whose tampered resend must be rejected",
+                no_args(),
+            ),
+            "test_mrtr_echo_state" => (
+                "Test tool: triggers MRTR flow with requestState. Client must echo state back \
+                 unchanged.",
+                no_args(),
+            ),
+            "test_mrtr_no_state" => (
+                "Test tool: triggers MRTR flow WITHOUT requestState. Client must NOT include \
+                 requestState in retry.",
+                no_args(),
+            ),
+            "test_mrtr_unrelated" => (
+                "Test tool: simple tool called between MRTR rounds. Must NOT carry inputResponses \
+                 or requestState from another tool.",
+                no_args(),
+            ),
+            "test_mrtr_no_result_type" => (
+                "Test tool: returns a result without resultType. Client must treat it as complete \
+                 (default).",
+                no_args(),
+            ),
             _ => ("", no_args()),
         };
         Some(ToolInfo::new(
@@ -696,9 +733,221 @@ impl ConformanceTool {
                 "no server->client channel on this transport: elicitation/create cannot be issued",
             )),
 
+            // ---------------------------------------------------------------
+            // The 2026-07-28 MRTR surface (SEP-2322).
+            //
+            // v2 replaces the mid-call server->client request with a result:
+            // the server ANSWERS `resultType: "input_required"` and the client
+            // calls again with `inputResponses` plus the opaque `requestState`.
+            // Every arm below reaches that through the SDK's own authoring
+            // surface — `MrtrSignal` + `InputRequest` + `into_meta_entry` —
+            // never through a hand-written envelope. A hand-written one could
+            // not reach the wire anyway: `own_reserved_result_fields` REMOVES a
+            // handler-supplied `inputRequests` / `requestState` and OVERWRITES
+            // `resultType`, precisely so the only minter is the sealed egress.
+            // ---------------------------------------------------------------
+            "test_input_required_result_request_state" => {
+                let Some(continuation) = extra.mrtr_continuation() else {
+                    // Round 1: ask, and carry handler state the client never sees.
+                    return input_required(
+                        "I need a confirmation before I can finish.",
+                        MrtrSignal {
+                            input_requests: one_request(
+                                "confirm",
+                                elicit(
+                                    "Please confirm",
+                                    serde_json::json!({
+                                        "type": "object",
+                                        "properties": { "ok": { "type": "boolean" } },
+                                        "required": ["ok"],
+                                    }),
+                                ),
+                            ),
+                            continuation: serde_json::json!({ "stage": "awaiting-confirm" }),
+                        },
+                    );
+                };
+                // Round 2: the continuation is present ONLY because the
+                // server-owned AEAD codec authenticated the token, so this
+                // value is trusted. The scenario requires the literal
+                // "state-ok" in the text so a reader can tell the state was
+                // received AND validated, not merely echoed.
+                let stage = continuation
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let confirmed = elicited_bool(&extra, "confirm", "ok").unwrap_or(false);
+                Ok(CallToolResult::new(vec![Content::text(format!(
+                    "state-ok (stage={stage}, confirmed={confirmed})"
+                ))]))
+            },
+
+            "test_input_required_result_tampered_state" => {
+                if extra.mrtr_continuation().is_some() {
+                    // Reached ONLY when the resent token verified. A tampered
+                    // token never gets here: the SDK's ingress answers -32602
+                    // before dispatch, which is the rejection this scenario
+                    // grades. The example deliberately owns no integrity check
+                    // of its own — the scenario is testing pmcp, not this file.
+                    return Ok(CallToolResult::new(vec![Content::text(
+                        "state-ok: the resent requestState verified",
+                    )]));
+                }
+                input_required(
+                    "I need a confirmation before I can finish.",
+                    MrtrSignal {
+                        input_requests: one_request(
+                            "confirm",
+                            elicit(
+                                "Please confirm",
+                                serde_json::json!({
+                                    "type": "object",
+                                    "properties": { "ok": { "type": "boolean" } },
+                                    "required": ["ok"],
+                                }),
+                            ),
+                        ),
+                        continuation: serde_json::json!({ "stage": "tamper-probe" }),
+                    },
+                )
+            },
+
+            // The four `test_mrtr_*` tools. See the note above `mrtr_divergence`
+            // for what pmcp can and cannot express here.
+            "test_mrtr_echo_state" => {
+                if extra.mrtr_continuation().is_some() {
+                    return Ok(CallToolResult::new(vec![Content::text("echo-state-ok")]));
+                }
+                input_required(
+                    "Please confirm to continue",
+                    MrtrSignal {
+                        input_requests: one_request("confirm", confirm_elicitation("Confirm?")),
+                        continuation: serde_json::json!({ "probe": "echo_state" }),
+                    },
+                )
+            },
+
+            "test_mrtr_no_state" => {
+                if extra.mrtr_continuation().is_some() {
+                    return Ok(CallToolResult::new(vec![Content::text("no-state-ok")]));
+                }
+                input_required(
+                    "Please confirm to continue (no state test)",
+                    MrtrSignal {
+                        input_requests: one_request(
+                            "confirm",
+                            confirm_elicitation("Confirm? (no state test)"),
+                        ),
+                        // DIVERGENCE, recorded rather than worked around: the
+                        // suite's own mock omits `requestState` here, and pmcp
+                        // cannot — `seal_input_required` writes `inputRequests`
+                        // AND `requestState` unconditionally, and the reserved-
+                        // field registry deletes any that the egress did not
+                        // mint. The continuation is therefore minimal, not
+                        // absent.
+                        continuation: Value::Null,
+                    },
+                )
+            },
+
+            // A plain complete result: the negative control for a client that
+            // treats every v2 response as an MRTR step.
+            "test_mrtr_unrelated" => Ok(CallToolResult::new(vec![Content::text("unrelated-ok")])),
+
+            // DIVERGENCE, recorded rather than worked around: the suite's mock
+            // omits `resultType` entirely. pmcp's v2 envelope always writes it
+            // (`inject_v2_result_envelope` is its single writer), so this
+            // returns a COMPLETE result — `resultType: "complete"` — which is
+            // the closest expressible value and is what a client must treat as
+            // the default anyway.
+            "test_mrtr_no_result_type" => Ok(CallToolResult::new(vec![Content::text(
+                "no-result-type-ok",
+            )])),
+
             other => Err(pmcp::Error::validation(format!("unknown tool: {other}"))),
         }
     }
+}
+
+// ===========================================================================
+// The MRTR authoring helpers (SEP-2322).
+//
+// These exist so every `input_required` result in this file is built the SAME
+// way, out of the SDK's own types, and so no arm is tempted to hand-write the
+// envelope. `MrtrSignal::into_meta_entry` is the ONE seam: the dispatch layer
+// takes the signal off `_meta`, seals `continuation` into the opaque
+// `requestState` with the AEAD codec keyed by `PMCP_REQUEST_STATE_KEY`, writes
+// `inputRequests`, and removes the internal key before serialization.
+//
+// The example adds NO cryptographic primitive of its own. It cannot: the codec
+// lives in `src/server/request_state.rs` and is reached only through this seam.
+//
+// A note on which SDK type is which, because it is easy to reach for the wrong
+// one. `pmcp::types::mrtr::InputRequiredResult` is the CLIENT-side parsed twin
+// of what these tools produce — it exists so a caller RECEIVES an unfulfilled
+// `input_required` result instead of an empty success, and a server handler
+// never constructs it. The server-side authoring type is [`MrtrSignal`], and
+// the two `input_required` fields are written by the SDK's own
+// `seal_input_required`, never by a handler.
+// ===========================================================================
+
+/// Attach an [`MrtrSignal`] to a `CallToolResult` so the dispatch layer seals it.
+///
+/// The `_meta` field is set DIRECTLY rather than through
+/// `RequestHandlerExtra::set_result_meta`, and that is load-bearing. Every tool
+/// here is served through `handle_output` returning `ToolOutput::Result`, and
+/// that verbatim arm returns BEFORE the dispatcher drains the handler's result
+/// `_meta` slot (`src/server/mod.rs`: "the verbatim `ToolOutput::Result` arm
+/// above returns earlier and owns its own `_meta`"). A signal set through
+/// `set_result_meta` on this path is silently dropped, and the tool ships an
+/// empty success for an operation it never completed.
+fn input_required(text: &str, signal: MrtrSignal) -> pmcp::Result<CallToolResult> {
+    let (key, value) = signal
+        .into_meta_entry()
+        .map_err(|error| pmcp::Error::internal(error.to_string()))?;
+    let mut meta = serde_json::Map::new();
+    meta.insert(key, value);
+    let mut result = CallToolResult::new(vec![Content::text(text)]);
+    result._meta = Some(meta);
+    Ok(result)
+}
+
+/// An [`InputRequests`] map with exactly one entry.
+fn one_request(key: &str, request: InputRequest) -> InputRequests {
+    let mut requests = InputRequests::new();
+    requests.insert(key.to_string(), request);
+    requests
+}
+
+/// A form-mode `elicitation/create` input request.
+fn elicit(message: &str, requested_schema: Value) -> InputRequest {
+    InputRequest::Elicitation(Box::new(ElicitRequestParams::Form {
+        message: message.to_string(),
+        requested_schema,
+    }))
+}
+
+/// The boolean-confirmation elicitation the `test_mrtr_*` tools share.
+fn confirm_elicitation(prompt: &str) -> InputRequest {
+    elicit(
+        prompt,
+        serde_json::json!({
+            "type": "object",
+            "properties": { "confirmed": { "type": "boolean", "description": prompt } },
+        }),
+    )
+}
+
+/// Read a boolean field out of the client's answer to an elicitation entry.
+///
+/// Every value here is CLIENT-SUPPLIED and is validated exactly like a tool
+/// argument: a missing key, a declined elicitation or a wrong-shaped answer all
+/// return `None` rather than a default that would look like a real answer.
+fn elicited_bool(extra: &RequestHandlerExtra, key: &str, field: &str) -> Option<bool> {
+    let InputResponse::Elicitation(result) = extra.input_responses()?.get(key)? else {
+        return None;
+    };
+    result.content.as_ref()?.get(field)?.as_bool()
 }
 
 /// The sampling request shape the `tools-call-sampling` scenario specifies.
