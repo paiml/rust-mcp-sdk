@@ -94,8 +94,10 @@
 # (6) A readiness POLL, never a bare `sleep`. `scripts/test_examples_with_tester.sh`
 #     is the in-repo anti-pattern: a fixed `sleep 2` that is simultaneously too
 #     long on a warm laptop and too short on a loaded CI runner, and that reports
-#     a server bug when it was really a race. The only `sleep` below is the
-#     BACKOFF BETWEEN poll attempts.
+#     a server bug when it was really a race. There are exactly three `sleep`
+#     calls below and NONE of them waits for readiness: one is the BACKOFF
+#     BETWEEN poll attempts, and the other two are inside `cleanup`, spacing the
+#     polls that WAIT FOR THE PORT TO BE RELEASED after the group is killed.
 #
 # (7) A DISTINCT port, checked free BEFORE anything starts. 8080/8081 belong to
 #     `scripts/test_examples_with_tester.sh`, 8147 to the s47 example and 8149 is
@@ -237,6 +239,10 @@ fail() {
 cleanup() {
   local status=$?
   if [ -n "$SERVER_PGID" ]; then
+    # `|| :` tolerates an ALREADY-DEAD group, which is the normal case on the
+    # success path. It is not a status eraser: the teardown's verdict comes from
+    # the `port_is_held` assertions below, which nothing masks — a `kill` that
+    # reported success while the port stayed bound would still fail this trap.
     kill -TERM -- "-$SERVER_PGID" 2>/dev/null || :
     local waited=0
     while [ "$waited" -lt 20 ] && port_is_held; do
