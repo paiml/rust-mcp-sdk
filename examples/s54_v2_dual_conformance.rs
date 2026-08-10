@@ -45,6 +45,35 @@
 //! `not_scored` at BOTH revisions, so implementing them would add surface
 //! without adding evidence. Their absence is a decision, not an omission.
 //!
+//! # DECLARED NON-CONFORMANCE — read this before citing the example (D-21)
+//!
+//! Neither requirement set exits 0, and that is a MEASURED, DECLARED outcome
+//! rather than an unfinished one. Phase 118 decision D-21 scopes the claim to
+//! what genuinely passes and states the rest in writing:
+//! `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
+//! No `--expected-failures` baseline, no allowlist and no known-fail file is
+//! used anywhere in this phase — the suppression the phase forbids stays
+//! forbidden, so the numbers below are the real ones.
+//!
+//! The scored 2026-07-28 failures that this example CANNOT fix, because every
+//! one of them lives in `src/` rather than in a fixture, with the gap they
+//! trace to:
+//!
+//! | Scored scenario | Gap | What `src/` does |
+//! |---|---|---|
+//! | `tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource` | G-1 | `Content::Resource` serialises FLAT; the spec's `EmbeddedResource` nests under `resource` |
+//! | `resources-read-binary` | G-2 | no blob-bearing resource-contents variant exists |
+//! | `tools-call-with-progress` | G-3 | `notification_tx` is set only in `Server::run()`, which `StreamableHttpServer` never calls |
+//! | `completion-complete` | G-4 | `completion/complete` is a catch-all arm returning `{}` |
+//! | `server-stateless` (`HttpServerMethodNotFound404ping`) | G-5 | `ping` is served under v2 instead of being retired |
+//! | `server-stateless` (`ServerImplementsDiscover`, `ServerUnsupportedVersionError`) | G-7 (new) | `server/discover` emits `protocolVersion`, never the `supportedVersions` array the spec mandates — `grep -rn supportedVersions src/` finds nothing |
+//! | `server-stateless` (3x `RequestMetaInvalid`, `HttpServerMetaInvalid400`) | G-6 (new) | a missing / malformed `_meta` answers `-32020`, not the `-32602` + HTTP 400 the spec requires; a missing `clientCapabilities` is not rejected at all |
+//! | `server-stateless` (`HttpServerHeaderMismatch400`) | G-8 (new) | a header/`_meta` protocol-version disagreement answers `-32022`, not `-32020` |
+//!
+//! Everything else that fails is a MISSING FIXTURE, and fixtures are exactly
+//! what this file is for. Do not cite this example as "pmcp passes the official
+//! suite"; cite it for the dual-era claim, which one process does demonstrate.
+//!
 //! # Divergence from `s47_v2_stateless_mrtr`: `PMCP_REQUEST_STATE_KEY`
 //!
 //! `s47` deliberately leaves that variable UNSET so a reader sees the SDK's
