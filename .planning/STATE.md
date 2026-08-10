@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.5
 milestone_name: MCP Spec 2026-07-28
 status: executing
-stopped_at: Phase 118.1 context gathered
-last_updated: "2026-08-10T17:15:44.616Z"
-last_activity: 2026-08-10 -- Phase 118.1 execution started
+stopped_at: Completed 118.1-01-PLAN.md
+last_updated: "2026-08-10T19:04:47.089Z"
+last_activity: 2026-08-10 -- Phase 118.1 plan 01 complete: CONF-04..08 minted, roadmap filled, Phase 118 merged as aec3a947
 progress:
   total_phases: 73
   completed_phases: 64
   total_plans: 413
-  completed_plans: 399
-  percent: 88
+  completed_plans: 400
+  percent: 97
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.1 (close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia) — EXECUTING
-Plan: 1 of 14
+Plan: 2 of 14
 Plans complete: **10 of 10** (118-01..118-10) — Phase 118 complete, `118-VERIFICATION.md` status `passed`
 Remaining: Phase 118.1 (nine conformance gaps G-1..G-9), then Phase 119 (docs)
-Status: Executing Phase 118.1
+Status: Ready to execute
 
 **117-13 HAS LANDED — THE D-03 CUT IS CLOSED, AND SMPL-01/SMPL-02 ARE DONE.** Commits `1a473e6d`
 (the verb split) + `50f039ab` (the severed-build 405 proof) + `ea301460` (config gating + the policy)
@@ -814,7 +814,7 @@ Prior-wave context — **113-21 landed the enumeration half of HTTP-09.** `tests
 Prior-wave context — **113-19 (wave 3) landed and the four-plan gap-closure round is CLOSED.** GAP-D: `decode_listen_chunks_for_fuzz` is now behind `#[cfg(any(feature = "fuzzing", test))]`; `#[doc(hidden)]` had hidden it from rustdoc but not from downstream callers or semver. Note for any re-verifier: `cargo public-api` OMITS `doc(hidden)` items, so the plan's seam-absence criterion passed vacuously (it was 0 before the fix too) — the falsifiable proof is a real downstream crate that fails `E0425` under `full` and compiles under `full,fuzzing`. GAP-E: the fuzz target's "latch never clears" tautology is replaced by a per-chunk `buffered_bytes() <= max_buffer_size` assertion, and it is PROVEN falsifiable — with only 113-17's pre-check disabled the campaign stays GREEN (113-17's two enforcement points are independently sufficient), and only with BOTH disabled does it crash (`the parser retained 9 bytes after chunk 0 under a 8-byte bound`). A 20 000-run campaign at `569f3533` is recorded in `113-FUZZ-EVIDENCE.md` § Campaign 2 (seed 3621664529, exit 0, artifacts dir EXISTS and is empty); campaign 1's PASS verdict is preserved verbatim because that campaign was green while GAP-A was open. The cross-cutting phase gate over 113-17 + 113-18 + 113-20 + 113-19 is GREEN: 6 suites, 4 build-matrix rows, `semver-checks` 223/223 no-update-required, zero REMOVED public items, zero new PMAT violations, `make quality-gate` exit 0 (243 ok / 0 FAILED). **NEXT: re-verify the phase** (`/gsd:verify-phase 113`) against `113-VERIFICATION.md`'s GAP-A..E; then, on or after 2026-07-28, re-run the 4-step procedure in `113-SPEC-RECHECK.md` § Recorded Exception, upgrade the Verdict, and only then flip HTTP-01..05 / CLNT-01..02 to `[x]`. A value mismatch is a phase-reopening event. Still unowned: WR-01, WR-02, WR-04, D-113-F..K, UNAS-01.
 
 Prior-wave context — 113-18 closed GAP-B and GAP-C. GAP-B is closed by CONTRACT, not by the originally-planned liveness reclaim: the receiver and the `ListenGuard` share one `stream::unfold` state tuple, so sender liveness cannot observe remote death (the verifier's reproduction dropped the receiver while holding the guard — a state production cannot enter). Instead the duplicate refusal became RETRYABLE (`RATE_LIMITED` -32005 at HTTP 200, `v2_status_for_code` byte-unchanged) and the fresh-id reconnect contract is documented in three places and pinned by a live tripwire whose negative control fails. GAP-C/WR-06 closed: both entry-creating rejection paths route through `prune_after_rejection`, proven by a test that fails when the prune is removed. A re-verifier must reproduce GAP-B through a REAL socket. Earlier in this wave 113-17 landed the parser work — `SseParser`'s bound is now UNCONDITIONAL over `buffer + current_event.data + chunk` (GAP-A closed for real), the two whole-body transport sites go through a `pub(crate)` `feed_complete_body`, and `connect_sse`'s ceiling is a configurable 16 MiB with no public-config-struct change (semver 223/223, no update required). **113-20 has now landed and T-113-84 is DISCHARGED**: `feed_complete_body`'s byte-cap precondition is an established fact naming both enforcing call sites. Every whole-body read on `StreamableHttpTransport` — the POST response, the `start_sse` GET stream, AND the previously-unenumerated v2 error envelope — goes through one `collect_body_within_cap` helper that refuses an over-cap `Content-Length` before reading a byte and bounds the delivered bytes with `http_body_util::Limited` (a STREAMING bound, so an over-cap body is never allocated whole). Zero `response.collect()` remain in that file. `DEFAULT_MAX_COLLECTED_BODY_BYTES` (16 MiB) lives on a PRIVATE field with an additive `with_max_collected_body_bytes()` seam, so semver stays 223/223 no-update-required. Four per-site negative-control runs recorded. D-113-K records the deferred GET-path incremental-parsing rewrite (T-113-94). Wave 3 (113-19, the phase gate) is unblocked. After it, re-verify the phase; then, on or after 2026-07-28, re-run the 4-step procedure in `113-SPEC-RECHECK.md` § Recorded Exception, upgrade the Verdict, and only then flip the seven requirements. HTTP-04 stays `[~]` until that gate clears. A value mismatch is a phase-reopening event.
-Last activity: 2026-08-10 -- Phase 118.1 execution started
+Last activity: 2026-08-10 -- Phase 118.1 plan 01 complete: CONF-04..08 minted, roadmap filled, Phase 118 merged as aec3a947
 
 ## v2.5 Phase Plan (8 phases, 38 requirements)
 
@@ -1227,6 +1227,9 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase 117]: 117-13: config-field gating taken IN FULL — the fallback was not needed; the four StreamableHttpServerConfig v1-only fields plus the SessionCallback alias are gated, semver-safe only while full-v2 stays out of every published default set (A7)
 - [Phase 117]: 117-13: GET/DELETE are SPLIT not moved — the v2 405 head stays always-compiled and build_mcp_router is unchanged, so the severed build answers 405 (refused) rather than 404 (unrouted)
 - [Phase 117]: 117-13: EventStoreHandle moved into v1_session.rs, reversing 117-12's note — its last uses on both sides went with the SSE twins; the alternatives were the transport's first feature attribute or a blanket allow(dead_code)
+- [Phase 118.1]: Phase 118.1 requirement text is WIRE BEHAVIOUR with a literal (schema.ts range, JSON-RPC code, or symbol) in every one of CONF-04..CONF-08, so a D-10 FIXED/REFUTED/DEFERRED verdict cannot be satisfied by prose alone
+- [Phase 118.1]: ROADMAP Phase 118.1 wave numbers are copied from the 14 PLAN.md frontmatter blocks (12 waves), not re-derived from D-05's five clusters, so the roadmap cannot drift from the plans' depends_on graph
+- [Phase 118.1]: make doc-check is NOT reachable from make quality-gate (standalone target at Makefile:546-551) — a green local gate does not imply CI's Quality Gate will pass; run make doc-check explicitly before pushing rustdoc changes
 
 ### Pending Todos
 
@@ -1282,10 +1285,10 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-10T05:44:59.432Z
-Stopped at: Phase 118.1 context gathered
-Resume file: .planning/phases/118.1-close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia/118.1-CONTEXT.md
-Next: **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`).
+Last session: 2026-08-10T19:03:06.372Z
+Stopped at: Completed 118.1-01-PLAN.md (Tasks 3-4 by a continuation executor after the Task 2 blocking checkpoint resolved `approved.`)
+Resume file: .planning/phases/118.1-close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia/118.1-02-PLAN.md
+Next: **Phase 118.1 plan 02 (Wave 2) — CONF-04's RED fences** — `118.1-02-PLAN.md`. Its `depends_on: [118.1-01]` is satisfied, the branch is cut from merged `main`, and CONF-04 now exists with the `schema.ts:1734-1748` literal its spec-derived goldens must derive from. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`) — run it explicitly before pushing anything touching rustdoc, or CI's `Quality Gate` will fail on a locally-green tree, as it did on `dee33acb`. *(The directive below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`).
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
 
 ## Performance Metrics
@@ -1416,3 +1419,4 @@ Next: **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/g
 | Phase 117 P12 | 95min | 2 tasks | 3 files |
 | Phase 117 P14 | 130min | 3 tasks | 7 files |
 | Phase 117 P13 | 45min | 3 tasks | 5 files |
+| Phase 118.1 P01 | 35min | 4 tasks | 2 files |

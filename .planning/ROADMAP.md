@@ -2773,7 +2773,7 @@ Plans:
 **Goal:** Both official-suite legs measure strictly better than the Phase-118 baseline (`2025-11-25`: 51 passed, 15 failed, exit 1, 11 scored scenarios red, 66 checks; `2026-07-28`: 124 passed, 54 failed, exit 1, 7 scored red, 178 checks), each of G-1..G-9 carries an explicit **FIXED / REFUTED / DEFERRED** disposition backed by a named RED-to-GREEN artifact, and the blocking CI gate is widened to exactly the surfaces that then pass — with no `--expected-failures`, no allowlist and no known-failure baseline.
 **Requirements**: CONF-04, CONF-05, CONF-06, CONF-07, CONF-08
 **Depends on:** Phase 118
-**Plans:** 14 plans
+**Plans:** 1/14 plans executed
 
 **Success Criteria** (what must be TRUE):
 
@@ -2787,7 +2787,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 118.1-01-PLAN.md — Wave 1. Bookkeeping plus the **D-14** branch precondition: mint CONF-04..CONF-08 as scoreable wire behaviour (D-12), fill this roadmap entry, and land Phase 118 on `main` before anything is re-measured (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
+- [x] 118.1-01-PLAN.md — Wave 1. Bookkeeping plus the **D-14** branch precondition: mint CONF-04..CONF-08 as scoreable wire behaviour (D-12), fill this roadmap entry, and land Phase 118 on `main` before anything is re-measured (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -2862,7 +2862,7 @@ Plans:
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
-| 118.1 Close the Nine Conformance Gaps | 0/14 | Not started | - |
+| 118.1 Close the Nine Conformance Gaps | 1/14 | In Progress | - |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
