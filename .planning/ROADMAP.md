@@ -2767,6 +2767,17 @@ Plans:
 
 - [x] 118-09-PLAN.md — Wave 5. D-02/D-15: two BLOCKING CI jobs (Node 22 + lockfile-keyed npm cache + `timeout-minutes`), all FOUR `gate` wirings each, and a `serde_yaml` structural tripwire proving a **BIJECTIVE** job→env→conditional→echo mapping, with a live negative control, the two-pin binding, and seven executed failure demonstrations (CONF-01/CONF-02/CONF-03)
 
+### Phase 118.1: Close the nine conformance gaps G-1..G-9 found by the official suite (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 118
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd:plan-phase 118.1 to break down)
+
 ### Phase 119: Documentation — Three Shapes + v2 Migration
 
 **Goal**: The milestone is documented per the house three-shapes rule (pmcp-book chapters + runnable examples + README/course), leading with the `cargo pmcp` workflow — covering both the v2.4 Agents & Teams surface (carried from Phase 111) and the v2 dual-version migration story, with runnable v2 examples verified against the shipped code.

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.5
 milestone_name: MCP Spec 2026-07-28
-status: executing
-stopped_at: Phase 118 context gathered
-last_updated: "2026-08-10T02:37:35.135Z"
+status: completed
+stopped_at: Phase 118.1 context gathered
+last_updated: "2026-08-10T05:44:59.448Z"
 last_activity: 2026-08-10
 progress:
-  total_phases: 72
+  total_phases: 73
   completed_phases: 64
   total_plans: 399
   completed_plans: 399
-  percent: 89
+  percent: 88
 ---
 
 # Project State
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 
 ## Current Position
 
-Phase: 999.1
+Phase: 118.1 (INSERTED — not yet planned)
 Plan: Not started
-Plans complete: **14 of 14** (117-01..117-14)
-Remaining: none — ready for phase verification
-Status: Executing Phase 118
+Plans complete: **10 of 10** (118-01..118-10) — Phase 118 complete, `118-VERIFICATION.md` status `passed`
+Remaining: Phase 118.1 (nine conformance gaps G-1..G-9), then Phase 119 (docs)
+Status: Phase 118 complete; Phase 118.1 inserted after it, awaiting /gsd:discuss-phase 118.1
 
 **117-13 HAS LANDED — THE D-03 CUT IS CLOSED, AND SMPL-01/SMPL-02 ARE DONE.** Commits `1a473e6d`
 (the verb split) + `50f039ab` (the severed-build 405 proof) + `ea301460` (config gating + the policy)
@@ -839,6 +839,7 @@ Last activity: 2026-08-10
 
 ### Roadmap Evolution
 
+- Phase 118.1 inserted after Phase 118 (2026-08-10) (URGENT): close the nine conformance gaps G-1..G-9 that Phase 118 found by running the official `@modelcontextprotocol/conformance` suite for the first time. Recorded with source citations in `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`. Inserted as a decimal rather than appended, because Phases 120-124 are already claimed by the v2.6 AI-Package Portability milestone. G-1 (`Content::Resource` serializes flat vs spec `EmbeddedResource` nesting under `resource:`) changes the wire format of a public type and needs a semver decision before it can be scheduled. Phase 119 (docs) now sequences after 118.1.
 - v2.5 milestone roadmap created (2026-07-22): 8 phases (112-119) map the 38 v1 requirements along the research-corroborated dependency spine — version-plumbing keystone (112) first and alone, stateless HTTP + MRTR (113), Tasks-as-extension (114), parallel JSON Schema (115) and Auth (116), agents/tester + v1 severability (117), conformance (118), docs (119). 100% coverage, no orphans, no duplicates. v2.4 Phase 111 docs folded into v2.5 DOCS-04 (Phase 119). Continues numbering after v2.4's Phases 106-111 (Phase 111 never executed).
 - v2.4 milestone roadmap created (2026-07-17): 6 phases (106-111) map 1:1 to the approved design doc's §4 phases A-F along the compliance→contracts→agent→teams→CLI→docs spine; all 31 v1 requirements mapped (100% coverage, no orphans).
 
@@ -1281,9 +1282,9 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-09T17:32:44.621Z
-Stopped at: Phase 118 context gathered
-Resume file: .planning/phases/118-conformance-against-the-official-suite/118-CONTEXT.md
+Last session: 2026-08-10T05:44:59.432Z
+Stopped at: Phase 118.1 context gathered
+Resume file: .planning/phases/118.1-close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia/118.1-CONTEXT.md
 Next: **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`).
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
 
