@@ -97,29 +97,38 @@
 //! what this file is for. Do not cite this example as "pmcp passes the official
 //! suite"; cite it for the dual-era claim, which one process does demonstrate.
 //!
-//! ## The removed-method retirement is WEAKER than the suite's score suggests
+//! ## Removed-method retirement (G-5 — closed by plan 118.1-05)
 //!
 //! v2 removes five RPCs: `initialize`, `ping`, `logging/setLevel`,
-//! `resources/subscribe` and `resources/unsubscribe`. The suite scores four of
-//! the five as passing. Probed directly with WELL-FORMED params, only two are
-//! genuinely retired:
+//! `resources/subscribe` and `resources/unsubscribe`. All five are now retired
+//! by EXACT METHOD STRING through the `V2_RETIRED_METHODS` table in
+//! `src/server/streamable_http_server.rs`, so each answers `404` + `-32601`
+//! however well-formed its `params` are:
 //!
 //! | Method under v2 | Suite's probe (`params` = `_meta` only) | Well-formed `params` |
 //! |---|---|---|
-//! | `initialize` | 404 + `-32601` | **HTTP 200, served** — and answers `protocolVersion: "2025-11-25"` |
-//! | `ping` | HTTP 200, served | HTTP 200, served |
-//! | `logging/setLevel` | 404 + `-32601` | **HTTP 200, served** |
-//! | `resources/subscribe` | 404 + `-32601` | 404 + `-32601` (genuinely retired) |
-//! | `resources/unsubscribe` | 404 + `-32601` | 404 + `-32601` (genuinely retired) |
+//! | `initialize` | 404 + `-32601` | 404 + `-32601` |
+//! | `ping` | 404 + `-32601` | 404 + `-32601` |
+//! | `logging/setLevel` | 404 + `-32601` | 404 + `-32601` |
+//! | `resources/subscribe` | 404 + `-32601` | 404 + `-32601` |
+//! | `resources/unsubscribe` | 404 + `-32601` | 404 + `-32601` |
 //!
-//! `v2_retired_method_of` in `src/server/streamable_http_server.rs` matches
-//! exactly `Subscribe` and `Unsubscribe` and nothing else. The other three
-//! answer `-32601` to the suite only because its probe sends `params` carrying
-//! `_meta` alone, which does not deserialize into `InitializeRequest` or
-//! `SetLoggingLevel` — a PARSE failure that happens to produce the required
-//! code. Two of the four "passes" therefore pass for the wrong reason, and the
-//! `docs/v1-sunset-policy.md` tension about a v2 server still answering
-//! `initialize` is CONFIRMED at the wire rather than merely suspected.
+//! BEFORE plan 118.1-05 the retirement was materially WEAKER than the suite's
+//! score suggested. The predicate then — `v2_retired_method_of` — matched
+//! exactly `Subscribe` and `Unsubscribe` and nothing else. `initialize`,
+//! `ping` and `logging/setLevel` were genuinely SERVED under well-formed
+//! params (`initialize` even answering `protocolVersion: "2025-11-25"`), and
+//! answered `-32601` to the suite only because its probe sends `params`
+//! carrying `_meta` alone, which does not deserialize into `InitializeRequest`
+//! or `SetLoggingLevel` — a PARSE failure that happened to produce the required
+//! code. Two of the four "passes" therefore passed for the wrong reason.
+//!
+//! Because the suite's own `initialize` and `logging/setLevel` checks were
+//! GREEN on a server that retired NEITHER, they MUST NOT be cited as evidence
+//! for G-5. `tests/v2_retired_methods.rs` is the fence that actually measures
+//! it — it sends well-formed params and requires 404 + `-32601` for all five.
+//! The `docs/v1-sunset-policy.md` tension about a v2 server still answering
+//! `initialize` is now resolved at the wire rather than merely suspected.
 //!
 //! # Divergence from `s47_v2_stateless_mrtr`: `PMCP_REQUEST_STATE_KEY`
 //!
