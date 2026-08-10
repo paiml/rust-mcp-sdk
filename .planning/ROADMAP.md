@@ -2223,6 +2223,7 @@ Plans:
 - [x] **Phase 116: Auth Hardening SEPs** — RFC 9207 `iss` validation (strict v2 / lenient v1), DCR `application_type`, issuer-keyed credential storage + three clarifications — all source changes to the hand-rolled OAuth stack, no new crates (completed 2026-08-07)
 - [x] **Phase 117: Agents, Tester & v1 Severability** — `pmcp-agent` (ToolInvoker + task polling) and `mcp-tester` exercise a v2 server end-to-end; v1-only machinery isolated behind a severable era-gated layer with a documented sunset policy; v2 path carries no session/SSE baggage (completed 2026-08-08)
 - [x] **Phase 118: Conformance Against the Official Suite** — official `@modelcontextprotocol/conformance` (commit-pinned) in CI over real HTTP against a dual-version example; Phase-109 Rust harness gains v2 fixtures (v1 stays green, dev-dep-free build); deprecated caps verified functional under v2 (completed 2026-08-10)
+- [ ] **Phase 118.1: Close the Nine Conformance Gaps** — the nine structural SDK defects G-1..G-9 that Phase 118's measurement found: nested `EmbeddedResource` + `blob` + `annotations`; the `completion/complete` seam and v2 method retirement; the `_meta` classifier, `-32020`/`-32022` ordering and `supportedVersions`; the server-to-client back-channel over StreamableHTTP; and v1 capability plumbing. Ends in a re-measurement, a per-gap FIXED/REFUTED/DEFERRED disposition, and a gate widened to exactly what passes
 - [ ] **Phase 119: Documentation — Three Shapes + v2 Migration** — Agents & Teams docs in three shapes (carried from v2.4 Phase 111); v2 migration guide + dual-version story + sunset policy; runnable stateless-v2-server and v2-client/agent examples
 
 ## Phase Details — v2.5 (MCP Spec 2026-07-28 v2 Support)
@@ -2769,14 +2770,70 @@ Plans:
 
 ### Phase 118.1: Close the nine conformance gaps G-1..G-9 found by the official suite (INSERTED)
 
-**Goal:** [Urgent work - to be planned]
-**Requirements**: TBD
+**Goal:** Both official-suite legs measure strictly better than the Phase-118 baseline (`2025-11-25`: 51 passed, 15 failed, exit 1, 11 scored scenarios red, 66 checks; `2026-07-28`: 124 passed, 54 failed, exit 1, 7 scored red, 178 checks), each of G-1..G-9 carries an explicit **FIXED / REFUTED / DEFERRED** disposition backed by a named RED-to-GREEN artifact, and the blocking CI gate is widened to exactly the surfaces that then pass — with no `--expected-failures`, no allowlist and no known-failure baseline.
+**Requirements**: CONF-04, CONF-05, CONF-06, CONF-07, CONF-08
 **Depends on:** Phase 118
-**Plans:** 0 plans
+**Plans:** 14 plans
+
+**Success Criteria** (what must be TRUE):
+
+  1. An embedded resource in a tool result or a prompt message serializes as the spec `EmbeddedResource` shape — `type: "resource"` with contents nested under `resource` — on both eras, binary content carries `blob` in both the nested and the flat `ReadResourceResult.contents` positions, content-level `annotations` is carried, and pmcp parses both the nested and the legacy flat shape while emitting only the nested one (CONF-04)
+  2. `completion/complete` is served by a registered handler seam on both native dispatchers, and all five methods absent from the 2026-07-28 core schema answer HTTP 404 with `-32601` on v2 even with well-formed params while still answering normally on v1 (CONF-05)
+  3. A v2 request missing `params._meta`, `io.modelcontextprotocol/protocolVersion` or `io.modelcontextprotocol/clientCapabilities` is rejected `-32602` + HTTP 400 while a missing `clientInfo` is served 200; version disagreement answers `-32020` and an unsupported agreed version `-32022` with `data.supported`; and `server/discover` emits `supportedVersions` from that same accept list (CONF-06)
+  4. The server-to-client back-channel works over StreamableHTTP — `peer.sample()`, `peer.list_roots()` and `peer.elicit()` complete over v1 stateful HTTP without blocking concurrent requests, progress notifications reach the client on both eras, and `set_result_meta` survives the `ToolOutput::Result` verbatim path (CONF-07)
+  5. `RequestHandlerExtra::client_capabilities()` returns the capabilities a v1 client advertised in its `initialize` handshake at every handler-dispatch construction site (CONF-08)
 
 Plans:
 
-- [ ] TBD (run /gsd:plan-phase 118.1 to break down)
+**Wave 1**
+
+- [ ] 118.1-01-PLAN.md — Wave 1. Bookkeeping plus the **D-14** branch precondition: mint CONF-04..CONF-08 as scoreable wire behaviour (D-12), fill this roadmap entry, and land Phase 118 on `main` before anything is re-measured (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 118.1-02-PLAN.md — Wave 2. **D-04**: CONF-04's RED fences — spec-derived byte goldens for the embedded-resource tool-result and prompt-message positions on BOTH eras plus the tolerant-reader fuzz target, each demonstrated RED against the unfixed tree (CONF-04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 118.1-03-PLAN.md — Wave 3. **D-01/D-03/D-15**: the CONF-04 fix — nested `EmbeddedResource` emitter, tolerant flat-input reader, `blob`, `annotations`, `#[non_exhaustive]` plus constructors in ONE batched edit, and the D-02 CHANGELOG wire-change callout with its documented `cargo semver-checks` delta (CONF-04)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 118.1-04-PLAN.md — Wave 4. G-4: the `completion/complete` handler seam on both native dispatchers, replacing the catch-all `json!({})` (CONF-05)
+- [ ] 118.1-05-PLAN.md — Wave 4. G-5: method-string retirement at the v2 ingress so all five schema-absent methods answer `-32601` under well-formed params — never validated against the suite's two false greens (CONF-05)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 118.1-06-PLAN.md — Wave 5. G-6/G-8: the three-way `_meta` classifier (`-32602` + HTTP 400 for the two required keys, HTTP 200 for a missing `clientInfo`) and the `-32020` / `-32022` check ordering (CONF-06)
+- [ ] 118.1-07-PLAN.md — Wave 5. G-7: `server/discover` emits `supportedVersions` from the SAME accept list the version errors are computed from (CONF-06)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 118.1-08-PLAN.md — Wave 6. G-9: v1 capability plumbing, so `client_capabilities()` carries the `initialize` handshake's capabilities at every handler-dispatch construction site (CONF-08)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 118.1-09-PLAN.md — Wave 7. **D-06/D-07**: `PeerHandle::elicit` plus the `set_result_meta` drain on the `ToolOutput::Result` verbatim path (CONF-07)
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
+- [ ] 118.1-10-PLAN.md — Wave 8. G-3, part 1: the v1 server-to-client channel plus inbound routing before the server mutex (CONF-07)
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
+- [ ] 118.1-11-PLAN.md — Wave 9. G-3, part 2: v1 session-bound peer injection, progress notifications, and the 118-07 `capability-not-offered` era-matrix tripwire flips (CONF-07)
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
+- [ ] 118.1-12-PLAN.md — Wave 10. G-3, part 3 (**D-16**): v2 multi-frame SSE progress on the POST response body — notification frames then the result frame ONLY, never an independent server-to-client request (CONF-07)
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
+- [ ] 118.1-13-PLAN.md — Wave 11. Re-measurement number one at the HELD `0.2.0-alpha.11` pin, plus the **D-10** FIXED/REFUTED/DEFERRED disposition for each of G-1..G-9 AMENDED into `118-CONFORMANCE-GAPS.md` (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
+- [ ] 118.1-14-PLAN.md — Wave 12. **D-09**: gate widening to exactly the surfaces that then pass — no `--expected-failures`, no allowlist, no known-failure baseline — plus the **D-08** re-pin and re-measurement number two, reported as a SEPARATE delta from the fixes' delta (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
 
 ### Phase 119: Documentation — Three Shapes + v2 Migration
 
@@ -2805,6 +2862,7 @@ Plans:
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
+| 118.1 Close the Nine Conformance Gaps | 0/14 | Not started | - |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
