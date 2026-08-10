@@ -2761,7 +2761,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 118-08-PLAN.md — Wave 4. The two driver scripts (one process from the built binary, two runs, readiness poll, process-GROUP teardown, per-run + total timeouts, the EXECUTABLE zero-check gate and the check floors; two dev-dependency-free build fences + nonzero-count guards for all three harness targets) with commands as DATA, plus the two Makefile targets (CONF-01/CONF-02/CONF-03)
+- [x] 118-08-PLAN.md — Wave 4. The two driver scripts (one process from the built binary, two runs, readiness poll, process-GROUP teardown, per-run + total timeouts, the EXECUTABLE zero-check gate and the check floors; two dev-dependency-free build fences + nonzero-count guards for all three harness targets) with commands as DATA, plus the two Makefile targets (CONF-01/CONF-02/CONF-03)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -2793,7 +2793,7 @@ Plans:
 | 115. JSON Schema 2020-12 + Caching Hints | 19/19 | Complete    | 2026-08-02 |
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
-| 118. Conformance Against the Official Suite | 8/10 | In Progress|  |
+| 118. Conformance Against the Official Suite | 9/10 | In Progress|  |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
