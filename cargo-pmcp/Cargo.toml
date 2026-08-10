@@ -153,7 +153,7 @@ base64 = "0.23"
 [dev-dependencies]
 mockito = "1"
 proptest = "1"
-serial_test = "3"
+serial_test = "4"
 assert_cmd = "2"
 predicates = "3"
 apollo-compiler = "1"
