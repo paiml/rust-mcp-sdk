@@ -2756,8 +2756,8 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 118-05-PLAN.md — Wave 3. D-13/D-18's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process started from the BUILT binary, with a cross-era bleed probe (CONF-01)
-- [ ] 118-07-PLAN.md — Wave 3. D-10/D-11/D-12 via **D-17**: the era matrix with a bidirectional baseline join, Roots/Sampling/Logging COMPLETING under both eras through a `StreamableHttpTransport` typed client, the baseline reconciled from measurement, and the 12-month advisory MECHANISM window reconciled into `docs/v1-sunset-policy.md` (CONF-02/CONF-03)
+- [x] 118-05-PLAN.md — Wave 3. D-13/D-18's follow-up re-measure, the MRTR + `InputRequiredResult` v2 surface, and both requirement sets green from ONE unrestarted process started from the BUILT binary, with a cross-era bleed probe (CONF-01)
+- [x] 118-07-PLAN.md — Wave 3. D-10/D-11/D-12 via **D-17**: the era matrix with a bidirectional baseline join, Roots/Sampling/Logging COMPLETING under both eras through a `StreamableHttpTransport` typed client, the baseline reconciled from measurement, and the 12-month advisory MECHANISM window reconciled into `docs/v1-sunset-policy.md` (CONF-02/CONF-03)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -2793,7 +2793,7 @@ Plans:
 | 115. JSON Schema 2020-12 + Caching Hints | 19/19 | Complete    | 2026-08-02 |
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
-| 118. Conformance Against the Official Suite | 6/10 | In Progress|  |
+| 118. Conformance Against the Official Suite | 8/10 | In Progress|  |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
