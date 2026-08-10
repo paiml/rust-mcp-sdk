@@ -216,7 +216,7 @@ jobs:
         cargo install cargo-audit --force
 
     - name: Install cargo-deny (make quality-gate chains purity-check, which needs it)
-      uses: taiki-e/install-action@v2.85.5
+      uses: taiki-e/install-action@v2.85.10
       with:
         # Pinned: the Makefile purity-check Layer 2 invocation uses cargo-deny
         # 0.18.3's CLI ordering (`check --config deny.toml bans`). Newer cargo-deny
@@ -332,7 +332,7 @@ jobs:
           ${{ runner.os }}-cargo-purity-
 
     - name: Install cargo-deny (Layer 2 backstop)
-      uses: taiki-e/install-action@v2.85.5
+      uses: taiki-e/install-action@v2.85.10
       with:
         # Pinned to match the Makefile purity-check Layer 2 CLI form (see the
         # quality-gate job's install step for the full rationale). Newer cargo-deny
