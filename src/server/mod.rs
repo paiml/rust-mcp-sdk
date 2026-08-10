@@ -475,6 +475,11 @@ pub struct Server {
     uri_to_tool_meta: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// Completion provider backing `completion/complete` (Phase 118.1-04,
+    /// CONF-05). Mirrors `ServerCore`'s field of the same name so BOTH native
+    /// dispatchers consult the same registered seam through the same shared
+    /// unit. `None` still answers the spec shape with an empty `values` array.
+    completions: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
     client_capabilities: Arc<RwLock<Option<ClientCapabilities>>>,
     initialized: Arc<RwLock<bool>>,
@@ -1894,9 +1899,30 @@ impl Server {
             ClientRequest::ListResourceTemplates(req) => {
                 Self::handle_list_resource_templates(self, req)
             },
+            // `completion/complete` (Phase 118.1-04, CONF-05 / G-4) — its OWN
+            // arm, no longer inside the catch-all below. The shared unit is
+            // DEFINED in `server/core.rs` and merely CALLED here, per the
+            // twin-site parity rule stated at `src/server/core.rs`'s MRTR
+            // section: `mod.rs` calls these helpers, it never defines its own.
+            ClientRequest::Complete(req) => {
+                crate::server::core::complete_completion(self.completions.as_ref(), &req)
+                    .await
+                    .and_then(|result| serde_json::to_value(result).map_err(Into::into))
+            },
+            // RESIDUAL, recorded rather than silently unified (Phase 118.1-04,
+            // RESEARCH Open Question 4): these four methods STILL diverge
+            // between the two native dispatchers. Here they answer
+            // `json!({})`; `ServerCore`'s `_ =>` arm
+            // (`src/server/core.rs`, the arm immediately after the
+            // `ClientRequest::Complete` one) answers `-32601 Method not
+            // supported`. Only this dispatcher is on the HTTP path, so only
+            // this side is measured by the official conformance suite. G-5
+            // (`resources/subscribe`, `resources/unsubscribe`,
+            // `logging/setLevel`, `ping` retirement on v2) is the requirement
+            // that owns them; unifying them here would smuggle a behaviour
+            // change in behind a conformance fix.
             ClientRequest::Subscribe(_)
             | ClientRequest::Unsubscribe(_)
-            | ClientRequest::Complete(_)
             | ClientRequest::SetLoggingLevel { level: _ }
             | ClientRequest::Ping => Ok(serde_json::json!({})),
             ClientRequest::CreateMessage(req) => self.handle_create_message(request_id, *req).await,
@@ -2865,6 +2891,11 @@ pub struct ServerBuilder {
     tools: HashMap<String, Arc<dyn ToolHandler>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// Completion provider backing `completion/complete` (Phase 118.1-04,
+    /// CONF-05), set via [`Self::completions`]. The twin of
+    /// `ServerCoreBuilder`'s slot of the same name: a provider registered
+    /// through EITHER builder family reaches its own dispatcher.
+    completions: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
     /// Cancellation manager for request cancellation
     cancellation_manager: cancellation::CancellationManager,
@@ -2980,6 +3011,7 @@ impl ServerBuilder {
             tools: HashMap::new(),
             prompts: HashMap::new(),
             resources: None,
+            completions: None,
             sampling: None,
             cancellation_manager: cancellation::CancellationManager::new(),
             roots_manager: roots::RootsManager::new(),
@@ -4142,6 +4174,72 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the completion provider backing `completion/complete`.
+    ///
+    /// The twin of
+    /// [`ServerCoreBuilder::completions`](crate::server::builder::ServerCoreBuilder::completions) —
+    /// same name, same signature, same single-provider shape — so a provider
+    /// registered through EITHER builder family reaches its own dispatcher. A
+    /// slot on one family with the dispatch arm on the other's server would be
+    /// an unreachable seam that still answered the spec shape, which is exactly
+    /// the false green this pair exists to prevent.
+    ///
+    /// A SINGLE, server-wide provider (the [`Self::resources`] shape, not the
+    /// name-keyed [`Self::prompt`] shape): the spec routes every
+    /// `completion/complete` to one seam and passes the `ref` as data. The
+    /// reference reaches the provider through
+    /// [`CompletionRequest::context`](crate::types::completable::CompletionRequest::context)
+    /// under the key `ref/prompt` or `ref/resource`.
+    ///
+    /// Registering a provider auto-advertises `capabilities.completions`.
+    /// Not registering one is NOT an error: `completion/complete` still answers
+    /// `{"completion": {"values": []}}`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pmcp::Server;
+    /// use pmcp::types::completable::StaticCompletionProvider;
+    ///
+    /// let server = Server::builder()
+    ///     .name("completion-server")
+    ///     .version("1.0.0")
+    ///     .completions(StaticCompletionProvider::from_strings(vec![
+    ///         "alpha".to_string(),
+    ///         "beta".to_string(),
+    ///     ]))
+    ///     .build()?;
+    /// # Ok::<(), pmcp::Error>(())
+    /// ```
+    #[must_use]
+    pub fn completions(
+        self,
+        provider: impl crate::types::completable::CompletionProviderTrait + 'static,
+    ) -> Self {
+        self.completions_arc(Arc::new(provider))
+    }
+
+    /// Set the completion provider with an Arc.
+    ///
+    /// This variant lets the caller share the provider `Arc` with something
+    /// outside the builder. Behavior is otherwise identical to
+    /// [`Self::completions`].
+    #[must_use]
+    pub fn completions_arc(
+        mut self,
+        provider: Arc<dyn crate::types::completable::CompletionProviderTrait>,
+    ) -> Self {
+        self.completions = Some(provider);
+
+        // Update capabilities to include completions.
+        // Use Some(default) instead of None to ensure the field serializes.
+        if self.capabilities.completions.is_none() {
+            self.capabilities.completions = Some(crate::types::CompletionCapabilities::default());
+        }
+
+        self
+    }
+
     /// Register a single SEP-2640 Agent Skill.
     ///
     /// Convenience over [`Self::skills`] for the single-skill case. The skill
@@ -5109,6 +5207,7 @@ impl ServerBuilder {
             uri_to_tool_meta,
             prompts: self.prompts,
             resources: final_resources,
+            completions: self.completions,
             sampling: self.sampling,
             client_capabilities: Arc::new(RwLock::new(None)),
             initialized: Arc::new(RwLock::new(false)),
