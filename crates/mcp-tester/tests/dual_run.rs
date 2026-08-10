@@ -265,9 +265,11 @@ async fn dual_run_against_a_dual_era_server_classifies_against_the_baseline() {
         discover.v2
     );
 
-    // ERA-01 is classified MISSING — the server still answers `initialize` on
-    // the v2 wire. See `the_server_still_answers_initialize_on_the_v2_wire`,
-    // which pins the evidence.
+    // ERA-01 reproduces. It was classified MISSING until phase 118.1 plan 05
+    // (CONF-05, gap G-5) severed the SERVER half of the delta; before that the
+    // difference was real of the CLIENT only. See
+    // `the_server_refuses_a_well_formed_initialize_on_the_v2_wire`, which pins
+    // the evidence and keeps the history.
     let initialize = report
         .differences
         .iter()
@@ -275,8 +277,11 @@ async fn dual_run_against_a_dual_era_server_classifies_against_the_baseline() {
         .expect("every baseline entry must be classified, including ones that do not reproduce");
     assert_eq!(
         initialize.class,
-        DifferenceClass::Missing,
-        "ERA-01 does not currently reproduce server-side. Observed v1={:?} v2={:?}",
+        DifferenceClass::Expected,
+        "ERA-01 must reproduce on the wire: a v1 server SERVES `initialize` and \
+         a v2 server RETIRES it. A MISSING here means the server-side \
+         retirement regressed — fix the server, do NOT re-record the baseline. \
+         Observed v1={:?} v2={:?}",
         initialize.v1,
         initialize.v2
     );
@@ -439,56 +444,93 @@ async fn a_v2_run_establishes_without_initialize_and_c01_asserts_it() {
         .iter()
         .find(|t| t.name.starts_with("Core: initialize absent"))
         .expect("the v2 C-01 must run and be named for what it asserts");
-    // C-01 currently FAILS, and that is the CORRECT result — see
-    // `the_server_still_answers_initialize_on_the_v2_wire`. Asserting `Passed`
-    // here would require weakening the probe until it stopped detecting the
-    // very thing it was written to detect.
+    // C-01 PASSES. It FAILED until phase 118.1 plan 05, and that was the
+    // CORRECT result then: the server answered `initialize` on the v2 wire. The
+    // probe was never weakened to make this green — the SERVER was severed. See
+    // `the_server_refuses_a_well_formed_initialize_on_the_v2_wire`.
     assert_eq!(
         c01.status,
-        mcp_tester::TestStatus::Failed,
-        "C-01 must report that the server answers `initialize` on the v2 wire; \
-         if this now passes, the server side has been severed and this \
-         assertion (plus the ERA-01 finding) should be updated: {:?}",
-        c01.details
+        mcp_tester::TestStatus::Passed,
+        "C-01 must observe the server REFUSING `initialize` on the v2 wire. A \
+         failure here means the retirement regressed; fix the server rather \
+         than this assertion: {:?}",
+        c01.error
     );
+    // Green alone is not enough. C-01 also asserts a `server/discover` half, so
+    // its pass must NAME the refusal it saw — otherwise a probe that stopped
+    // sending `initialize` at all would look identical to one that watched the
+    // server refuse it.
     assert!(
-        c01.error
-            .as_deref()
-            .is_some_and(|e| e.contains("ANSWERED `initialize`")),
-        "C-01's failure must name the wire fact it observed: {:?}",
-        c01.error
+        c01.details.as_deref().is_some_and(|d| {
+            d.contains("`initialize` refused") && d.contains("-32601") && d.contains("reason:")
+        }),
+        "C-01's pass must name the wire fact it observed, INCLUDING the refusal \
+         reason — on the 2026-07-28 wire a retired method and a request whose \
+         params never parsed share both the code and the status, so a report \
+         that prints only `-32601` cannot say which one it saw. The exact \
+         wording is pinned by \
+         `the_server_refuses_a_well_formed_initialize_on_the_v2_wire`, not here: \
+         C-01 runs against third-party servers whose phrasing is their own. \
+         Observed: {:?}",
+        c01.details
     );
 }
 
-/// A FINDING, recorded as a test rather than as prose.
+/// A FINDING, RESOLVED — recorded as a test rather than as prose.
 ///
 /// The baseline's ERA-01 records `initialize` as `served` on v1 and `absent` on
-/// v2. MEASURED here against a real opted-in `pmcp` server: the SERVER still
-/// answers a well-formed `initialize` on the `2026-07-28` wire, with HTTP 200
-/// and a result — and that result is a MIXED envelope, carrying the v1
-/// `protocolVersion: 2025-11-25` alongside the v2 `resultType` and
-/// `_meta["io.modelcontextprotocol/serverInfo"]`.
+/// v2. MEASURED here against a real opted-in `pmcp` server: the SERVER refuses a
+/// well-formed `initialize` on the `2026-07-28` wire with `-32601` and HTTP
+/// `404`. ERA-01 reproduces server-side, and the dual run classifies it
+/// EXPECTED.
 ///
-/// ERA-01's own `source` column cites only CLIENT-side artifacts
-/// (`REQUIREMENTS.md:911 (CLNT-01)`, `src/client/mod.rs:726-741`
-/// `v2_synthetic_initialize_result`). The client's `initialize` is indeed local
-/// and synthetic; the SERVER's `initialize` was never severed. So the delta is
-/// real as written about the client and does not reproduce on the server.
+/// # History — KEEP. The delta was once CLIENT-ONLY, and that is not obvious
 ///
-/// The baseline is deliberately NOT edited to match. It is the phase's spec
-/// artifact, and rewriting it so the comparison goes quiet is exactly the
-/// re-recorded-golden anti-pattern `tests/report_compat.rs` warns about. The
-/// tester reporting ERA-01 as MISSING is the tool working.
+/// Until phase 118.1 plan 05 (CONF-05, gap G-5) this test asserted the OPPOSITE
+/// and was right to. The server then answered a well-formed v2 `initialize` with
+/// HTTP 200 and a MIXED envelope: the v1 `protocolVersion: 2025-11-25` alongside
+/// the v2 `resultType` and `_meta["io.modelcontextprotocol/serverInfo"]`.
+/// ERA-01's `source` column cited only CLIENT-side artifacts, and its claim held
+/// of the client alone — a v2 client's `InitializeResult` is local and synthetic
+/// (`src/client/mod.rs`, `v2_synthetic_initialize_result`) — while the SERVER's
+/// `initialize` had never been severed. The tester reporting ERA-01 as MISSING
+/// was the tool working, not a bug in the baseline.
 ///
-/// # The trap this test also closes
+/// Plan 05 severed the server half: `V2_RETIRED_METHODS`
+/// (`src/server/streamable_http_server.rs`) retires all five methods the
+/// `2026-07-28` core schema removed, keyed on the METHOD NAME STRING rather than
+/// on a parsed request variant. `tests/v2_retired_methods.rs` is the pmcp-side
+/// fence for that change; this test is its mcp-tester-side counterpart.
+///
+/// The baseline's VALUES were correct throughout and are STILL UNTOUCHED —
+/// `v1: served`, `v2: absent`, `kind: method-removed`. The server caught up to
+/// the spec artifact; the spec artifact was not rewritten to match the server.
+/// Only ERA-01's `source`/`note` prose changed, because it described a
+/// client-only delta that is no longer client-only. Editing `v1`/`v2`/`kind` to
+/// quieten a comparison is the re-recorded-golden anti-pattern
+/// `tests/report_compat.rs` warns about, and is NOT what happened here.
+///
+/// # The trap this test still closes: TWO `-32601`s, TWO DIFFERENT CAUSES
 ///
 /// A probe whose `initialize` params omit `clientInfo`/`capabilities` is refused
-/// `-32601` by the TYPED PARSE, before dispatch. Refusing a MALFORMED request is
-/// not evidence that the METHOD is gone, so a probe built that way would report
-/// `absent` against a server that serves `initialize` perfectly well. Both
-/// shapes are asserted below so the distinction cannot be lost.
+/// `-32601` by the TYPED PARSE, before dispatch is reached
+/// (`map_unparsed_body_for_v2`, a documented known limitation). Refusing a
+/// MALFORMED request is not evidence that the METHOD is gone. That is exactly
+/// why the official conformance suite's `initialize` and `logging/setLevel`
+/// retirement checks were GREEN against a server that retired NEITHER — see the
+/// module docs of `tests/v2_retired_methods.rs`.
+///
+/// So both shapes are still sent. What changed is that they now agree on every
+/// coarse wire fact: same `-32601`, same HTTP `404`, same echoed id. A test that
+/// asserted only the code would therefore still pass if the retirement were
+/// reverted, silently losing the distinction it exists to hold. The MESSAGE is
+/// the one fact that separates them — the retirement route
+/// (`v2_retirement_message`, at the header gate, reached only by params that DO
+/// deserialize) names the era that removed the method and the replacement to
+/// use; the parse-failure route says only `Method not found: initialize`. The
+/// assertions below are keyed on that difference.
 #[tokio::test]
-async fn the_server_still_answers_initialize_on_the_v2_wire() {
+async fn the_server_refuses_a_well_formed_initialize_on_the_v2_wire() {
     let (addr, handle) = spawn(server_accepting(vec![V1, PROTOCOL_VERSION_2026_07_28])).await;
     let url = mcp_url(addr);
     let mut v2 = v2_tester(&url);
@@ -523,23 +565,71 @@ async fn the_server_still_answers_initialize_on_the_v2_wire() {
         .expect("probe completes");
     teardown(handle).await;
 
+    // 1. THE FINDING: a well-formed `initialize` is REFUSED, with the status and
+    //    code the 2026-07-28 transport requires for a method it does not
+    //    implement.
+    assert!(
+        well_formed.result.is_none(),
+        "FINDING REOPENED: the server ANSWERED a well-formed `initialize` on the \
+         2026-07-28 wire, so the plan-05 retirement has regressed. Fix the \
+         server; do not relax this test or re-record the baseline. Observed: \
+         {well_formed:?}"
+    );
+    assert_eq!(
+        well_formed.error_code,
+        Some(-32601),
+        "a retired method must answer METHOD_NOT_FOUND: {well_formed:?}"
+    );
+    assert_eq!(
+        well_formed.http_status, 404,
+        "the 2026-07-28 transport maps -32601 to 404: {well_formed:?}"
+    );
+
+    // 2. THE TRAP: the malformed probe is refused too — by the TYPED PARSE, and
+    //    with the SAME code and status. Asserting only these would not
+    //    distinguish a severed method from a request that never parsed.
     assert_eq!(
         malformed.error_code,
         Some(-32601),
-        "an initialize whose params do not parse is refused before dispatch —          which is NOT evidence that the method is absent"
+        "an initialize whose params do not parse is refused before dispatch — \
+         which is NOT evidence that the method is absent: {malformed:?}"
     );
-    assert!(
-        well_formed.result.is_some(),
-        "FINDING RESOLVED? The server now refuses a well-formed `initialize` on          the 2026-07-28 wire, so ERA-01 reproduces server-side. Update this          test, C-01's expected status, and note it in the baseline. Observed:          {well_formed:?}"
-    );
-    let result = well_formed.result.expect("checked above");
     assert_eq!(
-        result["protocolVersion"], "2025-11-25",
-        "the served result is a MIXED envelope: a v1 protocolVersion alongside          v2 fields. Observed: {result}"
+        malformed.http_status, well_formed.http_status,
+        "the two refusals are indistinguishable by status, which is why the \
+         message is asserted below: {malformed:?} vs {well_formed:?}"
+    );
+
+    // 3. WHICH IS WHY THE CAUSES ARE ASSERTED, NOT JUST THE CODES.
+    let retired = well_formed
+        .error_message
+        .expect("a JSON-RPC error carries a message");
+    let unparsed = malformed
+        .error_message
+        .expect("a JSON-RPC error carries a message");
+    assert!(
+        retired.contains("retired in MCP 2026-07-28"),
+        "the well-formed refusal must come from the RETIREMENT route \
+         (`v2_retirement_message`), not from a params-parse failure that happens \
+         to share its code. Observed: {retired:?}"
     );
     assert!(
-        !result["resultType"].is_null(),
-        "…and it carries the v2 `resultType`: {result}"
+        retired.contains("server/discover"),
+        "the retirement message must name the replacement the era defines, so an \
+         operator is not left looking for a method that no longer exists. \
+         Observed: {retired:?}"
+    );
+    assert!(
+        !unparsed.contains("retired"),
+        "the malformed probe must still be refused by the TYPED PARSE. If it now \
+         carries the retirement message the two routes have merged, and neither \
+         this test nor the official suite can tell a severed method from a \
+         malformed request any more. Observed: {unparsed:?}"
+    );
+    assert_ne!(
+        retired, unparsed,
+        "two -32601s from two different causes must not become one indistinct \
+         refusal"
     );
 }
 

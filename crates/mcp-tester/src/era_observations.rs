@@ -893,6 +893,7 @@ mod tests {
             session_header: None,
             result: Some(serde_json::json!({ "resultType": "complete" })),
             error_code: None,
+            error_message: None,
         });
         assert_eq!(
             classify_envelope_key(&present, "resultType"),
@@ -904,6 +905,7 @@ mod tests {
             session_header: None,
             result: Some(serde_json::json!({ "resultType": null })),
             error_code: None,
+            error_message: None,
         });
         assert_eq!(
             classify_envelope_key(&null, "resultType"),
@@ -923,6 +925,7 @@ mod tests {
                 session_header: None,
                 result: Some(result),
                 error_code: None,
+                error_message: None,
             })
         };
         assert_eq!(
@@ -950,6 +953,7 @@ mod tests {
                 session_header: None,
                 result: Some(result),
                 error_code: None,
+                error_message: None,
             })
         };
         assert_eq!(

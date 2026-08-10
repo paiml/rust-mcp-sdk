@@ -78,10 +78,18 @@ deltas:
     v1: served
     v2: absent
     kind: method-removed
-    source: ".planning/REQUIREMENTS.md:911 (CLNT-01); src/client/mod.rs:761 (v2_synthetic_initialize_result)"
+    source: ".planning/REQUIREMENTS.md:911 (CLNT-01); src/client/mod.rs:761 (v2_synthetic_initialize_result); src/server/streamable_http_server.rs:1409 (V2_RETIRED_METHODS)"
     note: >-
-      A v2 client's InitializeResult is LOCAL AND SYNTHETIC — no byte of it came
-      from the server.
+      BOTH HALVES ARE NOW SEVERED. A v2 client's InitializeResult is LOCAL AND
+      SYNTHETIC — no byte of it came from the server; and since phase 118.1 plan
+      05 (gap G-5) the SERVER refuses a well-formed v2 `initialize` with -32601
+      and HTTP 404. Until that plan the delta was real of the CLIENT ONLY and the
+      dual run reported it MISSING, which was the tool working. The v1/v2/kind
+      values above are UNCHANGED across that fix: they were right while the
+      server still served the method, and the server caught up to them — the
+      spec artifact was not rewritten to quieten a comparison. Fences:
+      tests/v2_retired_methods.rs (pmcp side),
+      crates/mcp-tester/tests/dual_run.rs (tester side).
     provisional: false
 
   - id: ERA-02

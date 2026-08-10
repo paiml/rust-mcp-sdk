@@ -3527,6 +3527,19 @@ pub struct RawProbeOutcome {
     pub result: Option<Value>,
     /// The JSON-RPC error code, when the response carried an error.
     pub error_code: Option<i64>,
+    /// The JSON-RPC error MESSAGE, when the response carried an error.
+    ///
+    /// Carried alongside [`Self::error_code`] because the code alone cannot
+    /// always say WHY a request was refused. On the `2026-07-28` wire a
+    /// `-32601` for a RETIRED method and a `-32601` for params that never
+    /// deserialized are the same code, the same HTTP status and the same
+    /// echoed id — the message text is the only wire fact that separates them
+    /// (`v2_retirement_message` vs `map_unparsed_body_for_v2`, both in
+    /// `src/server/streamable_http_server.rs`). A probe that dropped the
+    /// message could not tell a SEVERED method from a MALFORMED request, which
+    /// is exactly the confusion that made two of the official suite's
+    /// retirement checks pass for the wrong reason.
+    pub error_message: Option<String>,
 }
 
 impl RawProbeOutcome {
@@ -3698,12 +3711,19 @@ impl ServerTester {
             .and_then(|e| e.get("error"))
             .and_then(|e| e.get("code"))
             .and_then(Value::as_i64);
+        let error_message = envelope
+            .as_ref()
+            .and_then(|e| e.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         Ok(RawProbeOutcome {
             http_status,
             session_header,
             result,
             error_code,
+            error_message,
         })
     }
 

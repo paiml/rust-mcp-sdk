@@ -96,6 +96,14 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   `method-removed`, so the BASELINE is right and the three tripwires are the stale half.
   Owner: plan 118.1-12 (the G-5 disposition) or the orchestrator at merge, alongside the
   `examples/s54_v2_dual_conformance.rs` module prose that plan 05 flagged for the same reason.
+  **RESOLVED 2026-08-10 at the Wave 5 merge** (`gsd/phase-118.1-conformance-gaps`). All three
+  tripwires now assert the FIXED behaviour: ERA-01 classifies EXPECTED, C-01 expects `Passed`, and
+  `the_server_still_answers_initialize_on_the_v2_wire` is renamed
+  `the_server_refuses_a_well_formed_initialize_on_the_v2_wire` and keeps the history in its doc
+  comment. `cargo nextest run -p mcp-tester -E 'binary(dual_run)'` → 12 run, 12 passed. The
+  baseline's ERA-01 `v1`/`v2`/`kind` were NOT touched (they were already correct); only its
+  `source`/`note` prose, which still described a client-only delta, was updated. STILL OPEN from
+  this entry: the `examples/s54_v2_dual_conformance.rs` module prose.
 
 - **`pmcp-macros::expansion_snapshots` (3 tests), `pmcp-workbook-server` (6 tests) and
   `mcp-e2e-tests::{chess,dataviz,map}` (11 tests) fail on the same workspace run and are

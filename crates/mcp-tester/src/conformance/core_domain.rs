@@ -110,6 +110,34 @@ async fn test_initialize_handshake(tester: &mut ServerTester) -> TestResult {
 /// Fact 2 is what makes this test worth running. Without it a v2 server that
 /// still answered `initialize` would pass, which is precisely the regression
 /// ERA-01 exists to catch.
+/// Cap on the server-supplied refusal text C-01 echoes into its report line.
+///
+/// The message is UNTRUSTED: `raw_jsonrpc_probe` bounds the whole response body
+/// at 64 KiB, so without a second cap here a verbose — or hostile — server could
+/// push kilobytes of its own prose into a conformance report. Counted in CHARS
+/// rather than bytes because a byte-indexed cut through a multi-byte sequence
+/// panics.
+const MAX_REFUSAL_REASON_CHARS: usize = 160;
+
+/// Render the refusal MESSAGE as a report clause, bounded and elided.
+///
+/// Worth reporting because the CODE alone does not say why: on the `2026-07-28`
+/// wire a retired method and a request whose params never deserialized both
+/// answer `-32601`/`404`, and only the message distinguishes them. A reader of a
+/// C-01 pass would otherwise have no way to tell which one they were looking at.
+///
+/// PURE and total over arbitrary input.
+fn refusal_reason(message: Option<&str>) -> String {
+    let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) else {
+        return String::new();
+    };
+    let mut reason: String = message.chars().take(MAX_REFUSAL_REASON_CHARS).collect();
+    if message.chars().nth(MAX_REFUSAL_REASON_CHARS).is_some() {
+        reason.push('\u{2026}');
+    }
+    format!(", reason: {reason}")
+}
+
 async fn test_v2_no_initialize_handshake(tester: &mut ServerTester) -> TestResult {
     let start = Instant::now();
     let name = "Core: initialize absent (v2 server/discover)";
@@ -172,11 +200,12 @@ async fn test_v2_no_initialize_handshake(tester: &mut ServerTester) -> TestResul
             start.elapsed(),
             format!(
                 "server/discover established the connection; `initialize` refused \
-                 (HTTP {}, JSON-RPC code {})",
+                 (HTTP {}, JSON-RPC code {}{})",
                 outcome.http_status,
                 outcome
                     .error_code
-                    .map_or_else(|| "none".to_string(), |c| c.to_string())
+                    .map_or_else(|| "none".to_string(), |c| c.to_string()),
+                refusal_reason(outcome.error_message.as_deref())
             ),
         ),
         // A transport failure on the probe is itself a refusal to serve the
@@ -467,5 +496,52 @@ async fn test_malformed_request(tester: &mut ServerTester) -> TestResult {
             start.elapsed(),
             "Server correctly rejected malformed request",
         ),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{refusal_reason, MAX_REFUSAL_REASON_CHARS};
+
+    #[test]
+    fn refusal_reason_renders_a_clause_only_when_there_is_something_to_say() {
+        assert_eq!(refusal_reason(None), "");
+        assert_eq!(refusal_reason(Some("")), "");
+        assert_eq!(
+            refusal_reason(Some("   ")),
+            "",
+            "whitespace is not a reason; rendering `, reason: ` for it would \
+             claim evidence the server never sent"
+        );
+        assert_eq!(
+            refusal_reason(Some(
+                "Method not found: initialize (retired in MCP 2026-07-28)"
+            )),
+            ", reason: Method not found: initialize (retired in MCP 2026-07-28)"
+        );
+    }
+
+    /// The message is UNTRUSTED server bytes, and the cut must not panic on a
+    /// multi-byte sequence — the failure mode a byte-indexed slice would have.
+    #[test]
+    fn refusal_reason_bounds_untrusted_server_prose() {
+        let long = "é".repeat(MAX_REFUSAL_REASON_CHARS * 4);
+        let rendered = refusal_reason(Some(&long));
+        assert!(
+            rendered.ends_with('\u{2026}'),
+            "a truncated reason must be marked as truncated: {rendered}"
+        );
+        assert_eq!(
+            rendered.chars().count(),
+            ", reason: ".chars().count() + MAX_REFUSAL_REASON_CHARS + 1,
+            "the cap is on CHARS, not bytes: {rendered}"
+        );
+
+        let exact = "a".repeat(MAX_REFUSAL_REASON_CHARS);
+        assert_eq!(
+            refusal_reason(Some(&exact)),
+            format!(", reason: {exact}"),
+            "a message exactly at the cap is NOT truncated, so the ellipsis \
+             always means bytes were dropped"
+        );
     }
 }
