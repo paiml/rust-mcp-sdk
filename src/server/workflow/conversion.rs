@@ -53,7 +53,12 @@ impl PromptContent {
 
             Self::Image { data, mime_type } => Ok(Content::image(data, mime_type)),
 
-            Self::ResourceUri(uri) => Ok(Content::resource(uri)),
+            // A bare URI is `ResourceLink` in the spec, NOT `EmbeddedResource`:
+            // `EmbeddedResource.resource` is
+            // `TextResourceContents | BlobResourceContents` (schema.ts:1734-1748)
+            // and both arms require content this arm does not have. The LLM
+            // fetches it, which is exactly `ResourceLink` semantics.
+            Self::ResourceUri(uri) => Ok(Content::resource_link(uri.as_str(), uri.as_str())),
 
             // Strict mode - expand handles
             Self::ToolHandle(handle) => {
@@ -85,8 +90,9 @@ impl PromptContent {
                     });
                 }
 
-                // Return as resource reference (LLM will fetch)
-                Ok(Content::resource(handle.uri()))
+                // Return as resource reference (LLM will fetch) -- a spec
+                // `ResourceLink`, for the same reason as `Self::ResourceUri`.
+                Ok(Content::resource_link(handle.uri(), handle.uri()))
             },
 
             Self::Multi(parts) => {
@@ -215,7 +221,12 @@ mod tests {
         let content = PromptContent::ResourceHandle(handle);
         let protocol = content.to_protocol(&ctx).unwrap();
 
-        assert!(matches!(protocol, Content::Resource { .. }));
+        // A handle expands to a spec `ResourceLink`, not an `EmbeddedResource`:
+        // the LLM fetches the URI rather than receiving inline content.
+        match protocol {
+            Content::ResourceLink(link) => assert_eq!(link.uri, "resource://test/guide"),
+            other => panic!("expected Content::ResourceLink, got {other:?}"),
+        }
     }
 
     #[test]

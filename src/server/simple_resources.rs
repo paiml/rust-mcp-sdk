@@ -38,7 +38,9 @@ impl StaticResource {
             content: Content::Resource {
                 uri,
                 text: Some(content.into()),
+                blob: None,
                 mime_type: Some("text/plain".to_string()),
+                annotations: None,
                 meta: None,
             },
         }
@@ -58,7 +60,9 @@ impl StaticResource {
             content: Content::Resource {
                 uri,
                 text: Some(base64::prelude::BASE64_STANDARD.encode(data)),
+                blob: None,
                 mime_type: Some(mime_type),
+                annotations: None,
                 meta: None,
             },
         }
@@ -350,7 +354,9 @@ impl ResourceHandler for ResourceCollection {
                 contents: vec![Content::Resource {
                     uri: contents.uri.clone(),
                     text: contents.text.clone(),
+                    blob: None,
                     mime_type: Some(contents.mime_type.clone()),
+                    annotations: None,
                     meta,
                 }],
                 _meta: None,
