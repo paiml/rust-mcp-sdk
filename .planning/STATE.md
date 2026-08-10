@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.5
 milestone_name: MCP Spec 2026-07-28
 status: executing
-stopped_at: Completed 118.1-02-PLAN.md (CONF-04 fences built and proven RED; 8 of 10 goldens fail by design)
-last_updated: "2026-08-10T19:34:42.104Z"
-last_activity: 2026-08-10 -- Phase 118.1 plan 02 complete: four spec-derived embedded-resource goldens + a tolerant-reader fuzz target, both deliberately RED before the 118.1-03 fix
+stopped_at: Completed 118.1-03-PLAN.md (G-1 and G-2 closed; the CONF-04 fence is 10/10 GREEN with no literal weakened)
+last_updated: "2026-08-10T20:33:32.562Z"
+last_activity: 2026-08-10 -- Phase 118.1 plan 03 complete: Content::Resource emits the spec EmbeddedResource with blob + annotations on both eras, is #[non_exhaustive] with constructors, and reads both shapes
 progress:
   total_phases: 73
   completed_phases: 64
   total_plans: 413
-  completed_plans: 401
+  completed_plans: 402
   percent: 97
 ---
 
@@ -26,15 +26,44 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.1 (close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia) — EXECUTING
-Plan: 3 of 14
-Plans complete: **2 of 14** for Phase 118.1 (118.1-01, 118.1-02); Phase 118 itself is 10/10 with
-`118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
-Remaining: Phase 118.1 plans 03-14 (nine conformance gaps G-1..G-9), then Phase 119 (docs)
-Status: Ready to execute — **but note `make quality-gate` is DELIBERATELY not green on this
-branch**: 118.1-02 landed the CONF-04 wire goldens RED on purpose (D-04 requires the fences be
-demonstrated failing before 118.1-03's emitter fix). 8 of the 10 tests in
-`tests/embedded_resource_golden.rs` fail, and `fuzz/fuzz_targets/content_tolerant_reader.rs`
-crashes on its first input. Do NOT weaken a literal or `#[ignore]` a test to green the gate.
+Plan: 4 of 14
+Plans complete: **3 of 14** for Phase 118.1 (118.1-01, 118.1-02, 118.1-03); Phase 118 itself is
+10/10 with `118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
+Remaining: Phase 118.1 plans 04-14 (G-3..G-9), then Phase 119 (docs)
+Status: Ready to execute — **and `make quality-gate` is GREEN again on this branch.** 118.1-02's
+deliberately-RED fences were turned green by 118.1-03's emitter fix, not by weakening them:
+`tests/embedded_resource_golden.rs` is 10/10 with `git diff` on that file EMPTY since `2ab06a44`,
+and `cargo +nightly fuzz run content_tolerant_reader -- -max_total_time=300` completes 5,713,406
+executions with an empty artifacts directory.
+
+**118.1-03 HAS LANDED — G-1 AND G-2 ARE CLOSED.** Commits `fc40a606` (the batched breaking edit)
++ `fdb92352` (composition relays) + `188bca00` (every out-of-crate consumer + the live-run proof)
++ `c9056c72` (semver delta + CHANGELOG), +1545/-104 across 19 files.
+
+- `Content::Resource` emits `{"type":"resource","resource":{…}}` in the tool-result and
+  prompt-message positions on BOTH eras, carries `blob` and content-level `annotations`, and is
+  `#[non_exhaustive]` with `resource_with_blob` / `with_annotations` / `with_meta`.
+- **`ReadResourceResult.contents` is still FLAT** and gains only `blob` — `tests/v1_lists_golden.rs`
+  is 7/7 with `RESOURCES_READ` green, so the D-01 boundary held.
+- The reader is TOLERANT (D-03) via `#[serde(try_from)]` over ONE struct with an optional
+  `resource` and an optional `uri`, **not** a `#[serde(untagged)]` pair — RESEARCH assumption A1
+  is removed by construction rather than tested around.
+- Union rule, one sentence: `blob` is emitted only when `blob` is `Some` and `text` is `None`;
+  otherwise `text` is emitted, using the empty string when it is `None`. A payload carrying BOTH
+  is REJECTED on input (spec XOR).
+- **Accepted semver delta (D-15, one-time), recorded not hidden:** `enum_variant_marked_non_exhaustive`
+  (MAJOR) + `type_method_marked_deprecated` (MINOR); 223 checks, 221 pass, 2 fail, exit 100.
+  `enum_struct_variant_field_added` did NOT fire — batching the attribute with the fields cost ONE
+  major lint instead of two. Contrast `ServerDiscoverResult`, already `#[non_exhaustive]`
+  (`src/types/protocol/mod.rs:626-628`), which plan 07 extends for free.
+- The dual-conformance example is **RUN, not merely built**: `tests/embedded_resource_example_run.rs`
+  spawns the built binary on 127.0.0.1:8157 and records a real `blob` on both eras at
+  `target/118.1-03-blob-response.json`. Plan 04's sibling leg takes 8153.
+- `cargo pmcp new --kind mcp-app` scaffolds and `crates/pmcp-server/content/sdk-resources.md` were
+  both rewritten to constructor form — a stale struct literal there would emit non-compiling crates.
+- The four workspace-EXCLUDED example crates were measured at base `2ab06a44` FIRST: three were
+  already broken and now BUILD; `examples/26-server-tester` went 10 pre-existing errors to 8, with
+  the remainder logged to `deferred-items.md`.
 
 **117-13 HAS LANDED — THE D-03 CUT IS CLOSED, AND SMPL-01/SMPL-02 ARE DONE.** Commits `1a473e6d`
 (the verb split) + `50f039ab` (the severed-build 405 proof) + `ea301460` (config gating + the policy)
@@ -1293,16 +1322,17 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-10T19:34:28.075Z
-Stopped at: Completed 118.1-02-PLAN.md (CONF-04 fences built and proven RED; 8 of 10 goldens fail by design)
+Last session: 2026-08-10T20:35:00.000Z
+Stopped at: Completed 118.1-03-PLAN.md (G-1 and G-2 closed; the CONF-04 fence is 10/10 GREEN with no literal weakened)
 Resume file: None
-Next: **Phase 118.1 plan 03 (Wave 3) — the G-1/G-2 emitter fix** — `118.1-03-PLAN.md`. Its `depends_on: [118.1-02]` is satisfied and the fences it must clear now exist and are **RED by design**: `tests/embedded_resource_golden.rs` reports `10 tests run: 2 passed, 8 failed` and `cargo +nightly fuzz run content_tolerant_reader` crashes on its first input with ``missing field `uri` ``. **`make quality-gate` is therefore NOT green on this branch until 118.1-03 lands — that is expected, and no literal may be weakened or `#[ignore]`d to make it green.** Plan 03 must read `118.1-02-SUMMARY.md` § *Recorded-Wire-Bytes Inventory* before it starts: it names the seven external struct literals and two exhaustive patterns that `#[non_exhaustive]` will break (four of those crates are workspace-EXCLUDED, so `cargo build --workspace` will not surface them), the SECOND flipping test at `src/types/content.rs:447` that D-04 did not name, and the measured finding that NO `contracts/team-servers/fixtures/` fixture needs regenerating (RESEARCH assumption A5, discharged). **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), and **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`) — run `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. *(The directive below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`).
+Next: **Phase 118.1 plan 04 (Wave 4) — G-4, `completion/complete`** — `118.1-04-PLAN.md`. Its `depends_on` on 118.1-03 is satisfied: `make quality-gate` is GREEN again, `tests/embedded_resource_golden.rs` is 10/10 and `content_tolerant_reader` runs 5.7M executions clean. **Three things plan 04 inherits by name.** (1) It touches `examples/s54_v2_dual_conformance.rs`, which 118.1-03 also edited — the edit was confined to the resource handler and the module-header gap table, so a completion-provider edit cannot collide. (2) Its sibling live-run leg must take **port 8153**; 118.1-03's `tests/embedded_resource_example_run.rs` holds **8157**, and the two run concurrently under nextest. (3) That leg needs a **v1 session handshake** — `s54` runs on `StreamableHttpServerConfig::default()` with a live `session_id_generator`, so a bare v1 POST answers `HTTP 400 "Session ID required for non-initialization requests"`; copy `v1_open_session` from `tests/embedded_resource_example_run.rs`. Also inherited from 118.1-03: `Content::Resource` is now `#[non_exhaustive]`, so any NEW consumer built in a later plan must use `Content::resource_with_text` / `resource_with_blob` / `.with_annotations(..)` / `.with_meta(..)` and match with `..`. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), and **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`) — run `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. *(The directive below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`).
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
 
 ## Performance Metrics
 
 | Phase | Plan | Duration | Notes |
 |-------|------|----------|-------|
+| Phase 118.1 P03 | 125min | 5 tasks | 19 files |
 | Phase 116 P11 | 265min | 2 tasks | 3 files |
 | (v2.4 phases not yet planned) | — | — | — |
 | Phase 109 P00 | 25min | 2 tasks | 7 files |
