@@ -102,8 +102,13 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   `the_server_refuses_a_well_formed_initialize_on_the_v2_wire` and keeps the history in its doc
   comment. `cargo nextest run -p mcp-tester -E 'binary(dual_run)'` → 12 run, 12 passed. The
   baseline's ERA-01 `v1`/`v2`/`kind` were NOT touched (they were already correct); only its
-  `source`/`note` prose, which still described a client-only delta, was updated. STILL OPEN from
-  this entry: the `examples/s54_v2_dual_conformance.rs` module prose.
+  `source`/`note` prose, which still described a client-only delta, was updated. The `examples/s54_v2_dual_conformance.rs` module prose half of this entry was ALREADY closed
+  earlier, at the Wave 4 merge in `243a2423` — its retirement table and the reference to the
+  deleted `v2_retired_method_of` were rewritten to describe all five methods as retired, with
+  the pre-fix state preserved as history and an explicit note that the suite's own
+  `initialize`/`logging/setLevel` checks must NOT be cited as G-5 evidence. Re-verified at the
+  Wave 5 merge: no client-only or `never severed` claim remains in that file. **THIS ENTRY IS
+  FULLY RESOLVED — plan 118.1-12 has nothing left to do here.**
 
 - **`pmcp-macros::expansion_snapshots` (3 tests), `pmcp-workbook-server` (6 tests) and
   `mcp-e2e-tests::{chess,dataviz,map}` (11 tests) fail on the same workspace run and are
