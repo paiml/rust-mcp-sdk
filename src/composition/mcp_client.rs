@@ -275,13 +275,19 @@ impl FoundationClient for McpFoundationClient {
                 crate::types::Content::Resource {
                     uri,
                     text,
+                    blob,
                     mime_type,
                     ..
                 } => Ok(ResourceContent {
                     uri: uri.clone(),
                     mime_type: mime_type.clone(),
                     text: text.clone(),
-                    blob: None,
+                    // PROPAGATED, not dropped: `ResourceContent` has a `blob`
+                    // field for exactly this, and `Content::Resource` gained one
+                    // in 2.19.0 (G-2). Hardcoding `None` here would make a relayed
+                    // binary resource arrive empty — a data-loss defect that still
+                    // compiles and that no wire golden would catch.
+                    blob: blob.clone(),
                 }),
                 crate::types::Content::Image { data, mime_type } => Ok(ResourceContent {
                     uri: uri.to_string(),
@@ -362,6 +368,7 @@ impl FoundationClient for McpFoundationClient {
                     crate::types::Content::Resource {
                         uri,
                         text,
+                        blob,
                         mime_type,
                         ..
                     } => PromptContent::Resource {
@@ -369,7 +376,11 @@ impl FoundationClient for McpFoundationClient {
                             uri,
                             mime_type,
                             text,
-                            blob: None,
+                            // PROPAGATED for the same reason as the
+                            // `resources/read` relay above: an embedded BINARY
+                            // resource in a prompt message would otherwise lose
+                            // its payload while still type-checking.
+                            blob,
                         },
                     },
                     crate::types::Content::Audio { .. }
