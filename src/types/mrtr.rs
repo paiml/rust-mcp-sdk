@@ -34,7 +34,7 @@
 //! # The `Mcp-Name` header rule (Phase 118 D-13, widened by D-18)
 //!
 //! `Mcp-Name` is REQUIRED exactly on the methods that carry a ROUTING NAME —
-//! [`name_bearing_key`]'s combined table: `tools/call` / `prompts/get`
+//! `name_bearing_key`'s combined table: `tools/call` / `prompts/get`
 //! (`params.name`), `resources/read` (`params.uri`) and `tasks/get` /
 //! `tasks/update` / `tasks/cancel` (`params.taskId`). On every other v2 method it
 //! is OPTIONAL and IGNORED: the server's `require_v2_headers` discards whatever
@@ -46,7 +46,7 @@
 //! spec). **D-13 reverses that** — the official conformance suite sends the
 //! header only for name-bearing methods, so the stricter rule rejected the whole
 //! v2 scored set before dispatch. **D-18** then widened the server's predicate
-//! from `logical_name_key` to [`name_bearing_key`], so the validator now covers
+//! from `logical_name_key` to `name_bearing_key`, so the validator now covers
 //! exactly what the emitter emits.
 //!
 //! The CLIENT still emits the header on every v2 request, empty for a name-less
