@@ -27,3 +27,30 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   carries three standing obligations (the `ext-tasks` watch / D-114-S, D-113-U's owner, and
   UNAS-01's unassigned status) that must not be lost. The stale Phase-116 text below the new
   directive still wants a proper rewrite by whoever owns those obligations.
+
+## From 118.1-02 (2026-08-10)
+
+- **Two pre-existing `unused_imports` warnings under the fuzz crate's feature set.**
+  `cargo +nightly fuzz build` emits `unused imports: collect_reqwest_body_within_cap and
+  DEFAULT_AUTH_RESPONSE_BYTES` at `src/server/auth/jwt.rs:18` and
+  `src/server/auth/jwt_validator.rs:53`. The fuzz crate builds `pmcp` with
+  `default-features = false` + `oauth, streamable-http, fuzzing, validation`, and under that
+  combination the two imports have no consumer. NOT caused by this plan (neither file is touched
+  by it, and neither is reachable from `Content`), and NOT visible to `make lint`, which builds
+  with `--features full`. Out of scope per the executor SCOPE BOUNDARY. Owner: whoever next
+  touches the auth HTTP body-cap wiring.
+
+- **`make test-fuzz` cannot fail.** `Makefile:242-249` runs
+  `cargo fuzz list | while read target; do timeout 30s cargo fuzz run $target || echo "…"`, so a
+  crashing fuzz target prints a yellow warning and the target still exits 0 — and `test-fuzz` is
+  chained into `make quality-gate` through `validate-always`. This is convenient for THIS plan
+  (the deliberately-red `content_tolerant_reader` cannot break the gate) but it is a false-green
+  shape in the repo's own gate: no fuzz target can ever block a commit. Not changed here, because
+  making it fail would immediately block every commit until 118.1-03 lands. Owner: whoever
+  revisits the ALWAYS-fuzz enforcement after Phase 118.1 closes.
+
+- **The CI `fuzz.yml` matrix is a hardcoded four-target list**, not `cargo fuzz list`. Every job
+  in that workflow (`fuzz`, the coverage job and `fuzz-24h`) enumerates
+  `protocol_parsing jsonrpc_handling transport_layer auth_flows` literally, so the 20-plus targets
+  added since — including this plan's — are never fuzzed by CI at all. Again convenient here and
+  a real coverage gap in general. Owner: same as above.

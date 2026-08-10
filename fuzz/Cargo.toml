@@ -268,3 +268,23 @@ path = "fuzz_targets/team_era_deltas_parser.rs"
 test = false
 doc = false
 bench = false
+
+# Phase 118.1-02 (CONF-04, D-03): the `Content` TOLERANT READER. When pmcp acts as
+# a client it deserializes whatever a server sends, so `Content`'s `Deserialize` is
+# an untrusted parse surface, and 118.1-03 is about to widen it to accept two
+# shapes — memory amplification via a hybrid flat/nested payload is the DoS
+# concern (T-118.1-02-02). Beyond no-panic the target asserts two invariants a
+# type-level check cannot reach: serialize/deserialize is a FIXED POINT, and a
+# flat legacy input re-emits as the NESTED spec shape.
+#
+# DELIBERATELY RED until 118.1-03: on the unfixed tree the nested spec shape does
+# not deserialize at all. Registration only — this target adds NO dependency, it
+# reaches `pmcp::types::Content` through the `[dependencies.pmcp]` path entry
+# already declared above, and it is absent from `fuzz.yml`'s fixed four-target
+# matrix, so no CI job runs it.
+[[bin]]
+name = "content_tolerant_reader"
+path = "fuzz_targets/content_tolerant_reader.rs"
+test = false
+doc = false
+bench = false
