@@ -397,48 +397,49 @@ async fn team_target() -> ClientTarget<DuplexTransport> {
 // the call site rather than only inside the runner.
 // ===========================================================================
 
+/// Assert one server's replayed corpus: no failures, and the EXACT case count.
+///
+/// The four `*_is_conformant` tests below all end in the same three assertions.
+/// Spelled once here so a change to the guarantee is made in one place — and so
+/// the message builders are only evaluated when an assertion actually fails
+/// (`assert_eq!` does not evaluate its format arguments on the passing path).
+fn assert_server_corpus(server: &str, report: &ConformanceReport, expected: usize) {
+    assert_conformant(report);
+    assert_eq!(report.failed, 0, "{}", zero_failures_msg(server, report));
+    assert_eq!(
+        report.passed,
+        expected,
+        "{}",
+        exact_cases_msg(server, expected, report.passed)
+    );
+}
+
 #[tokio::test]
 async fn team_fs_is_conformant() {
     let dir = fixtures_root().join("team-fs");
     let report = run_fixtures(|| async { fs_target() }, &dir).await;
-    assert_conformant(&report);
-    let msg = zero_failures_msg("team-fs", &report);
-    assert_eq!(report.failed, 0, "{msg}");
-    let msg = exact_cases_msg("team-fs", EXPECTED_CASES_TEAM_FS, report.passed);
-    assert_eq!(report.passed, EXPECTED_CASES_TEAM_FS, "{msg}");
+    assert_server_corpus("team-fs", &report, EXPECTED_CASES_TEAM_FS);
 }
 
 #[tokio::test]
 async fn mem_mcp_is_conformant() {
     let dir = fixtures_root().join("mem-mcp");
     let report = run_fixtures(|| async { mem_target() }, &dir).await;
-    assert_conformant(&report);
-    let msg = zero_failures_msg("mem-mcp", &report);
-    assert_eq!(report.failed, 0, "{msg}");
-    let msg = exact_cases_msg("mem-mcp", EXPECTED_CASES_MEM_MCP, report.passed);
-    assert_eq!(report.passed, EXPECTED_CASES_MEM_MCP, "{msg}");
+    assert_server_corpus("mem-mcp", &report, EXPECTED_CASES_MEM_MCP);
 }
 
 #[tokio::test]
 async fn approval_mcp_is_conformant() {
     let dir = fixtures_root().join("approval-mcp");
     let report = run_fixtures(|| async { approval_target() }, &dir).await;
-    assert_conformant(&report);
-    let msg = zero_failures_msg("approval-mcp", &report);
-    assert_eq!(report.failed, 0, "{msg}");
-    let msg = exact_cases_msg("approval-mcp", EXPECTED_CASES_APPROVAL_MCP, report.passed);
-    assert_eq!(report.passed, EXPECTED_CASES_APPROVAL_MCP, "{msg}");
+    assert_server_corpus("approval-mcp", &report, EXPECTED_CASES_APPROVAL_MCP);
 }
 
 #[tokio::test]
 async fn team_mcp_is_conformant() {
     let dir = fixtures_root().join("team-mcp");
     let report = run_fixtures(|| async { team_target().await }, &dir).await;
-    assert_conformant(&report);
-    let msg = zero_failures_msg("team-mcp", &report);
-    assert_eq!(report.failed, 0, "{msg}");
-    let msg = exact_cases_msg("team-mcp", EXPECTED_CASES_TEAM_MCP, report.passed);
-    assert_eq!(report.passed, EXPECTED_CASES_TEAM_MCP, "{msg}");
+    assert_server_corpus("team-mcp", &report, EXPECTED_CASES_TEAM_MCP);
 }
 
 /// The whole-corpus case fence: all four servers replayed in one test so the

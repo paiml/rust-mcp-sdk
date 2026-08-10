@@ -133,18 +133,15 @@ fn describe(row: &ClassifiedDifference, baseline: &EraBaseline) -> String {
             || "no baseline entry".to_string(),
             |delta| format!("{} records v1 `{}` / v2 `{}`", delta.id, delta.v1, delta.v2),
         );
+    let token = |v: Option<&ObservedValue>| {
+        v.map_or_else(|| "not observed".to_string(), ObservedValue::token)
+    };
     format!(
         "  [{}] {} — observed v1 `{}` / v2 `{}`; {recorded}",
         row.class.label(),
         row.observation_id,
-        row.v1.as_ref().map_or_else(
-            || "not observed".to_string(),
-            pmcp_team_servers::conformance::ObservedValue::token
-        ),
-        row.v2.as_ref().map_or_else(
-            || "not observed".to_string(),
-            pmcp_team_servers::conformance::ObservedValue::token
-        ),
+        token(row.v1.as_ref()),
+        token(row.v2.as_ref()),
     )
 }
 
@@ -437,26 +434,38 @@ async fn era_matrix_observes_every_registry_id() {
 // no `deprecated-caps/` fixture directory was created.
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// INDEPENDENT ORACLE — spelled here, deliberately NOT imported.
+//
+// `era_target.rs`'s banner says every wire string is spelled once and imported;
+// `era_observations.rs` follows that rule. This file deliberately does not, and
+// the reason is the one already recorded for `LOG_LEVEL_META_KEY`: these tests
+// assert the WIRE CONTRACT. Importing the era target's own constant would make
+// each assertion agree with the target BY CONSTRUCTION — the target could
+// rename a field on the wire and every test here would follow it silently.
+//
+// The rationale is stated once, here, for all eight. The names below MATCH
+// `era_target.rs`'s exactly so the relationship stays greppable: changing a
+// field in the target and grepping its constant name finds these assertions.
+// (They previously carried different names, which hid exactly that link.)
+// ---------------------------------------------------------------------------
+
 /// The tool-result field the era target reports the observed log level under.
-const LOG_LEVEL_FIELD: &str = "observedLevel";
+const LOG_RESULT_LEVEL_FIELD: &str = "observedLevel";
 /// The tool-result field naming WHERE that level came from.
-const LOG_SOURCE_FIELD: &str = "levelSource";
+const LOG_RESULT_SOURCE_FIELD: &str = "levelSource";
 /// The `levelSource` value meaning "the per-request v2 `_meta` key set it".
-const LOG_SOURCE_REQUEST_META: &str = "request-meta";
+const LOG_LEVEL_SOURCE_REQUEST_META: &str = "request-meta";
 /// The `levelSource` value meaning "no `_meta` key applied; the server default".
-const LOG_SOURCE_SERVER_DEFAULT: &str = "server-default";
+const LOG_LEVEL_SOURCE_SERVER_DEFAULT: &str = "server-default";
 /// The `status` field both continuation tools report under.
-const STATUS_FIELD: &str = "status";
+const DEP_RESULT_STATUS_FIELD: &str = "status";
 /// `status` when the whole capability round trip finished.
-const STATUS_COMPLETED: &str = "completed";
+const DEP_STATUS_COMPLETED: &str = "completed";
 /// `status` when the era target declined to reach for the capability at all.
-const STATUS_CAPABILITY_NOT_OFFERED: &str = "capability-not-offered";
+const DEP_STATUS_CAPABILITY_NOT_OFFERED: &str = "capability-not-offered";
 
 /// The per-request v2 `_meta` key that REPLACES the `logging/setLevel` RPC.
-///
-/// Spelled here rather than imported because this test is asserting the WIRE
-/// contract: importing the era target's own constant would make the assertion
-/// agree with the target by construction.
 const LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
 
 /// The level the v2 arm asks for. Deliberately NOT the era target's default
@@ -636,13 +645,13 @@ async fn v1_capability_arm(url: &url::Url) {
     );
     assert_field(
         &logged,
-        LOG_SOURCE_FIELD,
-        LOG_SOURCE_SERVER_DEFAULT,
+        LOG_RESULT_SOURCE_FIELD,
+        LOG_LEVEL_SOURCE_SERVER_DEFAULT,
         "v1 dep__log_emit",
     );
     assert!(
         logged
-            .get(LOG_LEVEL_FIELD)
+            .get(LOG_RESULT_LEVEL_FIELD)
             .and_then(serde_json::Value::as_str)
             != Some(PROBED_LEVEL),
         "FAILURE MODE: the v1 arm reported the level the v2 `_meta` key asks for.\n\
@@ -663,11 +672,11 @@ async fn v1_capability_arm(url: &url::Url) {
         );
         assert_field(
             &result,
-            STATUS_FIELD,
-            STATUS_CAPABILITY_NOT_OFFERED,
+            DEP_RESULT_STATUS_FIELD,
+            DEP_STATUS_CAPABILITY_NOT_OFFERED,
             &format!(
                 "v1 {tool} over StreamableHttpServer (gap G-3). If this now reports \
-                 `{STATUS_COMPLETED}`, G-3 HAS BEEN FIXED: the peer handle now reaches the \
+                 `{DEP_STATUS_COMPLETED}`, G-3 HAS BEEN FIXED: the peer handle now reaches the \
                  HTTP dispatch path. That is good news — update THIS assertion and re-measure \
                  baseline rows ERA-13/ERA-14, whose v1 token is `absent` for exactly this reason"
             ),
@@ -717,11 +726,16 @@ async fn v2_capability_arm(url: &url::Url) {
             .await
             .expect("v2 dep__log_emit completes"),
     );
-    assert_field(&logged, LOG_LEVEL_FIELD, PROBED_LEVEL, "v2 dep__log_emit");
     assert_field(
         &logged,
-        LOG_SOURCE_FIELD,
-        LOG_SOURCE_REQUEST_META,
+        LOG_RESULT_LEVEL_FIELD,
+        PROBED_LEVEL,
+        "v2 dep__log_emit",
+    );
+    assert_field(
+        &logged,
+        LOG_RESULT_SOURCE_FIELD,
+        LOG_LEVEL_SOURCE_REQUEST_META,
         "v2 dep__log_emit",
     );
 
@@ -753,8 +767,8 @@ async fn v2_capability_arm(url: &url::Url) {
     );
     assert_field(
         &sampled,
-        STATUS_FIELD,
-        STATUS_COMPLETED,
+        DEP_RESULT_STATUS_FIELD,
+        DEP_STATUS_COMPLETED,
         "v2 dep__request_sampling",
     );
 
@@ -766,8 +780,8 @@ async fn v2_capability_arm(url: &url::Url) {
     );
     assert_field(
         &rooted,
-        STATUS_FIELD,
-        STATUS_COMPLETED,
+        DEP_RESULT_STATUS_FIELD,
+        DEP_STATUS_COMPLETED,
         "v2 dep__list_roots",
     );
 }
@@ -835,8 +849,8 @@ async fn v1_sampling_and_roots_complete_via_server_to_client_requests() {
     );
     assert_field(
         &sampled,
-        STATUS_FIELD,
-        STATUS_COMPLETED,
+        DEP_RESULT_STATUS_FIELD,
+        DEP_STATUS_COMPLETED,
         "v1 server-to-client sampling/createMessage",
     );
     assert_eq!(
@@ -856,8 +870,8 @@ async fn v1_sampling_and_roots_complete_via_server_to_client_requests() {
     );
     assert_field(
         &rooted,
-        STATUS_FIELD,
-        STATUS_COMPLETED,
+        DEP_RESULT_STATUS_FIELD,
+        DEP_STATUS_COMPLETED,
         "v1 server-to-client roots/list",
     );
     assert_eq!(
@@ -900,7 +914,7 @@ impl pmcp::ToolHandler for V1ControlSampling {
             ]))
             .await?;
         Ok(serde_json::json!({
-            STATUS_FIELD: STATUS_COMPLETED,
+            DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
             "model": completion.model,
         }))
     }
@@ -921,7 +935,7 @@ impl pmcp::ToolHandler for V1ControlRoots {
             .ok_or_else(|| pmcp::Error::internal("no peer handle: the v1 channel is missing"))?;
         let roots = peer.list_roots().await?;
         Ok(serde_json::json!({
-            STATUS_FIELD: STATUS_COMPLETED,
+            DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
             "rootUri": roots.roots.first().map(|root| root.uri.clone()),
         }))
     }

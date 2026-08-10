@@ -1051,13 +1051,15 @@ const ERR_MISSING_MCP_NAME: &str =
 /// absent and empty converge on the same carried value, because a stray value on
 /// a non-name-bearing method is discarded (see the sanitization note below).
 fn require_v2_headers(headers: &HeaderMap) -> std::result::Result<(String, String), &'static str> {
-    let version_present = headers.get(MCP_PROTOCOL_VERSION).is_some();
+    // The two UNIVERSALLY-required headers, checked adjacently. Both failures
+    // return the same error, so there is nothing to be gained by interleaving
+    // them with the `Mcp-Method` extraction.
+    if headers.get(MCP_PROTOCOL_VERSION).is_none() {
+        return Err(ERR_MISSING_V2_HEADERS);
+    }
     let Some(method) = bounded_header_str(headers, MCP_METHOD) else {
         return Err(ERR_MISSING_V2_HEADERS);
     };
-    if !version_present {
-        return Err(ERR_MISSING_V2_HEADERS);
-    }
     if !is_name_bearing_method(&method) {
         // SANITIZATION (Phase 118 D-20). The carried name is echoed straight back
         // out by `apply_v2_outbound_headers`, so whatever a client sent on a
@@ -1102,7 +1104,7 @@ fn cross_check_method(
 ///
 /// # Phase 118 D-18: this used to read the NARROWER table
 ///
-/// Before Phase 118 this resolved through [`crate::types::mrtr::logical_name_key`],
+/// Before Phase 118 this resolved through `crate::types::mrtr::logical_name_key`,
 /// which covers only the three MRTR methods. The client already emitted an
 /// `Mcp-Name` for `tasks/*` (through `name_bearing_key`) that the server neither
 /// required nor cross-checked — an emitter/validator asymmetry that contradicted

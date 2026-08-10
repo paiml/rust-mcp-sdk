@@ -46,7 +46,7 @@
 //! spec). **D-13 reverses that** — the official conformance suite sends the
 //! header only for name-bearing methods, so the stricter rule rejected the whole
 //! v2 scored set before dispatch. **D-18** then widened the server's predicate
-//! from [`logical_name_key`] to [`name_bearing_key`], so the validator now covers
+//! from `logical_name_key` to [`name_bearing_key`], so the validator now covers
 //! exactly what the emitter emits.
 //!
 //! The CLIENT still emits the header on every v2 request, empty for a name-less
@@ -164,7 +164,7 @@ pub(crate) struct MrtrMethod {
 ///
 /// This table decides **two** properties at once: MRTR eligibility
 /// ([`mrtr_eligible`]) and where a method's routing name lives
-/// ([`logical_name_key`]). For `tools/call` / `prompts/get` / `resources/read`
+/// (`logical_name_key`). For `tools/call` / `prompts/get` / `resources/read`
 /// those are the same set. For the tasks methods they are NOT: the spec makes
 /// `tasks/get` / `tasks/update` / `tasks/cancel` name-bearing (`Mcp-Name` =
 /// `params.taskId`) while none of them may carry an `input_required` result.
@@ -251,7 +251,7 @@ pub(crate) const TASK_ID_KEY: &str = "taskId";
 /// # Server-side enforcement is ON since Phase 118 (D-18)
 ///
 /// Phase 114 deliberately left it off: `is_name_bearing_method` (in
-/// `streamable_http_server.rs`) read [`logical_name_key`], so a tasks request was
+/// `streamable_http_server.rs`) read `logical_name_key`, so a tasks request was
 /// treated as non-name-bearing at ingress and `cross_check_name` returned
 /// `Ok(())` for it. A pmcp server accepted BOTH a conformant `Mcp-Name: <taskId>`
 /// and a legacy empty value, and detected neither a missing header nor one that
@@ -316,14 +316,22 @@ pub(crate) fn mrtr_method_static(method: &str) -> Option<&'static str> {
 /// for the three MRTR methods while the client emitted it for `tasks/*` as well.
 /// **Phase 118 D-18** repointed that predicate at [`name_bearing_key`], so the
 /// emitter and the validator now resolve through one table.
-pub(crate) fn logical_name_key(method: &str) -> Option<&'static str> {
+/// # Private on purpose (Phase 118 cleanup)
+///
+/// This is the NARROWER of two overlapping tables. Left `pub(crate)` it is a
+/// decoy: a future caller reaching for "the name key for this method" can pick
+/// it instead of [`name_bearing_key`] and silently reintroduce the exact
+/// emitter/validator asymmetry D-18 closed — a footgun that rustdoc prose
+/// cannot prevent. Made private so [`name_bearing_key`] is the only reachable
+/// answer outside this module.
+fn logical_name_key(method: &str) -> Option<&'static str> {
     Some(mrtr_row(method)?.name_key)
 }
 
 /// The COMBINED name-key lookup: every method that carries a routing name, from
 /// EITHER table (Phase 114, DQ4).
 ///
-/// [`logical_name_key`] is consulted first (the MRTR methods), then
+/// `logical_name_key` is consulted first (the MRTR methods), then
 /// [`TASK_NAME_BEARING_METHODS`]. The two tables are disjoint by construction —
 /// no `tasks/*` method is MRTR-eligible and no MRTR method is a tasks method —
 /// so the order is documentation rather than a tie-break, and
@@ -369,12 +377,12 @@ pub(crate) fn logical_name_of(method: &str, params: &Value) -> Option<String> {
 /// its logical-name key — both of which the presence-only cross-check treats
 /// the same way.
 ///
-/// # The name resolves through [`name_bearing_key`], not [`logical_name_key`]
+/// # The name resolves through [`name_bearing_key`], not `logical_name_key`
 ///
 /// So a `tasks/get` frame yields its `params.taskId` (Phase 114, DQ4).
 ///
 /// On the SERVER half this widening was inert until Phase 118: `cross_check_name`
-/// short-circuits on `is_name_bearing_method`, which read [`logical_name_key`], so
+/// short-circuits on `is_name_bearing_method`, which read `logical_name_key`, so
 /// a tasks request was never compared. **Phase 118 D-18 repointed that predicate
 /// at [`name_bearing_key`]**, so the widening is now live on both halves and a
 /// `tasks/*` request whose header disagrees with its body IS a `HEADER_MISMATCH`.

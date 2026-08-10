@@ -25,15 +25,17 @@
 # them; a lint is what makes the next one impossible to merge. That is D-19.
 #
 # ---------------------------------------------------------------------------
-# 2. Why the linted set is an explicit ALLOW-GROWTH array, not "everything"
+# 2. Why coverage is opt-OUT with a numeric cutoff, not an opt-in list
 # ---------------------------------------------------------------------------
 #
 # The historical plan corpus predates this rule. A repo-wide sweep over
 # `.planning/` would make `make quality-gate` red for reasons entirely
 # unrelated to the change under test, and a gate that is red for unrelated
-# reasons is a gate people learn to ignore. `LINTED_PHASES` therefore starts at
-# phase 118 only. Phases are ADDED as they are swept and NEVER removed — that
-# growth rule is what lets this be chained into `quality-gate` on day one.
+# reasons is a gate people learn to ignore. Coverage is therefore opt-OUT:
+# every phase is linted, and only phases numbered below `PRE_RULE_CUTOFF`
+# (the unswept historical corpus) are exempt. New phases are covered the
+# moment they are created — see the COVERAGE block below for why an opt-in
+# list was the wrong shape.
 #
 # ---------------------------------------------------------------------------
 # 3. Why it skips cleanly on a missing `.planning/`
@@ -74,19 +76,42 @@
 #   ./scripts/lint-plan-verify-commands.sh <phase-dir> ... # LOCAL EXPLORATION
 #
 # The argv override is for one-off local exploration only. CI and
-# `make quality-gate` always run the committed `LINTED_PHASES` array.
+# `make quality-gate` always run the discovered phase set (see COVERAGE).
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# The linted set. GROWTH RULE: phases are ADDED here as they are swept, and are
-# NEVER removed. Removing one silently disables the gate for that phase.
-# ---------------------------------------------------------------------------
-LINTED_PHASES=(
-  "118-conformance-against-the-official-suite"
-)
-
 PLANNING_PHASES=".planning/phases"
+
+# ---------------------------------------------------------------------------
+# COVERAGE: opt-OUT, not opt-in.
+#
+# This lint originally shipped with an opt-in `LINTED_PHASES` array plus a
+# growth rule ("added as swept, NEVER removed"). That shape does not grow:
+# nothing fails when a new phase is authored and never added, so coverage
+# decays to zero silently while the gate still reports PASS. That is
+# structurally a known-failure baseline applied to the plan corpus — the exact
+# shape Phase 118 exists to eliminate.
+#
+# So: every phase under $PLANNING_PHASES is linted by default, and the
+# exemption is explicit and bounded. Phases numbered below the cutoff predate
+# the rules and are the historical corpus this lint was never swept against.
+# The exemption list can only ever SHRINK — a new phase is covered the moment
+# it is created, with no human step.
+# ---------------------------------------------------------------------------
+PRE_RULE_CUTOFF=118
+
+# Returns 0 when a phase directory is exempt (numbered below the cutoff).
+# A directory whose leading token is not a number is NOT exempt — an
+# unparseable name must fail loudly rather than silently skip.
+phase_is_pre_cutoff() {
+  local phase="$1" num="${1%%-*}"
+  case "$num" in
+    '' | *[!0-9.]*) return 1 ;;
+  esac
+  # Compare on the integer part only, so decimal phases (e.g. 113.1) sort with
+  # their parent rather than being skipped by an arithmetic parse error.
+  [ "${num%%.*}" -lt "$PRE_RULE_CUTOFF" ]
+}
 
 # Build/test invocations whose exit status must not be thrown away. Extended
 # regex, applied to the QUOTE-STRIPPED line (see `strip_quoted_spans`).
@@ -141,7 +166,15 @@ check_line() {
   local file="$1" lineno="$2" line="$3"
   local stripped depiped
 
-  stripped="$(strip_quoted_spans "$line")"
+  # `strip_quoted_spans` forks a subshell AND a `sed`, so it is gated behind a
+  # raw-line pipe test. `stripped` has exactly one consumer (RULE 1), which
+  # requires a `|`, and stripping only REMOVES characters — so a raw line with
+  # no `|` can never yield a stripped line with one. Quote-awareness (the whole
+  # point of the strip) is therefore preserved for every line that could match.
+  case "$line" in
+    *"|"*) stripped="$(strip_quoted_spans "$line")" ;;
+    *) stripped="" ;;
+  esac
 
   # RULE 1 — a build/test invocation piped into another command, with no
   # `pipefail` on the same line. `||` is boolean OR, not a pipeline, so it is
@@ -149,7 +182,8 @@ check_line() {
   depiped="${stripped//||/}"
   case "$depiped" in
     *"|"*)
-      if printf '%s' "$stripped" | grep -qE "$BUILD_INVOCATIONS"; then
+      # bash has ERE built in; an external `grep` here would fork per piped line.
+      if [[ $stripped =~ $BUILD_INVOCATIONS ]]; then
         case "$line" in
           *pipefail*) ;;
           *)
@@ -195,7 +229,12 @@ lint_file() {
 
   while IFS= read -r line || [ -n "$line" ]; do
     lineno=$((lineno + 1))
-    trimmed="$(trim "$line")"
+    # Inline the two parameter expansions rather than calling `trim` through
+    # `$( )`: `trim` returns via `printf`, which forces a subshell on EVERY
+    # input line — the hottest path in this script. `trim` is still used by
+    # `report()`, which only runs on a violation.
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
     case "$trimmed" in
       '<verify>'|'<acceptance_criteria>')
         in_scope=1
@@ -226,15 +265,27 @@ if [ "$#" -gt 0 ]; then
   PHASES=("$@")
   echo "lint-plan-verify-commands: argv override in use (LOCAL EXPLORATION ONLY)."
 else
-  PHASES=("${LINTED_PHASES[@]}")
+  # Discover every phase, then drop only the explicitly-exempt pre-cutoff ones.
+  PHASES=()
+  EXEMPTED=0
+  for candidate in "$PLANNING_PHASES"/*/; do
+    [ -d "$candidate" ] || continue
+    name="$(basename "$candidate")"
+    if phase_is_pre_cutoff "$name"; then
+      EXEMPTED=$((EXEMPTED + 1))
+      continue
+    fi
+    PHASES+=("$name")
+  done
+  echo "lint-plan-verify-commands: linting ${#PHASES[@]} phase(s); $EXEMPTED exempt (numbered < $PRE_RULE_CUTOFF)."
 fi
 
 for phase in "${PHASES[@]}"; do
   dir="$PLANNING_PHASES/$phase"
   if [ ! -d "$dir" ]; then
     fail "FAILURE MODE: linted phase directory \`$dir\` does not exist.
-CONSEQUENCE: the phase is listed in LINTED_PHASES but nothing is scanned for it, so the gate is silently off for that phase.
-WHAT TO DO: correct the directory name, or — if the phase was genuinely renamed — update LINTED_PHASES in the same commit. Never delete an entry to make this pass."
+CONSEQUENCE: a phase was named explicitly (argv override) but nothing is scanned for it, so the gate is silently off for that phase.
+WHAT TO DO: correct the directory name. Never drop the argument to make this pass — the discovered default already covers every non-exempt phase."
     continue
   fi
   for plan in "$dir"/*-PLAN.md; do
@@ -251,7 +302,7 @@ echo "lint-plan-verify-commands: scanned $SCANNED_FILES plan file(s), inspected 
 if [ "$SCANNED_FILES" -eq 0 ]; then
   fail "FAILURE MODE: 0 plan files scanned, but $PLANNING_PHASES exists.
 CONSEQUENCE: this run inspected NOTHING and would have exited 0 — indistinguishable from a clean run, which is the masked-verification defect this lint exists to catch, committed by the lint itself.
-WHAT TO DO: check that the LINTED_PHASES entries name real phase directories containing \`*-PLAN.md\` files. Never 'fix' this by deleting the fence."
+WHAT TO DO: check that the discovered phase directories contain \`*-PLAN.md\` files. Never 'fix' this by deleting the fence."
 elif [ "$INSPECTED_LINES" -eq 0 ]; then
   fail "FAILURE MODE: $SCANNED_FILES plan file(s) scanned but 0 verification lines inspected.
 CONSEQUENCE: no <verify> or <acceptance_criteria> element was found in any scanned plan, so every rule below was applied to nothing.
