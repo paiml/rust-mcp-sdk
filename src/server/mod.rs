@@ -1511,7 +1511,15 @@ impl Server {
     ) -> JSONRPCResponse {
         crate::server::core::build_discover_response(
             id,
-            &self.capabilities,
+            // The SINGLE accept-list source (G-7): the same slice
+            // `negotiation_error_to_gate_reject` puts in an
+            // `UNSUPPORTED_PROTOCOL_VERSION` rejection's `error.data.supported`
+            // becomes the result's `supportedVersions`. There is no second list
+            // to drift from.
+            crate::server::core::DiscoverSource::new(
+                &self.capabilities,
+                self.supported_protocol_versions(),
+            ),
             &self.info,
             protocol_context,
         )

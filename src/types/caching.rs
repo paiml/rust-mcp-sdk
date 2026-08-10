@@ -697,6 +697,9 @@ mod cacheable_result_serde_locks {
                     protocol_version: "2026-07-28".to_string(),
                     capabilities: crate::types::ServerCapabilities::default(),
                     server_info: crate::types::Implementation::new("t", "0.0.0"),
+                    // This fixture asserts the ABSENCE of the unset cache hints;
+                    // the accept-list is irrelevant to that question (G-7).
+                    supported_versions: Vec::new(),
                     ttl_ms: None,
                     cache_scope: None,
                 }),

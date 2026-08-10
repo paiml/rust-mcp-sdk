@@ -1436,6 +1436,67 @@ pub(crate) fn project_capabilities_for_v1(capabilities: &ServerCapabilities) -> 
     projected
 }
 
+/// The server-side inputs the `server/discover` projection reads (Phase 118.1,
+/// G-7).
+///
+/// Bundles the two values that must come from the SAME server: the
+/// already-computed capabilities, and the protocol accept-list the version gate
+/// rejects against. They travel together because the conformance suite
+/// correlates them — every element of an unsupported-version rejection's
+/// `error.data.supported` must also appear in the discover result's
+/// `supportedVersions` — so an API that let a caller supply one without the
+/// other would be an API that let the two drift.
+///
+/// Both fields are borrowed, so this is a zero-copy view a caller assembles at
+/// the call site; it owns nothing and stores nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiscoverSource<'a> {
+    /// The server's already-computed capabilities (incl. the `extensions` map).
+    pub(crate) capabilities: &'a ServerCapabilities,
+    /// The server's configured protocol accept-list — the SINGLE source for
+    /// both `supportedVersions` and an `UNSUPPORTED_PROTOCOL_VERSION`
+    /// rejection's `error.data.supported`.
+    pub(crate) supported_versions: &'a [ProtocolVersion],
+}
+
+impl<'a> DiscoverSource<'a> {
+    /// Bundle a server's capabilities with its protocol accept-list.
+    pub(crate) fn new(
+        capabilities: &'a ServerCapabilities,
+        supported_versions: &'a [ProtocolVersion],
+    ) -> Self {
+        Self {
+            capabilities,
+            supported_versions,
+        }
+    }
+}
+
+/// Capabilities-only source for unit tests that inspect nothing but the
+/// PROJECTED CAPABILITIES, advertising an empty accept-list.
+///
+/// # Why this is `#[cfg(test)]`, and why that is the point
+///
+/// Gating the defaulting conversion to test builds is what makes the
+/// single-source rule STRUCTURAL rather than a convention: in a non-test build
+/// this impl does not exist, so the only way to reach
+/// [`build_discover_response`] is to name an accept-list explicitly. A
+/// production caller therefore CANNOT accidentally publish a defaulted or empty
+/// `supportedVersions` — it would not compile.
+///
+/// The empty slice is deliberate over a plausible default. A test that ends up
+/// reading `supportedVersions` through this conversion fails loudly on the empty
+/// array instead of passing against a real-looking list it never asked for.
+#[cfg(test)]
+impl<'a> From<&'a ServerCapabilities> for DiscoverSource<'a> {
+    fn from(capabilities: &'a ServerCapabilities) -> Self {
+        Self {
+            capabilities,
+            supported_versions: &[],
+        }
+    }
+}
+
 /// Isolated conversion fn producing the [`ServerDiscoverResult`] wire shape
 /// (Phase 112, VERS-04; era projection added by plan 114-05, D-02).
 ///
@@ -1471,14 +1532,22 @@ pub(crate) fn project_capabilities_for_v1(capabilities: &ServerCapabilities) -> 
 /// bytes of every existing tasks server on every era, which is exactly the lock
 /// D-02 exists to hold.
 pub(crate) fn discover_result_from_capabilities(
-    capabilities: &ServerCapabilities,
+    source: DiscoverSource<'_>,
     info: &Implementation,
     negotiated_version: String,
 ) -> ServerDiscoverResult {
     ServerDiscoverResult {
         protocol_version: negotiated_version,
-        capabilities: project_capabilities_for_v2(capabilities),
+        capabilities: project_capabilities_for_v2(source.capabilities),
         server_info: info.clone(),
+        // The accept-list is COPIED from the caller's source, never rebuilt
+        // here: `error.data.supported` reads the same slice, and the suite
+        // asserts the two agree (G-7).
+        supported_versions: source
+            .supported_versions
+            .iter()
+            .map(|version| version.as_str().to_string())
+            .collect(),
         ttl_ms: None,
         cache_scope: None,
     }
@@ -2121,12 +2190,22 @@ pub(crate) fn own_reserved_result_fields(
 /// served; a v1 / non-opted-in request receives standard `-32601`
 /// method-not-found (D-10), the same reject the public `parse_request` produces
 /// for `server/discover`.
-pub(crate) fn build_discover_response(
+///
+/// # `source` carries the accept-list, and production MUST name one (G-7)
+///
+/// [`DiscoverSource`] bundles the capabilities with the server's protocol
+/// accept-list, because `supportedVersions` on the result and
+/// `error.data.supported` on an unsupported-version rejection are required to be
+/// the same list. The `impl Into<_>` seam admits a capabilities-only source, but
+/// that conversion is `#[cfg(test)]`, so a PRODUCTION caller has no way to reach
+/// this fn without naming an accept-list explicitly.
+pub(crate) fn build_discover_response<'a>(
     id: RequestId,
-    capabilities: &ServerCapabilities,
+    source: impl Into<DiscoverSource<'a>>,
     info: &Implementation,
     protocol_context: Option<&crate::types::protocol::ProtocolContext>,
 ) -> JSONRPCResponse {
+    let source: DiscoverSource<'a> = source.into();
     // Era gate (D-10): v2 only. A v1 / non-opted-in request is method-not-found.
     if !matches!(
         protocol_context.map(|c| c.era),
@@ -2145,7 +2224,7 @@ pub(crate) fn build_discover_response(
     );
 
     // Read-only projection of the ALREADY-COMPUTED capabilities — no recompute.
-    let result = discover_result_from_capabilities(capabilities, info, negotiated_version);
+    let result = discover_result_from_capabilities(source, info, negotiated_version);
     let mut response = ServerCore::success_response(id, serde_json::to_value(result).unwrap());
     // Parity: the v2 object result carries resultType + serverInfo via the SAME
     // shared envelope helper every other v2 result uses. `server/discover` mints
@@ -4799,12 +4878,24 @@ mod tests {
     fn server_discover_wire_shape_golden() {
         let caps = ServerCapabilities::tools_only();
         let info = Implementation::new("golden-server", "1.2.3");
-        let result = discover_result_from_capabilities(&caps, &info, "2026-07-28".to_string());
+        // A REAL two-entry accept-list, so the golden pins that
+        // `supportedVersions` reproduces the caller's list in order rather than
+        // some derived or defaulted value (G-7).
+        let versions = vec![
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+            ProtocolVersion(crate::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
+        ];
+        let result = discover_result_from_capabilities(
+            DiscoverSource::new(&caps, &versions),
+            &info,
+            "2026-07-28".to_string(),
+        );
         let value = serde_json::to_value(&result).unwrap();
         let expected = serde_json::json!({
             "protocolVersion": "2026-07-28",
             "capabilities": { "tools": { "listChanged": true } },
-            "serverInfo": { "name": "golden-server", "version": "1.2.3" }
+            "serverInfo": { "name": "golden-server", "version": "1.2.3" },
+            "supportedVersions": ["2025-11-25", "2026-07-28"]
         });
         assert_eq!(value, expected, "discover wire shape drifted from golden");
     }
@@ -4829,8 +4920,10 @@ mod tests {
     #[test]
     fn server_discover_projects_the_tasks_extension_and_hides_the_v1_tasks_keys() {
         let info = Implementation::new("tasks-server", "1.0.0");
+        // Capabilities-only source: this test reads nothing but the projected
+        // capabilities, which is exactly what that conversion is for.
         let result = discover_result_from_capabilities(
-            &tasks_backed_capabilities(),
+            DiscoverSource::from(&tasks_backed_capabilities()),
             &info,
             "2026-07-28".to_string(),
         );
@@ -4862,8 +4955,10 @@ mod tests {
     #[test]
     fn server_discover_preserves_unrelated_experimental_keys() {
         let info = Implementation::new("tasks-server", "1.0.0");
+        // Capabilities-only source: this test reads nothing but the projected
+        // capabilities, which is exactly what that conversion is for.
         let result = discover_result_from_capabilities(
-            &tasks_backed_capabilities(),
+            DiscoverSource::from(&tasks_backed_capabilities()),
             &info,
             "2026-07-28".to_string(),
         );
@@ -4975,13 +5070,13 @@ mod tests {
         let info = Implementation::new("tasks-server", "1.0.0");
 
         let first = serde_json::to_value(discover_result_from_capabilities(
-            &caps,
+            DiscoverSource::from(&caps),
             &info,
             "2026-07-28".to_string(),
         ))
         .unwrap();
         let second = serde_json::to_value(discover_result_from_capabilities(
-            &caps,
+            DiscoverSource::from(&caps),
             &info,
             "2026-07-28".to_string(),
         ))

@@ -636,6 +636,56 @@ pub struct ServerDiscoverResult {
     /// SELF-REPORTED and unverified — never derive authorization from it.
     pub server_info: Implementation,
 
+    /// The protocol versions this server accepts — the REQUIRED
+    /// `2026-07-28` `DiscoverResult.supportedVersions` field.
+    ///
+    /// "MCP Protocol Versions this server supports. The client should choose a
+    /// version from this list for use in subsequent requests"
+    /// (`schema/vendored/core-2026-07-28/schema.ts:678-696`).
+    ///
+    /// # ONE accept list, read twice (Phase 118.1, G-7)
+    ///
+    /// This is the SAME list an unsupported-version rejection reports as
+    /// `error.data.supported`: both read the server's configured accept list
+    /// (`Server::supported_protocol_versions()`), which reaches the discover
+    /// projection through the `DiscoverSource` bundle rather than through a
+    /// second list assembled here. That is a structural requirement, not a
+    /// stylistic one — the official conformance suite's
+    /// `ServerUnsupportedVersionError` check asserts that every element of
+    /// `error.data.supported` also appears in this field, so two sources would
+    /// be two chances to disagree. `tests/v2_discover_supported_versions.rs`
+    /// fences the correlation against a SINGLE spawned server, where two
+    /// independent lists cannot both pass.
+    ///
+    /// # Why not `Option`, and why no `skip_serializing_if`
+    ///
+    /// The spec makes the field REQUIRED, and unlike [`ttl_ms`](Self::ttl_ms)
+    /// there is no "the handler expressed no preference" state to model: a
+    /// server always has an accept list. Omitting the key would fail the suite
+    /// outright, so it is emitted unconditionally.
+    ///
+    /// `#[serde(default)]` affects DESERIALIZATION only and is the repo's
+    /// tolerant-reader / strict-emitter rule (Phase 118.1 D-03) applied to the
+    /// client end: pmcp always EMITS the field, but
+    /// [`Client::server_discover`](crate::Client::server_discover) must not hard
+    /// fail against a peer that predates it or omits it.
+    ///
+    /// # Semver
+    ///
+    /// Adding this field is additive rather than a major bump because this
+    /// struct is `#[non_exhaustive]`, so `cargo semver-checks`'
+    /// `constructible_struct_adds_field` does not fire.
+    ///
+    /// That verdict is the OPPOSITE of the one plan 118.1-03 recorded for
+    /// `Content::Resource`, and the asymmetry is entirely explained by that one
+    /// attribute: `Content` is a public EXHAUSTIVE enum whose `Resource`
+    /// variant was not `#[non_exhaustive]`, so every representation of a new
+    /// spec field there was a major lint (`enum_struct_variant_field_added`)
+    /// and shipped as a documented one-time delta (D-15). Here the attribute
+    /// was already in place, so the same class of change costs nothing.
+    #[serde(default)]
+    pub supported_versions: Vec<String>,
+
     /// How long (in milliseconds) a client MAY cache this response — the
     /// `2026-07-28` `CacheableResult.ttlMs` hint.
     ///
