@@ -39,11 +39,87 @@
 //! already covers it; a top-level results directory is NOT ignored and would
 //! dirty the worktree on every run.
 //!
+//! # What the two runs prove
+//!
+//! Both requirement sets are served by ONE process, started once from the built
+//! binary at `target/debug/examples/s54_v2_dual_conformance` and never
+//! restarted between them — that single unchanged PID is the whole of the
+//! CONF-01 claim, because two processes would prove "pmcp can serve v1" and
+//! "pmcp can serve v2" as two separate facts rather than as one binary doing
+//! both. Measured against
+//! `@modelcontextprotocol/conformance@0.2.0-alpha.11`:
+//!
+//! | Requirement set | Scenarios | Result | Scored scenarios failing |
+//! |---|---|---|---|
+//! | `2025-11-25` | 33 (30 scored) | 51 passed, 15 failed | 11 |
+//! | `2026-07-28` | 50 (37 scored) | 124 passed, 54 failed | 7 |
+//!
+//! Both runs exit 1, for the reasons declared below. What one process DOES
+//! demonstrate, measured rather than asserted: the whole v2 MRTR surface (all
+//! 14 `input-required-result-*` scenarios green, including the `prompts/get`
+//! one that proves MRTR is not a `tools/call` feature), the v2 caching, session
+//! and DNS-rebinding scenarios, and — after the v2 run, against the same live
+//! process — a re-run of the v1 `server-session-lifecycle` scenario still
+//! passing 3/3, so no cross-era state bleed was observed.
+//!
 //! # The Tasks extension is deliberately ABSENT (D-14)
 //!
 //! The suite's task-bearing fixture tool and the ten `tasks-*` scenarios are
 //! `not_scored` at BOTH revisions, so implementing them would add surface
 //! without adding evidence. Their absence is a decision, not an omission.
+//!
+//! # DECLARED NON-CONFORMANCE — read this before citing the example (D-21)
+//!
+//! Neither requirement set exits 0, and that is a MEASURED, DECLARED outcome
+//! rather than an unfinished one. Phase 118 decision D-21 scopes the claim to
+//! what genuinely passes and states the rest in writing:
+//! `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
+//! No `--expected-failures` baseline, no allowlist and no known-fail file is
+//! used anywhere in this phase — the suppression the phase forbids stays
+//! forbidden, so the numbers below are the real ones.
+//!
+//! The scored 2026-07-28 failures that this example CANNOT fix, because every
+//! one of them lives in `src/` rather than in a fixture, with the gap they
+//! trace to:
+//!
+//! | Scored scenario | Gap | What `src/` does |
+//! |---|---|---|
+//! | `tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource` | G-1 | `Content::Resource` serialises FLAT; the spec's `EmbeddedResource` nests under `resource` |
+//! | `resources-read-binary` | G-2 | no blob-bearing resource-contents variant exists |
+//! | `tools-call-with-progress` | G-3 | `notification_tx` is set only in `Server::run()`, which `StreamableHttpServer` never calls |
+//! | `completion-complete` | G-4 | `completion/complete` is a catch-all arm returning `{}` |
+//! | `server-stateless` (`HttpServerMethodNotFound404ping`) | G-5 | `ping` is served under v2 instead of being retired — and see the sharper finding below |
+//! | `server-stateless` (`ServerImplementsDiscover`, `ServerUnsupportedVersionError`) | G-7 (new) | `server/discover` emits `protocolVersion`, never the `supportedVersions` array the spec mandates — `grep -rn supportedVersions src/` finds nothing |
+//! | `server-stateless` (3x `RequestMetaInvalid`, `HttpServerMetaInvalid400`) | G-6 (new) | a missing / malformed `_meta` answers `-32020`, not the `-32602` + HTTP 400 the spec requires; a missing `clientCapabilities` is not rejected at all |
+//! | `server-stateless` (`HttpServerHeaderMismatch400`) | G-8 (new) | a header/`_meta` protocol-version disagreement answers `-32022`, not `-32020` |
+//!
+//! Everything else that fails is a MISSING FIXTURE, and fixtures are exactly
+//! what this file is for. Do not cite this example as "pmcp passes the official
+//! suite"; cite it for the dual-era claim, which one process does demonstrate.
+//!
+//! ## The removed-method retirement is WEAKER than the suite's score suggests
+//!
+//! v2 removes five RPCs: `initialize`, `ping`, `logging/setLevel`,
+//! `resources/subscribe` and `resources/unsubscribe`. The suite scores four of
+//! the five as passing. Probed directly with WELL-FORMED params, only two are
+//! genuinely retired:
+//!
+//! | Method under v2 | Suite's probe (`params` = `_meta` only) | Well-formed `params` |
+//! |---|---|---|
+//! | `initialize` | 404 + `-32601` | **HTTP 200, served** — and answers `protocolVersion: "2025-11-25"` |
+//! | `ping` | HTTP 200, served | HTTP 200, served |
+//! | `logging/setLevel` | 404 + `-32601` | **HTTP 200, served** |
+//! | `resources/subscribe` | 404 + `-32601` | 404 + `-32601` (genuinely retired) |
+//! | `resources/unsubscribe` | 404 + `-32601` | 404 + `-32601` (genuinely retired) |
+//!
+//! `v2_retired_method_of` in `src/server/streamable_http_server.rs` matches
+//! exactly `Subscribe` and `Unsubscribe` and nothing else. The other three
+//! answer `-32601` to the suite only because its probe sends `params` carrying
+//! `_meta` alone, which does not deserialize into `InitializeRequest` or
+//! `SetLoggingLevel` — a PARSE failure that happens to produce the required
+//! code. Two of the four "passes" therefore pass for the wrong reason, and the
+//! `docs/v1-sunset-policy.md` tension about a v2 server still answering
+//! `initialize` is CONFIRMED at the wire rather than merely suspected.
 //!
 //! # Divergence from `s47_v2_stateless_mrtr`: `PMCP_REQUEST_STATE_KEY`
 //!
@@ -60,9 +136,11 @@ use async_trait::async_trait;
 use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpServerConfig};
 use pmcp::shared::http_constants::{ACCEPT_STREAMABLE, MCP_PROTOCOL_VERSION};
 use pmcp::types::capabilities::{
-    CompletionCapabilities, LoggingCapabilities, PromptCapabilities, ResourceCapabilities,
-    ServerCapabilities, ToolCapabilities,
+    ClientCapabilities, CompletionCapabilities, LoggingCapabilities, PromptCapabilities,
+    ResourceCapabilities, ServerCapabilities, ToolCapabilities,
 };
+use pmcp::types::elicitation::ElicitRequestParams;
+use pmcp::types::mrtr::{InputRequest, InputRequests, InputResponse, MrtrSignal};
 use pmcp::types::protocol::{
     ProtocolVersion, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28,
 };
@@ -122,12 +200,16 @@ const TEMPLATE_SUFFIX: &str = "/data";
 const TINY_WAV_BASE64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
 
 /// Every prompt name the suite names, in `prompts/list` order.
-const PROMPT_NAMES: [&str; 5] = [
+const PROMPT_NAMES: [&str; 6] = [
     "test_prompt",
     "test_simple_prompt",
     "test_prompt_with_arguments",
     "test_prompt_with_embedded_resource",
     "test_prompt_with_image",
+    // `input-required-result-non-tool-request` — the scenario that proves MRTR
+    // is UNIVERSAL rather than a tools/call feature, by driving it through
+    // prompts/get.
+    "test_input_required_result_prompt",
 ];
 
 /// Every tool name the suite names.
@@ -142,7 +224,7 @@ const PROMPT_NAMES: [&str; 5] = [
 /// The suite's task-bearing fixture tool and every other Tasks-extension tool
 /// are deliberately ABSENT (D-14) — they are `not_scored` at both revisions, so
 /// implementing them would add surface without adding evidence.
-const TOOL_NAMES: [&str; 17] = [
+const TOOL_NAMES: [&str; 30] = [
     "test_simple_text",
     "test_image_content",
     "test_audio_content",
@@ -160,6 +242,24 @@ const TOOL_NAMES: [&str; 17] = [
     "test_elicitation",
     "test_elicitation_sep1034_defaults",
     "test_elicitation_sep1330_enums",
+    // --- The 2026-07-28 MRTR surface (SEP-2322). ---
+    "test_input_required_result_elicitation",
+    "test_input_required_result_sampling",
+    "test_input_required_result_list_roots",
+    "test_input_required_result_multi_round",
+    "test_input_required_result_multiple_inputs",
+    "test_input_required_result_request_state",
+    "test_input_required_result_tampered_state",
+    "test_input_required_result_capabilities",
+    "test_mrtr_echo_state",
+    "test_mrtr_no_state",
+    "test_mrtr_unrelated",
+    "test_mrtr_no_result_type",
+    // The `server-stateless` diagnostic tool. Not in the plan's list — found by
+    // reading the scenario's own failure text, which names it verbatim
+    // ("server does not list the diagnostic tool 'test_streaming_elicitation'
+    // in tools/list, so the response stream could not be exercised").
+    "test_streaming_elicitation",
 ];
 
 /// Where the server binds when `argv[1]` is absent.
@@ -336,8 +436,15 @@ impl PromptHandler for ConformancePrompt {
     async fn handle(
         &self,
         args: HashMap<String, String>,
-        _extra: RequestHandlerExtra,
+        extra: RequestHandlerExtra,
     ) -> pmcp::Result<GetPromptResult> {
+        // MRTR is not a `tools/call` feature: `prompts/get` and
+        // `resources/read` are equally eligible, and this prompt is the fixture
+        // that proves it. Same authoring seam as the tools — the signal rides
+        // on the result's `_meta` and the SDK seals it.
+        if self.name == "test_input_required_result_prompt" {
+            return input_required_prompt(&extra);
+        }
         let messages = match self.name {
             "test_prompt" => vec![PromptMessage::new(
                 Role::User,
@@ -420,6 +527,10 @@ impl PromptHandler for ConformancePrompt {
                 )],
             ),
             "test_prompt_with_image" => ("A prompt that returns an image content block", vec![]),
+            "test_input_required_result_prompt" => (
+                "A prompt that asks the user for context before it can be rendered",
+                vec![],
+            ),
             _ => ("", vec![]),
         };
 
@@ -429,6 +540,53 @@ impl PromptHandler for ConformancePrompt {
         }
         Some(info)
     }
+}
+
+/// `test_input_required_result_prompt`, both rounds.
+///
+/// Round 1 asks for context through an `input_required` result; round 2 renders
+/// the prompt with whatever the client answered. The `_meta` field of
+/// [`GetPromptResult`] is set directly, exactly as the tools set
+/// `CallToolResult::_meta` — this is the one authoring seam, and `prompts/get`
+/// is one of the three methods the spec lets an `InputRequiredResult` ride on.
+fn input_required_prompt(extra: &RequestHandlerExtra) -> pmcp::Result<GetPromptResult> {
+    if extra.mrtr_continuation().is_some() {
+        let context =
+            elicited_string(extra, "user_context", "context").unwrap_or_else(|| "none".to_string());
+        return Ok(GetPromptResult::new(
+            vec![PromptMessage::new(
+                Role::User,
+                Content::text(format!("Using the context you supplied: {context}")),
+            )],
+            Some("A prompt rendered from elicited context".to_string()),
+        ));
+    }
+
+    let signal = MrtrSignal {
+        input_requests: one_request(
+            "user_context",
+            elicit(
+                "What context should the prompt use?",
+                one_string_schema("context"),
+            ),
+        ),
+        continuation: serde_json::json!({ "asked": "user_context" }),
+    };
+    let (key, value) = signal
+        .into_meta_entry()
+        .map_err(|error| pmcp::Error::internal(error.to_string()))?;
+    let mut meta = serde_json::Map::new();
+    meta.insert(key, value);
+
+    let mut result = GetPromptResult::new(
+        vec![PromptMessage::new(
+            Role::User,
+            Content::text("I need some context before I can render this prompt."),
+        )],
+        Some("Awaiting elicited context".to_string()),
+    );
+    result._meta = Some(meta);
+    Ok(result)
 }
 
 /// A required prompt argument with a description, the shape `prompts/list`
@@ -501,7 +659,7 @@ impl pmcp::ToolHandler for ConformanceTool {
             "test_logging_tool" => ("The tool the logging scenarios drive", no_args()),
             "test_complete" => ("Backs the completion/complete endpoint", no_args()),
             "test_missing_capability" => (
-                "Negative case for a capability the server does not advertise",
+                "Needs a client sampling capability, so an undeclared client is refused -32021",
                 no_args(),
             ),
             "test_headers" => ("Echoes the request's standard HTTP headers back", no_args()),
@@ -522,6 +680,62 @@ impl pmcp::ToolHandler for ConformanceTool {
                 "Requests elicitation with all five SEP-1330 enum variants",
                 no_args(),
             ),
+            "test_input_required_result_elicitation" => (
+                "Asks for a name through an input_required elicitation, then greets it",
+                no_args(),
+            ),
+            "test_input_required_result_sampling" => (
+                "Asks the client's model a question through an input_required sampling request",
+                no_args(),
+            ),
+            "test_input_required_result_list_roots" => (
+                "Asks the client for its roots through an input_required roots/list request",
+                no_args(),
+            ),
+            "test_input_required_result_multi_round" => (
+                "Two input_required rounds with evolving requestState, then a complete result",
+                no_args(),
+            ),
+            "test_input_required_result_multiple_inputs" => (
+                "One input_required result carrying elicitation, sampling and roots/list at once",
+                no_args(),
+            ),
+            "test_input_required_result_capabilities" => (
+                "Asks only for inputs the client's declared capabilities can answer",
+                no_args(),
+            ),
+            "test_streaming_elicitation" => (
+                "Answers with a single input_required result, never an independent request",
+                no_args(),
+            ),
+            "test_input_required_result_request_state" => (
+                "Round-trips an AEAD-sealed requestState across one MRTR continuation",
+                no_args(),
+            ),
+            "test_input_required_result_tampered_state" => (
+                "Mints an integrity-protected requestState whose tampered resend must be rejected",
+                no_args(),
+            ),
+            "test_mrtr_echo_state" => (
+                "Test tool: triggers MRTR flow with requestState. Client must echo state back \
+                 unchanged.",
+                no_args(),
+            ),
+            "test_mrtr_no_state" => (
+                "Test tool: triggers MRTR flow WITHOUT requestState. Client must NOT include \
+                 requestState in retry.",
+                no_args(),
+            ),
+            "test_mrtr_unrelated" => (
+                "Test tool: simple tool called between MRTR rounds. Must NOT carry inputResponses \
+                 or requestState from another tool.",
+                no_args(),
+            ),
+            "test_mrtr_no_result_type" => (
+                "Test tool: returns a result without resultType. Client must treat it as complete \
+                 (default).",
+                no_args(),
+            ),
             _ => ("", no_args()),
         };
         Some(ToolInfo::new(
@@ -539,6 +753,13 @@ impl ConformanceTool {
     /// `**Server Implementation Requirements:**` block character for
     /// character — they are contract, not prose.
     async fn call(&self, args: Value, extra: RequestHandlerExtra) -> pmcp::Result<CallToolResult> {
+        // The MRTR-shaped tools come first and are dispatched BY ROUND rather
+        // than by name alone, so each tool's ask and its resume sit next to
+        // their siblings instead of being buried in one arm. A tool that is not
+        // MRTR-shaped falls through to the match below.
+        if let Some(result) = self.mrtr_call(&extra) {
+            return result;
+        }
         match self.name {
             "test_simple_text" => Ok(CallToolResult::new(vec![Content::text(
                 "This is a simple text response for testing.",
@@ -609,12 +830,6 @@ impl ConformanceTool {
                 "Completion fixture tool",
             )])),
 
-            // The negative case: this tool exists so a scenario can prove the
-            // server refuses a capability it never advertised.
-            "test_missing_capability" => Err(pmcp::Error::validation(
-                "this server does not advertise the capability this tool needs",
-            )),
-
             "test_headers" | "test_custom_headers" => {
                 // pmcp's streamable-HTTP transport does not surface inbound
                 // request headers to a handler (no header plumbing into
@@ -667,9 +882,484 @@ impl ConformanceTool {
                 "no server->client channel on this transport: elicitation/create cannot be issued",
             )),
 
+            // ---------------------------------------------------------------
+            // The two `test_mrtr_*` tools that are NOT MRTR-shaped. Their
+            // MRTR-shaped siblings, and every `test_input_required_result_*`
+            // tool, live in `mrtr_ask` / `mrtr_resume` below.
+            // ---------------------------------------------------------------
+
+            // A plain complete result: the negative control for a client that
+            // treats every v2 response as an MRTR step.
+            "test_mrtr_unrelated" => Ok(CallToolResult::new(vec![Content::text("unrelated-ok")])),
+
+            // DIVERGENCE, recorded rather than worked around: the suite's mock
+            // omits `resultType` entirely. pmcp's v2 envelope always writes it
+            // (`inject_v2_result_envelope` is its single writer), so this
+            // returns a COMPLETE result — `resultType: "complete"` — which is
+            // the closest expressible value and is what a client must treat as
+            // the default anyway.
+            "test_mrtr_no_result_type" => Ok(CallToolResult::new(vec![Content::text(
+                "no-result-type-ok",
+            )])),
+
             other => Err(pmcp::Error::validation(format!("unknown tool: {other}"))),
         }
     }
+
+    /// The MRTR-shaped tools, dispatched BY ROUND rather than by name alone.
+    ///
+    /// `None` means "not an MRTR-shaped tool" and sends the caller back to the
+    /// plain `match`. The round split is the point: [`mrtr_ask`](Self::mrtr_ask)
+    /// is what a tool needs before it can answer, [`mrtr_resume`](Self::mrtr_resume)
+    /// is what it does once the client HAS answered. Keeping them apart leaves
+    /// each side a flat table a reviewer can hold beside the suite's
+    /// `**Server Implementation Requirements:**` blocks.
+    fn mrtr_call(&self, extra: &RequestHandlerExtra) -> Option<pmcp::Result<CallToolResult>> {
+        match extra.mrtr_continuation() {
+            Some(continuation) => self.mrtr_resume(continuation, extra),
+            None => self.mrtr_ask(extra),
+        }
+    }
+
+    /// Round 1: the `inputRequests` each MRTR-shaped tool needs answered, and
+    /// the handler-owned continuation that lets it resume.
+    ///
+    /// The continuation is SEALED by the SDK and never published; the client
+    /// sees only the opaque token.
+    fn mrtr_ask(&self, extra: &RequestHandlerExtra) -> Option<pmcp::Result<CallToolResult>> {
+        let (text, signal) = match self.name {
+            "test_input_required_result_elicitation" => (
+                "I need your name before I can greet you.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "user_name",
+                        elicit("What is your name?", one_string_schema("name")),
+                    ),
+                    continuation: serde_json::json!({ "asked": "user_name" }),
+                },
+            ),
+
+            "test_input_required_result_sampling" => (
+                "I need your model to answer a question first.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "capital_question",
+                        sample("What is the capital of France?", 100),
+                    ),
+                    continuation: serde_json::json!({ "asked": "capital_question" }),
+                },
+            ),
+
+            "test_input_required_result_list_roots" => (
+                "I need to know which roots your client exposes.",
+                MrtrSignal {
+                    input_requests: one_request("client_roots", InputRequest::ListRoots),
+                    continuation: serde_json::json!({ "asked": "client_roots" }),
+                },
+            ),
+
+            "test_input_required_result_multi_round" => (
+                "Step 1 of 2.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "step1",
+                        elicit("Step 1: What is your name?", one_string_schema("name")),
+                    ),
+                    // The step number rides INSIDE the sealed continuation, so
+                    // the client cannot skip ahead by editing the token — the
+                    // AEAD verdict rejects any edit before dispatch.
+                    continuation: serde_json::json!({ "step": 1 }),
+                },
+            ),
+
+            "test_input_required_result_multiple_inputs" => (
+                "I need three different answers before I can finish.",
+                MrtrSignal {
+                    input_requests: all_three_requests(),
+                    continuation: serde_json::json!({ "asked": "all-three" }),
+                },
+            ),
+
+            "test_input_required_result_request_state" => (
+                "I need a confirmation before I can finish.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "confirm",
+                        elicit("Please confirm", one_bool_schema("ok")),
+                    ),
+                    continuation: serde_json::json!({ "stage": "awaiting-confirm" }),
+                },
+            ),
+
+            "test_input_required_result_tampered_state" => (
+                "I need a confirmation before I can finish.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "confirm",
+                        elicit("Please confirm", one_bool_schema("ok")),
+                    ),
+                    continuation: serde_json::json!({ "stage": "tamper-probe" }),
+                },
+            ),
+
+            // The only tool that reads the client's declaration. Every OTHER
+            // arm asks for what its scenario dictates and lets the SDK reject
+            // an undeclared capability wholesale with -32021; this one is the
+            // scenario that grades the server for asking narrowly in the first
+            // place.
+            "test_input_required_result_capabilities" => (
+                "I need whatever inputs your client actually declared it can answer.",
+                MrtrSignal {
+                    input_requests: capability_scoped_requests(extra.client_capabilities()),
+                    continuation: serde_json::json!({ "asked": "capability-scoped" }),
+                },
+            ),
+
+            // `server-stateless` reads up to three frames off this call's
+            // response stream and fails the server if any frame is an
+            // independent JSON-RPC REQUEST. Answering with one `input_required`
+            // result is exactly the v2 shape that requirement exists to force.
+            "test_streaming_elicitation" => (
+                "I need one confirmation, delivered as a result and not as a request.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "stream_confirm",
+                        elicit("Confirm to continue", one_bool_schema("confirmed")),
+                    ),
+                    continuation: serde_json::json!({ "asked": "stream_confirm" }),
+                },
+            ),
+
+            // The negative case, and it is the SDK that says no. The tool asks
+            // for `sampling/createMessage`; when the client declared no
+            // sampling capability, `reject_undeclared_capabilities` refuses the
+            // WHOLE result with -32021 and `data.requiredCapabilities` set to
+            // `{"sampling": {}}` before any continuation is minted. The example
+            // states a need; it does not implement the refusal.
+            "test_missing_capability" => (
+                "I need your model to answer before I can finish.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "needs_sampling",
+                        sample("Answer anything at all.", 16),
+                    ),
+                    continuation: serde_json::json!({ "asked": "needs_sampling" }),
+                },
+            ),
+
+            "test_mrtr_echo_state" => (
+                "Please confirm to continue",
+                MrtrSignal {
+                    input_requests: one_request("confirm", confirm_elicitation("Confirm?")),
+                    continuation: serde_json::json!({ "probe": "echo_state" }),
+                },
+            ),
+
+            "test_mrtr_no_state" => (
+                "Please confirm to continue (no state test)",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "confirm",
+                        confirm_elicitation("Confirm? (no state test)"),
+                    ),
+                    // DIVERGENCE, recorded rather than worked around: the
+                    // suite's own mock omits `requestState` here, and pmcp
+                    // cannot — `seal_input_required` writes `inputRequests` AND
+                    // `requestState` unconditionally, and the reserved-field
+                    // registry deletes any the egress did not mint. The
+                    // continuation is therefore minimal, not absent.
+                    continuation: Value::Null,
+                },
+            ),
+
+            _ => return None,
+        };
+        Some(input_required(text, signal))
+    }
+
+    /// Round 2 (and 3): what each MRTR-shaped tool does once the client has
+    /// answered.
+    ///
+    /// Reached ONLY with a continuation the server-owned AEAD codec
+    /// authenticated, so `continuation` is server-minted and trusted. Everything
+    /// read out of `inputResponses` is the opposite — it came off the wire and
+    /// is validated exactly like a tool argument.
+    fn mrtr_resume(
+        &self,
+        continuation: &Value,
+        extra: &RequestHandlerExtra,
+    ) -> Option<pmcp::Result<CallToolResult>> {
+        // The one tool that answers a round with ANOTHER round.
+        if self.name == "test_input_required_result_multi_round"
+            && continuation.get("step").and_then(Value::as_u64) == Some(1)
+        {
+            return Some(input_required(
+                "Step 2 of 2.",
+                MrtrSignal {
+                    input_requests: one_request(
+                        "step2",
+                        elicit(
+                            "Step 2: What is your favorite color?",
+                            one_string_schema("color"),
+                        ),
+                    ),
+                    continuation: serde_json::json!({ "step": 2 }),
+                },
+            ));
+        }
+
+        let text = match self.name {
+            "test_input_required_result_elicitation" => {
+                format!("Hello, {}!", answered_name(extra, "user_name"))
+            },
+            "test_input_required_result_sampling" => format!(
+                "The model answered: {}",
+                sampled_text(extra, "capital_question")
+                    .unwrap_or_else(|| "(no sampling response)".to_string())
+            ),
+            "test_input_required_result_list_roots" => {
+                let roots = listed_roots(extra, "client_roots").unwrap_or_default();
+                format!("The client reported {} root(s): {}", roots.len(), {
+                    let joined = roots.join(", ");
+                    if joined.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        joined
+                    }
+                })
+            },
+            "test_input_required_result_multi_round" => format!(
+                "Done: name={}, color={}",
+                answered_name(extra, "step1"),
+                elicited_string(extra, "step2", "color")
+                    .unwrap_or_else(|| "(unanswered)".to_string())
+            ),
+            "test_input_required_result_multiple_inputs" => format!(
+                "Collected: name={}, greeting={}, roots={}",
+                answered_name(extra, "user_name"),
+                sampled_text(extra, "greeting").unwrap_or_else(|| "(none)".to_string()),
+                listed_roots(extra, "client_roots")
+                    .unwrap_or_default()
+                    .len()
+            ),
+            // The scenario requires the literal "state-ok" so a reader can tell
+            // the state was received AND validated, not merely echoed.
+            "test_input_required_result_request_state" => format!(
+                "state-ok (stage={}, confirmed={})",
+                continuation
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                elicited_bool(extra, "confirm", "ok").unwrap_or(false)
+            ),
+            // Reached ONLY when the resent token verified. A tampered token
+            // never gets here: the SDK's ingress answers -32602 before dispatch,
+            // which is the rejection this scenario grades. The example owns no
+            // integrity check of its own — the scenario is testing pmcp.
+            "test_input_required_result_tampered_state" => {
+                "state-ok: the resent requestState verified".to_string()
+            },
+            "test_input_required_result_capabilities" => {
+                "capability-scoped inputs received".to_string()
+            },
+            "test_streaming_elicitation" => "streaming-elicitation-ok".to_string(),
+            "test_missing_capability" => {
+                "the client declared the capability, so the call completed".to_string()
+            },
+            "test_mrtr_echo_state" => "echo-state-ok".to_string(),
+            "test_mrtr_no_state" => "no-state-ok".to_string(),
+            _ => return None,
+        };
+        Some(Ok(CallToolResult::new(vec![Content::text(text)])))
+    }
+}
+
+// ===========================================================================
+// The MRTR authoring helpers (SEP-2322).
+//
+// These exist so every `input_required` result in this file is built the SAME
+// way, out of the SDK's own types, and so no arm is tempted to hand-write the
+// envelope. `MrtrSignal::into_meta_entry` is the ONE seam: the dispatch layer
+// takes the signal off `_meta`, seals `continuation` into the opaque
+// `requestState` with the AEAD codec keyed by `PMCP_REQUEST_STATE_KEY`, writes
+// `inputRequests`, and removes the internal key before serialization.
+//
+// The example adds NO cryptographic primitive of its own. It cannot: the codec
+// lives in `src/server/request_state.rs` and is reached only through this seam.
+//
+// A note on which SDK type is which, because it is easy to reach for the wrong
+// one. `pmcp::types::mrtr::InputRequiredResult` is the CLIENT-side parsed twin
+// of what these tools produce — it exists so a caller RECEIVES an unfulfilled
+// `input_required` result instead of an empty success, and a server handler
+// never constructs it. The server-side authoring type is [`MrtrSignal`], and
+// the two `input_required` fields are written by the SDK's own
+// `seal_input_required`, never by a handler.
+// ===========================================================================
+
+/// Attach an [`MrtrSignal`] to a `CallToolResult` so the dispatch layer seals it.
+///
+/// The `_meta` field is set DIRECTLY rather than through
+/// `RequestHandlerExtra::set_result_meta`, and that is load-bearing. Every tool
+/// here is served through `handle_output` returning `ToolOutput::Result`, and
+/// that verbatim arm returns BEFORE the dispatcher drains the handler's result
+/// `_meta` slot (`src/server/mod.rs`: "the verbatim `ToolOutput::Result` arm
+/// above returns earlier and owns its own `_meta`"). A signal set through
+/// `set_result_meta` on this path is silently dropped, and the tool ships an
+/// empty success for an operation it never completed.
+fn input_required(text: &str, signal: MrtrSignal) -> pmcp::Result<CallToolResult> {
+    let (key, value) = signal
+        .into_meta_entry()
+        .map_err(|error| pmcp::Error::internal(error.to_string()))?;
+    let mut meta = serde_json::Map::new();
+    meta.insert(key, value);
+    let mut result = CallToolResult::new(vec![Content::text(text)]);
+    result._meta = Some(meta);
+    Ok(result)
+}
+
+/// An [`InputRequests`] map with exactly one entry.
+fn one_request(key: &str, request: InputRequest) -> InputRequests {
+    let mut requests = InputRequests::new();
+    requests.insert(key.to_string(), request);
+    requests
+}
+
+/// A form-mode `elicitation/create` input request.
+fn elicit(message: &str, requested_schema: Value) -> InputRequest {
+    InputRequest::Elicitation(Box::new(ElicitRequestParams::Form {
+        message: message.to_string(),
+        requested_schema,
+    }))
+}
+
+/// A `sampling/createMessage` input request with one user message.
+fn sample(prompt: &str, max_tokens: u32) -> InputRequest {
+    InputRequest::Sampling(Box::new(
+        sampling_params(prompt).with_max_tokens(max_tokens),
+    ))
+}
+
+/// The elicitation schema for exactly one required string field.
+fn one_string_schema(field: &str) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { field: { "type": "string" } },
+        "required": [field],
+    })
+}
+
+/// The elicitation schema for exactly one required boolean field.
+fn one_bool_schema(field: &str) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { field: { "type": "boolean" } },
+        "required": [field],
+    })
+}
+
+/// The three-entry `inputRequests` map — elicitation, sampling and roots/list
+/// in one result — that `input-required-result-multiple-input-requests` grades.
+fn all_three_requests() -> InputRequests {
+    let mut requests = InputRequests::new();
+    requests.insert(
+        "user_name".to_string(),
+        elicit("What is your name?", one_string_schema("name")),
+    );
+    requests.insert("greeting".to_string(), sample("Generate a greeting", 50));
+    requests.insert("client_roots".to_string(), InputRequest::ListRoots);
+    requests
+}
+
+/// The `inputRequests` map narrowed to what `declared` says the client can
+/// answer.
+///
+/// The spec's MUST NOT is that a server may not RELY on an undeclared
+/// capability. pmcp already enforces the hard half — an `inputRequests` map
+/// naming an undeclared capability is refused wholesale with `-32021` before a
+/// continuation is minted — so this is the SOFT half: ask narrowly, so a client
+/// that can answer something still gets asked for it.
+///
+/// The declaration is CLIENT-SUPPLIED and trivially forgeable. It says only what
+/// the client can ANSWER, never what it is allowed to reach, and nothing here
+/// makes an access decision from it.
+fn capability_scoped_requests(declared: Option<&ClientCapabilities>) -> InputRequests {
+    let mut requests = InputRequests::new();
+    let Some(declared) = declared else {
+        return requests;
+    };
+    if declared.elicitation.is_some() {
+        requests.insert(
+            "user_name".to_string(),
+            elicit("What is your name?", one_string_schema("name")),
+        );
+    }
+    if declared.sampling.is_some() {
+        requests.insert("greeting".to_string(), sample("Generate a greeting", 50));
+    }
+    if declared.roots.is_some() {
+        requests.insert("client_roots".to_string(), InputRequest::ListRoots);
+    }
+    requests
+}
+
+/// Read a string field out of the client's answer to an elicitation entry.
+fn elicited_string(extra: &RequestHandlerExtra, key: &str, field: &str) -> Option<String> {
+    let InputResponse::Elicitation(result) = extra.input_responses()?.get(key)? else {
+        return None;
+    };
+    result
+        .content
+        .as_ref()?
+        .get(field)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `name` the client elicited under `key`, or a neutral placeholder.
+fn answered_name(extra: &RequestHandlerExtra, key: &str) -> String {
+    elicited_string(extra, key, "name").unwrap_or_else(|| "friend".to_string())
+}
+
+/// Read the text out of the client's answer to a sampling entry.
+fn sampled_text(extra: &RequestHandlerExtra, key: &str) -> Option<String> {
+    let InputResponse::Sampling(result) = extra.input_responses()?.get(key)? else {
+        return None;
+    };
+    match &result.content {
+        Content::Text { text } => Some(text.clone()),
+        other => Some(format!("{other:?}")),
+    }
+}
+
+/// Read the URIs out of the client's answer to a `roots/list` entry.
+fn listed_roots(extra: &RequestHandlerExtra, key: &str) -> Option<Vec<String>> {
+    let InputResponse::Roots(result) = extra.input_responses()?.get(key)? else {
+        return None;
+    };
+    Some(result.roots.iter().map(|root| root.uri.clone()).collect())
+}
+
+/// The boolean-confirmation elicitation the `test_mrtr_*` tools share.
+fn confirm_elicitation(prompt: &str) -> InputRequest {
+    elicit(
+        prompt,
+        serde_json::json!({
+            "type": "object",
+            "properties": { "confirmed": { "type": "boolean", "description": prompt } },
+        }),
+    )
+}
+
+/// Read a boolean field out of the client's answer to an elicitation entry.
+///
+/// Every value here is CLIENT-SUPPLIED and is validated exactly like a tool
+/// argument: a missing key, a declined elicitation or a wrong-shaped answer all
+/// return `None` rather than a default that would look like a real answer.
+fn elicited_bool(extra: &RequestHandlerExtra, key: &str, field: &str) -> Option<bool> {
+    let InputResponse::Elicitation(result) = extra.input_responses()?.get(key)? else {
+        return None;
+    };
+    result.content.as_ref()?.get(field)?.as_bool()
 }
 
 /// The sampling request shape the `tools-call-sampling` scenario specifies.
