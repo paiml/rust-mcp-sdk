@@ -129,6 +129,87 @@ Removal of v1 support is tracked as **SMPL-F1** and is:
 
 Until that condition is met, v1 is a supported path, not a legacy one.
 
+## Three deprecated v1 MECHANISMS (Roots, Sampling, Logging)
+
+**What is deprecated below is the v1 WIRE MECHANISM, not the capability.** Roots, Sampling
+and Logging all remain fully functional on 2026-07-28 through their v2 replacements. If you
+read this heading and concluded "Sampling is being removed", read the table: nothing is being
+removed, and planning a migration away from Sampling would be planning the wrong migration.
+What changes is *how* the capability travels on the wire.
+
+| Capability | v1 mechanism (deprecated) | v2 mechanism (the replacement) | Status of the capability on v2 |
+|---|---|---|---|
+| **Logging** | the `logging/setLevel` RPC | the per-request `_meta` key `io.modelcontextprotocol/logLevel`, which the 2026-07-28 schema describes verbatim as *"Replaces the former `logging/setLevel` RPC"* | **Fully functional.** The level travels on every request instead of being set once for a session |
+| **Sampling** | a server→client `sampling/createMessage` request issued mid-call | an `InputRequiredResult` continuation (SEP-2322): the server RETURNS `resultType: "input_required"` with an `inputRequests` entry, the client answers it and resends | **Fully functional.** v2 is stateless and has no server→client request channel mid-call, so the continuation is the spec-blessed shape |
+| **Roots** | a server→client `roots/list` request issued mid-call | the same `InputRequiredResult` continuation (SEP-2322), with a roots-kind `inputRequests` entry | **Fully functional.** Identical mechanism to Sampling, applied to Roots |
+
+### The window: 12 months, advisory
+
+The advisory deprecation window for these three mechanisms is **12 months**, anchored to the
+2026-07-28 final-spec date, and therefore runs to **2027-07-28**.
+
+**Advisory means exactly this: nothing changes at the end of the window without a separate,
+explicit decision.** No mechanism is removed on 2027-07-28. No build breaks on 2027-07-28. No
+new output appears on 2027-07-28. The date exists so that a downstream project can plan its
+own migration against a stated horizon rather than against silence — it is not a scheduled
+removal, and this policy commits to no removal at all (see the reconciliation below).
+
+### This is NOT v1 removal, and NOT capability removal
+
+Three different claims live in this document and they must not be collapsed into one:
+
+1. **Mechanism deprecation** (this section) — three named v1 wire mechanisms whose v2
+   replacements have already landed, with a 12-month advisory window.
+2. **v1 removal** ([The removal condition](#the-removal-condition), SMPL-F1) — removing MCP
+   2025-11-25 support entirely, in a future pmcp 3.0. That is **adoption-gated with no date
+   and no committed window**, and this section does not change it. A narrower advisory window
+   for three mechanisms is not a schedule for the whole era, and the clause above stands
+   exactly as written.
+3. **Capability removal** — *not claimed anywhere in this document.* Roots, Sampling and
+   Logging are not being removed from MCP or from PMCP in any era.
+
+### What is measured today, not merely intended
+
+The `_meta` replacement mechanism is live and proven (see the verification block below).
+The **retirement half is not**: this SDK still SERVES `logging/setLevel` on a 2026-07-28
+connection rather than answering `-32601`, which is recorded as gap **G-5** in
+`.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`. That
+is stated here rather than omitted, because a deprecation notice that overstates what already
+happened is the same defect as a severance claim that overstates what was severed.
+
+### How to verify this section yourself
+
+```bash
+cargo test -p pmcp-team-servers --features http --test era_matrix
+```
+
+`crates/pmcp-team-servers/tests/era_matrix.rs` drives all three capabilities to COMPLETION
+under both eras against one live streamable-HTTP endpoint: under v1 through the v1 mechanisms,
+and under v2 through the `_meta` log-level key and two `InputRequiredResult` continuations. It
+asserts the tool RESULT and its content, not merely that a response arrived.
+
+`--features http` is **load-bearing**: the whole file is behind
+`#![cfg(all(feature = "conformance", feature = "http"))]`.
+
+Four things that can **never** prove this, and why:
+
+- **A passing run with a ZERO test count.** That is exactly what omitting `--features http`
+  produces: the file compiles to no tests, the harness prints `running 0 tests`, and cargo
+  exits `0`. The test COUNT is part of the evidence — the same trap the severance proofs
+  above document, in a different file.
+- **A matrix that observed no era difference at all.** Two independent era runs against a
+  dual-era server MUST differ; an empty comparison means the v2 arm never ran. `compare_eras`
+  surfaces that as a `suspicion`, and `era_matrix_is_conformant` consumes it as a FAILURE
+  rather than rendering a clean bill of health.
+- **The official conformance suite's v2 scenario set.** It contains no direct Roots or
+  Sampling server scenario, so it cannot prove this claim even in principle — passing it says
+  nothing either way about these three mechanisms.
+- **A fixture under `contracts/team-servers/fixtures/`.** That format expresses a
+  `tools_list` and a single `tool_call` and nothing else, so it cannot carry a preceding
+  `logging/setLevel`, a host-handler installation, a server→client exchange, or a
+  gather-and-resend round trip. The evidence therefore lives in probes and a typed client, and
+  the fixture format was deliberately NOT extended to carry it.
+
 ## What you have to do today
 
 **Nothing.** `v1-compat` is in `default`. An ordinary `pmcp = "2"` dependency keeps the full
@@ -222,6 +303,15 @@ change to this policy rather than an implementation detail:
   `allow()` suppressions throughout the SDK's own source.
 - **No runtime warning on v1 negotiation.** Logging a warning when a client negotiates v1 would
   change v1 runtime behavior, which is exactly what the next point forbids.
+- **No runtime warning on a still-supported MECHANISM.** The three deprecated mechanisms above
+  emit nothing: no warning, no notice, no new field. A warn on a still-supported mechanism
+  trains users to ignore warnings, and this one would fire on every affected call for a full
+  year — by the end of which it would carry no information at all. Deprecation here is
+  documented, never emitted. There is also a maintenance cost on the other side of the
+  keyboard: a warning nobody wants to regress has to be pinned by a warn-capture assertion,
+  and this repository has already measured what those cost — the intermittent
+  `oauth_store_wiring` DCR issuer-change test (Phase 116 surface, CI record 3 pass / 2 fail)
+  is an open flake in precisely that class. Adding a signal here would mean adding another.
 - **No behavior change on the wire — *on a `v1-compat` build*.** v1 request/response bytes stay
   identical there; feature-gating moves where code lives, it does not change what a v1 client
   observes. `tests/v1_byte_identity_after_cut.rs` pins nine of those responses byte-for-byte.

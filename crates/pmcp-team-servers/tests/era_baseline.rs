@@ -66,15 +66,43 @@ use std::path::PathBuf;
 /// loader and `include_str!` compiles the same bytes in.
 const BASELINE_FILE: &str = "baselines/era-deltas.yaml";
 
-/// Floor on the parsed entry count. Fourteen deltas were seeded, one per
-/// `PROBE_REGISTRY` entry, each with a checked citation.
+/// Floor on the parsed entry count. Fourteen deltas were seeded by plan 118-03,
+/// one per `PROBE_REGISTRY` entry, each with a checked citation, and plan 118-07
+/// RECONCILED all fourteen against measurement against the live era target —
+/// twelve confirmed as seeded, two (ERA-01, ERA-11) with their v2 token
+/// corrected to the measured fact. The reconciled count is therefore still 14,
+/// and this floor stays 14.
 ///
 /// Falling below this means either the reader broke or entries were removed
 /// without replacement. The remedy is NEVER to lower this number: a smaller
 /// baseline silently reclassifies real expected differences as findings (and,
-/// at zero, makes every diff pass over an empty set). Plan 118-07 may RAISE it
-/// once measurement adds rows; nothing ever lowers it.
+/// at zero, makes every diff pass over an empty set). A later phase may RAISE
+/// it; nothing ever lowers it.
 const MINIMUM_DELTAS: usize = 14;
+
+/// The `kind` marking a row that records a MEASURED SAMENESS (v1 token == v2
+/// token) rather than a measured difference.
+///
+/// Kept in step with `baselines/era-deltas.yaml` and with
+/// `tests/era_matrix.rs::AGREEMENT_KIND`, which additionally requires the
+/// OBSERVED tokens to equal the recorded ones before treating such a row as
+/// satisfied.
+const AGREEMENT_KIND: &str = "era-agreement";
+
+/// Hard cap on how many rows may carry [`AGREEMENT_KIND`].
+///
+/// Exactly the two plan 118-07 measured: ERA-01 (`initialize` still served on
+/// v2) and ERA-11 (`logging/setLevel` still served on v2), both declared gaps
+/// under Phase 118 decision D-21.
+///
+/// The cap exists because an agreement row is the ONE row shape whose MISSING
+/// classification `tests/era_matrix.rs` does not treat as a finding. Capping it
+/// at the measured two is what stops the shape from growing into a general
+/// escape hatch for "the eras stopped differing and we would rather not look".
+/// The remedy for a violation is to fix the server so the eras differ again, or
+/// to record the new sameness AS A PHASE DECISION and raise this cap in the same
+/// commit, saying why. Never raise it silently.
+const MAXIMUM_AGREEMENT_ROWS: usize = 2;
 
 /// Floor on the length of an entry's `source` citation. Below this a value is a
 /// label ("D-07", "spec"), not something a reviewer can go and check.
@@ -199,6 +227,72 @@ fn every_delta_carries_a_nonempty_source() {
 }
 
 // ===========================================================================
+// 3b. `kind: era-agreement` is shaped as it claims, and is CAPPED
+// ===========================================================================
+//
+// This is a CONTENT rule and the file's preamble says content rules do not
+// belong here — with one carve-out, which this is. Every other `kind` value is
+// presentational (it only groups rows in a rendered report), but
+// `era-agreement` is the one value that CHANGES A VERDICT: it is the sole row
+// shape whose MISSING classification `tests/era_matrix.rs` does not treat as a
+// finding. A field that decides an outcome has to be gated where it is written.
+
+#[test]
+fn agreement_rows_are_shaped_as_they_claim_and_are_capped() {
+    let baseline = baseline();
+
+    let agreements: Vec<&EraDelta> = baseline
+        .deltas
+        .iter()
+        .filter(|delta| delta.kind == AGREEMENT_KIND)
+        .collect();
+
+    for delta in &agreements {
+        assert_eq!(
+            delta.v1, delta.v2,
+            "FAILURE MODE: entry `{}` in {BASELINE_FILE} carries `kind: {AGREEMENT_KIND}` but \
+             records v1 `{}` and v2 `{}`, which are DIFFERENT.\n\
+             CONSEQUENCE: an \"agreement\" row that records a difference would be exempted from \
+             the MISSING arm while claiming a difference nothing has to reproduce — an \
+             allowlist wearing a measurement's clothes.\n\
+             WHAT TO DO: give the row the kind that matches what it records.",
+            delta.id, delta.v1, delta.v2
+        );
+    }
+
+    // The inverse direction: a row that records v1 == v2 without the marker
+    // could only ever be reported MISSING, forever.
+    for delta in &baseline.deltas {
+        assert!(
+            delta.v1 != delta.v2 || delta.kind == AGREEMENT_KIND,
+            "FAILURE MODE: entry `{}` in {BASELINE_FILE} records v1 == v2 (`{}`) but its kind is \
+             `{}`, not `{AGREEMENT_KIND}`.\n\
+             CONSEQUENCE: a row recording no difference can only ever be reported MISSING, in \
+             every run, forever — the permanent-false-finding failure mode.\n\
+             WHAT TO DO: mark it `{AGREEMENT_KIND}` with a citation for the sameness, or fix the \
+             tokens.",
+            delta.id,
+            delta.v1,
+            delta.kind
+        );
+    }
+
+    let ids: Vec<&str> = agreements.iter().map(|d| d.id.as_str()).collect();
+    assert!(
+        agreements.len() <= MAXIMUM_AGREEMENT_ROWS,
+        "FAILURE MODE: {} rows in {BASELINE_FILE} carry `kind: {AGREEMENT_KIND}` ({ids:?}); the \
+         cap is {MAXIMUM_AGREEMENT_ROWS}.\n\
+         CONSEQUENCE: agreement rows are the one shape whose MISSING classification is not a \
+         finding. Letting them accumulate turns the era matrix into a record of what stopped \
+         differing rather than a gate on it.\n\
+         WHAT TO DO: fix the server so the eras differ again, or record the new sameness as a \
+         PHASE DECISION and raise the cap in the same commit, saying why. Never raise it \
+         silently.",
+        agreements.len()
+    );
+}
+
+// ===========================================================================
 // 4. The parse is not vacuous
 // ===========================================================================
 
@@ -259,19 +353,31 @@ fn the_protocol_versions_match_the_sdk_constants() {
 // 6. Provisional entries name their owner
 // ===========================================================================
 
+/// After plan 118-07 the baseline is FULLY RECONCILED: every row was measured
+/// against the live era target, so nothing is awaiting measurement.
+///
+/// The owner rule below is deliberately kept even though it cannot run while
+/// this assertion holds. It is the rule a future phase must satisfy at the
+/// MOMENT it re-introduces a provisional row, and deleting it now would mean
+/// rediscovering it then — by which time the exemption in
+/// `tests/era_matrix.rs::assert_no_missing` would already be live again with no
+/// named owner attached to it.
 #[test]
 fn provisional_entries_name_their_owning_phase() {
     let baseline = baseline();
 
     let provisional: Vec<&EraDelta> = baseline.deltas.iter().filter(|d| d.provisional).collect();
 
+    let ids: Vec<&str> = provisional.iter().map(|d| d.id.as_str()).collect();
     assert!(
-        !provisional.is_empty(),
-        "FAILURE MODE: no entry in {BASELINE_FILE} is marked provisional, yet every row here is a \
-         claim AWAITING MEASUREMENT by plan 118-07. An all-final baseline turns an expected \
-         measurement correction into a mystery failure.\n\
-         WHAT TO DO: flag the entries whose owning phase has not signed off; do not delete this \
-         check."
+        provisional.is_empty(),
+        "FAILURE MODE: {ids:?} in {BASELINE_FILE} are marked provisional, but plan 118-07 \
+         reconciled every row against measurement and cleared the last flag.\n\
+         CONSEQUENCE: a provisional row is EXEMPT from the MISSING arm in \
+         tests/era_matrix.rs, so it is a claim nothing checks — strictly worse than no claim.\n\
+         WHAT TO DO: measure the row and clear the flag, or delete the row AND its probe. If a \
+         phase legitimately needs to re-introduce a provisional row, relax THIS assertion in the \
+         same commit and keep the owner rule below."
     );
 
     for delta in provisional {
