@@ -924,6 +924,11 @@ checkboxes a verifier can fail on.
 - [x] **CONF-01**: The official `@modelcontextprotocol/conformance` suite (pinned to a commit, re-pinned after the final spec) runs in CI against a dual-version pmcp server example over real HTTP
 - [x] **CONF-02**: The Phase-109 Rust conformance harness gains v2 fixtures while v1 fixtures stay green (dual conformance, verified with a dev-dependency-free build to avoid feature-unification false-greens)
 - [x] **CONF-03**: Deprecated Roots/Sampling/Logging capabilities remain fully functional under v2 negotiation (advisory-only deprecation, 12-month window)
+- [ ] **CONF-04**: An embedded resource in a tool result (`CallToolResult.content`) or in a prompt message (`GetPromptResult.messages[].content`) serializes as the spec `EmbeddedResource` shape — `type: "resource"` with the contents nested under `resource` (`schema/vendored/core-2026-07-28/schema.ts:1734-1748`) — on BOTH eras; binary content carries `blob` in both the nested position and the flat `ReadResourceResult.contents` position (`schema.ts:1514-1553`); content-level `annotations` is carried; and pmcp PARSES both the nested spec shape and the legacy flat shape on input while EMITTING only the nested one (tolerant reader, strict emitter). Scores G-1, G-2 and D-06's `annotations`.
+- [ ] **CONF-05**: `completion/complete` is served by a registered handler seam on both native dispatchers and returns `{completion: {values: [...]}}` (`schema.ts:2644-2663`) rather than the catch-all `json!({})`; and all five methods absent from the 2026-07-28 core schema — `initialize`, `ping`, `logging/setLevel`, `resources/subscribe`, `resources/unsubscribe` — answer HTTP 404 with JSON-RPC `-32601` on v2 **even with well-formed params** (so the 404 is retirement, not a coincidental `_meta` parse failure), while all five still answer normally on v1. Scores G-4 and G-5.
+- [ ] **CONF-06**: A v2 request whose `params._meta` is absent, or which omits `io.modelcontextprotocol/protocolVersion` or `io.modelcontextprotocol/clientCapabilities`, is rejected with JSON-RPC `-32602` and HTTP 400, while a request omitting only `io.modelcontextprotocol/clientInfo` is SERVED with HTTP 200; a header/`_meta` protocol-version disagreement answers `-32020` and an agreed-but-unsupported version answers `-32022` carrying `data.supported` and `data.requested`; and `server/discover` emits `supportedVersions` (`schema.ts:678-696`) from the SAME accept list those errors are computed from, so every element of `data.supported` appears in it. Scores G-6, G-7 and G-8.
+- [ ] **CONF-07**: The server-to-client back-channel works over StreamableHTTP — a tool handler's `peer.sample()`, `peer.list_roots()` and `peer.elicit()` complete over v1 stateful HTTP without blocking concurrent requests; progress notifications reach the client on both eras (v1 via the session SSE stream, v2 via an SSE-framed POST response body carrying ONLY notification frames and the final result frame, never an independent server-to-client request); and `RequestHandlerExtra::set_result_meta` survives the `ToolOutput::Result` verbatim path on both dispatchers. Scores G-3, plus D-06's `set_result_meta` drop and D-07's `PeerHandle::elicit`.
+- [ ] **CONF-08**: `RequestHandlerExtra::client_capabilities()` returns the capabilities a v1 client advertised in its `initialize` handshake at EVERY handler-dispatch construction site, so a server-side capability gate reads the same value under v1 as it does under v2. Scores G-9.
 
 ### Docs in Three Shapes (DOCS — continues v2.4 numbering)
 
@@ -1039,6 +1044,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CONF-01 | Phase 118 | Complete |
 | CONF-02 | Phase 118 | Complete |
 | CONF-03 | Phase 118 | Complete |
+| CONF-04 | Phase 118.1 | Pending |
+| CONF-05 | Phase 118.1 | Pending |
+| CONF-06 | Phase 118.1 | Pending |
+| CONF-07 | Phase 118.1 | Pending |
+| CONF-08 | Phase 118.1 | Pending |
 | DOCS-04 | Phase 119 | Pending |
 | DOCS-05 | Phase 119 | Pending |
 | DOCS-06 | Phase 119 | Pending |
@@ -1050,7 +1060,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 - Mapped to phases: 38 ✓
 - Unmapped: 0
 - **Added after roadmap creation: 1 (UNAS-01, SEP-2243 `x-mcp-header`) — UNMAPPED, needs a phase**
-- Running total: 39 requirements, 38 mapped, **1 unmapped**
+- **Minted after roadmap creation: 5 (CONF-04..CONF-08) — MAPPED to Phase 118.1, minted 2026-08-10 by Phase 118.1 plan 01 per D-12**
+- Running total: 44 requirements, 43 mapped, **1 unmapped**
 
 **Status-marker legend:**
 
@@ -1060,7 +1071,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | `[~]` / Implemented — pending final schema | Code shipped and green, but the requirement's own SPEC-RECHECK gate has not landed `PUBLISHED-CONFIRMED`. **Two different gates are in play — check which one owns the row before flipping it.** HTTP-0x / CLNT-0x are gated by `113-SPEC-RECHECK.md`; **TASK-01..06 are gated by `114-SPEC-RECHECK.md`, whose DQ6 trigger requires a versioned schema directory in BOTH `modelcontextprotocol/modelcontextprotocol` AND `modelcontextprotocol/ext-tasks`.** As of 2026-08-01 only the core half has published, so the TASK rows stay held. |
 | `[ ]` / Pending | Not started |
 
-**Phase map (8 phases, 112-119):**
+**Phase map (9 phases, 112-119, including the inserted 118.1):**
 
 - Phase 112 Version Plumbing Spine — VERS-01..09 (9)
 - Phase 113 Stateless HTTP + MRTR — HTTP-01..05, CLNT-01, CLNT-02 (7)
@@ -1069,6 +1080,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 - Phase 116 Auth Hardening SEPs — AUTH-01..03 (3) — **all 3 booked `[x]` by `116-15`, 2026-08-07**
 - Phase 117 Agents, Tester & v1 Severability — CLNT-03, CLNT-04, SMPL-01, SMPL-02 (4)
 - Phase 118 Conformance — CONF-01..03 (3)
+- Phase 118.1 Close the Nine Conformance Gaps — CONF-04..08 (5) — **INSERTED** 2026-08-10; scores G-1..G-9 from `118-CONFORMANCE-GAPS.md`
 - Phase 119 Documentation — DOCS-04..06 (3)
 
 ---
