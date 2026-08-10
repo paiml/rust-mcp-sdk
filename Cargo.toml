@@ -744,6 +744,31 @@ name = "s53_v2_agent_client"
 path = "examples/s53_v2_agent_client.rs"
 required-features = ["streamable-http", "http-client"]
 
+# Phase 118 (CONF-01): the dual-version conformance TARGET. The official
+# `@modelcontextprotocol/conformance` suite (pinned in `conformance/`) is run
+# against ONE instance of this server twice — once with `--requirements
+# 2025-11-25` and once with `--requirements 2026-07-28` — which is what makes
+# "one pmcp binary serves both eras" a measured claim rather than an assertion.
+# Phase 119's DOCS-06 cites this example as the runnable v2 server.
+#
+# Its tool / resource / prompt names are DICTATED by that suite, not chosen:
+# renaming one silently breaks the scenario that consumes it.
+#
+# NUMBERING: `s54` is the next free slot — `s47`/`s48`/`s49` are each occupied
+# twice and `s50`/`s51`/`s52`/`s53` all exist. See the bijection note above the
+# `s47_v2_stateless_mrtr` block.
+#
+# `testing` joins `streamable-http` for the same reason `s52` needs it: the
+# example reads the reserved `_meta` key spellings from `pmcp::testing`
+# (`META_PROTOCOL_VERSION`) rather than hand-copying wire strings that could
+# drift. Both are folded into `full`, which is what the documented run command
+# uses. Without this entry the example would carry no required-feature guard and
+# a default-feature `cargo run --example` would fail to compile.
+[[example]]
+name = "s54_v2_dual_conformance"
+path = "examples/s54_v2_dual_conformance.rs"
+required-features = ["streamable-http", "testing"]
+
 [[bench]]
 name = "comprehensive_benchmarks"
 harness = false
