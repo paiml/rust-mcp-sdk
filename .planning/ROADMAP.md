@@ -2751,8 +2751,8 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 118-04-PLAN.md — Wave 2. D-05: the dual-version conformance example `s54_v2_dual_conformance` **registered as a `[[example]]` with `required-features`**, the full 2025-11-25 fixture surface measured green, output under `target/conformance-results/` (CONF-01)
-- [ ] 118-06-PLAN.md — Wave 2. **D-16/D-17**: the raw streamable-HTTP probe client, the dual-accept-list era target on an ephemeral port (incl. the three deprecated-capability tools), and `observe()` — fourteen ESTABLISHED observations under both eras over ONE endpoint (CONF-02/CONF-03)
+- [x] 118-04-PLAN.md — Wave 2. D-05: the dual-version conformance example `s54_v2_dual_conformance` **registered as a `[[example]]` with `required-features`**, the full 2025-11-25 fixture surface measured green, output under `target/conformance-results/` (CONF-01)
+- [x] 118-06-PLAN.md — Wave 2. **D-16/D-17**: the raw streamable-HTTP probe client, the dual-accept-list era target on an ephemeral port (incl. the three deprecated-capability tools), and `observe()` — fourteen ESTABLISHED observations under both eras over ONE endpoint (CONF-02/CONF-03)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -2793,7 +2793,7 @@ Plans:
 | 115. JSON Schema 2020-12 + Caching Hints | 19/19 | Complete    | 2026-08-02 |
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
-| 118. Conformance Against the Official Suite | 4/10 | In Progress|  |
+| 118. Conformance Against the Official Suite | 6/10 | In Progress|  |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
