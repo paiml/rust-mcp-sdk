@@ -74,6 +74,10 @@ pub struct ServerCoreBuilder {
     /// Cached prompt metadata (populated at registration, avoids per-request cloning)
     prompt_infos: HashMap<String, PromptInfo>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// Completion provider backing `completion/complete` (Phase 118.1-04,
+    /// CONF-05). A SINGLE non-keyed slot in the shape of `resources` above,
+    /// set via [`Self::completions`].
+    completions: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
     tool_authorizer: Option<Arc<dyn ToolAuthorizer>>,
@@ -156,6 +160,7 @@ impl ServerCoreBuilder {
             tool_infos: HashMap::new(),
             prompt_infos: HashMap::new(),
             resources: None,
+            completions: None,
             sampling: None,
             auth_provider: None,
             tool_authorizer: None,
@@ -352,6 +357,72 @@ impl ServerCoreBuilder {
                 subscribe: Some(false),
                 list_changed: Some(false),
             });
+        }
+
+        self
+    }
+
+    /// Set the completion provider backing `completion/complete`.
+    ///
+    /// A SINGLE, server-wide provider — the [`Self::resources`] shape, not the
+    /// name-keyed [`Self::prompt`] shape. The spec routes every
+    /// `completion/complete` to one seam and passes the `ref` (`ref/prompt` or
+    /// `ref/resource`) as data, so a per-name registry would invent a dispatch
+    /// dimension the protocol does not have. The reference reaches the provider
+    /// through
+    /// [`CompletionRequest::context`](crate::types::completable::CompletionRequest::context).
+    ///
+    /// Registering a provider auto-advertises `capabilities.completions`, the
+    /// way [`Self::resources`] auto-advertises `capabilities.resources`.
+    ///
+    /// Not registering one is NOT an error: `completion/complete` still answers
+    /// the spec `CompleteResult` shape with an empty `values` array.
+    ///
+    /// The high-level [`ServerBuilder`](crate::server::ServerBuilder) carries an
+    /// identically-named setter, so a provider registered through either family
+    /// reaches its own dispatcher.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::types::completable::StaticCompletionProvider;
+    ///
+    /// # fn example() -> pmcp::Result<()> {
+    /// let server = ServerCoreBuilder::new()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .completions(StaticCompletionProvider::from_strings(vec![
+    ///         "alpha".to_string(),
+    ///         "beta".to_string(),
+    ///     ]))
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn completions(
+        self,
+        provider: impl crate::types::completable::CompletionProviderTrait + 'static,
+    ) -> Self {
+        self.completions_arc(Arc::new(provider))
+    }
+
+    /// Set the completion provider with an Arc.
+    ///
+    /// This variant is useful when the provider is shared with something outside
+    /// the builder. Behaviour is otherwise identical to [`Self::completions`].
+    #[must_use]
+    pub fn completions_arc(
+        mut self,
+        provider: Arc<dyn crate::types::completable::CompletionProviderTrait>,
+    ) -> Self {
+        self.completions = Some(provider);
+
+        // Update capabilities to include completions.
+        // Use Some(default) instead of None to ensure the field serializes.
+        if self.capabilities.completions.is_none() {
+            self.capabilities.completions = Some(crate::types::CompletionCapabilities::default());
         }
 
         self
@@ -1334,6 +1405,12 @@ impl ServerCoreBuilder {
         // `Server` uses (no drift between the two dispatchers).
         #[cfg(not(target_arch = "wasm32"))]
         let core = core.with_suppress_double_wrap(self.suppress_double_wrap);
+        // Thread the `completion/complete` provider (CONF-05, G-4) so the core's
+        // own dispatch arm reaches the registered seam. Without this the arm
+        // would read `None` forever — still spec-shaped, but silently ignoring
+        // every registered provider.
+        #[cfg(not(target_arch = "wasm32"))]
+        let core = core.with_completions(self.completions);
         // Thread the configured protocol-version accept-list (Phase 112,
         // VERS-01/02) so ingress era-resolution enforces the exact set the author
         // opted into. Default (unset) is v1-only — the server behaves as today.

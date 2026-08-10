@@ -202,6 +202,148 @@ pub(crate) fn build_uri_to_tool_meta(
     map
 }
 
+// ===========================================================================
+// `completion/complete` (Phase 118.1-04, CONF-05 / G-4).
+//
+// ONE shared unit, called from BOTH native dispatch sites — `ServerCore` below
+// and the high-level `Server` in `server/mod.rs`. That is the Phase-109/112
+// twin-site parity rule this file already states for the MRTR unit further
+// down: `mod.rs` CALLS this helper, it never defines its own.
+//
+// Before this unit existed the two dispatchers DISAGREED on the method:
+// `Server` answered `json!({})` from a five-method catch-all and `ServerCore`
+// answered `-32601` from its `_ =>` arm. Only `Server` is on the HTTP path, so
+// the official conformance suite could only ever measure half the defect.
+// ===========================================================================
+
+/// The spec's `@maxItems 100` bound on `CompleteResult.completion.values`.
+///
+/// Source: `schema/vendored/core-2026-07-28/schema.ts:2644-2663`, which
+/// annotates `values: string[]` with `@maxItems 100` in prose that no generated
+/// Rust type carries. A completion provider is driven by peer-chosen input
+/// (`ref` + a partial `argument.value`), so an unbounded array copied straight
+/// out of the provider is a denial-of-service surface as well as a conformance
+/// violation (T-118.1-04-01).
+pub(crate) const MAX_COMPLETION_VALUES: usize = 100;
+
+/// Shape a `completion/complete` answer from an optional registered provider.
+///
+/// # The no-provider contract
+///
+/// A server with no completion provider registered answers a SUCCESS carrying
+/// an EMPTY array — never an error, never a bare `{}`. The pinned conformance
+/// suite's own comment sanctions exactly this ("completion support can be
+/// minimal or return empty arrays"), and it is the shape the overwhelming
+/// majority of servers will emit, so it is the default rather than a special
+/// case.
+///
+/// # The `@maxItems 100` bound
+///
+/// `values` is TRUNCATED to [`MAX_COMPLETION_VALUES`] rather than rejected: a
+/// provider returning 150 candidates is not malformed, it is simply more
+/// specific than the wire allows, and refusing the whole answer would turn a
+/// working completion into an error. Truncation is reported honestly:
+///
+/// - `has_more` is set when the provider itself reported more OR when this
+///   function dropped elements, so a client never reads a truncated list as
+///   exhaustive.
+/// - `total` is `Some(n)` ONLY when the provider returned everything it had
+///   (`has_more == false` on its side), in which case `n` is the true total.
+///   When the provider itself claims more exist, the true total is unknown and
+///   `total` stays `None` — inventing one would be worse than omitting an
+///   optional field.
+///
+/// # The ref
+///
+/// [`CompletionRequest`](crate::types::completable::CompletionRequest) carries
+/// no dedicated ref slot, so the reference is threaded through its `context`
+/// map under the spec's own discriminator spelling — `ref/prompt` or
+/// `ref/resource` (`CompletionReference`'s serde renames). A provider that
+/// needs to know WHICH prompt or resource is being completed reads it there;
+/// one that does not can ignore it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn complete_completion(
+    provider: Option<&Arc<dyn crate::types::completable::CompletionProviderTrait>>,
+    request: &crate::types::protocol::CompleteRequest,
+) -> Result<crate::types::protocol::CompleteResult> {
+    use crate::types::protocol::{CompleteResult, CompletionResult};
+
+    let Some(provider) = provider else {
+        return Ok(CompleteResult {
+            completion: CompletionResult::new(Vec::new()),
+        });
+    };
+
+    let response = provider.complete(completion_request_for(request)).await?;
+    Ok(CompleteResult {
+        completion: bound_completion_values(response),
+    })
+}
+
+/// Project a wire [`CompleteRequest`](crate::types::protocol::CompleteRequest)
+/// onto the SDK's provider-facing
+/// [`CompletionRequest`](crate::types::completable::CompletionRequest).
+#[cfg(not(target_arch = "wasm32"))]
+fn completion_request_for(
+    request: &crate::types::protocol::CompleteRequest,
+) -> crate::types::completable::CompletionRequest {
+    use crate::types::protocol::CompletionReference;
+
+    let mut context = HashMap::new();
+    match &request.r#ref {
+        CompletionReference::Prompt { name } => {
+            context.insert(COMPLETION_REF_PROMPT_KEY.to_string(), name.clone());
+        },
+        CompletionReference::Resource { uri } => {
+            context.insert(COMPLETION_REF_RESOURCE_KEY.to_string(), uri.clone());
+        },
+    }
+    crate::types::completable::CompletionRequest {
+        argument: request.argument.name.clone(),
+        partial: request.argument.value.clone(),
+        context,
+    }
+}
+
+/// The `context` key carrying a `ref/prompt` reference's prompt name.
+///
+/// Spelled exactly as the wire discriminator (`CompletionReference`'s serde
+/// rename), so a provider matching on it is matching on the protocol's own
+/// vocabulary rather than on an SDK-invented alias.
+pub(crate) const COMPLETION_REF_PROMPT_KEY: &str = "ref/prompt";
+
+/// The `context` key carrying a `ref/resource` reference's URI.
+pub(crate) const COMPLETION_REF_RESOURCE_KEY: &str = "ref/resource";
+
+/// Apply the spec's `@maxItems 100` bound to a provider's answer.
+///
+/// Split out of [`complete_completion`] so the bound has a unit-testable seam
+/// that does not require constructing a provider — the truncation arithmetic is
+/// the part a regression would silently break.
+#[cfg(not(target_arch = "wasm32"))]
+fn bound_completion_values(
+    response: crate::types::completable::CompletionResponse,
+) -> crate::types::protocol::CompletionResult {
+    use crate::types::protocol::CompletionResult;
+
+    let available = response.completions.len();
+    let truncated = available > MAX_COMPLETION_VALUES;
+    let values: Vec<String> = response
+        .completions
+        .into_iter()
+        .take(MAX_COMPLETION_VALUES)
+        .map(|item| item.value)
+        .collect();
+
+    let mut result = CompletionResult::new(values).with_has_more(response.has_more || truncated);
+    if !response.has_more {
+        // The provider returned everything it had, so `available` IS the total —
+        // including the elements this function just dropped.
+        result = result.with_total(available);
+    }
+    result
+}
+
 /// Core server implementation without transport dependencies.
 ///
 /// This struct contains all the business logic for an MCP server without
@@ -237,6 +379,23 @@ pub struct ServerCore {
 
     /// Sampling handler (optional)
     sampling: Option<Arc<dyn SamplingHandler>>,
+
+    /// Completion provider backing `completion/complete` (optional, Phase
+    /// 118.1-04 / CONF-05).
+    ///
+    /// A SINGLE, non-keyed slot in the shape of `resources` above, not the
+    /// name-keyed `prompts` map: the spec routes every `completion/complete` to
+    /// one server-wide provider and passes the `ref` as data, so a per-name
+    /// registry would be inventing a dispatch dimension the protocol does not
+    /// have. Threaded from
+    /// [`ServerCoreBuilder::completions`](crate::server::builder::ServerCoreBuilder::completions)
+    /// via [`ServerCore::with_completions`]; the high-level `Server` carries an
+    /// IDENTICALLY-shaped field so both dispatchers consult the same seam.
+    ///
+    /// `None` still answers the spec shape — an empty `values` array — rather
+    /// than an error. See [`complete_completion`].
+    #[cfg(not(target_arch = "wasm32"))]
+    completions: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
 
     /// Client capabilities (set during initialization)
     client_capabilities: Arc<RwLock<Option<ClientCapabilities>>>,
@@ -386,6 +545,8 @@ impl ServerCore {
             prompt_infos,
             resources,
             sampling,
+            #[cfg(not(target_arch = "wasm32"))]
+            completions: None,
             client_capabilities: Arc::new(RwLock::new(None)),
             initialized: Arc::new(RwLock::new(false)),
             cancellation_manager: CancellationManager::new(),
@@ -449,6 +610,25 @@ impl ServerCore {
     #[must_use]
     pub fn with_suppress_double_wrap(mut self, suppress: HashSet<String>) -> Self {
         self.suppress_double_wrap = suppress;
+        self
+    }
+
+    /// Carry the `completion/complete` provider (Phase 118.1-04, CONF-05) from
+    /// the builder into the running `ServerCore`.
+    ///
+    /// Threaded from
+    /// [`ServerCoreBuilder::completions`](crate::server::builder::ServerCoreBuilder::completions)
+    /// rather than added to [`ServerCore::new`]'s already-eighteen-argument
+    /// signature, matching [`Self::with_suppress_double_wrap`] and
+    /// [`Self::with_server_request_dispatcher`]. `None` (the default) still
+    /// answers the spec `CompleteResult` shape with an empty `values` array.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_completions(
+        mut self,
+        provider: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
+    ) -> Self {
+        self.completions = provider;
         self
     }
 
@@ -3905,6 +4085,34 @@ impl ServerCore {
                         // otherwise strip (114-10 row 23).
                         *dispatch_claim = claim;
                         response
+                    },
+                    // `completion/complete` (CONF-05, G-4). Placed HERE, ahead
+                    // of the `_ =>` catch-all below, because that catch-all is
+                    // what used to answer `-32601 Method not supported` for
+                    // this method while the high-level `Server` answered
+                    // `json!({})` — two dispatchers, two different wrong
+                    // answers. Both now call the SAME shared unit.
+                    //
+                    // The four other methods the twin catch-all in
+                    // `server/mod.rs` still covers — `resources/subscribe`,
+                    // `resources/unsubscribe`, `logging/setLevel` and `ping` —
+                    // are deliberately NOT unified here. See the RESIDUAL note
+                    // on the `Subscribe | Unsubscribe | SetLoggingLevel | Ping`
+                    // arm in `Server::process_client_request`.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    ClientRequest::Complete(req) => {
+                        match complete_completion(self.completions.as_ref(), req).await {
+                            Ok(result) => Self::success_response(
+                                id,
+                                serde_json::to_value(result)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                            ),
+                            Err(e) => Self::error_response(
+                                id,
+                                crate::types::protocol::error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            ),
+                        }
                     },
                     _ => Self::error_response(
                         id,
