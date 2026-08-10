@@ -1603,6 +1603,13 @@ fn v1_tools_list_body() -> String {
 /// A v2 `tools/list` body — the era ALSO travels in `params._meta`, which is
 /// what makes the very first byte a client sends a real request rather than an
 /// `initialize` handshake.
+///
+/// `io.modelcontextprotocol/clientCapabilities` is REQUIRED on every v2 request
+/// (Phase 118.1, gap G-6): a `_meta` carrying only the protocol version is
+/// answered `-32602` + HTTP 400. This body is printed as a copy-pasteable `curl`
+/// below, so omitting the key would hand the reader a request the server refuses.
+/// `io.modelcontextprotocol/clientInfo` is deliberately absent — it is a SHOULD,
+/// and leaving it out keeps the printed command exercising that optionality.
 fn v2_tools_list_body() -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -1611,6 +1618,9 @@ fn v2_tools_list_body() -> String {
         "params": {
             "_meta": {
                 pmcp::testing::META_PROTOCOL_VERSION: PROTOCOL_VERSION_2026_07_28,
+                pmcp::testing::META_CLIENT_CAPABILITIES: {
+                    "elicitation": {}, "sampling": {}, "roots": {},
+                },
             },
         },
     })

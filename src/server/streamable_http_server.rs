@@ -701,14 +701,31 @@ enum HeaderProtocolVersion {
     Other,
 }
 
-/// The classification of an opted-in request over the header/`_meta` matrix.
-enum V2Classification {
-    /// v1 / both signals non-v2 → run the legacy path with zero enforcement.
-    Legacy,
-    /// v2 on BOTH the header and the resolved `_meta` era → enforce headers.
+/// The verdict of the v2 `_meta` gate over the RAW `MCP-Protocol-Version` header
+/// and the RAW `params._meta` object.
+///
+/// # Three-way, deliberately — this replaced a 2x2 era matrix
+///
+/// The predecessor, `classify_era_cell`, was a 2x2 over
+/// `(header_is_v2, meta_is_v2)`. That shape can express only "the two sides
+/// agree" or "the two sides disagree", so an ABSENT required `_meta` key and a
+/// PRESENT-but-disagreeing `protocolVersion` collapsed into the same
+/// `HEADER_MISMATCH` cell. The spec allocates them DIFFERENT codes — `-32602`
+/// for a missing required parameter, `-32020` for a header/body disagreement —
+/// so the distinction has to exist in the type (Phase 118.1, gap G-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2MetaVerdict {
+    /// No v2 signal on either side, or a `_meta` carrier only the shared
+    /// resolver can diagnose — defer to `resolve_raw_meta_protocol_context`
+    /// (v1 passthrough, `MalformedMeta`, or the accept list).
+    Defer,
+    /// A REQUIRED reserved `_meta` key is ABSENT → `INVALID_PARAMS`.
+    MissingRequired(&'static str),
+    /// The header and `_meta` disagree about the protocol version →
+    /// `HEADER_MISMATCH`. Evaluated BEFORE the accept list (gap G-8).
+    Disagreement(&'static str),
+    /// Both sides agree on `2026-07-28` → enforce the v2 header contract.
     Enforce,
-    /// A conflict cell (v2-header/non-v2-`_meta` or vice-versa) → fail closed.
-    Reject(i32, &'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -982,27 +999,161 @@ fn bounded_header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     raw.to_str().ok().map(str::to_string)
 }
 
-/// Classify one cell of the header/`_meta` matrix on an OPTED-IN server.
+// ---------------------------------------------------------------------------
+// The v2 `_meta` required-key + agreement rule (Phase 118.1 plan 06, CONF-06,
+// gaps G-6 and G-8).
+//
+// Every message below is a `&'static str` CONSTANT. None is ever assembled from
+// peer-supplied bytes (T-118.1-06-01): the only client-controlled value that
+// reaches the wire from this rule is `error.data.requested` on the accept-list
+// rejection, which the conformance suite REQUIRES to echo the requested version
+// and which is a plain string field, never interpolated into a message.
+// ---------------------------------------------------------------------------
+
+/// Rejection when a v2 request carries no `params._meta` object at all.
+const ERR_META_ABSENT: &str = "v2 requests must carry a params._meta object with \
+     io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities";
+
+/// Rejection when `params._meta` omits the reserved protocol-version key.
+const ERR_META_NO_PROTOCOL_VERSION: &str =
+    "params._meta is missing the required io.modelcontextprotocol/protocolVersion key";
+
+/// Rejection when `params._meta` omits the reserved client-capabilities key.
 ///
-/// `meta_is_v2` is Plan 04's resolved `ProtocolContext.era == Era::V2` — the
-/// authoritative per-request verdict this layer CONSUMES (Pitfall 2 / D-11).
-fn classify_era_cell(header: HeaderProtocolVersion, meta_is_v2: bool) -> V2Classification {
+/// `io.modelcontextprotocol/clientInfo` deliberately has NO counterpart: it is a
+/// SHOULD, and the conformance suite has a dedicated MUST-SERVE check
+/// (`RequestMetaClientInfoOptional`) for a request that omits it. Making the
+/// required-key rule symmetric over all three reserved keys turns that PASSING
+/// check red.
+const ERR_META_NO_CLIENT_CAPABILITIES: &str =
+    "params._meta is missing the required io.modelcontextprotocol/clientCapabilities key";
+
+/// Rejection when the header claims v2 and `_meta` names a different version.
+const ERR_HEADER_CLAIMS_V2: &str =
+    "MCP-Protocol-Version header claims v2 but _meta protocolVersion disagrees";
+
+/// Rejection when `_meta` claims v2 and the header does not.
+const ERR_META_CLAIMS_V2: &str =
+    "_meta claims v2 but MCP-Protocol-Version header is absent or not 2026-07-28";
+
+/// The `io.modelcontextprotocol/protocolVersion` STRING in a RAW `_meta` value.
+///
+/// `None` covers three distinct inputs on purpose, because they are separated by
+/// the two predicates below rather than here: no `_meta` at all, a `_meta` that
+/// is not an object, and a version that is not a string.
+fn raw_meta_protocol_version(meta: Option<&serde_json::Value>) -> Option<&str> {
+    meta?
+        .as_object()?
+        .get(crate::types::protocol::context::RESERVED_PROTOCOL_VERSION_KEY)?
+        .as_str()
+}
+
+/// Whether a RAW `_meta` value is an OBJECT that carries `key` at all.
+///
+/// Presence, not deserializability: an unusable VALUE at a present key is the
+/// shared resolver's `MalformedMeta` (already `INVALID_PARAMS`), while an ABSENT
+/// key is this layer's `MissingRequired`. Conflating them is the collapse G-6 is.
+fn raw_meta_object_has_key(meta: Option<&serde_json::Value>, key: &str) -> bool {
+    meta.and_then(serde_json::Value::as_object)
+        .is_some_and(|object| object.contains_key(key))
+}
+
+/// The THREE-WAY verdict over the header and the RAW `params._meta`.
+///
+/// Pure, total, and non-panicking over adversarial input — it reads only an
+/// already-decoded header classification and an already-parsed JSON value.
+///
+/// # The rule, in evaluation order
+///
+/// 1. **Neither side claims v2** → [`V2MetaVerdict::Defer`]. The v1 path and the
+///    accept-list path are both downstream, and this rule is V2-ONLY: the shared
+///    `resolve_protocol_context` serves BOTH eras and its absent-version arm IS
+///    the v1 fallback, so a required-key rule planted there would reject every v1
+///    request (T-118.1-06-03).
+/// 2. **`params._meta` absent entirely** → `MissingRequired`.
+/// 3. **`_meta` present but the protocol-version key absent** → `MissingRequired`.
+///    A `_meta` that is not an object, or a version that is not a string, is
+///    `Defer`red to the resolver's `MalformedMeta`, which already answers
+///    `INVALID_PARAMS`.
+/// 4. **The two sides name different versions** → `Disagreement`. This runs
+///    BEFORE the accept list, which is the whole of gap G-8: an unsupported
+///    version that DISAGREES with the header is a header/body disagreement
+///    (`-32020`), and only an unsupported version the header AGREES with is an
+///    accept-list rejection (`-32022`).
+/// 5. Otherwise → [`V2MetaVerdict::Enforce`].
+///
+/// `clientCapabilities` is deliberately NOT checked here — see
+/// [`require_v2_client_capabilities`] for where it lands and why.
+fn classify_v2_meta_version(
+    header: HeaderProtocolVersion,
+    raw_meta: Option<&serde_json::Value>,
+) -> V2MetaVerdict {
+    use crate::types::protocol::context::RESERVED_PROTOCOL_VERSION_KEY;
     let header_is_v2 = matches!(header, HeaderProtocolVersion::V2);
-    match (header_is_v2, meta_is_v2) {
-        (true, true) => V2Classification::Enforce,
-        (false, false) => V2Classification::Legacy,
-        // Both conflict cells are a HEADER/BODY DISAGREEMENT, which is exactly
-        // what the spec allocates `HEADER_MISMATCH` (-32020) for. Before Phase
-        // 113 these emitted the generic `INVALID_REQUEST` (-32600) because the
-        // v2 code did not exist yet.
-        (true, false) => V2Classification::Reject(
-            crate::types::protocol::error_codes::HEADER_MISMATCH,
-            "MCP-Protocol-Version header claims v2 but _meta protocolVersion disagrees",
-        ),
-        (false, true) => V2Classification::Reject(
-            crate::types::protocol::error_codes::HEADER_MISMATCH,
-            "_meta claims v2 but MCP-Protocol-Version header is absent or not 2026-07-28",
-        ),
+    let meta_version = raw_meta_protocol_version(raw_meta);
+    let meta_is_v2 = meta_version == Some(crate::types::protocol::PROTOCOL_VERSION_2026_07_28);
+
+    if !header_is_v2 && !meta_is_v2 {
+        return V2MetaVerdict::Defer;
+    }
+    if raw_meta.is_none() {
+        return V2MetaVerdict::MissingRequired(ERR_META_ABSENT);
+    }
+    let Some(version) = meta_version else {
+        return if raw_meta_object_has_key(raw_meta, RESERVED_PROTOCOL_VERSION_KEY) {
+            // Present but unusable — the resolver's MalformedMeta owns this.
+            V2MetaVerdict::Defer
+        } else if raw_meta.is_some_and(serde_json::Value::is_object) {
+            V2MetaVerdict::MissingRequired(ERR_META_NO_PROTOCOL_VERSION)
+        } else {
+            // A non-object `_meta` — likewise the resolver's MalformedMeta.
+            V2MetaVerdict::Defer
+        };
+    };
+    if !(header_is_v2 && version == crate::types::protocol::PROTOCOL_VERSION_2026_07_28) {
+        return V2MetaVerdict::Disagreement(if header_is_v2 {
+            ERR_HEADER_CLAIMS_V2
+        } else {
+            ERR_META_CLAIMS_V2
+        });
+    }
+    V2MetaVerdict::Enforce
+}
+
+/// Require `io.modelcontextprotocol/clientCapabilities` on an ACCEPTED v2
+/// request.
+///
+/// # Why this is a SEPARATE step, evaluated LATE
+///
+/// The two checks in [`classify_v2_meta_version`] are prerequisites for
+/// resolving the era at all: with no `protocolVersion` there is no era, and
+/// without an era "is this method retired on v2?" is not a well-formed question.
+/// `clientCapabilities` is different — it is a params requirement on a request
+/// whose era is already settled, so it must NOT preempt
+/// [`retire_v2_method`]. A method the 2026-07-28 schema REMOVED has no params
+/// contract to violate; answering `-32602 your params are wrong` for a method
+/// that does not exist would be both misleading and a regression against the
+/// conformance suite's five `HttpServerMethodNotFound404*` checks.
+///
+/// The status is NOT chosen here: `INVALID_PARAMS` reaches the wire through
+/// [`v2_status_for_code`], which maps it to `400`.
+fn require_v2_client_capabilities(
+    outcome: V2GateOutcome,
+    raw_meta: Option<&serde_json::Value>,
+) -> V2GateOutcome {
+    if !matches!(outcome, V2GateOutcome::EnforceOk { .. }) {
+        return outcome;
+    }
+    if raw_meta_object_has_key(
+        raw_meta,
+        crate::types::protocol::context::RESERVED_CLIENT_CAPABILITIES_KEY,
+    ) {
+        return outcome;
+    }
+    V2GateOutcome::Reject {
+        code: crate::types::protocol::error_codes::INVALID_PARAMS,
+        message: ERR_META_NO_CLIENT_CAPABILITIES.to_string(),
+        data: None,
     }
 }
 
@@ -1166,33 +1317,39 @@ fn cross_check_name(
 
 /// The thin top-level classifier over the full matrix (cog-safe composition).
 ///
-/// Inputs: decoded header signals + Plan-04 resolved `meta_is_v2` + the untrusted
-/// body `method`/`params.name`. Output: accept (with echo headers) | reject(code)
-/// | passthrough. Pure and non-panicking — property-tested.
+/// Inputs: the [`V2MetaVerdict`] already computed from the header and the RAW
+/// `params._meta` + the untrusted body `method`/`params.name`. Output: accept
+/// (with echo headers) | reject(code) | passthrough. Pure and non-panicking —
+/// property-tested.
+///
+/// The era verdict is a PARAMETER rather than something this function re-derives:
+/// [`run_v2_header_gate`] computes it once, before the accept list, and threads
+/// the same value here (D-11 / Pitfall 2 — one resolution per request).
 fn classify_v2_request(
     headers: &HeaderMap,
-    meta_is_v2: bool,
+    verdict: V2MetaVerdict,
     body_method: Option<&str>,
     body_name: Option<&str>,
 ) -> V2GateOutcome {
-    use crate::types::protocol::error_codes::HEADER_MISMATCH;
-    // Every rejection this classifier can produce is a missing-required-header
+    use crate::types::protocol::error_codes::{HEADER_MISMATCH, INVALID_PARAMS};
+    // Every rejection the ENFORCE arm can produce is a missing-required-header
     // or a header/body mismatch, so they all carry `HEADER_MISMATCH` and no
-    // structured `data`.
+    // structured `data`. The required-`_meta`-key rejections carry
+    // `INVALID_PARAMS` instead — that difference is gap G-6.
     let reject = |msg: &str| V2GateOutcome::Reject {
         code: HEADER_MISMATCH,
         message: msg.to_string(),
         data: None,
     };
-    let header = decode_version_header(headers);
-    match classify_era_cell(header, meta_is_v2) {
-        V2Classification::Legacy => V2GateOutcome::Passthrough,
-        V2Classification::Reject(code, msg) => V2GateOutcome::Reject {
-            code,
+    match verdict {
+        V2MetaVerdict::Defer => V2GateOutcome::Passthrough,
+        V2MetaVerdict::MissingRequired(msg) => V2GateOutcome::Reject {
+            code: INVALID_PARAMS,
             message: msg.to_string(),
             data: None,
         },
-        V2Classification::Enforce => {
+        V2MetaVerdict::Disagreement(msg) => reject(msg),
+        V2MetaVerdict::Enforce => {
             let (method, name) = match require_v2_headers(headers) {
                 Ok(pair) => pair,
                 Err(msg) => return reject(msg),
@@ -1635,6 +1792,27 @@ async fn run_v2_header_gate(
     // the server mutex would serialize every other request behind it.
     let body_json = raw_body_json(raw_body);
     let raw_meta = params_meta_of(body_json.as_ref());
+    // THE THREE-WAY `_meta` VERDICT (CONF-06 / gaps G-6 + G-8), computed from the
+    // RAW header and the RAW `_meta` — i.e. BEFORE the accept list below.
+    //
+    // ORDERING, which is the entire G-8 fix: a header/`_meta` DISAGREEMENT
+    // short-circuits HERE, ahead of `resolve_raw_meta_protocol_context`. Left
+    // where it used to sit — after the resolver — an unsupported version that
+    // ALSO disagreed with the header failed the accept list first and was
+    // reported as `-32022`, so the disagreement never got a chance to classify.
+    // The accept list still runs, and still answers `-32022`, for the case where
+    // the two sides AGREE on a version the server does not support.
+    let verdict = classify_v2_meta_version(decode_version_header(headers), raw_meta.as_ref());
+    if let V2MetaVerdict::Disagreement(message) = verdict {
+        return (
+            None,
+            V2GateOutcome::Reject {
+                code: crate::types::protocol::error_codes::HEADER_MISMATCH,
+                message: message.to_string(),
+                data: None,
+            },
+        );
+    }
     // The rejection is built INSIDE the lock scope so the accept-list is only
     // borrowed on the rare negotiation-failure branch. Cloning it into a `Vec`
     // on every request — under the server mutex — bought nothing: the happy path
@@ -1655,18 +1833,21 @@ async fn run_v2_header_gate(
         Err(reject) => return (None, reject),
     };
     // `Ok(None)` == not opted in → zero enforcement (D-04).
-    let Some(ref pc) = context else {
+    if context.is_none() {
         return (context.clone(), V2GateOutcome::Passthrough);
-    };
-    let meta_is_v2 = pc.era == crate::types::protocol::Era::V2;
+    }
     let (extracted_method, body_name) = method_and_name_of(body_json.as_ref());
     let body_method = body_method_override.or(extracted_method.as_deref());
-    let outcome = classify_v2_request(headers, meta_is_v2, body_method, body_name.as_deref());
+    let outcome = classify_v2_request(headers, verdict, body_method, body_name.as_deref());
     // v2 METHOD RETIREMENT (CONF-05 / G-5), keyed on the method STRING and
     // evaluated for every accepted v2 request — including the ones whose typed
     // parse would have succeeded and whose dispatch would therefore have SERVED
     // them. Runs after `classify_v2_request` on purpose; see `retire_v2_method`.
     let outcome = retire_v2_method(outcome);
+    // The required `clientCapabilities` key (CONF-06 / G-6), applied to a request
+    // that is still ACCEPTED after retirement. Deliberately after
+    // `retire_v2_method`; see `require_v2_client_capabilities`.
+    let outcome = require_v2_client_capabilities(outcome, raw_meta.as_ref());
     // MRTR params (HTTP-03): read on the ACCEPTED v2 path only, and only for an
     // MRTR-ELIGIBLE method; a present but unusable field becomes an
     // `INVALID_PARAMS` rejection here, BEFORE dispatch. `body_method` is the
@@ -4726,36 +4907,187 @@ mod tests {
         );
     }
 
+    /// A raw `params._meta` value carrying `version` (when `Some`) plus
+    /// `clientCapabilities`, for the verdict truth table below.
+    fn meta_value(version: Option<&str>) -> serde_json::Value {
+        use crate::types::protocol::context::{
+            RESERVED_CLIENT_CAPABILITIES_KEY, RESERVED_PROTOCOL_VERSION_KEY,
+        };
+        let mut meta = serde_json::Map::new();
+        if let Some(version) = version {
+            meta.insert(
+                RESERVED_PROTOCOL_VERSION_KEY.to_string(),
+                serde_json::json!(version),
+            );
+        }
+        meta.insert(
+            RESERVED_CLIENT_CAPABILITIES_KEY.to_string(),
+            serde_json::json!({}),
+        );
+        serde_json::Value::Object(meta)
+    }
+
+    /// The FULL truth table of the three-way `_meta` verdict, as literal rows.
+    ///
+    /// This replaced `classify_era_cell_covers_every_matrix_cell`, whose 2x2
+    /// shape could not express the row this table's second and third entries
+    /// pin: an ABSENT required key is `MissingRequired` (`-32602`), NOT the
+    /// `Disagreement` (`-32020`) the old matrix collapsed it into (gap G-6).
     #[test]
-    fn classify_era_cell_covers_every_matrix_cell() {
-        // v2/v2 → enforce
+    fn classify_v2_meta_version_covers_every_row() {
+        use HeaderProtocolVersion as H;
+        use V2MetaVerdict as V;
+        let unsupported = meta_value(Some("v999.0.0"));
+        let legacy = meta_value(Some("2025-11-25"));
+        let v2 = meta_value(Some(V2));
+        let no_version = meta_value(None);
+        let not_an_object = serde_json::json!("definitely not an object");
+        let bad_version = serde_json::json!({
+            crate::types::protocol::context::RESERVED_PROTOCOL_VERSION_KEY: 42,
+        });
+
+        // --- Defer: no v2 signal on either side. ---
+        assert_eq!(classify_v2_meta_version(H::Absent, None), V::Defer);
+        assert_eq!(classify_v2_meta_version(H::Other, None), V::Defer);
+        assert_eq!(classify_v2_meta_version(H::Other, Some(&legacy)), V::Defer);
+        assert_eq!(
+            classify_v2_meta_version(H::Other, Some(&unsupported)),
+            V::Defer,
+            "an unsupported version with NO v2 signal is the accept list's business"
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::Absent, Some(&no_version)),
+            V::Defer,
+            "a v1 request with a `_meta` and no protocolVersion is NOT this rule's business"
+        );
+
+        // --- MissingRequired: a v2 signal plus an ABSENT required key. ---
+        assert_eq!(
+            classify_v2_meta_version(H::V2, None),
+            V::MissingRequired(ERR_META_ABSENT)
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::V2, Some(&no_version)),
+            V::MissingRequired(ERR_META_NO_PROTOCOL_VERSION)
+        );
+
+        // --- Defer: a v2 signal plus an unusable `_meta` carrier. ---
+        assert_eq!(
+            classify_v2_meta_version(H::V2, Some(&not_an_object)),
+            V::Defer,
+            "a non-object `_meta` is the resolver's MalformedMeta, not a missing key"
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::V2, Some(&bad_version)),
+            V::Defer,
+            "a present-but-unusable version is MalformedMeta, not a missing key"
+        );
+
+        // --- Disagreement: both sides present, naming different versions. ---
+        assert_eq!(
+            classify_v2_meta_version(H::V2, Some(&unsupported)),
+            V::Disagreement(ERR_HEADER_CLAIMS_V2),
+            "G-8: a disagreement is classified BEFORE the accept list"
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::V2, Some(&legacy)),
+            V::Disagreement(ERR_HEADER_CLAIMS_V2)
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::Absent, Some(&v2)),
+            V::Disagreement(ERR_META_CLAIMS_V2)
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::Other, Some(&v2)),
+            V::Disagreement(ERR_META_CLAIMS_V2)
+        );
+        assert_eq!(
+            classify_v2_meta_version(H::Malformed, Some(&v2)),
+            V::Disagreement(ERR_META_CLAIMS_V2)
+        );
+
+        // --- Enforce: both sides agree on 2026-07-28. ---
+        assert_eq!(classify_v2_meta_version(H::V2, Some(&v2)), V::Enforce);
+    }
+
+    /// `clientCapabilities` is REQUIRED on an accepted v2 request, `clientInfo`
+    /// is NOT, and neither is judged on a request the gate did not accept.
+    #[test]
+    fn require_v2_client_capabilities_is_the_only_required_optional_key() {
+        use crate::types::protocol::context::{
+            RESERVED_CLIENT_CAPABILITIES_KEY, RESERVED_CLIENT_INFO_KEY,
+        };
+        use crate::types::protocol::error_codes::INVALID_PARAMS;
+
+        let with_caps = serde_json::json!({ RESERVED_CLIENT_CAPABILITIES_KEY: {} });
+        let info_only =
+            serde_json::json!({ RESERVED_CLIENT_INFO_KEY: { "name": "c", "version": "1" } });
+
         assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::V2, true),
-            V2Classification::Enforce
+            require_v2_client_capabilities(accepted_v2(), Some(&with_caps)),
+            V2GateOutcome::EnforceOk { .. }
         ));
-        // v1/v1 → legacy
+        // clientInfo present, capabilities absent → rejected. clientInfo being
+        // present is NOT a substitute: it is a SHOULD with its own MUST-SERVE
+        // conformance check.
+        let rejected = require_v2_client_capabilities(accepted_v2(), Some(&info_only));
+        let V2GateOutcome::Reject { code, message, .. } = rejected else {
+            panic!("a capabilities-less accepted v2 request must be rejected");
+        };
+        assert_eq!(code, INVALID_PARAMS);
+        assert_eq!(message, ERR_META_NO_CLIENT_CAPABILITIES);
+        let V2GateOutcome::Reject { code, data, .. } =
+            require_v2_client_capabilities(accepted_v2(), None)
+        else {
+            panic!("an accepted v2 request with NO `_meta` at all must be rejected");
+        };
+        assert_eq!(code, INVALID_PARAMS);
+        assert!(data.is_none(), "the required-key rejection carries no data");
+        // A request that was NOT accepted is left exactly as it was, so this
+        // step can never preempt method retirement or a header rejection.
         assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::Other, false),
-            V2Classification::Legacy
+            require_v2_client_capabilities(V2GateOutcome::Passthrough, None),
+            V2GateOutcome::Passthrough
         ));
+        let retired = V2GateOutcome::Reject {
+            code: crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+            message: "retired".to_string(),
+            data: None,
+        };
         assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::Absent, false),
-            V2Classification::Legacy
+            require_v2_client_capabilities(retired, None),
+            V2GateOutcome::Reject {
+                code: crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+                ..
+            }
         ));
-        // v2-header / non-v2-meta → reject
-        assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::V2, false),
-            V2Classification::Reject(HEADER_MISMATCH, _)
-        ));
-        // non-v2-header / v2-meta → reject
-        assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::Absent, true),
-            V2Classification::Reject(HEADER_MISMATCH, _)
-        ));
-        assert!(matches!(
-            classify_era_cell(HeaderProtocolVersion::Malformed, true),
-            V2Classification::Reject(HEADER_MISMATCH, _)
-        ));
+    }
+
+    /// Every rejection message this rule can emit is a `&'static str` CONSTANT,
+    /// so a rejection can never echo peer-supplied bytes (T-118.1-06-01).
+    #[test]
+    fn the_meta_rule_messages_are_constants_that_name_their_own_cause() {
+        for message in [
+            ERR_META_ABSENT,
+            ERR_META_NO_PROTOCOL_VERSION,
+            ERR_META_NO_CLIENT_CAPABILITIES,
+            ERR_HEADER_CLAIMS_V2,
+            ERR_META_CLAIMS_V2,
+        ] {
+            assert!(
+                !message.is_empty(),
+                "a rejection message must name its cause"
+            );
+        }
+        assert!(ERR_META_NO_PROTOCOL_VERSION
+            .contains(crate::types::protocol::context::RESERVED_PROTOCOL_VERSION_KEY));
+        assert!(ERR_META_NO_CLIENT_CAPABILITIES
+            .contains(crate::types::protocol::context::RESERVED_CLIENT_CAPABILITIES_KEY));
+        assert!(
+            !ERR_META_NO_CLIENT_CAPABILITIES
+                .contains(crate::types::protocol::context::RESERVED_CLIENT_INFO_KEY),
+            "clientInfo is a SHOULD and must not appear in a required-key message"
+        );
     }
 
     /// Every row of the [`require_v2_headers`] truth table, including the two
@@ -4865,7 +5197,12 @@ mod tests {
             (MCP_METHOD, "tools/call"),
             (MCP_NAME, "search"),
         ]);
-        let out = classify_v2_request(&h, true, Some("tools/call"), Some("search"));
+        let out = classify_v2_request(
+            &h,
+            V2MetaVerdict::Enforce,
+            Some("tools/call"),
+            Some("search"),
+        );
         assert!(matches!(out, V2GateOutcome::EnforceOk { .. }));
     }
 
@@ -4877,7 +5214,12 @@ mod tests {
             (MCP_NAME, "search"),
         ]);
         // body method disagrees with Mcp-Method (smuggling)
-        let out = classify_v2_request(&h, true, Some("resources/read"), Some("search"));
+        let out = classify_v2_request(
+            &h,
+            V2MetaVerdict::Enforce,
+            Some("resources/read"),
+            Some("search"),
+        );
         assert!(matches!(
             out,
             V2GateOutcome::Reject {
@@ -4905,7 +5247,7 @@ mod tests {
             (MCP_METHOD, "tools/list"),
             (MCP_NAME, ""),
         ]);
-        let out = classify_v2_request(&h, true, Some("tools/list"), None);
+        let out = classify_v2_request(&h, V2MetaVerdict::Enforce, Some("tools/list"), None);
         assert!(
             matches!(out, V2GateOutcome::EnforceOk { .. }),
             "an EMPTY Mcp-Name on a name-less v2 method must be ACCEPTED"
@@ -4918,7 +5260,7 @@ mod tests {
         // (the DRIFT-1 presence-on-every-request rule); D-13 reverses that,
         // because the official conformance suite sends exactly this shape.
         let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, "tools/list")]);
-        let out = classify_v2_request(&h, true, Some("tools/list"), None);
+        let out = classify_v2_request(&h, V2MetaVerdict::Enforce, Some("tools/list"), None);
         assert!(
             matches!(out, V2GateOutcome::EnforceOk { .. }),
             "an ABSENT Mcp-Name on a name-LESS method must be ACCEPTED (D-13)"
@@ -4942,7 +5284,7 @@ mod tests {
             (MCP_METHOD, "tools/call"),
             (MCP_NAME, &encoded),
         ]);
-        let out = classify_v2_request(&h, true, Some("tools/call"), Some(name));
+        let out = classify_v2_request(&h, V2MetaVerdict::Enforce, Some("tools/call"), Some(name));
         assert!(matches!(out, V2GateOutcome::EnforceOk { .. }));
     }
 
@@ -4959,7 +5301,12 @@ mod tests {
                 (MCP_METHOD, "tools/call"),
                 (MCP_NAME, bad),
             ]);
-            let out = classify_v2_request(&h, true, Some("tools/call"), Some("search"));
+            let out = classify_v2_request(
+                &h,
+                V2MetaVerdict::Enforce,
+                Some("tools/call"),
+                Some("search"),
+            );
             assert!(matches!(
                 out,
                 V2GateOutcome::Reject {
@@ -5250,7 +5597,7 @@ mod tests {
         // Non-name-bearing, NO Mcp-Name at all → accepted (THE D-13 CHANGE).
         for method in NAME_LESS_METHODS {
             let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
-            let out = classify_v2_request(&h, true, Some(method), None);
+            let out = classify_v2_request(&h, V2MetaVerdict::Enforce, Some(method), None);
             assert!(
                 matches!(out, V2GateOutcome::EnforceOk { .. }),
                 "{method} carries no routing name, so a missing Mcp-Name must be accepted"
@@ -5259,7 +5606,7 @@ mod tests {
         // Name-bearing (MRTR *and* tasks), NO Mcp-Name → rejected.
         for method in NAME_BEARING_METHODS {
             let h = headers_from(&[(MCP_PROTOCOL_VERSION, V2), (MCP_METHOD, method)]);
-            let out = classify_v2_request(&h, true, Some(method), Some("x"));
+            let out = classify_v2_request(&h, V2MetaVerdict::Enforce, Some(method), Some("x"));
             assert!(
                 matches!(out, V2GateOutcome::Reject { .. }),
                 "{method} carries a routing name, so a missing Mcp-Name must be rejected"
@@ -5273,7 +5620,12 @@ mod tests {
             (MCP_NAME, "task-a"),
         ]);
         assert!(matches!(
-            classify_v2_request(&h, true, Some("tasks/get"), Some("task-b")),
+            classify_v2_request(
+                &h,
+                V2MetaVerdict::Enforce,
+                Some("tasks/get"),
+                Some("task-b")
+            ),
             V2GateOutcome::Reject { .. }
         ));
         // A tasks method whose Mcp-Name AGREES with params.taskId passes.
@@ -5283,7 +5635,12 @@ mod tests {
             (MCP_NAME, "task-a"),
         ]);
         assert!(matches!(
-            classify_v2_request(&h, true, Some("tasks/get"), Some("task-a")),
+            classify_v2_request(
+                &h,
+                V2MetaVerdict::Enforce,
+                Some("tasks/get"),
+                Some("task-a")
+            ),
             V2GateOutcome::EnforceOk { .. }
         ));
         // A stray Mcp-Name on a name-less method is accepted AND discarded, so it
@@ -5293,7 +5650,7 @@ mod tests {
             (MCP_METHOD, "tools/list"),
             (MCP_NAME, "attacker-supplied"),
         ]);
-        match classify_v2_request(&h, true, Some("tools/list"), None) {
+        match classify_v2_request(&h, V2MetaVerdict::Enforce, Some("tools/list"), None) {
             V2GateOutcome::EnforceOk { method, name } => {
                 assert_eq!(method, "tools/list");
                 assert_eq!(name, "", "a stray Mcp-Name must be sanitized to empty");
@@ -5314,13 +5671,24 @@ mod tests {
         assert_eq!(h.get(MCP_PROTOCOL_VERSION).unwrap(), V2);
     }
 
+    /// One [`V2MetaVerdict`] per index, so a proptest can range over the whole
+    /// three-way verdict rather than the old boolean `meta_is_v2`.
+    fn verdict_case(kind: u8) -> V2MetaVerdict {
+        match kind {
+            0 => V2MetaVerdict::Defer,
+            1 => V2MetaVerdict::MissingRequired(ERR_META_ABSENT),
+            2 => V2MetaVerdict::Disagreement(ERR_HEADER_CLAIMS_V2),
+            _ => V2MetaVerdict::Enforce,
+        }
+    }
+
     proptest::proptest! {
         /// The classifier NEVER panics over arbitrary header bytes + signal
         /// combinations, and holds the accept/reject invariants (T-112-13).
         #[test]
         fn v2_header_gate_proptest(
             header_kind in 0u8..4,
-            meta_is_v2 in proptest::bool::ANY,
+            verdict_kind in 0u8..4,
             have_method in proptest::bool::ANY,
             have_name in proptest::bool::ANY,
             method_val in "[a-z/]{0,20}",
@@ -5349,20 +5717,21 @@ mod tests {
                 }
             }
 
-            // Must not panic.
-            let out = classify_v2_request(&h, meta_is_v2, body_method.as_deref(), body_name.as_deref());
+            let verdict = verdict_case(verdict_kind);
 
-            let header_is_v2 = decode_version_header(&h) == HeaderProtocolVersion::V2;
+            // Must not panic.
+            let out = classify_v2_request(&h, verdict, body_method.as_deref(), body_name.as_deref());
+
             match out {
                 V2GateOutcome::Passthrough => {
-                    // Only when neither signal is v2.
-                    proptest::prop_assert!(!header_is_v2 && !meta_is_v2);
+                    // Only when the `_meta` verdict deferred.
+                    proptest::prop_assert_eq!(verdict, V2MetaVerdict::Defer);
                 },
                 V2GateOutcome::EnforceOk { ref name, .. } => {
-                    // Only when BOTH signals are v2, `Mcp-Method` is present, and
+                    // Only when the verdict ENFORCES, `Mcp-Method` is present, and
                     // `Mcp-Name` is present OR the method carries no routing name
                     // (Phase 118 D-13, widened by D-18).
-                    proptest::prop_assert!(header_is_v2 && meta_is_v2);
+                    proptest::prop_assert_eq!(verdict, V2MetaVerdict::Enforce);
                     proptest::prop_assert!(have_method);
                     proptest::prop_assert!(have_name || !is_name_bearing_method(&method_val));
                     // A name is carried ONLY for a name-bearing method (D-20).
@@ -5371,7 +5740,17 @@ mod tests {
                     }
                 },
                 V2GateOutcome::Reject { code, .. } => {
-                    proptest::prop_assert_eq!(code, HEADER_MISMATCH);
+                    // A required-`_meta`-key rejection is INVALID_PARAMS; every
+                    // other rejection this classifier can produce is a header
+                    // violation or a header/body disagreement.
+                    if matches!(verdict, V2MetaVerdict::MissingRequired(_)) {
+                        proptest::prop_assert_eq!(
+                            code,
+                            crate::types::protocol::error_codes::INVALID_PARAMS
+                        );
+                    } else {
+                        proptest::prop_assert_eq!(code, HEADER_MISMATCH);
+                    }
                 },
             }
         }
@@ -5466,7 +5845,6 @@ mod tests {
             method_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
             name_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..40),
             body_bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..120),
-            meta_is_v2 in proptest::bool::ANY,
         ) {
             let mut h = HeaderMap::new();
             for (header_name, raw) in [
@@ -5489,16 +5867,29 @@ mod tests {
 
             // The raw-body reader is on the same unauthenticated path.
             let (body_method, body_name) = extract_body_method_and_name(&body_bytes);
+            // ...and so is the three-way `_meta` verdict: it reads the SAME raw
+            // body, so arbitrary bytes must reach it too and must not panic.
+            let raw_meta = raw_params_meta(&body_bytes);
+            let verdict = classify_v2_meta_version(decode_version_header(&h), raw_meta.as_ref());
             let out = classify_v2_request(
                 &h,
-                meta_is_v2,
+                verdict,
                 body_method.as_deref(),
                 body_name.as_deref(),
             );
-            // Every rejection is a structured outcome, never an unwind.
+            // Every rejection is a structured outcome, never an unwind. The
+            // required-key arm is INVALID_PARAMS; everything else is a header
+            // violation or a header/body disagreement.
             if let V2GateOutcome::Reject { code, .. } = out {
-                proptest::prop_assert_eq!(code, HEADER_MISMATCH);
+                let expected = if matches!(verdict, V2MetaVerdict::MissingRequired(_)) {
+                    crate::types::protocol::error_codes::INVALID_PARAMS
+                } else {
+                    HEADER_MISMATCH
+                };
+                proptest::prop_assert_eq!(code, expected);
             }
+            // The capabilities step never panics on adversarial `_meta` either.
+            let _ = require_v2_client_capabilities(out, raw_meta.as_ref());
         }
     }
 
@@ -5610,12 +6001,21 @@ mod tests {
     }
 
     /// A JSON-RPC body for `method` carrying a v2 `params._meta` under `key`.
+    ///
+    /// `io.modelcontextprotocol/clientCapabilities` is present because since
+    /// Phase 118.1 plan 06 it is a REQUIRED key on every accepted v2 request
+    /// (CONF-06 / gap G-6); a body without it is now a `-32602`, which would make
+    /// every `EnforceOk` assertion below fail for a reason unrelated to its
+    /// subject.
     fn v2_body_bytes(method: &str, key: &str) -> Vec<u8> {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
-            "params": { key: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+            "params": { key: {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            } },
         })
         .to_string()
         .into_bytes()

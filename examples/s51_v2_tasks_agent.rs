@@ -584,8 +584,15 @@ async fn server_answer_code(
     transport.set_negotiated_protocol_version(Some(PROTOCOL_VERSION_2026_07_28.to_string()));
 
     let mut params = params;
+    // BOTH reserved keys: since Phase 118.1 (gap G-6) a v2 request whose
+    // `_meta` omits `io.modelcontextprotocol/clientCapabilities` is refused with
+    // `-32602` before dispatch, which would mask the `-32601` this probe exists
+    // to observe. `clientInfo` stays out — it is a SHOULD.
     params["_meta"] = json!({
         pmcp::testing::META_PROTOCOL_VERSION: PROTOCOL_VERSION_2026_07_28,
+        pmcp::testing::META_CLIENT_CAPABILITIES: {
+            "elicitation": {}, "sampling": {}, "roots": {},
+        },
     });
     let frame = json!({
         "jsonrpc": "2.0",

@@ -75,3 +75,32 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   (`:96`). It is not a compiled target, so it cannot break a build, but it is a stale copy of a
   file this plan rewrote and will mislead the next reader. Deleting it is out of scope here.
   Owner: whoever next touches the transport benches.
+
+## From plan 118.1-06 (the G-6/G-8 `_meta` validation fix)
+
+- **`crates/mcp-tester/tests/dual_run.rs` carries three tripwires that plan 118.1-05 tripped and
+  did not flip.** Measured here on a full `cargo nextest run --workspace --exclude pmcp`:
+  `the_server_still_answers_initialize_on_the_v2_wire`, `a_v2_run_establishes_without_initialize_and_c01_asserts_it`
+  and `dual_run_against_a_dual_era_server_classifies_against_the_baseline` all FAIL. Their own
+  panic messages say what happened, verbatim: *"FINDING RESOLVED? The server now refuses a
+  well-formed `initialize` on the 2026-07-28 wire, so ERA-01 reproduces server-side. Update this
+  test, C-01's expected status, and note it in the baseline. Observed: RawProbeOutcome
+  { http_status: 404, session_header: None, result: None, error_code: Some(-32601) }"*.
+  **This is plan 05's `initialize` retirement, not plan 06's `_meta` rule**: the observed code is
+  `-32601` (retirement), never `-32602`/`-32020` (the only two codes plan 06 can newly produce),
+  and `mcp-tester`'s own `build_probe_body` (`crates/mcp-tester/src/tester.rs:3792-3799`) already
+  emits all three reserved `_meta` keys, so plan 06's required-key rule accepts its probes
+  unchanged. Plan 05's verification ran `--features full --lib --tests` plus
+  `-p pmcp-team-servers`, and never ran `-p mcp-tester`, which is why it was not observed there.
+  `crates/mcp-tester/baselines/era-deltas.yaml` ERA-01 already declares v1 `served` / v2 `absent` /
+  `method-removed`, so the BASELINE is right and the three tripwires are the stale half.
+  Owner: plan 118.1-12 (the G-5 disposition) or the orchestrator at merge, alongside the
+  `examples/s54_v2_dual_conformance.rs` module prose that plan 05 flagged for the same reason.
+
+- **`pmcp-macros::expansion_snapshots` (3 tests), `pmcp-workbook-server` (6 tests) and
+  `mcp-e2e-tests::{chess,dataviz,map}` (11 tests) fail on the same workspace run and are
+  unrelated to this phase.** The macro failures are `insta` snapshot mismatches, the
+  workbook failures are *"the matching-id server registers the workbook tools"* (tool
+  registration, no HTTP involved), and the e2e failures need a browser harness. None of the
+  three subsystems reaches the v2 HTTP header gate. Not touched. Owner: whoever next owns
+  those crates.
