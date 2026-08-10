@@ -921,9 +921,9 @@ checkboxes a verifier can fail on.
 
 ### Conformance (CONF)
 
-- [ ] **CONF-01**: The official `@modelcontextprotocol/conformance` suite (pinned to a commit, re-pinned after the final spec) runs in CI against a dual-version pmcp server example over real HTTP
-- [ ] **CONF-02**: The Phase-109 Rust conformance harness gains v2 fixtures while v1 fixtures stay green (dual conformance, verified with a dev-dependency-free build to avoid feature-unification false-greens)
-- [ ] **CONF-03**: Deprecated Roots/Sampling/Logging capabilities remain fully functional under v2 negotiation (advisory-only deprecation, 12-month window)
+- [x] **CONF-01**: The official `@modelcontextprotocol/conformance` suite (pinned to a commit, re-pinned after the final spec) runs in CI against a dual-version pmcp server example over real HTTP
+- [x] **CONF-02**: The Phase-109 Rust conformance harness gains v2 fixtures while v1 fixtures stay green (dual conformance, verified with a dev-dependency-free build to avoid feature-unification false-greens)
+- [x] **CONF-03**: Deprecated Roots/Sampling/Logging capabilities remain fully functional under v2 negotiation (advisory-only deprecation, 12-month window)
 
 ### Docs in Three Shapes (DOCS — continues v2.4 numbering)
 
@@ -1036,9 +1036,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLNT-04 | Phase 117 | Complete |
 | SMPL-01 | Phase 117 | Complete |
 | SMPL-02 | Phase 117 | Complete |
-| CONF-01 | Phase 118 | Pending |
-| CONF-02 | Phase 118 | Pending |
-| CONF-03 | Phase 118 | Pending |
+| CONF-01 | Phase 118 | Complete |
+| CONF-02 | Phase 118 | Complete |
+| CONF-03 | Phase 118 | Complete |
 | DOCS-04 | Phase 119 | Pending |
 | DOCS-05 | Phase 119 | Pending |
 | DOCS-06 | Phase 119 | Pending |
