@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use pmcp::types::protocol::error_codes::{HEADER_MISMATCH, UNSUPPORTED_PROTOCOL_VERSION};
+use pmcp::types::protocol::error_codes::{
+    HEADER_MISMATCH, INVALID_PARAMS, UNSUPPORTED_PROTOCOL_VERSION,
+};
 
 use pmcp::server::auth::{AuthContext, AuthProvider};
 use pmcp::server::http_middleware::{
@@ -145,16 +147,38 @@ fn build_server(opt_in_v2: bool) -> Server {
         .expect("server builds")
 }
 
+/// The reserved `_meta` object a v2 request in this file carries.
+///
+/// # `clientCapabilities` is MANDATORY since Phase 118.1 plan 06
+///
+/// This file's four body builders used to emit `_meta` carrying ONLY
+/// `io.modelcontextprotocol/protocolVersion`. Gap G-6 made
+/// `io.modelcontextprotocol/clientCapabilities` a REQUIRED key on every accepted
+/// v2 request (the conformance suite's `RequestMetaInvalid`
+/// missing-client-capabilities check, rpcId 104), so a body without it is now a
+/// `-32602` and every acceptance assertion in this file would fail for a reason
+/// unrelated to its subject. Built through ONE helper so the four builders
+/// cannot drift apart again.
+///
+/// `io.modelcontextprotocol/clientInfo` is deliberately ABSENT: it is a SHOULD,
+/// with its own MUST-SERVE conformance check (rpcId 105), so leaving it out here
+/// keeps this file exercising that optionality on every request.
+fn v2_reserved_meta(meta_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": meta_version,
+        "io.modelcontextprotocol/clientCapabilities": {
+            "elicitation": {}, "sampling": {}, "roots": {},
+        },
+    })
+}
+
 /// A `server/discover` request body. `meta_version` (when `Some`) carries the
 /// reserved protocol-version key in `params._meta` so the raw-_meta gate resolves
 /// the era from the authoritative `_meta` signal.
 fn discover_body(meta_version: Option<&str>) -> String {
     let mut params = serde_json::Map::new();
     if let Some(v) = meta_version {
-        params.insert(
-            "_meta".to_string(),
-            serde_json::json!({ "io.modelcontextprotocol/protocolVersion": v }),
-        );
+        params.insert("_meta".to_string(), v2_reserved_meta(v));
     }
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -295,6 +319,21 @@ async fn post(addr: SocketAddr, extra: &[(&str, &str)], body: &str) -> Resp {
     }
 }
 
+/// The typed sibling of [`v2_reserved_meta`], for the three builders that go
+/// through pmcp's OWN `RequestMeta` serialization.
+///
+/// Derived FROM `v2_reserved_meta` rather than restating its keys, so the raw
+/// `server/discover` builder and the three typed builders cannot disagree about
+/// which reserved keys a v2 request carries.
+fn v2_request_meta(meta_version: &str) -> RequestMeta {
+    let reserved = v2_reserved_meta(meta_version);
+    let mut meta = RequestMeta::new();
+    for (key, value) in reserved.as_object().expect("reserved _meta is an object") {
+        meta = meta.with_meta(key, value.clone());
+    }
+    meta
+}
+
 /// A raw `tools/call` body. `meta_version` (when `Some`) is carried in
 /// `params._meta` under the reserved protocol-version key so the SHARED Plan-04
 /// resolver classifies the era from `_meta` (the authoritative signal).
@@ -306,10 +345,7 @@ async fn post(addr: SocketAddr, extra: &[(&str, &str)], body: &str) -> Resp {
 fn call_body(tool: &str, meta_version: Option<&str>) -> String {
     let mut req = CallToolRequest::new(tool, serde_json::json!({}));
     if let Some(v) = meta_version {
-        req._meta = Some(RequestMeta::new().with_meta(
-            "io.modelcontextprotocol/protocolVersion",
-            serde_json::json!(v),
-        ));
+        req._meta = Some(v2_request_meta(v));
     }
     let params = serde_json::to_value(&req).expect("params serialize");
     serde_json::json!({
@@ -331,10 +367,7 @@ fn prompt_body(name: &str, meta_version: Option<&str>) -> String {
         _meta: None,
     };
     if let Some(v) = meta_version {
-        req._meta = Some(RequestMeta::new().with_meta(
-            "io.modelcontextprotocol/protocolVersion",
-            serde_json::json!(v),
-        ));
+        req._meta = Some(v2_request_meta(v));
     }
     let params = serde_json::to_value(&req).expect("params serialize");
     serde_json::json!({
@@ -355,10 +388,7 @@ fn resource_body(uri: &str, meta_version: Option<&str>) -> String {
         _meta: None,
     };
     if let Some(v) = meta_version {
-        req._meta = Some(RequestMeta::new().with_meta(
-            "io.modelcontextprotocol/protocolVersion",
-            serde_json::json!(v),
-        ));
+        req._meta = Some(v2_request_meta(v));
     }
     let params = serde_json::to_value(&req).expect("params serialize");
     serde_json::json!({
@@ -408,10 +438,19 @@ async fn v2_required_headers_accepts_well_formed_v2_and_echoes_headers() {
 }
 
 // ---------------------------------------------------------------------------
-// Matrix cell: v2 header but non-v2 _meta (absent) → REJECT (fail closed).
+// Matrix cell: v2 header but ABSENT `params._meta` → REJECT (fail closed).
+//
+// The CODE changed in Phase 118.1 plan 06 (gap G-6) and the assertion below was
+// updated with it. It used to read `HEADER_MISMATCH`, because the 2x2 era
+// classifier could only say "the two sides disagree" — an ABSENT `_meta` and a
+// `_meta` naming a DIFFERENT version landed in the same cell. The spec, and the
+// official conformance suite's `RequestMetaInvalid` missing-meta check (rpcId
+// 101), require `-32602` here: a required parameter is missing, which is not the
+// same defect as a header/body disagreement. `-32020` is still what a genuine
+// disagreement answers — see `v2_required_headers_rejects_v2_meta_without_version_header`.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn v2_required_headers_rejects_v2_header_with_non_v2_meta() {
+async fn v2_required_headers_rejects_v2_header_with_absent_meta() {
     let (addr, handle) = spawn(true).await;
     let r = post(
         addr,
@@ -420,15 +459,15 @@ async fn v2_required_headers_rejects_v2_header_with_non_v2_meta() {
             ("mcp-method", "tools/call"),
             ("mcp-name", "search"),
         ],
-        &call_body("search", None), // no v2 _meta → era resolves v1
+        &call_body("search", None), // no `params._meta` at all
     )
     .await;
     shutdown(handle).await;
 
-    assert_eq!(r.status, 400, "header/_meta disagreement must fail closed");
+    assert_eq!(r.status, 400, "an absent required _meta must fail closed");
     assert_eq!(
-        r.body["error"]["code"], HEADER_MISMATCH,
-        "a missing required header or a header/body disagreement is HEADER_MISMATCH"
+        r.body["error"]["code"], INVALID_PARAMS,
+        "an ABSENT required _meta key is INVALID_PARAMS, not HEADER_MISMATCH (G-6)"
     );
 }
 
@@ -738,7 +777,7 @@ async fn v2_resources_read_accepts_and_envelopes() {
 // REJECTED (the fail-closed cell) — the fix did not loosen the gate.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn v2_prompts_get_rejects_v2_header_with_non_v2_meta() {
+async fn v2_prompts_get_rejects_v2_header_with_absent_meta() {
     let (addr, handle) = spawn(true).await;
     let r = post(
         addr,
@@ -747,18 +786,18 @@ async fn v2_prompts_get_rejects_v2_header_with_non_v2_meta() {
             ("mcp-method", "prompts/get"),
             ("mcp-name", "greeting"),
         ],
-        &prompt_body("greeting", None), // no v2 _meta → era resolves v1
+        &prompt_body("greeting", None), // no `params._meta` at all
     )
     .await;
     shutdown(handle).await;
 
     assert_eq!(
         r.status, 400,
-        "v2-header prompts/get with non-v2 _meta must fail closed"
+        "v2-header prompts/get with an absent _meta must fail closed"
     );
     assert_eq!(
-        r.body["error"]["code"], HEADER_MISMATCH,
-        "a missing required header or a header/body disagreement is HEADER_MISMATCH"
+        r.body["error"]["code"], INVALID_PARAMS,
+        "an ABSENT required _meta key is INVALID_PARAMS, not HEADER_MISMATCH (G-6)"
     );
 }
 
@@ -931,15 +970,15 @@ async fn server_discover_rejects_v2_meta_without_header() {
 
 // v2 version header but NO v2 _meta → REJECT (fail closed).
 #[tokio::test]
-async fn server_discover_rejects_header_without_v2_meta() {
+async fn server_discover_rejects_header_without_meta() {
     let (addr, handle) = spawn(true).await;
     let r = post(addr, &discover_v2_headers(), &discover_body(None)).await;
     shutdown(handle).await;
 
-    assert_eq!(r.status, 400, "v2 header with no v2 _meta must reject");
+    assert_eq!(r.status, 400, "v2 header with no _meta must reject");
     assert_eq!(
-        r.body["error"]["code"], HEADER_MISMATCH,
-        "a missing required header or a header/body disagreement is HEADER_MISMATCH"
+        r.body["error"]["code"], INVALID_PARAMS,
+        "an ABSENT required _meta key is INVALID_PARAMS, not HEADER_MISMATCH (G-6)"
     );
 }
 
