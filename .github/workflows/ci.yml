@@ -526,11 +526,239 @@ jobs:
     - name: Build for wasm32 (make wasm-build)
       run: make wasm-build
 
+  # Phase 118 (CONF-01 / D-21) official MCP conformance suite gate.
+  #
+  # Runs `@modelcontextprotocol/conformance` — the OFFICIAL, external referee —
+  # against ONE pmcp server process at BOTH spec revisions, and blocks merge on
+  # what genuinely holds. This job is wired into the `gate` aggregate below in
+  # all FOUR required places (`needs:`, the `env:` binding, the `if` chain and
+  # the failure echo), so a broken conformance surface is a red required check
+  # rather than a green-looking advisory one. It must never be made advisory.
+  #
+  # WHAT THIS GATE CLAIMS, stated up front so the CI log cannot be misread.
+  # Neither requirement set exits 0 today. Measured on this pin:
+  #     --requirements 2025-11-25   ->   51 passed, 15 failed, exit 1
+  #     --requirements 2026-07-28   ->  124 passed,  54 failed, exit 1
+  # Nine structural SDK gaps (G-1..G-9) explain those failures and are recorded,
+  # with source citations, in
+  # `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
+  # The answer to that measurement is NOT an allowlist (fence 5). The gate is
+  # SCOPED to surfaces that genuinely pass — the MRTR surface plus the executed
+  # check floors — and the script PRINTS the declared non-conformance on every
+  # run, so the claim this repo makes is exactly the claim it can defend.
+  #
+  # THE FENCES, numbered, each naming the false green it closes:
+  #
+  #  1. `actions/setup-node@v4` with `node-version: 22` — the FIRST `setup-node`
+  #     in this repository, so there is no house style to inherit. The suite
+  #     imports `globSync` from `node:fs` at MODULE SCOPE (Node >= 22) and the
+  #     published package declares NO `engines` of its own, so a Node-20 runner
+  #     would sail through a naive install and then die at load with
+  #     `SyntaxError: The requested module 'fs' does not provide an export named
+  #     'globSync'` — several minutes in, from a stack trace naming neither Node
+  #     nor this repo. `conformance/.npmrc` sets `engine-strict=true`, which
+  #     makes the INSTALL itself fail on Node 20 (measured: `EBADENGINE`, exit 1,
+  #     no `node_modules`). Pinning the runner's Node is the FIRST line of
+  #     defence and the `.npmrc` is the SECOND; neither replaces the other,
+  #     because a runner can arrive with a pre-populated `node_modules` tree.
+  #
+  #  2. `cache: 'npm'` keyed on `conformance/package-lock.json` — the lockfile is
+  #     COMMITTED and exact, so the cache key is exact too. This removes a
+  #     per-run network fetch and the flake that comes with it. It does NOT
+  #     weaken the pin: `npm ci` still validates every integrity hash in the
+  #     lockfile, and because the key IS the lockfile a cache hit can never
+  #     serve a different dependency tree than the one committed.
+  #
+  #  3. `npm ci --ignore-scripts`, which lives INSIDE the script and not inline
+  #     here. The committed lockfile is authoritative — `npm install` resolves at
+  #     run time and can silently move the referee. `--ignore-scripts` is
+  #     load-bearing because npm runs lifecycle scripts for the WHOLE dependency
+  #     tree, not just the package named, so confirming the direct package's
+  #     `postinstall` is empty is necessary and nowhere near sufficient.
+  #
+  #  4. THE COMMANDS LIVE IN `scripts/run-conformance-suite.sh`, NOT INLINE, so
+  #     `tests/ci_conformance_gate_wiring.rs` can pin them AS DATA — the vacuity
+  #     guards, the zero-check gate and the two check floors included. None of
+  #     those can live inside a `#![cfg]`-selected test file: a test in a
+  #     conditionally-compiled file can never police whether that file was
+  #     compiled.
+  #
+  #  5. `--requirements`, never `--spec-version`, and NO `--expected-failures`.
+  #     D-03 admits no known-fail allowlist in any shape, and D-21 makes that
+  #     prohibition doubly binding now that the failures are known and named.
+  #     D-14 fixes the gate's boundary at the suite's SCORED set. If a future
+  #     edit finds itself writing a list of tolerated failures, that is the
+  #     forbidden shape — close the SDK gap or narrow the surface instead.
+  #
+  #  6. ONE server process for BOTH runs (D-06), started from the BUILT BINARY
+  #     and torn down by process GROUP. Two processes would prove "pmcp can serve
+  #     v1" and "pmcp can serve v2" as separate facts; the milestone headline is
+  #     that ONE binary does both, and only one process can demonstrate that (or
+  #     expose cross-era state bleed). `cargo run` is a PARENT process, so
+  #     trapping its pid can orphan the real server holding the port.
+  #
+  #  7. `if: always()` on the artifact upload — NOT `if: failure()`, which is the
+  #     shape `.github/workflows/fuzz.yml` uses and the WRONG one to copy here.
+  #     D-14 needs the not-scored `extension`/`pending` results reviewable on
+  #     GREEN runs, which is precisely when a failure-conditioned upload skips.
+  #     Those results are the input to the next re-pin decision.
+  #
+  #  8. `timeout-minutes: 75`, which is DELIBERATELY ABOVE the script's own
+  #     `TOTAL_BUDGET_SECONDS=3600` (60 minutes). The script's budget is the
+  #     DIAGNOSIS — it is checked at six named checkpoints and fails naming the
+  #     step that hung; this job-level value is only the BACKSTOP for a hang the
+  #     script's own checkpoints cannot reach. Setting the job timeout BELOW the
+  #     script budget would invert that: the platform would cancel the job first
+  #     and replace an actionable message with an opaque cancellation. Note that
+  #     `v1-severance` above carries NO `timeout-minutes` at all — that is the
+  #     template this job otherwise follows, and this divergence is deliberate,
+  #     not an oversight: `v1-severance` runs a bounded build, while this job
+  #     installs from a network registry and drives a live server over a port.
+  #
+  #  9. THIS JOB IS IN `gate.needs` AND THEREFORE BLOCKS MERGE. Measured
+  #     precedent for why that must be checked rather than assumed: on PR #319
+  #     `security_audit` and `workspace-test` were both RED while `gate` was
+  #     GREEN, because neither is listed in `gate.needs`. Adding a job to this
+  #     file does NOT make it block. Never move this job out of `gate.needs`,
+  #     and never mark it advisory — no error-tolerating step attribute and no
+  #     status-masking shell suffix. Those two spellings are deliberately not
+  #     written out here: `ci.yml` is grepped for them literally, and prose
+  #     forbidding a token must not be what makes that grep fire.
+  conformance-suite:
+    name: Official MCP Conformance Suite (CONF-01)
+    runs-on: ubuntu-latest
+    # Fence 8: above the script's own 3600 s budget, so the script's diagnosis
+    # wins the race and this is only the backstop.
+    timeout-minutes: 75
+    env:
+      # A fixed NON-PRODUCTION value. The target example reads this variable for
+      # PRESENCE only (examples/s54_v2_dual_conformance.rs:1403) to mint MRTR
+      # `requestState` tokens that live for the duration of one CI run against a
+      # loopback server. It protects nothing outside this job, it is not a
+      # credential for any system, and it must never be reused anywhere real.
+      # The value is never echoed and never placed on a command line.
+      PMCP_REQUEST_STATE_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    steps:
+    - uses: actions/checkout@v7
+
+    # Fences 1 and 2.
+    - name: Install Node 22 (suite requires >= 22; see fence 1)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        cache-dependency-path: 'conformance/package-lock.json'
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-conformance-
+
+    # Fences 3-6 all live inside the script, as DATA the wiring test pins.
+    - name: Run the official conformance suite at both revisions (CONF-01)
+      run: ./scripts/run-conformance-suite.sh
+
+    # Fence 7: `always()`, so the not-scored results stay reviewable on GREEN
+    # runs — which is exactly when `if: failure()` would skip.
+    - name: Upload conformance results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: conformance-results-${{ github.run_id }}-${{ github.run_attempt }}
+        path: target/conformance-results/
+
+  # Phase 118 (CONF-02 / CONF-03) era-comparison matrix gate.
+  #
+  # Wired into the `gate` aggregate below in all FOUR required places, exactly as
+  # `conformance-suite` above.
+  #
+  # THE FENCES, numbered:
+  #
+  #  1. WHY THIS JOB EXISTS AT ALL: **no CI job runs
+  #     `crates/pmcp-team-servers/tests/` today.** Measured, not assumed — three
+  #     independent paths all miss it. `ci.yml`'s `test` job is scoped to the
+  #     root `pmcp` package; `org-gate-checks.yml`'s `workspace-test` runs
+  #     `--lib --bins`, which EXCLUDES `tests/`, and is itself absent from
+  #     `gate.needs`; and `make quality-gate` never reaches that crate. The
+  #     Phase-109 team-servers harness, the 33-case v1 fixture corpus, the era
+  #     matrix and the baseline schema gate therefore execute only when a human
+  #     types the command. Adding an era matrix to a harness nothing executes
+  #     gates nothing — that is RESEARCH Pitfall 4, and the same shape Phase 117
+  #     found for the severance proofs.
+  #
+  #  2. WHY THIS IS NOT WIRED BY WIDENING `workspace-test`: that job's absence
+  #     from `gate.needs` is an explicitly DEFERRED item with its own scope, and
+  #     D-15 keeps it deferred by giving CONF-02 a gate it OWNS. Promoting
+  #     `workspace-test` here would silently pull an unrelated, unreviewed job
+  #     into the required check.
+  #
+  #  3. THE DEV-DEPENDENCY-FREE BUILD FENCES AND THE NONZERO-TEST-COUNT GUARDS
+  #     LIVE IN THE SCRIPT, outside the compilation unit. A `cfg!`-based guard
+  #     written INSIDE a `#![cfg]`-selected file expands to `!false` — it cannot
+  #     fail on any input, and on the build where it would be false the file does
+  #     not compile, so the test does not exist to run. A test inside a
+  #     conditionally-compiled file can never police whether that file was
+  #     compiled, so the guard has to live outside it, which is the script.
+  #
+  #  4. `era_matrix` and `era_baseline` need `--features http`, which is NOT in
+  #     this crate's default set. Omitting it is SILENT, not loud — measured:
+  #         cargo test -p pmcp-team-servers --test era_matrix
+  #             -> running 0 tests   ... exit 0
+  #         cargo test -p pmcp-team-servers --features http --test era_matrix
+  #             -> running 4 tests   ... exit 0
+  #     The zero-count guard in the script is the only thing that catches it, and
+  #     `MATRIX_TESTS` carries each target's flags AS DATA rather than leaving
+  #     them to a caller's memory.
+  #
+  #  5. `timeout-minutes: 45`. Same PURPOSE as `conformance-suite` fence 8 — turn
+  #     a hang into a bounded failure — but with an honest difference that must
+  #     not be papered over: `scripts/run-era-matrix.sh` declares NO internal
+  #     wall-clock budget of its own, so unlike the conformance job there is no
+  #     script diagnosis for this value to sit above. Here the job timeout is the
+  #     SOLE backstop. 45 minutes is well above the observed cost (two full
+  #     `cargo build` fences over the team-servers tree plus three test targets),
+  #     so it fires only on a genuine hang. If a script-level budget is ever
+  #     added, raise this value above it so the script's diagnosis wins.
+  era-matrix:
+    name: Era Matrix (CONF-02 / CONF-03)
+    runs-on: ubuntu-latest
+    # Fence 5: the SOLE backstop — this script declares no budget of its own.
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ runner.os }}-cargo-era-matrix-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-era-matrix-
+
+    # Fences 3 and 4 live inside the script, as DATA the wiring test pins.
+    - name: Run the era matrix on a dev-dependency-free build (CONF-02 / CONF-03)
+      run: ./scripts/run-era-matrix.sh
+
   # Unified gate — single required check for org ruleset.
   # Reports as "gate" to match the org ruleset's required status check.
   gate:
     runs-on: ubuntu-latest
-    needs: [test, quality-gate, purity-check, pmcp-agent-targets, wasm32-purity, v1-severance]
+    needs: [test, quality-gate, purity-check, pmcp-agent-targets, wasm32-purity, v1-severance, conformance-suite, era-matrix]
     if: always()
     steps:
       - name: Evaluate required checks
@@ -541,14 +769,18 @@ jobs:
           AGENT_TARGETS_RESULT: ${{ needs.pmcp-agent-targets.result }}
           WASM32_RESULT: ${{ needs.wasm32-purity.result }}
           SEVERANCE_RESULT: ${{ needs.v1-severance.result }}
+          CONFORMANCE_RESULT: ${{ needs.conformance-suite.result }}
+          ERA_MATRIX_RESULT: ${{ needs.era-matrix.result }}
         run: |
           if [[ "$TEST_RESULT" != "success" ]] || \
              [[ "$QG_RESULT" != "success" ]] || \
              [[ "$PURITY_RESULT" != "success" ]] || \
              [[ "$AGENT_TARGETS_RESULT" != "success" ]] || \
              [[ "$WASM32_RESULT" != "success" ]] || \
-             [[ "$SEVERANCE_RESULT" != "success" ]]; then
-            echo "Required checks failed: test=$TEST_RESULT, quality-gate=$QG_RESULT, purity-check=$PURITY_RESULT, pmcp-agent-targets=$AGENT_TARGETS_RESULT, wasm32-purity=$WASM32_RESULT, v1-severance=$SEVERANCE_RESULT"
+             [[ "$SEVERANCE_RESULT" != "success" ]] || \
+             [[ "$CONFORMANCE_RESULT" != "success" ]] || \
+             [[ "$ERA_MATRIX_RESULT" != "success" ]]; then
+            echo "Required checks failed: test=$TEST_RESULT, quality-gate=$QG_RESULT, purity-check=$PURITY_RESULT, pmcp-agent-targets=$AGENT_TARGETS_RESULT, wasm32-purity=$WASM32_RESULT, v1-severance=$SEVERANCE_RESULT, conformance-suite=$CONFORMANCE_RESULT, era-matrix=$ERA_MATRIX_RESULT"
             exit 1
           fi
           echo "All required checks passed."

@@ -81,14 +81,26 @@ const NON_BLOCKING_JOB: &str = "feature-flags";
 /// make `the_feature_flags_job_is_still_not_in_gate_needs` pass for the wrong
 /// reason. If this fires, FIX THE READER or restore the workflow — never lower the
 /// floor.
-const MINIMUM_GATE_NEEDS: usize = 6;
+///
+/// Raised from 6 to 8 by Phase 118, which added the `conformance-suite` and
+/// `era-matrix` jobs and wired both into `gate.needs`. Their own structural proof
+/// lives in `tests/ci_conformance_gate_wiring.rs`; this floor is what stops either
+/// of them being quietly un-wired again without some test noticing.
+const MINIMUM_GATE_NEEDS: usize = 8;
 
 /// Minimum number of jobs the workflow must declare.
 ///
 /// Non-vacuity floor, same contract as [`MINIMUM_GATE_NEEDS`]: a parse that
 /// produced an empty job map would make every lookup below fail for a reason
 /// unrelated to the wiring. Fix the reader, never lower the floor.
-const MINIMUM_JOBS: usize = 8;
+///
+/// Raised from 8 to 12 by Phase 118. The old value was ALREADY SLACK — the
+/// workflow declared 10 jobs against a floor of 8 — and a floor that is slack
+/// cannot notice a deletion, which is the only thing a floor is for. It is now
+/// set to the ACTUAL job count (the previous 10 plus `conformance-suite` and
+/// `era-matrix`), so removing any job fails here until someone deliberately
+/// re-states the count in the same commit.
+const MINIMUM_JOBS: usize = 12;
 
 /// The script the `v1-severance` job must invoke to RUN the severance proofs.
 ///
