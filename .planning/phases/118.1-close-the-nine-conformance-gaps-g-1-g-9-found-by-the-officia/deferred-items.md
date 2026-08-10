@@ -54,3 +54,24 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   `protocol_parsing jsonrpc_handling transport_layer auth_flows` literally, so the 20-plus targets
   added since — including this plan's — are never fuzzed by CI at all. Again convenient here and
   a real coverage gap in general. Owner: same as above.
+
+## From plan 118.1-03 (the G-1/G-2 emitter fix)
+
+- **`examples/26-server-tester` does not build, and did not build before this plan.** Measured at
+  the plan's base commit `2ab06a44` in a detached worktree: **10 errors**, in four classes —
+  2x `E0027` (`Content::Resource` patterns not mentioning `meta`), 1x `E0432` + 1x `E0433`
+  (`pmcp::client::auth` is behind the `http-client` feature and the crate's `Cargo.toml:17` asks
+  only for `streamable-http`), 3x `E0599` (`reqwest::ClientBuilder::tls_danger_accept_invalid_certs`
+  no longer exists in reqwest 0.13), and 3x `E0639` (`ClientCapabilities` and `CallToolResult` are
+  `#[non_exhaustive]` and are still built with struct literals). This plan fixed the two `E0027`s
+  (they are `Content::Resource` patterns, so they are in scope) and the two `E0004`s those had been
+  masking, taking the crate from 10 errors to **8**. The remaining 8 are all pre-existing and
+  belong to three unrelated subsystems. The crate is workspace-EXCLUDED (`Cargo.toml:784`), so
+  neither `cargo build --workspace` nor `make lint` has ever gated it. Owner: whoever next owns
+  the standalone example crates; the reqwest and feature-flag halves are independent of MCP
+  conformance work.
+
+- **`benches/transport_performance.rs.bak` still carries a `Content::Resource` struct literal**
+  (`:96`). It is not a compiled target, so it cannot break a build, but it is a stale copy of a
+  file this plan rewrote and will mislead the next reader. Deleting it is out of scope here.
+  Owner: whoever next touches the transport benches.

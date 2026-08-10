@@ -1666,10 +1666,13 @@ impl ServerTester {
                                     println!("      MIME type: {}", mime_type);
                                     println!("      Data size: {} bytes (base64)", data.len());
                                 },
+                                // `..` because `Content::Resource` is
+                                // `#[non_exhaustive]` as of pmcp 2.19.0.
                                 pmcp::types::Content::Resource {
                                     uri,
                                     text,
                                     mime_type,
+                                    ..
                                 } => {
                                     println!("      Content type: Resource Reference");
                                     println!("      URI: {}", uri);
@@ -1684,6 +1687,18 @@ impl ServerTester {
                                         };
                                         println!("      Text: {}", preview);
                                     }
+                                },
+                                // Pre-existing gap, surfaced once the `..` fix
+                                // above cleared the E0027 that masked it:
+                                // `Audio` and `ResourceLink` have existed since
+                                // MCP 2025-11-25 and were never handled here.
+                                pmcp::types::Content::Audio { mime_type, .. } => {
+                                    println!("      Content type: Audio");
+                                    println!("      MIME type: {}", mime_type);
+                                },
+                                pmcp::types::Content::ResourceLink(link) => {
+                                    println!("      Content type: Resource Link");
+                                    println!("      URI: {}", link.uri);
                                 },
                             }
                         }
@@ -1733,10 +1748,13 @@ impl ServerTester {
                                     ));
                                 }
                             },
+                            // `..` because `Content::Resource` is
+                            // `#[non_exhaustive]` as of pmcp 2.19.0.
                             pmcp::types::Content::Resource {
                                 uri,
                                 text: _,
                                 mime_type,
+                                ..
                             } => {
                                 if uri.is_empty() {
                                     warnings.push(format!(
@@ -1754,6 +1772,16 @@ impl ServerTester {
                                             resource.name, list_mime, content_mime
                                         ));
                                     }
+                                }
+                            },
+                            // Same pre-existing gap as the display match above.
+                            pmcp::types::Content::Audio { .. } => {},
+                            pmcp::types::Content::ResourceLink(link) => {
+                                if link.uri.is_empty() {
+                                    warnings.push(format!(
+                                        "Resource '{}' link has empty URI",
+                                        resource.name
+                                    ));
                                 }
                             },
                         }

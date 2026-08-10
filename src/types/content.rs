@@ -640,6 +640,44 @@ impl Content {
         self
     }
 
+    /// Attach a `_meta` map.
+    ///
+    /// `_meta` is emitted at CONTENT level (`EmbeddedResource._meta`,
+    /// `schema.ts:1743`), which is where the MCP Apps widget path reads it. In
+    /// the flat `ReadResourceResult.contents` projection the same field is
+    /// emitted as `ResourceContents._meta` (`schema.ts:1527`).
+    ///
+    /// Required, not convenient: `Content::Resource` is `#[non_exhaustive]` as of
+    /// 2.19.0, so a downstream crate — including every `cargo pmcp new
+    /// --kind mcp-app` scaffold — has no other way to set this field.
+    ///
+    /// Applies to the three arms pmcp models with a `_meta` field — `Resource`,
+    /// `Audio` and `ResourceLink`. `Text` and `Image` carry no such field today
+    /// and are returned unchanged.
+    ///
+    /// ```rust
+    /// use pmcp::types::Content;
+    ///
+    /// let mut meta = serde_json::Map::new();
+    /// meta.insert("widgetDescription".into(), "A chess board".into());
+    ///
+    /// let c = Content::resource_with_text("ui://chess/board", "<html/>", "text/html")
+    ///     .with_meta(meta);
+    /// let json = serde_json::to_value(&c).unwrap();
+    /// assert_eq!(json["_meta"]["widgetDescription"], "A chess board");
+    /// ```
+    #[must_use]
+    pub fn with_meta(mut self, meta: serde_json::Map<String, Value>) -> Self {
+        match &mut self {
+            Self::Resource { meta: slot, .. } | Self::Audio { meta: slot, .. } => {
+                *slot = Some(meta);
+            },
+            Self::ResourceLink(link) => link.meta = Some(meta),
+            Self::Text { .. } | Self::Image { .. } => {},
+        }
+        self
+    }
+
     /// Create audio content from base64-encoded data.
     ///
     /// ```rust

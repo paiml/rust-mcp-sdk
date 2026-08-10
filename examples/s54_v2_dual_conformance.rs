@@ -84,8 +84,8 @@
 //!
 //! | Scored scenario | Gap | What `src/` does |
 //! |---|---|---|
-//! | `tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource` | G-1 | `Content::Resource` serialises FLAT; the spec's `EmbeddedResource` nests under `resource` |
-//! | `resources-read-binary` | G-2 | no blob-bearing resource-contents variant exists |
+//! | ~~`tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource`~~ | G-1 | CLOSED in 118.1-03: `Content::Resource` now emits the spec's `EmbeddedResource`, nested under `resource` |
+//! | ~~`resources-read-binary`~~ | G-2 | CLOSED in 118.1-03: `Content::resource_with_blob` plus `blob` in the flat `ReadResourceResult.contents` projection |
 //! | `tools-call-with-progress` | G-3 | `notification_tx` is set only in `Server::run()`, which `StreamableHttpServer` never calls |
 //! | `completion-complete` | G-4 | `completion/complete` is a catch-all arm returning `{}` |
 //! | `server-stateless` (`HttpServerMethodNotFound404ping`) | G-5 | `ping` is served under v2 instead of being retired — and see the sharper finding below |
@@ -324,21 +324,33 @@ impl ResourceHandler for ConformanceResources {
                 "This is the content of the static text resource.",
                 "text/plain",
             )],
-            // NOTE: the suite requires `{uri, mimeType, blob}` here. pmcp's
-            // `Content` enum has no blob-bearing resource variant, so this arm
-            // cannot express the required shape — see the SDK-gap note in this
-            // plan's SUMMARY. The closest expressible value is emitted so the
-            // resource still exists and still reads.
-            "test://static-binary" => vec![Content::image(TINY_PNG_BASE64, "image/png")],
+            // The suite's `resources-read-binary` requires `{uri, mimeType, blob}`
+            // here. G-2 closed in 118.1-03: `Content::resource_with_blob` is the
+            // `BlobResourceContents` arm (schema.ts:1548) and the flat
+            // `ReadResourceResult.contents` projection now emits its `blob`.
+            "test://static-binary" => vec![Content::resource_with_blob(
+                uri,
+                TINY_PNG_BASE64,
+                "image/png",
+            )],
             "test://example-resource" => vec![Content::resource_with_text(
                 uri,
                 "This is an example resource for testing.",
                 "text/plain",
             )],
+            // Carries content-level `annotations` so the D-06 placement — a
+            // SIBLING of `resource`, never inside it (schema.ts:1741) — is
+            // exercised end to end by a live server rather than only by a unit
+            // test. This is the one URI in this example that carries them.
             "test://embedded-resource" => vec![Content::resource_with_text(
                 uri,
                 "This is an embedded resource content.",
                 "text/plain",
+            )
+            .with_annotations(
+                pmcp::types::content::Annotations::new()
+                    .with_audience(vec!["user".to_string()])
+                    .with_priority(0.5),
             )],
             "test://mixed-content-resource" => vec![Content::resource_with_text(
                 uri,

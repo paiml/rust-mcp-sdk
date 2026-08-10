@@ -103,6 +103,8 @@ prop_compose! {
 prop_compose! {
     fn arb_content()(
         choice in 0..3,
+        binary in prop::bool::ANY,
+        blob in prop::sample::select(vec!["", "AAA=", "iVBORw0KGgo="]),
         text in ".*",
         data in prop::collection::vec(0u8..255, 0..100),
         mime_type in prop::sample::select(vec![
@@ -119,12 +121,13 @@ prop_compose! {
                 data: String::from_utf8(data).unwrap_or_else(|_| "invalid_data".to_string()),
                 mime_type: mime_type.to_string(),
             },
-            _ => Content::Resource {
-                uri,
-                text: if text.is_empty() { None } else { Some(text) },
-                mime_type: if choice % 2 == 0 { Some(mime_type.to_string()) } else { None },
-                meta: None,
-            },
+            // `Content::Resource` is `#[non_exhaustive]` as of pmcp 2.19.0, so an
+            // external crate builds it through the constructors. Both arms of the
+            // spec payload union `TextResourceContents | BlobResourceContents`
+            // (schema.ts:1734-1748) are generated, which is also what makes the
+            // round-trip property cover G-2's `blob`.
+            _ if binary => Content::resource_with_blob(uri, blob, mime_type),
+            _ => Content::resource_with_text(uri, text, mime_type),
         }
     }
 }

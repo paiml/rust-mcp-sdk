@@ -90,12 +90,11 @@ fn bench_message_sizes(c: &mut Criterion) {
         mime_type: "image/png".to_string(),
     };
 
-    let resource_content = Content::Resource {
-        uri: "file://large-document.pdf".to_string(),
-        text: Some("This is a large document with extensive content...".repeat(100)),
-        mime_type: Some("application/pdf".to_string()),
-        meta: None,
-    };
+    let resource_content = Content::resource_with_text(
+        "file://large-document.pdf",
+        "This is a large document with extensive content...".repeat(100),
+        "application/pdf",
+    );
 
     let contents = vec![
         ("text_1kb", text_content),
