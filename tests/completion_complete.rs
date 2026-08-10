@@ -61,13 +61,20 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use common::v2::{header, post, spawn_default_config, teardown, v1_body};
+use common::v2::{header, post, spawn_default_config, teardown, v1_body, v2_body, v2_headers_for};
 use pmcp::server::builder::ServerCoreBuilder;
 use pmcp::server::core::ProtocolHandler;
 use pmcp::shared::http_constants::MCP_SESSION_ID;
-use pmcp::types::completable::StaticCompletionProvider;
+use pmcp::types::completable::{
+    CompletionItem, CompletionProviderTrait, CompletionRequest, CompletionResponse,
+    StaticCompletionProvider,
+};
 use pmcp::types::jsonrpc::ResponsePayload;
 use pmcp::types::protocol::{
     CompleteRequest, CompletionArgument, CompletionReference, InitializeRequest,
@@ -75,6 +82,8 @@ use pmcp::types::protocol::{
 };
 use pmcp::types::{ClientCapabilities, ClientRequest, JSONRPCResponse, Request, RequestId};
 use pmcp::{Implementation, Server};
+use proptest::prelude::*;
+use proptest::test_runner::Config as ProptestConfig;
 use serde_json::{json, Value};
 
 // ===========================================================================
@@ -411,4 +420,339 @@ async fn server_core_returns_the_values_of_a_provider_registered_through_core_bu
          `ServerCore` dispatcher. An empty array here means the slot exists but is wired \
          to nothing. Result was: {result}"
     );
+}
+
+// ===========================================================================
+// PROPERTY: the `@maxItems 100` bound holds over provider outputs of any size.
+//
+// Driven through the REAL `ServerCore` dispatcher rather than the internal
+// helper, because the bound is only load-bearing if the dispatcher is the thing
+// that applies it. A property over the helper alone would still pass if a
+// future dispatch arm bypassed it.
+// ===========================================================================
+
+/// A provider returning exactly `count` synthetic values, unconditionally.
+///
+/// Deliberately NOT [`StaticCompletionProvider`]: that one prefix-filters, so a
+/// property over "provider output length" would really be a property over the
+/// filter. This one ignores `partial` entirely, which makes `count` the single
+/// independent variable.
+struct CountingProvider {
+    count: usize,
+}
+
+#[async_trait::async_trait]
+impl CompletionProviderTrait for CountingProvider {
+    async fn complete(&self, _request: CompletionRequest) -> pmcp::Result<CompletionResponse> {
+        Ok(CompletionResponse {
+            completions: (0..self.count)
+                .map(|index| CompletionItem {
+                    value: format!("candidate-{index}"),
+                    label: None,
+                    description: None,
+                    icon: None,
+                    metadata: HashMap::new(),
+                })
+                .collect(),
+            has_more: false,
+            continuation_token: None,
+        })
+    }
+}
+
+/// The spec's bound, restated from the schema rather than imported from the
+/// crate.
+///
+/// `MAX_COMPLETION_VALUES` is `pub(crate)`, so this file could not import it
+/// even if that were desirable — and it is not: a fence that reads the same
+/// constant the implementation reads cannot catch a wrong constant. Source:
+/// `schema/vendored/core-2026-07-28/schema.ts:2649`, `@maxItems 100`.
+const SPEC_MAX_VALUES: usize = 100;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// For ANY provider output length, the emitted answer is a well-formed
+    /// `CompleteResult` that never exceeds the spec bound and whose `hasMore`
+    /// agrees with whether anything was dropped.
+    #[test]
+    fn emitted_values_never_exceed_the_spec_bound(count in 0usize..250) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime builds");
+
+        runtime.block_on(async move {
+            let core = ServerCoreBuilder::new()
+                .name("completion-complete-property")
+                .version("1.0.0")
+                .completions(CountingProvider { count })
+                .build()
+                .expect("core builds");
+
+            let response = core_complete_with(&core, EMPTY_PARTIAL).await;
+            let result = result_of(&response, "property: any provider output length");
+            let values = values_of(&result, "property: any provider output length");
+
+            prop_assert!(
+                values.len() <= SPEC_MAX_VALUES,
+                "a provider returning {count} values must be truncated to at most \
+                 {SPEC_MAX_VALUES} (schema.ts:2649 @maxItems 100). Got {}: {result}",
+                values.len()
+            );
+            prop_assert_eq!(
+                values.len(),
+                count.min(SPEC_MAX_VALUES),
+                "truncation must keep as many values as the bound allows, not fewer: {}",
+                result
+            );
+
+            let truncated = count > SPEC_MAX_VALUES;
+            prop_assert_eq!(
+                result["completion"]["hasMore"].as_bool(),
+                Some(truncated),
+                "hasMore must be true EXACTLY when elements were dropped, so a truncated \
+                 list is never readable as exhaustive: {}",
+                result
+            );
+            prop_assert_eq!(
+                result["completion"]["total"].as_u64(),
+                Some(count as u64),
+                "this provider reports has_more = false, so it returned everything it had \
+                 and `total` is the TRUE total including the dropped elements: {}",
+                result
+            );
+            Ok(())
+        })?;
+    }
+}
+
+// ===========================================================================
+// EXAMPLE leg — the dual-conformance example is RUN, not merely built.
+//
+// CLAUDE.md's ALWAYS requirements demand a working example per feature, and
+// `make test-examples` only BUILDS examples (`Makefile:254-258` says so in its
+// own banner). So "the example demonstrates the closed gap" was, until this
+// leg, an unenforced SUMMARY claim. A compiled example that never answers a
+// request cannot distinguish a closed gap from a fix written into a handler
+// that is never reached.
+//
+// This leg spawns the ALREADY-BUILT binary, drives a real `completion/complete`
+// against it on BOTH eras through the `common::v2` handshake helpers, and
+// records both answers as an artifact. It FAILS rather than skipping when the
+// binary is absent: a skip would restore exactly the unenforced criterion it
+// exists to close.
+//
+// The request is framed through `tests/common/v2.rs`, NOT a hand-rolled curl.
+// The v2 era signal is three headers (`Mcp-Method`, `Mcp-Name`,
+// `MCP-Protocol-Version`) plus a reserved `params._meta`, and a shell probe
+// gets that contract wrong in ways that produce a red saying nothing about the
+// gap under test.
+// ===========================================================================
+
+/// The example's compiled path, relative to the target directory.
+const EXAMPLE_REL_PATH: &str = "debug/examples/s54_v2_dual_conformance";
+
+/// Port 8153, deliberately.
+///
+/// 8147 is `s47_v2_stateless_mrtr`, 8149 is this example's own default, 8150 is
+/// `s50`/`s51`, 8151 belongs to `scripts/run-conformance-suite.sh`, 8155 is the
+/// fallback hint in the example's own bind-failure message, and 8157 is held by
+/// `tests/embedded_resource_example_run.rs` (plan 03), which runs CONCURRENTLY
+/// with this file under nextest. 8080/8081 belong to
+/// `scripts/test_examples_with_tester.sh`.
+const BIND_ADDR: &str = "127.0.0.1:8153";
+
+/// Where the recorded answers land, for the SUMMARY to quote verbatim.
+const ARTIFACT_REL_PATH: &str = "118.1-04-example-response.json";
+
+/// How long the child gets to bind its socket before the leg gives up.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the port gets to become free again after the child is killed.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The target directory, honouring `CARGO_TARGET_DIR` when it is set.
+fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        PathBuf::from,
+    )
+}
+
+/// A spawned child that is killed and reaped on EVERY exit path, panic included.
+///
+/// `Drop` rather than a trailing `kill()` call because the assertions below can
+/// unwind: a teardown that only runs on the happy path leaves a stale listener
+/// holding 8153 and turns the next run's failure into a mystery. This mirrors
+/// the `trap`-based cleanup in `scripts/run-conformance-suite.sh`.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn take_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.as_mut().and_then(|child| child.try_wait().ok())?
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Poll a TCP connect until the child's socket answers, or fail loudly.
+///
+/// A poll rather than a sleep: a fixed sleep either wastes wall clock or races
+/// the bind, and a race here would report "connection refused" for a gap that
+/// is actually closed.
+async fn wait_until_listening(addr: SocketAddr, guard: &mut ChildGuard) {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = guard.take_status() {
+            panic!(
+                "the example exited before binding {addr} (status {status}). The most likely \
+                 cause is that {addr} is already held — check with \
+                 `lsof -nP -iTCP:{} -sTCP:LISTEN`.",
+                addr.port()
+            );
+        }
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the example never accepted a connection on {addr} within {READY_TIMEOUT:?}");
+}
+
+/// Prove the port really came back, so a "teardown" that did not tear down is a
+/// failure here rather than a mystery in the next run.
+async fn wait_until_released(addr: SocketAddr) {
+    let deadline = Instant::now() + RELEASE_TIMEOUT;
+    while Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{addr} still accepts connections {RELEASE_TIMEOUT:?} after the child was killed: the \
+         teardown did not tear down, and the next run would talk to a stale listener"
+    );
+}
+
+/// Assert one era's answer carries the spec `CompleteResult` shape with at least
+/// one candidate — the example registers a real provider, so an empty array here
+/// would mean the seam was never reached.
+fn assert_example_answer(era: &str, response: &common::v2::Resp) {
+    assert_eq!(
+        response.status, 200,
+        "{era}: the example must serve {METHOD}, got HTTP {}: {}",
+        response.status, response.raw
+    );
+    let values = values_of(&response.body["result"], era);
+    assert!(
+        !values.is_empty(),
+        "{era}: the example registers a completion provider whose values are prefixed \
+         `test`, and the suite's partial is `test`, so at least one candidate must come \
+         back. An empty array means the registered provider was not reached. Raw \
+         response was: {}",
+        response.raw
+    );
+    for value in &values {
+        assert!(
+            value.starts_with(SUITE_ARG_VALUE),
+            "{era}: `{value}` does not start with the requested partial `{SUITE_ARG_VALUE}`, \
+             so the provider was not consulted with the request's argument value: {}",
+            response.raw
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_dual_conformance_example_serves_completion_complete_on_both_eras() {
+    let binary = target_dir().join(EXAMPLE_REL_PATH);
+    assert!(
+        binary.is_file(),
+        "{} is missing. This leg FAILS rather than skipping, by design: a skip would \
+         restore the unenforced 'the example demonstrates the fix' criterion it exists \
+         to close. Build it first with \
+         `cargo build --features full --example s54_v2_dual_conformance`.",
+        binary.display()
+    );
+
+    let addr: SocketAddr = BIND_ADDR
+        .parse()
+        .expect("BIND_ADDR is a literal socket addr");
+
+    let child = Command::new(&binary)
+        .arg(BIND_ADDR)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("could not spawn {}: {error}", binary.display()));
+    let mut guard = ChildGuard(Some(child));
+
+    wait_until_listening(addr, &mut guard).await;
+
+    // BOTH legs run before EITHER is asserted: an assertion on the v1 leg would
+    // panic before the v2 leg executed, leaving the v2 half of the claim with
+    // zero executed evidence. The artifact is written first for the same reason.
+    let params = suite_params();
+    let session = v1_open_session(addr).await;
+    let v1 = post(
+        addr,
+        &[header(MCP_SESSION_ID, &session)],
+        &v1_body(METHOD, json!(1), params.clone()),
+    )
+    .await;
+    let v2 = post(
+        addr,
+        &v2_headers_for(METHOD, &params),
+        &v2_body(METHOD, json!(2), params.clone()),
+    )
+    .await;
+
+    // The artifact carries the PARSED body as well as the raw text: the raw
+    // text alone is JSON-escaped inside this file, so a `"completion"` key would
+    // not appear as `"completion"` to a reader (or a grep) of the artifact.
+    let artifact = json!({
+        "note": format!(
+            "Live `{METHOD}` on {SUITE_PROMPT} (argument {SUITE_ARG_NAME} = \
+             \"{SUITE_ARG_VALUE}\"), served by target/{EXAMPLE_REL_PATH} bound to \
+             {BIND_ADDR}. Phase 118.1-04, G-4 / CONF-05."
+        ),
+        "request": params,
+        "v1": { "raw": v1.raw, "body": v1.body },
+        "v2": { "raw": v2.raw, "body": v2.body },
+    });
+    let artifact_path = target_dir().join(ARTIFACT_REL_PATH);
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).expect("the artifact always serializes"),
+    )
+    .unwrap_or_else(|error| panic!("could not write {}: {error}", artifact_path.display()));
+
+    assert_example_answer("v1 (2025-11-25)", &v1);
+    assert_example_answer("v2 (2026-07-28)", &v2);
+
+    // The v2 leg must genuinely have been served as v2, or "both eras" is a
+    // claim about a request that was silently downgraded. `resultType` is
+    // Phase 112's v2-only result-envelope key.
+    assert!(
+        v2.raw.contains("resultType"),
+        "the v2 leg carries no v2 result-envelope key, so it was not served as v2: {}",
+        v2.raw
+    );
+    assert!(
+        !v1.raw.contains("resultType"),
+        "the v1 leg carries a v2 result-envelope key, so the per-request era gate was \
+         bypassed: {}",
+        v1.raw
+    );
+
+    drop(guard);
+    wait_until_released(addr).await;
 }

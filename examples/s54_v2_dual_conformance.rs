@@ -87,7 +87,7 @@
 //! | ~~`tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource`~~ | G-1 | CLOSED in 118.1-03: `Content::Resource` now emits the spec's `EmbeddedResource`, nested under `resource` |
 //! | ~~`resources-read-binary`~~ | G-2 | CLOSED in 118.1-03: `Content::resource_with_blob` plus `blob` in the flat `ReadResourceResult.contents` projection |
 //! | `tools-call-with-progress` | G-3 | `notification_tx` is set only in `Server::run()`, which `StreamableHttpServer` never calls |
-//! | `completion-complete` | G-4 | `completion/complete` is a catch-all arm returning `{}` |
+//! | ~~`completion-complete`~~ | G-4 | CLOSED in 118.1-04: `completion/complete` has its own registration slot on BOTH builder families and answers the spec `CompleteResult` shape; this example registers a provider (see `completion_provider`) |
 //! | `server-stateless` (`HttpServerMethodNotFound404ping`) | G-5 | `ping` is served under v2 instead of being retired — and see the sharper finding below |
 //! | `server-stateless` (`ServerImplementsDiscover`, `ServerUnsupportedVersionError`) | G-7 (new) | `server/discover` emits `protocolVersion`, never the `supportedVersions` array the spec mandates — `grep -rn supportedVersions src/` finds nothing |
 //! | `server-stateless` (3x `RequestMetaInvalid`, `HttpServerMetaInvalid400`) | G-6 (new) | a missing / malformed `_meta` answers `-32020`, not the `-32602` + HTTP 400 the spec requires; a missing `clientCapabilities` is not rejected at all |
@@ -139,6 +139,7 @@ use pmcp::types::capabilities::{
     ClientCapabilities, CompletionCapabilities, LoggingCapabilities, PromptCapabilities,
     ResourceCapabilities, ServerCapabilities, ToolCapabilities,
 };
+use pmcp::types::completable::StaticCompletionProvider;
 use pmcp::types::elicitation::ElicitRequestParams;
 use pmcp::types::mrtr::{InputRequest, InputRequests, InputResponse, MrtrSignal};
 use pmcp::types::protocol::{
@@ -1427,7 +1428,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
             ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
         ])
-        .resources(ConformanceResources);
+        .resources(ConformanceResources)
+        // G-4 (CONF-05, closed in 118.1-04). The suite's `completion-complete`
+        // scenario calls `completion/complete` against
+        // `test_prompt_with_arguments` with `argument.value = "test"`, so the
+        // provider's values START with `test` — `StaticCompletionProvider`
+        // filters by prefix, and a provider whose values could not match would
+        // exercise the seam without demonstrating it.
+        .completions(completion_provider());
 
     for name in PROMPT_NAMES {
         builder = builder.prompt(name, ConformancePrompt { name });
@@ -1480,6 +1488,22 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 /// scenario reports an error that looks like a transport fault. `logging`
 /// backs `logging-set-level`, `completions` backs `completion/complete`, and
 /// `resources.subscribe` backs `resources-subscribe` / `resources-unsubscribe`.
+/// The minimal `completion/complete` provider this target registers (G-4).
+///
+/// Values are fixed and prefixed `test` so they survive
+/// [`StaticCompletionProvider`]'s prefix filter against the suite's
+/// `argument.value = "test"`. The suite's own source comments that "completion
+/// support can be minimal or return empty arrays", so a fixed array is exactly
+/// what the referee asks for — the scenario scores on `result.completion.values`
+/// being an array, not on the candidates being clever.
+fn completion_provider() -> StaticCompletionProvider {
+    StaticCompletionProvider::from_strings(vec![
+        "test_completion_alpha".to_string(),
+        "test_completion_beta".to_string(),
+        "test_completion_gamma".to_string(),
+    ])
+}
+
 fn conformance_capabilities() -> ServerCapabilities {
     // `ServerCapabilities` is `#[non_exhaustive]`, so it is built by mutating a
     // `Default` rather than with a struct literal.

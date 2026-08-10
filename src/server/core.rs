@@ -8785,4 +8785,236 @@ mod tests {
             );
         }
     }
+
+    // =======================================================================
+    // `completion/complete`, per arm (Phase 118.1-04, CONF-05 / G-4).
+    //
+    // These sit next to the helper rather than in `tests/completion_complete.rs`
+    // because `complete_completion` and `bound_completion_values` are
+    // `pub(crate)` / private: an integration test can only reach them through a
+    // dispatcher, which conflates "the bound is applied" with "the dispatcher
+    // applies the bound". Both facts matter, so both are asserted — the
+    // dispatcher half lives in `tests/completion_complete.rs`.
+    // =======================================================================
+    mod completion {
+        use super::*;
+        use crate::types::completable::{
+            CompletionItem, CompletionProviderTrait, CompletionRequest, CompletionResponse,
+        };
+        use crate::types::protocol::{CompleteRequest, CompletionArgument, CompletionReference};
+
+        /// A provider returning `count` values, reporting `has_more` verbatim.
+        struct Fixed {
+            count: usize,
+            has_more: bool,
+        }
+
+        #[async_trait]
+        impl CompletionProviderTrait for Fixed {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                Ok(CompletionResponse {
+                    completions: (0..self.count)
+                        .map(|index| CompletionItem {
+                            value: format!("v{index}"),
+                            label: None,
+                            description: None,
+                            icon: None,
+                            metadata: HashMap::new(),
+                        })
+                        .collect(),
+                    has_more: self.has_more,
+                    continuation_token: None,
+                })
+            }
+        }
+
+        /// A provider that always fails, to pin the error path.
+        struct Failing;
+
+        #[async_trait]
+        impl CompletionProviderTrait for Failing {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                Err(Error::internal("provider exploded"))
+            }
+        }
+
+        /// The suite's request shape, for the arms that do not care about it.
+        fn request() -> CompleteRequest {
+            CompleteRequest {
+                r#ref: CompletionReference::Prompt {
+                    name: "test_prompt_with_arguments".to_string(),
+                },
+                argument: CompletionArgument {
+                    name: "arg1".to_string(),
+                    value: String::new(),
+                },
+            }
+        }
+
+        fn provider_arc(
+            provider: impl CompletionProviderTrait + 'static,
+        ) -> Arc<dyn CompletionProviderTrait> {
+            Arc::new(provider)
+        }
+
+        #[tokio::test]
+        async fn no_provider_answers_an_empty_array_not_an_error() {
+            let result = complete_completion(None, &request())
+                .await
+                .expect("the no-provider path is a SUCCESS, never an error");
+            assert!(result.completion.values.is_empty());
+            assert!(!result.completion.has_more);
+            assert_eq!(result.completion.total, None);
+        }
+
+        #[tokio::test]
+        async fn a_provider_under_the_bound_is_passed_through_whole() {
+            let provider = provider_arc(Fixed {
+                count: 7,
+                has_more: false,
+            });
+            let result = complete_completion(Some(&provider), &request())
+                .await
+                .expect("provider succeeds");
+            assert_eq!(result.completion.values.len(), 7);
+            assert!(!result.completion.has_more);
+            assert_eq!(result.completion.total, Some(7));
+        }
+
+        #[tokio::test]
+        async fn exactly_the_bound_is_not_treated_as_truncated() {
+            let provider = provider_arc(Fixed {
+                count: MAX_COMPLETION_VALUES,
+                has_more: false,
+            });
+            let result = complete_completion(Some(&provider), &request())
+                .await
+                .expect("provider succeeds");
+            assert_eq!(result.completion.values.len(), MAX_COMPLETION_VALUES);
+            assert!(
+                !result.completion.has_more,
+                "exactly 100 fits the bound, so nothing was dropped"
+            );
+            assert_eq!(result.completion.total, Some(MAX_COMPLETION_VALUES));
+        }
+
+        #[tokio::test]
+        async fn one_over_the_bound_truncates_and_says_so() {
+            let provider = provider_arc(Fixed {
+                count: MAX_COMPLETION_VALUES + 1,
+                has_more: false,
+            });
+            let result = complete_completion(Some(&provider), &request())
+                .await
+                .expect("provider succeeds");
+            assert_eq!(result.completion.values.len(), MAX_COMPLETION_VALUES);
+            assert!(
+                result.completion.has_more,
+                "an element was dropped, so the list must not read as exhaustive"
+            );
+            assert_eq!(
+                result.completion.total,
+                Some(MAX_COMPLETION_VALUES + 1),
+                "the provider returned everything it had, so `total` is the TRUE total \
+                 including the dropped element"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_provider_claiming_more_suppresses_total() {
+            let provider = provider_arc(Fixed {
+                count: 3,
+                has_more: true,
+            });
+            let result = complete_completion(Some(&provider), &request())
+                .await
+                .expect("provider succeeds");
+            assert_eq!(result.completion.values.len(), 3);
+            assert!(result.completion.has_more);
+            assert_eq!(
+                result.completion.total, None,
+                "the provider says more exist, so the true total is UNKNOWN — inventing \
+                 one would be worse than omitting an optional field"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failing_provider_surfaces_its_error() {
+            let provider = provider_arc(Failing);
+            let error = complete_completion(Some(&provider), &request())
+                .await
+                .expect_err("a failing provider must not be swallowed into an empty array");
+            assert!(error.to_string().contains("provider exploded"));
+        }
+
+        /// A provider that records the [`CompletionRequest`] it was handed.
+        struct Recording(std::sync::Mutex<Option<CompletionRequest>>);
+
+        #[async_trait]
+        impl CompletionProviderTrait for Recording {
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                *self.0.lock().expect("uncontended") = Some(request);
+                Ok(CompletionResponse {
+                    completions: Vec::new(),
+                    has_more: false,
+                    continuation_token: None,
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn the_ref_and_the_argument_reach_the_provider() {
+            let recording = Arc::new(Recording(std::sync::Mutex::new(None)));
+            let provider: Arc<dyn CompletionProviderTrait> = recording.clone();
+
+            let mut wire = request();
+            wire.argument.value = "te".to_string();
+            complete_completion(Some(&provider), &wire)
+                .await
+                .expect("provider succeeds");
+
+            let seen = recording.0.lock().expect("uncontended").clone();
+            let seen = seen.expect("the provider was called");
+            assert_eq!(seen.argument, "arg1");
+            assert_eq!(seen.partial, "te");
+            assert_eq!(
+                seen.context
+                    .get(COMPLETION_REF_PROMPT_KEY)
+                    .map(String::as_str),
+                Some("test_prompt_with_arguments"),
+                "a ref/prompt reference reaches the provider under the spec's own \
+                 discriminator spelling"
+            );
+            assert!(!seen.context.contains_key(COMPLETION_REF_RESOURCE_KEY));
+        }
+
+        #[tokio::test]
+        async fn a_resource_ref_reaches_the_provider_under_its_own_key() {
+            let recording = Arc::new(Recording(std::sync::Mutex::new(None)));
+            let provider: Arc<dyn CompletionProviderTrait> = recording.clone();
+
+            let wire = CompleteRequest {
+                r#ref: CompletionReference::Resource {
+                    uri: "test://static-text".to_string(),
+                },
+                argument: CompletionArgument {
+                    name: "path".to_string(),
+                    value: String::new(),
+                },
+            };
+            complete_completion(Some(&provider), &wire)
+                .await
+                .expect("provider succeeds");
+
+            let seen = recording.0.lock().expect("uncontended").clone();
+            let seen = seen.expect("the provider was called");
+            assert_eq!(
+                seen.context
+                    .get(COMPLETION_REF_RESOURCE_KEY)
+                    .map(String::as_str),
+                Some("test://static-text")
+            );
+            assert!(!seen.context.contains_key(COMPLETION_REF_PROMPT_KEY));
+        }
+    }
 }
