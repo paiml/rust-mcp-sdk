@@ -4,14 +4,14 @@ milestone: v2.5
 milestone_name: MCP Spec 2026-07-28
 status: executing
 stopped_at: Completed 118.1-03-PLAN.md (G-1 and G-2 closed; the CONF-04 fence is 10/10 GREEN with no literal weakened)
-last_updated: "2026-08-10T20:33:32.562Z"
-last_activity: 2026-08-10 -- Phase 118.1 plan 03 complete: Content::Resource emits the spec EmbeddedResource with blob + annotations on both eras, is #[non_exhaustive] with constructors, and reads both shapes
+last_updated: "2026-08-11T17:04:42.446Z"
+last_activity: 2026-08-11 -- Phase 118.1 execution started
 progress:
   total_phases: 73
   completed_phases: 64
   total_plans: 413
-  completed_plans: 402
-  percent: 97
+  completed_plans: 406
+  percent: 88
 ---
 
 # Project State
@@ -26,41 +26,49 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.1 (close-the-nine-conformance-gaps-g-1-g-9-found-by-the-officia) — EXECUTING
-Plan: 4 of 14
+Plan: 1 of 14
 Plans complete: **3 of 14** for Phase 118.1 (118.1-01, 118.1-02, 118.1-03); Phase 118 itself is
 10/10 with `118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
 Remaining: Phase 118.1 plans 04-14 (G-3..G-9), then Phase 119 (docs)
-Status: Ready to execute — **and `make quality-gate` is GREEN again on this branch.** 118.1-02's
+Status: Executing Phase 118.1
 deliberately-RED fences were turned green by 118.1-03's emitter fix, not by weakening them:
 `tests/embedded_resource_golden.rs` is 10/10 with `git diff` on that file EMPTY since `2ab06a44`,
 and `cargo +nightly fuzz run content_tolerant_reader -- -max_total_time=300` completes 5,713,406
 executions with an empty artifacts directory.
 
 **118.1-03 HAS LANDED — G-1 AND G-2 ARE CLOSED.** Commits `fc40a606` (the batched breaking edit)
+
 + `fdb92352` (composition relays) + `188bca00` (every out-of-crate consumer + the live-run proof)
 + `c9056c72` (semver delta + CHANGELOG), +1545/-104 across 19 files.
 
 - `Content::Resource` emits `{"type":"resource","resource":{…}}` in the tool-result and
   prompt-message positions on BOTH eras, carries `blob` and content-level `annotations`, and is
   `#[non_exhaustive]` with `resource_with_blob` / `with_annotations` / `with_meta`.
+
 - **`ReadResourceResult.contents` is still FLAT** and gains only `blob` — `tests/v1_lists_golden.rs`
   is 7/7 with `RESOURCES_READ` green, so the D-01 boundary held.
+
 - The reader is TOLERANT (D-03) via `#[serde(try_from)]` over ONE struct with an optional
   `resource` and an optional `uri`, **not** a `#[serde(untagged)]` pair — RESEARCH assumption A1
   is removed by construction rather than tested around.
+
 - Union rule, one sentence: `blob` is emitted only when `blob` is `Some` and `text` is `None`;
   otherwise `text` is emitted, using the empty string when it is `None`. A payload carrying BOTH
   is REJECTED on input (spec XOR).
+
 - **Accepted semver delta (D-15, one-time), recorded not hidden:** `enum_variant_marked_non_exhaustive`
   (MAJOR) + `type_method_marked_deprecated` (MINOR); 223 checks, 221 pass, 2 fail, exit 100.
   `enum_struct_variant_field_added` did NOT fire — batching the attribute with the fields cost ONE
   major lint instead of two. Contrast `ServerDiscoverResult`, already `#[non_exhaustive]`
   (`src/types/protocol/mod.rs:626-628`), which plan 07 extends for free.
+
 - The dual-conformance example is **RUN, not merely built**: `tests/embedded_resource_example_run.rs`
   spawns the built binary on 127.0.0.1:8157 and records a real `blob` on both eras at
   `target/118.1-03-blob-response.json`. Plan 04's sibling leg takes 8153.
+
 - `cargo pmcp new --kind mcp-app` scaffolds and `crates/pmcp-server/content/sdk-resources.md` were
   both rewritten to constructor form — a stale struct literal there would emit non-compiling crates.
+
 - The four workspace-EXCLUDED example crates were measured at base `2ab06a44` FIRST: three were
   already broken and now BUILD; `examples/26-server-tester` went 10 pre-existing errors to 8, with
   the remainder logged to `deferred-items.md`.
@@ -848,7 +856,7 @@ Prior-wave context — **113-21 landed the enumeration half of HTTP-09.** `tests
 Prior-wave context — **113-19 (wave 3) landed and the four-plan gap-closure round is CLOSED.** GAP-D: `decode_listen_chunks_for_fuzz` is now behind `#[cfg(any(feature = "fuzzing", test))]`; `#[doc(hidden)]` had hidden it from rustdoc but not from downstream callers or semver. Note for any re-verifier: `cargo public-api` OMITS `doc(hidden)` items, so the plan's seam-absence criterion passed vacuously (it was 0 before the fix too) — the falsifiable proof is a real downstream crate that fails `E0425` under `full` and compiles under `full,fuzzing`. GAP-E: the fuzz target's "latch never clears" tautology is replaced by a per-chunk `buffered_bytes() <= max_buffer_size` assertion, and it is PROVEN falsifiable — with only 113-17's pre-check disabled the campaign stays GREEN (113-17's two enforcement points are independently sufficient), and only with BOTH disabled does it crash (`the parser retained 9 bytes after chunk 0 under a 8-byte bound`). A 20 000-run campaign at `569f3533` is recorded in `113-FUZZ-EVIDENCE.md` § Campaign 2 (seed 3621664529, exit 0, artifacts dir EXISTS and is empty); campaign 1's PASS verdict is preserved verbatim because that campaign was green while GAP-A was open. The cross-cutting phase gate over 113-17 + 113-18 + 113-20 + 113-19 is GREEN: 6 suites, 4 build-matrix rows, `semver-checks` 223/223 no-update-required, zero REMOVED public items, zero new PMAT violations, `make quality-gate` exit 0 (243 ok / 0 FAILED). **NEXT: re-verify the phase** (`/gsd:verify-phase 113`) against `113-VERIFICATION.md`'s GAP-A..E; then, on or after 2026-07-28, re-run the 4-step procedure in `113-SPEC-RECHECK.md` § Recorded Exception, upgrade the Verdict, and only then flip HTTP-01..05 / CLNT-01..02 to `[x]`. A value mismatch is a phase-reopening event. Still unowned: WR-01, WR-02, WR-04, D-113-F..K, UNAS-01.
 
 Prior-wave context — 113-18 closed GAP-B and GAP-C. GAP-B is closed by CONTRACT, not by the originally-planned liveness reclaim: the receiver and the `ListenGuard` share one `stream::unfold` state tuple, so sender liveness cannot observe remote death (the verifier's reproduction dropped the receiver while holding the guard — a state production cannot enter). Instead the duplicate refusal became RETRYABLE (`RATE_LIMITED` -32005 at HTTP 200, `v2_status_for_code` byte-unchanged) and the fresh-id reconnect contract is documented in three places and pinned by a live tripwire whose negative control fails. GAP-C/WR-06 closed: both entry-creating rejection paths route through `prune_after_rejection`, proven by a test that fails when the prune is removed. A re-verifier must reproduce GAP-B through a REAL socket. Earlier in this wave 113-17 landed the parser work — `SseParser`'s bound is now UNCONDITIONAL over `buffer + current_event.data + chunk` (GAP-A closed for real), the two whole-body transport sites go through a `pub(crate)` `feed_complete_body`, and `connect_sse`'s ceiling is a configurable 16 MiB with no public-config-struct change (semver 223/223, no update required). **113-20 has now landed and T-113-84 is DISCHARGED**: `feed_complete_body`'s byte-cap precondition is an established fact naming both enforcing call sites. Every whole-body read on `StreamableHttpTransport` — the POST response, the `start_sse` GET stream, AND the previously-unenumerated v2 error envelope — goes through one `collect_body_within_cap` helper that refuses an over-cap `Content-Length` before reading a byte and bounds the delivered bytes with `http_body_util::Limited` (a STREAMING bound, so an over-cap body is never allocated whole). Zero `response.collect()` remain in that file. `DEFAULT_MAX_COLLECTED_BODY_BYTES` (16 MiB) lives on a PRIVATE field with an additive `with_max_collected_body_bytes()` seam, so semver stays 223/223 no-update-required. Four per-site negative-control runs recorded. D-113-K records the deferred GET-path incremental-parsing rewrite (T-113-94). Wave 3 (113-19, the phase gate) is unblocked. After it, re-verify the phase; then, on or after 2026-07-28, re-run the 4-step procedure in `113-SPEC-RECHECK.md` § Recorded Exception, upgrade the Verdict, and only then flip the seven requirements. HTTP-04 stays `[~]` until that gate clears. A value mismatch is a phase-reopening event.
-Last activity: 2026-08-10
+Last activity: 2026-08-11 -- Phase 118.1 execution started
 
 ## v2.5 Phase Plan (8 phases, 38 requirements)
 
