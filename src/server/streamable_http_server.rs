@@ -885,7 +885,7 @@ async fn map_unparsed_body_for_v2(
     let raw_meta = params_meta_of(Some(&envelope));
     let resolved = {
         let server = state.server.lock().await;
-        server.resolve_raw_meta_protocol_context(raw_meta.as_ref())
+        server.resolve_raw_meta_protocol_context(raw_meta)
     };
     let Ok(Some(context)) = resolved else {
         return v1_response;
@@ -1096,18 +1096,20 @@ fn classify_v2_meta_version(
     if !header_is_v2 && !meta_is_v2 {
         return V2MetaVerdict::Defer;
     }
-    if raw_meta.is_none() {
+    let Some(meta) = raw_meta else {
         return V2MetaVerdict::MissingRequired(ERR_META_ABSENT);
-    }
+    };
     let Some(version) = meta_version else {
-        return if raw_meta_object_has_key(raw_meta, RESERVED_PROTOCOL_VERSION_KEY) {
-            // Present but unusable — the resolver's MalformedMeta owns this.
-            V2MetaVerdict::Defer
-        } else if raw_meta.is_some_and(serde_json::Value::is_object) {
-            V2MetaVerdict::MissingRequired(ERR_META_NO_PROTOCOL_VERSION)
-        } else {
-            // A non-object `_meta` — likewise the resolver's MalformedMeta.
-            V2MetaVerdict::Defer
+        // Exactly one shape is a missing-required-key rejection: an OBJECT that
+        // simply lacks the key. The other two — key present but unusable, and a
+        // non-object `_meta` — are both the resolver's MalformedMeta, so they
+        // defer. Binding `meta` above means this no longer re-tests an `Option`
+        // the line before it already proved is `Some`.
+        return match meta.as_object() {
+            Some(object) if !object.contains_key(RESERVED_PROTOCOL_VERSION_KEY) => {
+                V2MetaVerdict::MissingRequired(ERR_META_NO_PROTOCOL_VERSION)
+            },
+            _ => V2MetaVerdict::Defer,
         };
     };
     if !(header_is_v2 && version == crate::types::protocol::PROTOCOL_VERSION_2026_07_28) {
@@ -1317,6 +1319,26 @@ fn cross_check_name(
 
 /// The thin top-level classifier over the full matrix (cog-safe composition).
 ///
+/// The ONE construction of a header/body-mismatch rejection.
+///
+/// Two sites answer a `HEADER_MISMATCH`: [`run_v2_header_gate`] short-circuits a
+/// [`V2MetaVerdict::Disagreement`] before the accept list (the G-8 ordering fix),
+/// and [`classify_v2_request`]'s ENFORCE arm rejects a missing required header or
+/// a failed cross-check. They must stay byte-identical on the wire, so they share
+/// this constructor rather than each spelling out the same three fields.
+///
+/// Note the reachability asymmetry this makes visible: because the gate returns at
+/// the disagreement check, [`classify_v2_request`] never sees a `Disagreement` in
+/// production — that arm survives for the unit and property tests that call the
+/// classifier directly over the full matrix.
+fn header_mismatch_reject(message: &str) -> V2GateOutcome {
+    V2GateOutcome::Reject {
+        code: crate::types::protocol::error_codes::HEADER_MISMATCH,
+        message: message.to_string(),
+        data: None,
+    }
+}
+
 /// Inputs: the [`V2MetaVerdict`] already computed from the header and the RAW
 /// `params._meta` + the untrusted body `method`/`params.name`. Output: accept
 /// (with echo headers) | reject(code) | passthrough. Pure and non-panicking —
@@ -1331,16 +1353,12 @@ fn classify_v2_request(
     body_method: Option<&str>,
     body_name: Option<&str>,
 ) -> V2GateOutcome {
-    use crate::types::protocol::error_codes::{HEADER_MISMATCH, INVALID_PARAMS};
+    use crate::types::protocol::error_codes::INVALID_PARAMS;
     // Every rejection the ENFORCE arm can produce is a missing-required-header
     // or a header/body mismatch, so they all carry `HEADER_MISMATCH` and no
     // structured `data`. The required-`_meta`-key rejections carry
     // `INVALID_PARAMS` instead — that difference is gap G-6.
-    let reject = |msg: &str| V2GateOutcome::Reject {
-        code: HEADER_MISMATCH,
-        message: msg.to_string(),
-        data: None,
-    };
+    let reject = header_mismatch_reject;
     match verdict {
         V2MetaVerdict::Defer => V2GateOutcome::Passthrough,
         V2MetaVerdict::MissingRequired(msg) => V2GateOutcome::Reject {
@@ -1406,6 +1424,30 @@ const LOG_LEVEL_REQUEST_META_KEY: &str = "io.modelcontextprotocol/logLevel";
 /// `notifications/initialized` is likewise absent from the schema and is
 /// deliberately NOT here: it is a NOTIFICATION, so it carries no JSON-RPC id and
 /// has no response envelope in which a `-32601` could be delivered.
+///
+/// # This is one of TWO homes for "does this method exist on this era"
+///
+/// The other is the tasks-extension predicate in
+/// [`crate::server::task_dispatch`] — `V2_TASKS_METHOD_RETIRED` and the
+/// `tasks_*_serves_on_era` functions — which keys on a typed `ClientRequest`
+/// arm at the SHARED dispatch layer rather than on a method string at the HTTP
+/// ingress. Both produce `METHOD_NOT_FOUND` and both map to 404, so they are the
+/// same rule wearing two vocabularies.
+///
+/// **Which home does a new retirement belong in?**
+///
+/// - A method removed from the CORE `schema.ts` inventory → this table.
+/// - A method scoped to an EXTENSION (tasks, and anything that follows it) →
+///   the dispatch-side predicate, next to that extension's own era rules.
+///
+/// The split is deliberate but has a consequence worth knowing before you pick:
+/// era is resolved from `params._meta`, which is transport-independent, while
+/// this table lives in the HTTP transport. So a v2-opted-in stdio or WebSocket
+/// server retires `tasks/list` (shared dispatch) yet still serves the five
+/// below. Unifying them means hoisting this table to dispatch, which is blocked
+/// on the ordering constraint documented at [`retire_v2_method`]: retirement
+/// MUST run after `cross_check_method`, or a header/body smuggling attempt
+/// becomes an indistinguishable routine 404.
 const V2_RETIRED_METHODS: [(&str, Option<&str>); 5] = [
     (
         "initialize",
@@ -1612,7 +1654,10 @@ fn negotiation_error_to_gate_reject(
 /// `#[cfg(test)]` for the same reason).
 #[cfg(test)]
 fn raw_params_meta(body: &[u8]) -> Option<serde_json::Value> {
-    params_meta_of(raw_body_json(body).as_ref())
+    // Binds the parse to a local so the borrow `params_meta_of` returns outlives
+    // the call; this is the only caller that needs an OWNED `_meta`.
+    let parsed = raw_body_json(body);
+    params_meta_of(parsed.as_ref()).cloned()
 }
 
 /// Parse the raw JSON-RPC body ONCE. `None` for adversarial / non-JSON bytes.
@@ -1621,13 +1666,20 @@ fn raw_body_json(body: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// [`raw_params_meta`] over an ALREADY-PARSED body.
-fn params_meta_of(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+///
+/// BORROWS out of `value` rather than cloning. Every consumer
+/// (`classify_v2_meta_version`, `resolve_raw_meta_protocol_context`,
+/// `require_v2_client_capabilities`) takes `Option<&Value>`, so a clone here was
+/// per-request waste that grew when `require_v2_client_capabilities` began
+/// mandating the nested `_meta.clientCapabilities` object. It also makes the
+/// signature say what this function's contract already claimed: the gate reads
+/// ONE shared value, not a copy of it.
+fn params_meta_of(value: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
     let params = value?.get("params")?;
     params
         .get(crate::types::mrtr::META_KEY)
         .or_else(|| params.get("meta"))
         .filter(|meta| !meta.is_null())
-        .cloned()
 }
 
 /// The raw top-level `params` value of an ALREADY-PARSED body, or `Null`.
@@ -1802,16 +1854,9 @@ async fn run_v2_header_gate(
     // reported as `-32022`, so the disagreement never got a chance to classify.
     // The accept list still runs, and still answers `-32022`, for the case where
     // the two sides AGREE on a version the server does not support.
-    let verdict = classify_v2_meta_version(decode_version_header(headers), raw_meta.as_ref());
+    let verdict = classify_v2_meta_version(decode_version_header(headers), raw_meta);
     if let V2MetaVerdict::Disagreement(message) = verdict {
-        return (
-            None,
-            V2GateOutcome::Reject {
-                code: crate::types::protocol::error_codes::HEADER_MISMATCH,
-                message: message.to_string(),
-                data: None,
-            },
-        );
+        return (None, header_mismatch_reject(message));
     }
     // The rejection is built INSIDE the lock scope so the accept-list is only
     // borrowed on the rare negotiation-failure branch. Cloning it into a `Vec`
@@ -1823,7 +1868,7 @@ async fn run_v2_header_gate(
         // byte-for-byte unchanged (D-04). `resolve_raw_meta_protocol_context`
         // short-circuits to `Ok(None)` WITHOUT inspecting `_meta` at all.
         server
-            .resolve_raw_meta_protocol_context(raw_meta.as_ref())
+            .resolve_raw_meta_protocol_context(raw_meta)
             .map_err(|err| {
                 negotiation_error_to_gate_reject(&err, server.supported_protocol_versions())
             })
@@ -1847,7 +1892,7 @@ async fn run_v2_header_gate(
     // The required `clientCapabilities` key (CONF-06 / G-6), applied to a request
     // that is still ACCEPTED after retirement. Deliberately after
     // `retire_v2_method`; see `require_v2_client_capabilities`.
-    let outcome = require_v2_client_capabilities(outcome, raw_meta.as_ref());
+    let outcome = require_v2_client_capabilities(outcome, raw_meta);
     // MRTR params (HTTP-03): read on the ACCEPTED v2 path only, and only for an
     // MRTR-ELIGIBLE method; a present but unusable field becomes an
     // `INVALID_PARAMS` rejection here, BEFORE dispatch. `body_method` is the
@@ -6902,13 +6947,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // `subscriptions/listen` gate + wire frames (Plan 113-10, HTTP-04).
-    //
-    // Nested in a module NAMED after the production surface so
-    // `cargo test --lib -- subscriptions` actually selects these tests rather
-    // than passing vacuously (the plan-09 lesson).
-    // -------------------------------------------------------------------
-    // -------------------------------------------------------------------
     // v2 METHOD RETIREMENT (Phase 118.1 plan 05, CONF-05 / gap G-5).
     //
     // Nested in a module NAMED after the production surface so
@@ -7079,6 +7117,13 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------
+    // `subscriptions/listen` gate + wire frames (Plan 113-10, HTTP-04).
+    //
+    // Nested in a module NAMED after the production surface so
+    // `cargo test --lib -- subscriptions` actually selects these tests rather
+    // than passing vacuously (the plan-09 lesson).
+    // -------------------------------------------------------------------
     mod subscriptions_listen {
         use super::*;
         use crate::types::capabilities::{
@@ -7126,7 +7171,7 @@ mod tests {
         fn projected_capabilities(caps: &ServerCapabilities) -> ServerCapabilities {
             let response = crate::server::core::build_discover_response(
                 RequestId::Number(1),
-                caps,
+                crate::server::core::DiscoverSource::from(caps),
                 &Implementation::new("s", "1"),
                 Some(&v2_context()),
             );

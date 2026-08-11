@@ -140,6 +140,19 @@ const TASKS_RESULT_METHOD: &str = "tasks/result";
 /// Distinguishability is the mitigation, not a nicety: "this method was
 /// retired", "this method does not exist yet" and "this server serves no tasks
 /// at all" call for three different fixes.
+///
+/// # This is one of TWO homes for "does this method exist on this era"
+///
+/// The other is `V2_RETIRED_METHODS` in
+/// [`crate::server::streamable_http_server`], which retires methods removed from
+/// the CORE schema by matching the method STRING at the HTTP ingress. This one
+/// covers EXTENSION-scoped methods and keys on a typed `ClientRequest` arm at
+/// the shared dispatch layer. Both answer `METHOD_NOT_FOUND` and both map to
+/// 404 — the same rule in two vocabularies, at two layers.
+///
+/// A new retirement belongs here if the method is extension-scoped, and in the
+/// transport table if it was removed from the core `schema.ts` inventory. See
+/// that table's rustdoc for why the two are not yet unified.
 pub(crate) const V2_TASKS_METHOD_RETIRED: &str =
     "is not a method of the tasks extension on protocol version 2026-07-28: the extension \
      declares only tasks/get, tasks/update and tasks/cancel";

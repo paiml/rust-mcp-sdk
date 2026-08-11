@@ -224,7 +224,7 @@ pub(crate) fn build_uri_to_tool_meta(
 /// (`ref` + a partial `argument.value`), so an unbounded array copied straight
 /// out of the provider is a denial-of-service surface as well as a conformance
 /// violation (T-118.1-04-01).
-pub(crate) const MAX_COMPLETION_VALUES: usize = 100;
+const MAX_COMPLETION_VALUES: usize = 100;
 
 /// Shape a `completion/complete` answer from an optional registered provider.
 ///
@@ -310,10 +310,10 @@ fn completion_request_for(
 /// Spelled exactly as the wire discriminator (`CompletionReference`'s serde
 /// rename), so a provider matching on it is matching on the protocol's own
 /// vocabulary rather than on an SDK-invented alias.
-pub(crate) const COMPLETION_REF_PROMPT_KEY: &str = "ref/prompt";
+const COMPLETION_REF_PROMPT_KEY: &str = "ref/prompt";
 
 /// The `context` key carrying a `ref/resource` reference's URI.
-pub(crate) const COMPLETION_REF_RESOURCE_KEY: &str = "ref/resource";
+const COMPLETION_REF_RESOURCE_KEY: &str = "ref/resource";
 
 /// Apply the spec's `@maxItems 100` bound to a provider's answer.
 ///
@@ -2199,13 +2199,12 @@ pub(crate) fn own_reserved_result_fields(
 /// the same list. The `impl Into<_>` seam admits a capabilities-only source, but
 /// that conversion is `#[cfg(test)]`, so a PRODUCTION caller has no way to reach
 /// this fn without naming an accept-list explicitly.
-pub(crate) fn build_discover_response<'a>(
+pub(crate) fn build_discover_response(
     id: RequestId,
-    source: impl Into<DiscoverSource<'a>>,
+    source: DiscoverSource<'_>,
     info: &Implementation,
     protocol_context: Option<&crate::types::protocol::ProtocolContext>,
 ) -> JSONRPCResponse {
-    let source: DiscoverSource<'a> = source.into();
     // Era gate (D-10): v2 only. A v1 / non-opted-in request is method-not-found.
     if !matches!(
         protocol_context.map(|c| c.era),
@@ -4776,7 +4775,7 @@ mod tests {
         // Projection is produced by the ONE shared free fn the production caller uses.
         let response = build_discover_response(
             RequestId::from(1i64),
-            &server.capabilities,
+            DiscoverSource::from(&server.capabilities),
             &server.info,
             Some(&ctx),
         );
@@ -4805,7 +4804,7 @@ mod tests {
         let ctx = v1_ctx();
         let resp = build_discover_response(
             RequestId::from(2i64),
-            &server.capabilities,
+            DiscoverSource::from(&server.capabilities),
             &server.info,
             Some(&ctx),
         );
@@ -4821,7 +4820,7 @@ mod tests {
         // no resolved context at all → also -32601
         let resp_none = build_discover_response(
             RequestId::from(3i64),
-            &server.capabilities,
+            DiscoverSource::from(&server.capabilities),
             &server.info,
             None,
         );
@@ -4863,7 +4862,7 @@ mod tests {
         let ctx = v2_ctx();
         let _ = build_discover_response(
             RequestId::from(1i64),
-            &server.capabilities,
+            DiscoverSource::from(&server.capabilities),
             &server.info,
             Some(&ctx),
         );
@@ -5447,7 +5446,7 @@ mod tests {
             let discover_ctx = v2_ctx();
             let response = build_discover_response(
                 RequestId::from(3i64),
-                &server.capabilities,
+                DiscoverSource::from(&server.capabilities),
                 &server.info,
                 Some(&discover_ctx),
             );

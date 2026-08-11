@@ -35,14 +35,7 @@ impl StaticResource {
             name,
             description: None,
             mime_type: Some("text/plain".to_string()),
-            content: Content::Resource {
-                uri,
-                text: Some(content.into()),
-                blob: None,
-                mime_type: Some("text/plain".to_string()),
-                annotations: None,
-                meta: None,
-            },
+            content: Content::resource_with_text(uri, content, "text/plain"),
         }
     }
 
@@ -57,14 +50,16 @@ impl StaticResource {
             name,
             description: None,
             mime_type: Some(mime_type.clone()),
-            content: Content::Resource {
+            // NOTE: this encodes the image into `text`, not `blob`, which is what
+            // this constructor did before `blob` existed. Preserved deliberately —
+            // moving it to `Content::resource_with_blob` would change the wire
+            // output for every existing caller and is a compatibility decision,
+            // not a cleanup. See the phase 118.1 /simplify review (F2).
+            content: Content::resource_with_text(
                 uri,
-                text: Some(base64::prelude::BASE64_STANDARD.encode(data)),
-                blob: None,
-                mime_type: Some(mime_type),
-                annotations: None,
-                meta: None,
-            },
+                base64::prelude::BASE64_STANDARD.encode(data),
+                mime_type,
+            ),
         }
     }
 
