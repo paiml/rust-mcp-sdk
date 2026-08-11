@@ -1681,6 +1681,26 @@ impl Server {
         // parity rule this file follows everywhere else.
         let cacheable = crate::server::core::request_is_cacheable(&request);
 
+        // G-9 / CONF-08 (Phase 118.1-08): fold the v1 `initialize` handshake's
+        // advertised capabilities into the context threaded into DISPATCH — the
+        // SAME shared unit `ServerCore` calls, never a second copy (twin-site
+        // parity). THE ONE lock read per dispatch, guarded so v2 traffic never
+        // touches it (T-118.1-08-02); the read guard is dropped at the end of
+        // this statement, before the `Initialize` arm below takes the WRITE lock
+        // a few lines down. The EGRESS keeps the UNFOLDED `protocol_context`:
+        // the fold is a handler-visibility concern, not a wire-shape one.
+        let handshake_capabilities =
+            if crate::server::core::v1_capability_fold_applies(protocol_context.as_ref()) {
+                self.client_capabilities.read().await.clone()
+            } else {
+                None
+            };
+        let dispatch_context = crate::server::core::fold_v1_handshake_capabilities(
+            protocol_context.clone(),
+            handshake_capabilities,
+            &self.supported_protocol_versions,
+        );
+
         // The SECOND envelope claimant (Phase 114 plan 11), twin of the
         // `ServerCore` site: the `tasks/*` routes and the `tools/call` create
         // path state their own `resultType` and reserved-field ownership from the
@@ -1731,7 +1751,7 @@ impl Server {
                     id,
                     *boxed_req,
                     auth_context,
-                    protocol_context.clone(),
+                    dispatch_context,
                     &mut dispatch_claim,
                 ))
                 .await
@@ -1897,7 +1917,7 @@ impl Server {
                     .await
             },
             ClientRequest::ListResources(req) => {
-                self.handle_list_resources(request_id, req, auth_context)
+                self.handle_list_resources(request_id, req, auth_context, protocol_context)
                     .await
             },
             ClientRequest::ReadResource(req) => {
@@ -1933,7 +1953,10 @@ impl Server {
             | ClientRequest::Unsubscribe(_)
             | ClientRequest::SetLoggingLevel { level: _ }
             | ClientRequest::Ping => Ok(serde_json::json!({})),
-            ClientRequest::CreateMessage(req) => self.handle_create_message(request_id, *req).await,
+            ClientRequest::CreateMessage(req) => {
+                self.handle_create_message(request_id, *req, protocol_context)
+                    .await
+            },
             // Note: Elicitation responses are now handled as the response to
             // ServerRequest::ElicitationCreate in the JSON-RPC response flow,
             // not as a separate client request variant.
@@ -2445,6 +2468,10 @@ impl Server {
         request_id: RequestId,
         req: ListResourcesRequest,
         auth_context: Option<auth::AuthContext>,
+        // THREADED, not resolved here (Phase 118.1-08, G-9) — the twin of the
+        // `ServerCore` site. `ListResourcesRequest` carries no `_meta`, so the
+        // context can only arrive from the caller.
+        protocol_context: Option<crate::types::protocol::ProtocolContext>,
     ) -> Result<Value> {
         if let Some(handler) = &self.resources {
             let request_id_str = request_id.to_string();
@@ -2457,7 +2484,8 @@ impl Server {
                     request_id_str.clone(),
                     cancellation_token,
                 )
-                .with_auth_context(auth_context),
+                .with_auth_context(auth_context)
+                .with_protocol_context(protocol_context),
             );
             let mut result = match handler.list(req.cursor, extra).await {
                 Ok(v) => {
@@ -2589,6 +2617,14 @@ impl Server {
         &self,
         request_id: RequestId,
         req: crate::types::CreateMessageParams,
+        // THREADED, not resolved here (Phase 118.1-08, G-9). This arm serves an
+        // INBOUND `sampling/createMessage` — a `ClientRequest` variant, so a
+        // client handshake absolutely does have meaning here and the site is
+        // THREAD-THEN-FOLD, not a NO-OP. (The server-to-client direction is a
+        // `ServerRequest` handled by the peer dispatcher, which builds no
+        // `RequestHandlerExtra` at all.) `CreateMessageParams` carries no
+        // `_meta`, so the context can only arrive from the caller.
+        protocol_context: Option<crate::types::protocol::ProtocolContext>,
     ) -> Result<Value> {
         let handler = self
             .sampling
@@ -2600,10 +2636,13 @@ impl Server {
             .cancellation_manager
             .create_token(request_id_str.clone())
             .await;
-        let extra = self.attach_peer(crate::server::cancellation::RequestHandlerExtra::new(
-            request_id_str.clone(),
-            cancellation_token,
-        ));
+        let extra = self.attach_peer(
+            crate::server::cancellation::RequestHandlerExtra::new(
+                request_id_str.clone(),
+                cancellation_token,
+            )
+            .with_protocol_context(protocol_context),
+        );
         let result = match handler.create_message(req, extra).await {
             Ok(v) => {
                 self.cancellation_manager

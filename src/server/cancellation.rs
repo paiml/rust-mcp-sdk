@@ -398,6 +398,21 @@ impl RequestHandlerExtra {
     /// Returns the client's SELF-REPORTED advertised capabilities, or `None`
     /// when absent.
     ///
+    /// # Both eras reach this accessor
+    ///
+    /// On MCP `2026-07-28` the value comes from the per-request
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]`, resolved once at
+    /// ingress. On MCP `2025-11-25` it comes from the `initialize` handshake,
+    /// folded into the same `ProtocolContext` at the dispatch root by
+    /// `core::fold_v1_handshake_capabilities` (Phase 118.1-08, G-9). This method
+    /// reads ONLY `protocol_context.client_capabilities` in either case — it
+    /// deliberately does NOT reach for the server-level `client_capabilities`
+    /// lock, because it is a sync method on a value already moved into the
+    /// handler while the dispatch path holds that lock, and that shape
+    /// deadlocks.
+    ///
+    /// Absent both signals the answer is `None`, never a fabricated default.
+    ///
     /// **Security — self-reported, not for authorization:** like
     /// [`client_info`](Self::client_info), these capabilities are client-supplied
     /// and informational ONLY. They MUST NOT be used as an authorization anchor;
