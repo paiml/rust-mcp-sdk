@@ -3978,6 +3978,27 @@ async fn handle_post_fast_path_inner(
         is_init_request,
     } = read_and_classify_fast(&state, request).await?;
 
+    // THE DEADLOCK FIX (T-118.1-10-01), and deliberately the SECOND statement of
+    // this function. An inbound JSON-RPC RESPONSE is correlated and answered HERE,
+    // before the three sites that take `state.server.lock()` — `run_v2_header_gate`
+    // twice (the accept-list read and the negotiation read) and
+    // `extract_and_validate_auth` once. A tool handler parked on a peer call holds
+    // that same mutex for its whole duration, so an answer routed after any of
+    // them could never arrive: one tool call would take the transport offline.
+    //
+    // ONLY responses bypass. A response carries no authority — it invokes no
+    // method and can only resolve a correlation the SERVER minted — whereas
+    // requests and notifications keep going through the full gate and auth
+    // pipeline below, unchanged. Widening this would be an auth bypass.
+    //
+    // ONE shared function with the middleware twin, in the spirit of
+    // `dispatch_request_or_retire`: the rule cannot drift between the two paths.
+    if let Some(accepted) =
+        peer_channel::try_route_inbound_response(&state, &ingress, session_id.as_deref()).await
+    {
+        return Ok(accepted);
+    }
+
     // v2 required-header gate (VERS-05). The ordering constraints this call
     // carries — gate BEFORE session resolution and BEFORE the legacy
     // protocol-version check — are documented on `resolve_v2_gate` itself.
@@ -4344,9 +4365,20 @@ async fn dispatch_message_fast(
             ))
             .await
         },
-        HttpIngress::Public(
-            TransportMessage::Notification { .. } | TransportMessage::Response(_),
-        ) => StatusCode::ACCEPTED.into_response(),
+        HttpIngress::Public(TransportMessage::Notification { .. }) => {
+            StatusCode::ACCEPTED.into_response()
+        },
+        // UNREACHABLE BY CONSTRUCTION: `peer_channel::try_route_inbound_response`
+        // matched and answered every response envelope as the second statement of
+        // `handle_post_fast_path_inner`, before this pipeline began. The arm
+        // survives only because the match must stay exhaustive — and it now ROUTES
+        // through the identical correlation path rather than discarding, so a
+        // response that ever reached here by some future route could not silently
+        // lose a client's answer.
+        HttpIngress::Public(TransportMessage::Response(ref response)) => {
+            peer_channel::route_inbound_response(state, response, session_id.map(String::as_str))
+                .await
+        },
     }
 }
 
@@ -4471,9 +4503,15 @@ async fn dispatch_message_with_middleware(
             }
             response
         },
-        HttpIngress::Public(
-            TransportMessage::Notification { .. } | TransportMessage::Response(_),
-        ) => StatusCode::ACCEPTED.into_response(),
+        HttpIngress::Public(TransportMessage::Notification { .. }) => {
+            StatusCode::ACCEPTED.into_response()
+        },
+        // UNREACHABLE BY CONSTRUCTION — see the fast-path twin. Routes rather
+        // than discards, for the same reason.
+        HttpIngress::Public(TransportMessage::Response(ref response)) => {
+            peer_channel::route_inbound_response(state, response, response_session_id.as_deref())
+                .await
+        },
     }
 }
 
@@ -4670,6 +4708,15 @@ async fn handle_post_with_middleware_inner(
         protocol_version,
         is_init_request,
     } = read_and_classify_with_middleware(&state, request, http_middleware).await?;
+
+    // The SAME deadlock fix as the fast-path twin, from the SAME position in the
+    // pipeline and through the SAME shared function — see that call site for the
+    // three bypassed lock sites and for why only responses may bypass them.
+    if let Some(accepted) =
+        peer_channel::try_route_inbound_response(&state, &ingress, session_id.as_deref()).await
+    {
+        return Ok(accepted);
+    }
 
     // v2 required-header gate (VERS-05). The ordering constraints this call
     // carries — gate BEFORE session resolution and BEFORE the legacy

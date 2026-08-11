@@ -1,4 +1,4 @@
-//! The StreamableHTTP server-to-client channel (Phase 118.1 plan 10, CONF-07 / G-3).
+//! The `StreamableHTTP` server-to-client channel (Phase 118.1 plan 10, CONF-07 / G-3).
 //!
 //! # The property this module exists to preserve
 //!
@@ -74,11 +74,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::{v1, ServerState};
+use super::{v1, HttpIngress, ServerState};
 use crate::error::{Error, ErrorCode, Result};
 use crate::server::roots::ListRootsResult;
 use crate::server::server_request_dispatcher::ServerRequestDispatcher;
@@ -89,7 +91,7 @@ use crate::types::protocol::context::TransportBackchannel;
 use crate::types::sampling::{
     CreateMessageParams, CreateMessageResult, CreateMessageResultWithTools,
 };
-use crate::types::{Notification, ProgressToken, ServerRequest};
+use crate::types::{JSONRPCResponse, Notification, ProgressToken, ServerRequest};
 
 /// Capacity of the outbound server-to-client request channel.
 ///
@@ -116,6 +118,15 @@ const OUTBOUND_CAPACITY: usize = 100;
 /// completion or put an elicitation form in front of a person, short enough that
 /// an abandoned round trip is not an outage.
 const HTTP_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outbound channel's receiving half, parked until the drain claims it.
+///
+/// A named alias because the nested generic trips `clippy::type_complexity`
+/// inline — and because the shape is load-bearing enough to deserve a name: it is
+/// the `(correlation_id, ServerRequest)` pair `Server::run` also queues, held in
+/// a `parking_lot::Mutex<Option<..>>` so [`ensure_outbound_drain`] can take it
+/// exactly once.
+type ParkedOutboundReceiver = Arc<Mutex<Option<mpsc::Receiver<(String, ServerRequest)>>>>;
 
 /// Logged when an outbound dispatch reaches the drain with no recorded owner.
 const NO_OWNER: &str = "outbound dispatch carried no recorded session owner";
@@ -144,7 +155,7 @@ pub(crate) struct PeerChannel {
     /// `pmcp::axum::router()`), and `tokio::spawn` outside a runtime panics.
     /// [`ensure_outbound_drain`] takes it exactly once, from whichever call site
     /// first runs inside a runtime.
-    outbound_rx: Arc<Mutex<Option<mpsc::Receiver<(String, ServerRequest)>>>>,
+    outbound_rx: ParkedOutboundReceiver,
 }
 
 /// Hand-written: `ServerRequestDispatcher`'s own `Debug` prints cardinality only,
@@ -502,4 +513,121 @@ pub(crate) async fn attach_session_backchannel(
         .with_peer(peer)
         .with_notification_sink(session_notification_sink(state, session_id));
     Some(carrier.with_transport_backchannel(backchannel))
+}
+
+// ---------------------------------------------------------------------------
+// The inbound half: correlation BEFORE the server mutex.
+//
+// This is the deadlock fix (T-118.1-10-01), not an optimization. See
+// `try_route_inbound_response` for the three lock sites it bypasses and for why
+// bypassing them is sound for a response and for nothing else.
+// ---------------------------------------------------------------------------
+
+/// Try to answer this POST as an inbound JSON-RPC RESPONSE, before the pipeline
+/// takes the server mutex.
+///
+/// Returns `Some(202 Accepted)` for EVERY response envelope — resolved, unknown
+/// or wrongly-presented alike — and `None` for every other ingress, which then
+/// falls through to the untouched gate / session / auth / dispatch pipeline.
+///
+/// # Why this must run before `resolve_v2_gate` and `extract_and_validate_auth`
+///
+/// `dispatch_public_request` holds `state.server.lock().await` for the ENTIRE
+/// duration of a tool handler. A handler parked on `peer.sample()` therefore
+/// holds the server mutex while it waits for the client's answer — and that
+/// answer arrives as a POST whose first stages all take the same mutex:
+///
+/// * `run_v2_header_gate`, the accept-list read;
+/// * `run_v2_header_gate` again, the negotiation read;
+/// * `extract_and_validate_auth`, the auth-provider read.
+///
+/// Left in that order the answer can never reach the dispatcher that would
+/// release the handler: a guaranteed deadlock, and a denial-of-service control,
+/// because ONE tool call would take the whole transport offline.
+///
+/// # Why ONLY responses may bypass, and why that is not an auth bypass
+///
+/// An inbound response carries NO AUTHORITY. It invokes no method, reads nothing
+/// and changes no server state: it can only resolve a correlation the SERVER
+/// itself minted and is already waiting on. Requests and notifications keep
+/// going through the full gate and auth pipeline, unchanged. Do NOT widen this —
+/// a request that skipped `extract_and_validate_auth` would be a genuine
+/// elevation of privilege (T-118.1-10-06).
+///
+/// # No new body read
+///
+/// `HttpIngress::Public(TransportMessage::Response(_))` is the ALREADY-PARSED
+/// message, produced by the classifier from the buffer it already owns. The
+/// existing `MAX_*` body bounds therefore still apply, unchanged and unmodified
+/// (T-118.1-10-07), and this path allocates nothing per unknown id.
+/// `pub(super)`, not `pub(crate)`: [`HttpIngress`] is private to the transport
+/// module, and a `pub(crate)` signature naming it would be more visible than the
+/// type it takes. Both call sites live in that module, so this is exactly wide
+/// enough.
+pub(super) async fn try_route_inbound_response(
+    state: &ServerState,
+    ingress: &HttpIngress,
+    session_id: Option<&str>,
+) -> Option<Response> {
+    let HttpIngress::Public(TransportMessage::Response(response)) = ingress else {
+        return None;
+    };
+    Some(route_inbound_response(state, response, session_id).await)
+}
+
+/// Correlate ONE inbound response envelope and answer `202 Accepted`.
+///
+/// Split out from [`try_route_inbound_response`] so the residual
+/// `TransportMessage::Response` arms of the two dispatchers can route through the
+/// identical path instead of silently discarding, which is what they used to do.
+/// Those arms are unreachable by construction — the classification above answered
+/// every response before either dispatcher ran — but a match must stay
+/// exhaustive, and an exhaustive arm that DISCARDS is exactly the hole this plan
+/// closed.
+///
+/// # The rejection shape is ONE shape, deliberately
+///
+/// Three negative cases — an unknown correlation id, an id owned by a DIFFERENT
+/// session, and a response presented with no session at all — all answer the
+/// same `202 Accepted`, with no body and no distinguishing header, and none of
+/// them calls `handle_response`. Differentiating them (say `404` for unknown and
+/// `403` for wrong-session) would turn this endpoint into an enumeration oracle
+/// for live correlation ids (T-118.1-10-03). The correlation id is logged at
+/// `debug`; the payload never is.
+pub(crate) async fn route_inbound_response(
+    state: &ServerState,
+    response: &JSONRPCResponse,
+    session_id: Option<&str>,
+) -> Response {
+    let correlation_id = response.id.to_string();
+    let dispatcher = dispatcher(state);
+
+    // OWNERSHIP FIRST. A client that POSTs a response carrying an id it never
+    // received must not be able to resolve another session's pending
+    // `sampling/createMessage` (T-118.1-10-02). The check is exactly
+    // `owner_of(id) == Some(presented_session_id)`; `owner_of` answers `None`
+    // for an unknown id, so the unknown and wrong-session cases collapse into
+    // this one comparison and into the one indistinguishable answer below.
+    if dispatcher.owner_of(&correlation_id).await.as_deref() != session_id {
+        debug!(
+            "Discarded inbound response for correlation {}: not owned by the presenting session",
+            correlation_id
+        );
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    // Mapped exactly as `Server::route_response` maps it on the in-process path:
+    // a result verbatim, an error through `serde_json::to_value`, so the awaiting
+    // caller can tell the two apart.
+    let payload = match &response.payload {
+        crate::types::jsonrpc::ResponsePayload::Result(value) => value.clone(),
+        crate::types::jsonrpc::ResponsePayload::Error(err) => {
+            serde_json::to_value(err).unwrap_or(serde_json::Value::Null)
+        },
+    };
+
+    if let Err(e) = dispatcher.handle_response(&correlation_id, payload).await {
+        debug!("Failed to route response {}: {}", correlation_id, e);
+    }
+    StatusCode::ACCEPTED.into_response()
 }

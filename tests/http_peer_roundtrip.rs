@@ -2,7 +2,7 @@
 //!
 //! `tests/in_tool_peer_roundtrip.rs` proves the peer METHODS (`sample`,
 //! `list_roots`, `elicit`) work on the stock `Server::run` loop. This file asks
-//! the other half of the question: does the **StreamableHTTP transport** carry a
+//! the other half of the question: does the **`StreamableHTTP` transport** carry a
 //! server-to-client channel at all? The two files are deliberately separate so a
 //! failure here is attributable to the TRANSPORT and never to the method.
 //!
@@ -449,15 +449,15 @@ impl Conn {
 // Request construction.
 // ===========================================================================
 
-fn envelope(method: &str, id: Value, params: Value) -> String {
+fn envelope(method: &str, id: &Value, params: &Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
 }
 
 fn init_body() -> String {
     envelope(
         "initialize",
-        json!(1),
-        json!({
+        &json!(1),
+        &json!({
             "protocolVersion": LATEST_PROTOCOL_VERSION,
             "capabilities": { "sampling": {}, "roots": {}, "elicitation": {} },
             "clientInfo": { "name": "http-peer-fence", "version": "1.0.0" }
@@ -468,8 +468,8 @@ fn init_body() -> String {
 fn call_body(id: i64, tool: &str) -> String {
     envelope(
         "tools/call",
-        json!(id),
-        json!({ "name": tool, "arguments": {} }),
+        &json!(id),
+        &json!({ "name": tool, "arguments": {} }),
     )
 }
 
