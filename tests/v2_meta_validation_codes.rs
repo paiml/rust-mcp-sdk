@@ -59,8 +59,9 @@
 mod common;
 
 use common::v2::{
-    build_v2_server, default_client_capabilities, header, post, spawn_default_config, teardown,
-    Resp, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION, V1, V2,
+    build_v2_server, default_client_capabilities, header, jsonrpc_envelope, post,
+    spawn_default_config, teardown, v2_headers_claiming, Resp, META_CLIENT_CAPABILITIES,
+    META_CLIENT_INFO, META_PROTOCOL_VERSION, REQUEST_META_KEY, V1, V2,
 };
 use pmcp::shared::http_constants::{MCP_METHOD, MCP_PROTOCOL_VERSION};
 use pmcp::types::protocol::error_codes::{
@@ -123,20 +124,18 @@ fn canonical_meta_claiming(version: &str) -> Value {
 
 /// A JSON-RPC request body for `method`. `meta` of `None` omits the
 /// `params._meta` key ENTIRELY — the row-1 shape, which is `params: {}`.
+///
+/// This cannot route through [`common::v2::v2_body_claiming_version`]: every row
+/// here is the canonical `_meta` MINUS or MUTATED in exactly one respect, which is
+/// a shape the well-formed builders cannot express by construction. Only the
+/// envelope is shared, and the reserved key is spelled from the harness'
+/// [`REQUEST_META_KEY`] rather than re-typed.
 fn matrix_body_with_id(method: &str, id: Value, meta: Option<Value>) -> String {
     let mut params = serde_json::Map::new();
     if let Some(meta) = meta {
-        params.insert("_meta".to_string(), meta);
+        params.insert(REQUEST_META_KEY.to_string(), meta);
     }
-    // Built through a `Map` rather than the `json!` macro: the macro BORROWS its
-    // interpolated values, which would leave `id` passed by value but never
-    // consumed.
-    let mut body = serde_json::Map::new();
-    body.insert("jsonrpc".to_string(), json!("2.0"));
-    body.insert("id".to_string(), id);
-    body.insert("method".to_string(), json!(method));
-    body.insert("params".to_string(), Value::Object(params));
-    Value::Object(body).to_string()
+    jsonrpc_envelope(method, id, Value::Object(params))
 }
 
 /// [`matrix_body_with_id`] pinned to the referee's own probe target.
@@ -147,14 +146,13 @@ fn discover_body(id: Value, meta: Option<Value>) -> String {
 /// The v2 routing headers for `server/discover` with an explicit
 /// `MCP-Protocol-Version` value.
 ///
-/// `Mcp-Name` is deliberately omitted: `server/discover` carries no routing
-/// name, and since Phase 118 D-13 the header is required only on name-bearing
-/// methods. That is also what the referee sends.
+/// The referee omits `Mcp-Name` here and this sends it empty; the two are
+/// indistinguishable at the gate, because `server/discover` carries no routing
+/// name and Phase 118 D-13 has the server DISCARD an empty value on exactly such
+/// a method. [`v2_headers_claiming`] carries the full argument. These rows assert
+/// `_meta` validation CODES, so the header's presence is not what they measure.
 fn discover_headers(version: &str) -> Vec<(String, String)> {
-    vec![
-        header(MCP_METHOD, DISCOVER),
-        header(MCP_PROTOCOL_VERSION, version),
-    ]
+    v2_headers_claiming(DISCOVER, "", version)
 }
 
 // ===========================================================================

@@ -50,14 +50,15 @@
 
 mod common;
 
+use common::example_process::{
+    spawn_example, target_dir, wait_until_listening, wait_until_released,
+};
 use common::v2::{header, post, v1_body, v2_body, v2_headers_for, Resp};
 use pmcp::shared::http_constants::MCP_SESSION_ID;
 use pmcp::types::protocol::LATEST_PROTOCOL_VERSION;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The example's compiled path, relative to the crate manifest.
 const EXAMPLE_REL_PATH: &str = "debug/examples/s54_v2_dual_conformance";
@@ -77,77 +78,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the port gets to become free again after the child is killed.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The target directory, honouring `CARGO_TARGET_DIR` when it is set.
-fn target_dir() -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-        PathBuf::from,
-    )
-}
-
-/// A spawned child that is killed and reaped on EVERY exit path, panic included.
-///
-/// `Drop` rather than a trailing `kill()` call because the assertions below can
-/// unwind: a teardown that only runs on the happy path leaves a stale listener
-/// holding 8157 and turns the next run's failure into a mystery. This mirrors the
-/// `trap`-based cleanup in `scripts/run-conformance-suite.sh`.
-struct ChildGuard(Option<Child>);
-
-impl ChildGuard {
-    fn take_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.0.as_mut().and_then(|child| child.try_wait().ok())?
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Poll a TCP connect until the child's socket answers, or fail loudly.
-///
-/// A poll rather than a sleep: a fixed sleep either wastes wall clock or races
-/// the bind, and a race here would report "connection refused" for a gap that is
-/// actually closed.
-async fn wait_until_listening(addr: SocketAddr, guard: &mut ChildGuard) {
-    let deadline = Instant::now() + READY_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some(status) = guard.take_status() {
-            panic!(
-                "the example exited before binding {addr} (status {status}). The most likely \
-                 cause is that {addr} is already held — check with \
-                 `lsof -nP -iTCP:{} -sTCP:LISTEN`.",
-                addr.port()
-            );
-        }
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("the example never accepted a connection on {addr} within {READY_TIMEOUT:?}");
-}
-
-/// Prove the port really came back, so a "teardown" that did not tear down is a
-/// failure here rather than a mystery in the next run.
-async fn wait_until_released(addr: SocketAddr) {
-    let deadline = Instant::now() + RELEASE_TIMEOUT;
-    while Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(addr).await.is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "{addr} still accepts connections {RELEASE_TIMEOUT:?} after the child was killed: the \
-         teardown did not tear down, and the next run would talk to a stale listener"
-    );
-}
 
 /// `resources/read` params for the binary resource.
 fn read_params() -> Value {
@@ -238,29 +168,8 @@ fn assert_blob_answer(era: &str, response: &Resp) {
 
 #[tokio::test]
 async fn the_dual_conformance_example_serves_a_real_blob_on_both_eras() {
-    let binary = target_dir().join(EXAMPLE_REL_PATH);
-    assert!(
-        binary.is_file(),
-        "{} is missing. This leg FAILS rather than skipping, by design: a skip would \
-         restore the unenforced 'the example demonstrates the fix' criterion it exists \
-         to close. Build it first with \
-         `cargo build --features full --example s54_v2_dual_conformance`.",
-        binary.display()
-    );
-
-    let addr: SocketAddr = BIND_ADDR
-        .parse()
-        .expect("BIND_ADDR is a literal socket addr");
-
-    let child = Command::new(&binary)
-        .arg(BIND_ADDR)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|error| panic!("could not spawn {}: {error}", binary.display()));
-    let mut guard = ChildGuard(Some(child));
-
-    wait_until_listening(addr, &mut guard).await;
+    let (addr, mut guard) = spawn_example(EXAMPLE_REL_PATH, BIND_ADDR);
+    wait_until_listening(addr, &mut guard, READY_TIMEOUT).await;
 
     // BOTH legs run before EITHER is asserted — see the module header.
     let session = v1_open_session(addr).await;
@@ -314,5 +223,5 @@ async fn the_dual_conformance_example_serves_a_real_blob_on_both_eras() {
     );
 
     drop(guard);
-    wait_until_released(addr).await;
+    wait_until_released(addr, RELEASE_TIMEOUT).await;
 }

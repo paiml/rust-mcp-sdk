@@ -60,9 +60,8 @@
 mod common;
 
 use common::v2::{
-    build_v2_server, default_client_capabilities, header, post, spawn_default_config,
-    v2_discover_body, v2_headers, META_CLIENT_CAPABILITIES, META_CLIENT_INFO,
-    META_PROTOCOL_VERSION, REQUEST_META_KEY, V1, V2,
+    build_v2_server, post, spawn_default_config, v2_body_claiming_version, v2_discover_body,
+    v2_headers, v2_headers_claiming, V1, V2,
 };
 use pmcp::types::protocol::error_codes::UNSUPPORTED_PROTOCOL_VERSION;
 use serde_json::{json, Value};
@@ -71,40 +70,27 @@ use serde_json::{json, Value};
 /// so it can never collide with a real accept-list entry.
 const UNSUPPORTED: &str = "v999.0.0";
 
+/// The method every probe in this file targets.
+const DISCOVER: &str = "server/discover";
+
 /// A `server/discover` body whose reserved `_meta` claims `version` rather than
 /// [`V2`], for the unsupported-version rejection probe.
 ///
-/// Built by hand rather than through `v2_body`, which hard-codes [`V2`] as the
-/// `_meta` protocol version — this probe's entire purpose is to claim a
-/// DIFFERENT one while keeping the other two reserved keys well-formed, so the
-/// rejection is attributable to the version alone.
+/// [`v2_body`] hard-codes [`V2`] as the `_meta` protocol version, and this probe's
+/// entire purpose is to claim a DIFFERENT one while keeping the other two reserved
+/// keys well-formed, so the rejection is attributable to the version alone —
+/// which is exactly what [`v2_body_claiming_version`] builds, through the shared
+/// `RequestMeta` seam.
+///
+/// [`v2_body`]: common::v2::v2_body
 fn discover_body_claiming_version(id: Value, version: &str) -> String {
-    let meta = json!({
-        META_PROTOCOL_VERSION: version,
-        META_CLIENT_INFO: { "name": "pmcp-test-client", "version": "0.0.0" },
-        META_CLIENT_CAPABILITIES: default_client_capabilities(),
-    });
-    let mut params = serde_json::Map::new();
-    params.insert(REQUEST_META_KEY.to_string(), meta);
-    // Built through a `Map` rather than the `json!` macro: the macro BORROWS its
-    // interpolated values, which would leave `id` passed by value but never
-    // consumed.
-    let mut body = serde_json::Map::new();
-    body.insert("jsonrpc".to_string(), json!("2.0"));
-    body.insert("id".to_string(), id);
-    body.insert("method".to_string(), json!("server/discover"));
-    body.insert("params".to_string(), Value::Object(params));
-    Value::Object(body).to_string()
+    v2_body_claiming_version(DISCOVER, id, json!({}), version)
 }
 
 /// The headers for the rejection probe: the SAME unsupported version the body's
 /// `_meta` claims, so the gate sees AGREEMENT and reaches the accept-list check.
 fn unsupported_headers(version: &str) -> Vec<(String, String)> {
-    vec![
-        header("mcp-method", "server/discover"),
-        header("mcp-name", ""),
-        header("mcp-protocol-version", version),
-    ]
+    v2_headers_claiming(DISCOVER, "", version)
 }
 
 /// Read `value` as a NON-EMPTY array of strings, or fail with the raw body.

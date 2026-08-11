@@ -36,9 +36,8 @@ mod common;
 
 use async_trait::async_trait;
 use common::v2::{
-    build_v2_server, default_client_capabilities, delete, get, header, post, post_raw,
-    spawn_default_config, v2_body, v2_headers, ALLOW, META_CLIENT_CAPABILITIES, META_CLIENT_INFO,
-    META_PROTOCOL_VERSION, REQUEST_META_KEY, V1, V2,
+    build_v2_server, delete, get, header, post, post_raw, spawn_default_config, v2_body,
+    v2_body_claiming_version, v2_headers, ALLOW, V1, V2,
 };
 // Both are reached only from the `v1-compat`-gated v1 controls below.
 #[cfg(feature = "v1-compat")]
@@ -55,30 +54,6 @@ use pmcp::types::protocol::ProtocolVersion;
 use pmcp::{RequestHandlerExtra, Server, ToolHandler};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, OnceLock};
-
-/// A v2-SHAPED request body whose reserved `_meta` claims `version` rather than
-/// [`V2`], for the unsupported-version rejection test.
-fn body_claiming_version(method: &str, id: Value, params: Value, version: &str) -> String {
-    let meta = json!({
-        META_PROTOCOL_VERSION: version,
-        META_CLIENT_INFO: { "name": "pmcp-test-client", "version": "0.0.0" },
-        META_CLIENT_CAPABILITIES: default_client_capabilities(),
-    });
-    let mut params = params;
-    params
-        .as_object_mut()
-        .expect("params is an object")
-        .insert(REQUEST_META_KEY.to_string(), meta);
-    // Built through a `Map` rather than the `json!` macro: the macro BORROWS its
-    // interpolated values, which would leave `id`/`params` passed by value but
-    // never consumed.
-    let mut body = serde_json::Map::new();
-    body.insert("jsonrpc".to_string(), json!("2.0"));
-    body.insert("id".to_string(), id);
-    body.insert("method".to_string(), json!(method));
-    body.insert("params".to_string(), params);
-    Value::Object(body).to_string()
-}
 
 /// The canonical v2 `tools/call` this file drives most assertions from.
 fn v2_call_body(id: Value) -> String {
@@ -553,7 +528,7 @@ async fn v2_unsupported_version_400_with_supported() {
             header("mcp-name", "search"),
             header("mcp-protocol-version", "1999-01-01"),
         ],
-        &body_claiming_version(
+        &v2_body_claiming_version(
             "tools/call",
             json!(10),
             json!({ "name": "search", "arguments": {} }),

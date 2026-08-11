@@ -579,6 +579,31 @@ pub const REQUEST_META_KEY: &str = "_meta";
 /// [`v2_body`] with an explicit `clientCapabilities` value, for tests that
 /// deliberately under-declare.
 pub fn v2_body_with_caps(method: &str, id: Value, params: Value, caps: Value) -> String {
+    v2_body_claiming(method, id, params, V2, caps)
+}
+
+/// [`v2_body`] whose reserved `_meta` claims `version` rather than [`V2`], for
+/// the unsupported-version rejection probes.
+///
+/// Routed through the SAME [`RequestMeta`] path as [`v2_body_with_caps`] with
+/// only the version parameterized, so the probe differs from a well-formed
+/// request in exactly one respect and a rejection is attributable to the version
+/// alone.
+///
+/// Prefer this over re-spelling `_meta` locally. A hand-rolled copy writes
+/// `REQUEST_META_KEY` / `META_*` OUTSIDE the `RequestMeta` seam and so loses the
+/// D-113-A protection this harness exists to provide: the typed request structs
+/// once carried a struct-level `rename_all = "camelCase"` that renamed the
+/// `_meta` FIELD to `meta`, silently dropping a conformant client's era signal.
+/// Only a body built through pmcp's own serializer round-trips exactly what the
+/// server deserializes.
+pub fn v2_body_claiming_version(method: &str, id: Value, params: Value, version: &str) -> String {
+    v2_body_claiming(method, id, params, version, default_client_capabilities())
+}
+
+/// The one place a v2 `params._meta` is constructed: all three reserved keys,
+/// with both the protocol version and the capabilities parameterized.
+fn v2_body_claiming(method: &str, id: Value, params: Value, version: &str, caps: Value) -> String {
     let mut params = match params {
         Value::Object(map) => Value::Object(map),
         _ => json!({}),
@@ -586,7 +611,7 @@ pub fn v2_body_with_caps(method: &str, id: Value, params: Value, caps: Value) ->
     // Built through pmcp's OWN `RequestMeta` serialization so the reserved-key
     // spelling round-trips exactly what the server deserializes.
     let meta = RequestMeta::new()
-        .with_meta(META_PROTOCOL_VERSION, json!(V2))
+        .with_meta(META_PROTOCOL_VERSION, json!(version))
         .with_meta(
             META_CLIENT_INFO,
             json!({ "name": "pmcp-test-client", "version": "0.0.0" }),
@@ -604,7 +629,12 @@ pub fn v2_body_with_caps(method: &str, id: Value, params: Value, caps: Value) ->
 /// Built through a `serde_json::Map` rather than the `json!` macro because the
 /// macro borrows its interpolated values, which would leave `id`/`params` as
 /// pass-by-value-but-not-consumed parameters.
-fn jsonrpc_envelope(method: &str, id: Value, params: Value) -> String {
+///
+/// `pub` because the matrix suites need to wrap a DELIBERATELY malformed or
+/// absent `params._meta` in a well-formed envelope, which the `_meta`-building
+/// helpers above cannot express. Three files had re-typed it verbatim, comment
+/// included, before it was exported.
+pub fn jsonrpc_envelope(method: &str, id: Value, params: Value) -> String {
     let mut body = serde_json::Map::new();
     body.insert("jsonrpc".to_string(), json!("2.0"));
     body.insert("id".to_string(), id);
@@ -730,10 +760,34 @@ pub fn v2_headers_for(method: &str, params: &Value) -> Vec<(String, String)> {
 /// [`v2_headers`] without the value encoder, for tests that deliberately send a
 /// malformed sentinel or a raw non-ASCII value.
 pub fn v2_headers_raw(method: &str, raw_name: &str) -> Vec<(String, String)> {
+    v2_headers_claiming(method, raw_name, V2)
+}
+
+/// [`v2_headers_raw`] with an explicit `MCP-Protocol-Version`, for the probes that
+/// must claim a version the server does not support.
+///
+/// `raw_name` is NOT sentinel-encoded, exactly as in [`v2_headers_raw`]; pass the
+/// empty string for a method that carries no routing name.
+///
+/// # The `Mcp-Name` question, settled here
+///
+/// `Mcp-Name` is ALWAYS emitted, empty string included. Two facts, both true:
+///
+/// - The OFFICIAL referee OMITS the header entirely on `server/discover`, which
+///   carries no routing name — since Phase 118 D-13 the server requires it only
+///   on name-bearing methods, so omission is conformant.
+/// - Emitting it empty is ALSO conformant, because that same D-13 rule has the
+///   server DISCARD an empty value on a method with no routing name.
+///
+/// The two wire shapes are therefore indistinguishable at the gate, so the
+/// harness emits the superset and callers stop restating the choice. A probe that
+/// must reproduce the referee's bytes exactly — rather than its behaviour — is the
+/// one case that should still build its own vector, and should say so.
+pub fn v2_headers_claiming(method: &str, raw_name: &str, version: &str) -> Vec<(String, String)> {
     vec![
         (MCP_METHOD.to_string(), method.to_string()),
         (MCP_NAME.to_string(), raw_name.to_string()),
-        (MCP_PROTOCOL_VERSION.to_string(), V2.to_string()),
+        (MCP_PROTOCOL_VERSION.to_string(), version.to_string()),
     ]
 }
 

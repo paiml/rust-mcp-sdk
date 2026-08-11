@@ -4,4 +4,6 @@
 //! this is the correct home for helpers that several `tests/*.rs` files share.
 //! Consume it with `mod common;` from a test binary.
 
+/// Subprocess harness for the legs that RUN a built example binary.
+pub mod example_process;
 pub mod v2;
