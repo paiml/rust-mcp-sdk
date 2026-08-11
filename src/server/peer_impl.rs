@@ -319,7 +319,9 @@ mod tests {
             crate::types::elicitation::ElicitRequestParams::Form { ref message, .. } => {
                 assert_eq!(message, "approve the deploy?", "the params must ride along");
             },
-            ref other => panic!("form params must survive the dispatch, got {other:?}"),
+            crate::types::elicitation::ElicitRequestParams::Url { ref url, .. } => {
+                panic!("form params must survive the dispatch, got a url elicitation for {url}")
+            },
         }
 
         dispatcher
