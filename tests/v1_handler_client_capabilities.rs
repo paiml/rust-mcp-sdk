@@ -238,9 +238,17 @@ impl SamplingHandler for CapturingSampling {
 /// their constructors, so an integration-test crate cannot build one with `_meta`
 /// set. Going through `from_value::<ClientRequest>` is both the only route and
 /// the one that exercises the real `_meta` field spelling.
+///
+/// The envelope is assembled through a `serde_json::Map` rather than the `json!`
+/// macro because the macro BORROWS its interpolated values, which would leave
+/// `params` a pass-by-value-but-not-consumed parameter — the same reason
+/// `tests/common/duplex.rs`'s `era_signalling_request` builds its envelope by
+/// hand.
 fn client_request(method: &str, params: Value) -> Request {
-    let envelope = json!({ "method": method, "params": params });
-    let parsed: ClientRequest = serde_json::from_value(envelope)
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("method".to_string(), Value::String(method.to_string()));
+    envelope.insert("params".to_string(), params);
+    let parsed: ClientRequest = serde_json::from_value(Value::Object(envelope))
         .unwrap_or_else(|e| panic!("`{method}` deserializes into ClientRequest ({e})"));
     Request::Client(Box::new(parsed))
 }
