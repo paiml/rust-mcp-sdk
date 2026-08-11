@@ -706,13 +706,58 @@ impl ServerCore {
         resolve_ingress_protocol_context(&self.supported_protocol_versions, request)
     }
 
-    /// Attach the cached peer handle to `extra` when a dispatcher is configured.
-    /// No-op on wasm32 (peer is non-wasm) and when no dispatcher is attached.
+    /// Attach a peer handle to `extra`, preferring the REQUEST-SCOPED one.
+    ///
+    /// No-op on wasm32 (peer is non-wasm), and — when neither source is present
+    /// — when no dispatcher is attached, exactly as before.
+    ///
+    /// # Precedence: the request-scoped transport handle wins (T-118.1-11-04)
+    ///
+    /// Two sources can supply a peer and they are NOT equivalent:
+    ///
+    /// 1. `self.peer_handle` — a SINGLE field on this core, set once by the
+    ///    in-process actor loop. One transport, one client, so one handle says
+    ///    everything there is to say.
+    /// 2. the `TransportBackchannel` riding THIS request's `ProtocolContext`,
+    ///    attached by the `StreamableHTTP` transport at the one site that knows
+    ///    which session the request arrived on.
+    ///
+    /// On a MULTIPLEXED transport (1) cannot express "the session that issued
+    /// this request": a handle set there is shared by every concurrent session,
+    /// so one client's `sampling/createMessage` would be delivered to whichever
+    /// session the global handle happened to be bound to — the T-113-07
+    /// misbinding class. (2) is constructed per request and bound to the
+    /// originating session, so it is always the more specific answer and is
+    /// therefore read FIRST.
+    ///
+    /// The in-process path is untouched: that loop attaches no backchannel, so
+    /// the `self.peer_handle` fallback below is what runs there.
+    ///
+    /// # Ordering
+    ///
+    /// Every dispatch site calls this AFTER its `tool_authorizer` check, so an
+    /// unauthorized caller returns before a handler body ever runs and therefore
+    /// never sees `extra.peer()` — the invariant stated at `src/shared/peer.rs`.
+    ///
+    /// Kept structurally identical to `Server::attach_peer` (`src/server/mod.rs`):
+    /// the two dispatch roots must never disagree about which peer a handler sees.
     #[inline]
     fn attach_peer(&self, extra: RequestHandlerExtra) -> RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(peer) = self.peer_handle.as_ref() {
-            return extra.with_peer(peer.clone());
+        {
+            // Cloned out of the borrow before `with_peer` consumes `extra`.
+            let request_scoped = extra
+                .protocol_context
+                .as_ref()
+                .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+                .and_then(crate::types::protocol::context::TransportBackchannel::peer)
+                .cloned();
+            if let Some(peer) = request_scoped {
+                return extra.with_peer(peer);
+            }
+            if let Some(peer) = self.peer_handle.as_ref() {
+                return extra.with_peer(peer.clone());
+            }
         }
         extra
     }
@@ -9271,5 +9316,132 @@ mod tests {
             );
             assert!(!seen.context.contains_key(COMPLETION_REF_PROMPT_KEY));
         }
+    }
+}
+
+// ===========================================================================
+// `ServerCore::attach_peer` precedence — the TWIN of the `Server` suite in
+// `src/server/mod.rs` (`peer_precedence_tests`).
+//
+// Phase 118.1 plan 11. Both dispatch roots read the request-scoped
+// `TransportBackchannel` before the global `peer_handle`, and the two must never
+// disagree about which peer a handler sees. The `Server` side is measured over
+// there; this is the same measurement on this side, so a future edit to one
+// impl cannot silently diverge from the other.
+// ===========================================================================
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod core_peer_precedence_tests {
+    use super::*;
+    use crate::shared::peer::PeerHandle;
+    use crate::types::protocol::context::TransportBackchannel;
+    use crate::types::protocol::{Era, ProtocolContext, ProtocolVersion};
+    use crate::types::roots::{ListRootsResult, Root};
+    use crate::types::sampling::{CreateMessageParams, CreateMessageResult};
+    use crate::types::ProgressToken;
+
+    /// A peer that reports WHICH source supplied it.
+    struct NamedPeer(&'static str);
+
+    #[async_trait]
+    impl PeerHandle for NamedPeer {
+        async fn sample(&self, _params: CreateMessageParams) -> Result<CreateMessageResult> {
+            Err(Error::protocol(
+                crate::ErrorCode::METHOD_NOT_FOUND,
+                "not the method under test",
+            ))
+        }
+
+        async fn list_roots(&self) -> Result<ListRootsResult> {
+            Ok(ListRootsResult {
+                roots: vec![Root {
+                    uri: format!("file:///{}", self.0),
+                    name: Some(self.0.to_string()),
+                }],
+            })
+        }
+
+        async fn progress_notify(
+            &self,
+            _token: ProgressToken,
+            _progress: f64,
+            _total: Option<f64>,
+            _message: Option<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn attached_peer_name(extra: &RequestHandlerExtra) -> Option<String> {
+        let peer = extra.peer()?;
+        let roots = peer.list_roots().await.expect("the fixture peer answers");
+        roots.roots.first().and_then(|r| r.name.clone())
+    }
+
+    fn context_with_peer(name: &'static str) -> ProtocolContext {
+        let peer: Arc<dyn PeerHandle> = Arc::new(NamedPeer(name));
+        ProtocolContext::new(
+            Era::V1,
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+        )
+        .with_transport_backchannel(TransportBackchannel::new().with_peer(peer))
+    }
+
+    fn extra_with_context(context: Option<ProtocolContext>) -> RequestHandlerExtra {
+        RequestHandlerExtra::new(
+            "req-attach-peer".to_string(),
+            RequestHandlerExtra::default().cancellation_token,
+        )
+        .with_protocol_context(context)
+    }
+
+    fn bare_core() -> ServerCore {
+        crate::server::builder::ServerCoreBuilder::new()
+            .name("attach-peer-precedence-core")
+            .version("1.0.0")
+            .build()
+            .expect("core builds")
+    }
+
+    /// THE precedence claim (T-118.1-11-04), measured on this dispatch root.
+    #[tokio::test]
+    async fn the_request_scoped_peer_wins_over_the_global_peer_handle() {
+        let mut core = bare_core();
+        core.peer_handle = Some(Arc::new(NamedPeer("global")));
+
+        let extra = core.attach_peer(extra_with_context(Some(context_with_peer(
+            "request-scoped",
+        ))));
+
+        assert_eq!(
+            attached_peer_name(&extra).await.as_deref(),
+            Some("request-scoped"),
+            "ServerCore must resolve the peer exactly as `Server` does: the request-scoped \
+             transport handle wins over the global one"
+        );
+    }
+
+    /// The in-process fallback is untouched here too.
+    #[tokio::test]
+    async fn the_global_handle_still_applies_when_no_backchannel_rides_the_context() {
+        let mut core = bare_core();
+        core.peer_handle = Some(Arc::new(NamedPeer("global")));
+
+        let extra = core.attach_peer(extra_with_context(None));
+        assert_eq!(
+            attached_peer_name(&extra).await.as_deref(),
+            Some("global"),
+            "with no backchannel the global handle must still apply"
+        );
+    }
+
+    /// Neither source configured: still a no-op.
+    #[tokio::test]
+    async fn attach_peer_is_a_no_op_when_neither_source_is_configured() {
+        let core = bare_core();
+        let extra = core.attach_peer(extra_with_context(None));
+        assert!(
+            extra.peer().is_none(),
+            "with no global handle and no backchannel, `extra.peer()` stays None"
+        );
     }
 }
