@@ -557,9 +557,8 @@ impl RequestHandlerExtra {
     /// that returns a plain `Value` and does NOT override
     /// [`ToolHandler::handle_output`](crate::server::ToolHandler::handle_output))
     /// to attach task augmentation or custom `_meta` without owning the full
-    /// envelope. The keys are accumulated in an interior-mutable slot and, on the
-    /// **Payload dispatch path**, merged onto the server-built `CallToolResult`'s
-    /// `_meta` after the handler returns.
+    /// envelope. The keys are accumulated in an interior-mutable slot and merged
+    /// onto the outgoing `CallToolResult`'s `_meta` after the handler returns.
     ///
     /// Takes `&self`: the slot is interior-mutable, so this works even though the
     /// handler receives `RequestHandlerExtra` by value (the slot `Arc` is shared
@@ -577,12 +576,26 @@ impl RequestHandlerExtra {
     ///
     /// # Path scope
     ///
-    /// This affects the **Payload path ONLY**. It is **IGNORED** on the
-    /// [`ToolOutput::Result`](crate::server::ToolOutput::Result) path — a handler
-    /// that returns a full `CallToolResult` owns its entire envelope (including
-    /// `_meta`) and must set related-task metadata on that value directly, e.g.
-    /// via
-    /// [`CallToolResult::with_related_task`](crate::types::CallToolResult::with_related_task).
+    /// This applies on **both** tool-output paths, on **both** dispatchers
+    /// (`Server` and `ServerCore`):
+    ///
+    /// - **Payload path** — the keys merge onto the envelope the dispatcher
+    ///   builds (text-wrap / widget enrichment / `outputSchema` bridge).
+    /// - **[`ToolOutput::Result`](crate::server::ToolOutput::Result) (verbatim)
+    ///   path** — since D-06 (Phase 118.1) the keys merge onto the envelope the
+    ///   HANDLER authored, immediately before it is emitted. That arm still
+    ///   bypasses response middleware, the task create-path gate and the
+    ///   text-wrap tail (D-04 / D-04a); the bypass covers the response
+    ///   *pipeline*, not the handler's own `_meta`, which is authored by the same
+    ///   handler at the same trust level as the envelope itself. Before D-06 the
+    ///   keys were silently DROPPED here.
+    ///
+    /// A verbatim handler may of course still set `_meta` on the value directly,
+    /// e.g. via
+    /// [`CallToolResult::with_related_task`](crate::types::CallToolResult::with_related_task);
+    /// when it does both, the merge precedence above decides — the
+    /// `set_result_meta` key wins the collision, and the envelope's unrelated
+    /// keys survive.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_result_meta(&self, meta: serde_json::Map<String, serde_json::Value>) {
         let mut guard = self
@@ -1067,5 +1080,96 @@ mod tests {
         let debug_out = format!("{:?}", extra);
         // http::Extensions Debug prints type names, not field values
         assert!(!debug_out.contains("SECRET_VALUE_DO_NOT_LEAK"));
+    }
+}
+
+/// Property tests for the `_meta` merge both dispatchers now call on BOTH
+/// output paths (D-06, Phase 118.1 plan 09).
+///
+/// The verbatim `ToolOutput::Result` arm merges handler-authored keys into an
+/// envelope the HANDLER built, which can already carry widget, native and
+/// related-task keys. A whole-map replace there would silently destroy them, so
+/// the merge invariants are stated as properties over arbitrary key sets rather
+/// than over the handful of literals the integration fences happen to use
+/// (T-118.1-09-04).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod merge_result_meta_properties {
+    use super::merge_result_meta;
+    use crate::types::CallToolResult;
+    use proptest::prelude::*;
+    use serde_json::{Map, Value};
+
+    /// Arbitrary `_meta`-shaped map: reverse-DNS-ish keys, scalar values.
+    fn meta_map_strategy() -> impl Strategy<Value = Map<String, Value>> {
+        proptest::collection::hash_map("[a-z]{1,6}/[a-z]{1,6}", 0u64..1000, 0..8).prop_map(|m| {
+            m.into_iter()
+                .map(|(k, v)| (k, Value::from(v)))
+                .collect::<Map<String, Value>>()
+        })
+    }
+
+    proptest! {
+        /// Handler keys win; every existing key that the handler did NOT name
+        /// survives untouched; the result is exactly the union of both key sets.
+        #[test]
+        fn merge_is_a_union_with_handler_keys_winning(
+            existing in meta_map_strategy(),
+            handler in meta_map_strategy(),
+        ) {
+            let mut result = CallToolResult::new(vec![]);
+            if !existing.is_empty() {
+                result = result.with_meta(existing.clone());
+            }
+
+            merge_result_meta(&mut result, handler.clone());
+
+            if existing.is_empty() && handler.is_empty() {
+                // Nothing to merge and nothing pre-existing: no `_meta` is
+                // fabricated, so a no-opt-in handler stays byte-identical.
+                prop_assert!(result._meta.is_none());
+                return Ok(());
+            }
+
+            let merged = result._meta.as_ref().expect("_meta present after a non-empty merge");
+
+            for (key, value) in &handler {
+                prop_assert_eq!(merged.get(key), Some(value), "handler key must win: {}", key);
+            }
+            for (key, value) in &existing {
+                if !handler.contains_key(key) {
+                    prop_assert_eq!(
+                        merged.get(key),
+                        Some(value),
+                        "unrelated existing key must survive: {}",
+                        key
+                    );
+                }
+            }
+
+            let mut union: std::collections::BTreeSet<&String> = existing.keys().collect();
+            union.extend(handler.keys());
+            prop_assert_eq!(merged.len(), union.len(), "merge must add no keys of its own");
+        }
+
+        /// Merging is idempotent: applying the same handler map twice cannot
+        /// drift (repeated drains on a retried dispatch stay safe).
+        #[test]
+        fn merge_is_idempotent(
+            existing in meta_map_strategy(),
+            handler in meta_map_strategy(),
+        ) {
+            let mut once = CallToolResult::new(vec![]);
+            let mut twice = CallToolResult::new(vec![]);
+            if !existing.is_empty() {
+                once = once.with_meta(existing.clone());
+                twice = twice.with_meta(existing);
+            }
+
+            merge_result_meta(&mut once, handler.clone());
+            merge_result_meta(&mut twice, handler.clone());
+            merge_result_meta(&mut twice, handler);
+
+            prop_assert_eq!(once._meta, twice._meta);
+        }
     }
 }
