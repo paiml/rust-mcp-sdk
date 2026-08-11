@@ -469,3 +469,235 @@ async fn a_flooding_handler_cannot_grow_the_response_without_bound() {
         response.raw.len()
     );
 }
+
+// ===========================================================================
+// Plan 12 Task 3: the dual-conformance EXAMPLE is RUN, on BOTH eras.
+//
+// `make test-examples` only BUILDS examples, so "the conformance target emits
+// progress" would otherwise be an unenforced claim — the Phase-115 gate
+// precedent, and the exact false green the cross-AI review flagged for this
+// plan. This leg spawns the ALREADY-BUILT binary, drives `test_tool_with_progress`
+// on both eras, records the observed bytes as artifacts, and asserts a NON-ZERO
+// progress-frame count in each.
+//
+// It FAILS rather than skipping when the binary is absent (`spawn_example`'s own
+// assertion), because a skip restores the criterion this leg exists to close.
+// ===========================================================================
+
+/// The example's compiled path, relative to the crate manifest's target dir.
+const EXAMPLE_REL_PATH: &str = "debug/examples/s54_v2_dual_conformance";
+
+/// Port 8155, deliberately.
+///
+/// 8147 is `s47_v2_stateless_mrtr`, 8149 is this example's own default, 8150 is
+/// `s50`/`s51`, 8151 belongs to `scripts/run-conformance-suite.sh`, 8153 is held
+/// by plan 04's leg in `tests/completion_complete.rs` and 8157 by plan 03's leg
+/// in `tests/embedded_resource_example_run.rs` — both of which run CONCURRENTLY
+/// with this one under nextest. 8155 appears only as the fallback hint inside the
+/// example's own bind-failure message and is bound by nothing.
+const EXAMPLE_BIND_ADDR: &str = "127.0.0.1:8155";
+
+/// The tool name the pinned scenario requires, verbatim from `dist/index.js`:
+/// `n.request("tools/call", { name: "test_tool_with_progress", arguments: {},
+/// _meta: { progressToken: "progress-test-1" } })`.
+const SCENARIO_TOOL: &str = "test_tool_with_progress";
+
+/// Where the v1 leg's raw SSE bytes land, for the SUMMARY to quote.
+const V1_FRAMES_ARTIFACT: &str = "118.1-12-example-v1-frames.txt";
+
+/// Where the v2 leg's raw POST body lands.
+const V2_BODY_ARTIFACT: &str = "118.1-12-example-v2-body.txt";
+
+/// How long the child gets to bind before the leg gives up.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the port gets to become free again after the child is killed.
+const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the v1 SSE reader holds the stream open collecting frames.
+///
+/// The tool spends 2 x 120 ms sleeping (see `PROGRESS_INTERVAL` in the example),
+/// so this must comfortably exceed that. The reader stops EARLY once it has seen
+/// the result frame, so the full window is only spent on a failure.
+const V1_COLLECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Read a v1 session's GET SSE stream RAW, holding it open.
+///
+/// # Why a raw socket and not the harness's `get()`
+///
+/// `common::v2::get` (and pmcp's own `StreamableHttpTransport` client) read the
+/// body to EOF. A v1 session SSE stream NEVER ends, so both hang — that is the
+/// client-transport gap plan 11 recorded in `deferred-items.md`, and it is why
+/// `tests/http_peer_roundtrip.rs` drives its v1 assertions from a raw TCP reader
+/// too. The server half is not in question here; the reader is.
+///
+/// Returns the bytes observed, chunked-transfer framing included. The assertion
+/// downstream counts occurrences of `notifications/progress` in those bytes
+/// rather than parsing them, so a chunk boundary landing mid-line cannot turn a
+/// real frame into a false negative for the COUNT — and the raw bytes are written
+/// to disk either way.
+async fn read_v1_session_stream(
+    addr: std::net::SocketAddr,
+    session: &str,
+    trigger: impl std::future::Future<Output = ()>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the example accepts a GET connection");
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\
+         Mcp-Session-Id: {session}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("the GET request is written");
+
+    // The stream must be OPEN before the call is issued, or the server has
+    // nowhere to route the notifications and drops them. Read the response head
+    // first, which the server writes as soon as it accepts the stream.
+    let mut observed = String::new();
+    let mut buffer = [0_u8; 8192];
+    let deadline = tokio::time::Instant::now() + V1_COLLECT_WINDOW;
+    while !observed.contains("\r\n\r\n") {
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut buffer))
+            .await
+            .expect("the example answers the GET before the deadline")
+            .expect("the GET stream is readable");
+        assert!(read > 0, "the example closed the SSE stream immediately");
+        observed.push_str(&String::from_utf8_lossy(&buffer[..read]));
+    }
+
+    trigger.await;
+
+    // Collect until the result frame arrives or the window closes. Stopping on
+    // the result frame keeps the happy path fast; the window is the failure bound.
+    while tokio::time::Instant::now() < deadline && !observed.contains("\"result\"") {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => observed.push_str(&String::from_utf8_lossy(&buffer[..read])),
+            Ok(Err(error)) => panic!("the v1 SSE stream errored: {error}"),
+        }
+    }
+    observed
+}
+
+/// A `tools/call` body for the scenario's tool with its exact progress token.
+fn scenario_call_body(era_body: fn(&str, Value, Value) -> String, id: Value) -> String {
+    let base = era_body(
+        "tools/call",
+        id,
+        json!({ "name": SCENARIO_TOOL, "arguments": {} }),
+    );
+    let mut value: Value = serde_json::from_str(&base).expect("harness body parses");
+    value["params"]["_meta"]["progressToken"] = json!(TOKEN);
+    value.to_string()
+}
+
+#[tokio::test]
+async fn the_dual_conformance_example_emits_progress_on_both_eras() {
+    use common::example_process::{
+        spawn_example, target_dir, wait_until_listening, wait_until_released,
+    };
+    use common::v2::{header, post, v1_body, v2_headers};
+    use pmcp::shared::http_constants::MCP_SESSION_ID;
+    use pmcp::types::protocol::LATEST_PROTOCOL_VERSION;
+
+    let (addr, mut guard) = spawn_example(EXAMPLE_REL_PATH, EXAMPLE_BIND_ADDR);
+    wait_until_listening(addr, &mut guard, READY_TIMEOUT).await;
+
+    // --- v1: handshake, hold the session stream open, then call. -----------
+    let init = post(
+        addr,
+        &[],
+        &v1_body(
+            "initialize",
+            json!(0),
+            json!({
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "v2-sse-progress-example-run", "version": "0.0.0" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        init.status, 200,
+        "the v1 handshake must succeed before the progress call: {}",
+        init.raw
+    );
+    let session = init
+        .mcp_session_id
+        .clone()
+        .unwrap_or_else(|| panic!("the example minted no session id: {}", init.raw));
+
+    let v1_frames = read_v1_session_stream(addr, &session, async {
+        let call = post(
+            addr,
+            &[header(MCP_SESSION_ID, &session)],
+            &scenario_call_body(v1_body, json!(1)),
+        )
+        .await;
+        // 202, not 200, and that is the POINT: with a live session stream open,
+        // `build_response` routes the reply INTO that stream and answers the POST
+        // with a bare `202 Accepted`. A 200 here would mean the stream was NOT
+        // open and the reply fell back to the one-shot SSE body — in which case
+        // every progress notification would have been dropped and the frame count
+        // below would be measuring nothing.
+        assert_eq!(
+            call.status, 202,
+            "the v1 progress call must be ACCEPTED into the open session stream: {}",
+            call.raw
+        );
+    })
+    .await;
+
+    // --- v2: the POST response body IS the stream. -------------------------
+    let v2 = post_with_accept(
+        addr,
+        ACCEPT_SSE,
+        &v2_headers("tools/call", SCENARIO_TOOL),
+        &scenario_call_body(v2_body, json!(2)),
+    )
+    .await;
+
+    // BOTH legs are recorded BEFORE either is asserted, so a failure on one era
+    // is still diagnosed against a recording of both (the plan-02 lesson).
+    let v1_path = target_dir().join(V1_FRAMES_ARTIFACT);
+    let v2_path = target_dir().join(V2_BODY_ARTIFACT);
+    std::fs::write(&v1_path, &v1_frames)
+        .unwrap_or_else(|e| panic!("could not write {}: {e}", v1_path.display()));
+    std::fs::write(&v2_path, &v2.raw)
+        .unwrap_or_else(|e| panic!("could not write {}: {e}", v2_path.display()));
+
+    let v1_count = v1_frames.matches("notifications/progress").count();
+    let v2_count = progress_frames(&v2.raw).len();
+
+    assert!(
+        v1_count >= EXPECTED_PROGRESS_FRAMES,
+        "v1 (2025-11-25): the example must put at least {EXPECTED_PROGRESS_FRAMES} progress \
+         frames on the session stream — that is the floor the pinned scenario asserts. \
+         Saw {v1_count}. Recorded at {}. Stream was:\n{v1_frames}",
+        v1_path.display()
+    );
+    assert!(
+        v2_count >= EXPECTED_PROGRESS_FRAMES,
+        "v2 (2026-07-28): the example must put at least {EXPECTED_PROGRESS_FRAMES} progress \
+         frames on the POST RESPONSE BODY. Saw {v2_count}. Recorded at {}. Body was:\n{}",
+        v2_path.display(),
+        v2.raw
+    );
+    assert!(
+        v2.content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/event-stream")),
+        "and the v2 answer is SSE-framed; got {:?}: {}",
+        v2.content_type,
+        v2.raw
+    );
+
+    drop(guard);
+    wait_until_released(addr, RELEASE_TIMEOUT).await;
+}
