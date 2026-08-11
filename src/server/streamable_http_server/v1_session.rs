@@ -791,6 +791,34 @@ async fn replay_sse_events_from_header(
 /// store write in parallel.
 ///
 /// `event_store` comes from [`resumability_store`], so a v2 stream writes nothing.
+///
+/// # The payload is [`serialize_message`], NOT `serde_json::to_string`
+///
+/// [`TransportMessage`] is `#[serde(untagged)]`, so serializing it directly emits
+/// the STRUCT, not a JSON-RPC frame. `serialize_message`'s own rustdoc records
+/// this and it is not a style preference — the two encodings differ for two of
+/// the three variants:
+///
+/// | variant | raw `serde_json` | [`serialize_message`] |
+/// | ------- | ---------------- | --------------------- |
+/// | `Response` | `{"jsonrpc":"2.0","id":…,"result":…}` | identical |
+/// | `Request` | `{"id":…,"request":{"method":…}}` — unparseable | `{"jsonrpc":"2.0","id":…,"method":…,"params":…}` |
+/// | `Notification` | the params object ALONE, with no `method` and no `jsonrpc` | `{"jsonrpc":"2.0","method":…,"params":…}` |
+///
+/// Until phase 118.1 only `Response` ever reached a v1 SSE stream, where the two
+/// agree byte for byte — which is why the defect stayed latent. Plan 10 gave the
+/// transport a server-to-client REQUEST path and plan 11 a progress-NOTIFICATION
+/// path, and both are unparseable under the raw encoding: a client receiving
+/// `{"id":…,"request":…}` cannot dispatch it, and `parse_message` rejects it with
+/// "Unknown message type". Routing through the shared encoder means this stream
+/// speaks the same wire language as stdio, WebSocket and the WASM fetch
+/// transport, from ONE definition.
+///
+/// A serialization failure yields an EMPTY data payload rather than a panic. It
+/// is unreachable in practice — the only serde failure modes for these types are
+/// non-finite floats, and `ServerProgressReporter::validate_values` rejects those
+/// before a notification is ever constructed — but a formatter on the response
+/// path must not be able to abort the stream.
 fn sse_event_for_message(
     msg: &TransportMessage,
     session_id: &str,
@@ -806,10 +834,11 @@ fn sse_event_for_message(
             let _ = store.store_event(&sid, &event_id_clone, &msg_clone).await;
         });
     }
-    Event::default()
-        .id(event_id)
-        .event("message")
-        .data(serde_json::to_string(msg).unwrap())
+    let data = crate::shared::transport::serialize_message(msg)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    Event::default().id(event_id).event("message").data(data)
 }
 
 /// Read the inbound `Mcp-Session-Id` request header.

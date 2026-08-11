@@ -463,7 +463,21 @@ const DEP_RESULT_STATUS_FIELD: &str = "status";
 /// `status` when the whole capability round trip finished.
 const DEP_STATUS_COMPLETED: &str = "completed";
 /// `status` when the era target declined to reach for the capability at all.
+///
+/// No longer the EXPECTED v1 value — phase 118.1 closed G-3's server half — but
+/// still named here because it is one of the two regressions the tripwire below
+/// must be able to describe: a return to this value means the peer went absent
+/// again.
 const DEP_STATUS_CAPABILITY_NOT_OFFERED: &str = "capability-not-offered";
+/// `status` when the peer WAS present, the request WAS issued, and no live
+/// client stream existed to deliver it on.
+///
+/// The v1 expectation since phase 118.1 plan 11. See
+/// `era_target::DEP_STATUS_NO_LIVE_STREAM` for the full account, and re-spelled
+/// here rather than imported for the same reason every other token in this
+/// block is: a test that reads its expectation out of the code under test
+/// asserts nothing.
+const DEP_STATUS_NO_LIVE_STREAM: &str = "no-live-stream";
 
 /// The per-request v2 `_meta` key that REPLACES the `logging/setLevel` RPC.
 const LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
@@ -575,27 +589,38 @@ fn era_transport(url: &url::Url) -> pmcp::shared::streamable_http::StreamableHtt
 /// that positively BEFORE it is built, so a future transport swap fails loudly
 /// here instead of silently degrading to v1.
 ///
-/// # Two measured SDK gaps are pinned here rather than papered over
+/// # What the two tripwired arms assert NOW
 ///
 /// Phase 118 decision D-21 scopes the conformance claim to what genuinely
-/// passes and DECLARES the rest. Two arms below therefore assert measured
-/// reality with a tripwire message, not the seeded expectation:
+/// passes and DECLARES the rest, so these arms assert measured reality with a
+/// tripwire message rather than a seeded expectation. What that reality IS moved
+/// during phase 118.1; the history is kept so a reader can tell a fix from a
+/// regression.
 ///
-/// * **v2 `logging/setLevel` is still SERVED** (gap G-5 in
-///   `118-CONFORMANCE-GAPS.md`). `src/server/mod.rs:1897-1901` lumps
+/// * **v2 `logging/setLevel` is still SERVED.** `src/server/mod.rs` lumps
 ///   `SetLoggingLevel` in with `Subscribe`/`Complete`/`Ping` and answers
 ///   `Ok(json!({}))` with no era branch anywhere in `src/`. The REPLACEMENT
 ///   mechanism works — the `_meta` arm below proves it — only the retirement of
-///   the old RPC is missing.
-/// * **v1 Sampling/Roots are unreachable over `StreamableHttpServer`** (gap
-///   G-3). Measured here: the server-to-client peer handle is set only in
-///   `Server::run()` (`src/server/mod.rs:1173`), which `StreamableHttpServer`
-///   never calls, so `extra.peer()` is `None`; and
-///   `RequestHandlerExtra::client_capabilities()` is populated only from the v2
-///   per-request `_meta` reserved key
-///   (`src/types/protocol/context.rs:384-390`), never from the v1 `initialize`
-///   handshake, so a v1 tool handler cannot see what the client declared. The
-///   v1 MECHANISM itself is proved to complete by
+///   the old RPC is missing. (Gap G-5 in `118-CONFORMANCE-GAPS.md` was CLOSED by
+///   phase 118.1 plan 05 for the verbs it named; this `logging/setLevel`
+///   observation is what survives it.)
+/// * **v1 Sampling/Roots now REACH the capability over `StreamableHttpServer`,
+///   and stop one hop short of completing.** The status this file asserts is
+///   `no-live-stream`, not `capability-not-offered`, and the difference is the
+///   whole of gap G-3's server half:
+///   - phase 118.1 plan 08 folded the v1 `initialize` handshake capabilities
+///     into the per-request context, so `client_capabilities()` is populated on
+///     v1 (it was previously fed only by the v2 `_meta` reserved key — gap G-9);
+///   - plans 10 and 11 put a SESSION-BOUND peer handle on the `StreamableHTTP`
+///     dispatch path, so `extra.peer()` is `Some` (it was previously set only in
+///     `Server::run()`, which this transport never calls).
+///   The remaining hop is CLIENT-side and outside this crate: pmcp's own
+///   `StreamableHttpTransport` collects a GET SSE body to completion instead of
+///   reading it as a live stream, so it registers no receiver and the server
+///   fails the correlation at once. The SERVER half is measured directly, and
+///   green, by `tests/http_peer_roundtrip.rs` in the `pmcp` crate, which drives
+///   `sample`, `list_roots` and `elicit` to completion over v1 HTTP with a client
+///   that does hold a live stream. The v1 MECHANISM in-process is proved by
 ///   [`v1_sampling_and_roots_complete_via_server_to_client_requests`].
 #[tokio::test]
 async fn deprecated_capabilities_complete_under_both_eras() {
@@ -660,9 +685,11 @@ async fn v1_capability_arm(url: &url::Url) {
          WHAT TO DO: re-read the era gate in the target's log tool.\n  {logged}"
     );
 
-    // SAMPLING and ROOTS, v1 mechanism, over StreamableHttpServer. See the
-    // G-3 note on this module's CONF-03 test: both COMPLETE as tool calls, and
-    // both report that the target never reached for the capability.
+    // SAMPLING and ROOTS, v1 mechanism, over StreamableHttpServer. The target
+    // now REACHES for the capability — phase 118.1 plans 08/10/11 closed the
+    // server half of G-3 — and the request is issued and then fails fast because
+    // pmcp's own client transport holds no live GET SSE stream to receive it on.
+    // See the module doc for the full account.
     for tool in ["dep__request_sampling", "dep__list_roots"] {
         let result = payload(
             &client
@@ -673,12 +700,19 @@ async fn v1_capability_arm(url: &url::Url) {
         assert_field(
             &result,
             DEP_RESULT_STATUS_FIELD,
-            DEP_STATUS_CAPABILITY_NOT_OFFERED,
+            DEP_STATUS_NO_LIVE_STREAM,
             &format!(
-                "v1 {tool} over StreamableHttpServer (gap G-3). If this now reports \
-                 `{DEP_STATUS_COMPLETED}`, G-3 HAS BEEN FIXED: the peer handle now reaches the \
-                 HTTP dispatch path. That is good news — update THIS assertion and re-measure \
-                 baseline rows ERA-13/ERA-14, whose v1 token is `absent` for exactly this reason"
+                "v1 {tool} over StreamableHttpServer. Two regressions are possible here and they \
+                 mean OPPOSITE things.\n\
+                 IF THIS REPORTS `{DEP_STATUS_CAPABILITY_NOT_OFFERED}`: the peer handle has gone \
+                 ABSENT from the HTTP dispatch path again, or the v1 handshake capabilities have \
+                 stopped reaching the request context. That is a SERVER REGRESSION of gap G-3 — \
+                 re-run `cargo nextest run -E 'binary(http_peer_roundtrip)'`, which measures the \
+                 server half directly and must be green.\n\
+                 IF THIS REPORTS `{DEP_STATUS_COMPLETED}`: pmcp's `StreamableHttpTransport` \
+                 CLIENT has learned to hold a live GET SSE stream, so the round trip now lands. \
+                 That is good news — update THIS assertion and re-measure baseline rows \
+                 ERA-13/ERA-14."
             ),
         );
     }

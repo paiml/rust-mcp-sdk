@@ -117,3 +117,27 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   registration, no HTTP involved), and the e2e failures need a browser harness. None of the
   three subsystems reaches the v2 HTTP header gate. Not touched. Owner: whoever next owns
   those crates.
+
+- **pmcp's own `StreamableHttpTransport` CLIENT cannot hold a live GET SSE stream, so it can
+  receive NO server-initiated message over v1 HTTP.** Found 2026-08-11 by plan 118.1-11 while
+  flipping the era-matrix G-3 tripwire. `StreamableHttpTransport::start_sse`
+  (`src/shared/streamable_http.rs`) issues the GET and then calls
+  `Self::collect_body_within_cap(response, ..)` — a WHOLE-BODY read — before handing the result
+  to `SseParser::feed_complete_body`. Its own rustdoc states the design plainly: *"this body was
+  already read into memory in one piece, not a chunk of a live stream"*. A v1 session SSE stream
+  never ends, so there is nothing to collect; the client consequently registers no receiver and
+  the server's `route_to_session_stream` finds no stream for the session.
+  **This is a CLIENT gap, not the server gap G-3 named.** The SERVER half is closed and measured
+  green by `tests/http_peer_roundtrip.rs` (12 tests: `sample`, `list_roots`, `elicit`, progress,
+  session isolation, the deadlock guard), whose client is a raw TCP reader that DOES hold the
+  stream open. The consequence for the era matrix is that
+  `deprecated_capabilities_complete_under_both_eras` asserts `no-live-stream` rather than
+  `completed` — the request is issued and fails fast (plan 10's `NO_LIVE_STREAM`), which is the
+  correct server behaviour for a client that declared `sampling` and then opened nothing to
+  receive on.
+  NOT fixed here: making the client read a live SSE stream incrementally is an architectural
+  change to a public transport (Rule 4), it is outside this plan's `files_modified`, and it needs
+  its own concurrency and shutdown design plus a bound on the in-flight parser. Owner: a
+  follow-on client-transport phase. Plan 118.1-13 should record G-3's disposition as
+  **server FIXED / client OPEN** rather than a flat FIXED, citing `binary(http_peer_roundtrip)`
+  and `binary(era_matrix)`.

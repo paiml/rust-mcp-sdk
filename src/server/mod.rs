@@ -1207,18 +1207,124 @@ impl Server {
         Self::run_main_loop(actor).await
     }
 
-    /// Attach the cached peer handle to `extra` when a dispatcher is configured.
-    /// No-op on wasm32 and when running outside the `run()` lifecycle.
+    /// Attach a peer handle to `extra`, preferring the REQUEST-SCOPED one.
+    ///
+    /// No-op on wasm32, and — when neither source is present — outside the
+    /// `run()` lifecycle, exactly as before.
+    ///
+    /// # Precedence: the request-scoped transport handle wins (T-118.1-11-04)
+    ///
+    /// Two sources can supply a peer and they are NOT equivalent:
+    ///
+    /// 1. `self.peer_handle` — a SINGLE field on `Server`, set once by
+    ///    [`Server::run`] for the in-process actor loop. One transport, one
+    ///    client, so one handle says everything there is to say.
+    /// 2. the [`TransportBackchannel`](crate::types::protocol::context::TransportBackchannel)
+    ///    riding THIS request's `ProtocolContext`, attached by the
+    ///    `StreamableHTTP` transport at the one site that knows which session the
+    ///    request arrived on.
+    ///
+    /// On a MULTIPLEXED transport (1) cannot express "the session that issued
+    /// this request": a handle set there is shared by every concurrent session,
+    /// so one client's `sampling/createMessage` would be delivered to whichever
+    /// session the global handle happened to be bound to — the T-113-07
+    /// misbinding class. (2) is constructed per request and bound to the
+    /// originating session, so it is always the more specific answer and is
+    /// therefore read FIRST.
+    ///
+    /// The in-process path is untouched: `Server::run` attaches no backchannel,
+    /// so the `self.peer_handle` fallback below is what runs there.
+    ///
+    /// # Ordering
+    ///
+    /// Every dispatch site calls this AFTER its `tool_authorizer` check, so an
+    /// unauthorized caller returns before a handler body ever runs and therefore
+    /// never sees `extra.peer()` — the invariant stated at `src/shared/peer.rs`.
     #[inline]
     fn attach_peer(
         &self,
         extra: crate::server::cancellation::RequestHandlerExtra,
     ) -> crate::server::cancellation::RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(peer) = self.peer_handle.as_ref() {
-            return extra.with_peer(peer.clone());
+        {
+            // Cloned out of the borrow before `with_peer` consumes `extra`.
+            let request_scoped = extra
+                .protocol_context
+                .as_ref()
+                .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+                .and_then(crate::types::protocol::context::TransportBackchannel::peer)
+                .cloned();
+            if let Some(peer) = request_scoped {
+                return extra.with_peer(peer);
+            }
+            if let Some(peer) = self.peer_handle.as_ref() {
+                return extra.with_peer(peer.clone());
+            }
         }
         extra
+    }
+
+    /// The one-way notification sink this request's progress reporter emits
+    /// through, or `None` when the request has no vehicle at all.
+    ///
+    /// # Precedence mirrors [`Server::attach_peer`], for the same reason
+    ///
+    /// 1. the `TransportBackchannel`'s `notification_sink` on THIS request's
+    ///    `ProtocolContext` — session-bound, supplied by the `StreamableHTTP`
+    ///    transport at the one site that knows which session the request arrived
+    ///    on;
+    /// 2. `self.notification_tx`, the server-wide channel assigned by
+    ///    [`Server::run`] and by nothing else.
+    ///
+    /// The second is `None` on every HTTP-served server, because
+    /// `StreamableHttpServer` never calls `Server::run()`. That is precisely why
+    /// `extra.report_progress(..)` was silently inert over HTTP before phase
+    /// 118.1: `RequestHandlerExtra::report_progress` returns `Ok(())` when the
+    /// reporter is `None`, so the gap produced no error anywhere.
+    ///
+    /// The sink is handed through with NO adapter — the transport chose its type
+    /// to be `ServerProgressReporter::new`'s second parameter verbatim.
+    #[inline]
+    fn progress_notification_sink(
+        &self,
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] protocol_context: Option<
+            &crate::types::protocol::ProtocolContext,
+        >,
+    ) -> Option<Arc<dyn Fn(Notification) + Send + Sync>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(sink) = protocol_context
+            .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+            .and_then(crate::types::protocol::context::TransportBackchannel::notification_sink)
+        {
+            return Some(Arc::clone(sink));
+        }
+        let tx = self.notification_tx.as_ref()?.clone();
+        Some(Arc::new(move |notification| {
+            let _ = tx.try_send(notification);
+        }))
+    }
+
+    /// Build this request's progress reporter, or `None` when the client asked
+    /// for no progress or the request carries no notification vehicle.
+    ///
+    /// The `progress_token` lookup is unchanged: a request with no
+    /// `params._meta.progressToken` still gets no reporter, so a handler that
+    /// calls `extra.report_progress(..)` anyway stays silent. Only the SENDER
+    /// resolution moved — see [`Server::progress_notification_sink`].
+    ///
+    /// ONE construction site for all three dispatchers (tools, prompts,
+    /// resources): they had three byte-identical copies, and a fourth would have
+    /// been the one that kept reading `self.notification_tx` alone.
+    #[inline]
+    fn progress_reporter_for(
+        &self,
+        meta: Option<&crate::types::protocol::RequestMeta>,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> Option<Arc<dyn crate::server::progress::ProgressReporter>> {
+        let token = meta.and_then(|meta| meta.progress_token.as_ref())?;
+        let sink = self.progress_notification_sink(protocol_context)?;
+        let reporter = crate::server::progress::ServerProgressReporter::new(token.clone(), sink);
+        Some(Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>)
     }
 
     /// Spawn the outgoing-notification forwarder.
@@ -2089,24 +2195,13 @@ impl Server {
             }
         }
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the channel
+        // `extra.report_progress(..)` actually reads. Resolved BEFORE
+        // `protocol_context` is moved into `extra` below, because the transport's
+        // session-bound sink rides on it (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Clone the validated auth context for the create-path owner resolution
         // (the original is moved into `extra` below). This guarantees the
@@ -2428,24 +2523,12 @@ impl Server {
             .create_token(request_id_str.clone())
             .await;
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the SAME resolution the
+        // tools/call dispatcher makes, so a prompt handler over v1 HTTP emits on
+        // the session stream too (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Propagate the request `_meta` (raw JSON) and the once-at-ingress
         // resolved protocol context so prompt handlers read
@@ -2558,24 +2641,12 @@ impl Server {
             .create_token(request_id_str.clone())
             .await;
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the SAME resolution the
+        // tools/call dispatcher makes, so a resource read over v1 HTTP emits on
+        // the session stream too (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Propagate the request `_meta` (raw JSON) and the once-at-ingress
         // resolved protocol context so resource handlers read
@@ -7106,5 +7177,246 @@ mod tool_output_tests {
             ),
             other => panic!("expected ToolOutput::Payload, got {other:?}"),
         }
+    }
+}
+
+// ===========================================================================
+// `attach_peer` precedence and authorization ordering.
+//
+// Phase 118.1 plan 11. Two claims, both of which need crate-internal access —
+// `attach_peer` is private and `Server::peer_handle` is only ever set by
+// `Server::run()` — so they live here rather than in an integration test:
+//
+//   * T-118.1-11-04: when BOTH a global `Server::peer_handle` and a
+//     request-scoped `TransportBackchannel` peer are configured, the
+//     request-scoped one wins. A global handle cannot express WHICH session
+//     issued the request, so on a multiplexed transport it is the wrong answer.
+//   * `src/shared/peer.rs`'s authorization invariant: tool-level authz runs
+//     BEFORE the peer is wired, so a refused caller never reaches a handler body
+//     and therefore never sees `extra.peer()`.
+// ===========================================================================
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod peer_precedence_tests {
+    use super::*;
+    use crate::server::auth::AuthContext;
+    use crate::shared::peer::PeerHandle;
+    use crate::types::protocol::context::TransportBackchannel;
+    use crate::types::protocol::{Era, ProtocolContext, ProtocolVersion};
+    use crate::types::roots::{ListRootsResult, Root};
+    use crate::types::sampling::{CreateMessageParams, CreateMessageResult};
+    use crate::types::ProgressToken;
+    use crate::RequestHandlerExtra;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A peer that reports WHICH source supplied it, through the one method
+    /// with an observable, source-specific answer.
+    struct NamedPeer(&'static str);
+
+    #[async_trait]
+    impl PeerHandle for NamedPeer {
+        async fn sample(&self, _params: CreateMessageParams) -> Result<CreateMessageResult> {
+            Err(Error::protocol(
+                crate::ErrorCode::METHOD_NOT_FOUND,
+                "not the method under test",
+            ))
+        }
+
+        async fn list_roots(&self) -> Result<ListRootsResult> {
+            Ok(ListRootsResult {
+                roots: vec![Root {
+                    uri: format!("file:///{}", self.0),
+                    name: Some(self.0.to_string()),
+                }],
+            })
+        }
+
+        async fn progress_notify(
+            &self,
+            _token: ProgressToken,
+            _progress: f64,
+            _total: Option<f64>,
+            _message: Option<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The name the attached peer answers with, or `None` if none was attached.
+    async fn attached_peer_name(
+        extra: &crate::server::cancellation::RequestHandlerExtra,
+    ) -> Option<String> {
+        let peer = extra.peer()?;
+        let roots = peer.list_roots().await.expect("the fixture peer answers");
+        roots.roots.first().and_then(|r| r.name.clone())
+    }
+
+    /// A `ProtocolContext` carrying a request-scoped peer named `name`.
+    fn context_with_peer(name: &'static str) -> ProtocolContext {
+        let peer: Arc<dyn PeerHandle> = Arc::new(NamedPeer(name));
+        ProtocolContext::new(
+            Era::V1,
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+        )
+        .with_transport_backchannel(TransportBackchannel::new().with_peer(peer))
+    }
+
+    fn bare_server() -> Server {
+        Server::builder()
+            .name("attach-peer-precedence")
+            .version("1.0.0")
+            .build()
+            .expect("server builds")
+    }
+
+    fn extra_with_context(
+        context: Option<ProtocolContext>,
+    ) -> crate::server::cancellation::RequestHandlerExtra {
+        crate::server::cancellation::RequestHandlerExtra::new(
+            "req-attach-peer".to_string(),
+            crate::server::cancellation::RequestHandlerExtra::default().cancellation_token,
+        )
+        .with_protocol_context(context)
+    }
+
+    /// THE precedence claim (T-118.1-11-04). Both sources configured at once.
+    #[tokio::test]
+    async fn the_request_scoped_peer_wins_over_the_global_peer_handle() {
+        let mut server = bare_server();
+        server.peer_handle = Some(Arc::new(NamedPeer("global")));
+
+        let extra = server.attach_peer(extra_with_context(Some(context_with_peer(
+            "request-scoped",
+        ))));
+
+        assert_eq!(
+            attached_peer_name(&extra).await.as_deref(),
+            Some("request-scoped"),
+            "a request-scoped transport handle must win: the global `peer_handle` is a SINGLE \
+             field and cannot express which session issued this request (T-118.1-11-04)"
+        );
+    }
+
+    /// The fallback is untouched: the in-process `Server::run` path attaches no
+    /// backchannel, so it must still see the global handle.
+    #[tokio::test]
+    async fn the_global_handle_still_applies_when_no_backchannel_rides_the_context() {
+        let mut server = bare_server();
+        server.peer_handle = Some(Arc::new(NamedPeer("global")));
+
+        let with_no_context = server.attach_peer(extra_with_context(None));
+        assert_eq!(
+            attached_peer_name(&with_no_context).await.as_deref(),
+            Some("global"),
+            "with no protocol context at all the global handle must still apply"
+        );
+
+        let bare_context = ProtocolContext::new(
+            Era::V1,
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+        );
+        let with_peerless_context = server.attach_peer(extra_with_context(Some(bare_context)));
+        assert_eq!(
+            attached_peer_name(&with_peerless_context).await.as_deref(),
+            Some("global"),
+            "a context with no backchannel must fall through to the global handle"
+        );
+    }
+
+    /// Neither source configured: still a no-op, exactly as before.
+    #[tokio::test]
+    async fn attach_peer_is_a_no_op_when_neither_source_is_configured() {
+        let server = bare_server();
+        let extra = server.attach_peer(extra_with_context(None));
+        assert!(
+            extra.peer().is_none(),
+            "with no global handle and no backchannel, `extra.peer()` stays None"
+        );
+    }
+
+    /// A request-scoped peer applies even with NO global handle — the
+    /// `StreamableHTTP` case, where `Server::run()` never ran.
+    #[tokio::test]
+    async fn the_request_scoped_peer_applies_with_no_global_handle_at_all() {
+        let server = bare_server();
+        let extra = server.attach_peer(extra_with_context(Some(context_with_peer("transport"))));
+        assert_eq!(
+            attached_peer_name(&extra).await.as_deref(),
+            Some("transport"),
+            "the HTTP transport never calls `Server::run()`, so the request-scoped handle is \
+             the ONLY source there"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization ordering.
+    // -----------------------------------------------------------------------
+
+    /// Records whether its body ever ran, and reports the peer it saw.
+    struct EntryRecordingTool(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl ToolHandler for EntryRecordingTool {
+        async fn handle(&self, _args: Value, extra: RequestHandlerExtra) -> Result<Value> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(serde_json::json!({ "saw_peer": extra.peer().is_some() }))
+        }
+    }
+
+    /// Refuses every tool.
+    struct DenyAll;
+
+    #[async_trait]
+    impl crate::server::auth::ToolAuthorizer for DenyAll {
+        async fn can_access_tool(&self, _auth: &AuthContext, _tool: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn required_scopes_for_tool(&self, _tool_name: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An unauthorized caller never reaches the handler BODY, so it can never
+    /// observe `extra.peer()` — regardless of which peer source is configured.
+    ///
+    /// The ordering this measures is structural: `handle_call_tool` runs the
+    /// `tool_authorizer` check (`src/server/mod.rs`, immediately after the
+    /// auth-context resolution) and only afterwards calls `attach_peer`.
+    #[tokio::test]
+    async fn an_unauthorized_caller_never_reaches_the_handler_body() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut server = Server::builder()
+            .name("authz-before-peer")
+            .version("1.0.0")
+            .tool("guarded", EntryRecordingTool(entered.clone()))
+            .tool_authorizer(DenyAll)
+            .build()
+            .expect("server builds");
+        // BOTH peer sources configured, so a leak through either would show up.
+        server.peer_handle = Some(Arc::new(NamedPeer("global")));
+
+        let mut claim = crate::server::core::DispatchEnvelopeClaim::default();
+        let result = server
+            .handle_call_tool(
+                RequestId::from(1i64),
+                CallToolRequest {
+                    name: "guarded".to_string(),
+                    arguments: serde_json::json!({}),
+                    task: None,
+                    _meta: None,
+                },
+                Some(AuthContext::new("someone")),
+                Some(context_with_peer("request-scoped")),
+                &mut claim,
+            )
+            .await;
+
+        assert!(result.is_err(), "a denied tool call must return an error");
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "the handler body must never run for an unauthorized caller — authz runs BEFORE \
+             `attach_peer`, so a refused caller never sees `extra.peer()`"
+        );
     }
 }
