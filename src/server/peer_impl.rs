@@ -8,6 +8,11 @@
 //! task. This avoids the anti-pattern of ad-hoc per-site channel
 //! construction: every peer handle shares the single correlation authority.
 //!
+//! That rule binds every method here, `elicit` (`elicitation/create`) included —
+//! and it binds hardest there, because the payload correlated back is a person's
+//! answer. A second registry could resolve one client's approval against another
+//! client's prompt.
+//!
 //! Deserialization: the dispatcher returns `serde_json::Value`; the
 //! `DispatchPeerHandle` parses into the typed result and surfaces malformed
 //! responses as a protocol `INTERNAL_ERROR`.
@@ -22,6 +27,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::server::roots::ListRootsResult;
 use crate::server::server_request_dispatcher::ServerRequestDispatcher;
 use crate::shared::peer::PeerHandle;
+use crate::types::elicitation::{ElicitRequestParams, ElicitResult};
 use crate::types::sampling::{
     CreateMessageParams, CreateMessageResult, CreateMessageResultWithTools,
 };
@@ -101,6 +107,28 @@ impl PeerHandle for DispatchPeerHandle {
             Error::protocol(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Invalid list_roots response: {e}"),
+            )
+        })
+    }
+
+    async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult> {
+        // Same shape as `list_roots`, and deliberately so: dispatch through the
+        // SHARED `Arc<ServerRequestDispatcher>`, then decode. No channel and no
+        // pending map are constructed here — the module doc names ad-hoc
+        // per-site correlation as the anti-pattern this type exists to avoid,
+        // and for `elicit` the stakes are a user's answer being matched to the
+        // wrong request.
+        let value = self
+            .dispatcher
+            .dispatch(ServerRequest::ElicitationCreate(Box::new(params)))
+            .await?;
+        serde_json::from_value::<ElicitResult>(value).map_err(|e| {
+            // A malformed answer is peer-supplied JSON, so it must FAIL rather
+            // than degrade to a default: a synthesized action would report a
+            // decision the user never made.
+            Error::protocol(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Invalid elicit response: {e}"),
             )
         })
     }
