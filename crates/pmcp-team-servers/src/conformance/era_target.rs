@@ -143,6 +143,35 @@ pub const DEP_STATUS_CAPABILITY_NOT_OFFERED: &str = "capability-not-offered";
 /// [`DEP_RESULT_STATUS_FIELD`] value when the operation finished.
 pub const DEP_STATUS_COMPLETED: &str = "completed";
 
+/// [`DEP_RESULT_STATUS_FIELD`] value when the peer WAS present, the
+/// server-to-client request WAS issued, and it could not be delivered.
+///
+/// Introduced by phase 118.1 plan 11 because the outcome it names did not exist
+/// before: until the peer reached the `StreamableHTTP` dispatch path there was
+/// nothing between "the client declared no capability"
+/// ([`DEP_STATUS_CAPABILITY_NOT_OFFERED`]) and "the round trip finished"
+/// ([`DEP_STATUS_COMPLETED`]).
+///
+/// It is the honest reading of what the era matrix now measures. The SERVER half
+/// of G-3 is closed — `tests/http_peer_roundtrip.rs` drives all three round trips
+/// green over v1 HTTP with a client that holds a live SSE stream. But pmcp's OWN
+/// `StreamableHttpTransport` client does not hold one: its `start_sse` collects
+/// the GET body to completion and parses it in one piece (see that method's own
+/// rustdoc: "this body was already read into memory in one piece, not a chunk of
+/// a live stream"), so it has no reader registered when the server tries to
+/// deliver. The server fails the correlation AT ONCE rather than parking the
+/// handler for the dispatch timeout, which is exactly what plan 10's fail-fast
+/// path exists to do.
+///
+/// Reporting it as a STATUS rather than propagating the error is the instrument
+/// doing its job: an aborted tool call is not an observation.
+pub const DEP_STATUS_NO_LIVE_STREAM: &str = "no-live-stream";
+
+/// The result field carrying the transport error text behind
+/// [`DEP_STATUS_NO_LIVE_STREAM`], so the evidence is visible rather than
+/// summarised.
+pub const DEP_RESULT_DETAIL_FIELD: &str = "detail";
+
 /// [`DEP_RESULT_STATUS_FIELD`] value on the first leg of a v2 continuation.
 pub const DEP_STATUS_AWAITING_INPUT: &str = "awaiting-input";
 
@@ -318,6 +347,23 @@ fn v1_peer(
     extra.peer()
 }
 
+/// Report a peer call that was ISSUED but could not be delivered.
+///
+/// An instrument that aborts is an instrument that measures nothing: a
+/// propagated `Err` here surfaces as a failed tool call, which is
+/// indistinguishable at the matrix level from a broken target. Returning a
+/// STATUS keeps the observation joinable against the baseline and keeps the
+/// error text visible under [`DEP_RESULT_DETAIL_FIELD`].
+///
+/// See [`DEP_STATUS_NO_LIVE_STREAM`] for why this outcome exists at all and why
+/// it is not a server defect.
+fn undelivered(error: &pmcp::Error) -> Value {
+    json!({
+        DEP_RESULT_STATUS_FIELD: DEP_STATUS_NO_LIVE_STREAM,
+        DEP_RESULT_DETAIL_FIELD: error.to_string(),
+    })
+}
+
 /// [`TOOL_REQUEST_SAMPLING`] — the Sampling evidence tool.
 struct RequestSamplingTool;
 
@@ -333,11 +379,13 @@ impl ToolHandler for RequestSamplingTool {
         let Some(peer) = v1_peer(&extra, declared) else {
             return Ok(json!({ DEP_RESULT_STATUS_FIELD: DEP_STATUS_CAPABILITY_NOT_OFFERED }));
         };
-        let completion = peer.sample(sampling_params()).await?;
-        Ok(json!({
-            DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
-            "model": completion.model,
-        }))
+        match peer.sample(sampling_params()).await {
+            Ok(completion) => Ok(json!({
+                DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
+                "model": completion.model,
+            })),
+            Err(error) => Ok(undelivered(&error)),
+        }
     }
 
     fn metadata(&self) -> Option<ToolInfo> {
@@ -368,11 +416,13 @@ impl ToolHandler for ListRootsTool {
         let Some(peer) = v1_peer(&extra, declared) else {
             return Ok(json!({ DEP_RESULT_STATUS_FIELD: DEP_STATUS_CAPABILITY_NOT_OFFERED }));
         };
-        let roots = peer.list_roots().await?;
-        Ok(json!({
-            DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
-            "rootCount": roots.roots.len(),
-        }))
+        match peer.list_roots().await {
+            Ok(roots) => Ok(json!({
+                DEP_RESULT_STATUS_FIELD: DEP_STATUS_COMPLETED,
+                "rootCount": roots.roots.len(),
+            })),
+            Err(error) => Ok(undelivered(&error)),
+        }
     }
 
     fn metadata(&self) -> Option<ToolInfo> {
