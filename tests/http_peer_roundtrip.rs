@@ -105,6 +105,35 @@ const PEER_ABSENT: &str = "peer absent on this transport";
 /// The model the canned sampling answer reports back.
 const HOST_MODEL: &str = "host-model";
 
+/// The progress token the client attaches, and the one every emitted frame must
+/// carry back.
+const PROGRESS_TOKEN: &str = "progress-token-1";
+
+/// The `total` [`ProgressTool`] reports against. Its second report equals this,
+/// which makes that report FINAL and therefore exempt from rate limiting — so
+/// the frame count below is deterministic rather than timing-dependent.
+const PROGRESS_TOTAL: f64 = 2.0;
+
+/// How many frames [`ProgressTool`] emits: the always-admitted first report plus
+/// the always-admitted final one.
+const PROGRESS_STEPS: usize = 2;
+
+/// How many `report_progress` calls [`ProgressFloodTool`] makes back to back.
+const FLOOD_REPORTS: u32 = 200;
+
+/// The ceiling the flood's OBSERVED frame count must stay under.
+///
+/// `ServerProgressReporter` admits at most one non-final notification per 100 ms
+/// (`rate_limit_interval`), so a loop that runs in microseconds yields ONE frame.
+/// The ceiling is set far above that — it only has to be well below
+/// [`FLOOD_REPORTS`] to prove a bound exists, and being generous keeps the test
+/// from failing on a pathologically slow machine rather than on a real
+/// regression.
+const FLOOD_FRAME_CEILING: usize = 20;
+
+/// The `notifications/progress` method name, spelled once.
+const PROGRESS_METHOD: &str = "notifications/progress";
+
 // ===========================================================================
 // Tools.
 // ===========================================================================
@@ -179,6 +208,55 @@ impl ToolHandler for FastTool {
     }
 }
 
+/// Tool that emits progress through `extra.report_progress(..)` — the call the
+/// conformance target makes (`examples/s54_v2_dual_conformance.rs`) — and NOT
+/// through `peer.progress_notify(..)`.
+///
+/// The distinction is the whole point of this fixture. `report_progress` reads
+/// ONLY `RequestHandlerExtra.progress_reporter` and returns `Ok(())` silently
+/// when it is `None`, so a plan that wired the peer API alone would leave this
+/// tool green and the observed frame count at ZERO.
+///
+/// Emits exactly [`PROGRESS_STEPS`] frames DETERMINISTICALLY, with no sleeps:
+/// `ServerProgressReporter` always admits the first report, and always admits a
+/// FINAL one (`progress == total`) regardless of its 100 ms rate limit.
+struct ProgressTool;
+
+#[async_trait]
+impl ToolHandler for ProgressTool {
+    async fn handle(&self, _args: Value, extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        extra
+            .report_progress(1.0, Some(PROGRESS_TOTAL), Some("half".to_string()))
+            .await?;
+        extra
+            .report_progress(
+                PROGRESS_TOTAL,
+                Some(PROGRESS_TOTAL),
+                Some("done".to_string()),
+            )
+            .await?;
+        Ok(json!("progress-done"))
+    }
+}
+
+/// Tool that emits progress in a TIGHT LOOP, to measure the bound.
+///
+/// Reports [`FLOOD_REPORTS`] increasing values back to back with no awaits in
+/// between and NO total, so none of them is a final notification. The reporter's
+/// rate limit is therefore the only thing standing between a hostile handler and
+/// an unbounded write into the session's `mpsc::UnboundedSender`.
+struct ProgressFloodTool;
+
+#[async_trait]
+impl ToolHandler for ProgressFloodTool {
+    async fn handle(&self, _args: Value, extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        for step in 1..=FLOOD_REPORTS {
+            extra.report_progress(f64::from(step), None, None).await?;
+        }
+        Ok(json!(format!("flood:{FLOOD_REPORTS}")))
+    }
+}
+
 /// The two-way signal between the guard and its mutex-holding tool.
 ///
 /// [`tokio::sync::Notify::notify_one`] STORES a permit when nobody is waiting,
@@ -230,6 +308,29 @@ fn build_server(gate: Arc<HoldGate>) -> Server {
         .tool("elicit", ElicitTool)
         .tool("fast", FastTool)
         .tool("hold", MutexHoldingTool(gate))
+        .tool("progress", ProgressTool)
+        .tool("flood", ProgressFloodTool)
+        .build()
+        .expect("server builds")
+}
+
+/// The same fixture, opted into v2 alongside v1.
+///
+/// v2 is HANDSHAKE-FREE and SESSION-FREE (HTTP-01), so it has no SSE stream a
+/// progress notification could be delivered on. This server exists so the v2
+/// branch of the back-channel can be measured as INERT rather than assumed —
+/// see [`a_v2_call_with_a_progress_token_succeeds_and_emits_no_progress_frames`].
+fn build_dual_era_server() -> Server {
+    Server::builder()
+        .name("http-peer-roundtrip-v2")
+        .version("1.0.0")
+        .tool("progress", ProgressTool)
+        .with_supported_protocol_versions([
+            pmcp::types::protocol::ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
+            pmcp::types::protocol::ProtocolVersion(
+                pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+            ),
+        ])
         .build()
         .expect("server builds")
 }
@@ -239,15 +340,23 @@ fn build_server(gate: Arc<HoldGate>) -> Server {
 /// The [`HoldGate`] comes back with it so the guard can drive the mutex-holding
 /// tool; every other test ignores it.
 async fn spawn() -> (SocketAddr, JoinHandle<()>, Arc<HoldGate>) {
-    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
     let gate = Arc::new(HoldGate::default());
-    let server = Arc::new(Mutex::new(build_server(gate.clone())));
-    let (bound, handle) =
-        StreamableHttpServer::with_config(addr, server, StreamableHttpServerConfig::default())
-            .start()
-            .await
-            .expect("server starts on an ephemeral port");
+    let (bound, handle) = spawn_server(build_server(gate.clone())).await;
     (bound, handle, gate)
+}
+
+/// Spawn an arbitrary server on an ephemeral port, STATEFUL config.
+///
+/// `StreamableHttpServerConfig::default()` keeps a live `session_id_generator`,
+/// which is what a real dual-era deployment ships: the era, not the config,
+/// decides whether sessions are live for a given request.
+async fn spawn_server(server: Server) -> (SocketAddr, JoinHandle<()>) {
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+    let server = Arc::new(Mutex::new(server));
+    StreamableHttpServer::with_config(addr, server, StreamableHttpServerConfig::default())
+        .start()
+        .await
+        .expect("server starts on an ephemeral port")
 }
 
 // ===========================================================================
@@ -473,6 +582,50 @@ fn call_body(id: i64, tool: &str) -> String {
     )
 }
 
+/// [`call_body`] carrying a `progressToken` in `params._meta`.
+///
+/// That token is what makes the dispatcher build a `ServerProgressReporter` at
+/// all: with no token there is no reporter and `extra.report_progress(..)`
+/// returns `Ok(())` in silence.
+fn call_body_with_progress(id: i64, tool: &str) -> String {
+    envelope(
+        "tools/call",
+        &json!(id),
+        &json!({
+            "name": tool,
+            "arguments": {},
+            "_meta": { "progressToken": PROGRESS_TOKEN },
+        }),
+    )
+}
+
+/// [`call_body_with_progress`] with the three reserved `_meta` keys a v2 request
+/// must carry alongside the progress token (VERS-05 / D-113-A).
+///
+/// The key SPELLINGS come from `pmcp::testing`, not from a local literal, so a
+/// rename in the crate breaks this test rather than silently turning it into a
+/// probe of the rejection path — which is exactly the false green this test
+/// exists to rule out.
+fn v2_call_body_with_progress(id: i64, tool: &str) -> String {
+    envelope(
+        "tools/call",
+        &json!(id),
+        &json!({
+            "name": tool,
+            "arguments": {},
+            "_meta": {
+                "progressToken": PROGRESS_TOKEN,
+                pmcp::testing::META_PROTOCOL_VERSION:
+                    pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28,
+                pmcp::testing::META_CLIENT_INFO:
+                    { "name": "http-peer-fence", "version": "1.0.0" },
+                pmcp::testing::META_CLIENT_CAPABILITIES:
+                    { "elicitation": {}, "sampling": {}, "roots": {} },
+            },
+        }),
+    )
+}
+
 fn session_header(session: &str) -> Vec<(String, String)> {
     vec![("Mcp-Session-Id".to_string(), session.to_string())]
 }
@@ -573,6 +726,58 @@ fn sampling_answer() -> Value {
 /// The text of a `tools/call` reply frame, whatever shape it took.
 fn reply_text(frame: &Value) -> String {
     frame.to_string()
+}
+
+/// Drain a session stream until the reply to `id` arrives, collecting every
+/// `notifications/progress` frame seen BEFORE it.
+///
+/// Ordering is a property of the transport, not of timing: the handler's
+/// progress frames are pushed onto the session's sender while it runs, and its
+/// reply is pushed only after it returns, through the same FIFO channel. So
+/// "before the result" is an assertion the transport either satisfies or fails —
+/// there is nothing to race.
+///
+/// Every collected frame is PRINTED. The verify command greps the run log for
+/// `notifications/progress` and requires a non-zero count, so a test that ran
+/// but observed nothing cannot pass silently (T-118.1-11-06).
+async fn collect_progress_until_reply(stream: &mut Conn, id: i64, what: &str) -> Vec<Value> {
+    let mut progress = Vec::new();
+    loop {
+        let frame = stream.frame(what).await;
+        if frame.get("method").and_then(Value::as_str) == Some(PROGRESS_METHOD) {
+            println!("observed {PROGRESS_METHOD} frame: {frame}");
+            progress.push(frame);
+            continue;
+        }
+        if frame.get("id").and_then(Value::as_i64) == Some(id) {
+            println!("observed the tools/call reply for id {id}: {frame}");
+            return progress;
+        }
+    }
+}
+
+/// The `progressToken` a `notifications/progress` frame carries.
+fn progress_token_of(frame: &Value) -> Option<&str> {
+    frame
+        .get("params")
+        .and_then(|p| p.get("progressToken"))
+        .and_then(Value::as_str)
+}
+
+/// The v2 required-header set for `tools/call` on `name`.
+///
+/// Spelled here rather than imported from `tests/common/v2.rs`: this file's
+/// client is raw TCP and deliberately shares nothing with the `reqwest` harness,
+/// so a change to one cannot silently retune the other.
+fn v2_call_headers(name: &str) -> Vec<(String, String)> {
+    vec![
+        ("MCP-Method".to_string(), "tools/call".to_string()),
+        ("Mcp-Name".to_string(), name.to_string()),
+        (
+            "MCP-Protocol-Version".to_string(),
+            pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ),
+    ]
 }
 
 async fn teardown(handle: JoinHandle<()>, sockets: impl Send) {
@@ -852,4 +1057,237 @@ async fn a_server_to_client_request_reaches_only_the_issuing_session() {
 
     call.abort();
     teardown(handle, (stream_a, stream_b)).await;
+}
+
+// ===========================================================================
+// (7) PROGRESS — the channel `extra.report_progress(..)` actually reads.
+//
+// T-118.1-11-06. The conformance target calls `extra.report_progress(..)`
+// (`examples/s54_v2_dual_conformance.rs`), which reads ONLY
+// `RequestHandlerExtra.progress_reporter` and returns `Ok(())` silently when it
+// is `None`. That reporter was built from `Server::notification_tx`, which is
+// assigned by `Server::run()` and by nothing else — and `StreamableHttpServer`
+// never calls `run()`. So fixing `PeerHandle::progress_notify` alone would have
+// left this suite green and `tools-call-with-progress` red.
+//
+// These tests therefore drive `extra.report_progress(..)`, NOT
+// `peer.progress_notify(..)`, and assert a NON-ZERO observed frame count.
+// ===========================================================================
+
+#[tokio::test]
+async fn progress_frames_reach_the_issuing_session_before_the_tool_result() {
+    let (addr, handle, _gate) = spawn().await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+
+    let headers = session_header(&session);
+    let body = call_body_with_progress(2, "progress");
+    let call = tokio::spawn(async move { post(addr, &headers, &body, "the progress call").await });
+
+    let frames =
+        collect_progress_until_reply(&mut stream, 2, "a frame on the progress stream").await;
+
+    assert_eq!(
+        frames.len(),
+        PROGRESS_STEPS,
+        "the handler's `extra.report_progress(..)` calls must reach the client: observed \
+         {} frame(s) before the result, expected {PROGRESS_STEPS}",
+        frames.len()
+    );
+    for frame in &frames {
+        assert_eq!(
+            progress_token_of(frame),
+            Some(PROGRESS_TOKEN),
+            "every progress frame must echo the token the client sent: {frame}"
+        );
+    }
+
+    call.abort();
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// (8) PROGRESS ISOLATION — T-118.1-11-01, one message type further than (6).
+//
+// The sink is session-bound for the same reason the peer handle is. A global
+// notification channel would deliver one client's progress onto another's
+// stream, which is the T-113-07 class applied to notifications.
+// ===========================================================================
+
+#[tokio::test]
+async fn progress_frames_never_reach_an_unrelated_session() {
+    let (addr, handle, _gate) = spawn().await;
+
+    let session_a = open_session(addr).await;
+    let session_b = open_session(addr).await;
+    assert_ne!(session_a, session_b, "two distinct sessions");
+    let mut stream_a = open_stream(addr, &session_a).await;
+    let mut stream_b = open_stream(addr, &session_b).await;
+
+    let headers = session_header(&session_a);
+    let body = call_body_with_progress(2, "progress");
+    let call = tokio::spawn(async move { post(addr, &headers, &body, "the progress call").await });
+
+    let frames =
+        collect_progress_until_reply(&mut stream_a, 2, "a frame on the issuer's stream").await;
+    assert_eq!(
+        frames.len(),
+        PROGRESS_STEPS,
+        "the ISSUING session must receive every frame"
+    );
+
+    // The security claim: B is a bystander and saw nothing. Asserted AFTER A's
+    // reply so the frames provably existed and were provably routed elsewhere.
+    stream_b
+        .silent_for(QUIET, "the bystander session's stream")
+        .await;
+
+    call.abort();
+    teardown(handle, (stream_a, stream_b)).await;
+}
+
+// ===========================================================================
+// (9) THE NEGATIVE CASE — no `progressToken`, no frames.
+//
+// The token lookup is deliberately unchanged by this phase. A request that asks
+// for no progress must still get none, or the reporter would be emitting frames
+// no client is correlating.
+// ===========================================================================
+
+#[tokio::test]
+async fn no_progress_frame_is_emitted_without_a_progress_token() {
+    let (addr, handle, _gate) = spawn().await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+
+    // NOTE: `call_body`, not `call_body_with_progress` — no `_meta` at all.
+    let call = spawn_call(addr, &session, 2, "progress");
+
+    let frame = stream.frame("the tools/call reply").await;
+    assert_ne!(
+        frame.get("method").and_then(Value::as_str),
+        Some(PROGRESS_METHOD),
+        "with no progressToken the FIRST frame must be the result, not a progress \
+         notification: {frame}"
+    );
+    assert!(
+        reply_text(&frame).contains("progress-done"),
+        "the tool still succeeds — `report_progress` is a silent no-op with no reporter: {frame}"
+    );
+
+    call.abort();
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// (10) THE BOUND — T-118.1-11-03.
+//
+// The v1 session stream is an `mpsc::UnboundedSender`, so the queue itself
+// imposes no limit; the bound on progress emission is `ServerProgressReporter`'s
+// RATE limit (one non-final notification per 100 ms) plus its monotonic-progress
+// rule. This measures that bound rather than asserting it: a handler that calls
+// `report_progress` FLOOD_REPORTS times in a tight loop must not produce
+// FLOOD_REPORTS frames.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_tight_progress_loop_is_bounded_by_the_reporter_rate_limit() {
+    let (addr, handle, _gate) = spawn().await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+
+    let headers = session_header(&session);
+    let body = call_body_with_progress(2, "flood");
+    let call = tokio::spawn(async move { post(addr, &headers, &body, "the flood call").await });
+
+    let frames = collect_progress_until_reply(&mut stream, 2, "a frame on the flood stream").await;
+
+    assert!(
+        !frames.is_empty(),
+        "the flood must emit at least one frame — zero would mean the reporter is absent \
+         again, not that the bound works"
+    );
+    assert!(
+        frames.len() <= FLOOD_FRAME_CEILING,
+        "a tight loop of {FLOOD_REPORTS} `report_progress` calls produced {} frames, above the \
+         stated ceiling of {FLOOD_FRAME_CEILING}: the rate limit is the ONLY bound on an \
+         unbounded session sender (T-118.1-11-03)",
+        frames.len()
+    );
+
+    call.abort();
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// (11) A DEAD RECEIVER STILL SUCCEEDS.
+//
+// No GET stream is ever opened, so the session has no live SSE receiver at all.
+// Every progress emission is dropped by `route_to_session_stream`'s best-effort
+// path, and the tool must still complete — matching
+// `RequestHandlerExtra::report_progress`'s own `None`-reporter guard. Returning
+// a transport error here would break every caller that treats progress as
+// infallible.
+// ===========================================================================
+
+#[tokio::test]
+async fn progress_emission_still_succeeds_when_the_session_has_no_live_stream() {
+    let (addr, handle, _gate) = spawn().await;
+    let session = open_session(addr).await;
+
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &call_body_with_progress(2, "progress"),
+        "the progress call with no SSE stream",
+    )
+    .await;
+
+    assert_eq!(status, 200, "the call is answered inline: {body}");
+    assert!(
+        body.contains("progress-done"),
+        "the tool completes even though every progress frame was dropped: {body}"
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// (12) THE v2 BRANCH IS INERT — T-118.1-11-08.
+//
+// v2 is handshake-free and session-free, so `route_to_session_stream` has no
+// session to key on. This plan therefore attaches NO back-channel on v2: no peer
+// and no notification sink. The call must still succeed and emit nothing.
+//
+// This is not an aspiration — it is the guard against reusing the v1
+// session-keyed closure on v2, where it would look up an id that cannot exist,
+// silently drop every frame, and leave a green build with a permanently red
+// `tools-call-with-progress`. Plan 12 fills this branch with a bounded
+// per-request queue whose receiver becomes a multi-frame SSE POST body.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_v2_call_with_a_progress_token_succeeds_and_emits_no_progress_frames() {
+    let (addr, handle) = spawn_server(build_dual_era_server()).await;
+
+    let (status, body) = post(
+        addr,
+        &v2_call_headers("progress"),
+        &v2_call_body_with_progress(2, "progress"),
+        "the v2 progress call",
+    )
+    .await;
+
+    assert_eq!(status, 200, "a v2 tools/call succeeds: {body}");
+    assert!(
+        body.contains("progress-done"),
+        "the tool runs to completion on v2: {body}"
+    );
+    assert!(
+        !body.contains(PROGRESS_METHOD),
+        "v2 carries no session stream, so this plan emits NO progress frames there — \
+         plan 12 supplies v2's own vehicle: {body}"
+    );
+
+    teardown(handle, ()).await;
 }

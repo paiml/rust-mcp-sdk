@@ -133,6 +133,31 @@ impl PeerHandle for DispatchPeerHandle {
         })
     }
 
+    /// A no-op on THIS handle, and the reason is structural rather than pending.
+    ///
+    /// `DispatchPeerHandle` holds only the request/response correlation
+    /// authority. Progress is a NOTIFICATION — one-way, uncorrelated — and its
+    /// vehicle on the in-process path is `Server::notification_tx`, which is
+    /// assigned inside `Server::run()` and never handed to this type. Plumbing
+    /// it here would duplicate a channel the dispatch site already owns: the
+    /// in-process `Server` builds a `ServerProgressReporter` from that same
+    /// `notification_tx` and puts it on `RequestHandlerExtra`, so a handler
+    /// calling `extra.report_progress(..)` on the in-process path already emits.
+    ///
+    /// # What DOES emit, and where
+    ///
+    /// | path | `extra.report_progress(..)` | `peer.progress_notify(..)` |
+    /// | ---- | --------------------------- | -------------------------- |
+    /// | in-process `Server::run` | emits via `notification_tx` | no-op (this impl) |
+    /// | `StreamableHTTP` v1 session | emits via the transport's session sink | emits via the same sink (`SessionPeerHandle`) |
+    /// | `StreamableHTTP` v2 | no reporter, silent `Ok(())` | no sink, silent `Ok(())` |
+    ///
+    /// The v2 column is plan 12's work: its vehicle is a multi-frame SSE POST
+    /// response body, not a session stream, so it cannot reuse the v1 sink.
+    ///
+    /// Returning `Ok(())` is deliberate and must not change: callers treat
+    /// progress as infallible, matching `RequestHandlerExtra::report_progress`'s
+    /// own `None`-reporter guard.
     async fn progress_notify(
         &self,
         _token: ProgressToken,
@@ -140,13 +165,6 @@ impl PeerHandle for DispatchPeerHandle {
         _total: Option<f64>,
         _message: Option<String>,
     ) -> Result<()> {
-        // Progress is a notification (one-way, no response) not a
-        // request/response. The existing `Server::notification_tx:
-        // Sender<Notification>` channel is the right vehicle, but
-        // DispatchPeerHandle doesn't hold a clone. For this phase we
-        // preserve the existing `RequestHandlerExtra::report_progress`
-        // no-op behavior: return Ok(()) silently. Follow-on work can plumb
-        // notification_tx through DispatchPeerHandle for live progress.
         Ok(())
     }
 }
@@ -189,7 +207,11 @@ mod tests {
                 None,
             )
             .await;
-        assert!(result.is_ok(), "progress_notify is a no-op for this phase");
+        assert!(
+            result.is_ok(),
+            "progress_notify is infallible on this handle: the in-process path emits through \
+             `RequestHandlerExtra::report_progress`, not through the peer"
+        );
     }
 
     #[tokio::test]

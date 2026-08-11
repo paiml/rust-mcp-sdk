@@ -128,6 +128,15 @@ const HTTP_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// exactly once.
 type ParkedOutboundReceiver = Arc<Mutex<Option<mpsc::Receiver<(String, ServerRequest)>>>>;
 
+/// A one-way notification sink for ONE client session.
+///
+/// Named because the shape is load-bearing rather than incidental: it is EXACTLY
+/// [`ServerProgressReporter::new`](crate::server::progress::ServerProgressReporter::new)'s
+/// second parameter, so the transport's sink is handed to the request-scoped
+/// progress reporter with no adapter at all. The type is what the two eras share
+/// (plan 12 supplies v2's own closure of the same type); the closure is not.
+type NotificationSink = Arc<dyn Fn(Notification) + Send + Sync>;
+
 /// Logged when an outbound dispatch reaches the drain with no recorded owner.
 const NO_OWNER: &str = "outbound dispatch carried no recorded session owner";
 
@@ -283,20 +292,39 @@ async fn route_outbound(
 /// drain send the request to the client that triggered it and lets the inbound
 /// path refuse an answer from anyone else.
 ///
-/// Two `Arc` clones per request and no allocation beyond that, matching the cost
-/// bar `DispatchPeerHandle`'s rustdoc sets.
-#[derive(Debug, Clone)]
+/// Three `Arc` clones per request and no allocation beyond that, matching the
+/// cost bar `DispatchPeerHandle`'s rustdoc sets.
+#[derive(Clone)]
 pub(crate) struct SessionPeerHandle {
     dispatcher: Arc<ServerRequestDispatcher>,
     session_id: Arc<str>,
+    /// The SAME one-way sink the backchannel carries, so
+    /// [`PeerHandle::progress_notify`] and `extra.report_progress(..)` cannot
+    /// disagree about where a v1 progress frame goes.
+    notification_sink: NotificationSink,
+}
+
+/// Hand-written so a `{:?}` of this handle publishes no capability handle and no
+/// session token — the same redaction discipline `TransportBackchannel` and
+/// `ServerRequestDispatcher` already apply (T-118.1-10-09).
+impl std::fmt::Debug for SessionPeerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPeerHandle").finish_non_exhaustive()
+    }
 }
 
 impl SessionPeerHandle {
-    /// Bind the transport's dispatcher to one session.
-    pub(crate) fn new(dispatcher: Arc<ServerRequestDispatcher>, session_id: &str) -> Self {
+    /// Bind the transport's dispatcher and this session's notification sink to
+    /// one session.
+    pub(crate) fn new(
+        dispatcher: Arc<ServerRequestDispatcher>,
+        session_id: &str,
+        notification_sink: NotificationSink,
+    ) -> Self {
         Self {
             dispatcher,
             session_id: Arc::from(session_id),
+            notification_sink,
         }
     }
 }
@@ -378,18 +406,40 @@ impl PeerHandle for SessionPeerHandle {
         })
     }
 
+    /// Emit a `notifications/progress` frame on THIS session's live SSE stream.
+    ///
+    /// Goes through the same [`NotificationSink`] the request-scoped
+    /// `ServerProgressReporter` uses, so a handler that reaches for the peer API
+    /// and one that calls `extra.report_progress(..)` land on the identical
+    /// vehicle and the identical session. Unlike
+    /// [`DispatchPeerHandle::progress_notify`](crate::server::peer_impl::DispatchPeerHandle),
+    /// this is NOT a no-op: the sink exists here because the transport built it
+    /// at the one site that knows which session the request arrived on.
+    ///
+    /// # Still infallible, deliberately
+    ///
+    /// A one-way notification has no correlation to fail. A session whose SSE
+    /// stream has gone away drops the frame and still answers `Ok(())`, matching
+    /// both `route_to_session_stream`'s best-effort contract and
+    /// `RequestHandlerExtra::report_progress`'s `None`-reporter guard. Returning
+    /// a transport error here would break every caller that treats progress as
+    /// infallible.
+    ///
+    /// No rate limiting is applied at this level — `ServerProgressReporter`
+    /// owns that policy (10/s per token, plus a monotonic-progress rule) and it
+    /// is the channel `extra.report_progress(..)` goes through.
     async fn progress_notify(
         &self,
-        _token: ProgressToken,
-        _progress: f64,
-        _total: Option<f64>,
-        _message: Option<String>,
+        token: ProgressToken,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<String>,
     ) -> Result<()> {
-        // Plan 11 Task 2 replaces this: the notification vehicle already exists
-        // (see `session_notification_sink` below), it is the `ServerProgressReporter`
-        // wiring that is outstanding. Until then this matches
-        // `DispatchPeerHandle::progress_notify`'s no-op exactly, so the two
-        // handles cannot disagree about progress semantics.
+        let mut notification = crate::types::ProgressNotification::new(token, progress, message);
+        if let Some(total) = total {
+            notification = notification.with_total(total);
+        }
+        (self.notification_sink)(Notification::Progress(notification));
         Ok(())
     }
 }
@@ -398,22 +448,42 @@ impl PeerHandle for SessionPeerHandle {
 // Transport-side construction.
 // ---------------------------------------------------------------------------
 
-/// A one-way notification sink bound to one session's live SSE stream.
+/// Build the V1 one-way notification sink bound to one session's live SSE
+/// stream.
 ///
-/// Typed as `Arc<dyn Fn(Notification) + Send + Sync>` — EXACTLY
-/// `ServerProgressReporter::new`'s second parameter — so plan 11 can hand it in
-/// without an adapter. Best-effort by construction: a notification is one-way, so
-/// a session with no live stream drops it rather than failing a correlation
-/// (there is none to fail).
-fn session_notification_sink(
-    state: &ServerState,
-    session_id: &str,
-) -> Arc<dyn Fn(Notification) + Send + Sync> {
-    let state = state.clone();
+/// # This closure is v1-ONLY. Only the ATTACHMENT POINT and the TYPE are shared
+///
+/// [`route_to_session_stream`](v1::route_to_session_stream) is keyed by
+/// `session_id`, and v2 has no sessions at all — a v2 GET answers `405`
+/// (`sessions_active_truth_table`, `v2_verb_rejection`). Reusing this closure
+/// there would look up a session id that cannot exist, `route_to_session_stream`
+/// would hand the message straight back on every call, and EVERY v2 progress
+/// notification would be silently dropped: a green build with a permanently red
+/// `tools-call-with-progress` (T-118.1-11-08).
+///
+/// So [`attach_session_backchannel`] constructs this only when v1 sessions are
+/// live for the request. v2's sink is plan 12's — a bounded per-request queue
+/// whose receiver becomes the multi-frame SSE POST response body, which is a
+/// different vehicle entirely. What the two eras SHARE is the attachment site
+/// and the [`NotificationSink`] type, and that is the whole extent of it.
+///
+/// # Capture
+///
+/// Captures `V1State` (which is `Clone` and holds only the SSE-stream map, the
+/// session table and the event store) plus the session id — NEVER `ServerState`,
+/// which holds `Arc<Mutex<Server>>`. A sink outlives the request that built it,
+/// so capturing the server mutex would put a lock handle on the notification
+/// path and widen what a leaked closure can reach (T-118.1-11-07).
+///
+/// Best-effort by construction: a notification is one-way, so a session with no
+/// live stream drops it rather than failing a correlation (there is none to
+/// fail).
+fn session_notification_sink(state: &ServerState, session_id: &str) -> NotificationSink {
+    let v1_state = state.v1.clone();
     let session_id = session_id.to_string();
     Arc::new(move |notification| {
         let _ = v1::route_to_session_stream(
-            &state.v1,
+            &v1_state,
             &session_id,
             TransportMessage::Notification(notification),
         );
@@ -493,6 +563,20 @@ async fn synthesised_v1_context(
 /// (plan 11) prefers them over the server's single global `peer_handle`, which is
 /// what stops one client's `sampling/createMessage` reaching another's stream
 /// (T-118.1-10-04, the T-113-07 class).
+///
+/// # The v2 branch is INERT here, and that is plan 12's seam
+///
+/// The `!site.sessions_on` early return means a v2 request gets NO backchannel:
+/// no peer (there is no session stream to deliver a server-to-client request on)
+/// and no `notification_sink`. A v2 handler therefore finds no reporter and
+/// `extra.report_progress(..)` returns `Ok(())` silently — exactly as it did
+/// before this phase, so nothing regresses.
+///
+/// Plan 12 fills that branch at THIS SAME point with a DIFFERENT closure: a
+/// bounded per-request queue created before dispatch, whose receiver becomes the
+/// multi-frame SSE POST response body. It must not reuse the v1 closure — see
+/// [`session_notification_sink`] for why a session-keyed sink silently drops
+/// every frame on an era that has no sessions (T-118.1-11-08).
 pub(crate) async fn attach_session_backchannel(
     state: &ServerState,
     context: Option<crate::types::protocol::ProtocolContext>,
@@ -508,10 +592,18 @@ pub(crate) async fn attach_session_backchannel(
         Some(ctx) => ctx,
         None => synthesised_v1_context(state).await?,
     };
-    let peer: Arc<dyn PeerHandle> = Arc::new(SessionPeerHandle::new(dispatcher(state), session_id));
+    // ONE sink, shared by the peer handle and the backchannel, so
+    // `peer.progress_notify(..)` and `extra.report_progress(..)` are provably
+    // the same vehicle rather than two closures that happen to agree today.
+    let sink = session_notification_sink(state, session_id);
+    let peer: Arc<dyn PeerHandle> = Arc::new(SessionPeerHandle::new(
+        dispatcher(state),
+        session_id,
+        Arc::clone(&sink),
+    ));
     let backchannel = TransportBackchannel::new()
         .with_peer(peer)
-        .with_notification_sink(session_notification_sink(state, session_id));
+        .with_notification_sink(sink);
     Some(carrier.with_transport_backchannel(backchannel))
 }
 

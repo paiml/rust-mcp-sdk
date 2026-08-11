@@ -1264,6 +1264,69 @@ impl Server {
         extra
     }
 
+    /// The one-way notification sink this request's progress reporter emits
+    /// through, or `None` when the request has no vehicle at all.
+    ///
+    /// # Precedence mirrors [`Server::attach_peer`], for the same reason
+    ///
+    /// 1. the `TransportBackchannel`'s `notification_sink` on THIS request's
+    ///    `ProtocolContext` — session-bound, supplied by the `StreamableHTTP`
+    ///    transport at the one site that knows which session the request arrived
+    ///    on;
+    /// 2. `self.notification_tx`, the server-wide channel assigned by
+    ///    [`Server::run`] and by nothing else.
+    ///
+    /// The second is `None` on every HTTP-served server, because
+    /// `StreamableHttpServer` never calls `Server::run()`. That is precisely why
+    /// `extra.report_progress(..)` was silently inert over HTTP before phase
+    /// 118.1: `RequestHandlerExtra::report_progress` returns `Ok(())` when the
+    /// reporter is `None`, so the gap produced no error anywhere.
+    ///
+    /// The sink is handed through with NO adapter — the transport chose its type
+    /// to be `ServerProgressReporter::new`'s second parameter verbatim.
+    #[inline]
+    fn progress_notification_sink(
+        &self,
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] protocol_context: Option<
+            &crate::types::protocol::ProtocolContext,
+        >,
+    ) -> Option<Arc<dyn Fn(Notification) + Send + Sync>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(sink) = protocol_context
+            .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+            .and_then(crate::types::protocol::context::TransportBackchannel::notification_sink)
+        {
+            return Some(Arc::clone(sink));
+        }
+        let tx = self.notification_tx.as_ref()?.clone();
+        Some(Arc::new(move |notification| {
+            let _ = tx.try_send(notification);
+        }))
+    }
+
+    /// Build this request's progress reporter, or `None` when the client asked
+    /// for no progress or the request carries no notification vehicle.
+    ///
+    /// The `progress_token` lookup is unchanged: a request with no
+    /// `params._meta.progressToken` still gets no reporter, so a handler that
+    /// calls `extra.report_progress(..)` anyway stays silent. Only the SENDER
+    /// resolution moved — see [`Server::progress_notification_sink`].
+    ///
+    /// ONE construction site for all three dispatchers (tools, prompts,
+    /// resources): they had three byte-identical copies, and a fourth would have
+    /// been the one that kept reading `self.notification_tx` alone.
+    #[inline]
+    fn progress_reporter_for(
+        &self,
+        meta: Option<&crate::types::protocol::RequestMeta>,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> Option<Arc<dyn crate::server::progress::ProgressReporter>> {
+        let token = meta.and_then(|meta| meta.progress_token.as_ref())?;
+        let sink = self.progress_notification_sink(protocol_context)?;
+        let reporter = crate::server::progress::ServerProgressReporter::new(token.clone(), sink);
+        Some(Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>)
+    }
+
     /// Spawn the outgoing-notification forwarder.
     ///
     /// Forwards each queued [`Notification`] onto the transport actor's
@@ -2132,24 +2195,13 @@ impl Server {
             }
         }
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the channel
+        // `extra.report_progress(..)` actually reads. Resolved BEFORE
+        // `protocol_context` is moved into `extra` below, because the transport's
+        // session-bound sink rides on it (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Clone the validated auth context for the create-path owner resolution
         // (the original is moved into `extra` below). This guarantees the
@@ -2471,24 +2523,12 @@ impl Server {
             .create_token(request_id_str.clone())
             .await;
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the SAME resolution the
+        // tools/call dispatcher makes, so a prompt handler over v1 HTTP emits on
+        // the session stream too (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Propagate the request `_meta` (raw JSON) and the once-at-ingress
         // resolved protocol context so prompt handlers read
@@ -2601,24 +2641,12 @@ impl Server {
             .create_token(request_id_str.clone())
             .await;
 
-        // Create progress reporter if progress token is provided
+        // The request-scoped progress reporter — the SAME resolution the
+        // tools/call dispatcher makes, so a resource read over v1 HTTP emits on
+        // the session stream too (Phase 118.1 plan 11).
         #[allow(clippy::used_underscore_binding)] // _meta is part of MCP protocol spec
-        let progress_reporter = req
-            ._meta
-            .as_ref()
-            .and_then(|meta| meta.progress_token.as_ref())
-            .and_then(|token| {
-                self.notification_tx.as_ref().map(|tx| {
-                    let tx = tx.clone();
-                    let reporter = crate::server::progress::ServerProgressReporter::new(
-                        token.clone(),
-                        Arc::new(move |notification| {
-                            let _ = tx.try_send(notification);
-                        }),
-                    );
-                    Arc::new(reporter) as Arc<dyn crate::server::progress::ProgressReporter>
-                })
-            });
+        let progress_reporter =
+            self.progress_reporter_for(req._meta.as_ref(), protocol_context.as_ref());
 
         // Propagate the request `_meta` (raw JSON) and the once-at-ingress
         // resolved protocol context so resource handlers read
