@@ -141,3 +141,28 @@ Out-of-scope discoveries logged during execution. NOT fixed by the plan that fou
   follow-on client-transport phase. Plan 118.1-13 should record G-3's disposition as
   **server FIXED / client OPEN** rather than a flat FIXED, citing `binary(http_peer_roundtrip)`
   and `binary(era_matrix)`.
+
+## From the Wave 10 merge (2026-08-11, orchestrator)
+
+- **`spawn_example` detects a MISSING example binary but not a STALE one.**
+  Found at the plan 12 post-merge gate: `binary(v2_sse_progress)` was 10/10 in the executor's
+  worktree and `9 passed / 1 failed` on the merged tree. Cause was not the merge —
+  `target/debug/examples/s54_v2_dual_conformance` in the orchestrator checkout was built at 11:45,
+  five hours before the plan 11 + plan 12 sources it was supposed to exercise (16:37), so
+  `the_dual_conformance_example_emits_progress_on_both_eras` spawned a binary in which
+  `report_progress` was still inert and observed **0** progress frames. `cargo test --test <name>`
+  does NOT rebuild examples. Rebuilding with
+  `cargo build --features full --example s54_v2_dual_conformance` restored 10/10.
+  `tests/common/example_process.rs:90-97` asserts `binary.is_file()` with a good message and
+  deliberately FAILS rather than skips — so the MISSING case is safe, and a fresh CI checkout gets
+  a clear error. The STALE case is the hole: no mtime comparison against the example source, so a
+  stale binary silently exercises old code. Here it failed loudly, which is the safe direction, but
+  the same shape could pass and produce a FALSE GREEN — the exact class of defect this phase exists
+  to eliminate.
+  **Affects three tests in this phase** that share the pattern: `tests/v2_sse_progress.rs` (8155),
+  `tests/completion_complete.rs` (8153, plan 04) and `tests/embedded_resource_example_run.rs`
+  (8157, plan 03).
+  **Owner: plan 118.1-14.** Its CI conformance gate must build the examples before running any leg
+  that spawns one; a gate that inherits this pattern without a build step is green-by-staleness.
+  A durable fix is an mtime assertion in `spawn_example` (fail if the binary is older than its
+  `.rs` source), which would make the hazard structural rather than procedural.

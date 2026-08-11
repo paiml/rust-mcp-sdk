@@ -2773,7 +2773,7 @@ Plans:
 **Goal:** Both official-suite legs measure strictly better than the Phase-118 baseline (`2025-11-25`: 51 passed, 15 failed, exit 1, 11 scored scenarios red, 66 checks; `2026-07-28`: 124 passed, 54 failed, exit 1, 7 scored red, 178 checks), each of G-1..G-9 carries an explicit **FIXED / REFUTED / DEFERRED** disposition backed by a named RED-to-GREEN artifact, and the blocking CI gate is widened to exactly the surfaces that then pass — with no `--expected-failures`, no allowlist and no known-failure baseline.
 **Requirements**: CONF-04, CONF-05, CONF-06, CONF-07, CONF-08
 **Depends on:** Phase 118
-**Plans:** 11/14 plans executed
+**Plans:** 12/14 plans executed
 
 **Success Criteria** (what must be TRUE):
 
@@ -2825,7 +2825,7 @@ Plans:
 
 **Wave 10** *(blocked on Wave 9 completion)*
 
-- [ ] 118.1-12-PLAN.md — Wave 10. G-3, part 3 (**D-16**): v2 multi-frame SSE progress on the POST response body — notification frames then the result frame ONLY, never an independent server-to-client request (CONF-07)
+- [x] 118.1-12-PLAN.md — Wave 10. G-3, part 3 (**D-16**): v2 multi-frame SSE progress on the POST response body — notification frames then the result frame ONLY, never an independent server-to-client request (CONF-07)
 
 **Wave 11** *(blocked on Wave 10 completion)*
 
@@ -2862,7 +2862,7 @@ Plans:
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
-| 118.1 Close the Nine Conformance Gaps | 11/14 | In Progress|  |
+| 118.1 Close the Nine Conformance Gaps | 12/14 | In Progress|  |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
