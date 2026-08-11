@@ -3666,24 +3666,20 @@ impl ProtocolHandler for ServerCore {
         // G-9 / CONF-08 (Phase 118.1-08): fold the v1 `initialize` handshake's
         // advertised capabilities into the context threaded into DISPATCH, so
         // every downstream `RequestHandlerExtra` construction site sees them
-        // without nine copies of this read. THE ONE lock read per dispatch —
-        // guarded by `v1_capability_fold_applies` so v2 traffic never touches it
-        // (T-118.1-08-02), and the read guard is dropped at the end of this
-        // statement, well before `handle_initialize` below takes the write lock.
-        // The EGRESS below deliberately keeps the UNFOLDED `protocol_context`:
-        // the fold is a handler-visibility concern, not a wire-shape one.
-        // `server/mod.rs` calls the SAME shared unit — this site never defines
-        // its own (twin-site parity).
-        let handshake_capabilities = if v1_capability_fold_applies(protocol_context.as_ref()) {
-            self.client_capabilities.read().await.clone()
-        } else {
-            None
-        };
+        // without nine copies of this read. THE ONE lock read per dispatch, and
+        // the fold owns it — including the guard that keeps v2 traffic from
+        // touching the lock at all (T-118.1-08-02) — so `server/mod.rs` shares
+        // the whole unit rather than re-spelling its impure half (twin-site
+        // parity). The read guard is dropped inside the fold, well before
+        // `handle_initialize` below takes the write lock. The EGRESS below
+        // deliberately keeps the UNFOLDED `protocol_context`: the fold is a
+        // handler-visibility concern, not a wire-shape one.
         let dispatch_context = fold_v1_handshake_capabilities(
             protocol_context.clone(),
-            handshake_capabilities,
+            &self.client_capabilities,
             &self.supported_protocol_versions,
-        );
+        )
+        .await;
 
         // Execute the actual request handling with auth_context.
         //
@@ -4412,9 +4408,9 @@ pub(crate) fn resolve_ingress_protocol_context(
 
 /// Would the v1 handshake capability fold change anything for this context?
 ///
-/// The guard in front of [`fold_v1_handshake_capabilities`], split out so the
-/// two dispatchers can short-circuit BEFORE touching the server-level
-/// `client_capabilities` `RwLock` (T-118.1-08-02: a per-site or unconditional
+/// The first thing [`fold_v1_handshake_capabilities`] asks, kept a named
+/// function so the rule reads as a table. It runs BEFORE the fold touches the
+/// server-level `client_capabilities` `RwLock` (T-118.1-08-02: an unconditional
 /// lock read inside a hot dispatch path is a contention cost the fold does not
 /// need to pay on v2 traffic).
 ///
@@ -4424,30 +4420,10 @@ pub(crate) fn resolve_ingress_protocol_context(
 /// | `Some(era = V1)`, no capabilities | `true` | the v1 fallback context exists but nothing populated the field |
 /// | `Some(era = V1)`, capabilities already set | `false` | already answered; never overwrite |
 /// | `Some(era = V2)` | `false` | the v2 `_meta` path owns this field (T-118.1-08-03) |
-pub(crate) fn v1_capability_fold_applies(
-    context: Option<&crate::types::protocol::ProtocolContext>,
-) -> bool {
+fn v1_capability_fold_applies(context: Option<&crate::types::protocol::ProtocolContext>) -> bool {
     context.is_none_or(|ctx| {
         matches!(ctx.era, crate::types::protocol::Era::V1) && ctx.client_capabilities.is_none()
     })
-}
-
-/// The v1 version a context is synthesised against when none resolved.
-///
-/// Mirrors `resolve_negotiated_version`'s absent-signal arm exactly — the first
-/// v1 entry in the accept-list — so a synthesised context names the SAME version
-/// the shared resolver would have named had the server been opted in. A v2-only
-/// accept-list yields `None`: there is no v1 era for it to claim.
-fn v1_fallback_version(
-    accept_list: &[crate::types::ProtocolVersion],
-) -> Option<crate::types::ProtocolVersion> {
-    accept_list
-        .iter()
-        .find(|version| {
-            crate::types::protocol::protocol_era(version.as_str())
-                == crate::types::protocol::Era::V1
-        })
-        .cloned()
 }
 
 /// Fold the v1 `initialize` handshake's advertised capabilities into the
@@ -4460,6 +4436,25 @@ fn v1_fallback_version(
 /// the drift that rule exists to prevent, so the fold happens ONCE per dispatch
 /// at the root and every downstream site simply receives the already-folded
 /// context.
+///
+/// It takes the `RwLock` rather than an already-read value deliberately: a
+/// signature that took `Option<ClientCapabilities>` would leave the guard-then-
+/// read half — the part that actually encodes T-118.1-08-02 — copy-pasted at
+/// both roots, kept in step by a comment instead of by the compiler. That is
+/// the same shape [`MrtrRound`] was introduced to kill for this very pair of
+/// sites. Both `ServerCore` and `Server` hold this field as
+/// `Arc<RwLock<Option<ClientCapabilities>>>`, so one signature serves both.
+///
+/// # The THIRD native dispatch root, and why it is exempt
+///
+/// `Server::handle_tasks_update` is reached directly from the HTTP transport,
+/// bypassing `handle_request_with_context` and therefore this fold. That is
+/// correct, not an omission: `route_tasks_update` refuses at its first case via
+/// [`is_v1_task_era`](crate::server::task_dispatch::is_v1_task_era), which is
+/// `true` for exactly the `Some(Era::V1)` / `None` inputs
+/// [`v1_capability_fold_applies`] fires on — so a fold there would be dead by
+/// construction. A future v1-serving capability read on the tasks surface would
+/// need one.
 ///
 /// # The two endpoints this bridges
 ///
@@ -4492,7 +4487,8 @@ fn v1_fallback_version(
 /// `client_capabilities()` is a SYNC method on a value that has already been
 /// moved into the handler, and the dispatch path holds the lock — that shape
 /// deadlocks. The read happens here, once, at the dispatch root, and the guard
-/// is dropped before the fold runs.
+/// is dropped at the end of the `let` below — before the caller's
+/// `handle_initialize` takes the WRITE lock.
 ///
 /// **Security — self-reported, not for authorization:** like
 /// [`client_info`](crate::RequestHandlerExtra::client_info), these capabilities
@@ -4500,23 +4496,25 @@ fn v1_fallback_version(
 /// authorization anchor; real identity binds to the OAuth token (Phase 114 /
 /// TASK-05). G-9 widens WHO can read these values — it does not make them
 /// trustworthy.
-pub(crate) fn fold_v1_handshake_capabilities(
+pub(crate) async fn fold_v1_handshake_capabilities(
     context: Option<crate::types::protocol::ProtocolContext>,
-    handshake_capabilities: Option<crate::types::ClientCapabilities>,
+    handshake_lock: &RwLock<Option<crate::types::ClientCapabilities>>,
     accept_list: &[crate::types::ProtocolVersion],
 ) -> Option<crate::types::protocol::ProtocolContext> {
     if !v1_capability_fold_applies(context.as_ref()) {
         return context;
     }
-    let Some(capabilities) = handshake_capabilities else {
+    let Some(capabilities) = handshake_lock.read().await.clone() else {
         return context;
     };
     match context {
         Some(ctx) => Some(ctx.with_client_capabilities(capabilities)),
         // No context resolved (a non-opted-in server, D-04). The handshake DID
         // happen — the lock holds a value — so the era is known to be v1 and the
-        // context is synthesised rather than left absent.
-        None => v1_fallback_version(accept_list).map(|version| {
+        // context is synthesised rather than left absent. The version comes from
+        // the SHARED absent-signal rule, so it names what the resolver would
+        // have named had the server been opted in.
+        None => crate::types::protocol::context::first_v1_version(accept_list).map(|version| {
             crate::types::protocol::ProtocolContext::new(crate::types::protocol::Era::V1, version)
                 .with_client_capabilities(capabilities)
         }),

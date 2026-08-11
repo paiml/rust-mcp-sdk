@@ -1684,22 +1684,18 @@ impl Server {
         // G-9 / CONF-08 (Phase 118.1-08): fold the v1 `initialize` handshake's
         // advertised capabilities into the context threaded into DISPATCH — the
         // SAME shared unit `ServerCore` calls, never a second copy (twin-site
-        // parity). THE ONE lock read per dispatch, guarded so v2 traffic never
-        // touches it (T-118.1-08-02); the read guard is dropped at the end of
-        // this statement, before the `Initialize` arm below takes the WRITE lock
-        // a few lines down. The EGRESS keeps the UNFOLDED `protocol_context`:
-        // the fold is a handler-visibility concern, not a wire-shape one.
-        let handshake_capabilities =
-            if crate::server::core::v1_capability_fold_applies(protocol_context.as_ref()) {
-                self.client_capabilities.read().await.clone()
-            } else {
-                None
-            };
+        // parity). The fold owns the lock, so the guard that keeps v2 traffic
+        // off it (T-118.1-08-02) lives there too rather than being re-spelled
+        // here; the read guard drops inside, before the `Initialize` arm below
+        // takes the WRITE lock a few lines down. The EGRESS keeps the UNFOLDED
+        // `protocol_context`: the fold is a handler-visibility concern, not a
+        // wire-shape one.
         let dispatch_context = crate::server::core::fold_v1_handshake_capabilities(
             protocol_context.clone(),
-            handshake_capabilities,
+            &self.client_capabilities,
             &self.supported_protocol_versions,
-        );
+        )
+        .await;
 
         // The SECOND envelope claimant (Phase 114 plan 11), twin of the
         // `ServerCore` site: the `tasks/*` routes and the `tools/call` create

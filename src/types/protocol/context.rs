@@ -412,12 +412,24 @@ fn resolve_negotiated_version(
         },
         // Absent signal: fall back to the first v1 version in the accept-list.
         // A v2-only accept-list (no v1 version) never silently serves v1.
-        None => accept_list
-            .iter()
-            .find(|v| super::version::protocol_era(v.as_str()) == Era::V1)
-            .cloned()
+        None => first_v1_version(accept_list)
             .ok_or(ProtocolNegotiationError::UnsupportedVersion(String::new())),
     }
+}
+
+/// The first v1 version in an accept-list, or `None` for a v2-only list.
+///
+/// The absent-signal fallback rule, as ONE unit. [`resolve_negotiated_version`]
+/// applies it when a request carries no era signal; `server::core`'s v1
+/// handshake capability fold applies it when it has to synthesise a context a
+/// non-opted-in server never resolved (Phase 118.1-08, G-9). Both must name the
+/// SAME version, and a shared function is what makes that structural rather
+/// than a comment claiming two copies "mirror each other exactly".
+pub(crate) fn first_v1_version(accept_list: &[ProtocolVersion]) -> Option<ProtocolVersion> {
+    accept_list
+        .iter()
+        .find(|v| super::version::protocol_era(v.as_str()) == Era::V1)
+        .cloned()
 }
 
 /// Deserialize a present RESERVED `_meta` object key into `T`, mapping a

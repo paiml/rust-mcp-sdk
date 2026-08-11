@@ -150,6 +150,32 @@ fn slot() -> Slot {
     Arc::new(Mutex::new(None))
 }
 
+/// One observation slot per capturing handler, NAMED.
+///
+/// The builders below would otherwise take five consecutive `Slot` parameters,
+/// where swapping `read` and `list` compiles clean and silently points an
+/// assertion at the wrong handler — the exact false-green this fence exists to
+/// rule out.
+struct Slots {
+    tool: Slot,
+    prompt: Slot,
+    read: Slot,
+    list: Slot,
+    sampling: Slot,
+}
+
+impl Slots {
+    fn new() -> Self {
+        Self {
+            tool: slot(),
+            prompt: slot(),
+            read: slot(),
+            list: slot(),
+            sampling: slot(),
+        }
+    }
+}
+
 fn observed(slot: &Slot, what: &str) -> Observed {
     slot.lock()
         .expect("observation slot is not poisoned")
@@ -271,17 +297,48 @@ fn v2_meta(caps: &ClientCapabilities) -> Value {
     })
 }
 
-fn v2_accept_list() -> Vec<ProtocolVersion> {
-    vec![
-        ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
-        ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
-    ]
-}
-
 fn assert_ok(response: &JSONRPCResponse, what: &str) {
     if let ResponsePayload::Error(error) = &response.payload {
         panic!("{what} must succeed, got JSON-RPC error: {error:?}");
     }
+}
+
+/// The three FOLD-site probes, as ONE table.
+///
+/// `meta` splices a `params._meta` into each — the only difference between the
+/// v1 and v2 cases below — so the method names and params literals are spelled
+/// once here instead of once per case. Renaming the fixture resource, or adding
+/// a fourth probe, is a one-line edit.
+fn probes(meta: Option<&Value>) -> [(&'static str, Value); 3] {
+    let mut probes = [
+        ("tools/call", json!({ "name": "probe", "arguments": {} })),
+        (
+            "prompts/get",
+            json!({ "name": "greeting", "arguments": {} }),
+        ),
+        ("resources/read", json!({ "uri": "mem://greeting" })),
+    ];
+    if let Some(meta) = meta {
+        for (_, params) in &mut probes {
+            params["_meta"] = meta.clone();
+        }
+    }
+    probes
+}
+
+/// One handler saw exactly the v1 handshake's advertised set.
+///
+/// The shared body of every FOLD-site assertion: reading it out of a single
+/// place is what keeps the four call sites from drifting in what they claim.
+fn assert_carries(cell: &Slot, what: &str, expected: &Value) {
+    let seen = observed(cell, what);
+    assert_eq!(
+        seen.capabilities.as_ref(),
+        Some(expected),
+        "{what}: extra.client_capabilities() must carry the v1 handshake's advertised set \
+         (era seen: {:?})",
+        seen.era
+    );
 }
 
 // ===========================================================================
@@ -339,6 +396,14 @@ impl ServerDriver {
         }
     }
 
+    /// Drive every [`probes`] entry, asserting each is served without error.
+    async fn probe_all(&mut self, meta: Option<&Value>, context: &str) {
+        for (method, params) in probes(meta) {
+            let response = self.call(method, params).await;
+            assert_ok(&response, &format!("{method} [{context}]"));
+        }
+    }
+
     /// Ordered teardown: drop the socket FIRST so `run()` observes a closed
     /// transport, then abort, then await the join handle.
     async fn shutdown(self) {
@@ -347,33 +412,22 @@ impl ServerDriver {
         } = self;
         drop(transport);
         handle.abort();
-        let _ = handle_join(handle).await;
+        let _ = tokio::time::timeout(DEADLINE, handle).await;
     }
 }
 
-async fn handle_join(handle: tokio::task::JoinHandle<()>) -> std::result::Result<(), ()> {
-    match tokio::time::timeout(DEADLINE, handle).await {
-        Ok(_) => Ok(()),
-        Err(_) => Err(()),
-    }
-}
-
-fn build_server(
-    tool: Slot,
-    prompt: Slot,
-    read: Slot,
-    list: Slot,
-    sampling: Slot,
-    accept_list: Option<Vec<ProtocolVersion>>,
-) -> Server {
+fn build_server(slots: &Slots, accept_list: Option<Vec<ProtocolVersion>>) -> Server {
     let builder: ServerBuilder = Server::builder()
         .name("g9-fence-server")
         .version("1.0.0")
         .capabilities(ServerCapabilities::default())
-        .tool("probe", CapturingTool(tool))
-        .prompt("greeting", CapturingPrompt(prompt))
-        .resources(CapturingResource { read, list })
-        .sampling(CapturingSampling(sampling));
+        .tool("probe", CapturingTool(slots.tool.clone()))
+        .prompt("greeting", CapturingPrompt(slots.prompt.clone()))
+        .resources(CapturingResource {
+            read: slots.read.clone(),
+            list: slots.list.clone(),
+        })
+        .sampling(CapturingSampling(slots.sampling.clone()));
     let builder = match accept_list {
         Some(versions) => builder.with_supported_protocol_versions(versions),
         None => builder,
@@ -385,14 +439,17 @@ fn build_server(
 // Driver B — the `ServerCore` twin, entered through its REAL dispatch root.
 // ===========================================================================
 
-fn build_core(tool: Slot, prompt: Slot, read: Slot, list: Slot) -> Arc<dyn ProtocolHandler> {
+fn build_core(slots: &Slots) -> Arc<dyn ProtocolHandler> {
     Arc::new(
         pmcp::server::builder::ServerCoreBuilder::new()
             .name("g9-fence-core")
             .version("1.0.0")
-            .tool("probe", CapturingTool(tool))
-            .prompt("greeting", CapturingPrompt(prompt))
-            .resources(CapturingResource { read, list })
+            .tool("probe", CapturingTool(slots.tool.clone()))
+            .prompt("greeting", CapturingPrompt(slots.prompt.clone()))
+            .resources(CapturingResource {
+                read: slots.read.clone(),
+                list: slots.list.clone(),
+            })
             // Explicit, never defaulted: `build()` resolves an unset value by
             // ENVIRONMENT auto-detection, and a stateless core skips the
             // initialize gate this case depends on.
@@ -416,19 +473,26 @@ async fn core_call(
     .unwrap_or_else(|_| panic!("`{method}` deadline against ServerCore"))
 }
 
+/// The [`ServerDriver::probe_all`] twin for the `ServerCore` root: the SAME
+/// [`probes`] table, ids allocated from `first_id` because `core_call` has no
+/// connection to carry a counter on.
+async fn probe_all_via_core(core: &Arc<dyn ProtocolHandler>, first_id: i64, context: &str) {
+    for (offset, (method, params)) in probes(None).into_iter().enumerate() {
+        let id = first_id + i64::try_from(offset).expect("probe count fits in i64");
+        let response = core_call(core, id, method, params).await;
+        assert_ok(&response, &format!("{method} [{context}]"));
+    }
+}
+
 // ===========================================================================
 // 1. The three high-level `Server` FOLD sites.
 // ===========================================================================
 
 #[tokio::test]
 async fn v1_handshake_capabilities_reach_tool_prompt_and_resource_handlers() {
-    let (tool, prompt, read, list, sampling) = (slot(), slot(), slot(), slot(), slot());
+    let slots = Slots::new();
     let server = build_server(
-        tool.clone(),
-        prompt.clone(),
-        read.clone(),
-        list.clone(),
-        sampling,
+        &slots,
         // Default accept-list: v1-only. `resolve_ingress_protocol_context`
         // returns `Ok(None)` for EVERY request here (D-04), which is exactly the
         // shape G-9 leaves broken.
@@ -442,39 +506,13 @@ async fn v1_handshake_capabilities_reach_tool_prompt_and_resource_handlers() {
         .await;
     assert_ok(&init, "v1 initialize");
 
-    let call = driver
-        .call("tools/call", json!({ "name": "probe", "arguments": {} }))
-        .await;
-    assert_ok(&call, "tools/call");
-    let get_prompt = driver
-        .call(
-            "prompts/get",
-            json!({ "name": "greeting", "arguments": {} }),
-        )
-        .await;
-    assert_ok(&get_prompt, "prompts/get");
-    let read_resource = driver
-        .call("resources/read", json!({ "uri": "mem://greeting" }))
-        .await;
-    assert_ok(&read_resource, "resources/read");
-
+    driver.probe_all(None, "Server").await;
     driver.shutdown().await;
 
     let expected = canonical(&advertised);
-    for (what, cell) in [
-        ("tools/call", &tool),
-        ("prompts/get", &prompt),
-        ("resources/read", &read),
-    ] {
-        let seen = observed(cell, what);
-        assert_eq!(
-            seen.capabilities.as_ref(),
-            Some(&expected),
-            "{what}: extra.client_capabilities() must carry the v1 handshake's advertised set \
-             (era seen: {:?})",
-            seen.era
-        );
-    }
+    assert_carries(&slots.tool, "tools/call", &expected);
+    assert_carries(&slots.prompt, "prompts/get", &expected);
+    assert_carries(&slots.read, "resources/read", &expected);
 }
 
 // ===========================================================================
@@ -483,53 +521,19 @@ async fn v1_handshake_capabilities_reach_tool_prompt_and_resource_handlers() {
 
 #[tokio::test]
 async fn v1_handshake_capabilities_reach_the_server_core_dispatcher() {
-    let (tool, prompt, read, list) = (slot(), slot(), slot(), slot());
-    let core = build_core(tool.clone(), prompt.clone(), read.clone(), list.clone());
+    let slots = Slots::new();
+    let core = build_core(&slots);
 
     let advertised = distinctive_capabilities();
     let init = core_call(&core, 0, "initialize", initialize_params(&advertised)).await;
     assert_ok(&init, "v1 initialize against ServerCore");
 
-    let call = core_call(
-        &core,
-        1,
-        "tools/call",
-        json!({ "name": "probe", "arguments": {} }),
-    )
-    .await;
-    assert_ok(&call, "tools/call against ServerCore");
-    let get_prompt = core_call(
-        &core,
-        2,
-        "prompts/get",
-        json!({ "name": "greeting", "arguments": {} }),
-    )
-    .await;
-    assert_ok(&get_prompt, "prompts/get against ServerCore");
-    let read_resource = core_call(
-        &core,
-        3,
-        "resources/read",
-        json!({ "uri": "mem://greeting" }),
-    )
-    .await;
-    assert_ok(&read_resource, "resources/read against ServerCore");
+    probe_all_via_core(&core, 1, "ServerCore").await;
 
     let expected = canonical(&advertised);
-    for (what, cell) in [
-        ("tools/call", &tool),
-        ("prompts/get", &prompt),
-        ("resources/read", &read),
-    ] {
-        let seen = observed(cell, what);
-        assert_eq!(
-            seen.capabilities.as_ref(),
-            Some(&expected),
-            "ServerCore {what}: extra.client_capabilities() must carry the v1 handshake's \
-             advertised set (era seen: {:?})",
-            seen.era
-        );
-    }
+    assert_carries(&slots.tool, "ServerCore tools/call", &expected);
+    assert_carries(&slots.prompt, "ServerCore prompts/get", &expected);
+    assert_carries(&slots.read, "ServerCore resources/read", &expected);
 }
 
 // ===========================================================================
@@ -544,8 +548,8 @@ async fn v1_handshake_capabilities_reach_the_thread_then_fold_sites() {
     // --- Site 7 + 9: `Server::handle_list_resources` and
     // `Server::handle_create_message`, neither of which took a
     // `ProtocolContext` parameter before this plan.
-    let (tool, prompt, read, list, sampling) = (slot(), slot(), slot(), slot(), slot());
-    let server = build_server(tool, prompt, read, list.clone(), sampling.clone(), None);
+    let slots = Slots::new();
+    let server = build_server(&slots, None);
     let mut driver = ServerDriver::spawn(server);
     let init = driver
         .call("initialize", initialize_params(&advertised))
@@ -563,36 +567,18 @@ async fn v1_handshake_capabilities_reach_the_thread_then_fold_sites() {
     assert_ok(&create_message, "sampling/createMessage");
     driver.shutdown().await;
 
-    for (what, cell) in [
-        ("Server resources/list", &list),
-        ("Server sampling/createMessage", &sampling),
-    ] {
-        let seen = observed(cell, what);
-        assert_eq!(
-            seen.capabilities.as_ref(),
-            Some(&expected),
-            "{what}: extra.client_capabilities() must carry the v1 handshake's advertised set \
-             (era seen: {:?})",
-            seen.era
-        );
-    }
+    assert_carries(&slots.list, "Server resources/list", &expected);
+    assert_carries(&slots.sampling, "Server sampling/createMessage", &expected);
 
     // --- Site 3: `ServerCore::handle_list_resources`, the twin.
-    let (ctool, cprompt, cread, clist) = (slot(), slot(), slot(), slot());
-    let core = build_core(ctool, cprompt, cread, clist.clone());
+    let core_slots = Slots::new();
+    let core = build_core(&core_slots);
     let init = core_call(&core, 0, "initialize", initialize_params(&advertised)).await;
     assert_ok(&init, "v1 initialize against ServerCore");
     let list_resources = core_call(&core, 1, "resources/list", json!({})).await;
     assert_ok(&list_resources, "resources/list against ServerCore");
 
-    let seen = observed(&clist, "ServerCore resources/list");
-    assert_eq!(
-        seen.capabilities.as_ref(),
-        Some(&expected),
-        "ServerCore resources/list: extra.client_capabilities() must carry the v1 handshake's \
-         advertised set (era seen: {:?})",
-        seen.era
-    );
+    assert_carries(&core_slots.list, "ServerCore resources/list", &expected);
 }
 
 // ===========================================================================
@@ -605,15 +591,8 @@ async fn v1_handshake_capabilities_reach_the_thread_then_fold_sites() {
 /// (T-118.1-08-03).
 #[tokio::test]
 async fn v2_meta_client_capabilities_still_win_over_a_v1_handshake() {
-    let (tool, prompt, read, list, sampling) = (slot(), slot(), slot(), slot(), slot());
-    let server = build_server(
-        tool.clone(),
-        prompt.clone(),
-        read.clone(),
-        list,
-        sampling,
-        Some(v2_accept_list()),
-    );
+    let slots = Slots::new();
+    let server = build_server(&slots, Some(duplex::v2_accept_list()));
     let mut driver = ServerDriver::spawn(server);
 
     // The handshake plants a DIFFERENT set on the server-level lock.
@@ -624,38 +603,15 @@ async fn v2_meta_client_capabilities_still_win_over_a_v1_handshake() {
     assert_ok(&init, "v1 initialize on a v2-opted-in server");
 
     let per_request = v2_meta_capabilities();
-    let meta = v2_meta(&per_request);
-
-    let call = driver
-        .call(
-            "tools/call",
-            json!({ "name": "probe", "arguments": {}, "_meta": meta }),
-        )
-        .await;
-    assert_ok(&call, "v2 tools/call");
-    let get_prompt = driver
-        .call(
-            "prompts/get",
-            json!({ "name": "greeting", "arguments": {}, "_meta": meta }),
-        )
-        .await;
-    assert_ok(&get_prompt, "v2 prompts/get");
-    let read_resource = driver
-        .call(
-            "resources/read",
-            json!({ "uri": "mem://greeting", "_meta": meta }),
-        )
-        .await;
-    assert_ok(&read_resource, "v2 resources/read");
-
+    driver.probe_all(Some(&v2_meta(&per_request)), "v2").await;
     driver.shutdown().await;
 
     let expected = canonical(&per_request);
     let handshake_json = canonical(&handshake);
     for (what, cell) in [
-        ("tools/call", &tool),
-        ("prompts/get", &prompt),
-        ("resources/read", &read),
+        ("tools/call", &slots.tool),
+        ("prompts/get", &slots.prompt),
+        ("resources/read", &slots.read),
     ] {
         let seen = observed(cell, what);
         assert_eq!(
@@ -683,44 +639,23 @@ async fn v2_meta_client_capabilities_still_win_over_a_v1_handshake() {
 /// (T-118.1-08-04).
 #[tokio::test]
 async fn no_handshake_and_no_meta_yields_none() {
-    let (tool, prompt, read, list, sampling) = (slot(), slot(), slot(), slot(), slot());
+    let slots = Slots::new();
     // The high-level `Server` has NO initialize gate on its dispatch path, so a
     // `tools/call` sent as the FIRST frame is served with the lock still empty.
-    let server = build_server(
-        tool.clone(),
-        prompt.clone(),
-        read.clone(),
-        list.clone(),
-        sampling,
-        None,
-    );
+    let server = build_server(&slots, None);
     let mut driver = ServerDriver::spawn(server);
 
-    let call = driver
-        .call("tools/call", json!({ "name": "probe", "arguments": {} }))
-        .await;
-    assert_ok(&call, "tools/call with no handshake");
-    let get_prompt = driver
-        .call(
-            "prompts/get",
-            json!({ "name": "greeting", "arguments": {} }),
-        )
-        .await;
-    assert_ok(&get_prompt, "prompts/get with no handshake");
-    let read_resource = driver
-        .call("resources/read", json!({ "uri": "mem://greeting" }))
-        .await;
-    assert_ok(&read_resource, "resources/read with no handshake");
+    driver.probe_all(None, "no handshake").await;
     let list_resources = driver.call("resources/list", json!({})).await;
     assert_ok(&list_resources, "resources/list with no handshake");
 
     driver.shutdown().await;
 
     for (what, cell) in [
-        ("tools/call", &tool),
-        ("prompts/get", &prompt),
-        ("resources/read", &read),
-        ("resources/list", &list),
+        ("tools/call", &slots.tool),
+        ("prompts/get", &slots.prompt),
+        ("resources/read", &slots.read),
+        ("resources/list", &slots.list),
     ] {
         let seen = observed(cell, what);
         assert_eq!(
