@@ -125,13 +125,25 @@ If the handler is otherwise happy on the Payload path and just needs to stamp a
 related-task pointer, one call retrofits it — no `handle_output` impl needed:
 
 ```rust,ignore
-extra.set_result_meta(related_task_meta_map); // merges onto the Payload-built result
+extra.set_result_meta(related_task_meta_map); // merges onto the outgoing result
 ```
 
 `set_result_meta` MERGES with **handler-key-wins** precedence (unrelated
-widget/native `_meta` keys are preserved) and affects the Payload path ONLY — it
-is deliberately ignored on the `ToolOutput::Result` path, where the handler
-already owns the full envelope.
+widget/native `_meta` keys are preserved).
+
+**Path scope (amended by D-06, Phase 118.1 plan 09).** The merge now applies on
+BOTH output paths and BOTH dispatchers. It originally affected the Payload path
+only and was deliberately ignored on the `ToolOutput::Result` path, on the
+reasoning that a verbatim handler already owns its full envelope. That drop
+turned out to be load-bearing rather than cosmetic — the server-to-client
+elicitation wiring runs straight through the verbatim arm, so a handler that
+retrofitted `_meta` with one call silently shipped none. The verbatim arm still
+bypasses response middleware, the task create-path gate and the text-wrap tail
+(D-04 / D-04a); the bypass covers the response *pipeline*, not the handler's own
+`_meta`, which is authored by the same handler at the same trust level as the
+envelope it returns. When a verbatim handler sets `_meta` both ways, the
+`set_result_meta` key wins the collision and the envelope's unrelated keys
+survive.
 
 ### The runnable diff
 

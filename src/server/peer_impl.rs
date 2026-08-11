@@ -8,6 +8,11 @@
 //! task. This avoids the anti-pattern of ad-hoc per-site channel
 //! construction: every peer handle shares the single correlation authority.
 //!
+//! That rule binds every method here, `elicit` (`elicitation/create`) included —
+//! and it binds hardest there, because the payload correlated back is a person's
+//! answer. A second registry could resolve one client's approval against another
+//! client's prompt.
+//!
 //! Deserialization: the dispatcher returns `serde_json::Value`; the
 //! `DispatchPeerHandle` parses into the typed result and surfaces malformed
 //! responses as a protocol `INTERNAL_ERROR`.
@@ -22,6 +27,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::server::roots::ListRootsResult;
 use crate::server::server_request_dispatcher::ServerRequestDispatcher;
 use crate::shared::peer::PeerHandle;
+use crate::types::elicitation::{ElicitRequestParams, ElicitResult};
 use crate::types::sampling::{
     CreateMessageParams, CreateMessageResult, CreateMessageResultWithTools,
 };
@@ -101,6 +107,28 @@ impl PeerHandle for DispatchPeerHandle {
             Error::protocol(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Invalid list_roots response: {e}"),
+            )
+        })
+    }
+
+    async fn elicit(&self, params: ElicitRequestParams) -> Result<ElicitResult> {
+        // Same shape as `list_roots`, and deliberately so: dispatch through the
+        // SHARED `Arc<ServerRequestDispatcher>`, then decode. No channel and no
+        // pending map are constructed here — the module doc names ad-hoc
+        // per-site correlation as the anti-pattern this type exists to avoid,
+        // and for `elicit` the stakes are a user's answer being matched to the
+        // wrong request.
+        let value = self
+            .dispatcher
+            .dispatch(ServerRequest::ElicitationCreate(Box::new(params)))
+            .await?;
+        serde_json::from_value::<ElicitResult>(value).map_err(|e| {
+            // A malformed answer is peer-supplied JSON, so it must FAIL rather
+            // than degrade to a default: a synthesized action would report a
+            // decision the user never made.
+            Error::protocol(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Invalid elicit response: {e}"),
             )
         })
     }
@@ -230,6 +258,165 @@ mod tests {
             },
             other => panic!("tool_use block must survive decode, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // D-07: `elicit` over the SHARED dispatcher.
+    //
+    // These drive the SAME `ServerRequestDispatcher` harness the sampling cases
+    // use — deliberately, because the threat here (T-118.1-09-03) is a SECOND
+    // correlation authority: a peer method that built its own channel or pending
+    // map could resolve one client's answer against another client's request.
+    // If `elicit` ever stops riding this dispatcher, the `rx.recv()` in these
+    // tests goes silent and they fail.
+    //
+    // Every await is timeout-bounded: this whole cluster is about a back-channel
+    // that can park a tool handler, and an unbounded await in the test for a
+    // deadlock in the code just moves the hang into CI.
+    // -----------------------------------------------------------------------
+
+    /// Bound for awaits that must resolve promptly; generous enough not to be
+    /// load-flaky, short enough that a hang fails rather than stalls the suite.
+    const AWAIT_BOUND: Duration = Duration::from_secs(5);
+
+    fn elicit_params() -> crate::types::elicitation::ElicitRequestParams {
+        crate::types::elicitation::ElicitRequestParams::Form {
+            message: "approve the deploy?".to_string(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "approved": { "type": "boolean" } },
+                "required": ["approved"],
+            }),
+        }
+    }
+
+    /// Receive the next outbound dispatch, asserting it is an
+    /// `elicitation/create` and that it arrived on the SHARED dispatcher channel.
+    async fn recv_elicitation(
+        rx: &mut mpsc::Receiver<(String, ServerRequest)>,
+    ) -> (String, Box<crate::types::elicitation::ElicitRequestParams>) {
+        let (cid, req) = tokio::time::timeout(AWAIT_BOUND, rx.recv())
+            .await
+            .expect("the outbound elicitation must reach the shared dispatcher, not hang")
+            .expect("dispatcher channel stays open");
+        match req {
+            ServerRequest::ElicitationCreate(params) => (cid, params),
+            other => panic!("elicit must dispatch ServerRequest::ElicitationCreate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_elicit_decodes_answered_response() {
+        use crate::types::elicitation::ElicitAction;
+
+        let (dispatcher, mut rx) = build_dispatcher_with_long_timeout();
+        let peer = DispatchPeerHandle::new(dispatcher.clone());
+
+        let fut = tokio::spawn(async move { peer.elicit(elicit_params()).await });
+
+        let (cid, params) = recv_elicitation(&mut rx).await;
+        match *params {
+            crate::types::elicitation::ElicitRequestParams::Form { ref message, .. } => {
+                assert_eq!(message, "approve the deploy?", "the params must ride along");
+            },
+            crate::types::elicitation::ElicitRequestParams::Url { ref url, .. } => {
+                panic!("form params must survive the dispatch, got a url elicitation for {url}")
+            },
+        }
+
+        dispatcher
+            .handle_response(
+                &cid,
+                serde_json::json!({
+                    "action": "accept",
+                    "content": { "approved": true }
+                }),
+            )
+            .await
+            .expect("handle_response");
+
+        let result = tokio::time::timeout(AWAIT_BOUND, fut)
+            .await
+            .expect("elicit must not hang once answered")
+            .unwrap()
+            .expect("elicit succeeds on a well-formed answer");
+
+        assert_eq!(result.action, ElicitAction::Accept);
+        assert_eq!(
+            result
+                .content
+                .as_ref()
+                .and_then(|c| c.get("approved"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the accepted form content must decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elicit_malformed_answer_is_internal_error() {
+        let (dispatcher, mut rx) = build_dispatcher_with_long_timeout();
+        let peer = DispatchPeerHandle::new(dispatcher.clone());
+
+        let fut = tokio::spawn(async move { peer.elicit(elicit_params()).await });
+
+        let (cid, _params) = recv_elicitation(&mut rx).await;
+        // A client answering with a non-spec `action` is peer-supplied garbage:
+        // it must surface as a protocol error, never as a silent Accept.
+        dispatcher
+            .handle_response(
+                &cid,
+                serde_json::json!({ "action": "definitely-not-an-action" }),
+            )
+            .await
+            .expect("handle_response");
+
+        let error = tokio::time::timeout(AWAIT_BOUND, fut)
+            .await
+            .expect("elicit must not hang on a malformed answer")
+            .unwrap()
+            .expect_err("a malformed answer must NOT decode into a user decision");
+
+        match error {
+            Error::Protocol { code, .. } => {
+                assert_eq!(
+                    code,
+                    ErrorCode::INTERNAL_ERROR,
+                    "malformed peer answers map to INTERNAL_ERROR, matching list_roots"
+                );
+            },
+            other => panic!("expected a protocol error, got: {other:?}"),
+        }
+    }
+
+    /// T-118.1-09-02: an UNANSWERED elicitation must error on the dispatcher's
+    /// own timeout rather than parking the handler forever. The dispatch is
+    /// asserted to have gone out first, so this cannot pass by never trying.
+    #[tokio::test]
+    async fn test_elicit_unanswered_hits_the_dispatcher_timeout() {
+        let (dispatcher, mut rx) = build_dispatcher_with_short_timeout();
+        let peer = DispatchPeerHandle::new(dispatcher);
+
+        let fut = tokio::spawn(async move { peer.elicit(elicit_params()).await });
+
+        // The request went out on the shared channel...
+        let (_cid, _params) = recv_elicitation(&mut rx).await;
+
+        // ...and is never answered, so the dispatcher's timeout must fire.
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(AWAIT_BOUND, fut)
+            .await
+            .expect("an unanswered elicit must TIME OUT, not hang")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unanswered elicitation must return Err, never a synthesized answer"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "the dispatcher timeout must fire promptly (was {:?})",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

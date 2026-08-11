@@ -9,7 +9,11 @@
 //! handler retrofits `_meta` with one call, round-tripping through the
 //! encapsulated `Arc<std::sync::Mutex>` slot; merge precedence (handler-set key
 //! overwrites same-name key, unrelated widget/native keys preserved), repeated
-//! accumulation, no-op-when-never-called, and ignored-on-`ToolOutput::Result`.
+//! accumulation, no-op-when-never-called, and — FLIPPED by D-06 (Phase 118.1
+//! plan 09) — drained-onto-`ToolOutput::Result` as well. That last case used to
+//! assert the opposite (ignored on the verbatim path); the raw-wire twin of the
+//! new contract, covering both dispatchers, lives in
+//! `tests/tool_output_result_http.rs`.
 //!
 //! Both dispatchers are reachable, but these tests drive the high-level
 //! `pmcp::Server` over an in-process duplex transport via a real `pmcp::Client`
@@ -309,16 +313,25 @@ impl ToolHandler for WidgetCollisionTool {
 }
 
 /// A `tool_with_result` (verbatim `ToolOutput::Result`) tool that ALSO calls
-/// `set_result_meta` — proving the slot is IGNORED on the Result path (the
-/// handler owns its full envelope).
-fn result_path_ignores_set_meta_tool(server_name: &str) -> Server {
+/// `set_result_meta`.
+///
+/// FLIPPED by D-06 (Phase 118.1 plan 09). This fixture used to lock the OPPOSITE
+/// contract — the slot was IGNORED on the Result path — and the assertion below
+/// was `_meta` is absent. That drop was load-bearing rather than intentional:
+/// G-3's server-to-client elicitation wiring runs straight through this arm, so
+/// a handler that retrofitted `_meta` with one call silently shipped none. The
+/// verbatim arm still bypasses response middleware, the task create-path gate
+/// and the text-wrap tail; it now ALSO drains the handler's own `_meta` slot,
+/// which is authored by the same handler at the same trust level as the envelope
+/// it returns.
+fn result_path_drains_set_meta_tool(server_name: &str) -> Server {
     Server::builder()
         .name(server_name)
         .version("1.0.0")
-        .tool_with_result("verbatim_ignore", |_args: StartArgs, extra| {
+        .tool_with_result("verbatim_drain", |_args: StartArgs, extra| {
             Box::pin(async move {
                 let mut m = serde_json::Map::new();
-                m.insert("ignored".to_string(), json!(true));
+                m.insert("drained".to_string(), json!(true));
                 extra.set_result_meta(m);
                 Ok(CallToolResult::new(vec![Content::text("owned")]))
             })
@@ -401,13 +414,15 @@ async fn no_set_result_meta_injects_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn set_result_meta_ignored_on_tool_output_result_path() {
-    let server = result_path_ignores_set_meta_tool("verbatim-ignore-server");
-    let result = call_via_server(server, "verbatim_ignore", json!({ "job": "x" })).await;
+async fn set_result_meta_drains_onto_tool_output_result_path() {
+    let server = result_path_drains_set_meta_tool("verbatim-drain-server");
+    let result = call_via_server(server, "verbatim_drain", json!({ "job": "x" })).await;
     let v = serde_json::to_value(&result).expect("serialize");
+    // The handler still owns its CONTENT verbatim — D-06 touches `_meta` only.
     assert_eq!(v["content"][0]["text"], "owned");
-    assert!(
-        v.get("_meta").is_none_or(Value::is_null),
-        "set_result_meta must be IGNORED on the ToolOutput::Result path (handler owns the envelope)"
+    assert_eq!(
+        v["_meta"]["drained"],
+        json!(true),
+        "D-06: set_result_meta must reach the wire on the ToolOutput::Result path too, got: {v}"
     );
 }

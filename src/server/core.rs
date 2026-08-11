@@ -879,7 +879,23 @@ impl ServerCore {
                 // the create-path gate, and the text-wrap / widget-enrichment tail.
                 // REQUEST middleware already fired above for every tool, and a
                 // handler `Err(_)` still routes through the Middleware arm below.
+                //
+                // D-06 (Phase 118.1) RECLASSIFIES exactly one clause of D-04a:
+                // the bypass covers the response PIPELINE, not the handler's own
+                // `extra.set_result_meta(..)`. Those keys are authored by the same
+                // handler that authored this envelope, at the same trust level, so
+                // draining them here merges a handler's two `_meta` sources rather
+                // than reintroducing server-side rewriting. Handler-key-wins
+                // precedence, never a whole-map replace. G-3's elicitation wiring
+                // runs through this arm, which is why the drop was load-bearing.
                 crate::server::task_dispatch::DispatchOutput::Verbatim(call_result) => {
+                    let mut call_result = call_result;
+                    if let Some(handler_meta) = result_meta_handle.take_result_meta() {
+                        crate::server::cancellation::merge_result_meta(
+                            &mut call_result,
+                            handler_meta,
+                        );
+                    }
                     return Ok(ToolCallOutcome::Result(call_result));
                 },
                 crate::server::task_dispatch::DispatchOutput::Middleware(mut result) => {
@@ -1032,9 +1048,12 @@ impl ServerCore {
         };
 
         // D-03.3: drain any handler-set result `_meta` onto the Payload envelope
-        // with handler-key-wins precedence (Payload path only; the Verbatim,
-        // create-path, and error arms all returned earlier). Shadow-rebind so the
-        // wasm branch, which never sets the slot, needs no `mut`.
+        // with handler-key-wins precedence. The create-path and error arms
+        // returned earlier and are still `_meta`-free; the Verbatim arm also
+        // returned earlier but now performs this SAME drain against its own
+        // envelope (D-06), so the slot is already empty by the time control could
+        // reach here on that path. Shadow-rebind so the wasm branch, which never
+        // sets the slot, needs no `mut`.
         #[cfg(not(target_arch = "wasm32"))]
         let call_result = {
             let mut call_result = call_result;

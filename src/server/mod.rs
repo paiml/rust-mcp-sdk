@@ -2237,7 +2237,26 @@ impl Server {
             // create-path gate, text-wrap, and widget enrichment are ALL bypassed
             // (mirrors the `ToolRejected` verbatim early-return below, which also
             // returns after the unconditional token cleanup).
+            //
+            // D-06 (Phase 118.1) RECLASSIFIES exactly one clause of D-04a: the
+            // bypass covers the response PIPELINE, not the handler's own
+            // `extra.set_result_meta(..)`. Those keys come from the same handler
+            // that authored this envelope, at the same trust level, so draining
+            // them here merges a handler's two `_meta` sources rather than
+            // reintroducing server-side rewriting. Handler-key-wins precedence,
+            // never a whole-map replace. Twin of the `ServerCore` arm.
             task_dispatch::DispatchOutput::Verbatim(call_result) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                let call_result = {
+                    let mut call_result = call_result;
+                    if let Some(handler_meta) = result_meta_handle.take_result_meta() {
+                        crate::server::cancellation::merge_result_meta(
+                            &mut call_result,
+                            handler_meta,
+                        );
+                    }
+                    call_result
+                };
                 return Ok(serde_json::to_value(call_result)?);
             },
             task_dispatch::DispatchOutput::Middleware(result) => match result {
@@ -2352,9 +2371,13 @@ impl Server {
 
         // D-03.3: drain any handler-set result `_meta` (via extra.set_result_meta)
         // and merge it onto the Payload-built envelope with handler-key-wins
-        // precedence (unrelated widget/native keys preserved). Payload path ONLY —
-        // the verbatim `ToolOutput::Result` arm above returns earlier and owns its
-        // own `_meta`, so it never reaches here.
+        // precedence (unrelated widget/native keys preserved). The verbatim
+        // `ToolOutput::Result` arm above returns earlier and still owns its
+        // content, its redaction and its bypass of the response pipeline — but
+        // since D-06 (Phase 118.1) it performs this SAME drain against its own
+        // envelope before returning, so `set_result_meta` is no longer silently
+        // dropped there. By the time control reaches this line the slot has
+        // therefore only ever been filled by a Payload-path handler.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(handler_meta) = result_meta_handle.take_result_meta() {
             crate::server::cancellation::merge_result_meta(&mut call_result, handler_meta);

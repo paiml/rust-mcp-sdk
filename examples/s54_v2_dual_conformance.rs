@@ -1221,13 +1221,15 @@ impl ConformanceTool {
 /// Attach an [`MrtrSignal`] to a `CallToolResult` so the dispatch layer seals it.
 ///
 /// The `_meta` field is set DIRECTLY rather than through
-/// `RequestHandlerExtra::set_result_meta`, and that is load-bearing. Every tool
-/// here is served through `handle_output` returning `ToolOutput::Result`, and
-/// that verbatim arm returns BEFORE the dispatcher drains the handler's result
-/// `_meta` slot (`src/server/mod.rs`: "the verbatim `ToolOutput::Result` arm
-/// above returns earlier and owns its own `_meta`"). A signal set through
-/// `set_result_meta` on this path is silently dropped, and the tool ships an
-/// empty success for an operation it never completed.
+/// `RequestHandlerExtra::set_result_meta`. Every tool here is served through
+/// `handle_output` returning `ToolOutput::Result`, and until D-06 (Phase 118.1
+/// plan 09) that verbatim arm returned BEFORE the dispatcher drained the
+/// handler's result `_meta` slot — a signal set through `set_result_meta` on
+/// this path was silently dropped, and the tool shipped an empty success for an
+/// operation it never completed. Both dispatchers now perform that drain before
+/// the verbatim early return, so `set_result_meta` would work here too; the
+/// direct write is kept because it puts the signal on the value this function
+/// returns, where a reader can see it without knowing the dispatch rules.
 fn input_required(text: &str, signal: MrtrSignal) -> pmcp::Result<CallToolResult> {
     let (key, value) = signal
         .into_meta_entry()
