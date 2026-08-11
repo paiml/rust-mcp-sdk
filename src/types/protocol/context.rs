@@ -82,6 +82,121 @@ pub(crate) struct VerifiedContinuation {
     pub round: u8,
 }
 
+/// The per-request server-to-client capability handles a TRANSPORT can hand to
+/// dispatch (Phase 118.1 plan 10, CONF-07 / G-3).
+///
+/// # Why it rides on [`ProtocolContext`]
+///
+/// `RequestHandlerExtra` is built deep inside the dispatchers
+/// (`Server::call_tool_with_context`, `ServerCore::handle_call_tool`) and the
+/// peer is applied by `attach_peer` from a SINGLE global `peer_handle` field. A
+/// transport cannot reach either. But `ProtocolContext` is already resolved once
+/// at ingress, already threaded through `handle_request_with_context`, and
+/// already moved onto `RequestHandlerExtra` by `.with_protocol_context(..)` at
+/// both dispatch roots — so a request-scoped carrier riding here reaches the
+/// handler with NO signature change at any call site.
+///
+/// # `Debug` is hand-written and reports PRESENCE only
+///
+/// Both fields are live capability handles: the peer can issue
+/// `sampling/createMessage` and `elicitation/create` at the client, and the sink
+/// can emit notifications. They follow the same redaction discipline as the MRTR
+/// fields on the enclosing type — a single `tracing::debug!("{ctx:?}")` must not
+/// publish a capability handle or let a reader correlate one request's context
+/// with another's (T-118.1-10-09, the T-113-05 / T-113-31 class).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub(crate) struct TransportBackchannel {
+    /// The peer handle bound to the ORIGINATING session, if the transport has
+    /// a server-to-client channel for this request.
+    peer: Option<std::sync::Arc<dyn crate::shared::peer::PeerHandle>>,
+    /// A one-way notification sink for the same session.
+    ///
+    /// Typed EXACTLY as `ServerProgressReporter::new`'s second parameter so it
+    /// can be handed straight in with no adapter.
+    notification_sink: Option<std::sync::Arc<dyn Fn(crate::types::Notification) + Send + Sync>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for TransportBackchannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportBackchannel")
+            .field("has_peer", &self.peer().is_some())
+            .field("has_notification_sink", &self.notification_sink().is_some())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unwind safety, asserted DELIBERATELY.
+//
+// `PeerHandle` and the notification-sink `Fn` are public trait objects declared
+// without `+ RefUnwindSafe`, so `Arc<dyn …>` of either is neither `UnwindSafe`
+// nor `RefUnwindSafe`, and without these two impls the enclosing PUBLIC
+// `ProtocolContext` silently stops implementing both. `cargo semver-checks`
+// classifies that as `auto_trait_impl_removed` — a MAJOR break — which would
+// turn an intentionally additive `pub(crate)` field into a 3.0 gate. It is not a
+// theoretical concern: the check caught it on the first run of this plan.
+//
+// The assertion is honest rather than expedient. Both fields are opaque,
+// immutable-after-construction `Arc` capability handles: this type never mutates
+// through them and holds no invariant that a panic could tear. Every piece of
+// mutable state they reach — the dispatcher's `pending` and `owners` maps — is
+// behind `tokio::sync::RwLock`, which has no poisoning and therefore publishes
+// no broken-invariant signal for a `catch_unwind` caller to observe. Adding
+// `+ RefUnwindSafe` to the `PeerHandle` trait instead would be a MAJOR break of
+// its own (a new supertrait every external implementor must satisfy), so this is
+// the additive form of the same guarantee.
+//
+// Both are SAFE auto traits, so these are ordinary impls and assert nothing the
+// compiler would otherwise have to trust us about for memory safety.
+#[cfg(not(target_arch = "wasm32"))]
+impl std::panic::UnwindSafe for TransportBackchannel {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::panic::RefUnwindSafe for TransportBackchannel {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TransportBackchannel {
+    /// An empty backchannel. Layer capabilities on with the `with_*` builders.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach the session-bound peer handle.
+    #[must_use]
+    pub(crate) fn with_peer(
+        mut self,
+        peer: std::sync::Arc<dyn crate::shared::peer::PeerHandle>,
+    ) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    /// Attach the session-bound notification sink.
+    #[must_use]
+    pub(crate) fn with_notification_sink(
+        mut self,
+        sink: std::sync::Arc<dyn Fn(crate::types::Notification) + Send + Sync>,
+    ) -> Self {
+        self.notification_sink = Some(sink);
+        self
+    }
+
+    /// The session-bound peer handle, if the transport supplied one.
+    pub(crate) fn peer(&self) -> Option<&std::sync::Arc<dyn crate::shared::peer::PeerHandle>> {
+        self.peer.as_ref()
+    }
+
+    /// The session-bound notification sink, if the transport supplied one.
+    pub(crate) fn notification_sink(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn Fn(crate::types::Notification) + Send + Sync>> {
+        self.notification_sink.as_ref()
+    }
+}
+
 /// The protocol context resolved once at request ingress and threaded through
 /// dispatch.
 ///
@@ -128,13 +243,27 @@ pub struct ProtocolContext {
     /// server-owned codec verified the echoed `requestState` against the live
     /// principal and originating request.
     pub(crate) mrtr_verified: Option<VerifiedContinuation>,
+    /// The per-request server-to-client capability handles the TRANSPORT
+    /// supplied, if it has a back-channel for this request (CONF-07 / G-3).
+    ///
+    /// Crate-private for the same reason as the MRTR fields: this is internal
+    /// plumbing, and [`TransportBackchannel`] is `pub(crate)`, so a `pub` field
+    /// would expose a private type from a public interface. Adding a
+    /// `pub(crate)` field to a `#[non_exhaustive]` public struct is semver-MINOR.
+    ///
+    /// `#[cfg(not(target_arch = "wasm32"))]` because `src/shared/peer.rs` carries
+    /// a module-level gate of the same shape, so `PeerHandle` does not exist on
+    /// wasm at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) transport_backchannel: Option<TransportBackchannel>,
 }
 
 impl std::fmt::Debug for ProtocolContext {
     /// Renders the negotiation fields in full and the MRTR fields as PRESENCE
     /// only — see the type-level note for why the derive was unsafe here.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProtocolContext")
+        let mut binding = f.debug_struct("ProtocolContext");
+        let out = binding
             .field("era", &self.era)
             .field("negotiated_version", &self.negotiated_version)
             .field("client_info", &self.client_info)
@@ -145,8 +274,16 @@ impl std::fmt::Debug for ProtocolContext {
                 &self.request_state_token().is_some(),
             )
             .field("has_verified_continuation", &self.mrtr_verified.is_some())
-            .field("mrtr_round", &self.mrtr_round())
-            .finish()
+            .field("mrtr_round", &self.mrtr_round());
+        // PRESENCE only. A peer handle and a notification sink are live
+        // capability handles, so they follow the same redaction discipline as
+        // the MRTR fields above (T-118.1-10-09).
+        #[cfg(not(target_arch = "wasm32"))]
+        out.field(
+            "has_transport_backchannel",
+            &self.transport_backchannel().is_some(),
+        );
+        out.finish()
     }
 }
 
@@ -162,7 +299,32 @@ impl ProtocolContext {
             client_capabilities: None,
             mrtr: None,
             mrtr_verified: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            transport_backchannel: None,
         }
+    }
+
+    /// The per-request transport back-channel, if the transport supplied one.
+    ///
+    /// Read by `attach_peer` at both dispatch roots, which prefers a
+    /// REQUEST-SCOPED peer over the server's single global `peer_handle` — that
+    /// is what makes a server-to-client request reach the session that issued it
+    /// on a multiplexed transport (T-118.1-10-04).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn transport_backchannel(&self) -> Option<&TransportBackchannel> {
+        self.transport_backchannel.as_ref()
+    }
+
+    /// Attach the transport's per-request server-to-client capability handles.
+    ///
+    /// Called by the STREAMABLE-HTTP transport, once, after the era gate has run
+    /// and the originating session is known. Never called by dispatch: the value
+    /// is transport-owned by construction, so a handler cannot mint itself one.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub(crate) fn with_transport_backchannel(mut self, backchannel: TransportBackchannel) -> Self {
+        self.transport_backchannel = Some(backchannel);
+        self
     }
 
     /// Attach the client's implementation info.

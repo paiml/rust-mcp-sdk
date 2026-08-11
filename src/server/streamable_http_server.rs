@@ -67,6 +67,16 @@ use uuid::Uuid;
 #[cfg_attr(not(feature = "v1-compat"), path = "streamable_http_server/v1_session_off.rs")]
 pub(crate) mod v1;
 
+// ---------------------------------------------------------------------------
+// The server-to-client channel (Phase 118.1 plan 10, CONF-07 / G-3).
+//
+// NOT a pair: inbound response correlation is era-agnostic, and the outbound
+// half reaches the wire through `v1::route_to_session_stream`, whose zero-sized
+// twin already answers "no stream" on a `full-v2` build. One module, both
+// feature sets — see its own doc for the deadlock property it preserves.
+// ---------------------------------------------------------------------------
+pub(crate) mod peer_channel;
+
 /// Event store trait for resumability support.
 ///
 /// # This is NOT `crate::shared::event_store::EventStore`
@@ -482,6 +492,16 @@ pub(crate) struct ServerState {
     /// the event store, and every operation returns an OWNED answer rather than
     /// a borrow the zero-sized twin could not produce.
     v1: v1::V1State,
+    /// The server-to-client channel: the correlation authority, its outbound
+    /// drain, and the per-session peer handles (CONF-07 / G-3).
+    ///
+    /// HERE, on `ServerState`, and deliberately NOT inside `Mutex<Server>`. A
+    /// tool handler parked on a peer call holds that mutex for its whole
+    /// duration, so a dispatcher reachable only through it could not be reached
+    /// by the very response that would release the handler — the same deadlock
+    /// in a different costume (T-118.1-10-01). `peer_channel`'s module doc
+    /// records the property in full.
+    peer_channel: peer_channel::PeerChannel,
 }
 
 /// Build the base MCP Router without any Tower layers applied.
@@ -513,12 +533,19 @@ pub(crate) fn make_server_state(
     // into the `Arc` because the real half type-erases `config.event_store` on
     // the way in.
     let v1 = v1::V1State::new(&config);
-    ServerState {
+    let state = ServerState {
         server,
         config: Arc::new(config),
         allowed_origins,
         v1,
-    }
+        peer_channel: peer_channel::PeerChannel::new(),
+    };
+    // Start the outbound server-to-client drain if we are already inside a Tokio
+    // runtime. `pmcp::axum::router()` reaches this function synchronously and may
+    // not be, in which case this declines and `StreamableHttpServer::start()`
+    // makes the same idempotent call from inside one.
+    peer_channel::ensure_outbound_drain(&state);
+    state
 }
 
 /// A streamable HTTP server for MCP.
@@ -2061,6 +2088,10 @@ impl StreamableHttpServer {
     /// - [`DnsRebindingLayer`] -- Host/Origin header validation
     /// - [`SecurityHeadersLayer`] -- nosniff, DENY, no-store
     pub async fn start(self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        // Idempotent. `make_server_state` already tried, and succeeded whenever it
+        // ran inside a runtime; this covers the `with_config`-outside-a-runtime
+        // construction order.
+        peer_channel::ensure_outbound_drain(&self.state);
         let allowed = self.state.allowed_origins.clone();
         let cors = crate::server::tower_layers::build_mcp_cors_layer(&allowed);
 
@@ -3975,6 +4006,23 @@ async fn handle_post_fast_path_inner(
 
     let auth_context = extract_and_validate_auth(&state, &headers).await?;
 
+    // The transport-side half of the server-to-client channel (CONF-07 / G-3):
+    // bind a session-scoped peer + notification sink onto the ALREADY-RESOLVED
+    // context, at the one site that knows which session this request arrived on.
+    // A no-op when there is no live session or the era suppresses them, and
+    // placed AFTER every era-gated stage so `era`, `sessions_on` and the legacy
+    // version guard all read exactly what they read before.
+    let protocol_context = peer_channel::attach_session_backchannel(
+        &state,
+        protocol_context,
+        peer_channel::BackchannelSite {
+            session_id: response_session_id.as_deref(),
+            sessions_on,
+            is_init_request,
+        },
+    )
+    .await;
+
     Ok(dispatch_message_fast(
         &state,
         ingress,
@@ -4665,6 +4713,19 @@ async fn handle_post_with_middleware_inner(
     let auth_context =
         extract_auth_with_middleware(&state, &server_request, http_middleware, &http_context)
             .await?;
+
+    // The SAME transport-side attachment as the fast-path twin, from the same
+    // position in the pipeline — see that call site for why it sits here.
+    let protocol_context = peer_channel::attach_session_backchannel(
+        &state,
+        protocol_context,
+        peer_channel::BackchannelSite {
+            session_id: response_session_id.as_deref(),
+            sessions_on,
+            is_init_request,
+        },
+    )
+    .await;
 
     // `Box::pin` the dispatch future: the discover per-path assembly (Plan 112-10)
     // grows it past clippy's large_future threshold; boxing keeps the handler
