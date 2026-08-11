@@ -1253,21 +1253,39 @@ async fn progress_emission_still_succeeds_when_the_session_has_no_live_stream() 
 }
 
 // ===========================================================================
-// (12) THE v2 BRANCH IS INERT — T-118.1-11-08.
+// (12) THE v2 BRANCH HAS ITS OWN VEHICLE — T-118.1-11-08, flipped by plan 12.
 //
-// v2 is handshake-free and session-free, so `route_to_session_stream` has no
-// session to key on. This plan therefore attaches NO back-channel on v2: no peer
-// and no notification sink. The call must still succeed and emit nothing.
+// # History, kept because the tripwire's value was in the transition
 //
-// This is not an aspiration — it is the guard against reusing the v1
-// session-keyed closure on v2, where it would look up an id that cannot exist,
-// silently drop every frame, and leave a green build with a permanently red
-// `tools-call-with-progress`. Plan 12 fills this branch with a bounded
-// per-request queue whose receiver becomes a multi-frame SSE POST body.
+// Plan 11 asserted the OPPOSITE of what this test now asserts: that a v2 call
+// with a progress token emitted NOTHING. That was correct FOR PLAN 11, and it was
+// deliberately a tripwire rather than a permanent truth — v2 is handshake-free
+// and session-free, so `route_to_session_stream` has no session to key on, and
+// reusing v1's session-keyed closure on v2 would have looked up an id that cannot
+// exist, dropped every frame silently, and left a green build with a permanently
+// red `tools-call-with-progress`. The inert assertion was the guard against
+// exactly that, and plan 11's comment named plan 12 as its successor.
+//
+// # What plan 12 supplied (CONF-07 / D-16)
+//
+// v2's own vehicle: the POST RESPONSE BODY, framed as multi-frame SSE. A bounded
+// per-request queue is created before dispatch, the handler's progress reports
+// land in it, and the response body carries those frames followed by the result
+// frame. So the v2 branch is no longer inert, and the assertion inverts.
+//
+// The vehicle is MEASURED, not assumed: plan 12 Task 1 ran the pinned conformance
+// suite (0.2.0-alpha.11) against a server answering this exact shape and got
+// `tools-call-with-progress` SUCCESS with `progressCount: 3`.
+//
+// The frame-level properties (order, the result frame last, the
+// no-independent-requests constraint, the bound) are pinned by
+// `tests/v2_sse_progress.rs`. What is pinned HERE is the era contrast: the SAME
+// fixture server, the SAME tool, answered on v1 through the session stream and on
+// v2 through the response body.
 // ===========================================================================
 
 #[tokio::test]
-async fn a_v2_call_with_a_progress_token_succeeds_and_emits_no_progress_frames() {
+async fn a_v2_call_with_a_progress_token_emits_progress_on_the_response_body() {
     let (addr, handle) = spawn_server(build_dual_era_server()).await;
 
     let (status, body) = post(
@@ -1283,10 +1301,16 @@ async fn a_v2_call_with_a_progress_token_succeeds_and_emits_no_progress_frames()
         body.contains("progress-done"),
         "the tool runs to completion on v2: {body}"
     );
+
+    let frames = body.matches(PROGRESS_METHOD).count();
+    assert_eq!(
+        frames, PROGRESS_STEPS,
+        "v2 delivers progress on the POST RESPONSE BODY as multi-frame SSE (plan 12 / D-16); \
+         expected {PROGRESS_STEPS} frames, saw {frames}: {body}"
+    );
     assert!(
-        !body.contains(PROGRESS_METHOD),
-        "v2 carries no session stream, so this plan emits NO progress frames there — \
-         plan 12 supplies v2's own vehicle: {body}"
+        body.rfind("\"result\"") > body.rfind(PROGRESS_METHOD),
+        "and the result frame comes LAST, after every progress frame: {body}"
     );
 
     teardown(handle, ()).await;

@@ -921,6 +921,26 @@ const ALLOWLIST: &[Accumulation] = &[
               link. Neither mechanism retains state across calls.",
     },
     Accumulation {
+        path: "src/server/streamable_http_server.rs",
+        needle: "push_str(",
+        count: 2,
+        why: "render_v2_multi_frame_body assembles the v2 multi-frame SSE POST response body \
+              (CONF-07 / D-16): one append per queued progress notification, then exactly one \
+              append for the terminal result frame. The loop's length is the length of the vector \
+              V2ProgressQueue::drain returned, and THAT is bounded by the queue's own capacity — \
+              V2_PROGRESS_QUEUE_CAPACITY (64), a BOUNDED tokio mpsc whose synchronous producer \
+              uses try_send and drops on a full queue rather than blocking or growing \
+              (T-118.1-12-01). So the bound is the channel's capacity, applied BEFORE these bytes \
+              exist, not a drain downstream of them. The per-frame size is bounded independently: \
+              a progress notification is a ProgressToken plus two f64s and an Option<String>, all \
+              chosen by the SERVER's own handler, never read off a socket — the only \
+              peer-supplied component is the progress token, which arrived inside the request \
+              body under the transport's max_request_bytes cap. The second append runs exactly \
+              once per response and carries the same JSONRPCResponse the JSON path would have \
+              serialized whole, so it adds no byte the unchanged path did not already emit. \
+              Nothing streams into this String and it is built to completion before axum sees it.",
+    },
+    Accumulation {
         path: "src/shared/credential_store.rs",
         needle: "push_str(",
         count: 1,
