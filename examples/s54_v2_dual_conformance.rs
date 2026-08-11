@@ -80,18 +80,25 @@
 //!
 //! The scored 2026-07-28 failures that this example CANNOT fix, because every
 //! one of them lives in `src/` rather than in a fixture, with the gap they
-//! trace to:
+//! trace to.
 //!
-//! | Scored scenario | Gap | What `src/` does |
+//! **STATUS as of plan 118.1-12: all nine are struck through.** The rows are kept
+//! rather than deleted because each one records the DEFECT and the plan that
+//! closed it, and a reader tracing a scenario back to its cause needs both. A
+//! struck-through row is history; a live row would be a claim that the defect is
+//! still present, and there are none left in this table.
+//!
+//! | Scored scenario | Gap | What `src/` did, and what closed it |
 //! |---|---|---|
 //! | ~~`tools-call-embedded-resource`, `tools-call-mixed-content`, `prompts-get-embedded-resource`~~ | G-1 | CLOSED in 118.1-03: `Content::Resource` now emits the spec's `EmbeddedResource`, nested under `resource` |
 //! | ~~`resources-read-binary`~~ | G-2 | CLOSED in 118.1-03: `Content::resource_with_blob` plus `blob` in the flat `ReadResourceResult.contents` projection |
-//! | `tools-call-with-progress` | G-3 | `notification_tx` is set only in `Server::run()`, which `StreamableHttpServer` never calls |
+//! | ~~`tools-call-with-progress`~~ | G-3 | CLOSED across 118.1-10/11/12. HISTORY: `notification_tx` was set only in `Server::run()`, which `StreamableHttpServer` never calls, so `extra.report_progress(..)` was silently inert over HTTP on BOTH eras. v1 now routes through a session-bound `TransportBackchannel` onto the issuing session's SSE stream (118.1-11); v2 — which has no session and answers 405 on GET — carries the frames on its own POST RESPONSE BODY as multi-frame SSE (118.1-12 / D-16). RESIDUAL: pmcp's own CLIENT transport cannot hold a live GET SSE stream, so the v1 round trip is server-side-only. See `deferred-items.md` |
 //! | ~~`completion-complete`~~ | G-4 | CLOSED in 118.1-04: `completion/complete` has its own registration slot on BOTH builder families and answers the spec `CompleteResult` shape; this example registers a provider (see `completion_provider`) |
-//! | `server-stateless` (`HttpServerMethodNotFound404ping`) | G-5 | `ping` is served under v2 instead of being retired — and see the sharper finding below |
-//! | `server-stateless` (`ServerImplementsDiscover`, `ServerUnsupportedVersionError`) | G-7 (new) | `server/discover` emits `protocolVersion`, never the `supportedVersions` array the spec mandates — `grep -rn supportedVersions src/` finds nothing |
-//! | `server-stateless` (3x `RequestMetaInvalid`, `HttpServerMetaInvalid400`) | G-6 (new) | a missing / malformed `_meta` answers `-32020`, not the `-32602` + HTTP 400 the spec requires; a missing `clientCapabilities` is not rejected at all |
-//! | `server-stateless` (`HttpServerHeaderMismatch400`) | G-8 (new) | a header/`_meta` protocol-version disagreement answers `-32022`, not `-32020` |
+//! | ~~`server-stateless` (`HttpServerMethodNotFound404ping`)~~ | G-5 | CLOSED in 118.1-05: `ping` WAS served under v2 instead of being retired; retirement is now keyed on the method set — see the section below |
+//! | ~~`server-stateless` (`ServerImplementsDiscover`, `ServerUnsupportedVersionError`)~~ | G-7 (new) | CLOSED in 118.1-07: `server/discover` emitted only `protocolVersion` and never the `supportedVersions` array the spec mandates |
+//! | ~~`server-stateless` (3x `RequestMetaInvalid`, `HttpServerMetaInvalid400`)~~ | G-6 (new) | CLOSED in 118.1-06: a missing / malformed `_meta` answered `-32020` rather than the spec's `-32602` + HTTP 400, and a missing `clientCapabilities` was not rejected at all |
+//! | ~~`server-stateless` (`HttpServerHeaderMismatch400`)~~ | G-8 (new) | CLOSED in 118.1-06 alongside G-6: a header/`_meta` protocol-version disagreement answered `-32022` rather than `-32020` |
+//! | ~~(no scored scenario — a handler-visibility gap)~~ | G-9 | CLOSED in 118.1-08: a v1 handshake's declared client capabilities never reached `RequestHandlerExtra::client_capabilities()`, which read only the v2 `_meta` key, so a v1 handler could not see that its client had declared `sampling`/`roots` |
 //!
 //! Everything else that fails is a MISSING FIXTURE, and fixtures are exactly
 //! what this file is for. Do not cite this example as "pmcp passes the official
@@ -286,6 +293,14 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8149";
 /// Read for PRESENCE only — the value is never logged, printed or echoed
 /// (T-118-15).
 const REQUEST_STATE_KEY_VAR: &str = "PMCP_REQUEST_STATE_KEY";
+
+/// Interval between the `test_tool_with_progress` reports.
+///
+/// ONE TICK ABOVE `ServerProgressReporter`'s 100 ms rate-limit window, and that
+/// is the whole reason for the number. See the tool body for the defect this
+/// fixed: at the previous 50 ms the middle report was inside the window and was
+/// dropped, so the tool delivered two frames where the scenario requires three.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Serves every `test://` URI the 2025-11-25 scored set names.
 ///
@@ -820,12 +835,32 @@ impl ConformanceTool {
             )])),
 
             "test_tool_with_progress" => {
-                // The scenario requires at least three notifications with
-                // non-decreasing progress, and the delays are what let a client
-                // observe them as separate messages rather than one burst.
-                for step in [0.0_f64, 50.0, 100.0] {
+                // The scenario requires at least THREE notifications with
+                // non-decreasing progress:
+                //   `i.length < 3 && a.push("Expected at least 3 progress
+                //    notifications, got " + i.length)`
+                //
+                // # Why the interval is 120 ms and not 50 ms (fixed in 118.1-12)
+                //
+                // `ServerProgressReporter` admits at most one notification per
+                // 100 ms. It makes exactly two unconditional exceptions: the
+                // FIRST report always goes, and a FINAL report (`progress ==
+                // total`) always goes. Reports 1 (0/100) and 3 (100/100) ride
+                // those. Report 2 (50/100) is neither — so at the previous 50 ms
+                // spacing it landed INSIDE the rate-limit window and was
+                // silently dropped, and this tool delivered TWO frames while the
+                // comment above it claimed three. One short of the floor, which
+                // is a FAILURE even with the transport working.
+                //
+                // `PROGRESS_INTERVAL` is one tick above that window, so all
+                // three are admitted. It also still serves the original purpose
+                // of the delay: a client observes separate messages rather than
+                // one burst.
+                for (index, step) in [0.0_f64, 50.0, 100.0].into_iter().enumerate() {
+                    if index > 0 {
+                        tokio::time::sleep(PROGRESS_INTERVAL).await;
+                    }
                     extra.report_progress(step, Some(100.0), None).await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Ok(CallToolResult::new(vec![Content::text(
                     "Tool with progress completed",

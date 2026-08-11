@@ -2319,6 +2319,301 @@ fn serialize_response_as_json_value(
     Ok(json_value)
 }
 
+// ---------------------------------------------------------------------------
+// CONF-07 / G-3's v2 half (D-16): the POST response body as a multi-frame SSE
+// vehicle for `notifications/progress`.
+//
+// On v2 there are no sessions (`sessions_active_for(_, Some(Era::V2))` is false,
+// pinned by `sessions_active_truth_table`) and GET answers 405 (pinned by
+// `v2_verb_rejection`), so a POST's own response body is the ONLY channel a
+// server-to-client notification can travel on. This block generalizes the
+// one-shot `build_sse_response_from_single_message` into a builder that emits N
+// queued progress frames followed by the result frame.
+//
+// The measured basis (plan 12 Task 1): the pinned conformance suite
+// (0.2.0-alpha.11) reported `tools-call-with-progress` SUCCESS with
+// `progressCount: 3` against a server answering exactly this shape. Its v2 client
+// (`wt` in `dist/index.js`) pushes any frame with a `method` and no `id` onto its
+// `notifications` array, and THROWS -32600 on a frame carrying both.
+// ---------------------------------------------------------------------------
+
+/// Maximum number of progress notifications one v2 request may queue onto its
+/// POST response body.
+///
+/// # The number
+///
+/// **64.** The pinned suite's `tools-call-with-progress` asks for three, and
+/// `ServerProgressReporter` rate-limits a well-behaved handler to ten per second,
+/// so 64 admits roughly six seconds of continuous well-behaved reporting — far
+/// past any realistic tool — while capping the per-request memory a hostile
+/// handler can pin at 64 `Notification`s rather than at "however many it can emit
+/// before the response is built".
+///
+/// # The overflow policy: DROP-NEWEST, never block, never grow
+///
+/// The queue is a **bounded** `tokio::sync::mpsc` channel and the producer is a
+/// synchronous `Fn(Notification)` sink that cannot await, so it uses `try_send`:
+/// when the queue is full the notification is DROPPED and a `warn!` is logged.
+/// Progress is advisory by definition — the MCP spec says a receiver "is not
+/// obligated to provide these notifications" — so dropping is a conformant
+/// degradation, whereas blocking would let a slow reader stall a tool handler and
+/// growing without limit is the memory-DoS class Phase 113 fixed.
+///
+/// `build_sse_response_from_single_message` uses `mpsc::unbounded_channel`; that
+/// is sound for exactly-one-message and is deliberately NOT copied here
+/// (T-118.1-12-01).
+pub const V2_PROGRESS_QUEUE_CAPACITY: usize = 64;
+
+/// A frame that may legally appear on a v2 POST response stream.
+///
+/// # This type IS the control for `HttpServerNoIndependentRequestsOnStream`
+///
+/// The suite's v2 client refuses a top-level server-to-client REQUEST on this
+/// stream — it throws `-32600 "Server sent request '…' on response stream;
+/// stateless lifecycle forbids this (use MRTR)"`. Server-to-client requests stay
+/// MRTR on v2, which already works.
+///
+/// That constraint is enforced HERE, structurally: this enum has a notification
+/// arm and a result arm and **no request arm**, so a request frame on a v2
+/// response stream is not a bug to be avoided by review — it is unrepresentable.
+/// A comment saying "do not send requests here" would not be a control
+/// (T-118.1-12-02).
+///
+/// Contrast [`TransportMessage`], which carries a `Request { id, request }`
+/// variant and therefore must NOT be the item type of this stream.
+#[cfg_attr(not(feature = "streamable-http"), allow(dead_code))]
+enum V2ResponseFrame {
+    /// A one-way notification — today only `notifications/progress`.
+    Notification(crate::types::Notification),
+    /// The terminal result frame, carrying the LIVE request id (HTTP-05).
+    Result(crate::types::JSONRPCResponse),
+}
+
+impl V2ResponseFrame {
+    /// Project onto the wire type the shared serializer accepts.
+    ///
+    /// One-directional by construction: every `V2ResponseFrame` maps onto a
+    /// `TransportMessage`, and nothing maps back, so the missing request arm
+    /// cannot be reintroduced through this seam.
+    fn into_transport_message(self) -> TransportMessage {
+        match self {
+            Self::Notification(notification) => TransportMessage::Notification(notification),
+            Self::Result(response) => TransportMessage::Response(response),
+        }
+    }
+}
+
+/// The receiver half of one request's bounded progress queue.
+///
+/// Created BEFORE dispatch (so the sink handed to the handler has somewhere to
+/// write) and drained AFTER it (so the frames are all present when the response
+/// body is assembled). Owning it in a newtype keeps `FastPathDispatch` and
+/// `MiddlewareDispatch` from growing a bare `mpsc::Receiver` field whose
+/// element type nothing constrains.
+pub(crate) struct V2ProgressQueue {
+    receiver: mpsc::Receiver<crate::types::Notification>,
+}
+
+impl V2ProgressQueue {
+    /// Take every notification queued so far, in emission order.
+    ///
+    /// Non-blocking: the handler has already run to completion by the time this
+    /// is called (dispatch is awaited before the response is built), so the queue
+    /// is complete and `try_recv` drains it deterministically. Nothing here waits
+    /// on a producer, so a handler that emitted nothing costs one failed
+    /// `try_recv`.
+    fn drain(mut self) -> Vec<crate::types::Notification> {
+        let mut frames = Vec::new();
+        while let Ok(notification) = self.receiver.try_recv() {
+            frames.push(notification);
+        }
+        frames
+    }
+}
+
+/// Create one request's bounded progress queue.
+///
+/// Returns the sink to hand into the request's `TransportBackchannel` and the
+/// receiver to drain when the response is assembled. See
+/// [`V2_PROGRESS_QUEUE_CAPACITY`] for the bound and the drop-newest policy.
+pub(crate) fn new_v2_progress_queue() -> (
+    Arc<dyn Fn(crate::types::Notification) + Send + Sync>,
+    V2ProgressQueue,
+) {
+    let (tx, receiver) = mpsc::channel(V2_PROGRESS_QUEUE_CAPACITY);
+    let sink: Arc<dyn Fn(crate::types::Notification) + Send + Sync> =
+        Arc::new(move |notification| {
+            // DROP-NEWEST on a full queue. `try_send` never blocks, which is
+            // required: this closure is synchronous and runs on the handler's
+            // task.
+            if let Err(e) = tx.try_send(notification) {
+                tracing::warn!(
+                    target: "mcp.http",
+                    capacity = V2_PROGRESS_QUEUE_CAPACITY,
+                    error = %e,
+                    "v2 progress queue full or closed — dropping a progress notification"
+                );
+            }
+        });
+    (sink, V2ProgressQueue { receiver })
+}
+
+/// Render one SSE frame exactly as [`build_sse_response_from_single_message`]
+/// does — `id: <uuid>`, `event: message`, `data: <serialized message>`.
+///
+/// Hand-rendered rather than delegating to `axum`'s [`Event`] because the
+/// middleware path needs the same bytes as a complete `Vec<u8>` body and `Event`
+/// exposes no serializer. `sse_framing_matches_axum_event` in
+/// `tests/v2_sse_progress.rs`'s sibling unit tests below pins the two encodings
+/// together so this copy cannot drift.
+fn render_sse_frame(frame: V2ResponseFrame) -> String {
+    let message = frame.into_transport_message();
+    let json_bytes =
+        crate::shared::StdioTransport::serialize_message(&message).unwrap_or_else(|e| {
+            tracing::error!(target: "mcp.sse", error = %e, "Failed to serialize SSE message");
+            Vec::new()
+        });
+    let json_str = String::from_utf8(json_bytes).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "id: {}\nevent: message\ndata: {}\n\n",
+        Uuid::new_v4(),
+        json_str
+    )
+}
+
+/// Render the whole multi-frame body: every progress frame, then the result.
+///
+/// # Termination (T-118.1-12-03)
+///
+/// The body is COMPLETE before it is handed to axum. The handler has already run
+/// to completion — dispatch is awaited before the response is assembled — so
+/// there is no long-lived stream here, no keep-alive to schedule, and no
+/// connection held open by a stalled handler. The stream terminates on the result
+/// frame because the result frame is the last byte written.
+fn render_v2_multi_frame_body(
+    progress: Vec<crate::types::Notification>,
+    result: crate::types::JSONRPCResponse,
+) -> String {
+    let mut body = String::new();
+    for notification in progress {
+        body.push_str(&render_sse_frame(V2ResponseFrame::Notification(
+            notification,
+        )));
+    }
+    body.push_str(&render_sse_frame(V2ResponseFrame::Result(result)));
+    body
+}
+
+/// Build the multi-frame SSE POST response.
+///
+/// Sets `text/event-stream` plus the same anti-buffering treatment the long-lived
+/// listen stream uses, so an intermediary cannot coalesce the frames.
+fn build_v2_multi_frame_sse_response(
+    progress: Vec<crate::types::Notification>,
+    result: crate::types::JSONRPCResponse,
+) -> Response {
+    let body = render_v2_multi_frame_body(progress, result);
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(TEXT_EVENT_STREAM),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(X_ACCEL_BUFFERING, HeaderValue::from_static("no"));
+    response
+}
+
+/// Whether this request may answer with a multi-frame SSE body.
+///
+/// All three must hold (T-118.1-12-05):
+///
+/// * the era is **v2** — v1 has a session stream and uses it (plan 11);
+/// * JSON mode is **off** — an operator who configured JSON responses gets JSON;
+/// * the client's `Accept` includes **`text/event-stream`** — switching a client
+///   that asked only for JSON onto an event stream could break it or an
+///   intermediary between them.
+///
+/// Evaluated BEFORE dispatch so an ineligible request never even allocates a
+/// queue, which is what makes "a v2 call that emits no progress is byte-identical
+/// to today" true by construction rather than by a later branch.
+/// `accept` is the request's raw `Accept` value. Taken as a `&str` rather than a
+/// `HeaderMap` so the fast path (axum `HeaderMap`) and the middleware path
+/// (`ServerHttpRequest::get_header`) reach the SAME predicate instead of each
+/// re-deriving eligibility from the shape of its own request type.
+fn v2_multi_frame_eligible(
+    state: &ServerState,
+    era: Option<crate::types::protocol::Era>,
+    accept: Option<&str>,
+) -> bool {
+    era == Some(crate::types::protocol::Era::V2)
+        && !state.config.enable_json_response
+        && accept.is_some_and(|accept| accept.contains(TEXT_EVENT_STREAM))
+}
+
+/// Attach a v2 progress sink to this request's context, returning the queue.
+///
+/// The v2 twin of [`peer_channel::attach_session_backchannel`]'s v1 branch, and
+/// deliberately NOT a reuse of its closure: that one routes through
+/// `v1::route_to_session_stream` keyed by `session_id`, which has no meaning on
+/// an era with no sessions and would drop every frame silently (T-118.1-11-08).
+/// What the two share is the ATTACHMENT POINT and the sink TYPE.
+///
+/// No peer is attached: a v2 server-to-client REQUEST stays MRTR, and this stream
+/// structurally cannot carry one ([`V2ResponseFrame`]).
+fn attach_v2_progress_sink(
+    context: Option<crate::types::protocol::ProtocolContext>,
+    eligible: bool,
+) -> (
+    Option<crate::types::protocol::ProtocolContext>,
+    Option<V2ProgressQueue>,
+) {
+    if !eligible {
+        return (context, None);
+    }
+    let Some(context) = context else {
+        return (None, None);
+    };
+    let (sink, queue) = new_v2_progress_queue();
+    let backchannel =
+        crate::types::protocol::context::TransportBackchannel::new().with_notification_sink(sink);
+    (
+        Some(context.with_transport_backchannel(backchannel)),
+        Some(queue),
+    )
+}
+
+/// Decide whether this response becomes a multi-frame SSE body, and if so hand
+/// back its frames.
+///
+/// Returns `None` — meaning "use the unchanged response builder" — in every case
+/// but one:
+///
+/// * no queue (the request was not eligible, so none was created);
+/// * the queue is EMPTY (the handler reported no progress), which is what makes a
+///   no-progress v2 response byte-identical to today's;
+/// * the response is not a `Response` envelope (unreachable on this path, but the
+///   match states it rather than assuming it).
+///
+/// The `JSONRPCResponse` is cloned only on the multi-frame branch, so the common
+/// no-progress path pays one failed `try_recv` and nothing else.
+fn take_v2_progress_frames(
+    queue: Option<V2ProgressQueue>,
+    response_msg: &TransportMessage,
+) -> Option<(
+    Vec<crate::types::Notification>,
+    crate::types::JSONRPCResponse,
+)> {
+    let progress = queue?.drain();
+    if progress.is_empty() {
+        return None;
+    }
+    let TransportMessage::Response(result) = response_msg else {
+        return None;
+    };
+    Some((progress, result.clone()))
+}
+
 /// Build an OK JSON response body from a `TransportMessage`.
 fn build_json_response(response: &TransportMessage, trace_source: &'static str) -> Response {
     let json_value = match serialize_response_as_json_value(response) {
@@ -2970,6 +3265,12 @@ struct FastPathDispatch {
     /// [`v1::sessions_active`] for THIS request — gates the `Mcp-Session-Id`
     /// response header (HTTP-01).
     sessions_on: bool,
+    /// This request's bounded v2 progress queue (CONF-07 / D-16), or `None` when
+    /// the request is not eligible for a multi-frame SSE body.
+    ///
+    /// Created BEFORE dispatch so the handler's sink has somewhere to write, and
+    /// carried here so the receiver survives to the response builder.
+    progress_queue: Option<V2ProgressQueue>,
 }
 
 async fn handle_fast_path_request(
@@ -2986,6 +3287,7 @@ async fn handle_fast_path_request(
         protocol_context,
         v2_outbound,
         sessions_on,
+        progress_queue,
     } = dispatch;
 
     let era = protocol_context.as_ref().map(|pc| pc.era);
@@ -3026,7 +3328,14 @@ async fn handle_fast_path_request(
 
     v1::store_response_event(state, era, response_session_id.as_ref(), &response_msg).await;
 
-    let mut response = build_response(state, response_msg, session_id, sessions_on);
+    // CONF-07 / D-16: if this v2 request queued progress, its response body
+    // becomes a multi-frame SSE stream. `None` — no queue, or a queue the handler
+    // never wrote to — falls through to the UNCHANGED builder, which is what
+    // keeps a no-progress v2 response byte-identical to today's.
+    let mut response = match take_v2_progress_frames(progress_queue, &response_msg) {
+        Some((progress, result)) => build_v2_multi_frame_sse_response(progress, result),
+        None => build_response(state, response_msg, session_id, sessions_on),
+    };
 
     v1::apply_session_header(
         response.headers_mut(),
@@ -4044,6 +4353,19 @@ async fn handle_post_fast_path_inner(
     )
     .await;
 
+    // The v2 twin of the attachment above (CONF-07 / D-16), at the SAME point in
+    // the pipeline and for the same reason: this is the one site that knows both
+    // the resolved era and the client's `Accept`. Inert on v1 — that era has a
+    // session stream and plan 11 already routes to it.
+    let (protocol_context, progress_queue) = attach_v2_progress_sink(
+        protocol_context,
+        v2_multi_frame_eligible(
+            &state,
+            era,
+            headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()),
+        ),
+    );
+
     Ok(dispatch_message_fast(
         &state,
         ingress,
@@ -4053,6 +4375,7 @@ async fn handle_post_fast_path_inner(
             protocol_context,
             v2_outbound,
             sessions_on,
+            progress_queue,
         },
         auth_context,
         session_id.as_ref(),
@@ -4186,6 +4509,8 @@ struct MiddlewareDispatch {
     /// [`v1::sessions_active`] for THIS request — gates the `Mcp-Session-Id`
     /// response header (HTTP-01).
     sessions_on: bool,
+    /// This request's bounded v2 progress queue — see the fast-path twin.
+    progress_queue: Option<V2ProgressQueue>,
 }
 
 /// Assemble the `server/discover` response on the middleware path (VERS-04).
@@ -4401,6 +4726,7 @@ async fn dispatch_message_with_middleware(
         protocol_context,
         v2_outbound,
         sessions_on,
+        progress_queue,
     } = dispatch;
     match ingress {
         HttpIngress::Discover { id, .. } => {
@@ -4484,15 +4810,34 @@ async fn dispatch_message_with_middleware(
                 negotiated_version.as_deref(),
             );
 
-            let mut response = build_success_response_with_middleware(
-                &response_msg,
-                response_session_id.as_ref(),
-                &version_to_send,
-                sessions_on,
-                http_middleware,
-                http_context,
-            )
-            .await;
+            // CONF-07 / D-16, the middleware twin. The multi-frame body is a
+            // COMPLETE byte buffer by the time it is built (the handler has
+            // already run), so it passes through the response middleware chain
+            // like any other body — no streaming contract is broken.
+            let mut response = match take_v2_progress_frames(progress_queue, &response_msg) {
+                Some((progress, result)) => {
+                    // The session/version headers the JSON twin sets INSIDE
+                    // `build_success_response_with_middleware` are applied
+                    // here instead, so the two branches emit the same header
+                    // set and only the body framing differs.
+                    let mut sse = build_v2_multi_frame_sse_response(progress, result);
+                    let headers = sse.headers_mut();
+                    v1::apply_session_header(headers, response_session_id.as_ref(), sessions_on);
+                    headers.insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
+                    sse
+                },
+                None => {
+                    build_success_response_with_middleware(
+                        &response_msg,
+                        response_session_id.as_ref(),
+                        &version_to_send,
+                        sessions_on,
+                        http_middleware,
+                        http_context,
+                    )
+                    .await
+                },
+            };
 
             // v2 outbound headers on BOTH success and structured error (VERS-05).
             if let Some((method, name)) = &v2_outbound {
@@ -4774,6 +5119,16 @@ async fn handle_post_with_middleware_inner(
     )
     .await;
 
+    // The v2 progress queue (CONF-07 / D-16) — see the fast-path twin.
+    let (protocol_context, progress_queue) = attach_v2_progress_sink(
+        protocol_context,
+        v2_multi_frame_eligible(
+            &state,
+            era,
+            server_request.get_header(header::ACCEPT.as_str()),
+        ),
+    );
+
     // `Box::pin` the dispatch future: the discover per-path assembly (Plan 112-10)
     // grows it past clippy's large_future threshold; boxing keeps the handler
     // future small without changing behavior. Pre-dates plan 113.1 and is kept —
@@ -4788,6 +5143,7 @@ async fn handle_post_with_middleware_inner(
             protocol_context,
             v2_outbound,
             sessions_on,
+            progress_queue,
         },
         auth_context,
         http_middleware,
@@ -7405,6 +7761,161 @@ mod tests {
                 frame["result"]["_meta"][crate::server::core::RESERVED_SERVER_INFO_KEY]["name"],
                 json!("listen-server"),
                 "serverInfo comes from the SHARED envelope helper too"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // CONF-07 / G-3's v2 half (D-16): the multi-frame SSE POST response.
+    //
+    // Named after the production surface so `cargo test --lib -- v2_multi_frame`
+    // selects these rather than passing vacuously.
+    //
+    // The WIRE-level proof lives in `tests/v2_sse_progress.rs`, which drives a
+    // real server over real HTTP. What is proved HERE is the pair of properties
+    // an end-to-end test cannot reach: the queue's exact bound (the progress
+    // reporter's 100 ms rate limit stands between a handler and the queue, so no
+    // handler can push a queue to capacity through the public path), and the
+    // byte-equality of the hand-rendered framing with axum's own.
+    // -------------------------------------------------------------------
+    mod v2_multi_frame_sse {
+        use super::*;
+        use crate::types::notifications::{ProgressNotification, ProgressToken};
+        use crate::types::{JSONRPCResponse, Notification, RequestId};
+
+        /// A progress notification carrying `progress` as its value.
+        fn progress(value: f64) -> Notification {
+            Notification::Progress(ProgressNotification::new(
+                ProgressToken::String("tok".to_string()),
+                value,
+                None,
+            ))
+        }
+
+        /// T-118.1-12-01, measured DIRECTLY: the queue admits exactly
+        /// [`V2_PROGRESS_QUEUE_CAPACITY`] notifications and drops the rest.
+        ///
+        /// The sink is driven straight, bypassing `ServerProgressReporter` —
+        /// whose 100 ms rate limit would otherwise be the thing under test. This
+        /// is the assertion that distinguishes "bounded" from "we never happened
+        /// to overflow it".
+        #[test]
+        fn the_progress_queue_is_bounded_at_its_stated_capacity() {
+            let overflow = 500;
+            let (sink, queue) = new_v2_progress_queue();
+            for step in 0..(V2_PROGRESS_QUEUE_CAPACITY + overflow) {
+                #[allow(clippy::cast_precision_loss)]
+                sink(progress(step as f64));
+            }
+            let drained = queue.drain();
+            assert_eq!(
+                drained.len(),
+                V2_PROGRESS_QUEUE_CAPACITY,
+                "the per-request progress queue must cap at its stated bound, not grow"
+            );
+        }
+
+        /// DROP-NEWEST, stated in the constant's rustdoc and asserted here: the
+        /// frames that survive are the EARLIEST ones.
+        #[test]
+        fn the_overflow_policy_is_drop_newest() {
+            let (sink, queue) = new_v2_progress_queue();
+            for step in 0..(V2_PROGRESS_QUEUE_CAPACITY * 2) {
+                #[allow(clippy::cast_precision_loss)]
+                sink(progress(step as f64));
+            }
+            let drained = queue.drain();
+            let last = drained.last().expect("the queue is non-empty");
+            let Notification::Progress(last) = last else {
+                panic!("only progress notifications were pushed");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let expected_last = (V2_PROGRESS_QUEUE_CAPACITY - 1) as f64;
+            assert!(
+                (last.progress - expected_last).abs() < f64::EPSILON,
+                "drop-newest keeps the EARLIEST frames: the last survivor should be \
+                 {expected_last}, got {}",
+                last.progress
+            );
+        }
+
+        /// An empty queue drains to nothing, which is what makes a no-progress v2
+        /// response fall through to the UNCHANGED builder.
+        #[test]
+        fn an_unused_queue_drains_empty() {
+            let (_sink, queue) = new_v2_progress_queue();
+            assert!(
+                queue.drain().is_empty(),
+                "a handler that never reported progress leaves the queue empty"
+            );
+        }
+
+        /// The hand-rendered framing is BYTE-IDENTICAL to what axum's `Sse` +
+        /// `Event` produce for the same message — modulo the random event id,
+        /// which is regenerated per frame by construction.
+        ///
+        /// This is the control for the one place plan 12 does not reuse the axum
+        /// type: the middleware path needs a complete `Vec<u8>` body and `Event`
+        /// exposes no serializer, so the framing is written out by hand. Without
+        /// this test that copy could silently drift from
+        /// [`build_sse_response_from_single_message`]'s.
+        #[tokio::test]
+        async fn the_hand_rendered_framing_matches_axum_event() {
+            let message = TransportMessage::Response(JSONRPCResponse::success(
+                RequestId::Number(7),
+                json!({"ok": true}),
+            ));
+
+            let axum_response = build_sse_response_from_single_message(message.clone());
+            let axum_bytes = axum::body::to_bytes(axum_response.into_body(), 64 * 1024)
+                .await
+                .expect("the one-shot SSE body reads");
+            let axum_body = String::from_utf8(axum_bytes.to_vec()).expect("utf8");
+
+            let TransportMessage::Response(response) = message else {
+                unreachable!("constructed as a Response above")
+            };
+            let hand_body = render_sse_frame(V2ResponseFrame::Result(response));
+
+            // Strip the `id:` line from both — it is a fresh UUID each time.
+            let strip_id = |body: &str| {
+                body.lines()
+                    .filter(|line| !line.starts_with("id:"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_eq!(
+                strip_id(&hand_body),
+                strip_id(&axum_body),
+                "the hand-rendered frame must match axum's `Event` framing byte for byte \
+                 (modulo the per-frame uuid); hand={hand_body:?} axum={axum_body:?}"
+            );
+        }
+
+        /// The multi-frame body puts every notification BEFORE the result, and
+        /// terminates on the result (T-118.1-12-03).
+        #[test]
+        fn the_body_ends_on_the_result_frame() {
+            let response = JSONRPCResponse::success(RequestId::Number(1), json!({"ok": true}));
+            let body = render_v2_multi_frame_body(vec![progress(1.0), progress(2.0)], response);
+
+            let data: Vec<&str> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect();
+            assert_eq!(
+                data.len(),
+                3,
+                "two notifications plus the result; body: {body}"
+            );
+            assert!(
+                data[0].contains("notifications/progress")
+                    && data[1].contains("notifications/progress"),
+                "the notifications come first; body: {body}"
+            );
+            assert!(
+                data[2].contains("\"result\""),
+                "and the LAST frame is the result; body: {body}"
             );
         }
     }
