@@ -76,7 +76,7 @@ chrono = "0.4"
 # every test/purity run has been validated against; revisit the bump deliberately
 # (realign the quick-xml pin + port the 0.41 reader API + triage the ingest delta)
 # rather than letting a caret range drift it.
-umya-spreadsheet = "=3.0.0"
+umya-spreadsheet = "=3.0.1"
 
 # The provenance raw reader (Plan 02, WBCO-07) reads the ORIGINAL on-disk .xlsx
 # bytes via quick-xml/zip — umya cannot surface calcPr/app.xml and FABRICATES
