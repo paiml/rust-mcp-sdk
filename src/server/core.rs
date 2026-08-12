@@ -739,27 +739,20 @@ impl ServerCore {
     /// unauthorized caller returns before a handler body ever runs and therefore
     /// never sees `extra.peer()` — the invariant stated at `src/shared/peer.rs`.
     ///
-    /// Kept structurally identical to `Server::attach_peer` (`src/server/mod.rs`):
-    /// the two dispatch roots must never disagree about which peer a handler sees.
+    /// Delegates to [`attach_request_peer`], the ONE unit `Server::attach_peer`
+    /// also calls: the two dispatch roots must never disagree about which peer a
+    /// handler sees, and sharing the body is what makes that structural rather
+    /// than a claim two comments make about each other.
     #[inline]
     fn attach_peer(&self, extra: RequestHandlerExtra) -> RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // Cloned out of the borrow before `with_peer` consumes `extra`.
-            let request_scoped = extra
-                .protocol_context
-                .as_ref()
-                .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
-                .and_then(crate::types::protocol::context::TransportBackchannel::peer)
-                .cloned();
-            if let Some(peer) = request_scoped {
-                return extra.with_peer(peer);
-            }
-            if let Some(peer) = self.peer_handle.as_ref() {
-                return extra.with_peer(peer.clone());
-            }
+            attach_request_peer(extra, self.peer_handle.as_ref())
         }
-        extra
+        #[cfg(target_arch = "wasm32")]
+        {
+            extra
+        }
     }
 
     /// Get the configured payload limits.
@@ -4488,6 +4481,54 @@ fn v1_capability_fold_applies(context: Option<&crate::types::protocol::ProtocolC
     context.is_none_or(|ctx| {
         matches!(ctx.era, crate::types::protocol::Era::V1) && ctx.client_capabilities.is_none()
     })
+}
+
+/// Resolve which peer a handler sees, request-scoped first, then the global one.
+///
+/// The ONE unit both native dispatch roots call — `ServerCore::attach_peer` and
+/// `Server::attach_peer`. It exists for the same reason
+/// [`fold_v1_handshake_capabilities`] takes the lock rather than an already-read
+/// value: the precedence rule is the kind of thing two roots must never disagree
+/// about, and a rule spelled twice is kept in step by a comment instead of by the
+/// compiler. Both roots previously carried this body verbatim.
+///
+/// # Precedence, and why this order
+///
+/// 1. The `TransportBackchannel`'s peer on THIS request's `ProtocolContext` —
+///    session-bound, attached by the transport at the one site that knows which
+///    session the request arrived on. It must win: a global handle cannot know
+///    which session to route a server-to-client request back to.
+/// 2. The server-level `peer_handle`, which is what the in-process path uses —
+///    `Server::run` attaches no backchannel, so the fallback is the live path
+///    there rather than a safety net.
+///
+/// Returning `extra` unchanged when neither exists leaves `extra.peer()` as
+/// `None`, which handlers already treat as "no back-channel on this transport".
+///
+/// # Ordering
+///
+/// Every dispatch site calls this AFTER its `tool_authorizer` check, so an
+/// unauthorized caller returns before a handler body ever runs and therefore
+/// never sees `extra.peer()` — the invariant stated at `src/shared/peer.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn attach_request_peer(
+    extra: crate::server::cancellation::RequestHandlerExtra,
+    global: Option<&Arc<dyn crate::shared::peer::PeerHandle>>,
+) -> crate::server::cancellation::RequestHandlerExtra {
+    // Cloned out of the borrow before `with_peer` consumes `extra`.
+    let request_scoped = extra
+        .protocol_context
+        .as_ref()
+        .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+        .and_then(crate::types::protocol::context::TransportBackchannel::peer)
+        .cloned();
+    if let Some(peer) = request_scoped {
+        return extra.with_peer(peer);
+    }
+    if let Some(peer) = global {
+        return extra.with_peer(peer.clone());
+    }
+    extra
 }
 
 /// Fold the v1 `initialize` handshake's advertised capabilities into the

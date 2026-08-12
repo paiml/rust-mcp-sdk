@@ -1240,6 +1240,10 @@ impl Server {
     /// Every dispatch site calls this AFTER its `tool_authorizer` check, so an
     /// unauthorized caller returns before a handler body ever runs and therefore
     /// never sees `extra.peer()` — the invariant stated at `src/shared/peer.rs`.
+    ///
+    /// Delegates to [`crate::server::core::attach_request_peer`], the ONE unit
+    /// `ServerCore::attach_peer` also calls — the precedence rule is defined
+    /// once and merely invoked here (twin-site parity).
     #[inline]
     fn attach_peer(
         &self,
@@ -1247,21 +1251,12 @@ impl Server {
     ) -> crate::server::cancellation::RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // Cloned out of the borrow before `with_peer` consumes `extra`.
-            let request_scoped = extra
-                .protocol_context
-                .as_ref()
-                .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
-                .and_then(crate::types::protocol::context::TransportBackchannel::peer)
-                .cloned();
-            if let Some(peer) = request_scoped {
-                return extra.with_peer(peer);
-            }
-            if let Some(peer) = self.peer_handle.as_ref() {
-                return extra.with_peer(peer.clone());
-            }
+            crate::server::core::attach_request_peer(extra, self.peer_handle.as_ref())
         }
-        extra
+        #[cfg(target_arch = "wasm32")]
+        {
+            extra
+        }
     }
 
     /// The one-way notification sink this request's progress reporter emits

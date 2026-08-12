@@ -2458,15 +2458,21 @@ pub(crate) fn new_v2_progress_queue() -> (
     (sink, V2ProgressQueue { receiver })
 }
 
-/// Render one SSE frame exactly as [`build_sse_response_from_single_message`]
-/// does — `id: <uuid>`, `event: message`, `data: <serialized message>`.
+/// Append one SSE frame exactly as [`build_sse_response_from_single_message`]
+/// emits it — `id: <uuid>`, `event: message`, `data: <serialized message>`.
 ///
 /// Hand-rendered rather than delegating to `axum`'s [`Event`] because the
 /// middleware path needs the same bytes as a complete `Vec<u8>` body and `Event`
-/// exposes no serializer. `sse_framing_matches_axum_event` in
-/// `tests/v2_sse_progress.rs`'s sibling unit tests below pins the two encodings
-/// together so this copy cannot drift.
-fn render_sse_frame(frame: V2ResponseFrame) -> String {
+/// exposes no serializer. `the_hand_rendered_framing_matches_axum_event` below
+/// pins the two encodings together so this copy cannot drift.
+///
+/// Writes into a caller-owned buffer rather than returning a `String`: the
+/// multi-frame body appends up to [`V2_PROGRESS_QUEUE_CAPACITY`] + 1 frames, and
+/// a per-frame `String` immediately copied into the accumulator and dropped is
+/// one allocation and one copy per frame for nothing.
+fn write_sse_frame(out: &mut String, frame: V2ResponseFrame) {
+    use std::fmt::Write as _;
+
     let message = frame.into_transport_message();
     let json_bytes =
         crate::shared::StdioTransport::serialize_message(&message).unwrap_or_else(|e| {
@@ -2474,11 +2480,13 @@ fn render_sse_frame(frame: V2ResponseFrame) -> String {
             Vec::new()
         });
     let json_str = String::from_utf8(json_bytes).unwrap_or_else(|_| "{}".to_string());
-    format!(
+    // Writing into a String is infallible; the Result exists only for the fmt trait.
+    let _ = write!(
+        out,
         "id: {}\nevent: message\ndata: {}\n\n",
         Uuid::new_v4(),
         json_str
-    )
+    );
 }
 
 /// Render the whole multi-frame body: every progress frame, then the result.
@@ -2496,11 +2504,9 @@ fn render_v2_multi_frame_body(
 ) -> String {
     let mut body = String::new();
     for notification in progress {
-        body.push_str(&render_sse_frame(V2ResponseFrame::Notification(
-            notification,
-        )));
+        write_sse_frame(&mut body, V2ResponseFrame::Notification(notification));
     }
-    body.push_str(&render_sse_frame(V2ResponseFrame::Result(result)));
+    write_sse_frame(&mut body, V2ResponseFrame::Result(result));
     body
 }
 
@@ -2595,23 +2601,34 @@ fn attach_v2_progress_sink(
 /// * the response is not a `Response` envelope (unreachable on this path, but the
 ///   match states it rather than assuming it).
 ///
-/// The `JSONRPCResponse` is cloned only on the multi-frame branch, so the common
-/// no-progress path pays one failed `try_recv` and nothing else.
+/// Takes `response_msg` BY VALUE and hands it back in the `Err` arm rather than
+/// cloning it into the `Ok` arm: the response carries the whole tool result,
+/// including any base64 image or audio blob, and both call sites own it and drop
+/// it unused on the multi-frame branch. The common no-progress path pays one
+/// failed `try_recv` and a move.
 fn take_v2_progress_frames(
     queue: Option<V2ProgressQueue>,
-    response_msg: &TransportMessage,
-) -> Option<(
-    Vec<crate::types::Notification>,
-    crate::types::JSONRPCResponse,
-)> {
-    let progress = queue?.drain();
-    if progress.is_empty() {
-        return None;
-    }
-    let TransportMessage::Response(result) = response_msg else {
-        return None;
+    response_msg: TransportMessage,
+) -> std::result::Result<
+    (
+        Vec<crate::types::Notification>,
+        crate::types::JSONRPCResponse,
+    ),
+    TransportMessage,
+> {
+    let Some(queue) = queue else {
+        return Err(response_msg);
     };
-    Some((progress, result.clone()))
+    let progress = queue.drain();
+    if progress.is_empty() {
+        return Err(response_msg);
+    }
+    match response_msg {
+        TransportMessage::Response(result) => Ok((progress, result)),
+        // Not a response envelope, so there is nothing to terminate the stream
+        // with — the match states it rather than assuming it.
+        other => Err(other),
+    }
 }
 
 /// Build an OK JSON response body from a `TransportMessage`.
@@ -3332,9 +3349,9 @@ async fn handle_fast_path_request(
     // becomes a multi-frame SSE stream. `None` — no queue, or a queue the handler
     // never wrote to — falls through to the UNCHANGED builder, which is what
     // keeps a no-progress v2 response byte-identical to today's.
-    let mut response = match take_v2_progress_frames(progress_queue, &response_msg) {
-        Some((progress, result)) => build_v2_multi_frame_sse_response(progress, result),
-        None => build_response(state, response_msg, session_id, sessions_on),
+    let mut response = match take_v2_progress_frames(progress_queue, response_msg) {
+        Ok((progress, result)) => build_v2_multi_frame_sse_response(progress, result),
+        Err(response_msg) => build_response(state, response_msg, session_id, sessions_on),
     };
 
     v1::apply_session_header(
@@ -4814,8 +4831,8 @@ async fn dispatch_message_with_middleware(
             // COMPLETE byte buffer by the time it is built (the handler has
             // already run), so it passes through the response middleware chain
             // like any other body — no streaming contract is broken.
-            let mut response = match take_v2_progress_frames(progress_queue, &response_msg) {
-                Some((progress, result)) => {
+            let mut response = match take_v2_progress_frames(progress_queue, response_msg) {
+                Ok((progress, result)) => {
                     // The session/version headers the JSON twin sets INSIDE
                     // `build_success_response_with_middleware` are applied
                     // here instead, so the two branches emit the same header
@@ -4826,7 +4843,7 @@ async fn dispatch_message_with_middleware(
                     headers.insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
                     sse
                 },
-                None => {
+                Err(response_msg) => {
                     build_success_response_with_middleware(
                         &response_msg,
                         response_session_id.as_ref(),
@@ -7875,7 +7892,11 @@ mod tests {
             let TransportMessage::Response(response) = message else {
                 unreachable!("constructed as a Response above")
             };
-            let hand_body = render_sse_frame(V2ResponseFrame::Result(response));
+            let hand_body = {
+                let mut rendered = String::new();
+                write_sse_frame(&mut rendered, V2ResponseFrame::Result(response));
+                rendered
+            };
 
             // Strip the `id:` line from both — it is a fresh UUID each time.
             let strip_id = |body: &str| {

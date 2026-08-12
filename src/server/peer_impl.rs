@@ -32,6 +32,7 @@ use crate::types::sampling::{
     CreateMessageParams, CreateMessageResult, CreateMessageResultWithTools,
 };
 use crate::types::{ProgressToken, ServerRequest};
+use serde::Deserialize;
 
 /// [`PeerHandle`] that delegates outbound RPCs to a shared
 /// [`ServerRequestDispatcher`].
@@ -87,9 +88,11 @@ impl PeerHandle for DispatchPeerHandle {
             .dispatcher
             .dispatch(ServerRequest::CreateMessage(Box::new(params)))
             .await?;
-        if let Ok(with_tools) =
-            serde_json::from_value::<CreateMessageResultWithTools>(value.clone())
-        {
+        // Borrowing deserializer: the strict shape is TRIED first, so a clone
+        // here would copy the whole completion payload on every call just to
+        // fall back on the legacy shape. `&Value` leaves `value` owned for the
+        // fallback below.
+        if let Ok(with_tools) = CreateMessageResultWithTools::deserialize(&value) {
             return Ok(with_tools);
         }
         let legacy = serde_json::from_value::<CreateMessageResult>(value).map_err(|e| {
