@@ -11,18 +11,28 @@
 # 0. WHAT THIS GATE ASSERTS — read this before anything else (D-21)
 # ---------------------------------------------------------------------------
 #
-# This script does NOT assert "the official suite exits 0". It cannot, and no
-# edit should make it pretend otherwise. Measured on this pin, against the
-# target example, from one process:
+# This script does NOT assert "the official suite exits 0" on BOTH revisions. It
+# cannot yet, and no edit should make it pretend otherwise. Measured on this pin,
+# against the target example, from one process — 118.1-13 ran this twice and
+# 118.1-14 a third time, byte-identical every time:
 #
-#     --requirements 2025-11-25   ->   51 passed, 15 failed, exit 1
-#     --requirements 2026-07-28   ->  124 passed,  54 failed, exit 1
+#     --requirements 2025-11-25   ->   72 passed,  2 failed, exit 1
+#     --requirements 2026-07-28   ->  142 passed, 36 failed, exit 0
 #
-# Nine structural SDK gaps (G-1..G-9) explain those failures. They are recorded,
+# Phase 118.1 CLOSED eight of the nine structural SDK gaps (G-1..G-9) recorded,
 # with source citations, in
 # `.planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md`.
-# One of them (G-1) changes the wire format of a public type and needs a semver
-# decision, which is why none of them is folded into this phase.
+# What remains, named rather than tolerated:
+#
+#   * v1, SCORED: `tools-call-with-logging`. The SDK has no handler-facing
+#     emitter for `notifications/message` — `ServerNotification::LogMessage` is
+#     constructed only in tests. This is the ONE gap-attributable failure left,
+#     it is G-3 sub-item (d), and it is owned by Phase 118.2.
+#   * v1, NOT SCORED: `json-schema-2020-12`. A fixture the target example does
+#     not carry, not an SDK defect.
+#   * v2, NOT SCORED: 36 checks, 30 of them the Tasks extension the target
+#     example deliberately does not implement. NONE is scored, which is exactly
+#     why the v2 leg exits 0.
 #
 # The response to that measurement is NOT an allowlist. `conformance/README.md`
 # § 9 forbids `--expected-failures` and every other shape of known-fail
@@ -32,19 +42,28 @@
 #
 #   (i)   the MRTR surface — every `input-required-result-*` scenario — must be
 #         entirely green, with at least MIN_MRTR_SCENARIOS of them present;
-#   (ii)  each run's TOTAL executed check count must meet its hard-coded floor
+#   (ii)  for every revision in FULLY_SCORED_GREEN_REVISIONS, EVERY SCORED
+#         scenario must be entirely green AND that revision's own suite exit
+#         status must be 0. This is a universally quantified claim over the
+#         scored set: nothing can be removed from it to make a red run green;
+#   (iii) every scenario named in BLOCKING_GREEN_SCENARIOS must be PRESENT and
+#         entirely green. This is an INCLUSION list of surfaces this repo
+#         claims, and it is the exact opposite of a known-fail allowlist — see
+#         the note above the declaration;
+#   (iv)  each run's TOTAL executed check count must meet its hard-coded floor
 #         (README § 7 rule 4) — a "did the referee actually run" tripwire;
-#   (iii) the zero-check scenario sets must match their committed lists EXACTLY,
+#   (v)   the zero-check scenario sets must match their committed lists EXACTLY,
 #         in BOTH directions (README § 7 rule 3);
-#   (iv)  both runs must execute against ONE live process (D-06), each under a
+#   (vi)  both runs must execute against ONE live process (D-06), each under a
 #         timeout, each reporting a nonzero scenario count.
 #
 # The suite's own exit status is CAPTURED and REPORTED — see `run_requirement_set`
-# — but it is not the verdict, because a verdict of "must exit 0" is not
-# achievable today and a gate that can never be green is a gate that gets
-# deleted. The declared non-conformance is printed by this script on every run,
-# so a reader of the CI log learns the honest posture rather than inferring a
-# false one from a green tick.
+# — and for a revision in FULLY_SCORED_GREEN_REVISIONS it is now also ASSERTED.
+# For 2025-11-25 it stays a reported fact rather than the verdict, because that
+# leg still exits 1 on the one gap above and a gate that can never be green is a
+# gate that gets deleted. The declared non-conformance is printed by this script
+# on every run, so a reader of the CI log learns the honest posture rather than
+# inferring a false one from a green tick.
 #
 # ---------------------------------------------------------------------------
 # THE FENCES, numbered, each naming the false green it closes
@@ -181,10 +200,17 @@ ZERO_CHECK_NOT_SCORED_SCENARIOS=(
 # gaps are open; when a gap closes the count MOVES UP, because a scenario that
 # gets further runs more checks.
 #
-# Provenance: 118-04-SUMMARY.md `## Total executed checks` (66, v1) and
-# 118-05-SUMMARY.md `### Total executed checks — the numbers 118-08 hard-codes`
-# (66 v1, independently re-derived; 178 v2).
-MIN_CHECKS_V1=66
+# Provenance, RAISED by 118.1-14 from the 66/178 that 118-04 and 118-05
+# measured: `118.1-13-SUMMARY.md` `## Task 1, second pass: the post-fix
+# measurement` measured **74** on v1 and **178** on v2 in two identical runs, and
+# 118.1-14 re-measured both at the same pin and got the same two numbers a third
+# time (`target/118.1-14-conf-oldpin-A.log`).
+#
+# The v1 rise 66 -> 74 is this comment's own prediction coming true. Closing G-3
+# let three elicitation scenarios get PAST their first check and run their
+# sub-checks: `tools-call-elicitation` 1->2, `elicitation-sep1034-defaults` 1->6,
+# `elicitation-sep1330-enums` 1->6.
+MIN_CHECKS_V1=74
 MIN_CHECKS_V2=178
 
 # THE BLOCKING SURFACE (D-21). Every scenario whose name starts with this prefix
@@ -194,8 +220,121 @@ MIN_CHECKS_V2=178
 #
 # MIN_MRTR_SCENARIOS is a FLOOR, never lowered: a re-pin that adds MRTR
 # scenarios raises it.
+#
+# KEPT even though FULLY_SCORED_GREEN_REVISIONS below now subsumes it. All 14
+# MRTR scenarios live on 2026-07-28 and all 14 are SCORED, so today the
+# whole-scored-set clause already covers every one of them. This gate is retained
+# because that overlap is a property of the SUITE'S CURRENT SCORING POLICY, not
+# of the MRTR surface: if a re-pin moved these scenarios into `pending`, the
+# whole-scored-set clause would silently stop covering them while this one keeps
+# naming them. A gate that survives a change in someone else's classification is
+# worth its few lines.
 MRTR_SCENARIO_PREFIX="input-required-result-"
 MIN_MRTR_SCENARIOS=14
+
+# THE BLOCKING SURFACE, part 2 (D-09/D-21) — revisions whose ENTIRE SCORED SET
+# must be green.
+#
+# This is the strongest shape available and it needs no list: for every revision
+# named here, EVERY scored scenario must have zero FAILURE checks and at least
+# one SUCCESS check, and the revision's OWN suite exit status must be 0. It is
+# universally quantified over the scored set, so — unlike any enumeration —
+# nothing can be deleted from it to turn a red run green.
+#
+# Measured (118.1-13 twice, 118.1-14 once, all identical): the 2026-07-28 leg has
+# 37 scored scenarios, ALL entirely green, and exits 0. The 2025-11-25 leg cannot
+# join this list yet: `tools-call-with-logging` is scored and fails, so that leg
+# exits 1. Phase 118.2 owns it, and when it lands, MOVE 2025-11-25 here and
+# delete its entries from BLOCKING_GREEN_SCENARIOS below — that is a widening,
+# not a rewrite.
+#
+# NOT asserted: a PASS COUNT. 118.1-13 characterised the v2 total oscillating
+# 141<->142 at ~21% per fresh server process, because
+# `ServerAcceptsWhitespaceHeaderValue` calls an ARBITRARY tool from `tools/list`
+# with no arguments and any tool that legitimately errors on that fails it. It
+# lives in `http-header-validation`, which is NOT SCORED at 2026-07-28 (measured:
+# 14 passed / 0 failed here, and the leg exited 0 in a 118.1-13 run where it DID
+# fire). A pass-count floor would import that flake into a blocking gate; the
+# scored-set assertion does not.
+FULLY_SCORED_GREEN_REVISIONS=(2026-07-28)
+
+# Non-vacuity floor for the assertion above. If `not_scored_names` ever mis-parsed
+# the suite's roster and classified everything as not-scored, "every scored
+# scenario is green" would be true of the empty set. Measured: 37 scored
+# scenarios at 2026-07-28. NEVER LOWERED.
+MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION=37
+
+# THE BLOCKING SURFACE, part 3 (D-09/D-21) — named scenarios that must each be
+# PRESENT and entirely green, for revisions not yet covered by the clause above.
+#
+# WHY THIS IS NOT A KNOWN-FAIL ALLOWLIST, and the distinction is the whole point
+# of D-21. An allowlist is a list of failures declared acceptable: adding an
+# entry turns a RED run GREEN, which is why `conformance/README.md` § 9 forbids
+# every shape of it. This is an INCLUSION list of surfaces the repository CLAIMS:
+# adding an entry can only make the gate STRICTER, and no entry can ever be added
+# to silence a failure, because a failing scenario cannot satisfy "entirely
+# green". The two lists point in opposite directions.
+#
+# A listed scenario that is ABSENT from the results is a FAILURE, not a skip —
+# otherwise a re-pin that renamed a scenario would silently stop checking it
+# while the gate stayed green.
+#
+# Provenance: `118.1-13-SUMMARY.md` and 118.1-14's own re-measurement at the same
+# pin (`target/118.1-14-conf-oldpin-A.log`). These are the 29 of the 30 SCORED
+# 2025-11-25 scenarios that measured entirely green. The 30th is
+# `tools-call-with-logging`, which FAILS and is therefore simply not claimed —
+# it is named in section 0, in the summary this script prints, and in the gaps
+# document, rather than being listed anywhere as tolerated.
+#
+# Deliberately EXCLUDED, each for a stated reason:
+#   * every NOT-SCORED scenario, including the green ones (`server-session-
+#     lifecycle` 3/0 on v1). D-14 fixes this gate's boundary at the suite's
+#     SCORED set, and the check floors plus the zero-check equality already
+#     answer "did they run" for the rest.
+#   * `2026-07-28:http-header-validation` — green in this run (14/0) but MEASURED
+#     FLAKY at ~3 failures per 14 fresh server processes. A flaky scenario in a
+#     blocking gate turns CI red at random, which is a worse outcome than a
+#     narrower gate. It is also not-scored, so it is excluded twice over.
+#   * the 2026-07-28 scored scenarios — the FULLY_SCORED_GREEN_REVISIONS clause
+#     above already covers every one of them, strictly more strongly than an
+#     enumeration could.
+BLOCKING_GREEN_SCENARIOS=(
+  "2025-11-25:completion-complete"
+  "2025-11-25:dns-rebinding-protection"
+  "2025-11-25:elicitation-sep1034-defaults"
+  "2025-11-25:elicitation-sep1330-enums"
+  "2025-11-25:logging-set-level"
+  "2025-11-25:ping"
+  "2025-11-25:prompts-get-embedded-resource"
+  "2025-11-25:prompts-get-simple"
+  "2025-11-25:prompts-get-with-args"
+  "2025-11-25:prompts-get-with-image"
+  "2025-11-25:prompts-list"
+  "2025-11-25:resources-list"
+  "2025-11-25:resources-read-binary"
+  "2025-11-25:resources-read-text"
+  "2025-11-25:resources-subscribe"
+  "2025-11-25:resources-templates-read"
+  "2025-11-25:resources-unsubscribe"
+  "2025-11-25:server-initialize"
+  "2025-11-25:server-sse-multiple-streams"
+  "2025-11-25:tools-call-audio"
+  "2025-11-25:tools-call-elicitation"
+  "2025-11-25:tools-call-embedded-resource"
+  "2025-11-25:tools-call-error"
+  "2025-11-25:tools-call-image"
+  "2025-11-25:tools-call-mixed-content"
+  "2025-11-25:tools-call-sampling"
+  "2025-11-25:tools-call-simple-text"
+  "2025-11-25:tools-call-with-progress"
+  "2025-11-25:tools-list"
+)
+
+# Floor on the SIZE of the list above, so the list cannot be quietly shortened to
+# make a red run green. That — not adding entries — is the only direction in
+# which an inclusion list can be abused. NEVER LOWERED: a scenario that stops
+# passing is an SDK regression to fix, not a line to delete.
+MIN_BLOCKING_GREEN_SCENARIOS=29
 
 # The target, the binary, the port and the results tree.
 CONFORMANCE_EXAMPLE="s54_v2_dual_conformance"
@@ -635,7 +774,30 @@ echo "=== gates ==="
 
 observed_zero_scored=""
 observed_zero_not_scored=""
+observed_green=""
 declare -a CHECK_TOTALS=()
+
+# Is `$rev` one of the revisions whose whole SCORED set must be green?
+rev_is_fully_scored_green() {
+  local candidate="$1" listed
+  for listed in ${FULLY_SCORED_GREEN_REVISIONS[@]+"${FULLY_SCORED_GREEN_REVISIONS[@]}"}; do
+    [ "$listed" = "$candidate" ] && return 0
+  done
+  return 1
+}
+
+# The suite's OWN exit status for `$rev`, as captured by `run_requirement_set`.
+suite_status_for_rev() {
+  local candidate="$1" entry rrev rstatus rlog
+  for entry in "${RUN_SUMMARY[@]}"; do
+    IFS='|' read -r rrev rstatus rlog <<<"$entry"
+    if [ "$rrev" = "$candidate" ]; then
+      printf '%s' "$rstatus"
+      return 0
+    fi
+  done
+  fail "no captured suite status for requirement set '$candidate'."
+}
 
 for rev in "${REQUIREMENT_SETS[@]}"; do
   out="$RESULTS_ROOT/$rev"
@@ -645,6 +807,8 @@ for rev in "${REQUIREMENT_SETS[@]}"; do
 
   total_checks=0
   scenario_dirs=0
+  scored_scenarios=0
+  scored_failing=0
   for dir in "$out"/*/; do
     [ -d "$dir" ] || continue
     [ -f "$dir/checks.json" ] || fail "$dir has no checks.json; the run did not complete."
@@ -652,16 +816,87 @@ for rev in "${REQUIREMENT_SETS[@]}"; do
     name="$(scenario_name_from_dir "$dir")"
     n="$(scored_check_count "$dir")"
     total_checks=$((total_checks + n))
+
+    # The scored/not-scored split is taken from the run's OWN roster, once, and
+    # reused by every gate below — deriving it twice is how two gates end up
+    # disagreeing about what they are gating.
+    if printf '%s\n' "$not_scored" | grep -qxF "$name"; then
+      is_scored=0
+    else
+      is_scored=1
+    fi
+
+    passed="$(checks_with_status "$dir" SUCCESS)"
+    failed="$(checks_with_status "$dir" FAILURE)"
+
+    if [ "$is_scored" -eq 1 ]; then
+      scored_scenarios=$((scored_scenarios + 1))
+      if [ "$failed" -ne 0 ]; then
+        scored_failing=$((scored_failing + 1))
+      fi
+    fi
+
+    # "Entirely green" means BOTH: no failing check, AND at least one passing
+    # one. Dropping the second half would let a scenario that asserted nothing
+    # satisfy a claim that it passes.
+    if [ "$failed" -eq 0 ] && [ "$passed" -gt 0 ]; then
+      observed_green="$observed_green$rev:$name"$'\n'
+    fi
+
     if [ "$n" -eq 0 ]; then
-      if printf '%s\n' "$not_scored" | grep -qxF "$name"; then
-        observed_zero_not_scored="$observed_zero_not_scored$rev:$name"$'\n'
-      else
+      if [ "$is_scored" -eq 1 ]; then
         observed_zero_scored="$observed_zero_scored$rev:$name"$'\n'
+      else
+        observed_zero_not_scored="$observed_zero_not_scored$rev:$name"$'\n'
       fi
     fi
   done
 
   [ "$scenario_dirs" -gt 0 ] || fail "the '$rev' run produced no scenario directories under $out."
+
+  # --- the whole-scored-set gate, for the revisions that have earned it -------
+  if rev_is_fully_scored_green "$rev"; then
+    if [ "$scored_scenarios" -lt "$MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION" ]; then
+      fail "the '$rev' run had only $scored_scenarios scored scenario(s); the floor is $MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION.
+
+CONSEQUENCE: '$rev' is claimed to be ENTIRELY green over its scored set. That
+claim is vacuous if the scored set is empty or tiny — and the most likely way for
+it to shrink to nothing is a mis-parse of the suite's own 'Not scored for' roster,
+which would classify every scenario as not-scored and make the assertion below
+true of nothing at all.
+
+WHAT TO DO: check the roster in $log parses, then find out which scenarios left
+the scored set. Do NOT lower the floor."
+    fi
+
+    if [ "$scored_failing" -ne 0 ]; then
+      fail "the '$rev' run has $scored_failing scored scenario(s) with failing check(s).
+
+CONSEQUENCE: THIS is the regression this clause exists to catch. '$rev' is
+claimed to pass its ENTIRE scored set — that is the strongest claim this repo
+makes about the official suite — and a failure here breaks it.
+
+WHAT TO DO: read the failing checks under $RESULTS_ROOT/$rev/server-<scenario>-*/checks.json.
+Do NOT remove '$rev' from FULLY_SCORED_GREEN_REVISIONS to make this pass, and do
+NOT add anything to any exemption list — conformance/README.md § 9 admits none.
+Fix the SDK, or take the narrowing to a reviewed commit that says what regressed."
+    fi
+
+    rev_suite_status="$(suite_status_for_rev "$rev")"
+    if [ "$rev_suite_status" -ne 0 ]; then
+      fail "the '$rev' run is claimed to exit 0, but the suite exited $rev_suite_status.
+
+CONSEQUENCE: this assertion and the scored-failure count above are two INDEPENDENT
+authorities on the same fact — the suite's own verdict, and this script's
+re-derivation from checks.json on disk. Reaching this message with zero scored
+failures counted means the two disagree, which is a defect in the split this
+script computes, not a passing run.
+
+WHAT TO DO: compare the suite's 'Not scored for $rev:' roster in $log against the
+scenario directories under $RESULTS_ROOT/$rev. Do NOT delete either assertion."
+    fi
+    echo "requirements $rev: $scored_scenarios scored scenario(s) (floor $MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION), 0 failing, suite exit 0 OK"
+  fi
 
   floor="$(min_checks_for_rev "$rev")"
   if [ "$total_checks" -lt "$floor" ]; then
@@ -732,6 +967,56 @@ assert_set_equality "zero-check SCORED scenarios" "ZERO_CHECK_SCORED_SCENARIOS" 
 assert_set_equality "zero-check NOT-SCORED scenarios" "ZERO_CHECK_NOT_SCORED_SCENARIOS" \
   "$(printf '%s\n' ${ZERO_CHECK_NOT_SCORED_SCENARIOS[@]+"${ZERO_CHECK_NOT_SCORED_SCENARIOS[@]}"})" \
   "$observed_zero_not_scored"
+
+# --- the named blocking scenarios: PRESENT and entirely green ----------------
+#
+# Deliberately NOT `assert_set_equality`. That helper is bidirectional because
+# the zero-check lists are STATEMENTS OF FACT about the suite, and an unlisted
+# observation there means something stopped being exercised. This list is a
+# STATEMENT OF CLAIM about the SDK, and a scenario that turns green without being
+# listed is good news, not a defect — failing on it would punish progress. Only
+# the other direction is a defect, and it is checked here.
+
+green_file="$log_dir/observed-green.$$"
+printf '%s' "$observed_green" | grep -v '^$' | LC_ALL=C sort -u >"$green_file" || :
+
+blocking_listed=0
+blocking_missing=""
+for entry in ${BLOCKING_GREEN_SCENARIOS[@]+"${BLOCKING_GREEN_SCENARIOS[@]}"}; do
+  blocking_listed=$((blocking_listed + 1))
+  if ! grep -qxF "$entry" "$green_file"; then
+    blocking_missing="$blocking_missing    $entry"$'\n'
+  fi
+done
+rm -f "$green_file"
+
+if [ "$blocking_listed" -lt "$MIN_BLOCKING_GREEN_SCENARIOS" ]; then
+  fail "BLOCKING_GREEN_SCENARIOS lists $blocking_listed scenario(s); the floor is $MIN_BLOCKING_GREEN_SCENARIOS.
+
+CONSEQUENCE: this list is the set of surfaces the repository CLAIMS on the
+2025-11-25 leg. Shortening it is the ONE way an inclusion list can be abused —
+you cannot add an entry to silence a failure, but you can delete one. A gate that
+was quietly narrowed still goes green while claiming less than it did yesterday.
+
+WHAT TO DO: restore the entries. A scenario that stopped passing is an SDK
+regression to fix or a reviewed, stated narrowing — never a silent deletion."
+fi
+
+if [ -n "$blocking_missing" ]; then
+  fail "BLOCKING_GREEN_SCENARIOS: listed but NOT observed entirely green:
+$blocking_missing
+CONSEQUENCE: each of these is a surface this repo claims outright. An entry
+reaches this message for one of two reasons and BOTH are defects: the scenario
+ran and a check FAILED, or the scenario is ABSENT from the results entirely —
+renamed or dropped by a re-pin, so it silently stopped being checked while the
+gate stayed green.
+
+WHAT TO DO: read $RESULTS_ROOT/<rev>/server-<scenario>-*/checks.json. If the
+scenario was renamed upstream, rename it here in the same commit as the re-pin.
+Do NOT delete the entry to make this pass, and do NOT add the failure to any
+exemption list — conformance/README.md § 9 admits none."
+fi
+echo "named blocking scenarios: $blocking_listed listed (floor $MIN_BLOCKING_GREEN_SCENARIOS), all present and entirely green OK"
 
 # --- the MRTR surface: the surface D-21 actually blocks on -------------------
 
@@ -808,17 +1093,24 @@ for entry in "${CHECK_TOTALS[@]}"; do
   grep -E '^Total: ' "$log_dir/$rev.log" | sed -e 's/^/      /'
 done
 echo "  MRTR surface: $mrtr_scenarios scenario(s), $mrtr_checks check(s), 0 failures"
+echo "  whole-scored-set green: ${FULLY_SCORED_GREEN_REVISIONS[*]}"
+echo "  named blocking scenarios: $blocking_listed, all present and entirely green"
 echo "  zero-check gate: exact match on both lists"
 echo "  results: $RESULTS_ROOT/"
 echo "  server: one process (pid $SERVER_PID, group $SERVER_PGID), alive across both runs"
 
 echo ""
-echo "  DECLARED NON-CONFORMANCE (D-21): neither requirement set exits 0. Nine"
-echo "  structural SDK gaps (G-1..G-9) are recorded with source citations in"
-echo "  $GAPS_DOC."
-echo "  This gate blocks on the surfaces that genuinely pass — the MRTR surface, the"
-echo "  check floors and the zero-check sets — and states the rest plainly rather"
-echo "  than suppressing it. There is no known-fail allowlist here by design"
+echo "  DECLARED NON-CONFORMANCE (D-21): the 2026-07-28 leg now exits 0 with its"
+echo "  ENTIRE scored set green, and that is asserted above. The 2025-11-25 leg"
+echo "  still exits 1, on ONE scored failure — 'tools-call-with-logging', for which"
+echo "  the SDK has no handler-facing 'notifications/message' emitter. That is the"
+echo "  last gap-attributable failure of the nine (G-1..G-9), it is G-3 sub-item"
+echo "  (d), it is owned by Phase 118.2, and it is recorded with source citations"
+echo "  in $GAPS_DOC."
+echo "  This gate blocks on the surfaces that genuinely pass — the whole 2026-07-28"
+echo "  scored set, 29 named 2025-11-25 scenarios, the MRTR surface, the check"
+echo "  floors and the zero-check sets — and states the rest plainly rather than"
+echo "  suppressing it. There is no known-fail allowlist here by design"
 echo "  (conformance/README.md § 9)."
 
 echo ""

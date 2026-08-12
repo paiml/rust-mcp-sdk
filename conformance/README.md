@@ -173,11 +173,64 @@ in section 9 actually protects. The path lives under `target/` because `.gitigno
 `target/` and does **not** ignore a top-level `results` directory; writing there would dirty the
 worktree and show up as spurious diff noise on every run.
 
+### 8a. What the blocking gate CLAIMS (widened by Phase 118.1 plan 14)
+
+The repository's claim must be exactly the claim it can defend. Measured on this pin, from one
+process, five full runs across plans 118.1-13 and 118.1-14 with identical results:
+
+| Requirement set | Passed / failed | Checks executed | Scored scenarios | Scored failing | Suite exit |
+|-----------------|-----------------|-----------------|------------------|----------------|------------|
+| `2025-11-25` | 72 / 2 | 74 | 30 | **1** | 1 |
+| `2026-07-28` | 142 / 36 | 178 | 37 | **0** | **0** |
+
+`scripts/run-conformance-suite.sh` therefore blocks on all of the following, and nothing weaker:
+
+1. **`2026-07-28`: the ENTIRE scored set green, and the suite's own exit status 0.** Universally
+   quantified over the scored set (`FULLY_SCORED_GREEN_REVISIONS`), so no entry can be deleted from
+   it to turn a red run green. Guarded against vacuity by a floor on the scored-scenario count.
+2. **`2025-11-25`: 29 named scenarios present and entirely green** (`BLOCKING_GREEN_SCENARIOS`,
+   floor `MIN_BLOCKING_GREEN_SCENARIOS`). These are 29 of that leg's 30 scored scenarios. This is an
+   **inclusion list of claims, not a known-fail allowlist** — adding an entry can only make the gate
+   stricter, and no entry can ever be added to silence a failure, because a failing scenario cannot
+   satisfy "entirely green". Only deletion could weaken it, which is what the floor closes.
+3. The MRTR surface, the two check floors, and both zero-check set equalities, exactly as before.
+
+**Why `2025-11-25` is not on list 1.** Its 30th scored scenario, `tools-call-with-logging`, FAILS:
+the SDK has no handler-facing emitter for `notifications/message`. That is the last of the nine
+gaps, it is owned by **Phase 118.2**, and it is stated here and printed by the script on every run
+rather than being tolerated anywhere. When it lands, move `2025-11-25` into
+`FULLY_SCORED_GREEN_REVISIONS` and delete its now-redundant entries from `BLOCKING_GREEN_SCENARIOS`.
+
+**No pass-count is asserted, deliberately.** Plan 118.1-13 measured the `2026-07-28` total
+oscillating 141↔142 at roughly 3 failures per 14 fresh server processes. The cause is
+`ServerAcceptsWhitespaceHeaderValue`, which calls an *arbitrary* tool from `tools/list` with no
+arguments and requires a non-error response — so any tool that legitimately rejects an argument-free
+call fails it. It lives in `http-header-validation`, which is **not scored** at `2026-07-28`, so it
+cannot disturb clause 1. A pass-count floor would have imported that flake straight into a blocking
+gate. The same measurement **refuted** a suspected RFC 9110 OWS-trimming defect: in 14 of 14 fresh
+processes the server trimmed the whitespace and routed correctly.
+
 ## 9. What is FORBIDDEN
 
 No `--expected-failures` baseline. No known-fail allowlist of any shape. If a scenario genuinely
 does not apply to this SDK, that is a conversation at re-pin time — a reviewed commit with a stated
 reason — not a standing exemption that accumulates silently.
+
+**How this is ENFORCED, and how it must NOT be.** Do not add a raw
+`grep -rn -- '--expected-failures' scripts/ .github/workflows/` and expect it to come back empty:
+it matches **on the clean tree**, because the token appears in the comments that FORBID it — today
+at `scripts/run-conformance-suite.sh:38`, `.github/workflows/ci.yml:586` and line 178 of this file.
+A fence satisfied by the documentation explaining it is a fence that can only ever fail, and a
+guaranteed-failing check gets deleted, taking the real one with it.
+
+The enforcement is structural and already exists:
+`tests/ci_conformance_gate_wiring.rs::no_known_fail_allowlist_reaches_a_conformance_command` strips
+`#` comment lines with `commands_only`, asserts NON-VACUITY (the stripped view still contains
+`--requirements`), and only then asserts that every entry of `CONFORMANCE_FORBIDDEN_FLAGS`
+(`--expected-failures`, `--spec-version`, `--suite`, `--all-features`) is absent from the COMMANDS.
+`no_status_masking_reaches_an_era_matrix_command` does the same for the era-matrix script over
+`|| true`, `|| :` and `continue-on-error`. If a NEW suppression shape appears, add it to those
+constants — never add a second grep.
 
 ## 10. THE TWO PINS, reconciled
 
