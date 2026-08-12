@@ -156,7 +156,7 @@ use pmcp::types::capabilities::{
     ResourceCapabilities, ServerCapabilities, ToolCapabilities,
 };
 use pmcp::types::completable::StaticCompletionProvider;
-use pmcp::types::elicitation::ElicitRequestParams;
+use pmcp::types::elicitation::{ElicitAction, ElicitRequestParams, ElicitResult};
 use pmcp::types::mrtr::{InputRequest, InputRequests, InputResponse, MrtrSignal};
 use pmcp::types::protocol::{
     ProtocolVersion, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28,
@@ -166,7 +166,7 @@ use pmcp::types::{
     CallToolResult, Content, GetPromptResult, ListResourcesResult, PromptArgument, PromptInfo,
     PromptMessage, ReadResourceResult, ResourceInfo, Role, ToolInfo,
 };
-use pmcp::{PromptHandler, RequestHandlerExtra, ResourceHandler, Server};
+use pmcp::{PeerHandle, PromptHandler, RequestHandlerExtra, ResourceHandler, Server};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -928,16 +928,145 @@ impl ConformanceTool {
                 ))]))
             },
 
-            // All three elicitation tools hit the same wall: pmcp's
-            // `PeerHandle` exposes `sample`, `sample_with_tools`, `list_roots`
-            // and `progress_notify` — there is no `elicit`, and the
-            // `ElicitationManager` that would issue one is not reachable from a
-            // handler. Recorded as an SDK gap in this plan's SUMMARY.
-            "test_elicitation"
-            | "test_elicitation_sep1034_defaults"
-            | "test_elicitation_sep1330_enums" => Err(pmcp::Error::internal(
-                "no server->client channel on this transport: elicitation/create cannot be issued",
-            )),
+            // ---------------------------------------------------------------
+            // The three elicitation tools.
+            //
+            // HISTORY, kept because it is the finding this phase turns on. These
+            // three used to return a hardcoded
+            // `Err("no server->client channel on this transport")` under a
+            // comment claiming pmcp's `PeerHandle` had no `elicit` and that the
+            // issuing machinery was unreachable from a handler. BOTH claims were
+            // true when written and BOTH are now false: `PeerHandle::elicit`
+            // lands at `src/shared/peer.rs:172` (plan 09, D-07) and the HTTP
+            // server->client seam lands in plans 10 and 11, measured green by
+            // `tests/http_peer_roundtrip.rs::http_peer_elicit_completes_over_a_v1_session`.
+            //
+            // Leaving the refusal in place made this example report an SDK gap
+            // that no longer exists — a FALSE RED, which corrupts a conformance
+            // measurement exactly as badly as a false green. Plan 118.1-13
+            // measured the consequence: three scored `2025-11-25` scenarios red,
+            // plus a flapping `2026-07-28` check (`ServerAcceptsWhitespaceHeaderValue`)
+            // that picks an arbitrary tool by name and happened to land here.
+            //
+            // Each of the three requests a DIFFERENT schema, because each scenario
+            // validates a different SEP. They are deliberately not collapsed into
+            // one shared form.
+            "test_elicitation" => {
+                let message = args
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Please provide your information");
+                let peer = elicitation_peer(&extra)?;
+                let answer = peer
+                    .elicit(ElicitRequestParams::Form {
+                        message: message.to_string(),
+                        requested_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "username": { "type": "string", "title": "Username" },
+                                "email": { "type": "string", "title": "Email", "format": "email" },
+                            },
+                            "required": ["username", "email"],
+                        }),
+                    })
+                    .await?;
+                Ok(CallToolResult::new(vec![Content::text(
+                    format_elicit_answer(&answer),
+                )]))
+            },
+
+            // SEP-1034: every primitive type carries a `default`. The suite reads
+            // `params.requestedSchema.properties` and checks the type AND the
+            // default of each of the five fields, so the values below are load
+            // bearing and must not be "tidied".
+            "test_elicitation_sep1034_defaults" => {
+                let peer = elicitation_peer(&extra)?;
+                let answer = peer
+                    .elicit(ElicitRequestParams::Form {
+                        message: "Confirm your profile defaults".to_string(),
+                        requested_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "name":   { "type": "string",  "default": "John Doe" },
+                                "age":    { "type": "integer", "default": 30 },
+                                "score":  { "type": "number",  "default": 95.5 },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["active", "inactive", "pending"],
+                                    "default": "active",
+                                },
+                                "verified": { "type": "boolean", "default": true },
+                            },
+                        }),
+                    })
+                    .await?;
+                Ok(CallToolResult::new(vec![Content::text(
+                    format_elicit_answer(&answer),
+                )]))
+            },
+
+            // SEP-1330: all five enum variants in one schema. The suite asserts
+            // the variants are kept DISTINCT — an untitled enum must not also
+            // carry `oneOf` or `enumNames`, a titled one must use `oneOf` and not
+            // `enum`, and the untitled multi-select must use `items.enum` rather
+            // than `items.anyOf`. Merging any two of these breaks the scenario.
+            "test_elicitation_sep1330_enums" => {
+                let peer = elicitation_peer(&extra)?;
+                let answer = peer
+                    .elicit(ElicitRequestParams::Form {
+                        message: "Choose your options".to_string(),
+                        requested_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                // 1. untitled single-select: `enum`, nothing else.
+                                "untitledSingle": {
+                                    "type": "string",
+                                    "enum": ["option1", "option2", "option3"],
+                                },
+                                // 2. titled single-select: `oneOf` of const/title,
+                                //    and deliberately NO `enum` alongside it.
+                                "titledSingle": {
+                                    "type": "string",
+                                    "oneOf": [
+                                        { "const": "value1", "title": "First Option" },
+                                        { "const": "value2", "title": "Second Option" },
+                                        { "const": "value3", "title": "Third Option" },
+                                    ],
+                                },
+                                // 3. legacy titled: `enumNames` parallel to `enum`,
+                                //    same length. Deprecated, still asserted.
+                                "legacyEnum": {
+                                    "type": "string",
+                                    "enum": ["opt1", "opt2", "opt3"],
+                                    "enumNames": ["Option One", "Option Two", "Option Three"],
+                                },
+                                // 4. untitled multi-select: `items.enum`, not anyOf.
+                                "untitledMulti": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["option1", "option2", "option3"],
+                                    },
+                                },
+                                // 5. titled multi-select: `items.anyOf` of const/title.
+                                "titledMulti": {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            { "const": "value1", "title": "First Choice" },
+                                            { "const": "value2", "title": "Second Choice" },
+                                            { "const": "value3", "title": "Third Choice" },
+                                        ],
+                                    },
+                                },
+                            },
+                        }),
+                    })
+                    .await?;
+                Ok(CallToolResult::new(vec![Content::text(
+                    format_elicit_answer(&answer),
+                )]))
+            },
 
             // ---------------------------------------------------------------
             // The two `test_mrtr_*` tools that are NOT MRTR-shaped. Their
@@ -1419,6 +1548,39 @@ fn elicited_bool(extra: &RequestHandlerExtra, key: &str, field: &str) -> Option<
         return None;
     };
     result.content.as_ref()?.get(field)?.as_bool()
+}
+
+/// The server->client back-channel, or an explicit refusal naming the transport.
+///
+/// `extra.peer()` is `Some` on every transport that wires the seam. It was `None`
+/// under `StreamableHttpServer` until plans 118.1-10 and 118.1-11 wired it, which
+/// is why the three elicitation tools used to refuse unconditionally. The refusal
+/// is KEPT for the case where a handler genuinely has no peer — but it is now
+/// reached only when that is TRUE, rather than asserted in advance.
+fn elicitation_peer(extra: &RequestHandlerExtra) -> pmcp::Result<&Arc<dyn PeerHandle>> {
+    extra.peer().ok_or_else(|| {
+        pmcp::Error::internal(
+            "no server->client channel on this transport: elicitation/create cannot be issued",
+        )
+    })
+}
+
+/// Renders an elicitation answer in the shape the suite's scenario docs print:
+/// `Elicitation completed: action=<accept/decline/cancel>, content={...}`.
+///
+/// The action is rendered from the wire spelling (serde's camelCase), not from
+/// `{:?}` on the enum, so `Accept` reads as `accept` the way a client sees it.
+fn format_elicit_answer(answer: &ElicitResult) -> String {
+    let action = match answer.action {
+        ElicitAction::Accept => "accept",
+        ElicitAction::Decline => "decline",
+        ElicitAction::Cancel => "cancel",
+    };
+    let content = answer.content.as_ref().map_or_else(
+        || "{}".to_string(),
+        |c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string()),
+    );
+    format!("Elicitation completed: action={action}, content={content}")
 }
 
 /// The sampling request shape the `tools-call-sampling` scenario specifies.
