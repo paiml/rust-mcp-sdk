@@ -95,6 +95,7 @@ pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard
          `cargo build --features full --example {example_name}`.",
         binary.display()
     );
+    assert_binary_is_not_stale(&binary, example_name);
 
     let addr: SocketAddr = bind_addr
         .parse()
@@ -108,6 +109,109 @@ pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard
         .unwrap_or_else(|error| panic!("could not spawn {}: {error}", binary.display()));
 
     (addr, ChildGuard::new(child))
+}
+
+/// Fail if the example binary is OLDER than any source it is built from.
+///
+/// # The false green this closes
+///
+/// [`spawn_example`] already fails when the binary is ABSENT, which makes a fresh
+/// checkout safe. The STALE case was the hole, and it is not hypothetical: at the
+/// Phase-118.1 Wave-10 merge, `tests/v2_sse_progress.rs` was 10/10 in the
+/// executor's worktree and `9 passed / 1 failed` on the merged tree, because
+/// `target/debug/examples/s54_v2_dual_conformance` there had been built five
+/// hours BEFORE the plan-11 and plan-12 sources it was supposed to exercise. The
+/// test spawned a binary in which `report_progress` was still inert and observed
+/// zero progress frames.
+///
+/// **`cargo test --test <name>` does NOT rebuild examples.** Target selection
+/// excludes them, so `cargo nextest run -E 'binary(v2_sse_progress)'` happily
+/// runs against whatever binary is lying in `target/`. That time it failed
+/// loudly, which is the safe direction — but the same shape can just as easily
+/// PASS against stale code and report a gap closed that is not, which is the
+/// exact class of defect Phase 118.1 exists to eliminate.
+/// `.planning/phases/118.1-.../deferred-items.md` assigns this fix to plan 14.
+///
+/// # Why `src/` and not just the example source
+///
+/// Comparing only against `examples/<name>.rs` would NOT have caught the measured
+/// case: the staleness came from `src/shared/peer.rs` and
+/// `src/server/streamable_http_server.rs`, and the example source had not moved.
+/// The newest mtime across the whole compiled surface is the honest comparison.
+///
+/// # Why this cannot turn CI red spuriously
+///
+/// Both paths that run these legs build the examples first. `make quality-gate`
+/// runs `test-all`, whose `test-examples` prerequisite builds every example
+/// before `test-integration`; CI's `test` job runs `cargo test --all-features`
+/// with default target selection, which compiles examples. A fresh checkout gives
+/// every source the same checkout mtime and the build necessarily follows it.
+fn assert_binary_is_not_stale(binary: &Path, example_name: &str) {
+    let Some(binary_mtime) = modified_at(binary) else {
+        // Unreadable metadata is not a staleness signal, and inventing one here
+        // would convert an unrelated filesystem problem into a phantom failure.
+        return;
+    };
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut consider = |path: PathBuf| {
+        if let Some(mtime) = modified_at(&path) {
+            if newest.as_ref().is_none_or(|(_, best)| mtime > *best) {
+                newest = Some((path, mtime));
+            }
+        }
+    };
+
+    consider(manifest.join("examples").join(format!("{example_name}.rs")));
+    for source in rust_sources_under(&manifest.join("src")) {
+        consider(source);
+    }
+
+    let Some((newest_path, newest_mtime)) = newest else {
+        return;
+    };
+    assert!(
+        newest_mtime <= binary_mtime,
+        "{} is STALE: it was built BEFORE {}, so this leg would exercise OLD CODE \
+         and report a result about a source tree that no longer exists.\n\
+         `cargo test --test <name>` does NOT rebuild examples — target selection \
+         excludes them — so the binary in `target/` is whatever was left there last.\n\
+         REBUILD IT: `cargo build --features full --example {example_name}`\n\
+         This assertion exists because the merged-tree run of a Phase-118.1 leg once \
+         disagreed with the worktree run for exactly this reason.",
+        binary.display(),
+        newest_path.display()
+    );
+}
+
+/// A path's modification time, or `None` if the metadata cannot be read.
+fn modified_at(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Every `.rs` file under `root`, recursively.
+///
+/// Hand-rolled rather than pulling in a directory-walking dependency: this is a
+/// test helper in a crate whose dependency graph is deliberately audited, and the
+/// traversal is a dozen lines.
+fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// Poll a TCP connect until the child's socket answers, or fail loudly.
