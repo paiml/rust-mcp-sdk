@@ -2835,6 +2835,24 @@ Plans:
 
 - [ ] 118.1-14-PLAN.md — Wave 12. **D-09**: gate widening to exactly the surfaces that then pass — no `--expected-failures`, no allowlist, no known-failure baseline — plus the **D-08** re-pin and re-measurement number two, reported as a SEPARATE delta from the fixes' delta (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
 
+### Phase 118.2: The v1 client SSE transport and the `notifications/message` emitter (INSERTED)
+
+**Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
+**Requirements**: (to be minted at planning time — neither residual is covered by CONF-04..08)
+**Depends on:** Phase 118.1
+**Plans:** not yet planned
+
+**Why these two, and why together.** Both are the same shape: the v1 server-to-client channel exists and is proven, and each of these is a missing surface at one end of it. The developer chose one combined phase over two at the 118.1-13 sign-off.
+
+**Success Criteria** (what must be TRUE):
+
+  1. pmcp's own `StreamableHttpTransport` client can hold a live GET SSE stream and consume server-initiated messages over v1 HTTP. **Measured reason it cannot today:** `StreamableHttpTransport::start_sse` (`src/shared/streamable_http.rs`) calls `collect_body_within_cap` — a WHOLE-BODY read — before handing the result to `SseParser::feed_complete_body`; its own rustdoc says "this body was already read into memory in one piece, not a chunk of a live stream". A v1 session SSE stream never ends, so there is nothing to collect, the client registers no receiver, and the server's `route_to_session_stream` finds no stream for the session. **The SERVER half is sound and is NOT in scope here** — `binary(http_peer_roundtrip)` is 12 tests run, 12 passed, including `http_peer_sample_completes_over_a_v1_session`, `http_peer_list_roots_completes_over_a_v1_session` and `http_peer_elicit_completes_over_a_v1_session`, whose client is a raw TCP reader that DOES hold the stream open. That contrast is what localises the defect to the client. Consequence today: `binary(era_matrix)`'s `deprecated_capabilities_complete_under_both_eras` asserts `no-live-stream` rather than `completed`
+  2. A tool handler can emit MCP `notifications/message` log records during a call, and they reach the client on both eras. **Measured reason it cannot today:** there is no handler-facing emitter. `PeerHandle` (`src/shared/peer.rs:74`) is exactly `{ sample, sample_with_tools, list_roots, elicit, progress_notify }`; `RequestHandlerExtra` exposes `report_progress` / `report_percent` / `report_count` and no logging analogue; and `ServerNotification::LogMessage` (`src/types/notifications.rs:135`) is constructed ONLY in tests (`src/types/notifications.rs:278`, `src/types/subscriptions.rs:920`, `src/server/subscriptions.rs:1459`) — no production path emits it. **Evidence:** the official suite's `tools-call-with-logging` scenario fails `No log notifications received` on the `2025-11-25` leg, and it is the ONE remaining gap-attributable failure across both legs after Phase 118.1 (`GAP_ATTRIBUTABLE_FAILURES = 1`). Closing it should take the v1 leg to zero scored failures
+  3. Both changes are additive to public API surface and carry a `cargo semver-checks` verdict recorded in the phase's summary — adding a `PeerHandle` trait method is a breaking change for external implementors unless defaulted, which is why this is its own phase rather than a fix folded into 118.1
+  4. The official suite is re-measured after the change and the delta is reported against Phase 118.1's closing numbers (`2025-11-25`: 72 passed / 2 failed / 74 checks / exit 1; `2026-07-28`: 142 passed / 36 failed / 178 checks / exit 0), at whatever pin is then current
+
+**Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
+
 ### Phase 119: Documentation — Three Shapes + v2 Migration
 
 **Goal**: The milestone is documented per the house three-shapes rule (pmcp-book chapters + runnable examples + README/course), leading with the `cargo pmcp` workflow — covering both the v2.4 Agents & Teams surface (carried from Phase 111) and the v2 dual-version migration story, with runnable v2 examples verified against the shipped code.

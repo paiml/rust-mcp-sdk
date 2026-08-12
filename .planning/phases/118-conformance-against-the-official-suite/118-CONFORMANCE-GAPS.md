@@ -110,3 +110,96 @@ path is sound; only the HTTP wiring is missing.
 
 G-1 changes the wire format of a public type and needs a semver decision before it can be
 scheduled.
+
+## Dispositions — Phase 118.1 (amendment)
+
+**Amended:** 2026-08-11 by plan 118.1-13. **Nothing above this line was changed, and nothing
+was deleted** — the pre-existing gap table, the G-5 section, the measurement, the labelled
+self-correction in "What the gate does instead" and the Follow-up section all stand as written.
+D-10 requires this file to be AMENDED, never rewritten, and the earlier self-correction is
+itself the house style being followed here.
+
+### How this was measured
+
+Both legs re-run at the HELD pin `0.2.0-alpha.11` (D-08), from one process, after
+`rm -rf target/conformance-results` and a full `cargo build --features full --examples`, with the
+exit code captured through a `pipefail` tee rather than masked (D-19). Two runs, byte-identical.
+Check counts are computed from disk by the script's own method — one `checks.json` per scenario
+directory, counting `SUCCESS` and `FAILURE` — so they are directly comparable with the baseline
+in "The measurement" above.
+
+| Requirement set | Baseline | Now | Scored scenarios red | Checks executed | Suite exit |
+|---|---|---|---|---|---|
+| `2025-11-25` | 51 passed, 15 failed | **72 passed, 2 failed** | 11 to **1** | 66 to **74** | 1 (unchanged) |
+| `2026-07-28` | 124 passed, 54 failed | **142 passed, 36 failed** | 7 to **0** | 178 | **1 to 0** |
+
+**The `2026-07-28` leg now exits 0**, with every one of its 37 scored scenarios green; all 36
+remaining failures are in the 13 not-scored scenarios. That supersedes this file's earlier
+statement that "neither exits 0", which was true when written. The `2025-11-25` leg still exits 1
+on a single scored failure. Its executed-check count ROSE from 66 to 74, which is the check
+floor's own documented prediction: a scenario that gets further runs more checks.
+
+`GAP_ATTRIBUTABLE_FAILURES = 1`, computed from disk into `target/118.1-13-gap-attribution.txt`.
+
+### The dispositions
+
+Every executed test count below was measured on the post-fix tree, not quoted from an earlier
+plan. **No numbered gap uses the DEFERRED exit**: plan 12's four-part DEFERRED precondition —
+the only route by which any numbered gap could have taken it, and only for G-3's v2 half — was
+never invoked, because that half was built and measured rather than deferred.
+
+| ID | Verdict | Artifact, with its executed count | Suite before and after |
+|----|---------|-----------------------------------|----------------------|
+| G-1 | **FIXED** (plan 03) | `binary(embedded_resource_golden)` — 10 tests run, 10 passed; `binary(embedded_resource_example_run)` — 1 tests run, 1 passed | v1 `tools-call-embedded-resource` 0/2 to **2/0**, `tools-call-mixed-content` 1/1 to **2/0**, `prompts-get-embedded-resource` 1/1 to **2/0**; all three also green on v2 |
+| G-2 | **FIXED** (plan 03) | `binary(embedded_resource_golden)` — 10 tests run, 10 passed | v1 `resources-read-binary` 0/2 to **2/0**; green on v2 |
+| G-3 | **SPLIT** — two halves **FIXED**, two sub-items OPEN. This wording is the developer's D-10 sign-off of 2026-08-11, not an executor classification: G-3 was found not to reduce to a single verdict word, and it is recorded per sub-item rather than forced into one. **(a) v1 server seam: FIXED** (plans 10, 11) — `binary(http_peer_roundtrip)` — 12 tests run, 12 passed, including `http_peer_sample_completes_over_a_v1_session`, `http_peer_list_roots_completes_over_a_v1_session` and `http_peer_elicit_completes_over_a_v1_session`; `binary(era_matrix)` — 4 tests run, 4 passed. **(b) v2 multi-frame SSE progress: FIXED** (plan 12, signed off `approved — FIXED`) — `binary(v2_sse_progress)` — 10 tests run, 10 passed. **(c) v1 pmcp CLIENT transport: OPEN** — owner Phase 118.2; measured reason: `StreamableHttpTransport::start_sse` calls `collect_body_within_cap`, a whole-body read, before parsing, and a v1 session stream never ends, so pmcp's own client can receive no server-initiated message over v1 HTTP. The SERVER half is sound and measured green, which is what localises this to the client. **(d) log notifications: OPEN** — owner Phase 118.2; measured reason: no handler-facing emitter for `notifications/message`; `ServerNotification::LogMessage` is constructed only in tests. | v1 `tools-call-sampling` 1/1 to **2/0**, `tools-call-with-progress` 1/1 to **2/0**, `tools-call-elicitation` 1/1 to **2/0**, `elicitation-sep1034-defaults` 1/1 to **6/0**, `elicitation-sep1330-enums` 1/1 to **6/0**; v2 `tools-call-with-progress` **2/0** with `progressCount: 3`. **`tools-call-with-logging` is UNCHANGED at 1/1** — the one remaining gap-attributable failure on either leg |
+| G-4 | **FIXED** (plan 04) | `binary(completion_complete)` — 6 tests run, 6 passed | v1 `completion-complete` 0/2 to **2/0**; green on v2 |
+| G-5 | **FIXED** (plan 05) | `binary(v2_retired_methods)` — 4 tests run, 4 passed | **No scenario flips.** The checks move INSIDE `server-stateless`, which is now `28 passed, 0 failed` on v2 — covering `HttpServerMethodNotFound404ping` and its four retired-method siblings. Stated plainly rather than attributing a scenario that does not exist |
+| G-6 | **FIXED** (plan 06) | `binary(v2_meta_validation_codes)` — 8 tests run, 8 passed | **No scenario flips.** `server-stateless` **28/0** on v2, covering `RequestMetaInvalid` x3 and `HttpServerMetaInvalid400` |
+| G-7 | **FIXED** (plan 07) | `binary(v2_discover_supported_versions)` — 3 tests run, 3 passed | **No scenario flips.** `server-stateless` **28/0** on v2, covering `ServerImplementsDiscover` and `ServerUnsupportedVersionError` |
+| G-8 | **FIXED** (plan 06) | `binary(v2_meta_validation_codes)` — 8 tests run, 8 passed | **No scenario flips.** `server-stateless` **28/0** on v2, covering `HttpServerHeaderMismatch400` |
+| G-9 | **FIXED** (plan 08) | `binary(v1_handler_client_capabilities)` — 5 tests run, 5 passed | **No attributable suite scenario, by construction** — the suite never exercises a v1 server-side capability gate. The in-tree fence is the whole proof; this is stated rather than an attribution being invented |
+
+### The two adjacent items (not numbered gaps)
+
+| Item | Verdict | Artifact, with its executed count | Note |
+|------|---------|-----------------------------------|------|
+| D-06 `set_result_meta` on the `ToolOutput::Result` verbatim path | **FIXED** (plan 09) | `binary(tool_output_result_http)` — 4 tests run, 4 passed | No attributable suite scenario. The "Adjacent trap" section above described the drop; it is closed, and that section is retained as the record of how it was found |
+| D-07 `PeerHandle::elicit` | **FIXED** (plan 09) | `binary(in_tool_peer_roundtrip)` — 7 tests run, 7 passed; `binary(http_peer_roundtrip)` — 12 tests run, 12 passed | Now also proved end-to-end through the official suite — but only after plan 13 fixed the dual-conformance example, which had gone on refusing elicitation with a comment asserting `elicit` did not exist four plans after it did |
+
+### The named residuals (neither is one of the nine)
+
+| Residual | Verdict | Evidence |
+|----------|---------|----------|
+| RFC 9110 section 5.5 OWS trimming on `ServerAcceptsWhitespaceHeaderValue` (suspected by `118-05-SUMMARY.md:126`) | **REFUTED** | Measured over 14 fresh server processes: in every trial the server trimmed and routed correctly — `headerValue "  <tool>  "` yields `bodyValue "<tool>"`, `responseStatus 200`. pmcp honours RFC 9110. The residual does not exist |
+| The v2 oscillation (124/54 vs 123/55 at baseline; 141/37 vs 142/36 now) | **SURVIVES, and is now identified** | It is exactly `ServerAcceptsWhitespaceHeaderValue`, at **3 failures / 14 fresh server processes**. `tools/list` order is a per-process HashMap order, so the check picks a different tool per process, calls it with NO arguments, and requires a non-error response. Two of the three failures were `test_sampling requires prompt` — never elicitation, never G-3. 118-08's prediction that closing G-3 would remove it is **refuted**: the transport was never the cause. The check is `pending`/not-scored, so it does not disturb the v2 leg's exit 0 |
+
+### Classification of every remaining failure
+
+No failure is unclassified, and no "everything else" bucket exists. Buckets: **(a)** gap-attributable,
+**(b)** a named non-gap residual, **(c)** a missing fixture on the dual-conformance example, named.
+
+| Leg | Total failed | (a) gap-attributable | (b) named residual | (c) missing fixture |
+|-----|--------------|----------------------|--------------------|---------------------|
+| `2025-11-25` | 2 | **1** — `ToolsCallWithLogging` (G-3 sub-item d) | 0 | **1** — `json_schema_2020_12_tool`, a tool with a 2020-12 `$schema`/`$defs`/`$anchor` input schema. Not scored (`pending`) |
+| `2026-07-28` | 36 | **0** | 0 in both runs (the oscillation did not fire; it remains characterised above) | **36** — 30 Tasks-extension (26 absent tool fixtures plus 4 protocol behaviours; the extension is unimplemented in the target example by design), 1 `json_schema_2020_12_tool`, 5 `http-custom-header-server-validation` needing a tool with `x-mcp-header` annotations |
+
+Both rows sum to their leg's total.
+
+### Behaviour change worth stating: `ping` no longer answers on v2
+
+G-5's retirement means `ping` returns HTTP 404 with `-32601` on `2026-07-28`. That is correct per
+the schema and is what the suite requires, but it is a behaviour change for any v2 client using
+`ping` as a liveness probe. v1 still serves it normally.
+
+### Input to plan 14's gate widening — recorded, deliberately NOT decided here
+
+D-09 places the gate decision in plan 14, on evidence. The evidence this measurement provides:
+
+- The `2026-07-28` leg now **exits 0** with zero scored failures, so an `exit == 0` or a
+  scored-failures-is-zero assertion on that leg is newly available.
+- A v2 **pass-count** assertion is NOT safe. The total flaps between 141 and 142 at a measured
+  ~21% per-process rate, in a not-scored check, for reasons that are not SDK defects.
+- The `2025-11-25` leg still exits 1 and cannot carry an exit assertion, but its executed-check
+  floor can rise from 66 to **74**.
+- D-21 stands: no `--expected-failures`, no allowlist, no known-failure baseline.
