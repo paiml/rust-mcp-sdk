@@ -2223,7 +2223,7 @@ Plans:
 - [x] **Phase 116: Auth Hardening SEPs** — RFC 9207 `iss` validation (strict v2 / lenient v1), DCR `application_type`, issuer-keyed credential storage + three clarifications — all source changes to the hand-rolled OAuth stack, no new crates (completed 2026-08-07)
 - [x] **Phase 117: Agents, Tester & v1 Severability** — `pmcp-agent` (ToolInvoker + task polling) and `mcp-tester` exercise a v2 server end-to-end; v1-only machinery isolated behind a severable era-gated layer with a documented sunset policy; v2 path carries no session/SSE baggage (completed 2026-08-08)
 - [x] **Phase 118: Conformance Against the Official Suite** — official `@modelcontextprotocol/conformance` (commit-pinned) in CI over real HTTP against a dual-version example; Phase-109 Rust harness gains v2 fixtures (v1 stays green, dev-dep-free build); deprecated caps verified functional under v2 (completed 2026-08-10)
-- [ ] **Phase 118.1: Close the Nine Conformance Gaps** — the nine structural SDK defects G-1..G-9 that Phase 118's measurement found: nested `EmbeddedResource` + `blob` + `annotations`; the `completion/complete` seam and v2 method retirement; the `_meta` classifier, `-32020`/`-32022` ordering and `supportedVersions`; the server-to-client back-channel over StreamableHTTP; and v1 capability plumbing. Ends in a re-measurement, a per-gap FIXED/REFUTED/DEFERRED disposition, and a gate widened to exactly what passes
+- [x] **Phase 118.1: Close the Nine Conformance Gaps** — the nine structural SDK defects G-1..G-9 that Phase 118's measurement found: nested `EmbeddedResource` + `blob` + `annotations`; the `completion/complete` seam and v2 method retirement; the `_meta` classifier, `-32020`/`-32022` ordering and `supportedVersions`; the server-to-client back-channel over StreamableHTTP; and v1 capability plumbing. Ends in a re-measurement, a per-gap FIXED/REFUTED/DEFERRED disposition, and a gate widened to exactly what passes (completed 2026-08-12)
 - [ ] **Phase 119: Documentation — Three Shapes + v2 Migration** — Agents & Teams docs in three shapes (carried from v2.4 Phase 111); v2 migration guide + dual-version story + sunset policy; runnable stateless-v2-server and v2-client/agent examples
 
 ## Phase Details — v2.5 (MCP Spec 2026-07-28 v2 Support)
@@ -2773,7 +2773,7 @@ Plans:
 **Goal:** Both official-suite legs measure strictly better than the Phase-118 baseline (`2025-11-25`: 51 passed, 15 failed, exit 1, 11 scored scenarios red, 66 checks; `2026-07-28`: 124 passed, 54 failed, exit 1, 7 scored red, 178 checks), each of G-1..G-9 carries an explicit **FIXED / REFUTED / DEFERRED** disposition backed by a named RED-to-GREEN artifact, and the blocking CI gate is widened to exactly the surfaces that then pass — with no `--expected-failures`, no allowlist and no known-failure baseline.
 **Requirements**: CONF-04, CONF-05, CONF-06, CONF-07, CONF-08
 **Depends on:** Phase 118
-**Plans:** 13/14 plans executed
+**Plans:** 14/14 plans complete
 
 **Success Criteria** (what must be TRUE):
 
@@ -2833,7 +2833,7 @@ Plans:
 
 **Wave 12** *(blocked on Wave 11 completion)*
 
-- [ ] 118.1-14-PLAN.md — Wave 12. **D-09**: gate widening to exactly the surfaces that then pass — no `--expected-failures`, no allowlist, no known-failure baseline — plus the **D-08** re-pin and re-measurement number two, reported as a SEPARATE delta from the fixes' delta (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
+- [x] 118.1-14-PLAN.md — Wave 12. **D-09**: gate widening to exactly the surfaces that then pass — no `--expected-failures`, no allowlist, no known-failure baseline — plus the **D-08** re-pin and re-measurement number two, reported as a SEPARATE delta from the fixes' delta (CONF-04, CONF-05, CONF-06, CONF-07, CONF-08)
 
 ### Phase 118.2: The v1 client SSE transport and the `notifications/message` emitter (INSERTED)
 
@@ -2880,7 +2880,7 @@ Plans:
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
-| 118.1 Close the Nine Conformance Gaps | 13/14 | In Progress|  |
+| 118.1 Close the Nine Conformance Gaps | 14/14 | Complete   | 2026-08-12 |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
