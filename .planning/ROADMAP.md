@@ -2224,6 +2224,7 @@ Plans:
 - [x] **Phase 117: Agents, Tester & v1 Severability** — `pmcp-agent` (ToolInvoker + task polling) and `mcp-tester` exercise a v2 server end-to-end; v1-only machinery isolated behind a severable era-gated layer with a documented sunset policy; v2 path carries no session/SSE baggage (completed 2026-08-08)
 - [x] **Phase 118: Conformance Against the Official Suite** — official `@modelcontextprotocol/conformance` (commit-pinned) in CI over real HTTP against a dual-version example; Phase-109 Rust harness gains v2 fixtures (v1 stays green, dev-dep-free build); deprecated caps verified functional under v2 (completed 2026-08-10)
 - [x] **Phase 118.1: Close the Nine Conformance Gaps** — the nine structural SDK defects G-1..G-9 that Phase 118's measurement found: nested `EmbeddedResource` + `blob` + `annotations`; the `completion/complete` seam and v2 method retirement; the `_meta` classifier, `-32020`/`-32022` ordering and `supportedVersions`; the server-to-client back-channel over StreamableHTTP; and v1 capability plumbing. Ends in a re-measurement, a per-gap FIXED/REFUTED/DEFERRED disposition, and a gate widened to exactly what passes (completed 2026-08-12)
+- [ ] **Phase 118.2: v1 Client SSE Transport + `notifications/message` Emitter** — the two residuals Phase 118.1 measured and could not close in scope, both signed off as OPEN sub-items of G-3 at the 118.1-13 D-10 gate: pmcp's own `StreamableHttpTransport` client cannot hold a live GET SSE stream (`collect_body_within_cap` whole-body read), so it cannot consume the v1 server-to-client channel 118.1 built; and no handler-facing emitter exists for `notifications/message`, the ONE remaining gap-attributable suite failure (`GAP_ATTRIBUTABLE_FAILURES = 1`)
 - [ ] **Phase 119: Documentation — Three Shapes + v2 Migration** — Agents & Teams docs in three shapes (carried from v2.4 Phase 111); v2 migration guide + dual-version story + sunset policy; runnable stateless-v2-server and v2-client/agent examples
 
 ## Phase Details — v2.5 (MCP Spec 2026-07-28 v2 Support)
@@ -2880,7 +2881,8 @@ Plans:
 | 116. Auth Hardening SEPs | 16/16 | Complete   | 2026-08-07 |
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
-| 118.1 Close the Nine Conformance Gaps | 14/14 | Complete   | 2026-08-12 |
+| 118.1 Close the Nine Conformance Gaps | 14/14 | Complete    | 2026-08-12 |
+| 118.2 v1 Client SSE Transport + Log Emitter | 0/TBD | Not started | - |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
