@@ -2839,9 +2839,9 @@ Plans:
 ### Phase 118.2: The v1 client SSE transport and the `notifications/message` emitter (INSERTED)
 
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
-**Requirements**: (to be minted at planning time — neither residual is covered by CONF-04..08)
+**Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** not yet planned
+**Plans:** 12 plans in 7 waves
 
 **Why these two, and why together.** Both are the same shape: the v1 server-to-client channel exists and is proven, and each of these is a missing surface at one end of it. The developer chose one combined phase over two at the 118.1-13 sign-off.
 
@@ -2851,6 +2851,41 @@ Plans:
   2. A tool handler can emit MCP `notifications/message` log records during a call, and they reach the client on both eras. **Measured reason it cannot today:** there is no handler-facing emitter. `PeerHandle` (`src/shared/peer.rs:74`) is exactly `{ sample, sample_with_tools, list_roots, elicit, progress_notify }`; `RequestHandlerExtra` exposes `report_progress` / `report_percent` / `report_count` and no logging analogue; and `ServerNotification::LogMessage` (`src/types/notifications.rs:135`) is constructed ONLY in tests (`src/types/notifications.rs:278`, `src/types/subscriptions.rs:920`, `src/server/subscriptions.rs:1459`) — no production path emits it. **Evidence:** the official suite's `tools-call-with-logging` scenario fails `No log notifications received` on the `2025-11-25` leg, and it is the ONE remaining gap-attributable failure across both legs after Phase 118.1 (`GAP_ATTRIBUTABLE_FAILURES = 1`). Closing it should take the v1 leg to zero scored failures
   3. Both changes are additive to public API surface and carry a `cargo semver-checks` verdict recorded in the phase's summary — adding a `PeerHandle` trait method is a breaking change for external implementors unless defaulted, which is why this is its own phase rather than a fix folded into 118.1
   4. The official suite is re-measured after the change and the delta is reported against Phase 118.1's closing numbers (`2025-11-25`: 72 passed / 2 failed / 74 checks / exit 1; `2026-07-28`: 142 passed / 36 failed / 178 checks / exit 0), at whatever pin is then current
+
+**Plans**:
+
+**Wave 1** *(parallel — the client half and the emitter half are independent until the joint fence)*
+
+- [ ] 118.2-01-PLAN.md — Wave 1. **Defect A**: the dead `202 Accepted` branch means pmcp's client never issues a GET at all (MEASURED: 2 POSTs, 0 GETs); plus the recording-TCP-listener harness plans 02-04 reuse (CONF-09)
+- [ ] 118.2-05-PLAN.md — Wave 1. **D-06/D-08/D-09/D-12**: `extra.log(..)` on `RequestHandlerExtra` — no `PeerHandle` trait method — with `LoggingLevel` syslog ordering and the no-sink `Ok(())` contract (CONF-10)
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 118.2-02-PLAN.md — Wave 2. **D-01/D-02/D-04/D-05**: the incremental hyper-frame reader on the GET session stream, the bounded receive channel, and the bounded-reads ALLOWLIST entry in the SAME task as the accumulation site (CONF-09)
+- [ ] 118.2-06-PLAN.md — Wave 2. **D-07**: `attach_request_log_sink`, the ONE unit both native dispatch roots call, twinned on 118.1's `attach_request_peer` (CONF-10)
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 118.2-03-PLAN.md — Wave 3. **D-01, second site**: the POST-response `text/event-stream` read — the one that deadlocks in-tool elicitation — plus retiring `SseParser::feed_complete_body` and all three of its co-located dependants (CONF-09)
+- [ ] 118.2-07-PLAN.md — Wave 3. **D-10/D-11/D-12**: the v1 per-session level in `V1State` with its `full-v2` null twin, the first real reader of `io.modelcontextprotocol/logLevel`, and ignore-and-default on malformed input (CONF-10)
+
+**Wave 4** *(blocked on Wave 3)*
+
+- [ ] 118.2-04-PLAN.md — Wave 4. **D-03**: bounded reconnect with `Last-Event-ID` through a paired cursor accessor and no second call-site `#[cfg]`, plus the fuzz seam, the `full-v2` severance build and the `cargo semver-checks` verdict (CONF-09)
+- [ ] 118.2-08-PLAN.md — Wave 4. **D-13**: `logging/setLevel` split out of the four-method residual arm — literal `{}` on v1 (MEASURED suite constraint), `-32601` on v2 — on BOTH roots (CONF-10)
+- [ ] 118.2-09-PLAN.md — Wave 4. The ALWAYS-requirement example `s55_handler_logging`, plus rewriting the dual-conformance fixture's logging arm from `tracing::info!` (which never reaches the wire) to `extra.log(..)` inside the suite's 200 ms budget (CONF-10)
+
+**Wave 5** *(blocked on Wave 4 — needs BOTH halves)*
+
+- [ ] 118.2-10-PLAN.md — Wave 5. **D-15.3** the joint fence (pmcp on BOTH ends of a live stream, asserted at the transport layer with zero new public API) and **D-15.1** the `era_matrix` flip: constant AND prose, with ERA-12 undisturbed (CONF-09, CONF-10)
+
+**Wave 6** *(blocked on Wave 5)*
+
+- [ ] 118.2-11-PLAN.md — Wave 6. **D-15.2/D-16**: re-measurement at the HELD `0.2.0-alpha.11` pin, then the first era leg gated on its own EXIT CODE — with the per-revision scored floor split and the blocking list WIDENED rather than shortened — plus the CONF-09/CONF-10 bookings (CONF-09, CONF-10)
+
+**Wave 7** *(blocked on Wave 6)*
+
+- [ ] 118.2-12-PLAN.md — Wave 7. **D-14**: the re-pin as the FINAL act, re-measured once, with the bump's delta reported SEPARATELY from the fixes' delta — and a blocking developer checkpoint if the bump reds the D-16 gate (CONF-09, CONF-10)
 
 **Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
 
@@ -2882,7 +2917,7 @@ Plans:
 | 117. Agents, Tester & v1 Severability | 14/14 | Complete    | 2026-08-09 |
 | 118. Conformance Against the Official Suite | 10/10 | Complete    | 2026-08-10 |
 | 118.1 Close the Nine Conformance Gaps | 14/14 | Complete    | 2026-08-12 |
-| 118.2 v1 Client SSE Transport + Log Emitter | 0/TBD | Not started | - |
+| 118.2 v1 Client SSE Transport + Log Emitter | 0/12 | Planned — 12 plans in 7 waves | - |
 | 119. Documentation — Three Shapes + v2 Migration | 0/TBD | Not started | - |
 
 > **⚠ Phase 113's `Complete` above counts PLANS, not REQUIREMENTS — the phase is HELD, not closed.**
