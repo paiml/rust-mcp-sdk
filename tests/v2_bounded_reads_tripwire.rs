@@ -924,9 +924,11 @@ const ALLOWLIST: &[Accumulation] = &[
         path: "src/server/streamable_http_server.rs",
         needle: "push_str(",
         count: 2,
-        why: "render_v2_multi_frame_body assembles the v2 multi-frame SSE POST response body \
-              (CONF-07 / D-16): one append per queued progress notification, then exactly one \
-              append for the terminal result frame. The loop's length is the length of the vector \
+        why: "write_sse_frame appends one SSE frame into the caller's String — the frame's \
+              serialized payload and its terminator — and render_v2_multi_frame_body is its only \
+              caller: it assembles the v2 multi-frame SSE POST response body (CONF-07 / D-16) \
+              with one frame per queued progress notification, then exactly one for the terminal \
+              result. The loop's length is the length of the vector \
               V2ProgressQueue::drain returned, and THAT is bounded by the queue's own capacity — \
               V2_PROGRESS_QUEUE_CAPACITY (64), a BOUNDED tokio mpsc whose synchronous producer \
               uses try_send and drops on a full queue rather than blocking or growing \

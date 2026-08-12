@@ -226,20 +226,42 @@ pub(crate) fn ensure_outbound_drain(state: &ServerState) {
     let Some(outbound_rx) = state.peer_channel.outbound_rx.lock().take() else {
         return; // Already draining.
     };
-    let state = state.clone();
-    handle.spawn(async move { drain_outbound(state, outbound_rx).await });
+    // WEAK, and this is load-bearing rather than tidy. The dispatcher OWNS
+    // `outbound_tx`, the sending half of the very channel this task drains. A
+    // STRONG clone (or a clone of the whole `ServerState`, which reaches the
+    // dispatcher transitively) would keep that sender alive for as long as the
+    // task lives and the task alive for as long as the sender lives, so
+    // `recv()` could never answer `None`, the task would never exit, and it
+    // would pin the whole `ServerState` — `Arc<Mutex<Server>>`, the session map
+    // and the event store included — for the life of the PROCESS. Every
+    // `pmcp::axum::router()` / `StreamableHttpServer::start()` would leak one.
+    //
+    // `V1State` is cloned by value because it holds no sender for this channel:
+    // it is the SSE-stream map, the session table and the event store, i.e.
+    // exactly what `route_to_session_stream` needs and nothing more.
+    let v1_state = state.v1.clone();
+    let dispatcher = Arc::downgrade(&state.peer_channel.dispatcher);
+    handle.spawn(async move { drain_outbound(v1_state, dispatcher, outbound_rx).await });
 }
 
 /// Forward each outbound server-to-client request onto its ORIGINATING session's
 /// live SSE stream.
 ///
-/// Exits cleanly when the channel closes (the last dispatcher clone dropped).
+/// Exits cleanly when the channel closes — which happens when the last
+/// `ServerRequestDispatcher` clone (and with it `outbound_tx`) is dropped, i.e.
+/// when the server state goes away. The `Weak` upgrade is the second exit: a
+/// message still in flight when the dispatcher dies has nothing left to
+/// correlate against.
 async fn drain_outbound(
-    state: ServerState,
+    v1_state: v1::V1State,
+    dispatcher: std::sync::Weak<ServerRequestDispatcher>,
     mut outbound_rx: mpsc::Receiver<(String, ServerRequest)>,
 ) {
     while let Some((correlation_id, server_request)) = outbound_rx.recv().await {
-        route_outbound(&state, correlation_id, server_request).await;
+        let Some(dispatcher) = dispatcher.upgrade() else {
+            break;
+        };
+        route_outbound(&v1_state, &dispatcher, correlation_id, server_request).await;
     }
     debug!("StreamableHTTP server-request drain exited");
 }
@@ -250,11 +272,11 @@ async fn drain_outbound(
 /// channel type sufficient: the session is not carried in the tuple, it is
 /// RECORDED against the correlation id at dispatch time and resolved here.
 async fn route_outbound(
-    state: &ServerState,
+    v1_state: &v1::V1State,
+    dispatcher: &ServerRequestDispatcher,
     correlation_id: String,
     server_request: ServerRequest,
 ) {
-    let dispatcher = dispatcher(state);
     // An HTTP-owned dispatcher must never see an ownerless dispatch: everything
     // that reaches this channel came through `dispatch_owned`.
     let Some(session_id) = dispatcher.owner_of(&correlation_id).await else {
@@ -272,7 +294,7 @@ async fn route_outbound(
     // there is no live stream for the owning session. Dropping it there would
     // strand the caller until HTTP_DISPATCH_TIMEOUT while holding the server
     // mutex, so the correlation is failed AT ONCE instead.
-    if v1::route_to_session_stream(&state.v1, &session_id, message).is_some() {
+    if v1::route_to_session_stream(v1_state, &session_id, message).is_some() {
         dispatcher
             .fail_pending(&correlation_id, NO_LIVE_STREAM)
             .await;
@@ -700,10 +722,15 @@ pub(crate) async fn route_inbound_response(
     // OWNERSHIP FIRST. A client that POSTs a response carrying an id it never
     // received must not be able to resolve another session's pending
     // `sampling/createMessage` (T-118.1-10-02). The check is exactly
-    // `owner_of(id) == Some(presented_session_id)`; `owner_of` answers `None`
-    // for an unknown id, so the unknown and wrong-session cases collapse into
-    // this one comparison and into the one indistinguishable answer below.
-    if dispatcher.owner_of(&correlation_id).await.as_deref() != session_id {
+    // `owner_of(id) == Some(presented_session_id)`, and the RECORDED owner must
+    // EXIST: a bare `owner_of(..) != session_id` comparison is satisfied by the
+    // `None == None` cell, so a session-less POST (v2, or a stateless v1 server)
+    // carrying any correlation id at all would pass ownership and be handed to
+    // `handle_response`. Today that only ever answers `Err` for an unknown id,
+    // but the moment anything on this transport dispatches WITHOUT recording an
+    // owner, that cell becomes an unauthenticated resolution path.
+    let owner = dispatcher.owner_of(&correlation_id).await;
+    if owner.is_none() || owner.as_deref() != session_id {
         debug!(
             "Discarded inbound response for correlation {}: not owned by the presenting session",
             correlation_id

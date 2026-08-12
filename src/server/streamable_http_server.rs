@@ -1882,18 +1882,34 @@ async fn run_v2_header_gate(
     // The accept list still runs, and still answers `-32022`, for the case where
     // the two sides AGREE on a version the server does not support.
     let verdict = classify_v2_meta_version(decode_version_header(headers), raw_meta);
-    if let V2MetaVerdict::Disagreement(message) = verdict {
-        return (None, header_mismatch_reject(message));
-    }
     // The rejection is built INSIDE the lock scope so the accept-list is only
     // borrowed on the rare negotiation-failure branch. Cloning it into a `Vec`
     // on every request — under the server mutex — bought nothing: the happy path
     // never reads it.
     let resolved = {
         let server = state.server.lock().await;
-        // Non-opted-in servers run ZERO era-detection — the v1 path is
-        // byte-for-byte unchanged (D-04). `resolve_raw_meta_protocol_context`
-        // short-circuits to `Ok(None)` WITHOUT inspecting `_meta` at all.
+        // D-04 IS EVALUATED FIRST, and the disagreement short-circuit is INSIDE
+        // that guard rather than above it. A server that never opted into v2
+        // enforces NOTHING — `resolve_raw_meta_protocol_context` answers
+        // `Ok(None)` for it without inspecting `_meta` at all — so a
+        // disagreement check hoisted above this lock would make the header/body
+        // rule the ONE v2 rule a stock v1-only `Server::builder()` applies,
+        // turning requests it used to serve on the v1 path into `-32020`. The
+        // sibling `MissingRequired` verdict is already gated this way (it is
+        // consumed by `classify_v2_request` further down, which is only reached
+        // on an opted-in server), so this keeps the two halves of the same rule
+        // in step.
+        //
+        // G-8's ORDERING is preserved: the short-circuit still runs BEFORE
+        // `resolve_raw_meta_protocol_context` produces its accept-list
+        // rejection, so an unsupported version that ALSO disagrees with the
+        // header is still classified as a disagreement (`-32020`) rather than
+        // as an accept-list failure (`-32022`).
+        if crate::types::protocol::context::is_v2_opted_in(server.supported_protocol_versions()) {
+            if let V2MetaVerdict::Disagreement(message) = verdict {
+                return (None, header_mismatch_reject(message));
+            }
+        }
         server
             .resolve_raw_meta_protocol_context(raw_meta)
             .map_err(|err| {
@@ -1906,7 +1922,7 @@ async fn run_v2_header_gate(
     };
     // `Ok(None)` == not opted in → zero enforcement (D-04).
     if context.is_none() {
-        return (context.clone(), V2GateOutcome::Passthrough);
+        return (None, V2GateOutcome::Passthrough);
     }
     let (extracted_method, body_name) = method_and_name_of(body_json.as_ref());
     let body_method = body_method_override.or(extracted_method.as_deref());
@@ -2470,6 +2486,15 @@ pub(crate) fn new_v2_progress_queue() -> (
 /// multi-frame body appends up to [`V2_PROGRESS_QUEUE_CAPACITY`] + 1 frames, and
 /// a per-frame `String` immediately copied into the accumulator and dropped is
 /// one allocation and one copy per frame for nothing.
+///
+/// The PAYLOAD is appended with `push_str`, not interpolated through the
+/// formatter, and that is not a style choice: `tests/v2_bounded_reads_tripwire.rs`
+/// reviews byte accumulation by scanning for a fixed needle vocabulary that
+/// includes `push_str(` and not `write!(`. Spelling this append as a `write!`
+/// interpolation moves the one genuinely payload-sized accumulation in this file
+/// OUT of that reviewed population — silently, while the tripwire's allowlist
+/// entry rots into a dead entry. The constant framing around it still goes
+/// through `write!`, which is where the zero-allocation `Uuid` render belongs.
 fn write_sse_frame(out: &mut String, frame: V2ResponseFrame) {
     use std::fmt::Write as _;
 
@@ -2481,12 +2506,9 @@ fn write_sse_frame(out: &mut String, frame: V2ResponseFrame) {
         });
     let json_str = String::from_utf8(json_bytes).unwrap_or_else(|_| "{}".to_string());
     // Writing into a String is infallible; the Result exists only for the fmt trait.
-    let _ = write!(
-        out,
-        "id: {}\nevent: message\ndata: {}\n\n",
-        Uuid::new_v4(),
-        json_str
-    );
+    let _ = write!(out, "id: {}\nevent: message\ndata: ", Uuid::new_v4());
+    out.push_str(&json_str);
+    out.push_str("\n\n");
 }
 
 /// Render the whole multi-frame body: every progress frame, then the result.
@@ -2520,14 +2542,22 @@ fn build_v2_multi_frame_sse_response(
 ) -> Response {
     let body = render_v2_multi_frame_body(progress, result);
     let mut response = (StatusCode::OK, body).into_response();
-    let headers = response.headers_mut();
+    apply_v2_multi_frame_headers(response.headers_mut());
+    response
+}
+
+/// The `text/event-stream` + anti-buffering header set a multi-frame body needs.
+///
+/// ONE definition, applied by both the fast path (which mutates an already-built
+/// axum `Response`) and the middleware path (which assembles a `HeaderMap` before
+/// the chain runs), so the two cannot drift on content type or buffering.
+fn apply_v2_multi_frame_headers(headers: &mut HeaderMap) {
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(TEXT_EVENT_STREAM),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     headers.insert(X_ACCEL_BUFFERING, HeaderValue::from_static("no"));
-    response
 }
 
 /// Whether this request may answer with a multi-frame SSE body.
@@ -2581,8 +2611,16 @@ fn attach_v2_progress_sink(
         return (None, None);
     };
     let (sink, queue) = new_v2_progress_queue();
-    let backchannel =
-        crate::types::protocol::context::TransportBackchannel::new().with_notification_sink(sink);
+    // LAYERED onto whatever the context already carries, not substituted for it.
+    // `attach_session_backchannel` returns early on v2 today, so in practice the
+    // slot is empty here — but building a fresh `TransportBackchannel` would
+    // DISCARD a peer handle if that ever stopped being true, and a silently
+    // dropped peer is exactly the class of defect this phase is closing.
+    let backchannel = context
+        .transport_backchannel()
+        .cloned()
+        .unwrap_or_default()
+        .with_notification_sink(sink);
     (
         Some(context.with_transport_backchannel(backchannel)),
         Some(queue),
@@ -2619,16 +2657,21 @@ fn take_v2_progress_frames(
     let Some(queue) = queue else {
         return Err(response_msg);
     };
-    let progress = queue.drain();
-    if progress.is_empty() {
-        return Err(response_msg);
-    }
-    match response_msg {
-        TransportMessage::Response(result) => Ok((progress, result)),
+    // The envelope check comes FIRST. Draining before it would pull every queued
+    // frame out of the receiver and then drop them on the floor in the `Err`
+    // arm, silently losing progress the handler did emit; returning the message
+    // untouched leaves the queue intact for whatever the caller does next.
+    let result = match response_msg {
+        TransportMessage::Response(result) => result,
         // Not a response envelope, so there is nothing to terminate the stream
         // with — the match states it rather than assuming it.
-        other => Err(other),
+        other => return Err(other),
+    };
+    let progress = queue.drain();
+    if progress.is_empty() {
+        return Err(TransportMessage::Response(result));
     }
+    Ok((progress, result))
 }
 
 /// Build an OK JSON response body from a `TransportMessage`.
@@ -3210,8 +3253,26 @@ async fn build_success_response_with_middleware(
     v1::apply_session_header(&mut response_headers, response_session_id, sessions_on);
     response_headers.insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
 
-    let mut server_response =
-        ServerHttpResponse::new(StatusCode::OK, response_headers, response_body);
+    finish_with_middleware(response_headers, response_body, http_middleware, context).await
+}
+
+/// Run an ALREADY-COMPLETE header set and body through the response middleware
+/// chain and convert to an axum `Response`.
+///
+/// THE single site that calls [`ServerHttpMiddlewareChain::process_response`] on
+/// the middleware POST path. Extracted so the multi-frame SSE branch cannot skip
+/// it: that branch builds a complete byte buffer exactly like the JSON branch —
+/// the handler has already run — so an operator's response middleware must see
+/// it too. A branch that built its own `Response` and returned it directly would
+/// silently disable every configured response transform for precisely the
+/// requests that carry progress.
+async fn finish_with_middleware(
+    headers: HeaderMap,
+    body: Vec<u8>,
+    http_middleware: &ServerHttpMiddlewareChain,
+    context: &ServerHttpContext,
+) -> Response {
+    let mut server_response = ServerHttpResponse::new(StatusCode::OK, headers, body);
 
     if let Err(e) = http_middleware
         .process_response(&mut server_response, context)
@@ -4829,19 +4890,31 @@ async fn dispatch_message_with_middleware(
 
             // CONF-07 / D-16, the middleware twin. The multi-frame body is a
             // COMPLETE byte buffer by the time it is built (the handler has
-            // already run), so it passes through the response middleware chain
-            // like any other body — no streaming contract is broken.
+            // already run), so it goes through the SAME
+            // `finish_with_middleware` seam the JSON twin uses — no streaming
+            // contract is broken, and an operator's response middleware is not
+            // silently skipped for exactly the responses that carry progress.
             let mut response = match take_v2_progress_frames(progress_queue, response_msg) {
                 Ok((progress, result)) => {
                     // The session/version headers the JSON twin sets INSIDE
                     // `build_success_response_with_middleware` are applied
                     // here instead, so the two branches emit the same header
                     // set and only the body framing differs.
-                    let mut sse = build_v2_multi_frame_sse_response(progress, result);
-                    let headers = sse.headers_mut();
-                    v1::apply_session_header(headers, response_session_id.as_ref(), sessions_on);
+                    let mut headers = HeaderMap::new();
+                    apply_v2_multi_frame_headers(&mut headers);
+                    v1::apply_session_header(
+                        &mut headers,
+                        response_session_id.as_ref(),
+                        sessions_on,
+                    );
                     headers.insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
-                    sse
+                    finish_with_middleware(
+                        headers,
+                        render_v2_multi_frame_body(progress, result).into_bytes(),
+                        http_middleware,
+                        http_context,
+                    )
+                    .await
                 },
                 Err(response_msg) => {
                     build_success_response_with_middleware(
