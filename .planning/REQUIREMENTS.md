@@ -944,6 +944,59 @@ milestone** — they belong to v2.5 but have no phase yet. Assign them during th
 
 - [ ] **UNAS-01**: SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}` support — the v2 transport spec says clients **MUST** support `x-mcp-header` mirroring, and the header-mismatch validation table covers `Mcp-Param-*` alongside `Mcp-Method`/`Mcp-Name`. **No current requirement covers it**: not VERS-05 (which scopes only `Mcp-Method`/`Mcp-Name`), not HTTP-01..05, not CLNT-01. Surfaced by 113-RESEARCH.md assumption A8 and Open Question 4, both of which explicitly resolved *not* to absorb it into Phase 113 — no Phase-113 plan implements `Mcp-Param-{Name}` mirroring. It is **closest to CLNT-01's header work** (the client's outbound required-header emission) and would most naturally extend the server-side `classify_v2_request` matrix that Phase 112 landed. **UNASSIGNED — do not fold this into a phase without an explicit scoping decision.**
 
+  **Measured 2026-08-11 by Phase 118.1 plan 14 (D-13). Verdict: CARRIES TO v2.6, still unassigned —
+  with the measurement recorded as the reason.**
+
+  D-13 bound this entry's fate to the plan-14 suite re-pin: *if the newer suite exercises
+  `x-mcp-header` / `Mcp-Param-{Name}`, it gets a phase assignment on evidence; if not, it carries
+  forward.* Two facts changed the shape of that question.
+
+  **(1) There was no newer suite.** `0.2.0-alpha.11` is the newest published version of
+  `@modelcontextprotocol/conformance` (`dist-tags` → `{"latest":"0.1.16","alpha":"0.2.0-alpha.11"}`;
+  the version list ends there; the registry's `modified` equals that version's publish time). The
+  pin was reviewed and HELD — see `conformance/README.md` § 13.
+
+  **(2) D-13's premise is REFUTED by measurement — the pin already in place exercises it.** D-13
+  recorded zero hits for `x-mcp-header` and `Mcp-Param` "in any Phase-118 measurement artifact and
+  in `src/`" and concluded the suite does not exercise SEP-2243. The two observations are correct;
+  the conclusion does not follow, because **neither artifact is the suite**. Measured directly
+  against the installed bundle (`conformance/node_modules/@modelcontextprotocol/conformance/dist/index.js`,
+  md5 `f3c6b1db650114b62456ef6dac028a3c`):
+
+  ```
+  grep -c "x-mcp-header" …/dist/index.js   →  5
+  grep -c "Mcp-Param"    …/dist/index.js   →  4
+  ```
+
+  And it does not merely mention them — it **runs a scenario**,
+  `2026-07-28:http-custom-header-server-validation`, whose `checks.json` reads:
+
+  | Status | Check | Message |
+  |---|---|---|
+  | FAILURE | `HttpCustomHeaderServerNoTool` | `Server has no tools with x-mcp-header annotations to test` |
+  | FAILURE | `NotTestable` | `Declared check sep-2243-server-decode-base64 is not testable against this server` |
+  | FAILURE | `NotTestable` | `Declared check sep-2243-server-validate-param-match is not testable against this server` |
+  | FAILURE | `NotTestable` | `Declared check sep-2243-server-reject-invalid-param-chars is not testable against this server` |
+  | FAILURE | `NotTestable` | `Declared check sep-2243-server-reject-param-mismatch is not testable against this server` |
+  | SUCCESS | `WireSchemaValid` | — |
+
+  So four named server-side SEP-2243 checks are already written and waiting, and the SDK has
+  nothing for them to grade: `grep -rl "x-mcp-header" src/` and `grep -rl "Mcp-Param" src/` each
+  return **0 files**.
+
+  **Why it carries forward anyway, rather than being assigned now.** It is a **feature addition**
+  — tool-level `x-mcp-header` annotations plus the `Mcp-Param-{Name}` mirroring they drive — not a
+  conformance gap Phase 118 or 118.1 opened. The scenario is **NOT SCORED** at `2026-07-28`, and
+  its checks report `NotTestable` rather than a graded `FAILURE`, so it contributes **0** to
+  `gap_attributable_failures`, does not affect either leg's exit status, and does not block Phase
+  118.1 from closing. It is explicitly **NOT** folded into Phase 118.2, which stays scoped to the
+  v1 client transport and the `notifications/message` emitter.
+
+  It therefore stays **UNASSIGNED**, carried to **v2.6** — but it is no longer an open question
+  with no evidence attached: the suite scenario, the four check names and the SDK's zero-hit
+  surface are all named above, so whoever scopes it starts from a measurement rather than a
+  supposition.
+
 ## v2.6 Requirements — AI-Package Portability (Phases 120-124)
 
 Defined 2026-07-27. Scoped against `pmcp-package` 0.1.0 and `pmcp-openapi-server` 0.1.0 as they
@@ -1052,14 +1105,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DOCS-04 | Phase 119 | Pending |
 | DOCS-05 | Phase 119 | Pending |
 | DOCS-06 | Phase 119 | Pending |
-| UNAS-01 | **unassigned** | Awaiting phase assignment |
+| UNAS-01 | **unassigned — carried to v2.6** | Measured 2026-08-11 by `118.1-14` (D-13). The PINNED suite already exercises SEP-2243 via `2026-07-28:http-custom-header-server-validation` (4 `sep-2243-server-*` checks `NotTestable`, plus `Server has no tools with x-mcp-header annotations`); `grep -rl` over `src/` returns 0 files. D-13's zero-hit premise is REFUTED — it measured the measurement artifacts and `src/`, neither of which is the suite. Carries anyway: a FEATURE addition, not a gap this phase opened; the scenario is NOT SCORED and its checks are `NotTestable`, so it contributes 0 to `gap_attributable_failures`. Explicitly NOT folded into Phase 118.2 |
 
 **Coverage:**
 
 - v1 requirements: 38 total
 - Mapped to phases: 38 ✓
 - Unmapped: 0
-- **Added after roadmap creation: 1 (UNAS-01, SEP-2243 `x-mcp-header`) — UNMAPPED, needs a phase**
+- **Added after roadmap creation: 1 (UNAS-01, SEP-2243 `x-mcp-header`) — UNMAPPED, carried to v2.6.** Reviewed on evidence 2026-08-11 by `118.1-14` and deliberately left unassigned; see the UNAS-01 entry for the measurement. Still needs a phase — in v2.6, not in v2.5
 - **Minted after roadmap creation: 5 (CONF-04..CONF-08) — MAPPED to Phase 118.1, minted 2026-08-10 by Phase 118.1 plan 01 per D-12**
 - Running total: 44 requirements, 43 mapped, **1 unmapped**
 

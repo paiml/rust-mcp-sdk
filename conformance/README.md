@@ -301,3 +301,71 @@ invocation; the Makefile target and `scripts/run-conformance-suite.sh` are the r
 
 The **blocking** enforcement lives in `.github/workflows/ci.yml`, not in the Makefile. A green
 `make test-conformance` on a laptop is evidence, not a gate.
+
+## 13. Re-pin review log
+
+Section 11 says how to re-pin. This section records **when the question was last asked and what
+the answer was**, because "we checked and there was nothing to move to" and "nobody looked" are
+different facts that a silent, unchanged pin cannot tell apart.
+
+### 2026-08-11 — reviewed, HELD at `0.2.0-alpha.11`. There is no newer release.
+
+Phase 118.1 plan 14 ran section 11's investigation steps and stopped before its install steps,
+because the investigation returned no target:
+
+```
+$ npm view @modelcontextprotocol/conformance dist-tags --json
+{ "latest": "0.1.16", "alpha": "0.2.0-alpha.11" }
+```
+
+- The `alpha` dist-tag points at **the version already pinned**.
+- `npm view … versions --json` ends at `0.2.0-alpha.11`; there is nothing after it.
+- The registry's own `modified` timestamp is `2026-08-07T14:01:04.026Z`, equal to that version's
+  publish time to the second, so nothing has been published since.
+- `latest` is the `0.1.x` line, which section 3 rules out: it ships no `requirements/` directory
+  and no `--requirements` flag, so pinning to it would invalidate the scored-set methodology this
+  whole gate rests on. Section 3's floor — "any re-pin must stay at `0.2.0-alpha.11` or later" —
+  leaves exactly one admissible version, and it is the one already here.
+
+**Legitimacy evidence, recorded even though the pin did not move:**
+
+| Check | Result |
+|---|---|
+| `scripts.postinstall` | empty — prints nothing |
+| `gitHead` | `c321dd32035556e6769d3724a8ee97d87c3faaac`, unchanged from sections 1 and 10 |
+| `slopcheck install -e npm` | `1 OK` |
+| publisher | `GitHub Actions <npm-oidc-no-reply@github.com>`, npm **trusted publisher** OIDC — not a personal token |
+| provenance | SLSA v1 attestation plus a registry signature |
+| maintainers | the `modelcontextprotocol` org, including two `@anthropic.com` addresses |
+| cadence | `alpha.10` 2026-07-27 → `alpha.11` 2026-08-07 — regular, no unexplained gap |
+| `dist.integrity` | `sha512-imPK9tx5gQsL6ZKQq4MrsyDYfSaIwpRmX6+ogjbeAXs9LGvxkBxWcY7KcS7TvwaBk/ZiVWl6b/naF4q83UwDRA==`, **byte-identical to `package-lock.json`** |
+
+No takeover indicator on any of them.
+
+**Section 11's reproduction proof was still run**, because it is worth proving whether or not a
+version moved: `rm -rf conformance/node_modules` then `npm ci --prefix conformance
+--ignore-scripts` reinstalled from the committed lockfile with `package.json` md5
+`40950a081b77e054dba9a5006e5d87e0` and `package-lock.json` md5
+`d1ce39fff5939230dd42ecd23668d31b` **unchanged before and after**, and the installed CLI reports
+`0.2.0-alpha.11` and its full scenario inventory under `--ignore-scripts` (section 5).
+`npm install --save-exact` was deliberately NOT run: it is the command that would write a new pin.
+
+**Section 10's comparison was re-run and its verdict is unchanged:**
+`gh api repos/modelcontextprotocol/conformance/compare/a865118206d4d8cc8dbc5f5201607839281d0c3b...c321dd32035556e6769d3724a8ee97d87c3faaac`
+→ `status: ahead`, `ahead_by: 14`, `behind_by: 0`. The package pin remains a strict descendant of
+the repository pin, so the two are not crossed and nothing needs moving.
+
+**The consequence for attribution is a strengthening, not a weakness.** D-08 held this pin all
+phase so that every measured delta would be attributable to the SDK. With no bump available, the
+bump delta is **nil by construction** and the fix delta is therefore the *whole* delta — there is
+no suite-version confound to separate out at all.
+
+**Re-extraction was still performed.** Every check name, probe body and expected code quoted in
+the 118.1 research is pinned to this version, so an unchanged pin cannot have moved them — but
+that is an argument, not a measurement. All 16 named expectations were looked up in the installed
+bundle (md5 `f3c6b1db650114b62456ef6dac028a3c`, 809 888 bytes) and every one returned a nonzero
+hit count, so no in-tree test encoding them needed updating.
+
+**When to ask again:** whenever `npm view @modelcontextprotocol/conformance dist-tags --json`
+reports an `alpha` (or a `>= 0.2.0` `latest`) newer than what section 1 names. Then follow section
+11 in full and add the outcome here.
