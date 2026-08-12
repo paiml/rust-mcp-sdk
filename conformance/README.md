@@ -173,11 +173,64 @@ in section 9 actually protects. The path lives under `target/` because `.gitigno
 `target/` and does **not** ignore a top-level `results` directory; writing there would dirty the
 worktree and show up as spurious diff noise on every run.
 
+### 8a. What the blocking gate CLAIMS (widened by Phase 118.1 plan 14)
+
+The repository's claim must be exactly the claim it can defend. Measured on this pin, from one
+process, five full runs across plans 118.1-13 and 118.1-14 with identical results:
+
+| Requirement set | Passed / failed | Checks executed | Scored scenarios | Scored failing | Suite exit |
+|-----------------|-----------------|-----------------|------------------|----------------|------------|
+| `2025-11-25` | 72 / 2 | 74 | 30 | **1** | 1 |
+| `2026-07-28` | 142 / 36 | 178 | 37 | **0** | **0** |
+
+`scripts/run-conformance-suite.sh` therefore blocks on all of the following, and nothing weaker:
+
+1. **`2026-07-28`: the ENTIRE scored set green, and the suite's own exit status 0.** Universally
+   quantified over the scored set (`FULLY_SCORED_GREEN_REVISIONS`), so no entry can be deleted from
+   it to turn a red run green. Guarded against vacuity by a floor on the scored-scenario count.
+2. **`2025-11-25`: 29 named scenarios present and entirely green** (`BLOCKING_GREEN_SCENARIOS`,
+   floor `MIN_BLOCKING_GREEN_SCENARIOS`). These are 29 of that leg's 30 scored scenarios. This is an
+   **inclusion list of claims, not a known-fail allowlist** — adding an entry can only make the gate
+   stricter, and no entry can ever be added to silence a failure, because a failing scenario cannot
+   satisfy "entirely green". Only deletion could weaken it, which is what the floor closes.
+3. The MRTR surface, the two check floors, and both zero-check set equalities, exactly as before.
+
+**Why `2025-11-25` is not on list 1.** Its 30th scored scenario, `tools-call-with-logging`, FAILS:
+the SDK has no handler-facing emitter for `notifications/message`. That is the last of the nine
+gaps, it is owned by **Phase 118.2**, and it is stated here and printed by the script on every run
+rather than being tolerated anywhere. When it lands, move `2025-11-25` into
+`FULLY_SCORED_GREEN_REVISIONS` and delete its now-redundant entries from `BLOCKING_GREEN_SCENARIOS`.
+
+**No pass-count is asserted, deliberately.** Plan 118.1-13 measured the `2026-07-28` total
+oscillating 141↔142 at roughly 3 failures per 14 fresh server processes. The cause is
+`ServerAcceptsWhitespaceHeaderValue`, which calls an *arbitrary* tool from `tools/list` with no
+arguments and requires a non-error response — so any tool that legitimately rejects an argument-free
+call fails it. It lives in `http-header-validation`, which is **not scored** at `2026-07-28`, so it
+cannot disturb clause 1. A pass-count floor would have imported that flake straight into a blocking
+gate. The same measurement **refuted** a suspected RFC 9110 OWS-trimming defect: in 14 of 14 fresh
+processes the server trimmed the whitespace and routed correctly.
+
 ## 9. What is FORBIDDEN
 
 No `--expected-failures` baseline. No known-fail allowlist of any shape. If a scenario genuinely
 does not apply to this SDK, that is a conversation at re-pin time — a reviewed commit with a stated
 reason — not a standing exemption that accumulates silently.
+
+**How this is ENFORCED, and how it must NOT be.** Do not add a raw
+`grep -rn -- '--expected-failures' scripts/ .github/workflows/` and expect it to come back empty:
+it matches **on the clean tree**, because the token appears in the comments that FORBID it — today
+at `scripts/run-conformance-suite.sh:38`, `.github/workflows/ci.yml:586` and line 178 of this file.
+A fence satisfied by the documentation explaining it is a fence that can only ever fail, and a
+guaranteed-failing check gets deleted, taking the real one with it.
+
+The enforcement is structural and already exists:
+`tests/ci_conformance_gate_wiring.rs::no_known_fail_allowlist_reaches_a_conformance_command` strips
+`#` comment lines with `commands_only`, asserts NON-VACUITY (the stripped view still contains
+`--requirements`), and only then asserts that every entry of `CONFORMANCE_FORBIDDEN_FLAGS`
+(`--expected-failures`, `--spec-version`, `--suite`, `--all-features`) is absent from the COMMANDS.
+`no_status_masking_reaches_an_era_matrix_command` does the same for the era-matrix script over
+`|| true`, `|| :` and `continue-on-error`. If a NEW suppression shape appears, add it to those
+constants — never add a second grep.
 
 ## 10. THE TWO PINS, reconciled
 
@@ -248,3 +301,71 @@ invocation; the Makefile target and `scripts/run-conformance-suite.sh` are the r
 
 The **blocking** enforcement lives in `.github/workflows/ci.yml`, not in the Makefile. A green
 `make test-conformance` on a laptop is evidence, not a gate.
+
+## 13. Re-pin review log
+
+Section 11 says how to re-pin. This section records **when the question was last asked and what
+the answer was**, because "we checked and there was nothing to move to" and "nobody looked" are
+different facts that a silent, unchanged pin cannot tell apart.
+
+### 2026-08-11 — reviewed, HELD at `0.2.0-alpha.11`. There is no newer release.
+
+Phase 118.1 plan 14 ran section 11's investigation steps and stopped before its install steps,
+because the investigation returned no target:
+
+```
+$ npm view @modelcontextprotocol/conformance dist-tags --json
+{ "latest": "0.1.16", "alpha": "0.2.0-alpha.11" }
+```
+
+- The `alpha` dist-tag points at **the version already pinned**.
+- `npm view … versions --json` ends at `0.2.0-alpha.11`; there is nothing after it.
+- The registry's own `modified` timestamp is `2026-08-07T14:01:04.026Z`, equal to that version's
+  publish time to the second, so nothing has been published since.
+- `latest` is the `0.1.x` line, which section 3 rules out: it ships no `requirements/` directory
+  and no `--requirements` flag, so pinning to it would invalidate the scored-set methodology this
+  whole gate rests on. Section 3's floor — "any re-pin must stay at `0.2.0-alpha.11` or later" —
+  leaves exactly one admissible version, and it is the one already here.
+
+**Legitimacy evidence, recorded even though the pin did not move:**
+
+| Check | Result |
+|---|---|
+| `scripts.postinstall` | empty — prints nothing |
+| `gitHead` | `c321dd32035556e6769d3724a8ee97d87c3faaac`, unchanged from sections 1 and 10 |
+| `slopcheck install -e npm` | `1 OK` |
+| publisher | `GitHub Actions <npm-oidc-no-reply@github.com>`, npm **trusted publisher** OIDC — not a personal token |
+| provenance | SLSA v1 attestation plus a registry signature |
+| maintainers | the `modelcontextprotocol` org, including two `@anthropic.com` addresses |
+| cadence | `alpha.10` 2026-07-27 → `alpha.11` 2026-08-07 — regular, no unexplained gap |
+| `dist.integrity` | `sha512-imPK9tx5gQsL6ZKQq4MrsyDYfSaIwpRmX6+ogjbeAXs9LGvxkBxWcY7KcS7TvwaBk/ZiVWl6b/naF4q83UwDRA==`, **byte-identical to `package-lock.json`** |
+
+No takeover indicator on any of them.
+
+**Section 11's reproduction proof was still run**, because it is worth proving whether or not a
+version moved: `rm -rf conformance/node_modules` then `npm ci --prefix conformance
+--ignore-scripts` reinstalled from the committed lockfile with `package.json` md5
+`40950a081b77e054dba9a5006e5d87e0` and `package-lock.json` md5
+`d1ce39fff5939230dd42ecd23668d31b` **unchanged before and after**, and the installed CLI reports
+`0.2.0-alpha.11` and its full scenario inventory under `--ignore-scripts` (section 5).
+`npm install --save-exact` was deliberately NOT run: it is the command that would write a new pin.
+
+**Section 10's comparison was re-run and its verdict is unchanged:**
+`gh api repos/modelcontextprotocol/conformance/compare/a865118206d4d8cc8dbc5f5201607839281d0c3b...c321dd32035556e6769d3724a8ee97d87c3faaac`
+→ `status: ahead`, `ahead_by: 14`, `behind_by: 0`. The package pin remains a strict descendant of
+the repository pin, so the two are not crossed and nothing needs moving.
+
+**The consequence for attribution is a strengthening, not a weakness.** D-08 held this pin all
+phase so that every measured delta would be attributable to the SDK. With no bump available, the
+bump delta is **nil by construction** and the fix delta is therefore the *whole* delta — there is
+no suite-version confound to separate out at all.
+
+**Re-extraction was still performed.** Every check name, probe body and expected code quoted in
+the 118.1 research is pinned to this version, so an unchanged pin cannot have moved them — but
+that is an argument, not a measurement. All 16 named expectations were looked up in the installed
+bundle (md5 `f3c6b1db650114b62456ef6dac028a3c`, 809 888 bytes) and every one returned a nonzero
+hit count, so no in-tree test encoding them needed updating.
+
+**When to ask again:** whenever `npm view @modelcontextprotocol/conformance dist-tags --json`
+reports an `alpha` (or a `>= 0.2.0` `latest`) newer than what section 1 names. Then follow section
+11 in full and add the outcome here.

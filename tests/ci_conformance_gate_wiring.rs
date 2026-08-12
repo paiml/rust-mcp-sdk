@@ -183,20 +183,49 @@ const MATRIX_TESTS: &[&str] = &["conformance", "era_matrix", "era_baseline"];
 /// matrix consuming it is a weaker statement than one validated under the same.
 const HTTP_FEATURE_TARGETS: &[&str] = &["era_matrix", "era_baseline"];
 
-/// The zero-check gate's declarations, pinned by NAME so removing one is a
-/// failure rather than a silent relaxation.
+/// Every DATA declaration the conformance gate is made of, pinned by NAME so
+/// removing one is a test failure rather than a silent relaxation.
 ///
-/// Both scenario arrays are pinned, not just one: the SCORED array is empty today
-/// (measured — no scored scenario reported zero checks at either revision) and an
-/// empty array is the STRONGEST state, but an ABSENT array cannot fail. The
-/// NOT-SCORED array pins the two measured zero-check scenarios under the same
-/// bidirectional equality, which strengthens README § 7 rule 3 rather than
-/// exempting anything from it.
+/// The name is historical — this began as the zero-check gate's four
+/// declarations and Phase 118.1 plan 14 widened it to the whole blocking
+/// surface. The contract is unchanged and applies to every entry: **an ABSENT
+/// declaration cannot fail**, so deleting one would turn its gate off while
+/// every other check in this file still passed.
+///
+/// The zero-check half. Both scenario arrays are pinned, not just one: the
+/// SCORED array is empty today (measured — no scored scenario reported zero
+/// checks at either revision) and an empty array is the STRONGEST state, but an
+/// absent array cannot fail. The NOT-SCORED array pins the two measured
+/// zero-check scenarios under the same bidirectional equality, which strengthens
+/// README § 7 rule 3 rather than exempting anything from it.
+///
+/// The blocking-surface half, added by 118.1-14 when the gate was widened from
+/// "the MRTR surface" to "everything that genuinely passes":
+///
+/// * `FULLY_SCORED_GREEN_REVISIONS` — revisions whose ENTIRE scored set must be
+///   green and whose own suite exit status must be 0. Universally quantified, so
+///   nothing can be removed from it to make a red run green. `2026-07-28` today.
+/// * `MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION` — the non-vacuity floor for
+///   that clause. Without it, a mis-parse of the suite's `Not scored for` roster
+///   would classify every scenario as not-scored and make "every scored scenario
+///   is green" true of the empty set.
+/// * `BLOCKING_GREEN_SCENARIOS` — named scenarios that must be PRESENT and
+///   entirely green, for revisions the clause above does not yet cover. An
+///   INCLUSION list of claims, NOT a known-fail allowlist: adding an entry can
+///   only make the gate stricter, and no entry can be added to silence a
+///   failure, because a failing scenario cannot satisfy "entirely green".
+/// * `MIN_BLOCKING_GREEN_SCENARIOS` — the floor on that list's size. Deletion is
+///   the one direction in which an inclusion list can be abused, and this is
+///   what closes it.
 const ZERO_CHECK_DECLARATIONS: &[&str] = &[
     "ZERO_CHECK_SCORED_SCENARIOS",
     "ZERO_CHECK_NOT_SCORED_SCENARIOS",
     "MIN_CHECKS_V1",
     "MIN_CHECKS_V2",
+    "FULLY_SCORED_GREEN_REVISIONS",
+    "MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION",
+    "BLOCKING_GREEN_SCENARIOS",
+    "MIN_BLOCKING_GREEN_SCENARIOS",
 ];
 
 /// D-09's two dev-dependency-free build fences, as substrings of the era script.

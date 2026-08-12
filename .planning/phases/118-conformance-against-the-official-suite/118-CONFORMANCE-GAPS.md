@@ -203,3 +203,137 @@ D-09 places the gate decision in plan 14, on evidence. The evidence this measure
 - The `2025-11-25` leg still exits 1 and cannot carry an exit assertion, but its executed-check
   floor can rise from 66 to **74**.
 - D-21 stands: no `--expected-failures`, no allowlist, no known-failure baseline.
+
+## The bump delta — Phase 118.1 plan 14 (amendment)
+
+Appended 2026-08-11 by `118.1-14`. **Appends only; nothing above this line is edited.**
+D-08 required two separately attributed numbers — a fix delta and a bump delta. This section
+records the second one and the measurement that determined its value.
+
+### The bump delta is NIL, because there was no bump to make
+
+The D-08 re-pin was investigated and returned no target. `0.2.0-alpha.11` — the version held for
+the whole of Phase 118.1 — is the **newest published version** of
+`@modelcontextprotocol/conformance`:
+
+- `npm view … dist-tags --json` → `{ "latest": "0.1.16", "alpha": "0.2.0-alpha.11" }`. The `alpha`
+  tag points at the version already pinned.
+- `npm view … versions --json` ends at `0.2.0-alpha.11`.
+- The registry's own `modified` timestamp equals that version's publish time to the second, so
+  nothing has been published since 2026-08-07.
+- `latest` is the `0.1.x` line, which `conformance/README.md` § 3 rules out for shipping no
+  `requirements/` directory and no `--requirements` flag. Pinning to it would invalidate the
+  scored-set methodology this entire gate rests on.
+
+The pin was therefore **reviewed and HELD** on the developer's explicit ruling — recorded verbatim
+in `118.1-14-SUMMARY.md` — rather than advanced to an invented version or rolled back to an
+inadmissible one. The full legitimacy record, the reproduction proof and the re-extraction are in
+`conformance/README.md` § 13, which is new.
+
+### The two numbers, side by side
+
+| Delta | Pins | Value | Attributable to |
+|---|---|---|---|
+| **Fix delta** (plan 118.1-13) | `0.2.0-alpha.11` → `0.2.0-alpha.11` | v1 **51/15 → 72/2**; v2 **124/54 exit 1 → 142/36 exit 0**; `GAP_ATTRIBUTABLE_FAILURES` **4 → 1** | the SDK fixes of Phases 118.1-03 … 118.1-12, plus the elicitation-fixture repair |
+| **Bump delta** (plan 118.1-14) | `0.2.0-alpha.11` → `0.2.0-alpha.11` | **NIL — by construction** | nothing; there was no version change |
+
+**This is a STRENGTHENING of D-08's guarantee, not a weakening of it.** D-08 held the pin all
+phase precisely so that every measured movement would be attributable to the SDK rather than to a
+moving referee. With no bump available, the fix delta is the *whole* delta: there is no
+suite-version confound to separate out at all. Every number this phase reports is attributable to
+the SDK alone.
+
+Scenario attribution is correspondingly unambiguous: **every** scenario that moved is attributed
+to the fix delta, and **no** scenario is attributed to the bump delta, because the bump did not
+happen. The per-gap table in `## Dispositions — Phase 118.1 (amendment)` above therefore stands
+unamended: no gap's disposition changed, because nothing changed that could have changed one.
+
+### `GAP_ATTRIBUTABLE_FAILURES` at the held pin
+
+Recomputed from disk by `118.1-14` using plan `118.1-13` Task 1's attribution set **verbatim**
+(`target/118.1-14-gap-attribution.txt`), over a full two-leg run on this tree:
+
+```
+GAP_ATTRIBUTABLE_FAILURES=1
+ATTRIBUTED_FAILURE 2025-11-25:tools-call-with-logging/ToolsCallWithLogging
+```
+
+38 further failures are unattributed — 1 on v1 (`json-schema-2020-12`, a missing fixture, not
+scored) and 37 on v2 — and 1 + 38 = 39 = 2 + 37, which closes both legs exactly.
+
+**It reads 1, not 0, and it is recorded as 1.** The plan's must-have was
+`gap_attributable_failures == 0 at the NEW pin`, whose intent is *the bump did not reopen a closed
+gap*. With no bump, nothing could reopen: the value is unchanged from `118.1-13` at the same pin,
+which is itself a check on the recomputation. The remaining 1 is G-3 sub-item (d) — no
+handler-facing emitter for `notifications/message` — **OPEN**, owned by **Phase 118.2**, exactly
+as the dispositions above already record it. It is not restated as 0.
+
+### The gate that resulted
+
+`scripts/run-conformance-suite.sh` was widened, in lockstep with
+`tests/ci_conformance_gate_wiring.rs`, to block on:
+
+- `2026-07-28` — the **entire scored set** green (37 of 37) **and** the suite's own exit status 0.
+  Universally quantified, so nothing can be deleted from it to turn a red run green.
+- `2025-11-25` — **29 named scenarios**, each PRESENT and entirely green. These are 29 of that
+  leg's 30 scored scenarios. An **inclusion list of claims**, not a known-fail allowlist: adding
+  an entry can only make the gate stricter, and no entry can be added to silence a failure,
+  because a failing scenario cannot satisfy "entirely green". Deletion is the only abuse direction
+  and a floor closes it.
+- `MIN_CHECKS_V1` raised **66 → 74**; `MIN_CHECKS_V2` restated at 178. No floor lowered.
+- The MRTR surface and both zero-check set equalities, unchanged.
+
+The 30th scored `2025-11-25` scenario, `tools-call-with-logging`, is **not claimed**. It is named
+in the script's own output, in `conformance/README.md` § 8a and in the dispositions above.
+**No `--expected-failures`, no allowlist, no known-failure baseline was added anywhere** — the
+anti-suppression posture is still enforced structurally by
+`no_known_fail_allowlist_reaches_a_conformance_command` over comment-stripped commands.
+
+### Measured in situ: why no pass-count is asserted
+
+The verification run of the widened gate came in at **141 passed / 37 failed** where the
+measurement run had recorded **142 / 36** — the oscillation `118.1-13` characterised fired live —
+and the gate still reported `CONF-01 gates PASSED`. A per-scenario diff of the two runs shows
+exactly one line changed across all 83 scenario directories:
+
+```
+< 2026-07-28  http-header-validation  not-scored  14  0
+> 2026-07-28  http-header-validation  not-scored  13  1
+```
+
+A v2 pass-count floor of 142 would therefore have turned CI **red on a run with zero SDK
+defects**, and had `http-header-validation` been admitted to the named blocking list that run
+would have failed the gate. `118.1-13`'s instruction not to write a pass-count assertion is
+confirmed by measurement, and the scenario's exclusion was necessary rather than merely cautious.
+
+### UNAS-01 — decided on evidence, carried to v2.6
+
+D-13 bound UNAS-01's fate to this re-pin. The measurement **refutes D-13's own premise**: the
+suite at the pin *already in place* exercises SEP-2243. The bundle has 5 hits for `x-mcp-header`
+and 4 for `Mcp-Param`, and it runs `2026-07-28:http-custom-header-server-validation`, whose
+`checks.json` names four `sep-2243-server-*` checks as `NotTestable` alongside
+`HttpCustomHeaderServerNoTool: Server has no tools with x-mcp-header annotations to test`. The SDK
+has no support at all: `grep -rl` over `src/` returns 0 files for either token.
+
+D-13 concluded zero hits because it measured the Phase-118 *measurement artifacts* and `src/` —
+neither of which is the suite.
+
+UNAS-01 nonetheless **carries to v2.6, still unassigned**, on the developer's ruling: it is a
+feature addition (tool-level `x-mcp-header` annotations and the `Mcp-Param-{Name}` mirroring they
+drive), not a conformance gap this phase opened; the scenario is **not scored** and its checks
+report `NotTestable` rather than a graded `FAILURE`, so it contributes **0** to
+`gap_attributable_failures` and blocks nothing. It is explicitly **not** folded into Phase 118.2,
+which stays scoped to the v1 client transport and the logging emitter. The full record, including
+every check name, is in `.planning/REQUIREMENTS.md` under UNAS-01.
+
+### Suite facts re-extracted at the held pin
+
+Every check name, probe body and expected code quoted in the 118.1 research is pinned to
+`0.2.0-alpha.11`, so an unchanged pin cannot have moved them — but that is an argument, not a
+measurement. All 16 named expectations (the five-method retirement loop, the `_meta` probes,
+`ServerUnsupportedVersionError`, `ServerImplementsDiscover`, `supportedVersions`,
+`HttpServerNoIndependentRequestsOnStream`, `completion/complete`, `ToolsCallWithLogging` and
+`ServerAcceptsWhitespaceHeaderValue`) were looked up in the installed bundle and every one
+returned a nonzero hit count. **No in-tree test encoding a suite expectation needed updating**, and
+`binary(v2_conformance_pin)` runs 5 tests, 5 passed — its `SPEC_RECHECK_PINNED_SHA` is unaffected
+because the package pin did not move.
