@@ -8,7 +8,7 @@
 //! - **Standard tool definitions**: Consistent `validate_code` and `execute_code` tools
 //! - **Response formatting**: Consistent JSON responses across server types
 
-use pmcp::types::ToolInfo;
+use pmcp::types::{ToolAnnotations, ToolInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -316,7 +316,10 @@ impl CodeModeToolBuilder {
 
     /// Build the validate_code tool definition.
     pub fn build_validate_tool(&self) -> ToolInfo {
-        ToolInfo::new(
+        // Validation is pure static analysis in every app: no state is read
+        // from or written to external systems, and identical input yields an
+        // identical verdict (the approval token varies, but the effect does not).
+        ToolInfo::with_annotations(
             "validate_code",
             Some(
                 "Validates code and returns a business-language explanation with an approval token. \
@@ -347,12 +350,25 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code"]
             }),
+            ToolAnnotations::new()
+                .with_read_only(true)
+                .with_destructive(false)
+                .with_open_world(false)
+                .with_idempotent(true),
         )
     }
 
     /// Build the execute_code tool definition.
+    ///
+    /// KNOWN LIMITATION: the annotations below claim read-only because every
+    /// op surface shipped with code mode today (Cost Explorer, CloudWatch,
+    /// EC2/RDS/Lambda/DynamoDB describe/list) is a pure read. If an app ever
+    /// exposes a MUTATING op through its executor, these hints become
+    /// untruthful for that app — the durable fix is to derive them from the
+    /// Cedar policy / op registry (see the hint-aggregation proposal) rather
+    /// than hardcoding here.
     pub fn build_execute_tool(&self) -> ToolInfo {
-        ToolInfo::new(
+        ToolInfo::with_annotations(
             "execute_code",
             Some(
                 "Executes validated code using an approval token. \
@@ -377,6 +393,11 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code", "approval_token"]
             }),
+            ToolAnnotations::new()
+                .with_read_only(true)
+                .with_destructive(false)
+                .with_open_world(false)
+                .with_idempotent(true),
         )
     }
 }
