@@ -315,10 +315,23 @@ impl CodeModeToolBuilder {
     }
 
     /// Build the validate_code tool definition.
+    /// Annotations shared by both code-mode tools today: a pure read that
+    /// touches no external state and can be retried freely.
+    ///
+    /// Always true for `validate_code` (static analysis; the approval token
+    /// varies per call, but the effect does not). For `execute_code` it is an
+    /// assumption about the app's op surface — see the KNOWN LIMITATION on
+    /// [`Self::build_execute_tool`]. When hint derivation lands, only
+    /// `build_execute_tool` stops calling this.
+    fn safe_read_annotations() -> ToolAnnotations {
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_destructive(false)
+            .with_open_world(false)
+            .with_idempotent(true)
+    }
+
     pub fn build_validate_tool(&self) -> ToolInfo {
-        // Validation is pure static analysis in every app: no state is read
-        // from or written to external systems, and identical input yields an
-        // identical verdict (the approval token varies, but the effect does not).
         ToolInfo::with_annotations(
             "validate_code",
             Some(
@@ -350,23 +363,24 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code"]
             }),
-            ToolAnnotations::new()
-                .with_read_only(true)
-                .with_destructive(false)
-                .with_open_world(false)
-                .with_idempotent(true),
+            Self::safe_read_annotations(),
         )
     }
 
     /// Build the execute_code tool definition.
     ///
-    /// KNOWN LIMITATION: the annotations below claim read-only because every
-    /// op surface shipped with code mode today (Cost Explorer, CloudWatch,
-    /// EC2/RDS/Lambda/DynamoDB describe/list) is a pure read. If an app ever
-    /// exposes a MUTATING op through its executor, these hints become
-    /// untruthful for that app — the durable fix is to derive them from the
-    /// Cedar policy / op registry (see the hint-aggregation proposal) rather
-    /// than hardcoding here.
+    /// KNOWN LIMITATION: the read-only annotations are truthful only for apps
+    /// whose declared op surface is all reads — every `OperationEntry` with
+    /// `category = "read"` (config.rs) and, for GraphQL, `allow_mutations =
+    /// false`. That holds for every consumer shipped today, but nothing here
+    /// enforces it: an app that exposes a mutating op inherits untruthful
+    /// hints. The durable fix is to derive the hints instead of hardcoding —
+    /// the pieces already converge: `OperationRegistry::lookup_category`
+    /// (config.rs), the `ValidationPipeline` the generated handler already
+    /// owns at its `metadata()` call site (pmcp-code-mode-derive), and the
+    /// per-script fold precedent in javascript.rs (`is_read_only`); the full
+    /// Cedar/AVP design layers on policy_annotations.rs. See the
+    /// hint-aggregation proposal.
     pub fn build_execute_tool(&self) -> ToolInfo {
         ToolInfo::with_annotations(
             "execute_code",
@@ -393,11 +407,7 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code", "approval_token"]
             }),
-            ToolAnnotations::new()
-                .with_read_only(true)
-                .with_destructive(false)
-                .with_open_world(false)
-                .with_idempotent(true),
+            Self::safe_read_annotations(),
         )
     }
 }
