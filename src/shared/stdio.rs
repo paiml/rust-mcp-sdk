@@ -459,7 +459,7 @@ mod tests {
             .split("// EOF on stdin closes the READ side only")
             .nth(1)
             .expect("the EOF branch must carry its marker comment");
-        let branch = &body[..body.find("\n    }").unwrap_or(body.len().min(400))];
+        let branch = &body[..body.find("\n    }").unwrap_or_else(|| body.len().min(400))];
         assert!(
             branch.contains("read_closed"),
             "the EOF branch must close the read side: {branch}"
