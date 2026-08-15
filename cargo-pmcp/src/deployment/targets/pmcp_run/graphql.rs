@@ -1091,7 +1091,7 @@ pub async fn upload_test_scenario(
             $name: String!
             $description: String
             $content: String!
-            $format: UploadTestScenarioFormat
+            $format: String
         ) {
             uploadTestScenario(
                 serverId: $serverId
@@ -1135,7 +1135,7 @@ pub async fn download_test_scenario(
     let query = r#"
         query DownloadTestScenario(
             $scenarioId: String!
-            $format: DownloadTestScenarioFormat
+            $format: String
         ) {
             downloadTestScenario(
                 scenarioId: $scenarioId
@@ -1703,4 +1703,60 @@ pub async fn set_package_binding(
     response
         .set_package_binding
         .context("setPackageBinding returned null - check pmcp.run service logs")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every GraphQL variable declared by this file must use a type the pmcp.run
+    /// schema actually defines. All of these operations take scalars only, so the
+    /// check reduces to "is it a built-in GraphQL or AppSync scalar".
+    ///
+    /// Why this exists (2026-08-15): `uploadTestScenario` and `downloadTestScenario`
+    /// each declared `$format: UploadTestScenarioFormat` / `DownloadTestScenarioFormat`
+    /// — types that have never existed on ANY pmcp.run endpoint (the server takes a
+    /// plain `format: String`, and both call sites were already sending a lowercased
+    /// string). AppSync rejects the whole document at validation time with
+    /// "Unknown type UploadTestScenarioFormat", so both commands failed against every
+    /// server on the platform. The failure reads like a missing feature rather than a
+    /// client bug, which is what made it expensive to diagnose.
+    #[test]
+    fn declared_variable_types_are_known_scalars() {
+        const SOURCE: &str = include_str!("graphql.rs");
+        // GraphQL built-ins plus the AppSync-specific scalars this API uses.
+        const KNOWN: &[&str] = &[
+            "String", "Boolean", "Int", "Float", "ID", "AWSJSON", "AWSDate", "AWSTime",
+            "AWSDateTime", "AWSTimestamp", "AWSEmail", "AWSURL", "AWSPhone", "AWSIPAddress",
+        ];
+
+        let mut offenders: Vec<(usize, String)> = Vec::new();
+        for (i, line) in SOURCE.lines().enumerate() {
+            // Match a variable declaration inside a query string: `$name: Type` / `Type!`.
+            let Some(colon) = line.find(": ") else { continue };
+            if !line.trim_start().starts_with('$') {
+                continue;
+            }
+            // Normalize: drop a trailing comma (GraphQL allows comma-separated
+            // variable lists) and the non-null / list punctuation, leaving the
+            // bare named type — `[String!]!` and `String` both reduce to `String`.
+            let ty: String = line[colon + 2..]
+                .trim()
+                .trim_end_matches(',')
+                .chars()
+                .filter(|c| !matches!(c, '!' | '[' | ']'))
+                .collect();
+            let ty = ty.trim();
+            if ty.is_empty() || ty.contains(' ') {
+                continue;
+            }
+            if !KNOWN.contains(&ty) {
+                offenders.push((i + 1, ty.to_string()));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "GraphQL variables declared with a type pmcp.run does not define \
+             (AppSync rejects the whole document): {offenders:?}"
+        );
+    }
 }
