@@ -5,15 +5,15 @@ milestone_name: MCP Spec 2026-07-28
 current_phase: 118.2
 current_phase_name: the-v1-client-sse-transport-and-the-notifications-message-em
 status: executing
-stopped_at: Completed 118.2-14-PLAN.md
-last_updated: "2026-08-17T20:11:29.360Z"
+stopped_at: Completed 118.2-15-PLAN.md
+last_updated: "2026-08-17T21:05:06.761Z"
 last_activity: 2026-08-17
 last_activity_desc: Phase 118.2 execution started
 progress:
   total_phases: 11
   completed_phases: 9
   total_plans: 159
-  completed_plans: 154
+  completed_plans: 156
   percent: 82
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.2 (the-v1-client-sse-transport-and-the-notifications-message-em) — EXECUTING
-Plan: 2 of 17
+Plan: 3 of 17
 from 118.2-11's checkpoint). 118.2-12 was the phase's final act: the D-14 re-pin, held at
 `0.2.0-alpha.11` because it is already newest, bump delta NIL, developer approved 2026-08-17.
 Two deltas, never summed — SDK fixes `72/2 exit 1` → `73/1 exit 0` (`GAP_ATTRIBUTABLE_FAILURES`
@@ -1326,6 +1326,13 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase ?]: The uptime rule lives in a pure free fn budget_reset_earned(delivered, uptime), not an inline &&: run_session_stream is already split four ways to hold PMAT cog-25, and a pure predicate is testable at both sides of its threshold with no clock manipulation.
 - [Phase ?]: std::time::Instant, not tokio::time::Instant, for the uptime measurement — the tokio clock moves under tokio::time::pause(), which would make the refund arm depend on whether a caller paused time.
 - [Phase ?]: No new fuzz target for next_reconnect_delay: it is a pure two-argument fn fully covered by two proptest arms; a fuzz target over (u32, Option<u64>) would be a slower proptest. The existing streamable_sse_frames target was re-run (20,000 runs, exit 0) to prove the reader path is undisturbed.
+- [Phase ?]: CR-02 needs BOTH halves: measured 17 run / 16 passed / 1 failed with the latch and no id check. The latch removes the supply of poison; the id check stops it desynchronising the FIFO.
+- [Phase ?]: The terminal latch stores a reconstructable (TerminalKind, String) pair, not an Error: pmcp::Error is not Clone and making a public core type Clone to serve a private latch is the wrong trade.
+- [Phase ?]: The terminal latch is STICKY and write-once per TRANSPORT, not one-shot and not per-reader. One-shot restores exactly the CR-02 hazard; the stop-do-not-loop contract is stated in Transport::receive's rustdoc (T-118.2-15-04).
+- [Phase ?]: tokio::sync::watch generation counter subscribed BEFORE the first latch read, never Notify: notify_waiters wakes only tasks already parked, so a signal raised between two loop iterations is lost (T-118.2-15-05).
+- [Phase ?]: Arc<watch::Sender<u64>> rather than a bare Sender: Sender gained Clone in a tokio later than the declared 1.46 minimum, and 1.46 is not vendored here to measure against.
+- [Phase ?]: Discard-on-mismatch in dispatch_request, not re-queue and not an orphan buffer. Per-id response ROUTING is the correct long-term shape and is recorded in deferred-items.md (T-118.2-15-03, accepted).
+- [Phase ?]: The 25 tests the id check turned red were fixed by making three test mocks ECHO the request id, which is what a conformant server does. They had been asserting on the defect; the check was not weakened.
 
 ### Pending Todos
 
@@ -1386,8 +1393,8 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-17T20:11:16.695Z
-Stopped at: Completed 118.2-14-PLAN.md
+Last session: 2026-08-17T21:04:33.447Z
+Stopped at: Completed 118.2-15-PLAN.md
 Resume file: None
 Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
@@ -1539,3 +1546,4 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 118.2 P13 | 50m | 3 tasks | 6 files |
 | Phase 118.2 P12 | ~75min | 3 tasks | 4 files |
 | Phase 118.2 P14 | ~6h | 3 tasks | 2 files |
+| Phase 118.2 P15 | 2h | 3 tasks | 5 files |
