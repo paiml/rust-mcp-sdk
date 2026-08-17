@@ -203,3 +203,52 @@ the root formatter, so committing only `ui.rs` would half-close the blocker).
 
 A later executor running the same targets will see the same phantom
 modification. It is not their change.
+
+## A malformed v1 `logging/setLevel` is rejected `400` / `-32601`, not answered `{}` (recorded during 118.2-07)
+
+**MEASURED** by `a_malformed_level_value_is_ignored_and_not_echoed` in
+`tests/log_emitter.rs`, which now asserts the observed behaviour rather than the
+behaviour plan 07 predicted.
+
+Plan 07's Task 2 states that a malformed `logging/setLevel` `params.level`
+"stores-or-ignores and still answers `{}`". The v2 `_meta` half of that claim
+HOLDS and is fenced: a bogus `io.modelcontextprotocol/logLevel` value yields a
+normal `200`, the `info` default applies, and the peer's bytes appear nowhere in
+the response.
+
+The v1 RPC half does not, for a reason that predates this plan: a
+`logging/setLevel` whose `level` is not one of the eight `LoggingLevel` spellings
+fails TYPED PARSING inside `parse_transport_message_fast`, so the whole message
+never becomes a `ClientRequest` and the transport answers
+
+```
+400  {"error":{"code":-32700,"message":"Invalid JSON: … -32601 - Method not found: logging/setLevel"}}
+```
+
+long before plan 07's ingress capture runs. Making it answer `{}` means changing
+the deserialization of the PUBLIC `ClientRequest::SetLoggingLevel` variant (e.g.
+tolerating an unknown level string), which is out of this plan's `files_modified`
+and carries its own semver verdict.
+
+**What plan 07 DOES claim of that path holds and is fenced:** no panic, the
+peer's value is never echoed into the rejection (`T-118.2-07-04`), and nothing is
+stored — a later tool call on the same session is still filtering at the `info`
+default.
+
+**Owner:** unassigned. Natural home is plan 08, which already owns the
+`LogMessageParams` `message`-vs-`data` spec divergence and the `{}`-response pin
+(Pitfall 8).
+
+## `set_session_log_level`'s no-op-for-unknown-id is not wire-reachable (recorded during 118.2-07)
+
+`v1::set_session_log_level` is a NO-OP for an unknown session id rather than an
+insert, which is the T-118.2-07-02 denial-of-service control. On the wire that
+control is currently UNREACHABLE: `v1::validate_non_init_session` answers `404
+Unknown session ID` before the ingress capture runs, so a caller cannot get as
+far as the write with an id the server never issued.
+
+`a_set_level_for_an_unknown_session_id_inserts_no_session` therefore fences the
+END-TO-END property (no row is minted; the id is still unknown on the next
+request) rather than the no-op itself. The no-op remains as defence in depth for
+a future call site that reaches the write without the validation — the case the
+rustdoc names — and a mutation of it does NOT turn any fence red today.

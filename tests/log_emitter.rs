@@ -684,3 +684,894 @@ fn exactly_one_site_converts_the_server_notification_tx_into_a_sink() {
         "and it must be the named helper, so both consumers can reach it"
     );
 }
+
+// ===========================================================================
+// WIRE FENCES (Phase 118.2 plan 07) — a real `StreamableHttpServer` on an
+// ephemeral port, a raw stream-holding client, and real `notifications/message`
+// frames on the wire.
+//
+// The fences above measure the EMITTER and the dispatch roots. These measure the
+// thing a conforming client actually observes: that a `extra.log(..)` record
+// leaves the process, on BOTH eras, filtered by a level the CLIENT chose.
+//
+// The client is raw TCP rather than `reqwest` for the same reason
+// `tests/http_peer_roundtrip.rs` gives: the v1 vehicle is a GET
+// `text/event-stream` body that never reaches EOF, so it must be read
+// INCREMENTALLY, and each POST needs its own connection so HTTP keep-alive
+// head-of-line ordering can never be mistaken for server-side ordering.
+//
+// pmcp's own client is deliberately NOT the observer here. Plan 10 owns the
+// joint client/server fence; using it now would make a failure attributable to
+// either side.
+// ===========================================================================
+
+use std::net::{Ipv4Addr, SocketAddr};
+
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
+
+use pmcp::server::http_middleware::ServerHttpMiddlewareChain;
+use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpServerConfig};
+use pmcp::types::protocol::LATEST_PROTOCOL_VERSION;
+use pmcp::{Server, ToolHandler};
+
+/// The spec method every log record must arrive under. A LITERAL, never imported
+/// from `src/` — a fence that reads its expectation out of the code under test
+/// asserts nothing.
+const LOG_METHOD: &str = "notifications/message";
+
+/// The `_meta` key the 2026-07-28 transport carries a level in, spelled as a
+/// literal here for the same reason.
+const LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
+
+/// The v1 RPC the 2026-07-28 transport retired, likewise a literal.
+const SET_LEVEL_METHOD: &str = "logging/setLevel";
+
+/// The message on the `debug` record — delivered only when a client ASKED for
+/// `debug`, suppressed by the `info` default (D-12).
+const DEBUG_MESSAGE: &str = "log-emitter-debug-record";
+
+/// The message on the `info` record — delivered under the default.
+const INFO_MESSAGE: &str = "log-emitter-info-record";
+
+/// A level value that is not a level, chosen IN THIS TEST.
+///
+/// Deliberately a string that appears nowhere in `src/`: an absence assertion
+/// over a value the source also contains could be satisfied by a source string
+/// the test never sent, which would make the no-echo claim vacuous.
+const MALFORMED_LEVEL: &str = "NOT-A-LEVEL-2b7f1c";
+
+/// The tool every wire fence calls. It emits one record at `debug` and one at
+/// `info`, so a single call measures the filter in BOTH directions.
+struct LoggingTool;
+
+#[async_trait]
+impl ToolHandler for LoggingTool {
+    async fn handle(&self, _args: Value, extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        extra.log(LoggingLevel::Debug, DEBUG_MESSAGE)?;
+        extra.log(LoggingLevel::Info, INFO_MESSAGE)?;
+        Ok(json!("logged"))
+    }
+}
+
+/// A stock v1 server: NOT opted into v2, which is what a default deployment is.
+fn build_v1_server() -> Server {
+    Server::builder()
+        .name("log-emitter-v1")
+        .version("1.0.0")
+        .tool("logger", LoggingTool)
+        .build()
+        .expect("server builds")
+}
+
+/// The same fixture opted into BOTH eras, so one server can serve a v1 session
+/// and a v2 stateless request without the two fences drifting apart.
+fn build_dual_era_server() -> Server {
+    Server::builder()
+        .name("log-emitter-dual")
+        .version("1.0.0")
+        .tool("logger", LoggingTool)
+        .with_supported_protocol_versions([
+            pmcp::types::protocol::ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
+            pmcp::types::protocol::ProtocolVersion(
+                pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+            ),
+        ])
+        .build()
+        .expect("server builds")
+}
+
+/// `StreamableHttpServerConfig::default()` keeps a live `session_id_generator`,
+/// which is what a real deployment ships: the ERA decides whether sessions are
+/// live for a given request, not the config.
+fn stateful_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+}
+
+/// The same config with an EMPTY HTTP middleware chain attached.
+///
+/// `handle_post_request` routes on `config.http_middleware.is_none()`, so an
+/// empty chain is enough to send every POST down the MIDDLEWARE ingress path
+/// instead of the fast path — which is exactly the deployment shape that a
+/// resolution written at only one of the two call sites would silently ignore
+/// (T-118.2-07-06). No middleware behaviour is needed to prove that; only the
+/// route.
+fn middleware_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig {
+        http_middleware: Some(Arc::new(ServerHttpMiddlewareChain::new())),
+        ..StreamableHttpServerConfig::default()
+    }
+}
+
+/// Spawn on an EPHEMERAL port and read the bound address back from `start()`.
+async fn spawn_server(
+    server: Server,
+    config: StreamableHttpServerConfig,
+) -> (SocketAddr, JoinHandle<()>) {
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+    let server = Arc::new(TokioMutex::new(server));
+    StreamableHttpServer::with_config(addr, server, config)
+        .start()
+        .await
+        .expect("server starts on an ephemeral port")
+}
+
+async fn teardown(handle: JoinHandle<()>, sockets: impl Send) {
+    drop(sockets);
+    handle.abort();
+    let _ = handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// A minimal raw HTTP/1.1 client, lifted from `tests/http_peer_roundtrip.rs`.
+// ---------------------------------------------------------------------------
+
+/// One open HTTP response, readable frame by frame.
+struct Conn {
+    reader: BufReader<TcpStream>,
+    status: u16,
+    headers: Vec<(String, String)>,
+    buffer: String,
+    chunked: bool,
+    remaining: usize,
+    finished: bool,
+}
+
+impl Conn {
+    /// Send a request and read only as far as the response headers.
+    async fn open(addr: SocketAddr, verb: &str, extra: &[(String, String)], body: &str) -> Self {
+        let stream = TcpStream::connect(addr).await.expect("connects");
+        let accept = if verb == "GET" {
+            "text/event-stream"
+        } else {
+            "application/json, text/event-stream"
+        };
+        let mut request = format!(
+            "{verb} / HTTP/1.1\r\nHost: {addr}\r\nAccept: {accept}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in extra {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(request.as_bytes())
+            .await
+            .expect("request written");
+
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
+            .await
+            .expect("status line");
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("header line");
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+            }
+        }
+
+        let chunked = headers
+            .iter()
+            .any(|(n, v)| n == "transfer-encoding" && v.contains("chunked"));
+        let remaining = headers
+            .iter()
+            .find(|(n, _)| n == "content-length")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+
+        Self {
+            reader,
+            status,
+            headers,
+            buffer: String::new(),
+            chunked,
+            remaining,
+            finished: false,
+        }
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Pull more body bytes into [`Self::buffer`] in whichever framing applies.
+    async fn pull(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        if !self.chunked {
+            let mut payload = vec![0u8; self.remaining];
+            let ok = self.remaining > 0 && self.reader.read_exact(&mut payload).await.is_ok();
+            self.finished = true;
+            if !ok {
+                return false;
+            }
+            self.buffer.push_str(&String::from_utf8_lossy(&payload));
+            return true;
+        }
+        let mut size_line = String::new();
+        if self.reader.read_line(&mut size_line).await.unwrap_or(0) == 0 {
+            self.finished = true;
+            return false;
+        }
+        let size_token = size_line.trim().split(';').next().unwrap_or("").to_string();
+        let Ok(size) = usize::from_str_radix(&size_token, 16) else {
+            self.finished = true;
+            return false;
+        };
+        if size == 0 {
+            self.finished = true;
+            return false;
+        }
+        let mut payload = vec![0u8; size];
+        if self.reader.read_exact(&mut payload).await.is_err() {
+            self.finished = true;
+            return false;
+        }
+        let mut crlf = [0u8; 2];
+        let _ = self.reader.read_exact(&mut crlf).await;
+        self.buffer.push_str(&String::from_utf8_lossy(&payload));
+        true
+    }
+
+    /// Pop one complete SSE block (`…\n\n`) from the buffer, if present.
+    fn take_block(&mut self) -> Option<String> {
+        let end = self.buffer.find("\n\n")?;
+        let block = self.buffer[..end].to_string();
+        self.buffer.drain(..end + 2);
+        Some(block)
+    }
+
+    /// The next `data:` payload, or `None` at end of stream. UNBOUNDED — always
+    /// reach it through [`Self::frame`].
+    async fn next_data(&mut self) -> Option<String> {
+        loop {
+            if let Some(block) = self.take_block() {
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(rest) = line.strip_prefix("data:") {
+                        data.push_str(rest.trim_start());
+                    }
+                }
+                if !data.is_empty() {
+                    return Some(data);
+                }
+                continue;
+            }
+            if !self.pull().await {
+                if !self.buffer.trim().is_empty() {
+                    let rest = std::mem::take(&mut self.buffer);
+                    return Some(rest.trim().to_string());
+                }
+                return None;
+            }
+        }
+    }
+
+    /// The next protocol frame on this stream, parsed as JSON and BOUNDED.
+    ///
+    /// On a wedged transport an unbounded await does not FAIL, it hangs, and a
+    /// hung test reads as a slow test in CI rather than as a red one.
+    async fn frame(&mut self, what: &str) -> Value {
+        let data = tokio::time::timeout(BOUND, self.next_data())
+            .await
+            .unwrap_or_else(|_| panic!("{what} must not hang"))
+            .unwrap_or_else(|| panic!("{what}: the stream ended with no frame"));
+        serde_json::from_str(&data).expect("every frame on this stream is JSON")
+    }
+
+    /// Read the whole body of a completed response.
+    async fn body(&mut self) -> String {
+        while self.pull().await {}
+        std::mem::take(&mut self.buffer)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request construction.
+// ---------------------------------------------------------------------------
+
+fn envelope(method: &str, id: i64, params: &Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
+fn init_body() -> String {
+    envelope(
+        "initialize",
+        1,
+        &json!({
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "log-emitter-fence", "version": "1.0.0" }
+        }),
+    )
+}
+
+fn call_body(id: i64) -> String {
+    envelope(
+        "tools/call",
+        id,
+        &json!({ "name": "logger", "arguments": {} }),
+    )
+}
+
+/// A v1 `logging/setLevel` carrying `level` VERBATIM, so a fence can send a value
+/// that is not a level at all.
+fn set_level_body(id: i64, level: &Value) -> String {
+    envelope(SET_LEVEL_METHOD, id, &json!({ "level": level }))
+}
+
+/// A v2 `tools/call` with the three reserved `_meta` keys VERS-05 requires, plus
+/// an optional log level.
+///
+/// The reserved key SPELLINGS come from `pmcp::testing` so a rename in the crate
+/// breaks this fence rather than silently turning it into a probe of the
+/// rejection path. The LOG LEVEL key is a local literal on purpose — it is the
+/// wire contract under test.
+fn v2_call_body(id: i64, log_level: Option<&Value>) -> String {
+    let mut meta = json!({
+        pmcp::testing::META_PROTOCOL_VERSION:
+            pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28,
+        pmcp::testing::META_CLIENT_INFO: { "name": "log-emitter-fence", "version": "1.0.0" },
+        pmcp::testing::META_CLIENT_CAPABILITIES: {},
+    });
+    if let (Some(level), Some(map)) = (log_level, meta.as_object_mut()) {
+        map.insert(LOG_LEVEL_META_KEY.to_string(), level.clone());
+    }
+    envelope(
+        "tools/call",
+        id,
+        &json!({ "name": "logger", "arguments": {}, "_meta": meta }),
+    )
+}
+
+fn v2_call_headers() -> Vec<(String, String)> {
+    vec![
+        ("MCP-Method".to_string(), "tools/call".to_string()),
+        ("Mcp-Name".to_string(), "logger".to_string()),
+        (
+            "MCP-Protocol-Version".to_string(),
+            pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ),
+    ]
+}
+
+fn session_header(session: &str) -> Vec<(String, String)> {
+    vec![("Mcp-Session-Id".to_string(), session.to_string())]
+}
+
+/// POST `body` and return `(status, body)`, BOUNDED.
+async fn post(
+    addr: SocketAddr,
+    extra: &[(String, String)],
+    body: &str,
+    what: &str,
+) -> (u16, String) {
+    let mut conn = tokio::time::timeout(BOUND, Conn::open(addr, "POST", extra, body))
+        .await
+        .unwrap_or_else(|_| panic!("{what} must not hang"));
+    let status = conn.status;
+    let text = tokio::time::timeout(BOUND, conn.body())
+        .await
+        .unwrap_or_else(|_| panic!("{what} body must not hang"));
+    (status, text)
+}
+
+/// Handshake: POST `initialize` and return the minted session id.
+async fn open_session(addr: SocketAddr) -> String {
+    let mut conn = tokio::time::timeout(BOUND, Conn::open(addr, "POST", &[], &init_body()))
+        .await
+        .expect("initialize must not hang");
+    assert_eq!(conn.status, 200, "initialize is answered inline");
+    let session = conn
+        .header("mcp-session-id")
+        .expect("a stateful server mints a session id")
+        .to_string();
+    let _ = tokio::time::timeout(BOUND, conn.body())
+        .await
+        .expect("initialize body must not hang");
+    session
+}
+
+/// Open the session's live SSE stream — the v1 server-to-client vehicle.
+async fn open_stream(addr: SocketAddr, session: &str) -> Conn {
+    let conn = tokio::time::timeout(BOUND, Conn::open(addr, "GET", &session_header(session), ""))
+        .await
+        .expect("opening the SSE stream must not hang");
+    assert_eq!(conn.status, 200, "the SSE stream opens");
+    conn
+}
+
+/// Fire a `tools/call` WITHOUT awaiting its HTTP response.
+///
+/// With a live SSE stream the tool's reply is delivered onto that stream and the
+/// POST answers `202 Accepted` only once the handler has finished, so a fence
+/// that awaited it here could not read the records the handler emitted.
+fn spawn_call(addr: SocketAddr, session: &str, id: i64) -> JoinHandle<(u16, String)> {
+    let headers = session_header(session);
+    let body = call_body(id);
+    tokio::spawn(async move { post(addr, &headers, &body, "a queued tools/call").await })
+}
+
+// ---------------------------------------------------------------------------
+// Frame readers.
+// ---------------------------------------------------------------------------
+
+/// Drain a session stream until the reply to `id` arrives, collecting every
+/// `notifications/message` frame seen BEFORE it.
+///
+/// Ordering is a property of the TRANSPORT, not of timing: the handler's records
+/// are pushed onto the session's sender while it runs and its reply only after it
+/// returns, through the same FIFO channel. So "the record arrived, or it did not"
+/// is decided by the time the reply lands — no quiet window and no sleep.
+async fn records_before_reply(conn: &mut Conn, id: i64, what: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    loop {
+        let frame = conn.frame(what).await;
+        if frame.get("method").and_then(Value::as_str) == Some(LOG_METHOD) {
+            records.push(frame);
+            continue;
+        }
+        if frame.get("id").and_then(Value::as_i64) == Some(id) {
+            return records;
+        }
+    }
+}
+
+/// The next `n` frames on a stream, each of which MUST be a log record.
+///
+/// For the ingress path whose reply is answered inline: by the time the POST has
+/// returned, every record the handler emitted has already been pushed onto the
+/// session's sender, so this reads settled state rather than racing it.
+async fn take_records(conn: &mut Conn, n: usize, what: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    for _ in 0..n {
+        let frame = conn.frame(what).await;
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some(LOG_METHOD),
+            "{what}: expected a {LOG_METHOD} frame, got {frame} — a MISSING record shows up here \
+             as the next frame in line, which is what a level resolved on only one ingress path \
+             looks like"
+        );
+        records.push(frame);
+    }
+    records
+}
+
+/// Every `notifications/message` frame in a completed multi-frame SSE body.
+fn records_in_body(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter(|frame| frame.get("method").and_then(Value::as_str) == Some(LOG_METHOD))
+        .collect()
+}
+
+/// The `params.message` of each record, in arrival order.
+fn messages_of(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| record.pointer("/params/message").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+// ===========================================================================
+// Wire fence 1 — a v1 record reaches the live session stream.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_v1_handler_log_record_reaches_the_live_session_stream() {
+    let (addr, handle) = spawn_server(build_v1_server(), stateful_config()).await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+
+    let call = spawn_call(addr, &session, 2);
+    let records = records_before_reply(&mut stream, 2, "the v1 tool reply").await;
+    let _ = call.await;
+
+    assert_eq!(
+        messages_of(&records),
+        vec![INFO_MESSAGE.to_string()],
+        "the `info` record must arrive on the session's SSE stream, and the `debug` record must \
+         not — nothing set a level, so the `info` default applies (D-12)"
+    );
+    assert_eq!(
+        records[0]["params"]["level"], "info",
+        "the level rides the record as its lowercase wire spelling"
+    );
+    assert_eq!(
+        records[0]["method"], LOG_METHOD,
+        "and the frame is the spec notification, not a progress frame"
+    );
+
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// Wire fence 2 — a v2 record rides the multi-frame POST body.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_v2_handler_log_record_rides_the_multi_frame_post_body() {
+    let (addr, handle) = spawn_server(build_dual_era_server(), stateful_config()).await;
+
+    let (status, body) = post(
+        addr,
+        &v2_call_headers(),
+        &v2_call_body(2, None),
+        "the v2 logging call",
+    )
+    .await;
+
+    assert_eq!(status, 200, "a v2 tools/call succeeds: {body}");
+    let records = records_in_body(&body);
+    assert_eq!(
+        messages_of(&records),
+        vec![INFO_MESSAGE.to_string()],
+        "v2 delivers the record on the POST RESPONSE BODY as a multi-frame SSE notification: {body}"
+    );
+    assert!(
+        body.rfind("\"result\"") > body.find(LOG_METHOD),
+        "and the result frame comes AFTER the record, not before it: {body}"
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// Wire fence 3 — the v1 level is PER SESSION (D-11 / T-118.2-07-01, ASVS V3).
+//
+// This is the fence that would have caught the deferred cross-session
+// `client_capabilities` misattribution had it existed: the defect class is "one
+// client's request changed another client's behaviour", and it is invisible to
+// every single-session test in the suite.
+// ===========================================================================
+
+#[tokio::test]
+async fn the_v1_level_is_per_session_and_client_b_cannot_change_client_a() {
+    let (addr, handle) = spawn_server(build_v1_server(), stateful_config()).await;
+    let session_a = open_session(addr).await;
+    let session_b = open_session(addr).await;
+    assert_ne!(session_a, session_b, "two distinct sessions are in play");
+
+    // B asks for `debug`; A asks for nothing. Sent BEFORE either stream opens so
+    // the reply is answered inline instead of landing on a stream a later
+    // assertion reads.
+    let (status, body) = post(
+        addr,
+        &session_header(&session_b),
+        &set_level_body(2, &json!("debug")),
+        "B's logging/setLevel",
+    )
+    .await;
+    assert_eq!(status, 200, "logging/setLevel is served on v1: {body}");
+
+    let mut stream_a = open_stream(addr, &session_a).await;
+    let mut stream_b = open_stream(addr, &session_b).await;
+
+    let call_a = spawn_call(addr, &session_a, 3);
+    let records_a = records_before_reply(&mut stream_a, 3, "A's tool reply").await;
+    let _ = call_a.await;
+
+    let call_b = spawn_call(addr, &session_b, 4);
+    let records_b = records_before_reply(&mut stream_b, 4, "B's tool reply").await;
+    let _ = call_b.await;
+
+    assert_eq!(
+        messages_of(&records_b),
+        vec![DEBUG_MESSAGE.to_string(), INFO_MESSAGE.to_string()],
+        "B set `debug`, so B receives BOTH records"
+    );
+    assert_eq!(
+        messages_of(&records_a),
+        vec![INFO_MESSAGE.to_string()],
+        "A set nothing, so A must still be filtering at the `info` default — a level stored on the \
+         shared Arc<Mutex<Server>> instead of on the session would have leaked B's choice into A's \
+         stream (T-118.2-07-01)"
+    );
+
+    teardown(handle, (stream_a, stream_b)).await;
+}
+
+// ===========================================================================
+// Wire fence 4 — the v2 `_meta` key is PER REQUEST (D-10).
+// ===========================================================================
+
+#[tokio::test]
+async fn the_v2_meta_key_sets_the_level_for_that_request_only() {
+    let (addr, handle) = spawn_server(build_dual_era_server(), stateful_config()).await;
+
+    let (status, with_key) = post(
+        addr,
+        &v2_call_headers(),
+        &v2_call_body(2, Some(&json!("debug"))),
+        "the v2 call carrying a log level",
+    )
+    .await;
+    assert_eq!(status, 200, "the v2 call with a level succeeds: {with_key}");
+
+    let (status, without_key) = post(
+        addr,
+        &v2_call_headers(),
+        &v2_call_body(3, None),
+        "the v2 call carrying no log level",
+    )
+    .await;
+    assert_eq!(status, 200, "the v2 call without a level succeeds too");
+
+    assert_eq!(
+        messages_of(&records_in_body(&with_key)),
+        vec![DEBUG_MESSAGE.to_string(), INFO_MESSAGE.to_string()],
+        "the request that carried `{LOG_LEVEL_META_KEY}: debug` receives both records — before \
+         this plan the key was declared and read by nothing: {with_key}"
+    );
+    assert_eq!(
+        messages_of(&records_in_body(&without_key)),
+        vec![INFO_MESSAGE.to_string()],
+        "and the very next request, which carried no key, is back at the default — v2 is \
+         session-free, so a level that persisted would be state the era does not have: \
+         {without_key}"
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// Wire fence 5 — the default is `info` when nothing set one (D-12).
+// ===========================================================================
+
+#[tokio::test]
+async fn an_unset_level_defaults_to_info() {
+    let (addr, handle) = spawn_server(build_v1_server(), stateful_config()).await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+
+    let call = spawn_call(addr, &session, 2);
+    let records = records_before_reply(&mut stream, 2, "the tool reply").await;
+    let _ = call.await;
+
+    let messages = messages_of(&records);
+    assert!(
+        messages.iter().any(|m| m == INFO_MESSAGE),
+        "an `info` record is DELIVERED under the default: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m == DEBUG_MESSAGE),
+        "and a `debug` record is SUPPRESSED — both directions, because a default that let \
+         everything through would pass the delivery half alone: {messages:?}"
+    );
+
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// Wire fence 6 — a malformed level is inert, unechoed and non-fatal
+// (T-118.2-07-03 / T-118.2-07-04, ASVS V5 / V7).
+// ===========================================================================
+
+#[tokio::test]
+async fn a_malformed_level_value_is_ignored_and_not_echoed() {
+    let (addr, handle) = spawn_server(build_dual_era_server(), stateful_config()).await;
+
+    // (a) the v2 `_meta` key.
+    let (status, body) = post(
+        addr,
+        &v2_call_headers(),
+        &v2_call_body(2, Some(&json!(MALFORMED_LEVEL))),
+        "the v2 call carrying a malformed level",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the request still SERVES — an advisory diagnostic hint must not become an availability \
+         failure: {body}"
+    );
+    assert!(
+        !body.contains(MALFORMED_LEVEL),
+        "and the peer's own bytes are never echoed back, in the result or in any emitted record: \
+         {body}"
+    );
+    let records = records_in_body(&body);
+    assert_eq!(
+        messages_of(&records),
+        vec![INFO_MESSAGE.to_string()],
+        "the effective level falls back to the `info` default: {body}"
+    );
+    for record in &records {
+        assert!(
+            !record.to_string().contains(MALFORMED_LEVEL),
+            "no emitted record may carry the peer's value: {record}"
+        );
+    }
+
+    // (b) the v1 RPC, whose whole purpose IS the level.
+    //
+    // MEASURED, and it differs from the v2 arm above: a `logging/setLevel` whose
+    // `params.level` is not a level fails TYPED PARSING in
+    // `parse_transport_message_fast`, long before this plan's ingress capture
+    // runs, and is answered `400` / `-32601`. That rejection is PRE-EXISTING —
+    // it is the shared `ClientRequest` deserializer, not the capture — and
+    // changing it means changing the deserialization of a public type, which is
+    // outside this plan. Recorded in the phase's `deferred-items.md` rather than
+    // asserted away.
+    //
+    // What this plan DOES claim of that path is asserted here and holds: no
+    // panic, no echo of the peer's bytes, and nothing stored.
+    let session = open_session(addr).await;
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &set_level_body(3, &json!(MALFORMED_LEVEL)),
+        "a v1 logging/setLevel carrying a malformed level",
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the pre-existing typed parse rejects it — see the note above; a change here is a \
+         deliberate edit, not drift: {body}"
+    );
+    assert!(
+        !body.contains(MALFORMED_LEVEL),
+        "and the rejection does NOT echo the peer's value, which is this plan's claim \
+         (T-118.2-07-04): {body}"
+    );
+
+    let mut stream = open_stream(addr, &session).await;
+    let call = spawn_call(addr, &session, 4);
+    let records = records_before_reply(&mut stream, 4, "the tool reply after a bad setLevel").await;
+    let _ = call.await;
+    assert_eq!(
+        messages_of(&records),
+        vec![INFO_MESSAGE.to_string()],
+        "a malformed setLevel stores nothing, so the session is still at the `info` default"
+    );
+
+    teardown(handle, stream).await;
+}
+
+// ===========================================================================
+// Wire fence 7 — a setLevel for an unknown session mints nothing
+// (T-118.2-07-02).
+// ===========================================================================
+
+#[tokio::test]
+async fn a_set_level_for_an_unknown_session_id_inserts_no_session() {
+    let (addr, handle) = spawn_server(build_v1_server(), stateful_config()).await;
+    let invented = "session-that-was-never-issued";
+
+    let (status, body) = post(
+        addr,
+        &session_header(invented),
+        &set_level_body(2, &json!("debug")),
+        "a setLevel for an invented session id",
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "an unknown session id is rejected before dispatch: {body}"
+    );
+
+    // The observable for "nothing was minted": the SAME id is still unknown. A
+    // write that had grown a row would make this second request succeed, which is
+    // exactly how a caller would inflate the session map by guessing ids.
+    let (status, body) = post(
+        addr,
+        &session_header(invented),
+        &call_body(3),
+        "a follow-up call on the invented session id",
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "the invented session is STILL unknown, so the setLevel inserted no row: {body}"
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// Wire fence 8 — the level is honoured behind HTTP middleware too
+// (T-118.2-07-06).
+//
+// BEHAVIOURAL, not structural. `handle_post_request` routes on
+// `config.http_middleware.is_none()`, so an EMPTY chain is enough to send every
+// POST down the middleware ingress path — which means the both-paths claim can be
+// measured on the wire rather than asserted about the source. Without this fence
+// a resolution written at only one of the two `attach_v2_progress_sink` call
+// sites passes every other fence in this file.
+//
+// # Why this fence AWAITS the call instead of draining to the reply
+//
+// MEASURED, and it is a PRE-EXISTING divergence between the two ingress paths
+// that has nothing to do with the log level: the fast path frames its reply
+// through `build_response`, which hands it to the session's SSE stream and
+// answers `202`; the middleware path frames its reply through
+// `build_success_response_with_middleware`, which always answers INLINE and never
+// consults the stream. The log RECORDS still reach the stream on both paths —
+// they ride `attach_session_backchannel`'s session-keyed notification sink, which
+// is shared — so this fence awaits the POST (after which every record has
+// already been pushed) and then reads them off the stream.
+// ===========================================================================
+
+#[tokio::test]
+async fn the_level_is_honoured_behind_http_middleware_too() {
+    let (addr, handle) = spawn_server(build_v1_server(), middleware_config()).await;
+    let session = open_session(addr).await;
+
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &set_level_body(2, &json!("debug")),
+        "a setLevel on the middleware ingress path",
+    )
+    .await;
+    assert_eq!(status, 200, "logging/setLevel is served here too: {body}");
+
+    let mut stream = open_stream(addr, &session).await;
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &call_body(3),
+        "the tool call behind middleware",
+    )
+    .await;
+    assert_eq!(status, 200, "the tool call is served here too: {body}");
+    let records = take_records(&mut stream, 2, "the records behind middleware").await;
+
+    assert_eq!(
+        messages_of(&records),
+        vec![DEBUG_MESSAGE.to_string(), INFO_MESSAGE.to_string()],
+        "the middleware ingress path must resolve the level exactly as the fast path does — a \
+         control present in one deployment shape and absent in the other is indistinguishable \
+         from no control at all for the deployment that takes the other path"
+    );
+
+    teardown(handle, stream).await;
+}

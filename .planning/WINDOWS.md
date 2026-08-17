@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 2
+open_count: 3
 waived_count: 0
 fixed_count: 0
-total_count: 2
-last_updated: 2026-08-17T09:51:32.637Z
+total_count: 3
+last_updated: 2026-08-17T10:29:37.425Z
 ---
 
 # Broken Windows Ledger
@@ -17,6 +17,7 @@ last_updated: 2026-08-17T09:51:32.637Z
 |----|-------|------|------|------|-------------|--------|--------|-------------|-------------|
 | 1 | 118.2 | deviation | src/shared/streamable_http.rs |  | 118.2-03 rewrote two collected_body_cap unit tests that measured a whole-body cap the POST SSE path no longer has (parser bound + receive() refusal is the new contract) | open |  | 2026-08-17T08:07:00.553Z |  |
 | 2 | 118.2 | deviation | src/shared/streamable_http.rs |  | decode_sse_chunks_for_fuzz carries an annotated #[allow(clippy::type_complexity)] on its four-tuple return; a pub type alias was rejected to keep this plan's public-API addition at exactly one item | open |  | 2026-08-17T09:51:32.637Z |  |
+| 3 | 118.2 | deviation | src/server/streamable_http_server.rs |  | A malformed v1 logging/setLevel is rejected 400/-32601 by the pre-existing typed parse rather than answered {} as plan 118.2-07 predicted; the v2 _meta half of the claim holds | open |  | 2026-08-17T10:29:37.425Z |  |
 
 ````json
 [
@@ -42,6 +43,18 @@ last_updated: 2026-08-17T09:51:32.637Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-08-17T09:51:32.637Z",
+    "resolved_at": null
+  },
+  {
+    "id": 3,
+    "kind": "deviation",
+    "phase": "118.2",
+    "file": "src/server/streamable_http_server.rs",
+    "line": null,
+    "description": "A malformed v1 logging/setLevel is rejected 400/-32601 by the pre-existing typed parse rather than answered {} as plan 118.2-07 predicted; the v2 _meta half of the claim holds",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-08-17T10:29:37.425Z",
     "resolved_at": null
   }
 ]
