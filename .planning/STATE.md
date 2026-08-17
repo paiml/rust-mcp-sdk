@@ -5,15 +5,15 @@ milestone_name: MCP Spec 2026-07-28
 current_phase: 118.2
 current_phase_name: the-v1-client-sse-transport-and-the-notifications-message-em
 status: executing
-stopped_at: Completed 118.2-08-PLAN.md
-last_updated: "2026-08-17T11:23:14.083Z"
+stopped_at: Completed 118.2-09-PLAN.md
+last_updated: "2026-08-17T11:51:26.930Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 118.2 execution started
 progress:
   total_phases: 11
   completed_phases: 9
   total_plans: 153
-  completed_plans: 148
+  completed_plans: 150
   percent: 82
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.2 (the-v1-client-sse-transport-and-the-notifications-message-em) — EXECUTING
-Plan: 8 of 11
+Plan: 9 of 11
 Plans complete: **3 of 14** for Phase 118.1 (118.1-01, 118.1-02, 118.1-03); Phase 118 itself is
 10/10 with `118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
 Remaining: Phase 118.1 plans 04-14 (G-3..G-9), then Phase 119 (docs)
@@ -1305,6 +1305,8 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase ?]: LOG_LEVEL_SET_METHOD replaces the literal inside V2_RETIRED_METHODS so the retirement table and the v1 capture cannot silently disagree about which method this is
 - [Phase ?]: 118.2-08 (D-13): logging/setLevel gets ONE era-branched shared unit, server::core::set_logging_level_response — a literal {} on v1 (Pitfall 8), -32601 on v2 — called by BOTH native dispatch roots. Server reaches it through an adapter in handle_client_request, not from process_client_request, because create_response flattens every Err to -32603 and a -32601 cannot ride a Result<Value>.
 - [Phase ?]: 118.2-08 VERDICT: the LogMessageParams message-vs-data spec divergence stays DECLARED, not fixed. Plan 05's trigger ("if the official suite validates params.data") is FALSIFIED by measurement — the pinned suite's only notifications/message scenario is the NEGATIVE sep-2575-server-no-log-without-loglevel, and logging-set-level inspects only the RPC response. Changing LogMessageParams is a breaking public-type change with zero conformance payoff today; mechanized by the_vendored_schema_requires_data_where_pmcp_emits_message.
+- [Phase ?]: 118.2-09: the two logging tools were SPLIT into separate match arms — test_tool_with_logging requires >=3 records, test_logging_tool requires ZERO (SEP-2575); one body could only satisfy one
+- [Phase ?]: 118.2-09: tracing::info! is KEPT alongside extra.log in the fixture, with a comment naming the two audiences (operator subscriber vs MCP client)
 
 ### Pending Todos
 
@@ -1334,6 +1336,7 @@ yet. (Research flags per phase to be surfaced during `/gsd:plan-phase`.)
 - D-116-LINT-OAUTH test-side twin: make quality-gate runs 0 of 116-09's 25 oauth-gated security tests (25 run under full,oauth). Fix is PAIRED — clear the 24 pre-existing src/client/oauth.rs clippy errors, THEN enable oauth in make lint and the gate test stage. Owner 116-15.
 - 117-11 FINDING (hand-off to 117-12/117-13/Phase 118): the pmcp SERVER still answers a well-formed initialize on the 2026-07-28 wire, returning a mixed envelope (v1 protocolVersion 2025-11-25 + v2 resultType and _meta.serverInfo). Baseline ERA-01 records v2 as absent; its source cites only client-side artifacts, so the server side was never severed. Pinned by tests/dual_run.rs::the_server_still_answers_initialize_on_the_v2_wire.
 - make lint blocked by a pre-existing clippy::let_underscore_future at src/shared/streamable_http.rs:1718 (authored by 118.2-03 at 8b19602d); one-token fix, gates every remaining plan in phase 118.2
+- SEP-2575: on v2, a request with no _meta logLevel still receives notifications/message — resolve_request_log_level returns None and DEFAULT_LOG_LEVEL (info) applies. MEASURED in 118.2-09 (RED mutation 2). Fixture guards; src/ does not. Owner: 118.2-11 or a follow-on src/ plan.
 
 ## Deferred Items
 
@@ -1361,8 +1364,8 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-17T11:23:14.045Z
-Stopped at: Completed 118.2-08-PLAN.md
+Last session: 2026-08-17T11:51:26.890Z
+Stopped at: Completed 118.2-09-PLAN.md
 Resume file: None
 Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
@@ -1509,3 +1512,4 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 118.2 P04 | ~5h | 3 tasks | 6 files |
 | Phase 118.2 P07 | ~95 min | 3 tasks | 7 files |
 | Phase 118.2 P08 | ~85 min | 2 tasks | 5 files |
+| Phase 118.2 P09 | 70m | 2 tasks | 6 files |

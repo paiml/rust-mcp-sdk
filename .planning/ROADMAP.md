@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 6/11 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
+**Plans:** 8/11 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
 
 **Why these two, and why together.** Both are the same shape: the v1 server-to-client channel exists and is proven, and each of these is a missing surface at one end of it. The developer chose one combined phase over two at the 118.1-13 sign-off.
 
@@ -2873,8 +2873,8 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 118.2-08-PLAN.md — Wave 4. **D-13**: `logging/setLevel` split out of the four-method residual arm — literal `{}` on v1 (MEASURED suite constraint), `-32601` on v2 — on BOTH roots (CONF-10)
-- [ ] 118.2-09-PLAN.md — Wave 4. The ALWAYS-requirement example `s55_handler_logging`, plus rewriting the dual-conformance fixture's logging arm from `tracing::info!` (which never reaches the wire) to `extra.log(..)` inside the suite's 200 ms budget (CONF-10)
+- [x] 118.2-08-PLAN.md — Wave 4. **D-13**: `logging/setLevel` split out of the four-method residual arm — literal `{}` on v1 (MEASURED suite constraint), `-32601` on v2 — on BOTH roots (CONF-10)
+- [x] 118.2-09-PLAN.md — Wave 4. The ALWAYS-requirement example `s55_handler_logging`, plus rewriting the dual-conformance fixture's logging arm from `tracing::info!` (which never reaches the wire) to `extra.log(..)` inside the suite's 200 ms budget (CONF-10)
 
 **Wave 5** *(blocked on Wave 4 — needs BOTH halves)*
 
