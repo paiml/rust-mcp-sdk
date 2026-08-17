@@ -806,6 +806,15 @@ struct ReaderDelivery {
     terminal: Arc<RwLock<Option<TerminalReason>>>,
     /// The wake signal. See [`StreamableHttpTransport::terminal_signal`].
     terminal_signal: Arc<watch::Sender<u64>>,
+    /// The reader shutdown flag. See [`StreamableHttpTransport::shutdown`].
+    ///
+    /// A `bool` LEVEL where [`Self::terminal_signal`] is a `u64` generation, and
+    /// that is not an inconsistency: a consumer only ever needs a wake EDGE from
+    /// the terminal signal, whereas a reader spawned AFTER `close()` was called
+    /// must still learn that the transport is closed. `borrow()` answers that
+    /// immediately; `changed()` alone never would, because the change happened
+    /// before this reader subscribed.
+    shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl ReaderDelivery {
@@ -974,6 +983,33 @@ pub struct StreamableHttpTransport {
     /// the cheaper story: one shared sender, no ambiguity about what
     /// `send_modify` on a second producer would mean.
     terminal_signal: Arc<watch::Sender<u64>>,
+    /// Set once by [`Transport::close`], and raced against every reader's parked
+    /// body read (Phase 118.2, WR-01).
+    ///
+    /// The case none of this transport's other three termination signals covers.
+    /// A failing `sender.send(..)` needs a frame to send; the two
+    /// `is_closed()` checks need the reconnect loop to reach its backoff sleep;
+    /// `close()`'s abort reaches exactly ONE `JoinHandle`, the GET session
+    /// reader's. A peer that holds a stream open and sends only SSE keep-alive
+    /// comments — the standard idle keepalive — leaves every reader parked in
+    /// `body.frame()` with none of the three ever firing, and every reader
+    /// spawned per streaming POST is DETACHED, so `close()` does not reach it.
+    /// Racing this flag against the body read closes both halves.
+    ///
+    /// A `bool` LEVEL rather than a generation counter: a reader spawned after
+    /// `close()` must still observe the close, which `borrow()` answers and
+    /// `changed()` alone does not. Written with `send_replace`, which is
+    /// idempotent and — unlike `send` — does not error when no receiver exists.
+    ///
+    /// PRIVATE on a struct whose fields are already all private, so it is
+    /// invisible to `cargo semver-checks` for the measured reason
+    /// [`Self::max_collected_body_bytes`]'s rustdoc records (T-113-95).
+    ///
+    /// Behind an `Arc` for the reason [`Self::terminal_signal`]'s rustdoc records
+    /// at length: this struct is `#[derive(Clone)]`, and `watch::Sender` gained
+    /// its own `Clone` impl only in a later tokio than the `1.46` this crate's
+    /// manifest declares as its minimum.
+    shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl Debug for StreamableHttpTransport {
@@ -1046,6 +1082,10 @@ impl StreamableHttpTransport {
         // The wake signal's initial generation. Its VALUE is never read — only
         // its changes are — so any starting point does.
         let (terminal_signal, _) = watch::channel(0u64);
+        // The reader shutdown LEVEL, false until `close()`. Its value IS read —
+        // by every reader, at subscribe time — which is why it is a `bool` and
+        // not a second generation counter.
+        let (shutdown, _) = watch::channel(false);
         Self {
             config: Arc::new(RwLock::new(config)),
             client,
@@ -1058,6 +1098,7 @@ impl StreamableHttpTransport {
             max_collected_body_bytes: DEFAULT_MAX_COLLECTED_BODY_BYTES,
             terminal: Arc::new(RwLock::new(None)),
             terminal_signal: Arc::new(terminal_signal),
+            shutdown: Arc::new(shutdown),
         }
     }
 
@@ -1071,6 +1112,7 @@ impl StreamableHttpTransport {
             sender: self.sender.clone(),
             terminal: Arc::clone(&self.terminal),
             terminal_signal: Arc::clone(&self.terminal_signal),
+            shutdown: Arc::clone(&self.shutdown),
         }
     }
 
@@ -1592,11 +1634,19 @@ impl StreamableHttpTransport {
     /// silent, and a transport failure mid-body is delivered once as
     /// [`TransportError::Request`].
     ///
-    /// The reader RETURNS when a send fails, which is what happens the moment the
-    /// last transport clone drops the receive queue's `Receiver`. That, not a
-    /// `Drop` impl, is what stops a reader outliving its transport: the transport
-    /// is `Clone` and shares its abort handle, so one clone's drop would kill the
-    /// original's stream. See [`Transport::receive`] rule 3.
+    /// # What stops this reader, given that its `JoinHandle` is DROPPED
+    ///
+    /// Dropping a `JoinHandle` in tokio DETACHES rather than aborts, and there is
+    /// deliberately no `Drop` impl on the transport — it is `Clone` and shares its
+    /// abort handle, so one clone's drop would kill the original's stream. Two
+    /// mechanisms stop this reader instead, and BOTH are needed:
+    ///
+    /// 1. a failing `sender.send(..)`, the moment the last transport clone drops
+    ///    the receive queue's `Receiver` (see [`Transport::receive`] rule 3); and
+    /// 2. the shutdown race inside [`read_next_sse_frame`], which covers the case
+    ///    (1) cannot — a stream the peer holds OPEN and IDLE gives this reader no
+    ///    send to fail, and `close()` aborts only the GET session reader's handle,
+    ///    never this detached one (Phase 118.2, WR-01, T-118.2-17-02).
     fn spawn_sse_reader(&self, body: hyper::body::Incoming) -> tokio::task::JoinHandle<()> {
         let delivery = self.reader_delivery();
         let on_resumption = self.resumption_callback();
@@ -2428,6 +2478,19 @@ impl Transport for StreamableHttpTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
+        // Tell EVERY reader to stop, BEFORE the abort below (Phase 118.2, WR-01).
+        //
+        // The abort reaches exactly one `JoinHandle` — the GET session reader's —
+        // while each streaming POST spawns a DETACHED reader that nothing aborts
+        // and nothing bounds the number of. Those readers observe this flag and
+        // stop; without it they keep reading a peer-controlled socket that the
+        // application has explicitly finished with (T-118.2-17-02).
+        //
+        // `send_replace`, not `send`: it is idempotent on repeated `close()`
+        // calls, and it does not error when no receiver exists — the ordinary
+        // case for a transport that never opened a stream.
+        self.shutdown.send_replace(true);
+
         // Abort any running SSE stream
         let handle = self.abort_handle.write().take();
         if let Some(handle) = handle {
@@ -2548,6 +2611,15 @@ enum SseFrameStop {
     /// The parser discarded in-flight bytes past its bound (D-02). NEVER
     /// retried.
     Corrupt(Error),
+    /// The transport was CLOSED, or its last clone was dropped, while this
+    /// reader was parked on the body (Phase 118.2, WR-01).
+    ///
+    /// Carries no `Error` and is never retried, deliberately. An intentional
+    /// `close()` or a dropped transport is neither corruption nor a lifecycle
+    /// failure the application asked about, so it must not latch a terminal
+    /// reason — and it is not a [`Self::Dropped`] either, because that would
+    /// send the reconnect loop chasing a transport nobody owns.
+    Shutdown,
 }
 
 /// How ONE live SSE body ended (Phase 118.2, D-03).
@@ -2593,6 +2665,15 @@ async fn read_sse_body(
 ) -> SseBodyEnd {
     let mut state = SseReadState::new(body, max_buffer_size);
     let mut progress = SseProgress::default();
+    // Subscribed BEFORE the first read, and its LEVEL consulted at once: a reader
+    // spawned after `close()` was already called must exit immediately rather
+    // than park on a body nobody will ever read from it (WR-01). `changed()`
+    // alone would never fire for such a reader, because the change happened
+    // before it subscribed.
+    let mut shutdown = delivery.shutdown.subscribe();
+    if *shutdown.borrow() {
+        return SseBodyEnd::Ended;
+    }
     loop {
         if !drain_pending_events(
             delivery,
@@ -2612,17 +2693,45 @@ async fn read_sse_body(
         if state.done {
             return progress.dropped(None);
         }
-        match read_next_sse_frame(&mut state).await {
-            None => {},
-            Some(SseFrameStop::Dropped(error)) => return progress.dropped(Some(error)),
-            Some(SseFrameStop::Corrupt(error)) => {
-                // LATCHED rather than queued (CR-02), and the reader still
-                // RETURNS: the latch is write-once transport-wide, so one corrupt
-                // frame cannot become an error storm even across readers.
-                latch_terminal_reason(delivery, &error);
-                return SseBodyEnd::Ended;
-            },
+        if let Some(stop) = read_next_sse_frame(&mut state, delivery, &mut shutdown).await {
+            return end_of_frame_stop(stop, delivery, &progress);
         }
+    }
+}
+
+/// Turn a stream-ENDING [`SseFrameStop`] into this body's end.
+///
+/// Extracted from [`read_sse_body`] for the repo's cognitive-complexity budget:
+/// inline, the three arms inside the reader loop measured **25**, and the
+/// PR-blocking `pmat quality-gate --checks complexity` flags anything ABOVE 23 —
+/// a tighter threshold than the `--max-cognitive 25` a hand-run report defaults
+/// to. Extracting rather than annotating, per CLAUDE.md's zero-`#[allow]` rule.
+///
+/// The three stops are NOT interchangeable, and each difference is load-bearing:
+///
+/// * a DROP carries the reconnect loop's two facts forward (`delivered`, `retry`)
+///   and is the only retryable end;
+/// * CORRUPTION latches a terminal reason and never retries, because a re-open
+///   would replay the same corruption (T-118.2-04-02);
+/// * SHUTDOWN is SILENT — no latch at all. An intentional `close()` or a dropped
+///   transport is neither corruption nor a lifecycle failure the application
+///   asked about, and latching one would tell an application its stream failed
+///   when its own code closed it (T-118.2-17-05).
+fn end_of_frame_stop(
+    stop: SseFrameStop,
+    delivery: &ReaderDelivery,
+    progress: &SseProgress,
+) -> SseBodyEnd {
+    match stop {
+        SseFrameStop::Dropped(error) => progress.dropped(Some(error)),
+        SseFrameStop::Shutdown => SseBodyEnd::Ended,
+        SseFrameStop::Corrupt(error) => {
+            // LATCHED rather than queued (CR-02), and the reader still RETURNS:
+            // the latch is write-once transport-wide, so one corrupt frame cannot
+            // become an error storm even across readers.
+            latch_terminal_reason(delivery, &error);
+            SseBodyEnd::Ended
+        },
     }
 }
 
@@ -2694,8 +2803,55 @@ async fn drain_pending_events(
 ///    LATCHES, so a caller cannot miss it.
 /// 3. End-of-body sets `done` without draining: the CALLER drains `pending`
 ///    before it checks `done`, so trailing complete events are not lost.
-async fn read_next_sse_frame(state: &mut SseReadState) -> Option<SseFrameStop> {
-    match state.body.frame().await {
+/// 4. The parked body read is RACED against shutdown (WR-01). Without that race
+///    a peer that holds the stream open and sends nothing decides how long a
+///    dropped or closed transport's task and TCP connection survive
+///    (T-118.2-17-01): the reader never attempts a send, so the send-failure
+///    signal stays silent, and it never reaches a backoff sleep, so both
+///    `is_closed()` checks stay unreached.
+///
+/// # Why the shutdown receiver is a parameter and not a field on `SseReadState`
+///
+/// `state.body.frame()` borrows `state` mutably, and `watch::Receiver::changed()`
+/// takes `&mut self` too. Two mutable borrows of one `state` cannot coexist in a
+/// single `tokio::select!`, so the receiver is owned as a local by
+/// [`read_sse_body`] and passed here separately.
+async fn read_next_sse_frame(
+    state: &mut SseReadState,
+    delivery: &ReaderDelivery,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<SseFrameStop> {
+    // `biased`, with the BODY arm first: a frame that is already available is
+    // always consumed before a shutdown observed in the same wakeup. Unbiased,
+    // a burst-then-close server would lose its last frames — which is exactly
+    // the data D-04's await-capacity, never-drop policy exists to protect
+    // (T-118.2-17-04).
+    //
+    // `mpsc::Sender::closed()` and `watch::Receiver::changed()` are both
+    // cancel-safe. `Incoming::frame()` is cancelled only when a shutdown arm
+    // wins, at which point the reader is terminating and the body is about to be
+    // dropped, so nothing depends on its cancel-safety.
+    //
+    // The state mutation happens AFTER the select rather than inside an arm, so
+    // the mutable borrow of `state.body` taken by the body future is provably
+    // over before `state.done` is written.
+    let polled = tokio::select! {
+        biased;
+        frame = state.body.frame() => Some(frame),
+        // Resolves the instant the receive queue's `Receiver` drops, i.e. the
+        // last transport clone is gone. This is what covers the dropped-transport
+        // case with no `Drop` impl on the transport (T-118.2-17-01).
+        () = delivery.sender.closed() => None,
+        // Covers `close()`, which does NOT drop the `Receiver`. An `Err` here
+        // means every `watch::Sender` is gone, i.e. the transport itself is gone,
+        // which is also a shutdown.
+        _ = shutdown.changed() => None,
+    };
+    let Some(frame) = polled else {
+        state.done = true;
+        return Some(SseFrameStop::Shutdown);
+    };
+    match frame {
         // End of body. Anything already in `pending` is still drained by the
         // caller's loop before the `done` check ends the stream.
         None => {
@@ -2966,16 +3122,29 @@ pub fn decode_sse_chunks_for_fuzz(
 /// last real transport clone would not release it, and the task would never be
 /// reachable for abort at all (T-118.2-04-06).
 ///
-/// **This struct therefore has NO `abort_handle` field, deliberately.** Its two
-/// termination signals are instead:
+/// **This struct therefore has NO `abort_handle` field, deliberately.** Its FOUR
+/// termination signals are instead, each covering a case the others do not:
 ///
 /// 1. `delivery.sender.send(..)` returning `Err` — the receive queue's
-///    `Receiver` is gone, so there is nobody to deliver to; and
-/// 2. `delivery.is_closed()`, checked BEFORE and AFTER every backoff sleep,
-///    which is what makes a dropped transport stop a loop that is asleep rather
-///    than reading.
+///    `Receiver` is gone, so there is nobody to deliver to. Covers a reader that
+///    is actively DELIVERING when its transport goes away.
+/// 2. `delivery.is_closed()`, checked BEFORE and AFTER every backoff sleep.
+///    Covers a reconnect loop that is ASLEEP rather than reading.
+/// 3. `close()`'s abort of `abort_handle`. Covers THIS task — and only this task:
+///    every reader spawned per streaming POST is detached and is not reachable
+///    through that handle.
+/// 4. `delivery.shutdown`, raced against the parked body read inside
+///    [`read_next_sse_frame`] (Phase 118.2, WR-01). Covers the case none of the
+///    other three does: a reader parked in `body.frame()` on a stream the peer
+///    holds OPEN and IDLE. It never attempts a send (1), never reaches a sleep
+///    (2), and on a POST response stream is not reachable by the abort (3), so
+///    without this arm a dropped or closed transport leaves a live task holding a
+///    live TCP connection until the SERVER times it out (T-118.2-17-01,
+///    T-118.2-17-02).
 ///
-/// Both go true the moment the last transport clone drops the `Receiver`.
+/// Signals 1, 2 and 4's `sender.closed()` arm all go true the moment the last
+/// transport clone drops the `Receiver`. Signal 4's `shutdown` arm is what makes
+/// an explicit `close()` reach a reader the abort cannot.
 ///
 /// Every field is a cheap clone of an already-shared value. The hyper `Client`
 /// is `Clone` and pools connections, so the clone REUSES the pool rather than
