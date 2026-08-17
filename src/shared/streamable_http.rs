@@ -2494,6 +2494,111 @@ async fn deliver_sse_event(
     }
 }
 
+/// Decode a SEQUENCE of body chunks exactly as a live SSE stream would, for
+/// fuzzing and property testing (Phase 118.2, ALWAYS/FUZZ).
+///
+/// # Not a decode API
+///
+/// `#[doc(hidden)]` and gated behind the non-default `fuzzing` feature, so it is
+/// absent from `default` and `full` builds. It differs from the shipping reader
+/// in ways a caller would not want:
+///
+/// - the **unvalidated `max_buffer_size`**, which accepts `0` and then latches
+///   the parser on the first non-empty chunk (a fuzz campaign wants that
+///   reachable; a caller almost never does);
+/// - **errors flattened to `String`**, so no private type escapes — which also
+///   means no caller can match on the failure;
+/// - it keeps FEEDING after an overflow, where a live stream ends on the first
+///   `true`, so that the latch itself is testable.
+///
+/// The exact twin of
+/// [`crate::client::subscriptions::decode_listen_chunks_for_fuzz`], whose
+/// precedent this follows deliberately rather than inventing a second shape.
+///
+/// # Why a chunk SEQUENCE, and not one chunk
+///
+/// 1. **The overflow branch.** The parser is built with
+///    [`SseParser::with_max_buffer_size`], so a campaign can pick a bound small
+///    enough that short generated inputs reach the discard-and-latch path. At
+///    the production 16 MiB bound ([`DEFAULT_MAX_COLLECTED_BODY_BYTES`]) a
+///    fuzzer would have to synthesise 16 MiB of newline-free input to get there,
+///    i.e. never.
+/// 2. **State carried ACROSS chunks.** The undecoded-UTF-8 tail and the SSE line
+///    buffer both survive from one chunk to the next in a live stream — exactly
+///    as in [`read_next_sse_frame`] — so a split mid-character or mid-line is
+///    reachable here and is not reachable with one chunk.
+///
+/// # Returns
+///
+/// `(outcomes, overflowed_after_each_chunk, peak_buffered_bytes,
+/// undecoded_tail_bytes)`. The last three each have one entry per INPUT CHUNK,
+/// evaluated after that chunk was drained:
+///
+/// - `outcomes` — one entry per `message` frame the stream would have delivered
+///   or failed on, decoded through the SAME `parse_message` call
+///   [`deliver_sse_event`] uses, with errors flattened to their `Display` string.
+/// - `overflowed_after_each_chunk` — `sse_stream_overflow(&parser).is_some()`,
+///   the PRODUCTION observer rather than a reconstruction of it.
+/// - `peak_buffered_bytes` — `SseParser::buffered_bytes()`, i.e. the two
+///   accumulators the bound actually covers (the unterminated line PLUS the
+///   `data:` payload of the event still awaiting its blank line). This is the
+///   quantity a campaign asserts against `max_buffer_size`. Reporting only
+///   outcomes and flags is precisely why 20 000 green runs of the sibling target
+///   could coexist with an unbounded-growth defect.
+/// - `undecoded_tail_bytes` — what is left in the byte buffer after
+///   `take_utf8_prefix`, which must never exceed 3: the longest incomplete UTF-8
+///   character. **One vector more than the sibling seam returns**, and
+///   deliberately: this reader's UTF-8 tail is a second unbounded-growth
+///   candidate, and a target cannot assert a bound it cannot observe.
+#[cfg(any(feature = "fuzzing", test))]
+#[doc(hidden)]
+#[must_use]
+// Why: `clippy::type_complexity` fires on the four-vector return, which the
+// sibling seam avoids only by returning three. Factoring it into a `pub type`
+// alias would add a SECOND public item to this crate's API surface — and this
+// plan's semver claim is that it adds exactly ONE (the function). The tuple is
+// positional at both call sites and its four members are enumerated in the
+// `# Returns` section above, so an alias would buy documentation that is
+// already there at the cost of a surface this crate does not want.
+#[allow(clippy::type_complexity)]
+pub fn decode_sse_chunks_for_fuzz(
+    chunks: &[&[u8]],
+    max_buffer_size: usize,
+) -> (
+    Vec<std::result::Result<TransportMessage, String>>,
+    Vec<bool>,
+    Vec<usize>,
+    Vec<usize>,
+) {
+    let mut parser = SseParser::with_max_buffer_size(max_buffer_size);
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut outcomes = Vec::new();
+    let mut overflowed = Vec::with_capacity(chunks.len());
+    let mut peak_buffered_bytes = Vec::with_capacity(chunks.len());
+    let mut undecoded_tail_bytes = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        bytes.extend_from_slice(chunk);
+        let text = crate::shared::sse_parser::take_utf8_prefix(&mut bytes);
+        outcomes.extend(
+            drain_sse_events(&mut parser, &text)
+                .into_iter()
+                .map(|event| {
+                    crate::shared::StdioTransport::parse_message(event.data.as_bytes())
+                        .map_err(|error| error.to_string())
+                }),
+        );
+        overflowed.push(sse_stream_overflow(&parser).is_some());
+        peak_buffered_bytes.push(parser.buffered_bytes());
+        undecoded_tail_bytes.push(bytes.len());
+    }
+    (
+        outcomes,
+        overflowed,
+        peak_buffered_bytes,
+        undecoded_tail_bytes,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The session stream's OWNED reader context and its bounded reconnect loop
 // (Phase 118.2, D-03).
@@ -4096,6 +4201,134 @@ mod tests {
                 error.to_string().contains("400"),
                 "the status must survive: {error}"
             );
+        }
+    }
+
+    // ==================================================================
+    // Phase 118.2 / ALWAYS-PROPERTY — the incremental SSE reader under
+    // arbitrary peer bytes.
+    //
+    // The in-tree, always-run half of the fuzz campaign that
+    // `fuzz/fuzz_targets/streamable_sse_frames.rs` runs at length. Both drive
+    // the SAME seam, `decode_sse_chunks_for_fuzz`, which is the PRODUCTION
+    // decode sequence rather than a re-implementation of it — a target that
+    // re-implements the code under test proves nothing about the code under
+    // test.
+    //
+    // Deliberately NOT `#[ignore]`d, and so NOT selected by `make
+    // test-property`'s `-- --ignored property_`. That mirrors the in-repo
+    // precedent these are modelled on (`src/client/subscriptions.rs`'s
+    // `proptest!` block, which is likewise always-run) and is strictly more
+    // coverage: these arms run on every `cargo test` / `cargo nextest run`,
+    // rather than only when someone remembers the property target.
+    // ==================================================================
+
+    mod sse_reader_properties {
+        use super::*;
+
+        /// The bound the property arms run the parser at.
+        ///
+        /// DELIBERATELY tiny, for the same reason the fuzz target's is:
+        /// production bounds this path at 16 MiB
+        /// ([`DEFAULT_MAX_COLLECTED_BODY_BYTES`]), and generated inputs of a few
+        /// hundred bytes would never reach the discard-and-latch branch there.
+        /// The branch is bound-agnostic, so a small bound loses no fidelity.
+        const TINY_BOUND: usize = 64;
+
+        /// Assert the two RETENTION bounds the reader must hold after every
+        /// chunk.
+        ///
+        /// Non-vacuous by construction: it asserts a SIZE, not a latch. A
+        /// "the overflow flag never clears" assertion cannot fail for any input
+        /// at any bound, which is exactly how 20 000 green runs of the sibling
+        /// campaign coexisted with an unbounded-growth defect.
+        fn assert_retention_bounded(peaks: &[usize], tails: &[usize], bound: usize) {
+            for (index, held) in peaks.iter().copied().enumerate() {
+                assert!(
+                    held <= bound,
+                    "the parser retained {held} bytes after chunk {index} under a {bound}-byte \
+                     bound (peaks: {peaks:?})"
+                );
+            }
+            for (index, tail) in tails.iter().copied().enumerate() {
+                assert!(
+                    tail <= 3,
+                    "the undecoded UTF-8 tail was {tail} bytes after chunk {index}; the longest \
+                     incomplete character is 3 bytes, so anything more means take_utf8_prefix \
+                     stopped draining (tails: {tails:?})"
+                );
+            }
+        }
+
+        proptest::proptest! {
+            /// Arbitrary bytes from a peer never panic the reader, and never
+            /// grow it past its bound.
+            #[test]
+            fn property_arbitrary_bytes_never_panic_or_grow_the_reader(
+                bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+            ) {
+                let (_outcomes, _overflowed, peaks, tails) =
+                    decode_sse_chunks_for_fuzz(&[&bytes], TINY_BOUND);
+                assert_retention_bounded(&peaks, &tails, TINY_BOUND);
+            }
+
+            /// The same, CHUNKED — so the SSE line buffer, the undecoded UTF-8
+            /// tail and the overflow discard branch are all exercised across
+            /// chunk boundaries, which is where a live stream actually splits.
+            #[test]
+            fn property_chunked_arbitrary_bytes_never_panic_or_grow_the_reader(
+                bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+            ) {
+                let chunks: Vec<&[u8]> = if bytes.is_empty() {
+                    vec![&bytes[..]]
+                } else {
+                    bytes.chunks(7).collect()
+                };
+                let (_outcomes, _overflowed, peaks, tails) =
+                    decode_sse_chunks_for_fuzz(&chunks, TINY_BOUND);
+                assert_retention_bounded(&peaks, &tails, TINY_BOUND);
+            }
+
+            /// A VALID frame decodes to exactly one message no matter WHERE the
+            /// peer splits it — including mid-character and mid-line.
+            ///
+            /// This is the arm that would catch a reader that lost or
+            /// duplicated an event across a chunk boundary; the two above only
+            /// bound memory.
+            #[test]
+            fn property_a_valid_frame_survives_any_chunk_split(
+                split in 1usize..80,
+            ) {
+                // A multi-byte character inside the payload, so some splits land
+                // mid-character.
+                let frame = "id: e1\nevent: message\ndata: \
+                             {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\
+                             \"params\":{\"progressToken\":\"t\u{00e9}\",\"progress\":1}}\n\n";
+                let raw = frame.as_bytes();
+                let at = split.min(raw.len());
+                let chunks: Vec<&[u8]> = vec![&raw[..at], &raw[at..]];
+                let (outcomes, overflowed, _peaks, tails) =
+                    decode_sse_chunks_for_fuzz(&chunks, DEFAULT_MAX_COLLECTED_BODY_BYTES);
+                assert_eq!(
+                    outcomes.len(),
+                    1,
+                    "a split at byte {at} yielded {} message(s), not 1",
+                    outcomes.len()
+                );
+                assert!(
+                    outcomes[0].is_ok(),
+                    "a split at byte {at} corrupted the payload: {:?}",
+                    outcomes[0]
+                );
+                assert!(
+                    !overflowed.iter().any(|seen| *seen),
+                    "a frame well under the bound must not overflow it"
+                );
+                assert!(
+                    tails.iter().all(|tail| *tail <= 3),
+                    "the undecoded UTF-8 tail must stay under one character: {tails:?}"
+                );
+            }
         }
     }
 }

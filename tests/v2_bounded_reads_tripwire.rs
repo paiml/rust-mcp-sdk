@@ -1032,8 +1032,9 @@ const ALLOWLIST: &[Accumulation] = &[
     Accumulation {
         path: "src/shared/streamable_http.rs",
         needle: "extend_from_slice(",
-        count: 1,
-        why: "The SSE reader appends ONE hyper frame to a byte buffer and then \
+        count: 2,
+        why: "TWO sites since 118.2-04, and the SECOND is the fuzz seam for the FIRST. Site one: \
+              the SSE reader appends ONE hyper frame to a byte buffer and then \
               fully drains it with take_utf8_prefix on the SAME iteration, so the residual is the \
               incomplete-character tail of at most three bytes. ONE site, TWO consumers since \
               118.2-03: the GET session stream and the POST response that answers \
@@ -1046,20 +1047,32 @@ const ALLOWLIST: &[Accumulation] = &[
               with_max_collected_body_bytes. That reuse is Phase 118.2 D-02: the collected-body \
               cap BECOMES the parser bound rather than a second knob, because a new field on the \
               externally-constructible StreamableHttpTransportConfig would be a MAJOR semver \
-              event. Overflow ends the stream with a named error; it never keeps parsing.",
+              event. Overflow ends the stream with a named error; it never keeps parsing. Site \
+              two: decode_sse_chunks_for_fuzz replays that EXACT sequence over a caller-supplied \
+              chunk list, under a caller-supplied bound, on the same SseParser and the same \
+              take_utf8_prefix. It is #[cfg(any(feature = \"fuzzing\", test))] and so absent from \
+              default and full builds, and its whole purpose is that a campaign ASSERTS the bound \
+              this justification claims — fuzz/fuzz_targets/streamable_sse_frames.rs checks \
+              buffered_bytes() <= max_buffer_size and an undecoded tail of at most 3 bytes after \
+              EVERY chunk. A second append that MEASURES the first one's bound is the one kind of \
+              new accumulation site that makes this entry stronger rather than weaker.",
     },
     Accumulation {
         path: "src/shared/streamable_http.rs",
         needle: ".extend(",
-        count: 1,
-        why: "This collects the events drain_sse_events has just COMPLETED from one chunk, not \
+        count: 2,
+        why: "TWO sites since 118.2-04, and the SECOND is the fuzz seam for the FIRST. Site one \
+              collects the events drain_sse_events has just COMPLETED from one chunk, not \
               bytes retained across chunks: the reader task pops every pending event and delivers \
               it before it polls the body again, so the population is bounded by what a single \
               hyper frame can complete, and each completed event was itself admitted under the \
               parser's retained-state bound. Same mechanism as the src/client/subscriptions.rs \
               entry above, on this transport's two SSE streams — the GET session stream and the \
               POST response — rather than on subscriptions/listen. One drain site, two \
-              consumers.",
+              consumers. Site two is decode_sse_chunks_for_fuzz collecting the SAME \
+              drain_sse_events output into its outcome vector, bounded per chunk by the same \
+              parser and unreachable outside a fuzzing or test build (its cfg is \
+              any(feature = \"fuzzing\", test), so neither default nor full compiles it).",
     },
     Accumulation {
         path: "src/shared/streamable_http.rs",

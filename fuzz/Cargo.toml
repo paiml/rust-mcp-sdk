@@ -188,6 +188,19 @@ test = false
 doc = false
 bench = false
 
+# Phase 118.2-04 (CONF-09): the streamable-HTTP CLIENT's incremental SSE reader,
+# the sibling of the target above on the OTHER client stream. Both of its read
+# sites — the GET session stream and the POST response that answers
+# `text/event-stream` — decode bytes a remote server chose. Registration only:
+# this target adds NO dependency, reaching the decode sequence through the
+# `fuzzing`-gated `decode_sse_chunks_for_fuzz` seam.
+[[bin]]
+name = "streamable_sse_frames"
+path = "fuzz_targets/streamable_sse_frames.rs"
+test = false
+doc = false
+bench = false
+
 # Phase 114-14 (TASK-02): the RAW `tasks/update` params boundary. `inputResponses`
 # is the ENTIRE request payload and its decode is the one place in the tasks
 # surface where guessing at overlapping result shapes is actively wrong (D-113-O),
