@@ -419,29 +419,9 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
     let request_line = request_line.trim_end().to_string();
     shared.request_lines.lock().push(request_line.clone());
 
-    let mut content_length = 0usize;
-    // The ONE header value this harness ever retains. See `Shared::get_cursors`
-    // for why an allow-list of exactly one non-credential header name keeps the
-    // module's never-record-a-header rule intact.
-    let mut cursor: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-            return;
-        }
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().unwrap_or(0);
-            }
-            if name.trim().eq_ignore_ascii_case("last-event-id") {
-                cursor = Some(value.trim().to_string());
-            }
-        }
-    }
+    let Some((content_length, cursor)) = read_headers(&mut reader).await else {
+        return;
+    };
 
     let mut body = vec![0u8; content_length];
     if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
@@ -471,6 +451,39 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
         serve_post_sse(reader, write_half, &shared).await;
     } else {
         serve_post(&mut write_half, &value).await;
+    }
+}
+
+/// Read the request's header block, returning `(content-length, Last-Event-ID)`.
+///
+/// `None` means the peer closed mid-headers.
+///
+/// Exactly TWO header names are looked at, and only their values are returned;
+/// nothing else about the block is retained anywhere. That is what keeps the
+/// module's never-record-a-header rule true while still letting fence 11 assert
+/// on the resumption cursor the client actually put on the wire.
+async fn read_headers(
+    reader: &mut BufReader<ReadHalf<TcpStream>>,
+) -> Option<(usize, Option<String>)> {
+    let mut content_length = 0usize;
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+            return None;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            return Some((content_length, cursor));
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse().unwrap_or(0);
+        } else if name.trim().eq_ignore_ascii_case("last-event-id") {
+            cursor = Some(value.trim().to_string());
+        }
     }
 }
 

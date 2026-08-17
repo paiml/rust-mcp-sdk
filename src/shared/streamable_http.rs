@@ -24,6 +24,7 @@ use parking_lot::RwLock;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::mpsc;
 use url::Url;
@@ -489,6 +490,55 @@ pub const DEFAULT_MAX_COLLECTED_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// the five end reasons and how they differ.
 const CLIENT_RECEIVE_QUEUE_CAPACITY: usize = 64;
 
+/// How long the session-stream reader waits before its FIRST reconnect
+/// (Phase 118.2, D-03).
+///
+/// The REFERENCE client's `initialReconnectionDelay`
+/// (`@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js:9`), and taken
+/// from there deliberately: a pmcp client that blinks back on a different
+/// schedule than every JavaScript client a server operator has already tuned for
+/// is a pmcp-specific operational surprise, not an improvement.
+///
+/// Spelled in SECONDS rather than as the reference's literal `1000` ms because
+/// `clippy::duration_suboptimal_units` requires it; the value is identical.
+const INITIAL_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// The ceiling on any reconnect wait, including one a SERVER asked for.
+///
+/// The reference client's `maxReconnectionDelay` (`streamableHttp.js:10`). It
+/// caps the exponential curve, and — unlike the reference — it also caps a
+/// server-provided SSE `retry:` value. That is deliberate: `retry:` is
+/// peer-controlled, and an uncapped one lets a peer park a client's reader task
+/// for an arbitrary duration.
+///
+/// Spelled in SECONDS rather than as the reference's literal `30000` ms for the
+/// same lint reason as [`INITIAL_SSE_RECONNECT_DELAY`]; the value is identical.
+const MAX_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+/// How fast the reconnect wait grows per attempt.
+///
+/// The reference client's `reconnectionDelayGrowFactor`
+/// (`streamableHttp.js:11`), applied as `initial * growth^attempt` exactly as
+/// its `_getNextReconnectionDelay` does.
+const SSE_RECONNECT_GROWTH: f64 = 1.5;
+
+/// How many times a dropped session stream is re-opened before the reader gives
+/// up LOUDLY.
+///
+/// The reference client's `maxRetries` (`streamableHttp.js:12`), and
+/// deliberately small. D-03's stated purpose is surviving a proxy BLINK — an
+/// ALB or gateway idle timeout closing an otherwise healthy stream — not
+/// indefinite reconnection to a peer that is gone. An unbounded loop against a
+/// server that keeps closing is a self-inflicted denial of service aimed at a
+/// server that is already unwell (T-118.2-04-01).
+///
+/// PRIVATE, and with no `with_*` override, because no caller in this repo needs
+/// one. Were one ever needed it would go on [`StreamableHttpTransport`] as an
+/// inherent method — never as a field on
+/// [`StreamableHttpTransportConfig`], which is externally constructible with
+/// all-`pub` fields and would therefore make a new field a MAJOR semver event.
+const MAX_SSE_RECONNECT_ATTEMPTS: u32 = 2;
+
 /// Build the over-cap refusal shared by every collected-body read.
 ///
 /// Names the LIMIT and the observed size, and deliberately echoes no body
@@ -543,6 +593,45 @@ impl OutboundFrame {
             )) => Self::InitializedNotification,
             _ => Self::Other,
         }
+    }
+}
+
+/// The shared state EVERY outgoing request on this transport is built from.
+///
+/// # Why this exists
+///
+/// [`StreamableHttpTransport::build_request_with_middleware`] and
+/// [`StreamableHttpTransport::process_response_headers`] were `&self` methods,
+/// which made them unreachable from the `'static` reconnect task (Phase 118.2,
+/// D-03): a spawned task cannot borrow the transport. Cloning the whole
+/// transport into the task is not a way around it either — the task would then
+/// own an `Arc` holding its OWN join handle, so dropping the last real transport
+/// clone could never release it (see [`SseReaderContext`]).
+///
+/// A BORROWED view rather than an owned struct, so neither caller clones an
+/// `Arc` merely to build a request. [`StreamableHttpTransport`] and
+/// [`SseReaderContext`] each hand one out, and the request builder underneath is
+/// therefore ONE builder with TWO callers.
+///
+/// Do NOT fork a second builder for the reconnect path. A divergent request
+/// builder is precisely how a reconnect quietly stops sending the
+/// `Authorization` header or stops running the request-middleware chain
+/// (T-118.2-04-07) — the failure would be invisible until an auth-enforcing
+/// deployment saw its stream 401 after every idle timeout.
+struct RequestParts<'a> {
+    config: &'a Arc<RwLock<StreamableHttpTransportConfig>>,
+    protocol_version: &'a Arc<RwLock<Option<String>>>,
+    v2_mode: &'a Arc<AtomicBool>,
+}
+
+impl RequestParts<'_> {
+    /// Whether this connection speaks the v2 (`2026-07-28`) wire contract.
+    ///
+    /// The same read [`StreamableHttpTransport::is_v2`] performs, on the same
+    /// `Arc`; see [`StreamableHttpTransport::v2_mode`] for why it is not derived
+    /// from the negotiated protocol version.
+    fn is_v2(&self) -> bool {
+        self.v2_mode.load(Ordering::Relaxed)
     }
 }
 
@@ -923,22 +1012,22 @@ impl StreamableHttpTransport {
     /// not be able to plant one that the outbound path would then have to
     /// suppress. Refusing to STORE it is the belt to the outbound braces.
     #[cfg(feature = "v1-compat")]
-    fn capture_session_header(&self, headers: &hyper::HeaderMap) {
-        if self.is_v2() {
+    fn capture_session_header(parts: &RequestParts<'_>, headers: &hyper::HeaderMap) {
+        if parts.is_v2() {
             return;
         }
         if let Some(value) = headers.get(MCP_SESSION_ID) {
             if let Ok(text) = value.to_str() {
                 // Compare under the READ lock first. After the first response of
                 // a session the value is identical every time, and this is the
-                // same lock `build_request_with_middleware` read-holds for every
+                // same lock `build_request_from_parts` read-holds for every
                 // outgoing request — so an unconditional write makes a writer
                 // contend with the request path once per response, to store a
                 // value that is already there.
-                if self.config.read().session_id.as_deref() == Some(text) {
+                if parts.config.read().session_id.as_deref() == Some(text) {
                     return;
                 }
-                self.config.write().session_id = Some(text.to_string());
+                parts.config.write().session_id = Some(text.to_string());
             }
         }
     }
@@ -950,8 +1039,7 @@ impl StreamableHttpTransport {
     /// here the store itself is gone, so the suppression is structural. Do NOT
     /// "improve" this by inspecting `headers` to log an ignored session id.
     #[cfg(not(feature = "v1-compat"))]
-    #[allow(clippy::unused_self)]
-    const fn capture_session_header(&self, _headers: &hyper::HeaderMap) {}
+    const fn capture_session_header(_parts: &RequestParts<'_>, _headers: &hyper::HeaderMap) {}
 
     /// Terminate the HTTP session this transport established, if any.
     ///
@@ -1046,84 +1134,45 @@ impl StreamableHttpTransport {
     ///
     /// # The cursor argument is v1-only
     ///
-    /// The parameter keeps the same POSITION and TYPE on both feature sets so
-    /// every caller compiles unchanged, but only the `v1-compat` build names it
-    /// `resumption_token` and reads it. On a `full-v2` build it is
-    /// `_ignored_cursor`: MCP `2026-07-28` removed SSE resumability, so there
-    /// is nothing to resume from and the GET this builds carries no
-    /// `Last-Event-ID` — the constant does not even exist on that build.
-    pub async fn start_sse(
-        &self,
-        #[cfg(feature = "v1-compat")] resumption_token: Option<String>,
-        #[cfg(not(feature = "v1-compat"))] _ignored_cursor: Option<String>,
-    ) -> Result<()> {
+    /// The parameter keeps the same POSITION and TYPE on both feature sets, and
+    /// since Phase 118.2 it also keeps the same NAME: it is passed straight
+    /// through to [`Self::build_sse_get_request`], which is where the one gated
+    /// read of it lives. On a `full-v2` build that function discards it — MCP
+    /// `2026-07-28` removed SSE resumability, so there is nothing to resume from
+    /// and the GET carries no `Last-Event-ID`; the constant does not even exist
+    /// on that build.
+    ///
+    /// # Reconnect (D-03)
+    ///
+    /// The spawned reader does not merely read one body. When a stream is
+    /// DROPPED — an end-of-body, or a connection failure mid-body, with no
+    /// corruption observed — it re-opens the GET under a bounded retry budget,
+    /// carrying the resumption cursor. See
+    /// [`SseReaderContext::run_session_stream`] for the loop and for what is
+    /// deliberately NOT retried.
+    pub async fn start_sse(&self, cursor: Option<String>) -> Result<()> {
         // Abort any existing SSE stream
         let handle = self.abort_handle.write().take();
         if let Some(handle) = handle {
             handle.abort();
         }
 
-        let url = self.config.read().url.clone();
+        // The OWNED context the reader task keeps. Built before the first open so
+        // the initial GET and every reconnect go through the same code.
+        let context = self.sse_reader_context();
 
-        // Build GET request with middleware integration
-        let mut request = self
-            .build_request_with_middleware(
-                Method::GET,
-                url.as_str(),
-                vec![], // Empty body for GET
-            )
-            .await?;
-
-        // Add SSE-specific headers
-        request.headers_mut().insert(
-            ACCEPT,
-            TEXT_EVENT_STREAM.parse().map_err(|e| {
-                Error::Transport(TransportError::InvalidMessage(format!(
-                    "Invalid header: {}",
-                    e
-                )))
-            })?,
-        );
-
-        // Add the SSE resumption cursor, on the builds that have one.
-        //
-        // Why: this is the ONLY `#[cfg]` at a CALL SITE in this file. It is
-        // unavoidable because the argument it reads is itself gated (see this
-        // method's doc): on `full-v2` the parameter is `_ignored_cursor` and
-        // `apply_resumption_header` does not exist. Every other v1 read on this
-        // transport goes through a paired accessor with a constant `full-v2`
-        // answer instead — do NOT let a second one accumulate here.
-        #[cfg(feature = "v1-compat")]
-        Self::apply_resumption_header(&mut request, resumption_token.as_deref())?;
-
-        // Send request
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|e| Error::Transport(TransportError::Request(e.to_string())))?;
-
-        // Handle 405 (SSE not supported) gracefully
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            // Server doesn't support GET SSE, which is OK
+        // `None` means the server answered 405: it does not offer a GET stream at
+        // all, which the spec makes an ordinary answer rather than an error.
+        let Some(body) = context.open_sse_once(cursor).await? else {
             return Ok(());
-        }
-
-        if !response.status().is_success() {
-            return Err(Error::Transport(TransportError::Request(format!(
-                "SSE request failed with status: {}",
-                response.status()
-            ))));
-        }
-
-        // Process response headers
-        self.process_response_headers(&response);
+        };
 
         // The HTTP response-BODY middleware chain is deliberately NOT run over
         // this stream, exactly as `Self::post_streaming` states for the
         // `subscriptions/listen` body: "the chain processes a complete `Vec<u8>`
-        // body, and a stream has none by construction". `process_response_headers`
-        // above still runs, so HEADER-level middleware behaviour is unchanged.
+        // body, and a stream has none by construction". `process_headers_from`
+        // inside `open_sse_once` still runs, so HEADER-level middleware behaviour
+        // is unchanged.
         //
         // Rejected alternatives, recorded so they are not re-derived: prohibiting
         // body-transforming middleware (unenforceable — the chain is a public
@@ -1131,10 +1180,12 @@ impl StreamableHttpTransport {
         // and a semver event this phase does not plan for).
         //
         // The session stream is the FIRST of this transport's two SSE read sites;
-        // the second is the POST response in `Self::post_body`. Both go through
-        // `Self::spawn_sse_reader`, so there is one reader shape, one parser
-        // bound, and one corrupt-frame story rather than two that can drift.
-        let handle = self.spawn_sse_reader(response.into_body());
+        // the second is the POST response in `Self::post_body`. Both read through
+        // `read_sse_body`, so there is one reader shape, one parser bound, and one
+        // corrupt-frame story rather than two that can drift. Only THIS one
+        // reconnects: a POST response stream that ends is the call's answer
+        // arriving, not a stream to restore.
+        let handle = tokio::spawn(async move { context.run_session_stream(body).await });
 
         // ONLY the session stream is tracked here: `close()` and the next
         // `start_sse` abort whatever this slot holds, and a POST reader parked in
@@ -1143,16 +1194,102 @@ impl StreamableHttpTransport {
         Ok(())
     }
 
-    /// Spawn the incremental SSE reader over one live response body, and hand
-    /// back its join handle.
+    /// Build the GET that opens a `text/event-stream` session stream.
     ///
-    /// The SINGLE reader for both of this transport's `text/event-stream` sites
-    /// — the GET session stream ([`Self::start_sse`]) and the POST response that
-    /// answers `text/event-stream` ([`Self::post_body`]). Everything the two
-    /// sites must agree on lives here: the parser bound (D-02, the transport's
-    /// `max_collected_body_bytes`), the resumption-cursor write, the
-    /// message-event filter, the terminal-error taxonomy (D-02/D-05), and the
-    /// await-capacity delivery policy (D-04).
+    /// The ONE place this transport constructs that request. [`Self::start_sse`]
+    /// reaches it through [`SseReaderContext::open_sse_once`], and so does every
+    /// reconnect, so the initial open and each re-open carry the same auth
+    /// header, the same middleware chain and the same `Accept`.
+    ///
+    /// # The cursor argument is v1-only
+    ///
+    /// The parameter keeps the same POSITION and TYPE on both feature sets so
+    /// every caller compiles unchanged, but only the `v1-compat` build names it
+    /// `resumption_token` and reads it. On a `full-v2` build it is
+    /// `_ignored_cursor`, and the GET this builds carries no `Last-Event-ID` —
+    /// the constant does not even exist on that build.
+    async fn build_sse_get_request(
+        parts: &RequestParts<'_>,
+        #[cfg(feature = "v1-compat")] resumption_token: Option<String>,
+        #[cfg(not(feature = "v1-compat"))] _ignored_cursor: Option<String>,
+    ) -> Result<Request<Full<Bytes>>> {
+        let url = parts.config.read().url.clone();
+
+        // Build GET request with middleware integration
+        let mut request = Self::build_request_from_parts(
+            parts,
+            Method::GET,
+            url.as_str(),
+            vec![], // Empty body for GET
+        )
+        .await?;
+
+        // Add SSE-specific headers
+        request.headers_mut().insert(
+            ACCEPT,
+            TEXT_EVENT_STREAM.parse().map_err(|e| {
+                Error::Transport(TransportError::InvalidMessage(format!(
+                    "Invalid header: {e}"
+                )))
+            })?,
+        );
+
+        // Add the SSE resumption cursor, on the builds that have one.
+        //
+        // Why: this is the ONLY `#[cfg]` at a CALL SITE in this file. It is
+        // unavoidable because the argument it reads is itself gated (see this
+        // function's doc): on `full-v2` the parameter is `_ignored_cursor` and
+        // `apply_resumption_header` does not exist. Every other v1 read on this
+        // transport goes through a paired accessor with a constant `full-v2`
+        // answer instead — including the RECONNECT cursor
+        // ([`SseReaderContext::reconnect_cursor`]), which was added in Phase
+        // 118.2 specifically so that a second gate did NOT accumulate here. Do
+        // not let one accumulate now; `tests/v1_severability_tripwire.rs` counts
+        // them.
+        #[cfg(feature = "v1-compat")]
+        Self::apply_resumption_header(&mut request, resumption_token.as_deref())?;
+
+        Ok(request)
+    }
+
+    /// The OWNED state a spawned session-stream reader carries.
+    ///
+    /// Every field is a cheap clone of an already-shared value; the hyper
+    /// `Client` clone reuses the connection POOL rather than opening a second
+    /// one. `abort_handle` is deliberately absent — see [`SseReaderContext`].
+    fn sse_reader_context(&self) -> SseReaderContext {
+        SseReaderContext {
+            client: self.client.clone(),
+            config: Arc::clone(&self.config),
+            protocol_version: Arc::clone(&self.protocol_version),
+            v2_mode: Arc::clone(&self.v2_mode),
+            sender: self.sender.clone(),
+            last_event_id: Arc::clone(&self.last_event_id),
+            // Read ONCE, here, through the paired accessor, so the spawned task
+            // itself carries no `#[cfg]` at all.
+            on_resumption: self.resumption_callback(),
+            max_collected_body_bytes: self.max_collected_body_bytes,
+        }
+    }
+
+    /// Spawn the incremental SSE reader over ONE live POST response body, and
+    /// hand back its join handle.
+    ///
+    /// The POST half of this transport's two `text/event-stream` sites. Both
+    /// halves read through [`read_sse_body`], so the parser bound (D-02, the
+    /// transport's `max_collected_body_bytes`), the resumption-cursor write, the
+    /// message-event filter, the corruption taxonomy (D-02/D-05) and the
+    /// await-capacity delivery policy (D-04) are shared rather than duplicated.
+    ///
+    /// # This site does NOT reconnect, and that is the point
+    ///
+    /// A POST response stream that ends is the call's ANSWER arriving; there is
+    /// nothing to restore, and re-issuing the GET would not restore it anyway.
+    /// Reconnect belongs to the session stream alone
+    /// ([`SseReaderContext::run_session_stream`]). What this site does instead is
+    /// exactly what plan 01's taxonomy prescribes: an ordinary end-of-body is
+    /// silent, and a transport failure mid-body is delivered once as
+    /// [`TransportError::Request`].
     ///
     /// The reader RETURNS when a send fails, which is what happens the moment the
     /// last transport clone drops the receive queue's `Receiver`. That, not a
@@ -1162,30 +1299,25 @@ impl StreamableHttpTransport {
     fn spawn_sse_reader(&self, body: hyper::body::Incoming) -> tokio::task::JoinHandle<()> {
         let sender = self.sender.clone();
         let on_resumption = self.resumption_callback();
-        let last_event_id = self.last_event_id.clone();
-        let mut state = SseReadState::new(body, self.max_collected_body_bytes);
+        let last_event_id = Arc::clone(&self.last_event_id);
+        let max_buffer_size = self.max_collected_body_bytes;
 
         tokio::spawn(async move {
-            loop {
-                if let Some(event) = state.pending.pop_front() {
-                    if !deliver_sse_event(&sender, &last_event_id, on_resumption.as_ref(), event)
-                        .await
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                // End-of-body drains `pending` FIRST (above), so trailing
-                // complete events are never lost to the `done` check.
-                if state.done {
-                    return;
-                }
-                if let Some(error) = read_next_sse_frame(&mut state).await {
-                    // Terminal, and latched by returning: at most ONE error per
-                    // reader, so one corrupt frame cannot become an error storm.
-                    let _ = sender.send(Err(error)).await;
-                    return;
-                }
+            let end = read_sse_body(
+                &sender,
+                &last_event_id,
+                on_resumption.as_ref(),
+                body,
+                max_buffer_size,
+            )
+            .await;
+            // Terminal, and latched by returning: at most ONE error per reader,
+            // so one failed stream cannot become an error storm.
+            if let SseBodyEnd::Dropped {
+                cause: Some(error), ..
+            } = end
+            {
+                let _ = sender.send(Err(error)).await;
             }
         })
     }
@@ -1228,14 +1360,46 @@ impl StreamableHttpTransport {
         builder
     }
 
+    /// A borrowed view of everything an outgoing request is built from.
+    ///
+    /// See [`RequestParts`] for why the builder underneath takes this rather
+    /// than `&self`.
+    fn request_parts(&self) -> RequestParts<'_> {
+        RequestParts {
+            config: &self.config,
+            protocol_version: &self.protocol_version,
+            v2_mode: &self.v2_mode,
+        }
+    }
+
     /// Build a `hyper::Request` with middleware integration.
     ///
     /// This method:
     /// 1. Builds initial request with config headers, auth, session, protocol version
     /// 2. Runs HTTP middleware on the request
     /// 3. Returns the modified `hyper::Request` ready to send
+    ///
+    /// A thin `&self` wrapper over [`Self::build_request_from_parts`], kept so
+    /// every existing caller is unchanged; the reconnect task reaches the same
+    /// body through [`SseReaderContext`]'s own [`RequestParts`].
     async fn build_request_with_middleware(
         &self,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<Request<Full<Bytes>>> {
+        Self::build_request_from_parts(&self.request_parts(), method, url, body).await
+    }
+
+    /// The ONE request builder on this transport (Phase 118.2, T-118.2-04-07).
+    ///
+    /// Both the caller-task path ([`Self::build_request_with_middleware`]) and
+    /// the spawned reconnect path ([`SseReaderContext::open_sse_once`]) come
+    /// here, so the auth header, the session header, the protocol-version
+    /// header, the v2 routing headers and the request-middleware chain cannot
+    /// diverge between an initial open and a re-open.
+    async fn build_request_from_parts(
+        parts: &RequestParts<'_>,
         method: Method,
         url: &str,
         body: Vec<u8>,
@@ -1251,7 +1415,7 @@ impl StreamableHttpTransport {
         // `set_session_id` produce a request built from two different config
         // states. See `outbound_session_from`.
         let (extra_headers, auth_provider, middleware_chain, outbound_session) = {
-            let config = self.config.read();
+            let config = parts.config.read();
             (
                 config.extra_headers.clone(),
                 config.auth_provider.clone(),
@@ -1277,7 +1441,7 @@ impl StreamableHttpTransport {
             false
         };
 
-        let is_v2 = self.is_v2();
+        let is_v2 = parts.is_v2();
 
         // Add session ID header if we have one.
         //
@@ -1293,7 +1457,7 @@ impl StreamableHttpTransport {
         }
 
         // Add protocol version header if we have one
-        if let Some(protocol_version) = self.protocol_version.read().as_ref() {
+        if let Some(protocol_version) = parts.protocol_version.read().as_ref() {
             request_builder =
                 request_builder.header(MCP_PROTOCOL_VERSION, protocol_version.as_str());
         }
@@ -1400,17 +1564,28 @@ impl StreamableHttpTransport {
     }
 
     /// Process response headers and extract session/protocol information
+    ///
+    /// A thin `&self` wrapper over [`Self::process_headers_from`], so every
+    /// existing caller is unchanged while the spawned reconnect task reaches the
+    /// same body through [`SseReaderContext`]'s [`RequestParts`]. A reconnect
+    /// that skipped this would stop tracking a protocol version the server
+    /// re-states on the re-opened stream.
     fn process_response_headers(&self, response: &HyperResponse<impl hyper::body::Body>) {
+        Self::process_headers_from(&self.request_parts(), response.headers());
+    }
+
+    /// The ONE response-header processor on this transport.
+    fn process_headers_from(parts: &RequestParts<'_>, headers: &hyper::HeaderMap) {
         // Update session ID from response header, on the builds that have a
         // session to update. See `Self::capture_session_header` for why the v1
         // half still carries a runtime `is_v2()` guard and the `full-v2` twin
         // needs none.
-        self.capture_session_header(response.headers());
+        Self::capture_session_header(parts, headers);
 
         // Update protocol version from response header
-        if let Some(protocol_version) = response.headers().get(MCP_PROTOCOL_VERSION) {
+        if let Some(protocol_version) = headers.get(MCP_PROTOCOL_VERSION) {
             if let Ok(protocol_version_str) = protocol_version.to_str() {
-                *self.protocol_version.write() = Some(protocol_version_str.to_string());
+                *parts.protocol_version.write() = Some(protocol_version_str.to_string());
             }
         }
     }
@@ -2012,7 +2187,152 @@ impl SseReadState {
     }
 }
 
-/// Read ONE body frame into `state`, returning `Some(error)` only when the
+/// Why [`read_next_sse_frame`] stopped, when it stopped (Phase 118.2, D-03).
+///
+/// The two variants are NOT interchangeable, and the distinction is the whole of
+/// T-118.2-04-02: a DROP is a peer or an intermediary going away, which is
+/// exactly what a reconnect exists to survive, while CORRUPTION means this byte
+/// stream has already lost data. Retrying a stream the peer is actively
+/// corrupting is a reconnect storm aimed at a server that is already unwell, and
+/// it would replay the same corruption.
+enum SseFrameStop {
+    /// The body ended in a transport FAILURE mid-flight. Retryable on the
+    /// session stream; delivered as-is on the POST stream.
+    Dropped(Error),
+    /// The parser discarded in-flight bytes past its bound (D-02). NEVER
+    /// retried.
+    Corrupt(Error),
+}
+
+/// How ONE live SSE body ended (Phase 118.2, D-03).
+enum SseBodyEnd {
+    /// The stream is over with NO corruption observed: either an ordinary
+    /// end-of-body (`cause: None`) or a transport failure mid-body
+    /// (`cause: Some`).
+    ///
+    /// `delivered` records whether this body produced at least one event, which
+    /// is what lets a long-lived stream that blinks again earn a FRESH reconnect
+    /// budget rather than inheriting a spent one. `retry` is the last
+    /// server-provided SSE `retry:` value seen on it.
+    Dropped {
+        cause: Option<Error>,
+        delivered: bool,
+        retry: Option<Duration>,
+    },
+    /// The stream ended for a reason that is not a drop: a D-02 overflow, a D-05
+    /// parse failure, or a receive queue whose `Receiver` is gone. Any terminal
+    /// error has ALREADY been sent. Never retried, and nothing further is sent.
+    Ended,
+}
+
+/// Read ONE live body to its end, delivering every event it yields.
+///
+/// The SINGLE reader body for both of this transport's `text/event-stream`
+/// sites — the GET session stream and the POST response — so the parser bound,
+/// the message-event filter, the corruption taxonomy and the await-capacity
+/// delivery policy cannot drift between them. What the two sites do with the
+/// RETURN VALUE is where they legitimately differ: only the session stream
+/// reconnects on a [`SseBodyEnd::Dropped`].
+///
+/// A free function over already-decoded values rather than a method, for the
+/// same reason the four helpers under it are: a `hyper::body::Incoming` cannot
+/// be constructed outside hyper, so every part of this path that CAN be reached
+/// from a test is.
+async fn read_sse_body(
+    sender: &mpsc::Sender<Result<TransportMessage>>,
+    last_event_id: &Arc<RwLock<Option<String>>>,
+    on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+    body: hyper::body::Incoming,
+    max_buffer_size: usize,
+) -> SseBodyEnd {
+    let mut state = SseReadState::new(body, max_buffer_size);
+    let mut progress = SseProgress::default();
+    loop {
+        if !drain_pending_events(
+            sender,
+            last_event_id,
+            on_resumption,
+            &mut state,
+            &mut progress,
+        )
+        .await
+        {
+            // Either a frame was unparseable (D-05, terminal error already
+            // sent) or the receiver is gone. Neither is a drop to retry.
+            return SseBodyEnd::Ended;
+        }
+        // End-of-body drains `pending` FIRST (above), so trailing complete
+        // events are never lost to the `done` check.
+        if state.done {
+            return progress.dropped(None);
+        }
+        match read_next_sse_frame(&mut state).await {
+            None => {},
+            Some(SseFrameStop::Dropped(error)) => return progress.dropped(Some(error)),
+            Some(SseFrameStop::Corrupt(error)) => {
+                // Terminal, and latched by returning: at most ONE error per
+                // reader, so one corrupt frame cannot become an error storm.
+                let _ = sender.send(Err(error)).await;
+                return SseBodyEnd::Ended;
+            },
+        }
+    }
+}
+
+/// What one body has produced so far, for the two facts the reconnect loop
+/// needs from a stream that then dropped.
+#[derive(Default)]
+struct SseProgress {
+    /// At least one event was delivered, so a re-opened stream that WORKED
+    /// earns a fresh reconnect budget.
+    delivered: bool,
+    /// The last server-provided SSE `retry:` value, which
+    /// [`next_reconnect_delay`] lets win over the computed backoff.
+    retry: Option<Duration>,
+}
+
+impl SseProgress {
+    /// This body DROPPED, with `cause` if the drop was a transport failure
+    /// rather than an ordinary end-of-body.
+    fn dropped(&self, cause: Option<Error>) -> SseBodyEnd {
+        SseBodyEnd::Dropped {
+            cause,
+            delivered: self.delivered,
+            retry: self.retry,
+        }
+    }
+}
+
+/// Deliver every event already parsed, returning `false` when the reader must
+/// STOP without retrying.
+///
+/// Split out of [`read_sse_body`] purely for the repo's cognitive-complexity
+/// budget (CLAUDE.md, cog 25) — inline, the loop measured 29. The split is
+/// along the natural seam: this owns the per-EVENT rules, the caller owns the
+/// per-BODY ones.
+async fn drain_pending_events(
+    sender: &mpsc::Sender<Result<TransportMessage>>,
+    last_event_id: &Arc<RwLock<Option<String>>>,
+    on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+    state: &mut SseReadState,
+    progress: &mut SseProgress,
+) -> bool {
+    while let Some(event) = state.pending.pop_front() {
+        // Recorded BEFORE delivery, and from any event: a peer that sends
+        // `retry:` alongside a frame is telling the client how long to wait if
+        // this stream drops, and the answer must survive the frame.
+        if let Some(millis) = event.retry {
+            progress.retry = Some(Duration::from_millis(millis));
+        }
+        if !deliver_sse_event(sender, last_event_id, on_resumption, event).await {
+            return false;
+        }
+        progress.delivered = true;
+    }
+    true
+}
+
+/// Read ONE body frame into `state`, returning `Some(stop)` only when the
 /// stream must END.
 ///
 /// Extracted from the reader task's loop so neither exceeds the repo's
@@ -2027,7 +2347,7 @@ impl SseReadState {
 ///    LATCHES, so a caller cannot miss it.
 /// 3. End-of-body sets `done` without draining: the CALLER drains `pending`
 ///    before it checks `done`, so trailing complete events are not lost.
-async fn read_next_sse_frame(state: &mut SseReadState) -> Option<Error> {
+async fn read_next_sse_frame(state: &mut SseReadState) -> Option<SseFrameStop> {
     match state.body.frame().await {
         // End of body. Anything already in `pending` is still drained by the
         // caller's loop before the `done` check ends the stream.
@@ -2037,7 +2357,9 @@ async fn read_next_sse_frame(state: &mut SseReadState) -> Option<Error> {
         },
         Some(Err(e)) => {
             state.done = true;
-            Some(Error::Transport(TransportError::Request(e.to_string())))
+            Some(SseFrameStop::Dropped(Error::Transport(
+                TransportError::Request(e.to_string()),
+            )))
         },
         Some(Ok(frame)) => {
             if let Some(chunk) = frame.data_ref() {
@@ -2050,9 +2372,10 @@ async fn read_next_sse_frame(state: &mut SseReadState) -> Option<Error> {
                     // The peer pushed the parser's retained state plus this chunk
                     // past the bound, so the parser DISCARDED bytes and this byte
                     // stream is no longer trustworthy. There is nothing
-                    // meaningful to continue to.
+                    // meaningful to continue to, and nothing to RECONNECT to
+                    // either — a re-open would replay the same corruption.
                     state.done = true;
-                    return Some(error);
+                    return Some(SseFrameStop::Corrupt(error));
                 }
             }
             // A trailers frame carries no data; the caller loops and reads again.
@@ -2169,6 +2492,306 @@ async fn deliver_sse_event(
             false
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// The session stream's OWNED reader context and its bounded reconnect loop
+// (Phase 118.2, D-03).
+// ---------------------------------------------------------------------------
+
+/// Everything a spawned session-stream reader OWNS, so it can reissue an
+/// authenticated, middleware-aware GET without borrowing the transport.
+///
+/// # Why an owned context, and not a `StreamableHttpTransport` clone
+///
+/// The reader task is `'static`: it cannot borrow `&self`, and a `&self` helper
+/// is therefore not callable from it. Cloning the whole transport in would
+/// compile — but it would also hand the task `abort_handle`, and that is a
+/// genuine leak rather than a convenience:
+/// `abort_handle: Arc<RwLock<Option<JoinHandle<()>>>>` holds THIS TASK's own
+/// join handle, so a task owning that `Arc` owns its own handle. Dropping the
+/// last real transport clone would not release it, and the task would never be
+/// reachable for abort at all (T-118.2-04-06).
+///
+/// **This struct therefore has NO `abort_handle` field, deliberately.** Its two
+/// termination signals are instead:
+///
+/// 1. `sender.send(..)` returning `Err` — the receive queue's `Receiver` is
+///    gone, so there is nobody to deliver to; and
+/// 2. `sender.is_closed()`, checked BEFORE and AFTER every backoff sleep, which
+///    is what makes a dropped transport stop a loop that is asleep rather than
+///    reading.
+///
+/// Both go true the moment the last transport clone drops the `Receiver`.
+///
+/// Every field is a cheap clone of an already-shared value. The hyper `Client`
+/// is `Clone` and pools connections, so the clone REUSES the pool rather than
+/// opening a second one.
+struct SseReaderContext {
+    /// The transport's own hyper client, so a reconnect reuses its pool.
+    client: Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        Full<Bytes>,
+    >,
+    /// The URL, the auth provider and the request-middleware chain all live
+    /// here, which is what makes a reissued GET authenticated and
+    /// middleware-aware rather than a bare request.
+    config: Arc<RwLock<StreamableHttpTransportConfig>>,
+    /// Read by the shared request builder for the `MCP-Protocol-Version` header,
+    /// and WRITTEN by the shared response-header processor on each re-open.
+    protocol_version: Arc<RwLock<Option<String>>>,
+    /// Read by the shared request builder to decide session-header suppression
+    /// and v2 routing headers.
+    v2_mode: Arc<AtomicBool>,
+    /// Plan 01's `Result`-carrying receive queue, and this task's liveness
+    /// signal.
+    sender: mpsc::Sender<Result<TransportMessage>>,
+    /// Where a delivered event's id is recorded, and what
+    /// [`Self::reconnect_cursor`] reads back out on the `v1-compat` build.
+    last_event_id: Arc<RwLock<Option<String>>>,
+    /// Read ONCE from the paired `resumption_callback` accessor at construction,
+    /// so this task carries no `#[cfg]` of its own.
+    on_resumption: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    /// The D-02 parser bound, i.e. the transport's `max_collected_body_bytes`.
+    max_collected_body_bytes: usize,
+}
+
+impl SseReaderContext {
+    /// A borrowed view of everything a reissued request is built from.
+    fn request_parts(&self) -> RequestParts<'_> {
+        RequestParts {
+            config: &self.config,
+            protocol_version: &self.protocol_version,
+            v2_mode: &self.v2_mode,
+        }
+    }
+
+    /// The cursor a reconnect resumes from.
+    ///
+    /// The `v1-compat` half: whatever the last delivered event's id was.
+    #[cfg(feature = "v1-compat")]
+    fn reconnect_cursor(&self) -> Option<String> {
+        self.last_event_id.read().clone()
+    }
+
+    /// The null twin: a `full-v2` build has no resumption cursor, so the answer
+    /// is the constant `None`.
+    ///
+    /// MCP `2026-07-28` removed SSE resumability outright. Do NOT "improve" this
+    /// by reading `last_event_id` — answering here is exactly what keeps the
+    /// reconnect call site free of a `#[cfg]`, and
+    /// `tests/v1_severability_tripwire.rs` asserts both halves of that. A
+    /// `full-v2` build cannot construct a cursor at all, which is what makes
+    /// "no attacker-influenced cursor reaches the wire" a property of the
+    /// compiled crate rather than of a runtime branch (T-118.2-04-03).
+    #[cfg(not(feature = "v1-compat"))]
+    #[allow(clippy::unused_self)]
+    const fn reconnect_cursor(&self) -> Option<String> {
+        None
+    }
+
+    /// Issue ONE GET and hand back its live body.
+    ///
+    /// `Ok(None)` means the server answered `405 Method Not Allowed`: it does
+    /// not offer a GET session stream at all, which the spec makes an ordinary
+    /// answer rather than an error. The initial open treats that as "no stream,
+    /// no problem"; a RECONNECT treats it as a named end, because a server that
+    /// offered the stream a moment ago and now refuses it is not a stream that
+    /// can be restored.
+    async fn open_sse_once(&self, cursor: Option<String>) -> Result<Option<hyper::body::Incoming>> {
+        let request =
+            StreamableHttpTransport::build_sse_get_request(&self.request_parts(), cursor).await?;
+
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|e| Error::Transport(TransportError::Request(e.to_string())))?;
+
+        // Handle 405 (SSE not supported) gracefully
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(Error::Transport(TransportError::Request(format!(
+                "SSE request failed with status: {}",
+                response.status()
+            ))));
+        }
+
+        // Process response headers
+        StreamableHttpTransport::process_headers_from(&self.request_parts(), response.headers());
+        Ok(Some(response.into_body()))
+    }
+
+    /// Read the session stream, RE-OPENING it under a bounded budget whenever it
+    /// is dropped (Phase 118.2, D-03).
+    ///
+    /// # The retry lives INSIDE this one task, deliberately
+    ///
+    /// [`StreamableHttpTransport::start_sse`] aborts `abort_handle` as its very
+    /// FIRST act, so a recursive `start_sse` call from in here would abort the
+    /// task making the call. The loop therefore owns the attempt counter and the
+    /// sleep, and re-opens through [`Self::open_sse_once`].
+    ///
+    /// # What is retried, and what is not
+    ///
+    /// Only a DROP — an end-of-body, or a connection failure mid-body, with no
+    /// corruption seen. A D-02 overflow or a D-05 parse failure is a CORRUPTION
+    /// end: the terminal error is already on the queue and re-opening would
+    /// replay the same corruption against a peer that is already misbehaving
+    /// (T-118.2-04-02).
+    ///
+    /// # No re-handshake, ever
+    ///
+    /// A reconnect reissues the GET and NOTHING else. A `404` or an expired
+    /// session ends the loop with a named error rather than silently re-running
+    /// `initialize`: a silent re-handshake would mint a new session id and
+    /// orphan every in-flight correlation, which would let a peer induce
+    /// correlation loss simply by expiring a session (T-118.2-04-04, RESEARCH
+    /// Open Question 2).
+    ///
+    /// # Cancellation
+    ///
+    /// `sender.is_closed()` is checked before AND after each sleep. Without the
+    /// post-sleep check the loop wakes up and reconnects to a peer nobody is
+    /// listening to. `close()` additionally aborts this task outright, but a
+    /// DROPPED transport cannot — there is no transport left to call `close()`
+    /// on — which is precisely why the loop consults its sender rather than
+    /// relying on the abort handle.
+    async fn run_session_stream(self, mut body: hyper::body::Incoming) {
+        // Reconnects already made. Reset to 0 after a re-opened stream that
+        // actually delivers, so a stream that survives for hours and then blinks
+        // again earns a FRESH budget rather than inheriting a spent one. That is
+        // a deliberate choice, not an oversight: the budget bounds a burst of
+        // failures, not the lifetime of a healthy connection.
+        let mut attempt: u32 = 0;
+        loop {
+            let end = read_sse_body(
+                &self.sender,
+                &self.last_event_id,
+                self.on_resumption.as_ref(),
+                body,
+                self.max_collected_body_bytes,
+            )
+            .await;
+
+            let SseBodyEnd::Dropped {
+                cause,
+                delivered,
+                retry,
+            } = end
+            else {
+                return;
+            };
+            if delivered {
+                attempt = 0;
+            }
+
+            if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
+                // Do NOT go quiet: a reader that simply stops is
+                // indistinguishable from a healthy idle stream.
+                let _ = self
+                    .sender
+                    .send(Err(reconnect_budget_exhausted(attempt, cause.as_ref())))
+                    .await;
+                return;
+            }
+
+            if self.sender.is_closed() {
+                return;
+            }
+            tokio::time::sleep(next_reconnect_delay(attempt, retry)).await;
+            if self.sender.is_closed() {
+                return;
+            }
+            attempt += 1;
+
+            // The call site carries NO `#[cfg]`: `reconnect_cursor` is a paired
+            // accessor whose `full-v2` twin answers the constant `None`.
+            match self.open_sse_once(self.reconnect_cursor()).await {
+                Ok(Some(reopened)) => body = reopened,
+                Ok(None) => {
+                    let _ = self.sender.send(Err(reconnect_stream_gone(attempt))).await;
+                    return;
+                },
+                Err(error) => {
+                    let _ = self
+                        .sender
+                        .send(Err(reconnect_open_failed(attempt, &error)))
+                        .await;
+                    return;
+                },
+            }
+        }
+    }
+}
+
+/// How long to wait before reconnect attempt `attempt` (0-based).
+///
+/// `min(INITIAL_SSE_RECONNECT_DELAY * SSE_RECONNECT_GROWTH^attempt,
+/// MAX_SSE_RECONNECT_DELAY)`, the reference client's `_getNextReconnectionDelay`
+/// curve — unless the peer sent an SSE `retry:` field, which WINS, exactly as the
+/// reference client lets it.
+///
+/// Unlike the reference, a peer-provided value is still CLAMPED to
+/// [`MAX_SSE_RECONNECT_DELAY`]: `retry:` is remote input, and an uncapped one
+/// parks a client's reader task for a duration the peer chose.
+///
+/// Non-panicking on any `attempt`: an exponent that overflows `i32`, or a
+/// product that is infinite, falls back to the maximum rather than
+/// `unwrap`-ing a `Duration` conversion.
+fn next_reconnect_delay(attempt: u32, server_retry: Option<Duration>) -> Duration {
+    if let Some(retry) = server_retry {
+        return retry.min(MAX_SSE_RECONNECT_DELAY);
+    }
+    let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+    let seconds = INITIAL_SSE_RECONNECT_DELAY.as_secs_f64() * SSE_RECONNECT_GROWTH.powi(exponent);
+    Duration::try_from_secs_f64(seconds)
+        .unwrap_or(MAX_SSE_RECONNECT_DELAY)
+        .min(MAX_SSE_RECONNECT_DELAY)
+}
+
+/// The stream-ENDING error, when the reconnect budget is spent (D-03).
+///
+/// Deliberately in the [`TransportError::Request`] family and deliberately
+/// worded so it cannot be confused with the D-02 overflow or the D-05 parse
+/// failure, both of which are [`TransportError::InvalidMessage`]: a consumer has
+/// to be able to tell a LIFECYCLE end (the peer went away; the correlations in
+/// flight are lost but nothing was corrupted) from CORRUPTION (this byte stream
+/// lost data). `tests/client_sse_stream.rs` asserts the three-way distinctness
+/// in both directions.
+fn reconnect_budget_exhausted(attempts: u32, cause: Option<&Error>) -> Error {
+    let because = cause.map_or_else(
+        || "the peer ended the body".to_string(),
+        |error| format!("the last attempt ended with: {error}"),
+    );
+    Error::Transport(TransportError::Request(format!(
+        "the session stream was dropped and its {MAX_SSE_RECONNECT_ATTEMPTS}-attempt reconnect \
+         budget (MAX_SSE_RECONNECT_ATTEMPTS) is exhausted after {attempts} attempt(s); {because}"
+    )))
+}
+
+/// The stream-ENDING error, when a reconnect is answered `405 Method Not
+/// Allowed`.
+fn reconnect_stream_gone(attempts: u32) -> Error {
+    Error::Transport(TransportError::Request(format!(
+        "the session stream was dropped and reconnect attempt {attempts} was answered 405 Method \
+         Not Allowed: the server no longer offers a GET session stream, so there is nothing left \
+         to resume"
+    )))
+}
+
+/// The stream-ENDING error, when a reconnect cannot re-open the stream.
+///
+/// Names the refusal to re-handshake explicitly, because "why did it not just
+/// start a new session?" is the first question this message will be asked.
+fn reconnect_open_failed(attempts: u32, cause: &Error) -> Error {
+    Error::Transport(TransportError::Request(format!(
+        "the session stream was dropped and reconnect attempt {attempts} could not re-open it \
+         ({cause}); the stream was ended. The client deliberately does NOT re-handshake: a silent \
+         re-`initialize` would mint a new session and orphan every in-flight correlation"
+    )))
 }
 
 /// Derive the `(Mcp-Method, Mcp-Name)` pair a v2 request must carry, from the
