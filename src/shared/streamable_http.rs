@@ -453,6 +453,42 @@ impl StreamableHttpTransportConfigBuilder {
 /// hatch.
 pub const DEFAULT_MAX_COLLECTED_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// How many server-to-client messages may sit between a reader task and
+/// [`Transport::receive`] before the reader must wait (Phase 118.2, D-04).
+///
+/// # What it bounds
+///
+/// The IN-FLIGHT messages on this transport's receive queue. Worst-case in-flight
+/// memory is therefore `CLIENT_RECEIVE_QUEUE_CAPACITY` x
+/// `StreamableHttpTransport::max_collected_body_bytes`. Before this constant the
+/// queue was `mpsc::unbounded_channel()`, which is not a bound at all: a peer
+/// that pushes frames faster than the application consumes them grows this
+/// process's heap for the lifetime of the connection.
+///
+/// # The policy is AWAIT CAPACITY, never drop
+///
+/// A spawned reader task `.await`s capacity, so backpressure lands on the reader,
+/// the TCP window closes, and the peer stops writing. That is deliberately the
+/// OPPOSITE of the server-side `V2_PROGRESS_QUEUE_CAPACITY` precedent
+/// (`streamable_http_server.rs`), which is the same size and `try_send`s with a
+/// drop-newest policy. Said here rather than left for a reader to assume drift:
+/// this queue carries `sampling` / `roots` / `elicit` **requests**, and a dropped
+/// request strands a correlation until it times out, whereas a dropped progress
+/// frame is superseded by the next one. The two directions are allowed to differ
+/// precisely because their payloads differ.
+///
+/// The CALLER-task send sites (inside [`StreamableHttpTransport::post_body`])
+/// are the exception, and they `try_send` instead: `Client::dispatch_request`
+/// calls `send()` and only then loops on `receive()`, so a caller-task site that
+/// blocked on a full queue could never be drained by the consumer that is inside
+/// it. Those sites fail loudly with a named error rather than blocking.
+///
+/// # Why the element is a `Result`
+///
+/// So a reader task can report WHY a stream ended. See [`Transport::receive`] for
+/// the five end reasons and how they differ.
+const CLIENT_RECEIVE_QUEUE_CAPACITY: usize = 64;
+
 /// Build the over-cap refusal shared by every collected-body read.
 ///
 /// Names the LIMIT and the observed size, and deliberately echoes no body
@@ -475,6 +511,41 @@ fn collected_body_over_cap(max_bytes: usize, declared: Option<usize>) -> Error {
     )))
 }
 
+/// What an outbound POST carries, as far as the `202 Accepted` handler needs to
+/// know (Phase 118.2, Defect A).
+///
+/// Deliberately NOT the broad `is_notification: bool` this replaced. The
+/// reference implementation guards its stream-open on
+/// `isInitializedNotification(message)`
+/// (`@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js:370-377`), and
+/// the difference is not cosmetic: [`StreamableHttpTransport::start_sse`] aborts
+/// the live reader as its FIRST act, so a broad predicate tears down and re-opens
+/// the session stream on every `notifications/cancelled` and
+/// `notifications/progress` the client sends.
+///
+/// Derived from the TYPED outbound message, never re-parsed from the serialized
+/// body: the typed path already has the identity in hand, and re-parsing would
+/// let a hostile body influence which client branch runs (T-118.2-01-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundFrame {
+    /// The `notifications/initialized` notification, specifically.
+    InitializedNotification,
+    /// Every other frame: a request, a response, or any other notification.
+    Other,
+}
+
+impl OutboundFrame {
+    /// Classify a typed transport message.
+    fn of(message: &TransportMessage) -> Self {
+        match message {
+            TransportMessage::Notification(crate::types::Notification::Client(
+                crate::types::ClientNotification::Initialized,
+            )) => Self::InitializedNotification,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// A streamable HTTP transport for MCP.
 ///
 /// This transport supports both stateless and stateful operation modes:
@@ -492,10 +563,14 @@ pub struct StreamableHttpTransport {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
     >,
-    /// Channel for receiving messages from SSE streams or responses
-    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<TransportMessage>>>,
-    /// Sender for messages
-    sender: mpsc::UnboundedSender<TransportMessage>,
+    /// Channel for receiving messages from SSE streams or responses.
+    ///
+    /// BOUNDED at [`CLIENT_RECEIVE_QUEUE_CAPACITY`], and its element is a
+    /// `Result` so a reader task can deliver a terminal reason rather than
+    /// vanishing. See [`Transport::receive`].
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<TransportMessage>>>>,
+    /// Sender for messages. See [`Self::receiver`].
+    sender: mpsc::Sender<Result<TransportMessage>>,
     /// Protocol version negotiated with server
     protocol_version: Arc<RwLock<Option<String>>>,
     /// Whether the CLIENT explicitly selected the v2 (`2026-07-28`) era
@@ -595,7 +670,7 @@ impl StreamableHttpTransport {
             .pool_max_idle_per_host(10)
             .build(https);
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(CLIENT_RECEIVE_QUEUE_CAPACITY);
         Self {
             config: Arc::new(RwLock::new(config)),
             client,
@@ -697,6 +772,34 @@ impl StreamableHttpTransport {
         response: HyperResponse<hyper::body::Incoming>,
     ) -> Result<Bytes> {
         Self::collect_body_within_cap(response, self.max_collected_body_bytes).await
+    }
+
+    /// Put a message on the receive queue from a CALLER task (Phase 118.2, D-04).
+    ///
+    /// `try_send`, deliberately, where a spawned reader task would `.await`
+    /// capacity: [`crate::Client`]'s `dispatch_request` calls `send()` and only
+    /// THEN loops on `receive()`, so a caller-task site that blocked on a full
+    /// queue could never be drained by the consumer that is inside it — a
+    /// self-deadlock. Failing loudly with an error naming
+    /// [`CLIENT_RECEIVE_QUEUE_CAPACITY`] satisfies D-04's never-silently-drop
+    /// rule while keeping the send path non-blocking.
+    ///
+    /// A closed channel maps to the same [`TransportError::Send`] family the
+    /// unbounded sender's failure mapped to, so a caller matching on the error
+    /// family sees no new shape.
+    fn queue_from_caller(&self, message: TransportMessage) -> Result<()> {
+        self.sender.try_send(Ok(message)).map_err(|error| {
+            Error::Transport(TransportError::Send(match error {
+                mpsc::error::TrySendError::Full(_) => format!(
+                    "the client receive queue is full at its {CLIENT_RECEIVE_QUEUE_CAPACITY}-message \
+                     capacity (CLIENT_RECEIVE_QUEUE_CAPACITY); the application is not draining \
+                     Transport::receive() fast enough"
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    "the client receive queue is closed".to_string()
+                },
+            }))
+        })
     }
 
     /// Whether this connection speaks the v2 (`2026-07-28`) wire contract.
@@ -1048,7 +1151,7 @@ impl StreamableHttpTransport {
                     if let Ok(msg) =
                         crate::shared::StdioTransport::parse_message(event.data.as_bytes())
                     {
-                        let _ = sender.send(msg);
+                        let _ = sender.send(Ok(msg)).await;
                     }
                 }
             }
@@ -1300,10 +1403,13 @@ impl StreamableHttpTransport {
             return Ok(());
         }
 
+        // Classify BEFORE serializing: the 202 handler needs the notification's
+        // identity, and the typed value is where it lives. See `OutboundFrame`.
+        let outbound = OutboundFrame::of(&message);
+
         // Use JSON-RPC compatibility layer for serialization
         let body_bytes = crate::shared::StdioTransport::serialize_message(&message)?;
-        let is_notification = matches!(message, TransportMessage::Notification { .. });
-        self.post_body(body_bytes, is_notification).await
+        self.post_body(body_bytes, outbound).await
     }
 
     /// Read the JSON-RPC ERROR envelope out of a non-2xx response body (D-113-E).
@@ -1458,26 +1564,37 @@ impl StreamableHttpTransport {
     /// field), and both paths must go through the SAME header emission, 401
     /// retry, and response handling.
     ///
-    /// `is_notification` only selects the 202-Accepted behavior; it is not
-    /// re-derived from the bytes so the typed path keeps its exact semantics.
-    async fn post_body(&self, body_bytes: Vec<u8>, is_notification: bool) -> Result<()> {
+    /// `outbound` only selects the 202-Accepted behavior; it is not re-derived
+    /// from the bytes so the typed path keeps its exact semantics.
+    async fn post_body(&self, body_bytes: Vec<u8>, outbound: OutboundFrame) -> Result<()> {
         let response = self.post_once(body_bytes).await?;
 
         // Process headers for session and protocol info
         self.process_response_headers(&response);
 
+        // 202 Accepted — the notification acknowledgement, handled BEFORE the
+        // non-2xx guard (Phase 118.2, Defect A).
+        //
+        // Why the branch moved: `202` satisfies `is_success()` — `http`'s own
+        // `StatusCode::is_success` is `(200..300).contains(..)` — so the 202
+        // sub-branch that used to live inside `if !response.status().is_success()`
+        // was dead code from the day it was written. MEASURED in Phase 118.2
+        // research: a real `ClientBuilder` handshake against a recording listener
+        // produced two POSTs and ZERO GETs, i.e. the session stream was never
+        // opened at all. Fenced by `tests/client_sse_stream.rs`.
+        if response.status() == StatusCode::ACCEPTED {
+            if outbound == OutboundFrame::InitializedNotification {
+                // Tolerate failure: a server answering `405 Method Not Allowed`
+                // to the GET is a perfectly valid StreamableHTTP server that
+                // simply offers no session stream. That tolerance was in the
+                // dead branch and is preserved here.
+                let _ = self.start_sse(None).await;
+            }
+            return Ok(());
+        }
+
         // Handle non-success responses
         if !response.status().is_success() {
-            // Special handling for 202 Accepted (notification acknowledged)
-            if response.status() == StatusCode::ACCEPTED {
-                // For initialization messages, try to start SSE stream
-                if is_notification {
-                    // Try to start GET SSE (tolerate 405)
-                    let _ = self.start_sse(None).await;
-                }
-                return Ok(());
-            }
-
             // D-113-E: on v2 a STRUCTURED JSON-RPC error rides a 4xx.
             //
             // Phase-113 plan 04 maps the v2 error codes onto HTTP statuses
@@ -1498,9 +1615,9 @@ impl StreamableHttpTransport {
                             %status,
                             "v2 non-2xx carried a JSON-RPC error envelope — surfacing it structurally"
                         );
-                        self.sender
-                            .send(message)
-                            .map_err(|e| Error::Transport(TransportError::Send(e.to_string())))?;
+                        // A CALLER-task send: non-blocking, loud on a full queue.
+                        // See `Self::queue_from_caller`.
+                        self.queue_from_caller(message)?;
                         return Ok(());
                     },
                     None => {
@@ -1603,16 +1720,14 @@ impl StreamableHttpTransport {
                     })?;
                     // Use JSON-RPC compatibility layer
                     let msg = crate::shared::StdioTransport::parse_message(json_str.as_bytes())?;
-                    self.sender
-                        .send(msg)
-                        .map_err(|e| Error::Transport(TransportError::Send(e.to_string())))?;
+                    // A CALLER-task send. See `Self::queue_from_caller`.
+                    self.queue_from_caller(msg)?;
                 }
             } else {
                 // Single message - use JSON-RPC compatibility layer
                 let msg_parsed = crate::shared::StdioTransport::parse_message(&modified_body)?;
-                self.sender
-                    .send(msg_parsed)
-                    .map_err(|e| Error::Transport(TransportError::Send(e.to_string())))?;
+                // A CALLER-task send. See `Self::queue_from_caller`.
+                self.queue_from_caller(msg_parsed)?;
             }
             return Ok(());
         }
@@ -1652,16 +1767,14 @@ impl StreamableHttpTransport {
                     })?;
                     // Use JSON-RPC compatibility layer
                     let msg = crate::shared::StdioTransport::parse_message(json_str.as_bytes())?;
-                    self.sender
-                        .send(msg)
-                        .map_err(|e| Error::Transport(TransportError::Send(e.to_string())))?;
+                    // A CALLER-task send. See `Self::queue_from_caller`.
+                    self.queue_from_caller(msg)?;
                 }
             } else {
                 // Single message - use JSON-RPC compatibility layer
                 let msg_parsed = crate::shared::StdioTransport::parse_message(&modified_body)?;
-                self.sender
-                    .send(msg_parsed)
-                    .map_err(|e| Error::Transport(TransportError::Send(e.to_string())))?;
+                // A CALLER-task send. See `Self::queue_from_caller`.
+                self.queue_from_caller(msg_parsed)?;
             }
         } else if content_type.contains(TEXT_EVENT_STREAM) {
             // SSE stream response - handle streaming
@@ -1698,7 +1811,7 @@ impl StreamableHttpTransport {
                         if let Ok(msg) =
                             crate::shared::StdioTransport::parse_message(event.data.as_bytes())
                         {
-                            let _ = sender.send(msg);
+                            let _ = sender.send(Ok(msg)).await;
                         }
                     }
                 }
@@ -1724,13 +1837,44 @@ impl Transport for StreamableHttpTransport {
             .await
     }
 
+    /// Take the next server-to-client message, or the reason the stream ended.
+    ///
+    /// # The five end reasons, and how they differ (Phase 118.2, D-02/D-03/D-05)
+    ///
+    /// | End reason | What the reader puts on the queue | What this returns |
+    /// |---|---|---|
+    /// | A message arrived | `Ok(msg)` | `Ok(msg)` |
+    /// | Parser overflow (D-02) | `Err(TransportError::InvalidMessage)` naming the parser bound and echoing NO body content; NOT retried | that error, exactly once, after every already-queued message |
+    /// | Unparseable frame (D-05) | `Err(TransportError::InvalidMessage)` naming the parse failure, with any echoed frame text truncated to a 200-character bound; NOT retried | as above |
+    /// | Reconnect budget exhausted (D-03) | `Err(TransportError::Request)` naming the exhausted budget | as above |
+    /// | Ordinary EOF, or a deliberate [`Transport::close`] / last-transport-drop | NOTHING — the reader exits silently | this keeps awaiting, exactly as before |
+    ///
+    /// Three rules make that taxonomy hold:
+    ///
+    /// 1. **FIFO is the ordering guarantee.** A terminal `Err` is queued BEHIND
+    ///    every message already delivered, so a consumer sees all successfully
+    ///    parsed frames before the failure. That is why the reason rides the
+    ///    queue rather than a side slot — a slot would have to be polled, and
+    ///    the transport holds a `Sender` clone for its whole life, so `recv()`
+    ///    never returns `None` on its own.
+    /// 2. **At most ONE terminal error per reader.** The reader returns
+    ///    immediately after a successful terminal send, so one corrupt frame
+    ///    cannot become an error storm.
+    /// 3. **A failed send means the receiver is gone**, so the reader RETURNS
+    ///    rather than retrying. That is what makes "dropping the last transport
+    ///    clone terminates the reader" true without a `Drop` impl — impossible
+    ///    here anyway, since the transport is `Clone` and shares its abort
+    ///    handle, so one clone's drop would kill the original's stream.
+    ///
+    /// The public signature is unchanged; only the private queue's element type
+    /// moved, which `cargo semver-checks` cannot see.
     async fn receive(&mut self) -> Result<TransportMessage> {
         // Receive from channel - this will block until a message is available
         let mut receiver = self.receiver.lock().await;
         receiver
             .recv()
             .await
-            .ok_or_else(|| Error::Transport(TransportError::ConnectionClosed))
+            .ok_or_else(|| Error::Transport(TransportError::ConnectionClosed))?
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -1787,7 +1931,9 @@ impl Transport for StreamableHttpTransport {
     }
 
     async fn send_raw(&mut self, body: Vec<u8>) -> Result<()> {
-        self.post_body(body, false).await
+        // The v2 raw path never carries `notifications/initialized` — v2 has no
+        // handshake at all — so its 202s never open a session stream.
+        self.post_body(body, OutboundFrame::Other).await
     }
 }
 
