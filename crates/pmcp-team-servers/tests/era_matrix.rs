@@ -469,15 +469,42 @@ const DEP_STATUS_COMPLETED: &str = "completed";
 /// must be able to describe: a return to this value means the peer went absent
 /// again.
 const DEP_STATUS_CAPABILITY_NOT_OFFERED: &str = "capability-not-offered";
-/// `status` when the peer WAS present, the request WAS issued, and no live
-/// client stream existed to deliver it on.
+/// `status` when the peer WAS present, the request WAS issued, and the answer
+/// never came back.
 ///
-/// The v1 expectation since phase 118.1 plan 11. See
-/// `era_target::DEP_STATUS_NO_LIVE_STREAM` for the full account, and re-spelled
-/// here rather than imported for the same reason every other token in this
-/// block is: a test that reads its expectation out of the code under test
+/// The v1 expectation since phase 118.1 plan 11, and still the v1 expectation
+/// after phase 118.2 — but **for a different reason**, which is why the arm below
+/// now also asserts [`DEP_RESULT_DETAIL_FIELD`]. The wire spelling is a
+/// CATCH-ALL: `era_target::undelivered()` reports it for any peer error at all,
+/// so it cannot by itself distinguish "there was no stream to deliver on" (the
+/// pre-118.2 state) from "it was delivered and nobody answered" (now). The name
+/// is kept matching `era_target`'s so the two stay greppable; the module doc
+/// carries the account of what moved.
+///
+/// Re-spelled here rather than imported for the same reason every other token in
+/// this block is: a test that reads its expectation out of the code under test
 /// asserts nothing.
 const DEP_STATUS_NO_LIVE_STREAM: &str = "no-live-stream";
+
+/// The result field carrying the transport error text behind
+/// [`DEP_STATUS_NO_LIVE_STREAM`].
+const DEP_RESULT_DETAIL_FIELD: &str = "detail";
+
+/// What the `detail` must NAME now: the server waited out its dispatch budget.
+///
+/// A substring rather than the whole message, because the request id inside it
+/// (`dispatch-1`) is a counter this file has no business pinning.
+const DISPATCH_TIMEOUT_MARKER: &str = "timed out";
+
+/// What the `detail` said at the phase base `cb5d1365`, and must NOT say now.
+///
+/// Asserted in the NEGATIVE alongside [`DISPATCH_TIMEOUT_MARKER`], because
+/// "which hop is missing" is a property of the PAIR: a one-directional check
+/// would pass against an implementation whose error text happened to contain
+/// both. This is the marker that makes the detail assertion non-vacuous — it is
+/// exactly what the base tree reported, in 0.18 s, when no live client stream
+/// existed.
+const BASE_FAIL_FAST_MARKER: &str = "Dispatch oneshot channel closed";
 
 /// The per-request v2 `_meta` key that REPLACES the `logging/setLevel` RPC.
 const LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
@@ -612,8 +639,9 @@ fn era_transport(url: &url::Url) -> pmcp::shared::streamable_http::StreamableHtt
 ///   below proves it. (Gap G-5 in `118-CONFORMANCE-GAPS.md` was CLOSED by phase
 ///   118.1 plan 05 for the verbs it named; the residual `logging/setLevel`
 ///   dispatch-root observation that survived it is closed by 118.2-08.)
-/// * **v1 Sampling/Roots now REACH the capability over `StreamableHttpServer`,
-///   and stop one hop short of completing.** The status this file asserts is
+/// * **v1 Sampling/Roots REACH the capability over `StreamableHttpServer`, the
+///   request is now DELIVERED to pmcp's own client, and the round trip still
+///   stops one hop short — at the ANSWER.** The status this file asserts is
 ///   `no-live-stream`, not `capability-not-offered`, and the difference is the
 ///   whole of gap G-3's server half:
 ///   - phase 118.1 plan 08 folded the v1 `initialize` handshake capabilities
@@ -622,10 +650,47 @@ fn era_transport(url: &url::Url) -> pmcp::shared::streamable_http::StreamableHtt
 ///   - plans 10 and 11 put a SESSION-BOUND peer handle on the `StreamableHTTP`
 ///     dispatch path, so `extra.peer()` is `Some` (it was previously set only in
 ///     `Server::run()`, which this transport never calls).
-///   The remaining hop is CLIENT-side and outside this crate: pmcp's own
-///   `StreamableHttpTransport` collects a GET SSE body to completion instead of
-///   reading it as a live stream, so it registers no receiver and the server
-///   fails the correlation at once. The SERVER half is measured directly, and
+///
+///   **What phase 118.2 FIXED, and what it did not.** pmcp's own
+///   `StreamableHttpTransport` now opens the GET session stream after the
+///   `initialized` notification is answered `202`, and reads that body
+///   INCREMENTALLY. Both halves of that were defects and both are closed:
+///   118.2-01 found the `start_sse(None)` call sitting inside
+///   `if !response.status().is_success()` — and `202 Accepted` IS a success
+///   status, so the branch was dead and no GET was ever issued; 118.2-03 replaced
+///   the whole-body `collect()` at both read sites with the one incremental
+///   reader, because a session stream has no end-of-body for a `collect()` to
+///   wait for. 118.2-04 added bounded reconnect with `Last-Event-ID` on top.
+///   The pmcp-on-BOTH-ends proof of the resulting channel is
+///   `tests/pmcp_both_ends_logging.rs` in the `pmcp` crate: a handler-emitted
+///   `notifications/message` reaching a real `StreamableHttpTransport` over a
+///   live v1 session stream, before the call's own reply.
+///
+///   **The residual, and it MOVED rather than vanished.** Measured at the phase
+///   base `cb5d1365` and again at 118.2-10, with this arm's expectation
+///   temporarily flipped so the payload printed:
+///   - BASE, in 0.18 s: `detail: "Protocol error: -32603 - Dispatch oneshot
+///     channel closed"` — there was no live client stream, so the server failed
+///     the correlation AT ONCE;
+///   - NOW, in ~30 s: `detail: "Protocol error: -32001 - Server request
+///     dispatch-1 timed out"` — the request IS delivered (a scratch probe read
+///     `Request { id: "dispatch-1", request: Client(CreateMessage(..)) }` off
+///     pmcp's own client queue) and the server then waits out its dispatch budget
+///     for an answer that never comes.
+///   The client cannot ANSWER because `Client::dispatch_request` awaits
+///   `transport.send(..)` to COMPLETE before entering the receive loop that would
+///   dispatch the inbound request, and the server holds the `tools/call` POST open
+///   for the whole handler — so the client is parked inside its own `send()` while
+///   the handler waits on it. That is a lifecycle deadlock in `src/`, not a
+///   missing stream, and closing it is a design decision (overlap the client's
+///   send with its receive loop, or answer the request POST `202` before running
+///   the handler) which 118.2-10 recorded in the phase's `deferred-items.md`
+///   rather than smuggling in behind a test change. `DEP_STATUS_NO_LIVE_STREAM` is
+///   the value `era_target::undelivered()` reports for ANY peer error, so the wire
+///   spelling did not have to move for the CAUSE to; that is exactly why the arm
+///   below now also asserts the `detail`.
+///
+///   The SERVER half is measured directly, and
 ///   green, by `tests/http_peer_roundtrip.rs` in the `pmcp` crate, which drives
 ///   `sample`, `list_roots` and `elicit` to completion over v1 HTTP with a client
 ///   that does hold a live stream. The v1 MECHANISM in-process is proved by
@@ -694,10 +759,11 @@ async fn v1_capability_arm(url: &url::Url) {
     );
 
     // SAMPLING and ROOTS, v1 mechanism, over StreamableHttpServer. The target
-    // now REACHES for the capability — phase 118.1 plans 08/10/11 closed the
-    // server half of G-3 — and the request is issued and then fails fast because
-    // pmcp's own client transport holds no live GET SSE stream to receive it on.
-    // See the module doc for the full account.
+    // REACHES for the capability — phase 118.1 plans 08/10/11 closed the server
+    // half of G-3 — and since phase 118.2 the request is also DELIVERED to
+    // pmcp's own client over a live GET SSE stream. What is still missing is the
+    // ANSWER, so the server waits out its dispatch budget. See the module doc
+    // for the measured before/after and for why the wire STATUS did not move.
     for tool in ["dep__request_sampling", "dep__list_roots"] {
         let result = payload(
             &client
@@ -717,11 +783,46 @@ async fn v1_capability_arm(url: &url::Url) {
                  stopped reaching the request context. That is a SERVER REGRESSION of gap G-3 — \
                  re-run `cargo nextest run -E 'binary(http_peer_roundtrip)'`, which measures the \
                  server half directly and must be green.\n\
-                 IF THIS REPORTS `{DEP_STATUS_COMPLETED}`: pmcp's `StreamableHttpTransport` \
-                 CLIENT has learned to hold a live GET SSE stream, so the round trip now lands. \
-                 That is good news — update THIS assertion and re-measure baseline rows \
-                 ERA-13/ERA-14."
+                 IF THIS REPORTS `{DEP_STATUS_COMPLETED}`: a pmcp CLIENT has learned to ANSWER a \
+                 server-to-client request issued while its own call is outstanding, so the round \
+                 trip now lands. That is good news — update THIS assertion and the detail \
+                 assertion below it, close the client-lifecycle deferred item, and re-measure \
+                 baseline rows ERA-13/ERA-14."
             ),
+        );
+
+        // THE DETAIL. The status alone is a catch-all — `undelivered()` reports
+        // it for any peer error — so it cannot tell "no stream existed" from
+        // "delivered, unanswered". Pinning the detail is what makes this arm
+        // record WHICH hop is missing, and it is measurably non-vacuous: at the
+        // phase base `cb5d1365` this same field read
+        // `BASE_FAIL_FAST_MARKER` in 0.18 s.
+        let detail = result
+            .get(DEP_RESULT_DETAIL_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "FAILURE MODE: v1 {tool} reported `{DEP_STATUS_NO_LIVE_STREAM}` with no \
+                     `{DEP_RESULT_DETAIL_FIELD}`.\n\
+                     CONSEQUENCE: the evidence for WHY the round trip did not complete is gone, \
+                     and the status alone cannot distinguish an undelivered request from an \
+                     unanswered one.\n\
+                     WHAT TO DO: restore the detail field in `era_target::undelivered()`.\n  \
+                     {result}"
+                )
+            });
+        assert!(
+            detail.contains(DISPATCH_TIMEOUT_MARKER) && !detail.contains(BASE_FAIL_FAST_MARKER),
+            "FAILURE MODE: v1 {tool} did not fail the way phase 118.2 left it failing.\n\
+             EXPECTED: a detail containing `{DISPATCH_TIMEOUT_MARKER}` and NOT containing \
+             `{BASE_FAIL_FAST_MARKER}` — the request is delivered on a live stream and the \
+             server waits out its dispatch budget for an answer.\n\
+             IF IT NOW CONTAINS `{BASE_FAIL_FAST_MARKER}`: the CLIENT has stopped holding a live \
+             GET SSE stream and the server is failing the correlation at once again. That is a \
+             REGRESSION of phase 118.2's client half — re-run \
+             `cargo nextest run -E 'binary(client_sse_stream)'` and \
+             `-E 'binary(pmcp_both_ends_logging)'` in the `pmcp` crate.\n\
+             OBSERVED: {detail}"
         );
     }
 }
