@@ -122,12 +122,36 @@ type SseStreamMap = HashMap<String, mpsc::UnboundedSender<TransportMessage>>;
 
 /// What the transport remembers about one MCP 2025-11-25 session.
 ///
-/// Both fields are private to this module: every read and write goes through an
-/// operation below, so the twin never has to model a shape it does not hold.
+/// All three fields are private to this module: every read and write goes
+/// through an operation below, so the twin never has to model a shape it does
+/// not hold.
 #[derive(Debug, Clone)]
 struct SessionInfo {
     initialized: bool,
     protocol_version: Option<String>,
+    /// The level this session's `logging/setLevel` last asked for, if it ever
+    /// asked (phase 118.2 plan 07, D-11).
+    ///
+    /// `None` means "this session never called `logging/setLevel`". The D-12
+    /// default (`info`) is applied at RESOLUTION time, not stored here, so the
+    /// two facts — "asked for nothing" and "asked for info" — stay
+    /// distinguishable in the one place that can act on the difference.
+    ///
+    /// # Why the level lives on the SESSION and not on the server
+    ///
+    /// `ServerState::server` is one `Arc<tokio::sync::Mutex<Server>>` shared by
+    /// every session. A level stored there would let client B's `setLevel`
+    /// change client A's filtering — a cross-session information-disclosure
+    /// defect (T-118.2-07-01). The per-session home is also the correct LIFETIME:
+    /// `logging/setLevel` is retired in MCP 2026-07-28, which carries the level
+    /// per request in `_meta` instead, so a v2 build allocates none of this.
+    // Why: the only reader is `session_log_level` below, whose only caller is
+    // the HTTP-ingress resolver that lands in the NEXT commit of this plan.
+    // Without this the storage commit cannot pass `RUSTFLAGS="-D warnings"`.
+    // REMOVE IT in that commit — it is a one-commit scaffold, not a standing
+    // exemption.
+    #[allow(dead_code)]
+    log_level: Option<crate::types::LoggingLevel>,
 }
 
 /// All state that exists ONLY for MCP 2025-11-25.
@@ -229,6 +253,9 @@ fn insert_session(
         SessionInfo {
             initialized,
             protocol_version,
+            // A freshly tracked session has asked for no level; `info` applies
+            // by default until it does (D-12).
+            log_level: None,
         },
     );
 }
@@ -246,6 +273,61 @@ pub(crate) fn session_protocol_version(state: &V1State, session_id: &str) -> Opt
         .read()
         .get(session_id)
         .and_then(|info| info.protocol_version.clone())
+}
+
+/// The log level a session's `logging/setLevel` last asked for, if it asked.
+///
+/// Deliberately collapses "no such session" and "session with no recorded
+/// level" into the same `None`, for exactly the reason
+/// [`session_protocol_version`] does: both cases mean "nothing overrides the
+/// default", every caller treats them identically, and the collapse removes a
+/// distinction the zero-sized twin could not represent. The D-12 default
+/// (`info`) is applied by the RESOLVER at the HTTP ingress, not here.
+///
+/// Returns an OWNED answer — [`crate::types::LoggingLevel`] is `Copy` — so the
+/// twin can produce one without a map to borrow out of.
+// Why: see `SessionInfo::log_level` — the ingress resolver that calls this lands
+// in the next commit of this plan. REMOVE the allow in that commit.
+#[allow(dead_code)]
+pub(crate) fn session_log_level(
+    state: &V1State,
+    session_id: &str,
+) -> Option<crate::types::LoggingLevel> {
+    state
+        .sessions
+        .read()
+        .get(session_id)
+        .and_then(|info| info.log_level)
+}
+
+/// Record the level a `logging/setLevel` request asked for, against ITS session.
+///
+/// THE single write path for [`SessionInfo::log_level`].
+///
+/// # A write for an unknown session id is a NO-OP, not an insert
+///
+/// That is a denial-of-service control (T-118.2-07-02), not a style choice.
+/// Minting a session row from a `logging/setLevel` would let a caller grow the
+/// session map without limit by guessing — or simply inventing — session ids,
+/// on a request that the session pipeline has not authorised. `get_mut` rather
+/// than `entry(..).or_insert(..)` is what makes that structural: there is no
+/// insertion path in this function to reach.
+///
+/// In production the transport reaches this only with the session id that
+/// `validate_non_init_session` already accepted, so the no-op arm is defence in
+/// depth rather than the common case — but it is the arm that stays correct if a
+/// future call site forgets the validation.
+// Why: see `SessionInfo::log_level` — the ingress capture that calls this lands
+// in the next commit of this plan. REMOVE the allow in that commit.
+#[allow(dead_code)]
+pub(crate) fn set_session_log_level(
+    state: &V1State,
+    session_id: &str,
+    level: crate::types::LoggingLevel,
+) {
+    if let Some(info) = state.sessions.write().get_mut(session_id) {
+        info.log_level = Some(level);
+    }
 }
 
 /// Stop tracking a v1 session.
