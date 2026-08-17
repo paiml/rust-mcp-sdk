@@ -551,3 +551,26 @@ for that measurement to close; entry 4 (the in-tree divergence) is marked `fixed
 `the_emitted_frame_satisfies_the_vendored_schemas_required_data_member` (the rewritten
 118.2-08 fence, still reading the in-repo vendored schema), and
 `property_every_delivered_log_frame_carries_a_data_member`.
+
+---
+
+## Deferred by `118.2-11` (2026-08-17) — out of scope, not fixed
+
+**`RUSTSEC-2026-0257`, `webbrowser` — resolved as a stale LOCAL lockfile, not deferred.**
+`make quality-gate`'s `audit` stage reported one vulnerability: `webbrowser 1.2.0`, "Unix
+`BROWSER` handling allows browser argument injection", advisory dated 2026-07-29, solution
+"upgrade to >= 1.2.2". It reached a direct `pmcp` dependency (`webbrowser = { version = "1",
+optional = true }`, `Cargo.toml:138`, behind the `oauth` feature).
+
+Recorded here because the diagnosis is worth not repeating: **`Cargo.lock` is gitignored in
+this repo** (`.gitignore:3`), and the declared constraint `"1"` already admits `1.2.2`. So
+this was never a repository defect and never affected CI, which resolves fresh on every run —
+it was one stale local lockfile entry. `cargo update -p webbrowser` moved `1.2.0 -> 1.2.4`
+(pulling `dispatch2 0.3.1` and `objc2-app-kit 0.3.2`), `cargo audit` went clean, and **no
+committed file changed**. Nothing to defer, and no dependency decision was taken on anyone's
+behalf.
+
+**The 7 `cargo audit` allowed-warnings are untouched and remain out of scope**, including
+`RUSTSEC-2024-0436` (`paste 1.0.15` unmaintained, via `umya-spreadsheet 3.0.0` ->
+`pmcp-workbook-compiler`). They are pre-existing, allowed by the repo's audit configuration,
+and unrelated to this plan.
