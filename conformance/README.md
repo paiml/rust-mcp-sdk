@@ -247,6 +247,25 @@ and a reader must not assume it does.
 status `ahead`, `ahead_by: 14`, `behind_by: 0`. The package pin is therefore a **strict descendant**
 of the repository pin — 14 commits newer, on the same line of history, with no divergence.
 
+> **The `compare` command above stopped working on 2026-08-17** and a substitute is recorded here so
+> a future re-pin is not blocked by it. It now returns `404 Not Found` for these two SHAs. That is
+> **not** a statement about the pins: both SHAs still resolve individually via
+> `gh api repos/modelcontextprotocol/conformance/commits/<sha>`, the repo is public and unarchived,
+> and `compare/main...main` on the *same* repo returns `identical` — so it is neither an access nor a
+> reachability problem. The same 404 reproduces on an unrelated public repo, i.e. it is upstream of
+> this project. Re-derive the verdict from the ancestry listing instead, which needs no compare:
+>
+> ```bash
+> gh api "repos/modelcontextprotocol/conformance/commits?sha=<package-gitHead>&per_page=30" \
+>   --jq '.[].sha' | grep -n '<repository-pin-sha>'
+> ```
+>
+> The 1-based line number *N* it prints is the repository pin's position walking back from the
+> package pin, so the package is `N - 1` commits ahead; the pin is **crossed** only if the SHA does
+> not appear at all (then run the same query in the other direction before concluding). Measured
+> 2026-08-17: the repository pin appears at line **15**, i.e. `ahead_by: 14`, `behind_by: 0` —
+> identical to the compare endpoint's last working answer.
+
 What that implies, and what to do:
 
 - **The package is newer (today's case).** The predicate `113-SPEC-RECHECK.md` § B.1 quotes may have
@@ -369,3 +388,68 @@ hit count, so no in-tree test encoding them needed updating.
 **When to ask again:** whenever `npm view @modelcontextprotocol/conformance dist-tags --json`
 reports an `alpha` (or a `>= 0.2.0` `latest`) newer than what section 1 names. Then follow section
 11 in full and add the outcome here.
+
+### 2026-08-17 — reviewed again, HELD at `0.2.0-alpha.11`. Still no newer release.
+
+Phase 118.2 plan 12 asked the question a second time, six days after the entry above, because D-14
+requires the pin to be moved to whatever is newest as the **final act of the phase** — so that the
+bump's delta can be reported separately from the delta produced by the phase's SDK fixes. The
+investigation returned no target, so the two deltas are not merely separable, they are separated by
+construction: **the bump delta is nil.**
+
+```
+$ npm view @modelcontextprotocol/conformance dist-tags --json
+{ "latest": "0.1.16", "alpha": "0.2.0-alpha.11" }
+
+$ npm view @modelcontextprotocol/conformance versions --json   # tail
+… "0.2.0-alpha.9", "0.2.0-alpha.10", "0.2.0-alpha.11" ]
+```
+
+- The `alpha` dist-tag still points at **the version already pinned**, and the version list still
+  ends there — nothing has been published after it.
+- The registry's `modified` timestamp is still `2026-08-07T14:01:04.026Z`, equal to `alpha.11`'s
+  publish time (`2026-08-07T14:01:03.583Z`) to the second.
+- `latest` is still the `0.1.x` line, which section 3 rules out. Note that `npm view … version`
+  reports `0.1.16` because it reads `dist-tags.latest`; that is **older** than the pin, and taking
+  it would be a downgrade, not a re-pin. Section 3's floor — "at `0.2.0-alpha.11` or later" — still
+  leaves exactly one admissible version, and it is the one already here.
+
+**Legitimacy evidence, re-run rather than copied forward** (every value identical to 2026-08-11):
+
+| Check | Result |
+|---|---|
+| `scripts.postinstall` | empty — prints nothing |
+| `gitHead` | `c321dd32035556e6769d3724a8ee97d87c3faaac`, unchanged |
+| `slopcheck install -e npm` | `1 OK`, exit 0 |
+| publisher | `GitHub Actions <npm-oidc-no-reply@github.com>`, npm **trusted publisher** OIDC (`oidcConfigId oidc:a5486a44-…`) — not a personal token |
+| maintainers | the `modelcontextprotocol` org; three `@anthropic.com` and two `@modelcontextprotocol.io` addresses |
+| `dist.integrity` | `sha512-imPK9tx5gQsL6ZKQq4MrsyDYfSaIwpRmX6+ogjbeAXs9LGvxkBxWcY7KcS7TvwaBk/ZiVWl6b/naF4q83UwDRA==`, **byte-identical to `package-lock.json` line 32** |
+
+**Run `slopcheck` from a neutral directory.** It literally executes `npm install <pkg>` in the
+current working directory, and `npm install` walks *up* the tree for a manifest. Invoked from this
+repository — which has no root `package.json` — it reached `~/package.json` and audited that
+project's 1 927 packages instead, printing npm's output and no `1 OK` verdict. Nothing was modified
+(that manifest already listed the package and its mtime did not change), but the check silently
+measured the wrong thing. `cd /tmp && slopcheck install -e npm …` gives the real answer.
+
+**Reproduction proof, again produced by execution rather than argument.** The measurement run below
+performs section 11's `npm ci --prefix conformance --ignore-scripts` itself, and it reinstalled 117
+packages from the committed lockfile with **both manifests byte-unchanged** —
+`package.json` md5 `40950a081b77e054dba9a5006e5d87e0` and `package-lock.json` md5
+`d1ce39fff5939230dd42ecd23668d31b`, the same two digests recorded on 2026-08-11.
+`git status --short conformance/` is clean. `npm install --save-exact` was again deliberately NOT
+run — it is the command that would write a new pin.
+
+**Section 10's comparison was re-run and its verdict is unchanged** (`ahead_by: 14`,
+`behind_by: 0`), but the prescribed `gh api … compare` command now 404s and the verdict had to be
+re-derived another way. See the note in section 10 for the diagnosis and the substitute command;
+this is a change in the GitHub API's behaviour, not in either pin.
+
+**The measurement.** One run, at the unchanged pin, against the gate as plan `118.2-11` hardened it
+(`target/118.2-12-conf-newpin.log`): `2025-11-25` 73 passed / 1 failed, 74 checks, 30 scored, 0
+scored failures, suite exit 0; `2026-07-28` 142 passed / 36 failed, 178 checks, 37 scored, 0 scored
+failures, suite exit 0; `CONF-01 gates PASSED`, script exit 0. Every number is identical to the
+held-pin measurement, which is the expected consequence of an unchanged pin and is recorded because
+"identical" and "not re-measured" are different facts.
+
+**When to ask again:** unchanged from the entry above.
