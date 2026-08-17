@@ -772,6 +772,23 @@ name = "s54_v2_dual_conformance"
 path = "examples/s54_v2_dual_conformance.rs"
 required-features = ["streamable-http", "testing"]
 
+# The `extra.log(..)` ALWAYS-requirement example (Phase 118.2, CONF-10).
+#
+# NO `required-features`, and that is the point rather than an omission:
+# `RequestHandlerExtra::log` / `log_with_data` / `with_log_sink` /
+# `with_log_level` are all on the DEFAULT surface, so `cargo run --example
+# s55_handler_logging` with no flags must work. Adding a guard here would hide
+# a future regression that pushed the emitter behind a feature. `s43` (the
+# handler-scoped example this one is modelled on) carries none for the same
+# reason.
+#
+# It is declared explicitly even though `autoexamples` would discover it, so
+# that the manifest — not the directory listing — is the record of which
+# examples exist and what each one needs.
+[[example]]
+name = "s55_handler_logging"
+path = "examples/s55_handler_logging.rs"
+
 [[bench]]
 name = "comprehensive_benchmarks"
 harness = false

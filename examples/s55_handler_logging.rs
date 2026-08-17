@@ -1,11 +1,13 @@
 //! Server-side logging from a tool handler: `extra.log(..)` and the level that
 //! decides what a client actually sees (Phase 118.2, CONF-10).
 //!
-//! Run it:
+//! Run with: cargo run --example s55_handler_logging
 //!
-//! ```text
-//! cargo run --example s55_handler_logging
-//! ```
+//! It finishes in well under a second: the sink is a local capture, so nothing
+//! here opens a port, spawns a transport or touches the network. Contrast
+//! `examples/s54_v2_dual_conformance.rs`, which drives the same `extra.log(..)`
+//! surface over a real streamable-HTTP server for the official conformance
+//! suite — same API, opposite end of the wiring.
 //!
 //! # What this shows
 //!
@@ -44,11 +46,20 @@
 //! * **Emitting is synchronous.** No `.await`, so a handler can log from anywhere
 //!   in its body without restructuring.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::{Arc, Mutex};
 
 use pmcp::types::{LoggingLevel, Notification};
 use pmcp::RequestHandlerExtra;
 use serde_json::json;
+
+/// The per-request notification sink's exact type, spelled once.
+///
+/// This is the signature `RequestHandlerExtra::with_log_sink` takes, so it is
+/// worth naming: it is **synchronous** and it returns `()`. A sink that cannot
+/// report failure is why `log(..)`'s `Ok(())` is not a delivery acknowledgement.
+type LogSink = Arc<dyn Fn(Notification) + Send + Sync>;
 
 /// Stand in for the transport's per-request notification sink.
 ///
@@ -56,10 +67,10 @@ use serde_json::json;
 /// request's sink at dispatch, from the transport's back-channel. Printing the
 /// serialized notification is the point — this is byte-for-byte what a connected
 /// client receives.
-fn printing_sink() -> (Arc<dyn Fn(Notification) + Send + Sync>, Arc<Mutex<usize>>) {
+fn printing_sink() -> (LogSink, Arc<Mutex<usize>>) {
     let seen = Arc::new(Mutex::new(0usize));
     let counter = Arc::clone(&seen);
-    let sink: Arc<dyn Fn(Notification) + Send + Sync> = Arc::new(move |notification| {
+    let sink: LogSink = Arc::new(move |notification| {
         *counter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
@@ -134,9 +145,16 @@ fn main() -> pmcp::Result<()> {
     // ---------------------------------------------------------------------
     // 4. No sink at all — the shape a unit test sees. Logging still succeeds.
     // ---------------------------------------------------------------------
+    //
+    //    This is the D-08 contract, and it is deliberate rather than an
+    //    oversight: with no sink attached the same three calls return `Ok(())`
+    //    and emit nothing at all — no panic, no error, no warning. The cost is
+    //    that a MISPLUMBED transport looks exactly like a quiet handler; the
+    //    benefit is that a logging handler stays unit-testable outside a
+    //    server, which is why every `#[test]` in this repo can call one.
     println!("\n[4] no sink attached — `log(..)` is Ok(()) and emits nothing");
     run_the_tool(&RequestHandlerExtra::default())?;
-    println!("    the handler is still callable outside a server");
+    println!("    the handler is still callable outside a server (D-08)");
 
     println!();
     Ok(())
