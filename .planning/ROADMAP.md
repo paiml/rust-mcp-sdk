@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 14/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
+**Plans:** 15/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
 
 - [x] 118.2-13-PLAN.md
 
@@ -2903,7 +2903,7 @@ Plans:
 **Wave 10** *(parallel — plan 16 touches no source file)*
 
 - [ ] 118.2-16-PLAN.md — Wave 10. The record: WR-03..WR-06 and IN-01..IN-06 appended to `deferred-items.md` with their review anchors and reasons, and the reasoned no-external-API `COVERAGE.md` declaration (CONF-09, CONF-10)
-- [ ] 118.2-17-PLAN.md — Wave 10. **WR-01 + WR-02**: a `watch` shutdown signal raced against the parked body read at both SSE sites (closing the idle-stream task/socket leak on drop AND on `close()`), and the resumption cursor promoted to per-reader state so a POST-stream id can never become the session GET's `Last-Event-ID` (CONF-09)
+- [x] 118.2-17-PLAN.md — Wave 10. **WR-01 + WR-02**: a `watch` shutdown signal raced against the parked body read at both SSE sites (closing the idle-stream task/socket leak on drop AND on `close()`), and the resumption cursor promoted to per-reader state so a POST-stream id can never become the session GET's `Last-Event-ID` (CONF-09)
 
 **Wave 11** *(blocked on Waves 8-10)*
 
