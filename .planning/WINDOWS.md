@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 1
+open_count: 2
 waived_count: 0
 fixed_count: 0
-total_count: 1
-last_updated: 2026-08-17T08:07:00.553Z
+total_count: 2
+last_updated: 2026-08-17T09:51:32.637Z
 ---
 
 # Broken Windows Ledger
@@ -16,6 +16,7 @@ last_updated: 2026-08-17T08:07:00.553Z
 | id | phase | kind | file | line | description | status | reason | recorded_at | resolved_at |
 |----|-------|------|------|------|-------------|--------|--------|-------------|-------------|
 | 1 | 118.2 | deviation | src/shared/streamable_http.rs |  | 118.2-03 rewrote two collected_body_cap unit tests that measured a whole-body cap the POST SSE path no longer has (parser bound + receive() refusal is the new contract) | open |  | 2026-08-17T08:07:00.553Z |  |
+| 2 | 118.2 | deviation | src/shared/streamable_http.rs |  | decode_sse_chunks_for_fuzz carries an annotated #[allow(clippy::type_complexity)] on its four-tuple return; a pub type alias was rejected to keep this plan's public-API addition at exactly one item | open |  | 2026-08-17T09:51:32.637Z |  |
 
 ````json
 [
@@ -29,6 +30,18 @@ last_updated: 2026-08-17T08:07:00.553Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-08-17T08:07:00.553Z",
+    "resolved_at": null
+  },
+  {
+    "id": 2,
+    "kind": "deviation",
+    "phase": "118.2",
+    "file": "src/shared/streamable_http.rs",
+    "line": null,
+    "description": "decode_sse_chunks_for_fuzz carries an annotated #[allow(clippy::type_complexity)] on its four-tuple return; a pub type alias was rejected to keep this plan's public-API addition at exactly one item",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-08-17T09:51:32.637Z",
     "resolved_at": null
   }
 ]
