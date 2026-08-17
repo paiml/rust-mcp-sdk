@@ -45,6 +45,15 @@
 //!   callable outside a server.
 //! * **Emitting is synchronous.** No `.await`, so a handler can log from anywhere
 //!   in its body without restructuring.
+//! * **Every frame carries `data`, and a plain `log(..)` repeats the message
+//!   there.** That is why the printed JSON below shows
+//!   `"message":"query dispatched","data":"query dispatched"` — not a bug. The
+//!   MCP schema declares `data` REQUIRED with no `message` member at all, and the
+//!   official reference client's `z.unknown()` is non-optional under zod v4, so a
+//!   frame without `data` is dropped on the floor. pmcp therefore defaults `data`
+//!   to the message and keeps `message` alongside as an extension. A
+//!   `log_with_data(..)` value is passed through verbatim and never overwritten
+//!   — the `slow query` record below shows both halves at once.
 
 #![cfg(not(target_arch = "wasm32"))]
 

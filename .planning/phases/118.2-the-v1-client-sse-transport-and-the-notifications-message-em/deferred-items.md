@@ -498,3 +498,56 @@ finding is not observable by the official suite and stays an in-tree unmet truth
 **Disposition:** G-3 sub-item (d) stays **OPEN** with its cause fully localised. The gate
 was NOT hardened and CONF-09 was NOT booked, per the plan's own STOP instruction and D-21.
 Appended to `.planning/WINDOWS.md`. Natural owner: a follow-on plan that owns `src/`.
+
+---
+
+## RESOLVED (118.2-13): the `message`-vs-`data` divergence, by Option A
+
+**Resolved:** 2026-08-17, plan `118.2-13`. This closes the two entries above — the
+118.2-08 VERDICT ("DECLARED, not fixed") and the 118.2-11 measurement that refuted its
+premise. It does NOT close the SEP-2575 v2 default or the client-lifecycle deadlock, both
+of which remain open above.
+
+**Option A, taken by the user at plan 118.2-11's blocking-human checkpoint.**
+`emit_log_record` (`src/server/cancellation.rs`) now populates `data` with the message
+string when the caller supplied none:
+
+```rust
+let data = data.unwrap_or_else(|| serde_json::Value::String(message.clone()));
+let params = crate::types::LogMessageParams::new(level, message).with_data(data);
+```
+
+* **`log_with_data(..)` is untouched** — an explicitly supplied value moves through
+  verbatim and is never overwritten. The clone lives in the `None` arm only.
+* **Both early returns stay ahead of it** — a below-bar record and a no-sink record still
+  construct no payload at all.
+* **No Rust API change.** `cargo semver-checks --baseline-rev cb5d1365 -p pmcp` reports
+  `no semver update required`; the diff on `src/types/notifications.rs` is 33 lines, all
+  `///`. That is the whole reason Option A was chosen over C: it buys conformance with no
+  semver event.
+* **`message` stays on the wire** as a pmcp extension. The schema does not close
+  `additionalProperties` and the reference client strips unknown members; the pinned
+  bundle parses the `data`-bearing frame `ok: true` with `message` also present.
+
+**Options B, C and D were rejected at the checkpoint.** D — changing only the conformance
+fixture — was rejected as gaming the referee: it turns the suite green while every real
+`extra.log` caller keeps emitting non-conformant frames.
+
+**Correcting the record.** `118.2-08` concluded "no suite scenario validates an emitted
+notification's params" and DECLARED the divergence on that basis. The premise is FALSE:
+`WireSchemaValid` is not a scenario, it is a check that runs inside scenarios over every
+frame the implementation sends. Any in-tree comment or summary still saying "do not change
+`LogMessageParams`" is stale guidance written on a falsified premise.
+
+**What this plan does NOT claim.** The suite SCORE. Re-measuring
+`2025-11-25:tools-call-with-logging` (expected 0/2 → 1/1) and `WireSchemaValid` belongs to
+plan `118.2-11` when it resumes its tasks 2-3. `WINDOWS.md` entry 8 therefore stays OPEN
+for that measurement to close; entry 4 (the in-tree divergence) is marked `fixed`.
+
+**Fences:** `tests/log_emitter.rs` —
+`a_plain_log_emits_the_required_data_member_carrying_the_message`,
+`an_explicitly_supplied_data_value_survives_verbatim`,
+`a_below_bar_record_never_reaches_the_sink_and_builds_no_payload`,
+`the_emitted_frame_satisfies_the_vendored_schemas_required_data_member` (the rewritten
+118.2-08 fence, still reading the in-repo vendored schema), and
+`property_every_delivered_log_frame_carries_a_data_member`.

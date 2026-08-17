@@ -2151,3 +2151,89 @@ fn a_below_bar_record_never_reaches_the_sink_and_builds_no_payload() {
         "a record AT the bar must still be delivered"
     );
 }
+
+/// Property arm for `make test-property` (`cargo test --features "full" --
+/// --ignored property_`).
+///
+/// The unit fences above pin the contract at chosen points; this arm asserts it
+/// as an INVARIANT over arbitrary messages and every level at or above the bar:
+///
+/// * every delivered frame has a `data` member — never absent, whichever level
+///   or message produced it;
+/// * a plain `log(..)` puts the message string there, so the two members agree;
+/// * an explicitly supplied `data` survives byte-for-byte, whatever the message
+///   is — including the adversarial case of a message that is itself the JSON
+///   text of some other value.
+///
+/// The message generator deliberately includes the empty string and text with
+/// quotes and braces: `""` is the input a "default only when non-empty" bug
+/// would slip through, and the rest would break a default implemented by string
+/// concatenation rather than by `Value::String`.
+#[test]
+#[ignore = "property arm — selected by `make test-property` (--ignored property_)"]
+fn property_every_delivered_log_frame_carries_a_data_member() {
+    use proptest::prelude::*;
+
+    // Levels at or above the bar, so every generated record is DELIVERED. The
+    // below-bar half is pinned exhaustively by
+    // `a_below_bar_record_never_reaches_the_sink_and_builds_no_payload`.
+    let at_or_above = prop::sample::select(vec![
+        LoggingLevel::Info,
+        LoggingLevel::Notice,
+        LoggingLevel::Warning,
+        LoggingLevel::Error,
+        LoggingLevel::Critical,
+        LoggingLevel::Alert,
+        LoggingLevel::Emergency,
+    ]);
+
+    proptest!(|(level in at_or_above, message in r#"[a-zA-Z0-9 {}"':,\-]{0,64}"#)| {
+        // --- a plain log(..): `data` is defaulted to the message ---
+        let capture = Capture::new();
+        let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+        extra.log(level, message.clone()).expect("log must be Ok(())");
+
+        let records = capture.json();
+        prop_assert_eq!(records.len(), 1, "a level at or above `info` must be delivered");
+        let params = records[0]
+            .pointer("/params")
+            .expect("the record carries params")
+            .clone();
+
+        prop_assert_eq!(
+            params.get("data").and_then(serde_json::Value::as_str),
+            Some(message.as_str()),
+            "every delivered frame must carry `data`, holding the message: {}",
+            params
+        );
+        prop_assert_eq!(
+            params.get("message").and_then(serde_json::Value::as_str),
+            Some(message.as_str()),
+            "and `message` must still be there alongside it: {}",
+            params
+        );
+
+        // --- log_with_data(..): the caller's value is never overwritten ---
+        let capture = Capture::new();
+        let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+        let supplied = json!({ "supplied": true, "echo": message.clone() });
+        extra
+            .log_with_data(level, message.clone(), supplied.clone())
+            .expect("log_with_data must be Ok(())");
+
+        let records = capture.json();
+        prop_assert_eq!(records.len(), 1, "the record must be delivered");
+        let params = records[0]
+            .pointer("/params")
+            .expect("the record carries params")
+            .clone();
+
+        prop_assert_eq!(
+            params.get("data"),
+            Some(&supplied),
+            "an explicitly supplied `data` must survive verbatim, never replaced by the \
+             message: {}",
+            params
+        );
+    });
+}
