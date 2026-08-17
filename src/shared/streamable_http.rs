@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use url::Url;
 
 /// Options for sending messages over streamable HTTP transport.
@@ -693,6 +693,192 @@ impl RequestParts<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The TERMINAL LATCH (Phase 118.2, CR-02).
+//
+// Before this, every terminal reason this transport produces was delivered by
+// pushing `Err(..)` onto the SAME bounded queue the responses ride. The only
+// consumer is `Client::dispatch_request`, so a reason raised while the
+// application was IDLE sat in the FIFO and failed the next, unrelated request:
+// a `tools/call` that succeeded on the wire came back reporting a session-stream
+// failure from minutes earlier, and its real answer stayed in the queue to
+// desynchronise every later call. That is a data-correctness hazard, not a
+// robustness nicety, so the reason moved OFF the queue and onto a latch.
+// ---------------------------------------------------------------------------
+
+/// Which [`TransportError`] variant a latched reason rebuilds.
+///
+/// The terminal reasons this transport produces are exactly two shapes, and the
+/// distinction is load-bearing for a consumer: an `InvalidMessage` end means the
+/// PEER's byte stream was untrustworthy, whereas a `Request` end means the
+/// stream's lifecycle ran out. Collapsing them would make the D-02/D-05
+/// corruption taxonomy indistinguishable from a spent reconnect budget, which is
+/// the very confusion `tests/client_sse_stream.rs`'s fences 5, 7 and 12 assert
+/// against in both directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalKind {
+    /// A D-02 parser overflow or a D-05 unparseable frame.
+    InvalidMessage,
+    /// A spent reconnect budget, a `405` on reconnect, a failed re-open, or a
+    /// POST response stream dropped mid-body.
+    Request,
+}
+
+/// Why this transport's stream ended, stored so it can be handed to EVERY later
+/// [`Transport::receive`] rather than to whichever caller happened to be next.
+///
+/// # Why the reason and not the `Error`
+///
+/// [`Error`] does not derive `Clone` (`src/error/mod.rs`), and neither does
+/// [`TransportError`]. A latch that stored an `Error` could therefore hand it out
+/// exactly once — which is precisely the one-shot behaviour CR-02 is about, since
+/// the caller after that one gets a hang instead. Making a PUBLIC core type
+/// `Clone` to serve a PRIVATE latch is the wrong trade: it is a permanent
+/// addition to pmcp's API surface bought to avoid a `String` clone on a path that
+/// runs at most once per stream. The reconstructable pair is stored and the
+/// `Error` is rebuilt on read.
+#[derive(Clone, Debug)]
+struct TerminalReason {
+    kind: TerminalKind,
+    message: String,
+}
+
+impl TerminalReason {
+    /// Rebuild the [`Error`] this reason stands for.
+    fn to_error(&self) -> Error {
+        let message = self.message.clone();
+        Error::Transport(match self.kind {
+            TerminalKind::InvalidMessage => TransportError::InvalidMessage(message),
+            TerminalKind::Request => TransportError::Request(message),
+        })
+    }
+}
+
+/// Classify any [`Error`] as a [`TerminalReason`].
+///
+/// TOTAL and non-panicking: the two variants this transport's terminal builders
+/// actually produce are matched exactly, and everything else maps to the
+/// `Request` family carrying the error's `Display` text. A fresh terminal site
+/// added later therefore latches something meaningful rather than being silently
+/// dropped.
+///
+/// It echoes no peer content the original error did not already carry, and both
+/// untrusted-input builders already bound their own echo:
+/// [`sse_stream_overflow`] names the limit and echoes NOTHING, and
+/// [`unparseable_sse_frame`] truncates at [`MAX_ECHOED_SSE_FRAME`]. Storing the
+/// message changes its LIFETIME, not its content (T-118.2-15-06).
+fn terminal_reason_of(error: &Error) -> TerminalReason {
+    match error {
+        Error::Transport(TransportError::InvalidMessage(message)) => TerminalReason {
+            kind: TerminalKind::InvalidMessage,
+            message: message.clone(),
+        },
+        Error::Transport(TransportError::Request(message)) => TerminalReason {
+            kind: TerminalKind::Request,
+            message: message.clone(),
+        },
+        other => TerminalReason {
+            kind: TerminalKind::Request,
+            message: other.to_string(),
+        },
+    }
+}
+
+/// The handles a reader task needs to deliver ANYTHING to the consumer.
+///
+/// # Why a bundle rather than three parameters
+///
+/// [`read_sse_body`] already took five arguments and is reached from two call
+/// sites; the per-reader cursor and the reader shutdown signal that follow this
+/// change add two more handles to the same path. Threading them individually
+/// would push `read_sse_body` and its helpers past clippy's
+/// `too_many_arguments` threshold and force an `#[allow]` onto the reader path.
+///
+/// **Extend THIS struct rather than adding a parameter.** Every reader helper
+/// takes it by reference, so a new handle costs one field and no signature
+/// churn.
+#[derive(Clone)]
+struct ReaderDelivery {
+    /// Plan 01's `Result`-carrying receive queue. Only `Ok(msg)` rides it now —
+    /// D-04's await-capacity, never-drop policy for those is unchanged.
+    sender: mpsc::Sender<Result<TransportMessage>>,
+    /// The write-once terminal slot. See [`StreamableHttpTransport::terminal`].
+    terminal: Arc<RwLock<Option<TerminalReason>>>,
+    /// The wake signal. See [`StreamableHttpTransport::terminal_signal`].
+    terminal_signal: Arc<watch::Sender<u64>>,
+}
+
+impl ReaderDelivery {
+    /// Whether the receive queue's `Receiver` is gone, i.e. the last transport
+    /// clone dropped.
+    ///
+    /// The reconnect loop's cancellation signal, checked before AND after every
+    /// backoff sleep. See [`SseReaderContext`].
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+/// Latch `error` as the reason this transport's stream ended, and wake anyone
+/// parked in [`Transport::receive`].
+///
+/// # First writer wins, and that is not arbitrary
+///
+/// The FIRST terminal reason is the CAUSAL one — a parse failure that then causes
+/// a reconnect to fail is diagnosed by the parse failure, not by the reconnect.
+/// There is one GET session-stream reader plus one detached reader per streaming
+/// POST, and each of them is otherwise entitled to overwrite the diagnosis with
+/// its own downstream symptom.
+///
+/// This write-once rule REPLACES the old "at most ONE terminal error per reader"
+/// invariant, which bounded each reader but said nothing about the transport: two
+/// readers could each deliver one error, and the consumer saw both. Now the
+/// transport as a whole surfaces exactly one reason, forever.
+///
+/// The wake uses `send_modify` and never `send`: [`watch::Sender::send`] returns
+/// `Err` when no receiver exists, which is the ordinary case for a transport
+/// nobody is currently receiving on, and treating that as a failure would make
+/// the latch write look broken every time it mattered least.
+fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
+    {
+        let mut slot = delivery.terminal.write();
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(terminal_reason_of(error));
+    }
+    // Bumped only on the write that WON, and after the guard is dropped: a woken
+    // consumer reads the latch, and waking it while still holding the write lock
+    // would hand it a lock it has to wait for.
+    delivery
+        .terminal_signal
+        .send_modify(|generation| *generation += 1);
+}
+
+/// The queue-then-latch decision inside [`Transport::receive`], as ONE step.
+///
+/// `None` means neither the queue nor the latch has anything YET, so the caller
+/// must wait. A queued message ALWAYS wins over a latch that is already set —
+/// that ordering is what makes "every message already delivered is seen before
+/// the failure" true under a latch rather than under FIFO.
+///
+/// Extracted from [`Transport::receive`] so neither it nor this exceeds the
+/// repo's cognitive-complexity budget (CLAUDE.md, cog 25) without an `#[allow]`.
+fn drain_or_latch(
+    receiver: &mut mpsc::Receiver<Result<TransportMessage>>,
+    terminal: &Arc<RwLock<Option<TerminalReason>>>,
+) -> Option<Result<TransportMessage>> {
+    match receiver.try_recv() {
+        Ok(queued) => return Some(queued),
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            return Some(Err(Error::Transport(TransportError::ConnectionClosed)))
+        },
+        Err(mpsc::error::TryRecvError::Empty) => {},
+    }
+    let latched = terminal.read().as_ref().map(TerminalReason::to_error);
+    latched.map(Err)
+}
+
 /// A streamable HTTP transport for MCP.
 ///
 /// This transport supports both stateless and stateful operation modes:
@@ -749,6 +935,45 @@ pub struct StreamableHttpTransport {
     /// `<config_surface_decision>`. Every field of THIS struct is already
     /// private, so adding one here is invisible to semver (T-113-95).
     max_collected_body_bytes: usize,
+    /// WHY this transport's stream ended, written at most once (Phase 118.2,
+    /// CR-02).
+    ///
+    /// Terminal reasons used to ride [`Self::receiver`] alongside the responses,
+    /// which meant a reason raised while the application was idle failed the next
+    /// unrelated request. They are latched here instead, and
+    /// [`Transport::receive`] consults this slot only after the queue reports
+    /// EMPTY. See [`latch_terminal_reason`] for the write-once rule.
+    ///
+    /// PRIVATE on a struct whose fields are already all private, so it is
+    /// invisible to `cargo semver-checks` for exactly the measured reason
+    /// [`Self::max_collected_body_bytes`]'s rustdoc records (T-113-95) — the same
+    /// field on the externally-constructible
+    /// [`StreamableHttpTransportConfig`] would fail
+    /// `constructible_struct_adds_field` and force a MAJOR version.
+    terminal: Arc<RwLock<Option<TerminalReason>>>,
+    /// The wake signal for a consumer already parked in [`Transport::receive`].
+    ///
+    /// Without it the latch has a lost-wakeup hole that is not theoretical: the
+    /// transport holds a [`Self::sender`] clone for its whole life, so `recv()`
+    /// never returns on its own, and a consumer parked on the queue would never
+    /// observe a latch written after it parked (T-118.2-15-05).
+    ///
+    /// A `watch` GENERATION counter and never a `Notify`:
+    /// `Notify::notify_waiters` wakes only the tasks ALREADY parked, so a signal
+    /// raised between two iterations of the receive loop is lost — the reasoning
+    /// this repo already recorded for its own test harness at
+    /// `tests/client_sse_stream.rs`'s `close_live`. A generation counter has no
+    /// such window PROVIDED the consumer subscribes BEFORE its first latch read,
+    /// which [`Transport::receive`] does as its very first act.
+    ///
+    /// Behind an `Arc` because this struct is `#[derive(Clone)]` and every field
+    /// must be. `watch::Sender` gained its own `Clone` impl only in a later tokio
+    /// than the `1.46` this crate's manifest declares as its minimum, and that
+    /// minimum is not vendored here to measure against — so the `Arc` keeps the
+    /// declared floor honest rather than resting on a version claim. It is also
+    /// the cheaper story: one shared sender, no ambiguity about what
+    /// `send_modify` on a second producer would mean.
+    terminal_signal: Arc<watch::Sender<u64>>,
 }
 
 impl Debug for StreamableHttpTransport {
@@ -818,6 +1043,9 @@ impl StreamableHttpTransport {
             .build(https);
 
         let (sender, receiver) = mpsc::channel(CLIENT_RECEIVE_QUEUE_CAPACITY);
+        // The wake signal's initial generation. Its VALUE is never read — only
+        // its changes are — so any starting point does.
+        let (terminal_signal, _) = watch::channel(0u64);
         Self {
             config: Arc::new(RwLock::new(config)),
             client,
@@ -828,6 +1056,21 @@ impl StreamableHttpTransport {
             abort_handle: Arc::new(RwLock::new(None)),
             last_event_id: Arc::new(RwLock::new(None)),
             max_collected_body_bytes: DEFAULT_MAX_COLLECTED_BODY_BYTES,
+            terminal: Arc::new(RwLock::new(None)),
+            terminal_signal: Arc::new(terminal_signal),
+        }
+    }
+
+    /// The delivery handles a reader task spawned by this transport carries.
+    ///
+    /// One place, so the GET session-stream reader and every streaming-POST
+    /// reader cannot drift over which queue they push to or which latch they
+    /// write.
+    fn reader_delivery(&self) -> ReaderDelivery {
+        ReaderDelivery {
+            sender: self.sender.clone(),
+            terminal: Arc::clone(&self.terminal),
+            terminal_signal: Arc::clone(&self.terminal_signal),
         }
     }
 
@@ -1321,7 +1564,7 @@ impl StreamableHttpTransport {
             config: Arc::clone(&self.config),
             protocol_version: Arc::clone(&self.protocol_version),
             v2_mode: Arc::clone(&self.v2_mode),
-            sender: self.sender.clone(),
+            delivery: self.reader_delivery(),
             last_event_id: Arc::clone(&self.last_event_id),
             // Read ONCE, here, through the paired accessor, so the spawned task
             // itself carries no `#[cfg]` at all.
@@ -1355,27 +1598,29 @@ impl StreamableHttpTransport {
     /// is `Clone` and shares its abort handle, so one clone's drop would kill the
     /// original's stream. See [`Transport::receive`] rule 3.
     fn spawn_sse_reader(&self, body: hyper::body::Incoming) -> tokio::task::JoinHandle<()> {
-        let sender = self.sender.clone();
+        let delivery = self.reader_delivery();
         let on_resumption = self.resumption_callback();
         let last_event_id = Arc::clone(&self.last_event_id);
         let max_buffer_size = self.max_collected_body_bytes;
 
         tokio::spawn(async move {
             let end = read_sse_body(
-                &sender,
+                &delivery,
                 &last_event_id,
                 on_resumption.as_ref(),
                 body,
                 max_buffer_size,
             )
             .await;
-            // Terminal, and latched by returning: at most ONE error per reader,
-            // so one failed stream cannot become an error storm.
+            // LATCHED rather than queued (CR-02): a POST response stream that
+            // dropped is this call's answer failing to arrive, and pushing that
+            // onto the shared queue is what let it surface as the NEXT,
+            // unrelated call's error instead.
             if let SseBodyEnd::Dropped {
                 cause: Some(error), ..
             } = end
             {
-                let _ = sender.send(Err(error)).await;
+                latch_terminal_reason(&delivery, &error);
             }
         })
     }
@@ -2101,42 +2346,85 @@ impl Transport for StreamableHttpTransport {
 
     /// Take the next server-to-client message, or the reason the stream ended.
     ///
-    /// # The five end reasons, and how they differ (Phase 118.2, D-02/D-03/D-05)
+    /// # The five end reasons, and how they differ (Phase 118.2, D-02/D-03/D-05, CR-02)
     ///
-    /// | End reason | What the reader puts on the queue | What this returns |
+    /// | End reason | How the reader delivers it | What this returns |
     /// |---|---|---|
-    /// | A message arrived | `Ok(msg)` | `Ok(msg)` |
-    /// | Parser overflow (D-02) | `Err(TransportError::InvalidMessage)` naming the parser bound and echoing NO body content; NOT retried | that error, exactly once, after every already-queued message |
-    /// | Unparseable frame (D-05) | `Err(TransportError::InvalidMessage)` naming the parse failure, with any echoed frame text truncated to a 200-character bound; NOT retried | as above |
-    /// | Reconnect budget exhausted (D-03) | `Err(TransportError::Request)` naming the exhausted budget | as above |
+    /// | A message arrived | `Ok(msg)` on the receive QUEUE | `Ok(msg)` |
+    /// | Parser overflow (D-02) | LATCHED as `TransportError::InvalidMessage`, naming the parser bound and echoing NO body content; NOT retried | that error, after every already-queued message, and on every later call |
+    /// | Unparseable frame (D-05) | LATCHED as `TransportError::InvalidMessage`, naming the parse failure, with any echoed frame text truncated to a 200-character bound; NOT retried | as above |
+    /// | Reconnect budget exhausted (D-03) | LATCHED as `TransportError::Request`, naming the exhausted budget | as above |
     /// | Ordinary EOF, or a deliberate [`Transport::close`] / last-transport-drop | NOTHING — the reader exits silently | this keeps awaiting, exactly as before |
     ///
     /// Three rules make that taxonomy hold:
     ///
-    /// 1. **FIFO is the ordering guarantee.** A terminal `Err` is queued BEHIND
-    ///    every message already delivered, so a consumer sees all successfully
-    ///    parsed frames before the failure. That is why the reason rides the
-    ///    queue rather than a side slot — a slot would have to be polled, and
-    ///    the transport holds a `Sender` clone for its whole life, so `recv()`
-    ///    never returns `None` on its own.
-    /// 2. **At most ONE terminal error per reader.** The reader returns
-    ///    immediately after a successful terminal send, so one corrupt frame
-    ///    cannot become an error storm.
+    /// 1. **The queue is drained before the latch is consulted.** Every message
+    ///    already queued is delivered BEFORE the reason is surfaced, so a
+    ///    consumer still sees all successfully parsed frames — including a log
+    ///    record or a server-to-client request that arrived just before the
+    ///    failure — ahead of it. The reason does NOT ride the queue: it used to,
+    ///    and because the queue has exactly one consumer, a reason raised while
+    ///    the application was idle was handed to the next, unrelated request
+    ///    instead (CR-02). Ordering is now a property of this method's read
+    ///    order rather than of the channel.
+    /// 2. **The latch is write-once for the whole transport.** The FIRST
+    ///    terminal reason wins and later ones are discarded, so one corrupt
+    ///    frame cannot become an error storm even across the GET reader and the
+    ///    detached reader of every streaming POST. See `latch_terminal_reason`.
     /// 3. **A failed send means the receiver is gone**, so the reader RETURNS
     ///    rather than retrying. That is what makes "dropping the last transport
     ///    clone terminates the reader" true without a `Drop` impl — impossible
     ///    here anyway, since the transport is `Clone` and shares its abort
     ///    handle, so one clone's drop would kill the original's stream.
     ///
-    /// The public signature is unchanged; only the private queue's element type
-    /// moved, which `cargo semver-checks` cannot see.
+    /// # The terminal reason is STICKY — stop on it, do not loop
+    ///
+    /// Once a stream has ended terminally, EVERY subsequent `receive()` returns
+    /// that same error immediately rather than blocking. A consumer that loops on
+    /// `receive()` and merely logs each error will therefore spin in a hot loop
+    /// instead of hanging. **The contract is to stop on a terminal error.**
+    ///
+    /// That is a deliberate trade over a one-shot reason: one-shot restores
+    /// exactly the hazard CR-02 is about, where the reason is consumed by
+    /// whichever caller happened to be next and every caller after that gets an
+    /// unexplained hang.
+    ///
+    /// The public signature is unchanged, and both the queue's element type and
+    /// the latch are private, which `cargo semver-checks` cannot see.
     async fn receive(&mut self) -> Result<TransportMessage> {
-        // Receive from channel - this will block until a message is available
+        // Subscribed FIRST, before the queue lock and before the first latch
+        // read, so there is no lost-wakeup window: any latch write from here on
+        // bumps a generation this receiver has not yet observed
+        // (T-118.2-15-05).
+        let mut signal = self.terminal_signal.subscribe();
         let mut receiver = self.receiver.lock().await;
-        receiver
-            .recv()
-            .await
-            .ok_or_else(|| Error::Transport(TransportError::ConnectionClosed))?
+        loop {
+            if let Some(outcome) = drain_or_latch(&mut receiver, &self.terminal) {
+                return outcome;
+            }
+            tokio::select! {
+                // `biased` so the QUEUE is polled first: a message that lands in
+                // the same instant a reason is latched must still be delivered
+                // ahead of it.
+                biased;
+                queued = receiver.recv() => {
+                    return queued
+                        .ok_or_else(|| Error::Transport(TransportError::ConnectionClosed))?;
+                },
+                signalled = signal.changed() => {
+                    if signalled.is_err() {
+                        // Unreachable while `self` lives — the transport owns the
+                        // `watch::Sender` — but degrading to the queue alone
+                        // rather than looping keeps a would-be hot spin
+                        // impossible by construction.
+                        return receiver
+                            .recv()
+                            .await
+                            .ok_or_else(|| Error::Transport(TransportError::ConnectionClosed))?;
+                    }
+                },
+            }
+        }
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -2297,7 +2585,7 @@ enum SseBodyEnd {
 /// be constructed outside hyper, so every part of this path that CAN be reached
 /// from a test is.
 async fn read_sse_body(
-    sender: &mpsc::Sender<Result<TransportMessage>>,
+    delivery: &ReaderDelivery,
     last_event_id: &Arc<RwLock<Option<String>>>,
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     body: hyper::body::Incoming,
@@ -2307,7 +2595,7 @@ async fn read_sse_body(
     let mut progress = SseProgress::default();
     loop {
         if !drain_pending_events(
-            sender,
+            delivery,
             last_event_id,
             on_resumption,
             &mut state,
@@ -2328,9 +2616,10 @@ async fn read_sse_body(
             None => {},
             Some(SseFrameStop::Dropped(error)) => return progress.dropped(Some(error)),
             Some(SseFrameStop::Corrupt(error)) => {
-                // Terminal, and latched by returning: at most ONE error per
-                // reader, so one corrupt frame cannot become an error storm.
-                let _ = sender.send(Err(error)).await;
+                // LATCHED rather than queued (CR-02), and the reader still
+                // RETURNS: the latch is write-once transport-wide, so one corrupt
+                // frame cannot become an error storm even across readers.
+                latch_terminal_reason(delivery, &error);
                 return SseBodyEnd::Ended;
             },
         }
@@ -2369,7 +2658,7 @@ impl SseProgress {
 /// along the natural seam: this owns the per-EVENT rules, the caller owns the
 /// per-BODY ones.
 async fn drain_pending_events(
-    sender: &mpsc::Sender<Result<TransportMessage>>,
+    delivery: &ReaderDelivery,
     last_event_id: &Arc<RwLock<Option<String>>>,
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     state: &mut SseReadState,
@@ -2382,7 +2671,7 @@ async fn drain_pending_events(
         if let Some(millis) = event.retry {
             progress.retry = Some(Duration::from_millis(millis));
         }
-        if !deliver_sse_event(sender, last_event_id, on_resumption, event).await {
+        if !deliver_sse_event(delivery, last_event_id, on_resumption, event).await {
             return false;
         }
         progress.delivered = true;
@@ -2530,7 +2819,7 @@ fn truncate_sse_frame(text: &str) -> String {
 /// `sender.send` means the receiver was dropped — the last transport clone is
 /// gone — so the reader RETURNS rather than retrying.
 async fn deliver_sse_event(
-    sender: &mpsc::Sender<Result<TransportMessage>>,
+    delivery: &ReaderDelivery,
     last_event_id: &Arc<RwLock<Option<String>>>,
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     event: crate::shared::sse_parser::SseEvent,
@@ -2542,11 +2831,12 @@ async fn deliver_sse_event(
         }
     }
     match crate::shared::StdioTransport::parse_message(event.data.as_bytes()) {
-        Ok(message) => sender.send(Ok(message)).await.is_ok(),
+        // A successfully parsed message still rides the QUEUE, with D-04's
+        // await-capacity, never-drop policy exactly as it was. Only the `Err`
+        // arm moved onto the latch (CR-02).
+        Ok(message) => delivery.sender.send(Ok(message)).await.is_ok(),
         Err(cause) => {
-            let _ = sender
-                .send(Err(unparseable_sse_frame(&cause, &event.data)))
-                .await;
+            latch_terminal_reason(delivery, &unparseable_sse_frame(&cause, &event.data));
             false
         },
     }
@@ -2679,11 +2969,11 @@ pub fn decode_sse_chunks_for_fuzz(
 /// **This struct therefore has NO `abort_handle` field, deliberately.** Its two
 /// termination signals are instead:
 ///
-/// 1. `sender.send(..)` returning `Err` — the receive queue's `Receiver` is
-///    gone, so there is nobody to deliver to; and
-/// 2. `sender.is_closed()`, checked BEFORE and AFTER every backoff sleep, which
-///    is what makes a dropped transport stop a loop that is asleep rather than
-///    reading.
+/// 1. `delivery.sender.send(..)` returning `Err` — the receive queue's
+///    `Receiver` is gone, so there is nobody to deliver to; and
+/// 2. `delivery.is_closed()`, checked BEFORE and AFTER every backoff sleep,
+///    which is what makes a dropped transport stop a loop that is asleep rather
+///    than reading.
 ///
 /// Both go true the moment the last transport clone drops the `Receiver`.
 ///
@@ -2706,9 +2996,9 @@ struct SseReaderContext {
     /// Read by the shared request builder to decide session-header suppression
     /// and v2 routing headers.
     v2_mode: Arc<AtomicBool>,
-    /// Plan 01's `Result`-carrying receive queue, and this task's liveness
-    /// signal.
-    sender: mpsc::Sender<Result<TransportMessage>>,
+    /// Everything this task delivers through: plan 01's receive queue (its
+    /// liveness signal too) and CR-02's terminal latch with its wake signal.
+    delivery: ReaderDelivery,
     /// Where a delivered event's id is recorded, and what
     /// [`Self::reconnect_cursor`] reads back out on the `v1-compat` build.
     last_event_id: Arc<RwLock<Option<String>>>,
@@ -2840,7 +3130,7 @@ impl SseReaderContext {
             // behaviour depend on whether some caller paused the clock.
             let opened_at = std::time::Instant::now();
             let end = read_sse_body(
-                &self.sender,
+                &self.delivery,
                 &self.last_event_id,
                 self.on_resumption.as_ref(),
                 body,
@@ -2863,18 +3153,18 @@ impl SseReaderContext {
             if attempt >= MAX_SSE_RECONNECT_ATTEMPTS {
                 // Do NOT go quiet: a reader that simply stops is
                 // indistinguishable from a healthy idle stream.
-                let _ = self
-                    .sender
-                    .send(Err(reconnect_budget_exhausted(attempt, cause.as_ref())))
-                    .await;
+                latch_terminal_reason(
+                    &self.delivery,
+                    &reconnect_budget_exhausted(attempt, cause.as_ref()),
+                );
                 return;
             }
 
-            if self.sender.is_closed() {
+            if self.delivery.is_closed() {
                 return;
             }
             tokio::time::sleep(next_reconnect_delay(attempt, retry)).await;
-            if self.sender.is_closed() {
+            if self.delivery.is_closed() {
                 return;
             }
             attempt += 1;
@@ -2884,14 +3174,11 @@ impl SseReaderContext {
             match self.open_sse_once(self.reconnect_cursor()).await {
                 Ok(Some(reopened)) => body = reopened,
                 Ok(None) => {
-                    let _ = self.sender.send(Err(reconnect_stream_gone(attempt))).await;
+                    latch_terminal_reason(&self.delivery, &reconnect_stream_gone(attempt));
                     return;
                 },
                 Err(error) => {
-                    let _ = self
-                        .sender
-                        .send(Err(reconnect_open_failed(attempt, &error)))
-                        .await;
+                    latch_terminal_reason(&self.delivery, &reconnect_open_failed(attempt, &error));
                     return;
                 },
             }
