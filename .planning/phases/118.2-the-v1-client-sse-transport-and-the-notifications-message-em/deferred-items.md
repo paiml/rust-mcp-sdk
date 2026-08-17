@@ -360,3 +360,77 @@ only when `extra.log_level.is_some()`, with the gap named in a comment at the
 guard so the next reader cannot mistake the guard for the fix. Appended to
 `.planning/WINDOWS.md` so it is visible at ship time. Natural owner: the phase
 that measures the suite (118.2-11) or a follow-on `src/` plan.
+
+## DEFERRED (118.2-10): there is no `Client`-level notification observation API
+
+**Measured, not inferred.** `Client::notification_tx: Option<mpsc::Sender<Notification>>`
+is initialised to `None` at ALL THREE construction sites — `src/client/mod.rs:406`,
+`:453` and `:496` — `ClientBuilder` has no field for it and no setter, and the only
+other reference in the file is the `Clone` impl at `:5263`. The forwarding branch
+inside `dispatch_request`'s wait loop (`:3764`) is therefore permanently dead: a
+`notifications/message` that reaches a `pmcp::Client` while one of its own requests is
+outstanding is run through the middleware chain and then **dropped on the floor**.
+
+**Consequence for a consumer.** Phase 118.2 gave the SDK a complete server-to-client
+log channel — the handler emits (`extra.log`, plan 05), the sink is attached at both
+dispatch roots (plan 06), the level is resolved per era (plan 07), the record is framed
+onto the v1 session stream, and pmcp's own transport now READS that stream live
+(plans 01-04). `tests/pmcp_both_ends_logging.rs` proves the whole path end to end. But
+an application built on `pmcp::Client` still cannot SEE those records without dropping
+to `Transport::receive()` itself, which means giving up the `Client` API entirely.
+
+**Why 118.2-10 did not build it.** This plan's `files_modified` are two test files, and
+the API is genuinely additive NEW SCOPE the phase did not plan for: it needs a design
+decision (a builder callback `ClientBuilder::on_notification(..)` versus a
+`Client::subscribe_notifications() -> Receiver<Notification>` versus both), a semver
+verdict, and its own CLAUDE.md ALWAYS-requirement package (fuzz / property / unit /
+example). Folding it in under the joint fence would have been a new public surface
+added under time pressure — exactly T-118.2-10-04.
+
+**Disposition:** the joint fence asserts at the TRANSPORT layer instead, which satisfies
+D-15.3's "pmcp on both ends" literally and adds zero public API, so the phase's
+`cargo semver-checks` verdict stays clean. This entry is the record that the DX gap is
+real and known. Natural owner: a follow-on client-DX plan, not a conformance phase.
+
+## FINDING (118.2-10): a pmcp CLIENT cannot ANSWER a server-to-client request issued during its own call
+
+**Measured with a scratch probe during 118.2-10, and it moves the residual that
+`crates/pmcp-team-servers/tests/era_matrix.rs` has been recording.**
+
+The probe drove a real `StreamableHttpTransport` against a real `StreamableHttpServer`
+whose tool reaches for `extra.peer().sample(..)`, issuing the `tools/call` POST on one
+transport clone and draining `Transport::receive()` on another. What the client's own
+queue saw, verbatim:
+
+```
+PROBE frame 0: Request { id: String("dispatch-1"), request: Client(CreateMessage(CreateMessageParams { .. })) }
+PROBE frame 1: TIMEOUT
+```
+
+So **delivery is fixed**: the server's `sampling/createMessage` request reaches pmcp's
+own client over the live v1 session stream. What still fails is the ANSWER, and the
+reason is a lifecycle deadlock rather than a missing stream:
+
+* the server holds the `tools/call` POST open for the whole duration of the handler,
+  answering `202` only after it returns;
+* `Client::dispatch_request` (`src/client/mod.rs`) awaits `transport.send(..)` to
+  COMPLETE before it enters the receive loop that would dispatch the inbound request;
+* so the client is parked inside `send()`, cannot answer, and the server's peer request
+  expires — `Protocol error: -32001 - Server request dispatch-1 timed out`.
+
+Measured in the first probe run: `send within bound: Elapsed(())` at a 10 s bound, on a
+call whose handler was waiting for the client.
+
+**Not fixed here, and not fixable inside this plan's `files_modified`.** Both candidate
+fixes are `src/` behaviour changes to a core path with their own ALWAYS-requirement
+package and semver verdict: either `Client::dispatch_request` must overlap its outbound
+send with its receive loop, or the server must answer the request POST `202` before
+running the handler (detached dispatch). Choosing between them is a design decision, not
+a bug fix, which is deviation Rule 4 territory.
+
+**Disposition:** `deprecated_capabilities_complete_under_both_eras` therefore keeps
+asserting `no-live-stream` — the value `era_target::undelivered()` reports for ANY peer
+error — but 118.2-10 STRENGTHENED it to also pin the `detail`, so the fence now records
+WHICH hop is missing instead of implying the stream is dead. The module doc records the
+fixed state, the pre-fix state, and this residual. Appended to `.planning/WINDOWS.md`.
+Natural owner: a follow-on client-lifecycle plan.
