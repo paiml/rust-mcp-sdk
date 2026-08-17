@@ -4307,7 +4307,7 @@ mod tests {
         #[test]
         fn a_peer_value_below_the_floor_is_raised_to_it() {
             assert_eq!(
-                next_reconnect_delay(0, Some(MIN_SSE_RECONNECT_DELAY - STEP)),
+                next_reconnect_delay(0, Some(MIN_SSE_RECONNECT_DELAY.saturating_sub(STEP))),
                 MIN_SSE_RECONNECT_DELAY,
                 "one millisecond under the floor is still under the floor"
             );
@@ -4335,8 +4335,8 @@ mod tests {
         #[test]
         fn a_peer_value_just_below_the_ceiling_is_honoured_verbatim() {
             assert_eq!(
-                next_reconnect_delay(0, Some(MAX_SSE_RECONNECT_DELAY - STEP)),
-                MAX_SSE_RECONNECT_DELAY - STEP,
+                next_reconnect_delay(0, Some(MAX_SSE_RECONNECT_DELAY.saturating_sub(STEP))),
+                MAX_SSE_RECONNECT_DELAY.saturating_sub(STEP),
                 "the ceiling is likewise a bound, not an overwrite"
             );
         }
@@ -4413,7 +4413,7 @@ mod tests {
             assert!(
                 !budget_reset_earned(
                     true,
-                    RECONNECT_BUDGET_RESET_UPTIME - Duration::from_millis(1)
+                    RECONNECT_BUDGET_RESET_UPTIME.saturating_sub(Duration::from_millis(1))
                 ),
                 "one millisecond under the threshold is still a bounce"
             );
