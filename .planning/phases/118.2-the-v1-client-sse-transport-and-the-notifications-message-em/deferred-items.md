@@ -116,3 +116,30 @@ to plans 04, 06, 07, 08 and 09 and are out of 118.2-05's scope.
 or a single sweep should fix all 7. Until then `make quality-gate` fails at
 `lint-plans` for a reason unrelated to any source change — a SECOND pre-existing
 blocker stacked on top of the `fmt-check` one recorded above.
+
+## `make audit` fails on pre-existing dependency advisories (found during 118.2-03)
+
+`make quality-gate`'s `audit` step (`cargo audit`) exits 2 at the branch tip on
+advisories in third-party crates. One VULNERABILITY plus six unmaintained /
+unsound warnings:
+
+| Crate | ID | Class |
+|-------|----|-------|
+| `webbrowser` | RUSTSEC-2026-0257 | vulnerability |
+| `paste` | RUSTSEC-2024-0436 | unmaintained |
+| `smartstring` | RUSTSEC-2026-0249 | unmaintained |
+| `anyhow` | RUSTSEC-2026-0190 | unsound |
+| `event-listener` | RUSTSEC-2026-0221 | unsound |
+| `lru` | RUSTSEC-2026-0253 | unsound |
+| `rand` | RUSTSEC-2026-0097 | unsound |
+| `scc` | RUSTSEC-2026-0205 | unsound |
+
+**Provenance:** plan 118.2-03 changed four `.rs` files and NO manifest —
+`git status --short -- Cargo.toml Cargo.lock` is empty across all of its commits
+— so none of these can have been introduced by it. They are a dependency-tree
+fact of the branch tip, and closing them means bumping or dropping third-party
+crates.
+
+**Disposition:** out of scope for phase 118.2, which touches no dependency. It is
+a THIRD pre-existing blocker on `make quality-gate`, stacked on the `fmt-check`
+and (now-cleared) `lint-plans` ones above. Needs its own dependency-hygiene pass.
