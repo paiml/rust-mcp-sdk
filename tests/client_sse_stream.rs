@@ -23,7 +23,7 @@
 //! # The SECOND collect site (plan 03)
 //!
 //! Fences 8-10 ask the same question of the OTHER whole-body collect: the POST
-//! that answers `text/event-stream`. In StreamableHTTP such a POST stays open for
+//! that answers `text/event-stream`. In `StreamableHTTP` such a POST stays open for
 //! the whole call and can carry notifications **and server-to-client requests**
 //! before its result frame. Collecting it whole means progress arrives only after
 //! the call ends — and an in-tool elicitation over a POST stream deadlocks
@@ -424,7 +424,7 @@ async fn serve_get(
 /// Answer a POST with a chunked `text/event-stream` that NEVER ends (plan 03).
 ///
 /// The SAME shape as [`serve_get`], on the SECOND stream source and the SECOND
-/// open-connection counter. This is the response a StreamableHTTP server gives
+/// open-connection counter. This is the response a `StreamableHTTP` server gives
 /// to a `tools/call` it wants to narrate: notifications and server-to-client
 /// requests ride it, and the result frame closes it.
 async fn serve_post_sse(
@@ -608,7 +608,7 @@ fn server_request_frame(id: &str) -> String {
     format!("event: message\ndata: {payload}\n\n")
 }
 
-/// The id of the client's own outbound `ping` request, if it has been POSTed.
+/// The id of the client's own outbound `ping` request, if it has been `POSTed`.
 fn outbound_ping_id(server: &RecordingServer) -> Option<Value> {
     server.post_bodies().into_iter().find_map(|body| {
         (body.get("method").and_then(Value::as_str) == Some("ping"))
@@ -617,7 +617,7 @@ fn outbound_ping_id(server: &RecordingServer) -> Option<Value> {
     })
 }
 
-/// Whether the client has POSTed a JSON-RPC RESULT for `id`.
+/// Whether the client has `POSTed` a JSON-RPC RESULT for `id`.
 fn answered(server: &RecordingServer, id: &str) -> bool {
     server.post_bodies().iter().any(|body| {
         body.get("id").and_then(Value::as_str) == Some(id) && body.get("result").is_some()

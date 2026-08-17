@@ -1715,7 +1715,7 @@ impl StreamableHttpTransport {
         // lifetime is bounded by the send-failure rule instead — see
         // `Self::spawn_sse_reader`.
         if content_type.contains(TEXT_EVENT_STREAM) {
-            let _ = self.spawn_sse_reader(response.into_body());
+            drop(self.spawn_sse_reader(response.into_body()));
             return Ok(());
         }
 
