@@ -4,17 +4,17 @@ milestone: v2.5
 milestone_name: MCP Spec 2026-07-28
 current_phase: 118.2
 current_phase_name: the-v1-client-sse-transport-and-the-notifications-message-em
-status: verifying
+status: executing
 stopped_at: Completed 118.2-12-PLAN.md (Task 3 checkpoint approved 2026-08-17; re-pin held at 0.2.0-alpha.11, bump delta nil)
-last_updated: "2026-08-17T14:36:19.015Z"
+last_updated: "2026-08-17T17:35:23.014Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 118.2 execution started
 progress:
   total_phases: 11
   completed_phases: 10
-  total_plans: 154
+  total_plans: 159
   completed_plans: 154
-  percent: 91
+  percent: 82
 ---
 
 # Project State
@@ -37,7 +37,7 @@ Two deltas, never summed — SDK fixes `72/2 exit 1` → `73/1 exit 0` (`GAP_ATT
 Plans complete: **3 of 14** for Phase 118.1 (118.1-01, 118.1-02, 118.1-03); Phase 118 itself is
 10/10 with `118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
 Remaining: Phase 118.1 plans 04-14 (G-3..G-9), then Phase 119 (docs)
-Status: Phase complete — ready for verification
+Status: Ready to execute
 deliberately-RED fences were turned green by 118.1-03's emitter fix, not by weakening them:
 `tests/embedded_resource_golden.rs` is 10/10 with `git diff` on that file EMPTY since `2ab06a44`,
 and `cargo +nightly fuzz run content_tolerant_reader -- -max_total_time=300` completes 5,713,406
