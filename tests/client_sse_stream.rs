@@ -1610,17 +1610,20 @@ async fn a_post_sse_reader_terminates_when_its_owning_transport_is_dropped() {
     // Drop EVERY transport clone. There is deliberately no `Drop` impl to rely
     // on: `StreamableHttpTransport` is `Clone` and shares its abort handle, so a
     // `Drop` impl would let one clone's drop kill the original's stream. The
-    // contract is the send-failure signal instead — dropping the last clone
-    // drops the receive queue's `Receiver`, so the reader's next
-    // `sender.send(..).await` returns `Err` and the reader RETURNS.
+    // contract is the receive queue instead — dropping the last clone drops the
+    // queue's `Receiver`, which BOTH fails the reader's next
+    // `sender.send(..).await` AND resolves the `sender.closed()` arm the reader
+    // races against its parked body read (WR-01).
     drop(transport);
 
-    // One frame, purely so the reader HAS a next send to fail. A reader that
-    // ignores its send result keeps the body alive and this fence stays red.
-    server
-        .push_post_frame(progress_frame("orphan", "fence-10", 1, None))
-        .await;
-
+    // NOTHING is pushed. This fence used to write one frame here "purely so the
+    // reader HAS a next send to fail", and that crutch WAS the measurement gap
+    // WR-01 names: a reader must stop on a stream that is open and IDLE, not only
+    // on one that hands it a send to fail. A server holding this body open with
+    // SSE keep-alive comments — the standard idle keepalive — produces no events
+    // at all, so the send-failure signal never fires and the reader stays parked
+    // in `body.frame()` holding a live socket. The shutdown race added for WR-01
+    // is what makes the assertion below true with no frame at all.
     assert!(
         wait_for(|| server.open_post_connections() == 0).await,
         "a returned reader drops the response body, which closes the connection — {} POST \
@@ -2172,6 +2175,289 @@ async fn a_response_whose_id_does_not_match_is_not_returned_as_this_calls_answer
          about a request that was never sent would pass against any tree. Observed POST bodies: \
          {:?}",
         server.post_bodies()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fences 18-20 — WR-01 (a reader parked on an IDLE-but-open stream never
+// observes shutdown, so a task and a socket leak) and WR-02 (the resumption
+// cursor is shared across streams, so a reconnect can resume from ANOTHER
+// stream's event id).
+//
+// Why the existing 17 fences cannot reach either:
+//
+// * Every termination signal this phase documents needs the reader to ACT. The
+//   failing `sender.send(..)` needs a frame to send; the two `is_closed()`
+//   checks need the loop to reach its backoff sleep. A server holding the
+//   stream open with SSE keep-alive comments — the standard idle keepalive —
+//   produces no events at all, so the reader parks in `body.frame()` and
+//   neither signal ever fires. Fence 10 hid this by pushing a frame on purpose;
+//   that crutch is gone as of this plan.
+// * `close()` aborts exactly ONE `JoinHandle` — the GET session reader's. Every
+//   reader spawned per streaming POST is DETACHED (`drop(spawn_sse_reader(..))`)
+//   and there is no bound on how many exist, so each one survives `close()`
+//   outright.
+// * Fence 11 proves the re-opened GET carries A cursor, but a GET-only scenario
+//   has exactly one writer, so the shared cursor and the per-stream one agree.
+//   Only a scenario with a GET and a streaming POST live at the SAME TIME can
+//   tell them apart.
+// ===========================================================================
+
+/// The event id the GET session stream delivers in fence 20.
+///
+/// Distinguishable from [`POST_STREAM_EVENT_ID`] by VALUE, because the whole
+/// subject of that fence is WHICH stream's id reached the reconnect's
+/// `Last-Event-ID` header.
+const GET_STREAM_EVENT_ID: &str = "get-stream-e11";
+
+/// The event id the streaming POST response delivers in fence 20 — the id that
+/// must NEVER become the session stream's resume point.
+const POST_STREAM_EVENT_ID: &str = "post-stream-e97";
+
+/// How many `receive()` pops fence 20 will make while looking for its two
+/// frames.
+///
+/// One queue serves both streams, so arrival ORDER is not guaranteed and the
+/// fence matches on payload instead. The cap exists so a tree that delivers
+/// neither frame fails on its subject rather than looping forever; it is not a
+/// synchronisation device — each pop is itself bounded by [`BOUND`].
+const CROSS_STREAM_POPS: usize = 6;
+
+// ===========================================================================
+// Fence 18 — WR-01, the dropped-transport half: a reader parked on an
+// idle-but-open GET session stream stops when the last transport clone drops.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_reader_parked_on_an_idle_open_stream_stops_when_the_transport_is_dropped() {
+    let server = RecordingServer::start().await;
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+
+    assert!(
+        wait_for(|| server.open_get_connections() >= 1).await,
+        "the session stream must be OPEN server-side before it can be leaked. Observed request \
+         lines: {:?}",
+        server.request_lines()
+    );
+
+    // NOTHING is ever pushed on this stream, and that is the whole point: the
+    // reader never attempts a send, so the send-failure signal stays silent, and
+    // it never reaches a backoff sleep, so both `is_closed()` checks stay
+    // unreached. This is the peer shape WR-01 names — a server that holds the
+    // session stream open and sends only keep-alive comments, which the shared
+    // parser drops without producing an event.
+    assert_eq!(
+        server.frames_written(),
+        0,
+        "this fence measures an IDLE stream; a frame written here would restore exactly the crutch \
+         fence 10 just lost"
+    );
+
+    drop(transport);
+
+    assert!(
+        wait_for(|| server.open_get_connections() == 0).await,
+        "a reader parked on an idle-but-open body must STOP when the last transport clone is \
+         dropped — {} GET stream(s) were still open at the SERVER. `abort_handle` holds a \
+         `JoinHandle`, and dropping a `JoinHandle` DETACHES rather than aborts, and there is no \
+         `Drop` impl on the transport, so a dropped transport otherwise leaves a live task holding \
+         a live TCP connection until the SERVER times it out. In a process that creates and drops \
+         transports in a loop — a pool, a CLI, a test suite — that is an unbounded task and \
+         file-descriptor leak whose duration the PEER chooses (T-118.2-17-01)",
+        server.open_get_connections()
+    );
+
+    // And nothing comes BACK: a reader that stopped must not have been mistaken
+    // for a dropped stream worth reconnecting.
+    let gets = server.get_lines();
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        server.open_get_connections(),
+        0,
+        "no session stream may re-open after the transport is gone"
+    );
+    assert_eq!(
+        server.get_lines(),
+        gets,
+        "and no further GET may be issued — a shutdown that surfaced as a retryable DROP would send \
+         the reconnect loop chasing a transport nobody owns. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 19 — WR-01, the `close()` half: a DETACHED POST-response reader is
+// stopped by `close()`, which aborts only the GET session reader's handle.
+// ===========================================================================
+
+#[tokio::test]
+async fn close_stops_a_detached_post_response_reader() {
+    let server = RecordingServer::start().await;
+    server.answer_post_with_sse("ping");
+    let mut transport = transport_for(&server);
+
+    timeout(BOUND, transport.send(ping_request("fence-19")))
+        .await
+        .expect("the POST returns as soon as the stream is open — a hang here IS the defect")
+        .expect("the harness answers the POST with a 200 text/event-stream");
+    assert!(
+        wait_for(|| server.open_post_connections() >= 1).await,
+        "the POST stream must be open before close() can be asked to stop it. Observed request \
+         lines: {:?}",
+        server.request_lines()
+    );
+
+    // `close()`, NOT drop. The transport stays alive for the whole assertion
+    // below, so the receive queue's `Receiver` is still held and the
+    // send-failure/`sender.closed()` path is NOT what could stop this reader —
+    // an explicit close is.
+    timeout(BOUND, transport.close())
+        .await
+        .expect("close() returns within BOUND")
+        .expect("close() succeeds against this harness");
+
+    assert!(
+        wait_for(|| server.open_post_connections() == 0).await,
+        "close() must stop EVERY reader, not only the GET session reader whose `JoinHandle` it \
+         aborts — {} POST stream(s) were still open at the SERVER. Each streaming POST spawns a \
+         DETACHED reader (`drop(spawn_sse_reader(..))`) with no bound on how many exist, so on the \
+         unfixed tree every one of them survives close() outright and keeps reading a \
+         peer-controlled socket that the application has explicitly finished with \
+         (T-118.2-17-02)",
+        server.open_post_connections()
+    );
+
+    // It stays closed, and the transport is still alive while we check — so this
+    // is close()'s doing and not a drop's.
+    let written = server.frames_written();
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        server.open_post_connections(),
+        0,
+        "no POST stream may re-open after close()"
+    );
+    assert_eq!(
+        server.frames_written(),
+        written,
+        "nothing may still be consuming the stream a full QUIET after close()"
+    );
+    assert!(
+        transport.is_connected(),
+        "the transport itself is still alive here — a fence that had dropped it would be measuring \
+         fence 10's signal instead of close()'s"
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 20 — WR-02: a cursor minted on a streaming POST response must never
+// become the session stream's `Last-Event-ID` on reconnect.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_post_stream_cursor_never_becomes_the_session_streams_last_event_id() {
+    let server = RecordingServer::start().await;
+    server.answer_post_with_sse("ping");
+    let mut transport = transport_for(&server);
+
+    // Both streams live at once: the GET session stream, and a POST answered with
+    // a held-open `text/event-stream`. That co-existence is what no earlier fence
+    // arranges, and it is the only shape in which a shared cursor and a
+    // per-stream one can disagree.
+    open_stream(&mut transport).await;
+    assert!(
+        wait_for(|| server.open_get_connections() >= 1).await,
+        "the session stream must be open. Observed request lines: {:?}",
+        server.request_lines()
+    );
+    timeout(BOUND, transport.send(ping_request("fence-20")))
+        .await
+        .expect("the POST returns as soon as its stream is open")
+        .expect("the harness answers the POST with a 200 text/event-stream");
+    assert!(
+        wait_for(|| server.open_post_connections() >= 1).await,
+        "the POST stream must be open TOO. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    // An id-carrying frame on EACH stream, delivered through the production path
+    // rather than planted. The progress values differ so each is identifiable by
+    // its own payload: one queue serves both streams, so arrival order is not
+    // guaranteed and an order-based match would be measuring the scheduler.
+    server
+        .push_frame(progress_frame(GET_STREAM_EVENT_ID, "fence-20", 1, None))
+        .await;
+    server
+        .push_post_frame(progress_frame(POST_STREAM_EVENT_ID, "fence-20", 2, None))
+        .await;
+
+    let mut seen_get_frame = false;
+    let mut seen_post_frame = false;
+    for _ in 0..CROSS_STREAM_POPS {
+        if seen_get_frame && seen_post_frame {
+            break;
+        }
+        let message = timeout(BOUND, transport.receive())
+            .await
+            .expect("each pushed frame reaches receive() within BOUND")
+            .expect("the frame parses into a transport message");
+        match progress_of(&message) {
+            Some(value) if (value - 1.0).abs() < f64::EPSILON => seen_get_frame = true,
+            Some(value) if (value - 2.0).abs() < f64::EPSILON => seen_post_frame = true,
+            _ => {},
+        }
+    }
+    assert!(
+        seen_get_frame && seen_post_frame,
+        "both frames must be DELIVERED, so each stream's cursor is recorded by the same production \
+         path a live stream records it on. Observed: GET frame {seen_get_frame}, POST frame \
+         {seen_post_frame}"
+    );
+
+    // The transport-wide accessor's meaning is deliberately UNCHANGED: it is
+    // "the most recent id seen on ANY stream", and here that is the POST's. This
+    // assertion is what pins that only the RECONNECT cursor was promoted to
+    // per-reader state — a fix that "corrected" this accessor to report the
+    // session stream's id would change a public, documented behaviour.
+    assert_eq!(
+        transport.last_event_id().as_deref(),
+        Some(POST_STREAM_EVENT_ID),
+        "StreamableHttpTransport::last_event_id() must still report the most recent id from ANY \
+         stream — the POST's. Only the reconnect cursor moves"
+    );
+
+    // Now the proxy blinks on BOTH bodies, and the session stream reconnects.
+    server.end_live_sse_streams();
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= 2).await,
+        "the session stream must be RE-OPENED after it is dropped. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let cursors = server.get_cursors();
+    assert!(
+        cursors.len() >= 2,
+        "the harness must have recorded a cursor slot per GET; got {cursors:?}"
+    );
+    assert_eq!(
+        cursors[0], None,
+        "the FIRST open has nothing to resume from and must carry no cursor at all; got {cursors:?}"
+    );
+    assert_eq!(
+        cursors[1].as_deref(),
+        Some(GET_STREAM_EVENT_ID),
+        "the re-opened GET must resume from the id THIS STREAM delivered, never from one minted on \
+         a streaming POST response. MCP resumability is per-stream: replaying another stream's \
+         cursor asks the server to resume from a position belonging to a different stream, which \
+         is a rejection, a replay of the wrong frames, or a SILENT GAP — and a silent gap is \
+         exactly the failure the reconnect exists to prevent, and is indistinguishable from a \
+         healthy resume (T-118.2-17-03). Observed cursors: {cursors:?}"
     );
 
     server.shutdown().await;
