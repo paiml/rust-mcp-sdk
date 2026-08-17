@@ -204,11 +204,23 @@ const HTTP_FEATURE_TARGETS: &[&str] = &["era_matrix", "era_baseline"];
 ///
 /// * `FULLY_SCORED_GREEN_REVISIONS` — revisions whose ENTIRE scored set must be
 ///   green and whose own suite exit status must be 0. Universally quantified, so
-///   nothing can be removed from it to make a red run green. `2026-07-28` today.
-/// * `MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION` — the non-vacuity floor for
-///   that clause. Without it, a mis-parse of the suite's `Not scored for` roster
-///   would classify every scenario as not-scored and make "every scored scenario
-///   is green" true of the empty set.
+///   nothing can be removed from it to make a red run green. **Both** revisions
+///   since 118.2-11 (D-16): `2025-11-25` joined when phase 118.2 closed its last
+///   scored failure, so that leg is now gated on its own exit code rather than
+///   only on a check-count floor — a floor that counts checks is satisfiable by
+///   a run that FAILS.
+/// * `MIN_SCORED_SCENARIOS_V1` / `MIN_SCORED_SCENARIOS_V2` — the non-vacuity
+///   floor for that clause, PER REVISION. Without it, a mis-parse of the suite's
+///   `Not scored for` roster would classify every scenario as not-scored and
+///   make "every scored scenario is green" true of the empty set.
+///
+///   These two replace the single shared
+///   `MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION` that 118.1-14 pinned here,
+///   and BOTH are pinned so the split cannot be quietly re-collapsed. The legs
+///   have different scored-set sizes (30 and 37); a shared constant could only
+///   have admitted `2025-11-25` by being LOWERED to 30, which would have
+///   weakened the v2 guard by seven scenarios. Pinning both names is what makes
+///   that regression visible here rather than only in a red suite run.
 /// * `BLOCKING_GREEN_SCENARIOS` — named scenarios that must be PRESENT and
 ///   entirely green, for revisions the clause above does not yet cover. An
 ///   INCLUSION list of claims, NOT a known-fail allowlist: adding an entry can
@@ -223,7 +235,8 @@ const ZERO_CHECK_DECLARATIONS: &[&str] = &[
     "MIN_CHECKS_V1",
     "MIN_CHECKS_V2",
     "FULLY_SCORED_GREEN_REVISIONS",
-    "MIN_SCORED_SCENARIOS_PER_FULLY_GREEN_REVISION",
+    "MIN_SCORED_SCENARIOS_V1",
+    "MIN_SCORED_SCENARIOS_V2",
     "BLOCKING_GREEN_SCENARIOS",
     "MIN_BLOCKING_GREEN_SCENARIOS",
 ];
