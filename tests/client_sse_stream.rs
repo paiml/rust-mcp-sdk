@@ -210,6 +210,32 @@ const ZERO_RETRY_BOUND: Duration = Duration::from_secs(8);
 /// times the wait it must outlast.
 const ZERO_RETRY_QUIET: Duration = Duration::from_millis(1500);
 
+/// How long fence 17 waits for a call whose answer bore the WRONG id
+/// (plan 15, CR-02).
+///
+/// # This bound is NOT a synchronisation device, and the asymmetry is the reason
+///
+/// Post-fix the call NEVER completes: the correlation check discards the
+/// mis-addressed frame and keeps waiting for the response that actually carries
+/// this request's id, which this peer never sends. The bound therefore only
+/// decides how long the fence waits before concluding so.
+///
+/// Pre-fix the call completes in MILLISECONDS — the receive loop returns the
+/// first response frame it pops, whatever its id — so CI load makes this fence
+/// SAFER rather than flakier: a slow machine cannot turn a returned wrong answer
+/// into a timeout, it can only make the (already-passing) wait longer. That is
+/// why two seconds is enough and why the fence never asserts on an upper time
+/// bound as its SUBJECT.
+const MISMATCH_BOUND: Duration = Duration::from_secs(2);
+
+/// The id fence 17's peer answers with instead of the one it was asked with.
+///
+/// Deliberately self-describing rather than a plausible-looking `"1"`: it is a
+/// literal no `pmcp` client request can ever have produced (`call_tool` mints a
+/// `RequestId::String` holding a UUID), so a failure message naming it reads as
+/// "this frame was addressed to nobody" rather than as an off-by-one.
+const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
+
 // ===========================================================================
 // The recording listener.
 //
@@ -298,6 +324,37 @@ struct Shared {
     /// iterations of the pump loop would be lost and the fence would hang until
     /// its bound rather than fail on its subject.
     close_live: watch::Sender<u64>,
+    /// When set, the `initialize` result advertises a `tools` capability instead
+    /// of the bare `{}` (plan 15, CR-02).
+    ///
+    /// `Client::call_tool` runs `assert_capability("tools", "tools/call")` BEFORE
+    /// it puts a byte on the wire, so against a `{}`-capability handshake a
+    /// call-tool fence would fail without ever reaching the transport — vacuous,
+    /// and vacuous in the direction that LOOKS like the fence is working.
+    ///
+    /// Default OFF, so fences 1-15 see exactly the `initialize` result they
+    /// always did.
+    advertise_tools: AtomicBool,
+    /// When set, an id-bearing non-`initialize` POST is answered with a JSON-RPC
+    /// success instead of the bare `202` (plan 15, CR-02).
+    ///
+    /// Default OFF, for the same reason [`advertise_tools`](Shared::advertise_tools)
+    /// is: fences 1-15 assert on a listener that answers every non-`initialize`
+    /// POST `202 Accepted`.
+    answer_calls: AtomicBool,
+    /// When set, the NEXT answered call is addressed to [`MISMATCHED_CALL_ID`]
+    /// rather than to the id it was asked with (plan 15, CR-02).
+    ///
+    /// CONSUMED on use, so exactly one call is mis-addressed and every later call
+    /// is answered correctly. That is what lets fence 17 measure the correlation
+    /// decision without also changing what a second call would see.
+    next_call_id_is_mismatched: AtomicBool,
+    /// How many calls this harness has ANSWERED, so call *n* and call *n+1* are
+    /// distinguishable by the VALUE of their result rather than by their order.
+    ///
+    /// The desync fence 16 measures is "call 2 was handed call 1's result", and a
+    /// result that is byte-identical between the two cannot detect it.
+    calls_answered: AtomicUsize,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -339,6 +396,10 @@ impl RecordingServer {
             one_frame_then_close: Mutex::new(None),
             get_instants: Mutex::new(Vec::new()),
             close_live,
+            advertise_tools: AtomicBool::new(false),
+            answer_calls: AtomicBool::new(false),
+            next_call_id_is_mismatched: AtomicBool::new(false),
+            calls_answered: AtomicUsize::new(0),
         });
 
         let accept = tokio::spawn({
@@ -420,6 +481,36 @@ impl RecordingServer {
     /// When each GET was accepted, server-side, in arrival order.
     fn get_instants(&self) -> Vec<std::time::Instant> {
         self.shared.get_instants.lock().clone()
+    }
+
+    /// Advertise a `tools` capability in the `initialize` result (plan 15, CR-02).
+    ///
+    /// Call BEFORE the client connects, mirroring
+    /// [`close_get_streams_on_accept`](RecordingServer::close_get_streams_on_accept).
+    /// Without it `Client::call_tool` refuses locally — see
+    /// [`Shared::advertise_tools`].
+    fn advertise_tools(&self) {
+        self.shared.advertise_tools.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer every id-bearing non-`initialize` POST with a JSON-RPC success
+    /// carrying a per-call distinguishable marker (plan 15, CR-02).
+    ///
+    /// Call BEFORE the client connects. The marker is what makes "call 2 received
+    /// call 1's result" observable — see [`Shared::calls_answered`].
+    fn answer_calls_with_an_echoing_result(&self) {
+        self.shared.answer_calls.store(true, Ordering::SeqCst);
+    }
+
+    /// Address the NEXT answered call to [`MISMATCHED_CALL_ID`] instead of to the
+    /// id it was asked with (plan 15, CR-02).
+    ///
+    /// Call BEFORE the client connects. Consumed on use, so exactly one call is
+    /// mis-addressed.
+    fn answer_the_next_call_with_a_mismatched_id(&self) {
+        self.shared
+            .next_call_id_is_mismatched
+            .store(true, Ordering::SeqCst);
     }
 
     /// End every LIVE SSE body cleanly, mid-flight (plan 04).
@@ -532,7 +623,7 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
     if streams {
         serve_post_sse(reader, write_half, &shared).await;
     } else {
-        serve_post(&mut write_half, &value).await;
+        serve_post(&mut write_half, &value, &shared).await;
     }
 }
 
@@ -569,12 +660,13 @@ async fn read_headers(
     }
 }
 
-/// Answer a POST: the initialize result, or a bare `202 Accepted`.
+/// Answer a POST: the initialize result, an answered CALL, or a bare
+/// `202 Accepted`.
 ///
 /// Every answer carries `connection: close` so hyper cannot reuse the socket for
 /// a later request — one connection per request keeps `request_lines()` an
 /// exact, ordered record of what the client did.
-async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value) {
+async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared: &Shared) {
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
 
     let response = if method == "initialize" {
@@ -583,7 +675,7 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value) {
             "id": value.get("id").cloned().unwrap_or(Value::Null),
             "result": {
                 "protocolVersion": LATEST_PROTOCOL_VERSION,
-                "capabilities": {},
+                "capabilities": advertised_capabilities(shared),
                 "serverInfo": { "name": "recording-server", "version": "0.0.0" },
             },
         })
@@ -593,6 +685,8 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value) {
              content-length: {}\r\nconnection: close\r\n\r\n{result}",
             result.len()
         )
+    } else if let Some(answer) = call_answer(value, method, shared) {
+        answer
     } else {
         // Every notification — initialized or not — is acknowledged with the
         // bare 202 the spec prescribes. Which of them reopens the session stream
@@ -603,6 +697,70 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value) {
     let _ = write_half.write_all(response.as_bytes()).await;
     let _ = write_half.flush().await;
     let _ = write_half.shutdown().await;
+}
+
+/// The `capabilities` member of this harness's `initialize` result.
+///
+/// `{}` unless a fence asked for [`RecordingServer::advertise_tools`], so fences
+/// 1-15 see the byte-identical result they always did.
+fn advertised_capabilities(shared: &Shared) -> Value {
+    if shared.advertise_tools.load(Ordering::SeqCst) {
+        json!({ "tools": {} })
+    } else {
+        json!({})
+    }
+}
+
+/// The JSON-RPC success answering ONE id-bearing, non-`initialize` POST, or
+/// `None` when this harness is not in answering mode (plan 15, CR-02).
+///
+/// Two properties the fences depend on:
+///
+/// 1. The `result` is a `CallToolResult` shape whose single text item carries
+///    [`call_marker`] of a per-answer sequence number, so call *n* and call *n+1*
+///    differ BY VALUE. A constant result cannot detect a desync.
+/// 2. The `id` echoes the request's own, EXCEPT when
+///    [`RecordingServer::answer_the_next_call_with_a_mismatched_id`] armed a
+///    single mis-addressed answer — consumed here on use.
+fn call_answer(value: &Value, method: &str, shared: &Shared) -> Option<String> {
+    if !shared.answer_calls.load(Ordering::SeqCst) {
+        return None;
+    }
+    // Restated here rather than relied upon from the caller's `else if`: the
+    // handshake result is built by its own branch, and an answering mode that
+    // could ever shadow it would break every fence in this file at once.
+    if method == "initialize" {
+        return None;
+    }
+    // A notification carries no `id`, and answering one would be a protocol
+    // violation the fences would then have to reason about.
+    let asked_with = value.get("id").cloned().filter(|id| !id.is_null())?;
+    let sequence = shared.calls_answered.fetch_add(1, Ordering::SeqCst) + 1;
+    let addressed_to = if shared
+        .next_call_id_is_mismatched
+        .swap(false, Ordering::SeqCst)
+    {
+        Value::String(MISMATCHED_CALL_ID.to_string())
+    } else {
+        asked_with
+    };
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": addressed_to,
+        "result": { "content": [ { "type": "text", "text": call_marker(sequence) } ] },
+    })
+    .to_string();
+    Some(format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
+/// The marker answer *n* carries, so answer *n* is distinguishable from answer
+/// *n+1* by value.
+fn call_marker(sequence: usize) -> String {
+    format!("call-answer-{sequence}")
 }
 
 /// Answer a GET with a `text/event-stream` whose body is already over (plan 04).
@@ -917,6 +1075,26 @@ fn outbound_ping_id(server: &RecordingServer) -> Option<Value> {
 fn answered(server: &RecordingServer, id: &str) -> bool {
     server.post_bodies().iter().any(|body| {
         body.get("id").and_then(Value::as_str) == Some(id) && body.get("result").is_some()
+    })
+}
+
+/// How many `tools/call` POST bodies this harness has observed.
+///
+/// A vacuity guard for fences 16 and 17: a correlation fence that never reached
+/// the wire proves nothing, and would pass against any tree at all.
+fn calls_observed(server: &RecordingServer) -> usize {
+    server
+        .post_bodies()
+        .iter()
+        .filter(|body| body.get("method").and_then(Value::as_str) == Some("tools/call"))
+        .count()
+}
+
+/// The text of a call result's first content item.
+fn text_of(result: &pmcp::types::CallToolResult) -> Option<String> {
+    result.content.first().and_then(|content| match content {
+        pmcp::types::Content::Text { text } => Some(text.clone()),
+        _ => None,
     })
 }
 
@@ -1808,6 +1986,192 @@ async fn reconnect_with_one_delivered_frame_and_zero_retry_stays_bounded() {
         "the exhaustion error must still NAME the budget it spent even when every body delivered. \
          A reader that simply goes quiet is indistinguishable from a healthy idle stream; got \
          {text:?}"
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fences 16-17 — CR-02: a terminal reason raised while the application was IDLE
+// must not fail the next, unrelated call, and a response bearing someone else's
+// id must never be returned as this call's answer (plan 15).
+//
+// The two halves are one defect. Every terminal reason phase 118.2 introduced is
+// delivered by pushing `Err(..)` onto the SAME queue the responses ride, and the
+// only consumer is `Client::dispatch_request` — so a reason raised while nobody
+// is asking sits in the FIFO and is handed to whoever asks next. That same
+// receive loop returned the first `Response` frame it popped with NO comparison
+// of `response.id` against the id it was awaiting, so one out-of-band entry
+// desynchronises the queue permanently and call *n+1* silently receives call
+// *n*'s result (T-118.2-15-01).
+//
+// Fence 16 measures the poisoning and the desync it causes; fence 17 measures
+// the correlation decision in isolation, with no terminal reason anywhere.
+// ===========================================================================
+
+// ===========================================================================
+// Fence 16 — an idle terminal error does not fail the next unrelated call.
+//
+// The automated replacement for the second `human_verification` item in
+// `118.2-VERIFICATION.md`, exercising exactly the interleaving that report
+// described: the session stream dies while the application is idle, and the
+// application then makes two ordinary tool calls.
+// ===========================================================================
+
+#[tokio::test]
+async fn an_idle_terminal_error_does_not_fail_the_next_unrelated_call() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    // Every GET opens successfully and ends at once, so the session stream spends
+    // its WHOLE reconnect budget and raises its named terminal reason while the
+    // application is doing nothing at all.
+    server.close_get_streams_on_accept();
+
+    // The observer clone is bound only to keep the transport alive for the whole
+    // fence. `receive()` is NEVER called on it: it shares the receive queue with
+    // the clone the client owns, so a read here would STEAL the very response
+    // these assertions are about and the fence would measure the harness.
+    let (client, _observer) = handshake(&server).await;
+
+    let expected_gets = 1 + SHIPPED_RECONNECT_BUDGET;
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= expected_gets).await,
+        "the session stream must spend its budget before the fence calls anything — otherwise \
+         there is no idle terminal reason to be poisoned by. Observed request lines: {:?}",
+        server.request_lines()
+    );
+    // An OBSERVATION window, not a synchronisation device: it proves the
+    // reconnect loop has STOPPED, which is what establishes both halves of the
+    // precondition — the terminal reason has been raised, and it was raised with
+    // NO request in flight. Every wait after this point goes through a bound.
+    tokio::time::sleep(RECONNECT_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        expected_gets,
+        "the budget must be spent and the loop finished before the first call. Observed request \
+         lines: {:?}",
+        server.request_lines()
+    );
+
+    // --- Call 1: whatever it reports, it must describe ITSELF. ---
+    let first = timeout(
+        BOUND,
+        client.call_tool("fence-16-one".to_string(), json!({})),
+    )
+    .await
+    .expect("the first call completes within BOUND");
+    if let Err(error) = &first {
+        let text = error.to_string();
+        assert!(
+            !text.contains(RECONNECT_PHRASE),
+            "a tools/call that succeeded on the wire came back reporting a SESSION-STREAM failure \
+             raised while the application was idle. An out-of-band terminal reason on the shared \
+             response FIFO is handed to whichever request asks next, so an unrelated call fails \
+             with a diagnosis of something that happened minutes earlier and the real answer is \
+             left in the queue to desynchronise every later call (CR-02). Got: {text:?}"
+        );
+    }
+
+    // --- Call 2: its OWN answer, not call 1's. ---
+    //
+    // This is the desync assertion the verification report demanded. An
+    // id-correlation unit test does not satisfy it: the subject is that TWO
+    // consecutive calls through a real `pmcp::Client` each receive their own
+    // result.
+    let second = timeout(
+        BOUND,
+        client.call_tool("fence-16-two".to_string(), json!({})),
+    )
+    .await
+    .expect("the second call completes within BOUND")
+    .expect("the harness answers every id-bearing call with a JSON-RPC success");
+    let observed = text_of(&second);
+    assert_eq!(
+        observed.as_deref(),
+        Some(call_marker(2).as_str()),
+        "call 2 must receive call 2's OWN result. Once one out-of-band entry desynchronises the \
+         response FIFO, every later call is handed the PREVIOUS call's answer — a cross-request \
+         data leak between two callers of one client (T-118.2-15-01), and silent, because a \
+         well-formed result for the wrong request is indistinguishable from a correct one at the \
+         call site. Expected {:?}, got {observed:?}",
+        call_marker(2)
+    );
+
+    assert_eq!(
+        calls_observed(&server), 2,
+        "both calls must actually have reached the wire — a fence that asserts on results it never \
+         asked for would pass against any tree. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 17 — a response bearing an id that is not this call's is not returned
+// as this call's answer.
+//
+// No terminal reason exists anywhere here: the GET side is the ordinary
+// held-open session stream. The ONLY thing under test is the correlation
+// decision, so a failure cannot be blamed on the latch.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_response_whose_id_does_not_match_is_not_returned_as_this_calls_answer() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_the_next_call_with_a_mismatched_id();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so this fence differs from fence 16 in exactly \
+         one thing: there is no terminal reason anywhere. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    // The bounded wait CANCELS `dispatch_request` mid-loop, so the client's
+    // `active_requests` entry for this id is not reaped by the WR-04 exit
+    // cleanup — that path runs on an `Err` return, and a cancelled future
+    // returns nothing at all. A known consequence of cancelling a pending
+    // request, not what this fence measures; the client is dropped immediately
+    // below.
+    let outcome = timeout(
+        MISMATCH_BOUND,
+        client.call_tool("fence-17".to_string(), json!({})),
+    )
+    .await;
+
+    match outcome {
+        // The correct post-fix shape: the mis-addressed frame was discarded and
+        // the call is still waiting for the response that carries ITS id, which
+        // this peer never sends.
+        Err(_still_waiting) => {},
+        Ok(Ok(result)) => panic!(
+            "the client returned a server response addressed to {MISMATCHED_CALL_ID:?} as the \
+             answer to a request it never identified. A receive loop that returns the first \
+             `Response` frame it pops, without comparing `response.id` against the id it is \
+             awaiting, accepts a fabricated or re-typed id from a hostile or merely buggy peer \
+             (T-118.2-15-02) and mis-pairs concurrent callers of one client \
+             (T-118.2-15-01). Returned result: {:?}",
+            text_of(&result)
+        ),
+        // An error is not this call's answer either, so it does not falsify the
+        // fence's subject. It is a DIFFERENT outcome from the intended one, and
+        // is accepted rather than asserted on so that this fence stays about
+        // correlation alone.
+        Ok(Err(_not_an_answer)) => {},
+    }
+
+    assert_eq!(
+        calls_observed(&server),
+        1,
+        "the call must actually have reached the wire — a fence that concludes 'still waiting' \
+         about a request that was never sent would pass against any tree. Observed POST bodies: \
+         {:?}",
+        server.post_bodies()
     );
 
     server.shutdown().await;
