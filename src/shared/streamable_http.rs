@@ -4280,6 +4280,160 @@ mod tests {
     }
 
     // ==================================================================
+    // Phase 118.2 plan 14 / ALWAYS-UNIT — every boundary of the two-sided
+    // reconnect bound and both arms of the budget-refund predicate (CR-01).
+    //
+    // Each test is named for the PROPERTY it pins rather than for the
+    // function it calls, so a failure names the contract that broke rather
+    // than merely the symbol that moved.
+    // ==================================================================
+
+    mod reconnect_delay_bounds {
+        use super::*;
+
+        /// One millisecond, the step used either side of each threshold.
+        const STEP: Duration = Duration::from_millis(1);
+
+        #[test]
+        fn a_peer_asking_for_zero_still_waits_the_floor() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(Duration::ZERO)),
+                MIN_SSE_RECONNECT_DELAY,
+                "`retry: 0` is the CR-01 input: honoured verbatim it turns the reconnect loop \
+                 into a request flood that also re-mints an access token per iteration"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_below_the_floor_is_raised_to_it() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MIN_SSE_RECONNECT_DELAY - STEP)),
+                MIN_SSE_RECONNECT_DELAY,
+                "one millisecond under the floor is still under the floor"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_exactly_at_the_floor_is_left_alone() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MIN_SSE_RECONNECT_DELAY)),
+                MIN_SSE_RECONNECT_DELAY,
+                "the bound is inclusive at its lower end"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_just_above_the_floor_is_honoured_verbatim() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MIN_SSE_RECONNECT_DELAY + STEP)),
+                MIN_SSE_RECONNECT_DELAY + STEP,
+                "the floor must bound a hostile value, not overwrite a reasonable one — a peer \
+                 that asks for a legitimate wait still gets the wait it asked for"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_just_below_the_ceiling_is_honoured_verbatim() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MAX_SSE_RECONNECT_DELAY - STEP)),
+                MAX_SSE_RECONNECT_DELAY - STEP,
+                "the ceiling is likewise a bound, not an overwrite"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_exactly_at_the_ceiling_is_left_alone() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MAX_SSE_RECONNECT_DELAY)),
+                MAX_SSE_RECONNECT_DELAY,
+                "the bound is inclusive at its upper end too"
+            );
+        }
+
+        #[test]
+        fn a_peer_value_above_the_ceiling_is_lowered_to_it() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(MAX_SSE_RECONNECT_DELAY + STEP)),
+                MAX_SSE_RECONNECT_DELAY,
+                "an uncapped peer value parks a client's reader task for a duration the peer chose"
+            );
+        }
+
+        #[test]
+        fn a_saturating_peer_value_neither_panics_nor_escapes_the_ceiling() {
+            assert_eq!(
+                next_reconnect_delay(0, Some(Duration::MAX)),
+                MAX_SSE_RECONNECT_DELAY,
+                "`Duration::MAX` is reachable from the wire: `retry:` is parsed as u64 \
+                 milliseconds and nothing about the parse bounds it"
+            );
+        }
+
+        #[test]
+        fn a_saturating_attempt_count_falls_back_to_the_ceiling() {
+            assert_eq!(
+                next_reconnect_delay(u32::MAX, None),
+                MAX_SSE_RECONNECT_DELAY,
+                "the exponential curve must SATURATE rather than overflow: an `unwrap` on the \
+                 Duration conversion here would panic inside a client's reader task"
+            );
+        }
+
+        #[test]
+        fn the_computed_curve_never_falls_under_the_floor() {
+            for attempt in 0..8u32 {
+                let delay = next_reconnect_delay(attempt, None);
+                assert!(
+                    delay >= MIN_SSE_RECONNECT_DELAY && delay <= MAX_SSE_RECONNECT_DELAY,
+                    "attempt {attempt} produced {delay:?}, outside the two-sided bound"
+                );
+            }
+        }
+
+        #[test]
+        fn a_body_that_delivered_nothing_never_earns_a_fresh_budget() {
+            assert!(
+                !budget_reset_earned(false, RECONNECT_BUDGET_RESET_UPTIME),
+                "uptime alone is not delivery: a stream that stayed up delivering nothing is a \
+                 stream that is not working"
+            );
+            assert!(
+                !budget_reset_earned(false, Duration::MAX),
+                "and no amount of uptime changes that"
+            );
+        }
+
+        #[test]
+        fn a_one_frame_bounce_never_earns_a_fresh_budget() {
+            assert!(
+                !budget_reset_earned(true, Duration::ZERO),
+                "this is the CR-01 shape exactly: one frame, then the body ends. Refunding here \
+                 makes the reconnect loop unbounded for any budget value"
+            );
+            assert!(
+                !budget_reset_earned(
+                    true,
+                    RECONNECT_BUDGET_RESET_UPTIME - Duration::from_millis(1)
+                ),
+                "one millisecond under the threshold is still a bounce"
+            );
+        }
+
+        #[test]
+        fn a_stream_that_stayed_up_and_delivered_earns_a_fresh_budget() {
+            assert!(
+                budget_reset_earned(true, RECONNECT_BUDGET_RESET_UPTIME),
+                "the threshold is inclusive"
+            );
+            assert!(
+                budget_reset_earned(true, RECONNECT_BUDGET_RESET_UPTIME * 120),
+                "a stream that worked for an hour and then blinked must not inherit a spent \
+                 budget — that is the case D-03 exists for"
+            );
+        }
+    }
+
+    // ==================================================================
     // Phase 118.2 / ALWAYS-PROPERTY — the incremental SSE reader under
     // arbitrary peer bytes.
     //
@@ -4402,6 +4556,56 @@ mod tests {
                 assert!(
                     tails.iter().all(|tail| *tail <= 3),
                     "the undecoded UTF-8 tail must stay under one character: {tails:?}"
+                );
+            }
+
+            /// The reconnect wait NEVER escapes its two-sided bound, for any
+            /// attempt count and any peer-supplied `retry:` — including the
+            /// zero, the saturating and the overflowing cases (CR-01,
+            /// plan 14).
+            ///
+            /// Likewise NOT `#[ignore]`d, for the reason stated above this
+            /// module: these run on every `cargo test` and every
+            /// `cargo nextest run`, rather than only when someone remembers
+            /// `make test-property`'s `-- --ignored property_` selector.
+            #[test]
+            fn property_next_reconnect_delay_stays_inside_both_bounds(
+                attempt in proptest::prelude::any::<u32>(),
+                retry_millis in proptest::option::of(proptest::prelude::any::<u64>()),
+            ) {
+                let server_retry = retry_millis.map(Duration::from_millis);
+                let delay = next_reconnect_delay(attempt, server_retry);
+                assert!(
+                    delay >= MIN_SSE_RECONNECT_DELAY,
+                    "attempt {attempt} with retry {retry_millis:?} produced {delay:?}, under the \
+                     {MIN_SSE_RECONNECT_DELAY:?} floor — an unfloored wait is a request flood"
+                );
+                assert!(
+                    delay <= MAX_SSE_RECONNECT_DELAY,
+                    "attempt {attempt} with retry {retry_millis:?} produced {delay:?}, over the \
+                     {MAX_SSE_RECONNECT_DELAY:?} ceiling — an uncapped wait parks the reader"
+                );
+            }
+
+            /// The wait is a PURE function of its two arguments.
+            ///
+            /// The CONF-09 `idempotency` probe for the delay half: a
+            /// scheduler decision that changed between two identical calls
+            /// would make the reconnect schedule unreproducible, and
+            /// unreproducible is exactly what a bounded schedule cannot be.
+            /// The loop's own re-entry idempotency is bounded by the attempt
+            /// counter, which plan 14 made monotonic by removing the
+            /// unconditional refund.
+            #[test]
+            fn property_next_reconnect_delay_is_pure(
+                attempt in proptest::prelude::any::<u32>(),
+                retry_millis in proptest::option::of(proptest::prelude::any::<u64>()),
+            ) {
+                let server_retry = retry_millis.map(Duration::from_millis);
+                assert_eq!(
+                    next_reconnect_delay(attempt, server_retry),
+                    next_reconnect_delay(attempt, server_retry),
+                    "two identical calls disagreed for attempt {attempt}, retry {retry_millis:?}"
                 );
             }
         }
