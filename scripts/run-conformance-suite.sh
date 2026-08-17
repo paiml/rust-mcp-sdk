@@ -197,6 +197,41 @@ ZERO_CHECK_NOT_SCORED_SCENARIOS=(
   "2026-07-28:tasks-status-notifications"
 )
 
+# ============================================================================
+# RE-PIN FLOOR REVIEW — 118.2-12, 2026-08-17. ALL SIX FLOORS RE-VERIFIED, NONE
+# MOVED, NONE LOWERED.
+#
+# D-14 requires the conformance pin to be moved to whatever is newest as the
+# FINAL act of phase 118.2, so that the SUITE BUMP's delta is reported
+# separately from the SDK FIXES' delta. The investigation returned no target:
+# `0.2.0-alpha.11` is still both the `alpha` dist-tag and the last entry in
+# `npm view … versions`, so the pin is ALREADY the newest and the bump delta is
+# NIL BY CONSTRUCTION (`conformance/README.md` § 13, entry 2026-08-17).
+#
+# The suite was nevertheless re-measured once at that pin against the gate as
+# 118.2-11 hardened it (`target/118.2-12-conf-newpin.log`), because "identical"
+# and "not re-measured" are different facts and an unchanged pin can only be
+# ARGUED to produce unchanged floors, not assumed to. Every floor below was
+# checked against that run and every one is EXACTLY MET:
+#
+#   MIN_CHECKS_V1                 74   measured  74
+#   MIN_CHECKS_V2                178   measured 178
+#   MIN_MRTR_SCENARIOS            14   measured  14
+#   MIN_SCORED_SCENARIOS_V1       30   measured  30
+#   MIN_SCORED_SCENARIOS_V2       37   measured  37
+#   MIN_BLOCKING_GREEN_SCENARIOS  30   measured  30
+#
+# (No line numbers cited: they drift with every edit to this file. Each floor
+# carries its own RE-VERIFIED note immediately above its declaration.)
+#
+# Exactly met, so there is nothing to RAISE — a floor is raised only when the
+# fresh measurement EXCEEDS it. Nothing was lowered; D-21 still admits no
+# expected-failures flag, no allowlist and no known-failure baseline anywhere in
+# this file (the sole mention of that flag remains the § 9 prohibition at the
+# head of this script), and `2025-11-25` remains in
+# FULLY_SCORED_GREEN_REVISIONS.
+# ============================================================================
+
 # THE CHECK FLOORS (README § 7 rule 4). Measured from `checks.json` ON DISK —
 # `SUCCESS` + `FAILURE` records, i.e. the checks the suite itself counts — not
 # read off the console.
@@ -225,6 +260,10 @@ ZERO_CHECK_NOT_SCORED_SCENARIOS=(
 # itself the evidence that 118.2's `tools-call-with-logging` flip was two
 # FAILUREs converting to two SUCCESSes inside one scenario (0/2 -> 2/0), not a
 # scenario appearing or disappearing. Raised, never lowered.
+#
+# RE-VERIFIED by 118.2-12 at the newest available pin — which is still
+# `0.2.0-alpha.11`, so this is the same pin, re-asked rather than re-pinned. One
+# fresh run: 74 and 178 again. See the RE-PIN FLOOR REVIEW block above.
 MIN_CHECKS_V1=74
 MIN_CHECKS_V2=178
 
@@ -244,6 +283,10 @@ MIN_CHECKS_V2=178
 # whole-scored-set clause would silently stop covering them while this one keeps
 # naming them. A gate that survives a change in someone else's classification is
 # worth its few lines.
+#
+# RE-VERIFIED by 118.2-12 at the newest available pin (still `0.2.0-alpha.11`):
+# 14 scenarios, 36 checks, 0 failures. Unchanged, so nothing to raise. See the
+# RE-PIN FLOOR REVIEW block above.
 MRTR_SCENARIO_PREFIX="input-required-result-"
 MIN_MRTR_SCENARIOS=14
 
@@ -316,6 +359,11 @@ FULLY_SCORED_GREEN_REVISIONS=(2025-11-25 2026-07-28)
 # Both are NEVER LOWERED, per revision. Measured: 30 scored at 2025-11-25 in nine
 # fresh 118.2-11 runs; 37 scored at 2026-07-28 in 118.1-13 (x2), 118.1-14 and all
 # nine 118.2-11 runs.
+#
+# RE-VERIFIED by 118.2-12 at the newest available pin (still `0.2.0-alpha.11`):
+# 30 scored at 2025-11-25 and 37 at 2026-07-28, both entirely green, both legs
+# exiting 0. Exactly met, so neither is raised. See the RE-PIN FLOOR REVIEW
+# block above.
 MIN_SCORED_SCENARIOS_V1=30
 MIN_SCORED_SCENARIOS_V2=37
 
@@ -409,6 +457,11 @@ BLOCKING_GREEN_SCENARIOS=(
 # RAISED 29 -> 30 by 118.2-11, in the same edit that added
 # `2025-11-25:tools-call-with-logging` to the list above. The list now names all
 # 30 SCORED 2025-11-25 scenarios.
+#
+# RE-VERIFIED by 118.2-12 at the newest available pin (still `0.2.0-alpha.11`):
+# all 30 PRESENT and entirely green in one fresh run — so the new suite renamed
+# none of them, which is the failure mode the absent-entry-is-a-FAILURE rule
+# above exists to catch at re-pin time. See the RE-PIN FLOOR REVIEW block above.
 MIN_BLOCKING_GREEN_SCENARIOS=30
 
 # The target, the binary, the port and the results tree.
