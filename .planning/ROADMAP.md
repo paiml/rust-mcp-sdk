@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 12 plans in 7 waves
+**Plans:** 11 plans in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
 
 **Why these two, and why together.** Both are the same shape: the v1 server-to-client channel exists and is proven, and each of these is a missing surface at one end of it. The developer chose one combined phase over two at the 118.1-13 sign-off.
 
@@ -2856,22 +2856,23 @@ Plans:
 
 **Wave 1** *(parallel — the client half and the emitter half are independent until the joint fence)*
 
-- [ ] 118.2-01-PLAN.md — Wave 1. **Defect A**: the dead `202 Accepted` branch means pmcp's client never issues a GET at all (MEASURED: 2 POSTs, 0 GETs); plus the recording-TCP-listener harness plans 02-04 reuse (CONF-09)
-- [ ] 118.2-05-PLAN.md — Wave 1. **D-06/D-08/D-09/D-12**: `extra.log(..)` on `RequestHandlerExtra` — no `PeerHandle` trait method — with `LoggingLevel` syslog ordering and the no-sink `Ok(())` contract (CONF-10)
+- [ ] 118.2-01-PLAN.md — Wave 1. **Defect A + Defect B on the GET path, in ONE atomic slice**: the dead `202 Accepted` branch means pmcp's client never issues a GET at all (MEASURED: 2 POSTs, 0 GETs), AND the whole-body collect means an opened stream is never read — `start_sse` collects before it spawns (`:1002` vs `:1020`), so the two cannot land separately. Ships the recording-TCP-listener harness plans 03/04 reuse, the `Result`-carrying bounded receive channel that gives terminal reader errors a route to `receive()`, the incremental reader, and the bounded-reads ALLOWLIST entry (CONF-09)
+- [ ] 118.2-05-PLAN.md — Wave 1. **D-06/D-08/D-09/D-12**: `extra.log(..)` + `extra.log_with_data(..)` on `RequestHandlerExtra` — two methods, no `PeerHandle` trait method — with `LoggingLevel` syslog ordering and the no-sink `Ok(())` contract (CONF-10)
+
+*(plan 02 was merged into plan 01 by the cross-AI review round and deleted; the numbering gap is deliberate)*
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 118.2-02-PLAN.md — Wave 2. **D-01/D-02/D-04/D-05**: the incremental hyper-frame reader on the GET session stream, the bounded receive channel, and the bounded-reads ALLOWLIST entry in the SAME task as the accumulation site (CONF-09)
-- [ ] 118.2-06-PLAN.md — Wave 2. **D-07**: `attach_request_log_sink`, the ONE unit both native dispatch roots call, twinned on 118.1's `attach_request_peer` (CONF-10)
+- [ ] 118.2-03-PLAN.md — Wave 2. **D-01, second site**: the POST-response `text/event-stream` read — the one that deadlocks in-tool elicitation — plus retiring `SseParser::feed_complete_body` and all three of its co-located dependants, and the streaming response-middleware contract (CONF-09)
+- [ ] 118.2-06-PLAN.md — Wave 2. **D-07**: `attach_request_log_sink`, the ONE unit both native dispatch roots call, twinned on 118.1's `attach_request_peer` — plus the `ProtocolContext.resolved_log_level` carrier that gets a level from the HTTP ingress to the dispatch root that actually builds the `RequestHandlerExtra` (CONF-10)
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 118.2-03-PLAN.md — Wave 3. **D-01, second site**: the POST-response `text/event-stream` read — the one that deadlocks in-tool elicitation — plus retiring `SseParser::feed_complete_body` and all three of its co-located dependants (CONF-09)
-- [ ] 118.2-07-PLAN.md — Wave 3. **D-10/D-11/D-12**: the v1 per-session level in `V1State` with its `full-v2` null twin, the first real reader of `io.modelcontextprotocol/logLevel`, and ignore-and-default on malformed input (CONF-10)
+- [ ] 118.2-04-PLAN.md — Wave 3. **D-03**: bounded reconnect with `Last-Event-ID` over an owned `SseReaderContext`, through a paired cursor accessor and with no second call-site `#[cfg]`; cancellation on close/drop during backoff; the public `decode_sse_chunks_for_fuzz` seam and its target; the `full-v2` severance build and the `cargo semver-checks` verdict (CONF-09)
+- [ ] 118.2-07-PLAN.md — Wave 3. **D-10/D-11/D-12**: the v1 per-session level in `V1State` with its `full-v2` null twin, the first real reader of `io.modelcontextprotocol/logLevel`, the resolved level written onto `ProtocolContext` at BOTH ingress paths, and ignore-and-default on malformed input (CONF-10)
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 118.2-04-PLAN.md — Wave 4. **D-03**: bounded reconnect with `Last-Event-ID` through a paired cursor accessor and no second call-site `#[cfg]`, plus the fuzz seam, the `full-v2` severance build and the `cargo semver-checks` verdict (CONF-09)
 - [ ] 118.2-08-PLAN.md — Wave 4. **D-13**: `logging/setLevel` split out of the four-method residual arm — literal `{}` on v1 (MEASURED suite constraint), `-32601` on v2 — on BOTH roots (CONF-10)
 - [ ] 118.2-09-PLAN.md — Wave 4. The ALWAYS-requirement example `s55_handler_logging`, plus rewriting the dual-conformance fixture's logging arm from `tracing::info!` (which never reaches the wire) to `extra.log(..)` inside the suite's 200 ms budget (CONF-10)
 
