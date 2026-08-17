@@ -7456,3 +7456,208 @@ mod peer_precedence_tests {
         );
     }
 }
+
+// ===========================================================================
+// `attach_request_log_sink` at the `Server` root — the TWIN of
+// `core_log_sink_tests` in `src/server/core.rs` (Phase 118.2 plan 06, CONF-10 /
+// D-07).
+//
+// Same crate-internal-access reason as `peer_precedence_tests` above:
+// `attach_peer`, `notification_tx_sink`, `progress_reporter_for` and
+// `Server::notification_tx` are all private, and `TransportBackchannel` /
+// `ProtocolContext::with_resolved_log_level` are `pub(crate)`. An integration
+// test can construct none of them.
+//
+// The claims measured here that the `ServerCore` side CANNOT measure:
+//
+//   * the `notification_tx`-derived fallback exists on this root and nowhere
+//     else, and the request-scoped sink still beats it;
+//   * D-07: the progress-token gate moved OFF the log sink and STAYED on the
+//     progress reporter. One request, both answers, in one test.
+// ===========================================================================
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod log_sink_precedence_tests {
+    use super::*;
+    use crate::types::protocol::context::TransportBackchannel;
+    use crate::types::protocol::{Era, ProtocolContext, ProtocolVersion};
+    use crate::types::LoggingLevel;
+    use std::sync::Mutex;
+
+    /// A sink that records every notification handed to it.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Notification>>>);
+
+    impl Capture {
+        fn sink(&self) -> Arc<dyn Fn(Notification) + Send + Sync> {
+            let slot = Arc::clone(&self.0);
+            Arc::new(move |notification| {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(notification);
+            })
+        }
+
+        fn len(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    fn bare_context() -> ProtocolContext {
+        ProtocolContext::new(
+            Era::V1,
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+        )
+    }
+
+    fn context_with_sink(capture: &Capture) -> ProtocolContext {
+        bare_context().with_transport_backchannel(
+            TransportBackchannel::new().with_notification_sink(capture.sink()),
+        )
+    }
+
+    fn extra_with_context(
+        context: Option<ProtocolContext>,
+    ) -> crate::server::cancellation::RequestHandlerExtra {
+        crate::server::cancellation::RequestHandlerExtra::new(
+            "req-attach-log-sink".to_string(),
+            crate::server::cancellation::RequestHandlerExtra::default().cancellation_token,
+        )
+        .with_protocol_context(context)
+    }
+
+    fn bare_server() -> Server {
+        Server::builder()
+            .name("attach-log-sink-precedence")
+            .version("1.0.0")
+            .build()
+            .expect("server builds")
+    }
+
+    /// The ROOT claim on this side: `Server::attach_peer` wires the log sink from
+    /// the server-wide `notification_tx` when the request carries no
+    /// back-channel of its own — the in-process `Server::run` path.
+    #[tokio::test]
+    async fn the_server_root_attaches_its_notification_tx_derived_fallback_log_sink() {
+        let mut server = bare_server();
+        let (tx, mut rx) = mpsc::channel(4);
+        server.notification_tx = Some(tx);
+
+        let extra = server.attach_peer(extra_with_context(Some(bare_context())));
+        extra
+            .log(
+                LoggingLevel::Warning,
+                "through the notification_tx fallback",
+            )
+            .expect("the emitter always returns Ok");
+
+        let received = rx.try_recv().expect("the fallback sink must deliver");
+        match received {
+            Notification::Server(crate::types::ServerNotification::LogMessage(params)) => {
+                assert_eq!(params.message, "through the notification_tx fallback");
+                assert_eq!(params.level, LoggingLevel::Warning);
+            },
+            other => panic!("expected a LogMessage notification, got {other:?}"),
+        }
+    }
+
+    /// The precedence rule measured on THIS root too, with both sources live at
+    /// once — the `ServerCore` twin cannot run this, because it has no
+    /// `notification_tx` to lose to.
+    #[tokio::test]
+    async fn the_request_scoped_sink_wins_over_the_notification_tx_fallback() {
+        let mut server = bare_server();
+        let (tx, mut rx) = mpsc::channel(4);
+        server.notification_tx = Some(tx);
+        let request_scoped = Capture::default();
+
+        let extra =
+            server.attach_peer(extra_with_context(Some(context_with_sink(&request_scoped))));
+        extra
+            .log(LoggingLevel::Warning, "which sink received me?")
+            .expect("the emitter always returns Ok");
+
+        assert_eq!(
+            request_scoped.len(),
+            1,
+            "the session-bound transport sink must win at the `Server` root exactly as it does at \
+             the `ServerCore` root (T-118.2-06-02/03)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the server-wide channel must NOT also receive one session's record"
+        );
+    }
+
+    /// D-07, stated as a test: ONE request with NO `progressToken` gets a LIVE
+    /// log sink and a `None` progress reporter.
+    ///
+    /// The gate moved off the sink and stayed on the reporter. Unifying the two
+    /// would either silence logs for every client that never asked for progress,
+    /// or make progress notifications unconditional — a client that sent no token
+    /// has nothing to correlate them with (T-118.2-06-04).
+    #[tokio::test]
+    async fn the_progress_token_gate_still_applies_to_progress_only() {
+        let mut server = bare_server();
+        let (tx, _rx) = mpsc::channel(4);
+        server.notification_tx = Some(tx);
+        let capture = Capture::default();
+        let context = context_with_sink(&capture);
+
+        assert!(
+            server.progress_reporter_for(None, Some(&context)).is_none(),
+            "no `params._meta.progressToken` must still mean no progress reporter"
+        );
+
+        let extra = server.attach_peer(extra_with_context(Some(context)));
+        assert!(
+            extra.log_sink.is_some(),
+            "the log sink is UNGATED by the progress token — a client that never asked for \
+             progress must still receive `notifications/message` (D-07)"
+        );
+        extra
+            .log(LoggingLevel::Info, "no progress token on this request")
+            .expect("the emitter always returns Ok");
+        assert_eq!(
+            capture.len(),
+            1,
+            "the record must reach the client even though this request has no progress reporter"
+        );
+    }
+
+    /// There is exactly ONE `notification_tx`-to-sink conversion, and both
+    /// consumers read it. Measured behaviourally rather than by grep: the
+    /// progress path and the log path must produce sinks that reach the SAME
+    /// channel with the SAME non-blocking discipline.
+    #[tokio::test]
+    async fn the_progress_and_log_paths_share_one_notification_tx_sink() {
+        let mut server = bare_server();
+        let (tx, mut rx) = mpsc::channel(4);
+        server.notification_tx = Some(tx);
+
+        let via_progress = server
+            .progress_notification_sink(None)
+            .expect("a server with a notification_tx has a sink");
+        let via_log = server
+            .notification_tx_sink()
+            .expect("the same server has the same sink");
+
+        via_progress(Notification::Server(
+            crate::types::ServerNotification::LogMessage(crate::types::LogMessageParams::new(
+                LoggingLevel::Info,
+                "via progress".to_string(),
+            )),
+        ));
+        via_log(Notification::Server(
+            crate::types::ServerNotification::LogMessage(crate::types::LogMessageParams::new(
+                LoggingLevel::Info,
+                "via log".to_string(),
+            )),
+        ));
+
+        assert!(rx.try_recv().is_ok(), "the progress-derived sink delivers");
+        assert!(rx.try_recv().is_ok(), "the log-derived sink delivers too");
+    }
+}

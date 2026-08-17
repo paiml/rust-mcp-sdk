@@ -9594,3 +9594,238 @@ mod core_peer_precedence_tests {
         );
     }
 }
+
+// ===========================================================================
+// `attach_request_log_sink` — the log-sink precedence rule, the log-level
+// carrier, and the `ServerCore` root that calls them (Phase 118.2 plan 06,
+// CONF-10 / D-07).
+//
+// These live HERE rather than in `tests/log_emitter.rs` for the same reason the
+// peer suite above does, stated verbatim in `src/server/mod.rs`'s
+// `peer_precedence_tests`: they need crate-internal access. All three of
+// `attach_request_log_sink`, `TransportBackchannel` and
+// `ProtocolContext::with_resolved_log_level` are `pub(crate)`, so an integration
+// test cannot construct the request-scoped half of the precedence rule at all.
+// `tests/log_emitter.rs` carries the STRUCTURAL both-roots fence that guards
+// these from silent deletion.
+//
+// The `Server` twin of this module is `log_sink_precedence_tests` in
+// `src/server/mod.rs` — same claims, other root, so a future edit to one impl
+// cannot silently diverge from the other.
+// ===========================================================================
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod core_log_sink_tests {
+    use super::*;
+    use crate::types::protocol::context::TransportBackchannel;
+    use crate::types::protocol::{Era, ProtocolContext, ProtocolVersion};
+    use crate::types::{LoggingLevel, Notification};
+    use std::sync::Mutex;
+
+    /// A sink that records every notification handed to it, so a fence can tell
+    /// WHICH of two sinks a record reached rather than only that one did.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Notification>>>);
+
+    impl Capture {
+        fn sink(&self) -> Arc<dyn Fn(Notification) + Send + Sync> {
+            let slot = Arc::clone(&self.0);
+            Arc::new(move |notification| {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(notification);
+            })
+        }
+
+        fn len(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    fn bare_context() -> ProtocolContext {
+        ProtocolContext::new(
+            Era::V1,
+            ProtocolVersion(crate::types::protocol::LATEST_PROTOCOL_VERSION.to_string()),
+        )
+    }
+
+    fn context_with_sink(capture: &Capture) -> ProtocolContext {
+        bare_context().with_transport_backchannel(
+            TransportBackchannel::new().with_notification_sink(capture.sink()),
+        )
+    }
+
+    fn extra_with_context(
+        context: Option<ProtocolContext>,
+    ) -> crate::server::cancellation::RequestHandlerExtra {
+        crate::server::cancellation::RequestHandlerExtra::new(
+            "req-attach-log-sink".to_string(),
+            crate::server::cancellation::RequestHandlerExtra::default().cancellation_token,
+        )
+        .with_protocol_context(context)
+    }
+
+    fn bare_core() -> ServerCore {
+        crate::server::builder::ServerCoreBuilder::new()
+            .name("attach-log-sink-precedence-core")
+            .version("1.0.0")
+            .build()
+            .expect("core builds")
+    }
+
+    /// THE precedence claim (T-118.2-06-02). Both sources configured at once.
+    ///
+    /// Two DISTINGUISHABLE captures, not one: a fence that only proved "a record
+    /// arrived somewhere" could not tell the correct routing from the inverted
+    /// one, and the inverted one publishes a session's records onto the
+    /// server-wide channel.
+    #[test]
+    fn a_request_scoped_sink_wins_over_the_root_fallback() {
+        let request_scoped = Capture::default();
+        let fallback = Capture::default();
+
+        let extra = attach_request_log_sink(
+            extra_with_context(Some(context_with_sink(&request_scoped))),
+            Some(fallback.sink()),
+        );
+        extra
+            .log(LoggingLevel::Warning, "which sink received me?")
+            .expect("the emitter always returns Ok");
+
+        assert_eq!(
+            request_scoped.len(),
+            1,
+            "the session-bound transport sink must win: the root fallback is a SINGLE server-wide \
+             channel and cannot express which session issued this request (T-118.2-06-02)"
+        );
+        assert_eq!(
+            fallback.len(),
+            0,
+            "the root fallback must NOT also receive the record — that would publish one \
+             session's log records onto the server-wide channel"
+        );
+    }
+
+    /// The mirror: with no backchannel, the root's fallback is what runs.
+    #[test]
+    fn the_root_fallback_is_used_when_no_request_scoped_sink_exists() {
+        let fallback = Capture::default();
+
+        let extra = attach_request_log_sink(
+            extra_with_context(Some(bare_context())),
+            Some(fallback.sink()),
+        );
+        extra
+            .log(LoggingLevel::Warning, "no backchannel on this request")
+            .expect("the emitter always returns Ok");
+
+        assert_eq!(
+            fallback.len(),
+            1,
+            "with no request-scoped sink the root fallback must apply — that is the live path on \
+             the in-process `Server::run` transport, not a safety net"
+        );
+    }
+
+    /// Neither source configured: still a no-op, and `extra.log(..)` is silent
+    /// rather than an error (D-08).
+    #[test]
+    fn attach_request_log_sink_is_a_no_op_when_neither_source_exists() {
+        let extra = attach_request_log_sink(extra_with_context(Some(bare_context())), None);
+        assert!(
+            extra.log_sink.is_none(),
+            "with no fallback and no backchannel, `extra.log_sink` stays None"
+        );
+        assert!(
+            extra.log(LoggingLevel::Error, "into the void").is_ok(),
+            "a sinkless emit is silence, not an error (D-08)"
+        );
+    }
+
+    /// The CARRIER fence: a level resolved onto the `ProtocolContext` reaches
+    /// the emitter, and its absence leaves `DEFAULT_LOG_LEVEL` in force.
+    ///
+    /// This runs BEFORE any writer of `with_resolved_log_level` exists (the HTTP
+    /// ingress lands in plan 07), which is the point: a broken carrier cannot
+    /// hide behind a missing writer.
+    #[test]
+    fn a_resolved_log_level_on_the_context_reaches_the_extra() {
+        let with_level = Capture::default();
+        let context = context_with_sink(&with_level).with_resolved_log_level(LoggingLevel::Debug);
+        let extra = attach_request_log_sink(extra_with_context(Some(context)), None);
+
+        assert_eq!(
+            extra.log_level,
+            Some(LoggingLevel::Debug),
+            "the resolved level must be lifted off the context by the SAME unit that resolves the \
+             sink — attaching them at different sites is how two roots end up filtering differently"
+        );
+        extra
+            .log(LoggingLevel::Debug, "debug is at the bar now")
+            .expect("the emitter always returns Ok");
+        assert_eq!(
+            with_level.len(),
+            1,
+            "with `debug` resolved, a debug record must pass the filter"
+        );
+
+        // The mirror: no resolved level, so D-12's `info` default applies and the
+        // same debug record is dropped.
+        let defaulted = Capture::default();
+        let extra = attach_request_log_sink(
+            extra_with_context(Some(context_with_sink(&defaulted))),
+            None,
+        );
+        assert!(
+            extra.log_level.is_none(),
+            "with nothing resolved the unit must leave `log_level` alone so DEFAULT_LOG_LEVEL \
+             applies at emit time"
+        );
+        extra
+            .log(LoggingLevel::Debug, "below the default bar")
+            .expect("the emitter always returns Ok");
+        assert_eq!(
+            defaulted.len(),
+            0,
+            "an unconfigured request filters at `info` (D-12), so a debug record is dropped"
+        );
+    }
+
+    /// The ROOT claim on this side: `ServerCore::attach_peer` — the one
+    /// post-authorization site every `ServerCore` dispatcher calls — wires the
+    /// log sink, not just the peer.
+    #[test]
+    fn the_server_core_root_attaches_the_request_scoped_log_sink() {
+        let capture = Capture::default();
+        let core = bare_core();
+
+        let extra = core.attach_peer(extra_with_context(Some(context_with_sink(&capture))));
+        extra
+            .log(LoggingLevel::Info, "through the ServerCore root")
+            .expect("the emitter always returns Ok");
+
+        assert_eq!(
+            capture.len(),
+            1,
+            "`ServerCore::attach_peer` must attach the log sink too — it is the single site every \
+             dispatcher on this root already calls, AFTER its `tool_authorizer` check"
+        );
+    }
+
+    /// The documented asymmetry, pinned: `ServerCore` has no `notification_tx`
+    /// of any kind, so its fallback is a literal `None` and a request with no
+    /// backchannel gets no sink at all. A future reader who "fixes" the literal
+    /// `None` by inventing a channel here breaks this.
+    #[test]
+    fn the_server_core_root_has_no_fallback_sink_of_its_own() {
+        let core = bare_core();
+        let extra = core.attach_peer(extra_with_context(Some(bare_context())));
+        assert!(
+            extra.log_sink.is_none(),
+            "`ServerCore` owns no notification channel; the request-scoped `TransportBackchannel` \
+             is its ONLY possible sink"
+        );
+    }
+}

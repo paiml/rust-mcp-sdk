@@ -515,3 +515,144 @@ fn a_saturated_bounded_sink_drops_the_excess_and_the_emitter_still_returns_ok() 
          matching the vehicle rather than silently differing from it"
     );
 }
+
+// ===========================================================================
+// Fence 6 — BOTH dispatch roots attach the log sink (Phase 118.2 plan 06, D-07).
+//
+// STRUCTURAL, not behavioural, and the reason is a visibility fact rather than a
+// convenience: `server::core::attach_request_log_sink`,
+// `ProtocolContext::with_resolved_log_level` and `TransportBackchannel` are all
+// `pub(crate)`, and `Server::attach_peer` / `Server::notification_tx` are
+// private. An integration test cannot construct the request-scoped half of the
+// precedence rule at all, so the BEHAVIOURAL fences live crate-internally beside
+// the units they measure:
+//
+//   * `src/server/core.rs` :: `core_log_sink_tests`
+//   * `src/server/mod.rs`  :: `log_sink_precedence_tests`
+//
+// which is the same placement, for the same stated reason, that Phase 118.1
+// chose for the `attach_peer` precedence suite. This fence is what keeps those
+// two modules from being deleted or renamed silently, and what pins the
+// both-roots claim in the file a reader of CONF-10 actually opens. Plan 07's
+// wire fences cover the behavioural half end-to-end.
+// ===========================================================================
+
+const CORE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/core.rs");
+const SERVER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/mod.rs");
+
+/// Every line of `path` that is not a comment, joined back together.
+///
+/// A claim satisfied by a doc comment is not a claim: the whole point is that
+/// both roots CALL the unit, not that both roots mention it.
+fn code_lines(path: &str) -> String {
+    let source =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path} is readable: {e}"));
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn both_dispatch_roots_attach_the_log_sink() {
+    let core = code_lines(CORE_ROOT);
+    let server = code_lines(SERVER_ROOT);
+
+    assert!(
+        core.contains("pub(crate) fn attach_request_log_sink("),
+        "the shared unit must be DEFINED in src/server/core.rs, beside its `attach_request_peer` \
+         twin"
+    );
+    assert!(
+        core.contains("attach_request_log_sink(extra, None)"),
+        "the `ServerCore` root must call the shared unit, with the literal `None` fallback it has \
+         no notification channel to fill"
+    );
+    assert!(
+        server.contains("attach_request_log_sink(extra, self.notification_tx_sink())"),
+        "the `Server` root must call the SAME unit, passing its notification_tx-derived fallback \
+         — changing one root and not the other is this phase's most likely silent defect"
+    );
+
+    // The behavioural halves, which cannot live in this file. Named here so
+    // deleting one is a red test rather than a silent loss of coverage.
+    for fence in [
+        "fn a_request_scoped_sink_wins_over_the_root_fallback(",
+        "fn the_root_fallback_is_used_when_no_request_scoped_sink_exists(",
+        "fn attach_request_log_sink_is_a_no_op_when_neither_source_exists(",
+        "fn a_resolved_log_level_on_the_context_reaches_the_extra(",
+        "fn the_server_core_root_attaches_the_request_scoped_log_sink(",
+        "fn the_server_core_root_has_no_fallback_sink_of_its_own(",
+    ] {
+        assert!(
+            core.contains(fence),
+            "the crate-internal behavioural fence `{fence}` must still exist in src/server/core.rs"
+        );
+    }
+    for fence in [
+        "fn the_server_root_attaches_its_notification_tx_derived_fallback_log_sink(",
+        "fn the_request_scoped_sink_wins_over_the_notification_tx_fallback(",
+        "fn the_progress_token_gate_still_applies_to_progress_only(",
+        "fn the_progress_and_log_paths_share_one_notification_tx_sink(",
+    ] {
+        assert!(
+            server.contains(fence),
+            "the crate-internal behavioural fence `{fence}` must still exist in src/server/mod.rs"
+        );
+    }
+}
+
+/// The progress-token gate is still on the PROGRESS reporter, in source.
+///
+/// The behavioural half lives in `log_sink_precedence_tests`; this pins the one
+/// line, because "unify the two paths" is a tidy-looking refactor that would
+/// make progress notifications unconditional (T-118.2-06-04).
+#[test]
+fn the_progress_token_gate_is_still_the_first_line_of_progress_reporter_for() {
+    let server = code_lines(SERVER_ROOT);
+    assert!(
+        server.contains("let token = meta.and_then(|meta| meta.progress_token.as_ref())?;"),
+        "`progress_reporter_for` must still gate on the progress token — D-07 removed that gate \
+         from the LOG sink only"
+    );
+}
+
+// ===========================================================================
+// Fence 7 — the log sink is UNGATED by the progress token (D-07), measured over
+// the public surface.
+//
+// The crate-internal twin proves the DISPATCH root does this. This proves the
+// EMITTER does: a `RequestHandlerExtra` with a live log sink and no progress
+// reporter at all logs happily, which is the shape every non-progress request
+// now has.
+// ===========================================================================
+
+#[test]
+fn the_log_sink_is_live_without_any_progress_reporter() {
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+
+    assert!(
+        extra.progress_reporter.is_none(),
+        "this fence is only meaningful for a request with NO progress reporter"
+    );
+    extra
+        .log(LoggingLevel::Info, "no progress token was ever sent")
+        .expect("the emitter always returns Ok");
+
+    assert_eq!(
+        capture.len(),
+        1,
+        "a client that never asked for progress must still receive `notifications/message` — the \
+         progress token gates the reporter, not the sink (D-07)"
+    );
+    let record = &capture.json()[0];
+    assert_eq!(
+        record["method"], "notifications/message",
+        "and it must be the spec method, not a progress notification"
+    );
+}
