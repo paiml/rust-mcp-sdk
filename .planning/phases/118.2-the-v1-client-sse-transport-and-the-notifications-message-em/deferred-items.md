@@ -854,3 +854,83 @@ Separately, and **not re-booked here:** the per-id response **ROUTING** redesign
 discard-on-mismatch decision generates is already recorded above under
 `## DEFERRED (118.2-15): per-id response ROUTING, and the cost of discard-on-mismatch`, together with
 its accepted cost (`T-118.2-15-03`). See that entry rather than a duplicate here.
+
+## CLOSING VERIFICATION (118.2-18) — findings the closing gate run surfaced, none of them the closure's
+
+Appended by `118.2-18`, the gap-closure round's closing plan, **append-only**: nothing above is
+rewritten, and plan 16's declined-findings appendix is cross-referenced rather than re-litigated.
+These three are recorded because a closing verification that quietly re-runs a red gate until it is
+green, and says only the green number, is the failure mode this whole round exists to refuse.
+
+### A pre-existing `.expect` turns a transient keychain read failure into a panic
+
+- **Where:** `src/shared/streamable_http.rs:1070` (and its HTTP/2 twin at `:1061`) —
+  `.with_native_roots().expect("Failed to load native root certificates")`.
+- **Provenance: NOT this closure's.** `git blame` attributes both lines to `1564e6226`
+  ("fix: Improve HTTP transport compatibility for MCP server composition"), which predates Phase 118.2
+  entirely. None of this closure's nine source commits touches them.
+- **Measured here:** the first `make quality-gate` run of `118.2-18` failed with **5 of 5**
+  `streamable_http_oauth_integration` tests panicking at that exact line, all with
+  `Os(Error { code: -36, message: "I/O error." })` from the macOS keychain — the user, admin AND
+  system trust stores all failing to load at once, while the volume was under the pressure the gate's
+  own example-build step created (free space fell from 104Gi to 40Gi during that step). Preserved at
+  `target/118.2-18-gate-keychain-fail.log`.
+- **Proven environmental, not a regression:** the identical source re-ran **5 passed / 0 failed**
+  (`target/118.2-18-oauth-rerun.log`), and the full `make quality-gate` then re-ran **exit 0**, "ALL
+  TOYOTA WAY QUALITY CHECKS PASSED" (`target/118.2-18-gate.log`). Failing took 40.86 s; passing took
+  4.78 s.
+- **Consequence of leaving it:** a transient OS-level trust-store read failure — disk pressure, a
+  wedged `syspolicyd`, a sandbox without keychain access — **panics inside library code** rather than
+  returning an `Err` the caller can handle. A panic in a transport constructor is not something a
+  downstream application can recover from or even diagnose from the message.
+- **Reason deferred:** out of scope. It is pre-existing, it is not on the client SSE path this closure
+  fixed, and turning an `.expect` into a propagated error changes a public constructor's failure mode —
+  a decision that belongs with whoever owns the connector's error contract, not with a transport
+  safety closure. Recorded so the next reader does not re-diagnose it as a code regression, which is
+  exactly what it looks like at first sight.
+
+### The conformance runner has two fail-closed environment guards; both fired before any scenario ran
+
+Recorded because both produce a **non-zero exit having measured nothing**, and a closing record that
+reported either as a suite result would be reporting a different referee — or no referee at all.
+
+1. **Node version.** The shell's default `node` is `v20.8.1`; the suite needs `>= 22` because it
+   imports `globSync` from `node:fs` at module scope. The script refuses up front with that
+   explanation rather than dying in a stack trace that names neither Node nor this repo. Resolved by
+   putting `~/.nvm/versions/node/v22.22.2/bin` on `PATH` — the script's own suggested remedy.
+2. **`PMCP_REQUEST_STATE_KEY`.** Unset, and the script refuses rather than letting the example derive
+   a fresh per-process key, because the MRTR surface the gate blocks on would then be measuring a
+   different server than CI does. Resolved with an ephemeral non-production
+   `openssl rand -hex 32` value, never echoed and never committed.
+
+Both guards are **correct behaviour and worth keeping** — each is a "fails closed instead of measuring
+nothing" control of exactly the kind this phase has been recording. They are noted here only so the
+next person to run the suite locally does not read either refusal as a conformance failure.
+
+### The D-16 gate went RED on the first closing run, and it is reported rather than accommodated
+
+- **Run 1** (`target/118.2-18-conf.log`): the `2025-11-25` leg scored **72 passed / 1 scored failure**
+  and the gate exited **1**. The failing scenario was `tools-call-sampling`, with the error message
+  **verbatim** the one `WINDOWS.md` entry 9 already records: `MCP error -32603: Internal error:
+  Protocol error: -32603 - Dispatch oneshot channel closed`. Its `WireSchemaValid` check **passed** —
+  5 messages validated, 0 violations — so nothing about the emitted wire shape moved.
+- **Run 2** (`target/118.2-18-conf-run2.log`), identical source, identical pin: `2025-11-25`
+  **73 passed / 1 failed** (the pre-existing unscored `json-schema-2020-12`), **30 scored scenarios,
+  floor 30, 0 failing, leg exit 0**; `2026-07-28` **142 passed / 36 failed**, 37 scored, floor 37, leg
+  exit 0; all six floor assertions OK; script exit **0**. Byte-identical to `118.2-12`'s closing
+  figures.
+- **Disposition:** this is the SAME server-to-client request-lifecycle race already booked OPEN as
+  `WINDOWS.md` entries 6 and 9, landing this time on `tools-call-sampling` rather than
+  `tools-call-elicitation` — both are server-to-client request scenarios, and entry 9 already frames
+  the finding as the race rather than as one scenario, so it is **not re-booked here and entry 9 is
+  not edited**. What IS new is a second measured instance, which makes entry 9's "1 of 9 fresh runs"
+  a floor rather than a curiosity.
+- **Nothing was weakened, and D-21 carries forward verbatim.** No allowlist, no `--expected-failures`,
+  no known-failure baseline, and `2025-11-25` was not removed from `FULLY_SCORED_GREEN_REVISIONS`:
+  `git status --porcelain -- scripts/run-conformance-suite.sh conformance/` is **empty**, and
+  `git diff --stat 83e46b68..HEAD -- scripts/ conformance/` is **empty** across the entire closure.
+  The gate red-ing on a fresh run is a fact about an open defect, not a reason to move the gate.
+- **The suite cannot attribute this closure's fixes either way.** It exercises pmcp only as a SERVER —
+  CONF-09's own stated limitation (i) — and this closure changed CLIENT code only
+  (`src/shared/streamable_http.rs`'s client half and `src/client/mod.rs`). Run 2's green is a
+  regression check on the server-side gate, not validation of CR-01, CR-02, WR-01 or WR-02.
