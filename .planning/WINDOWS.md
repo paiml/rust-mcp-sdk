@@ -2,9 +2,9 @@
 schema_version: 1
 open_count: 7
 waived_count: 0
-fixed_count: 1
-total_count: 8
-last_updated: 2026-08-17T13:35:18.978Z
+fixed_count: 2
+total_count: 9
+last_updated: 2026-08-17T13:44:13.623Z
 ---
 
 # Broken Windows Ledger
@@ -22,7 +22,8 @@ last_updated: 2026-08-17T13:35:18.978Z
 | 5 | 118.2 | unmet-truth | src/server/streamable_http_server.rs | 1677 | SEP-2575: on v2 a request with no _meta logLevel still gets notifications/message, because resolve_request_log_level returns None and DEFAULT_LOG_LEVEL (info) applies. Measured 118.2-09 RED mutation 2. Fixture guards; SDK does not. | open |  | 2026-08-17T11:41:50.564Z |  |
 | 6 | 118.2 | unmet-truth | crates/pmcp-team-servers/tests/era_matrix.rs | 776 | deprecated_capabilities_complete_under_both_eras still asserts no-live-stream, not completed: phase 118.2 fixed DELIVERY of the server-to-client request but a pmcp client cannot ANSWER one issued during its own call (parked inside transport.send while the server holds the tools/call POST). Detail moved from 'Dispatch oneshot channel closed' (0.18s) to 'Server request dispatch-1 timed out' (~30s). | open |  | 2026-08-17T12:11:22.433Z |  |
 | 7 | 118.2 | deviation | .planning/phases/118.2-the-v1-client-sse-transport-and-the-notifications-message-em/deferred-items.md |  | 118.2-10 deferred the Client-level notification observation API: Client::notification_tx is None at src/client/mod.rs:406/:453/:496, ClientBuilder has no setter, the forwarding branch at :3764 is dead. A pmcp::Client consumer still cannot see notifications/message without dropping to Transport::receive(). | open |  | 2026-08-17T12:11:22.529Z |  |
-| 8 | 118.2 | unmet-truth | src/types/notifications.rs | 168 | LogMessageParams emits required 'message' and omits optional 'data'; the spec requires 'data' and has no 'message'. Measured 118.2-11: official suite 2025-11-25:tools-call-with-logging went 1/1 -> 0/2 (WireSchemaValid rejects all 3 frames; the reference zod client drops them so logCount=0). GAP_ATTRIBUTABLE_FAILURES 1 -> 2. Refutes 118.2-08's 'no scenario validates emitted params'. | open |  | 2026-08-17T12:28:31.523Z |  |
+| 8 | 118.2 | unmet-truth | src/types/notifications.rs | 168 | LogMessageParams emits required 'message' and omits optional 'data'; the spec requires 'data' and has no 'message'. Measured 118.2-11: official suite 2025-11-25:tools-call-with-logging went 1/1 -> 0/2 (WireSchemaValid rejects all 3 frames; the reference zod client drops them so logCount=0). GAP_ATTRIBUTABLE_FAILURES 1 -> 2. Refutes 118.2-08's 'no scenario validates emitted params'. | fixed |  | 2026-08-17T12:28:31.523Z | 2026-08-17T13:44:06.553Z |
+| 9 | 118.2 | unmet-truth | src/client/mod.rs |  | MEASURED FLAKE: official suite 2025-11-25:tools-call-elicitation failed 1 of 9 fresh runs (118.2-11 re-measurement, held pin 0.2.0-alpha.11) with 'MCP error -32603: Dispatch oneshot channel closed' -- the same server-to-client request-lifecycle race as entry 6, here against the reference client. Already gate-fatal via BLOCKING_GREEN_SCENARIOS at pre-hardening settings, so the D-16 widening adds no new exposure. Nothing softened to accommodate it. | open |  | 2026-08-17T13:44:13.623Z |  |
 
 ````json
 [
@@ -117,9 +118,21 @@ last_updated: 2026-08-17T13:35:18.978Z
     "file": "src/types/notifications.rs",
     "line": 168,
     "description": "LogMessageParams emits required 'message' and omits optional 'data'; the spec requires 'data' and has no 'message'. Measured 118.2-11: official suite 2025-11-25:tools-call-with-logging went 1/1 -> 0/2 (WireSchemaValid rejects all 3 frames; the reference zod client drops them so logCount=0). GAP_ATTRIBUTABLE_FAILURES 1 -> 2. Refutes 118.2-08's 'no scenario validates emitted params'.",
-    "status": "open",
+    "status": "fixed",
     "reason": "",
     "recorded_at": "2026-08-17T12:28:31.523Z",
+    "resolved_at": "2026-08-17T13:44:06.553Z"
+  },
+  {
+    "id": 9,
+    "kind": "unmet-truth",
+    "phase": "118.2",
+    "file": "src/client/mod.rs",
+    "line": null,
+    "description": "MEASURED FLAKE: official suite 2025-11-25:tools-call-elicitation failed 1 of 9 fresh runs (118.2-11 re-measurement, held pin 0.2.0-alpha.11) with 'MCP error -32603: Dispatch oneshot channel closed' -- the same server-to-client request-lifecycle race as entry 6, here against the reference client. Already gate-fatal via BLOCKING_GREEN_SCENARIOS at pre-hardening settings, so the D-16 widening adds no new exposure. Nothing softened to accommodate it.",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-08-17T13:44:13.623Z",
     "resolved_at": null
   }
 ]

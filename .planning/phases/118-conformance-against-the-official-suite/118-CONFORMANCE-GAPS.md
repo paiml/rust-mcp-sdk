@@ -464,3 +464,126 @@ whose declared `files_modified` are a shell script and two planning documents.
 **G-3 therefore remains SPLIT**, now three-quarters closed: (a) FIXED, (b) FIXED, (c) FIXED, **(d)
 OPEN with its cause fully localised** — no longer "no handler-facing emitter exists" but "the emitter
 exists and emits a params shape the specification does not admit."
+
+---
+
+## Dispositions — Phase 118.2 (amendment 2: the re-measurement after plan `118.2-13`)
+
+**Amended:** 2026-08-17 by plan `118.2-11`, resuming at Task 2 after the halt recorded above.
+**Appends only; nothing above this line is edited or deleted** — the halt, its numbers, and its stated
+reasons remain on the record exactly as measured, because they were correct when taken.
+
+### What changed between the two measurements
+
+The halt above was raised to the developer, who chose to fix it in `src/`. Plan `118.2-13` (commits
+`f65f104a`, `dd55eeab`, `790e741f`, `f73f3c65`) made `emit_log_record` default the record's `data`
+member to the message string:
+
+```rust
+let data = data.unwrap_or_else(|| serde_json::Value::String(message.clone()));
+```
+
+`extra.log_with_data(..)` still passes its explicit `data` through verbatim. `cargo semver-checks
+--baseline-rev cb5d1365 -p pmcp` reported **no semver update required**. Nothing else moved: the pin is
+still `0.2.0-alpha.11`, and `scripts/run-conformance-suite.sh`, `conformance/package.json` and
+`BLOCKING_GREEN_SCENARIOS` were all untouched by plan 13. **The delta below is attributable to that one
+`src/` change alone.**
+
+### The re-measurement — same pin, same method, nine fresh runs
+
+Same held pin `0.2.0-alpha.11`, same one-process harness, Node v22.22.2, example rebuilt first. Logs:
+`target/118.2-11-conf-postfix.log` (run 0) and `target/118.2-11-conf-rep1.log` … `-rep8.log`.
+
+| Requirement set | 118.1 closing | Amendment 1 (pre-fix) | **Now (post-fix, 8 of 9 runs)** | Checks | Scored red | Suite exit |
+|---|---|---|---|---|---|---|
+| `2025-11-25` | 72 passed, 2 failed | 71 passed, 3 failed | **73 passed, 1 failed** | 74 | **0** | **0** |
+| `2026-07-28` | 142 passed, 36 failed | 142 passed, 36 failed | **142 passed, 36 failed** | 178 | 0 | 0 |
+
+The v2 leg is byte-identical for the third consecutive measurement — 37 of 37 scored scenarios green.
+Phase 118.2 has disturbed nothing on v2 at any point.
+
+**The v1 leg's entire delta is the one scenario this phase was chartered to flip:**
+
+| Scenario | 118.1 closing | Amendment 1 | **Now** | Scored |
+|---|---|---|---|---|
+| `2025-11-25:tools-call-with-logging` | 1 passed, 1 failed | 0 passed, 2 failed | **2 passed, 0 failed** | yes |
+| every other scored `2025-11-25` scenario | — | unchanged | unchanged, all green | — |
+| `2025-11-25:json-schema-2020-12` | 1 passed, 1 failed | unchanged | unchanged — **not scored** (`pending`, missing fixture) | no |
+
+`73 + 1 = 74`: the executed-check total is unchanged across all three measurements, so this is two
+failures converting to two passes inside one scenario — not a scenario appearing or disappearing.
+It ends up **better than the 118.1 baseline** rather than merely restored, because
+`tools-call-with-logging` carried a failing `WireSchemaValid` at 118.1 closing too; both of its checks
+are now green.
+
+**`GAP_ATTRIBUTABLE_FAILURES: 2 → 0.`** The v1 leg's only remaining failure is the unscored missing
+fixture `json-schema-2020-12`, which was never gap-attributable.
+
+The scenario's own artifact, from `target/conformance-results/2025-11-25/server-tools-call-with-logging-*/checks.json`:
+
+```json
+{"id":"tools-call-with-logging","status":"SUCCESS",
+ "details":{"logCount":3,"logs":[
+   {"level":"info","data":"Tool execution started"},
+   {"level":"info","data":"Tool processing data"},
+   {"level":"info","data":"Tool execution completed"}]}}
+{"id":"wire-schema-valid","status":"SUCCESS",
+ "details":{"messagesValidated":10,"violations":[]}}
+```
+
+All three frames now reach the reference client's collector — the zod `data: z.unknown()` member that
+was non-optional under zod v4, and therefore dropped every record, is populated. `WireSchemaValid`
+validates the same ten messages it validated while failing, and reports zero violations.
+
+### G-3 sub-item (d) — final verdict
+
+| Sub-item | Amendment 1 verdict | **Final verdict** | Evidence |
+|---|---|---|---|
+| **(d) log notifications** | PARTIAL — emission FIXED, wire shape non-conformant, OPEN against the suite | **FIXED** | `2025-11-25:tools-call-with-logging` 0/2 → **2/0**, `WireSchemaValid` 10 messages / 0 violations, `GAP_ATTRIBUTABLE_FAILURES` 2 → 0, `logCount` 0 → 3. In-tree: `binary(log_emitter)`, `binary(log_records_example_run)`, `binary(pmcp_both_ends_logging)`, plus plan 13's property fence over the required `data` member |
+
+**G-3 is therefore CLOSED**: (a) FIXED, (b) FIXED, (c) FIXED, (d) FIXED. The `message`/`data`
+divergence recorded as `.planning/WINDOWS.md` entries 4 and 8 is closed by measurement, not by
+argument.
+
+### Two findings deliberately NOT swept into this green
+
+Recorded so a reader of the green numbers is not misled:
+
+1. **SEP-2575 on v2 is still unmet** (`.planning/WINDOWS.md` entry 5). A v2 `tools/call` with no
+   `_meta["io.modelcontextprotocol/logLevel"]` still receives a log record, because
+   `resolve_request_log_level` returns `None` and `DEFAULT_LOG_LEVEL` (`info`) applies. Amendment 1
+   measured that the pinned suite runs **no** `sep-2575-*` scenario on the v2 leg, and that is still
+   true here — so this is **not externally observable and therefore not fixed by these green numbers**.
+   It remains an in-tree unmet truth.
+2. **The client lifecycle deadlock is still open** (`.planning/WINDOWS.md` entry 6).
+   `Client::dispatch_request` awaits `transport.send(..)` before entering its receive loop, while the
+   server holds the `tools/call` POST open, so a pmcp client cannot ANSWER a server-to-client request
+   issued during its own call. Delivery is fixed; the answer path deadlocks. See the flake below — this
+   is the same defect, observed against the reference client.
+
+### A measured flake on the v1 leg, recorded rather than tuned around
+
+`2025-11-25:tools-call-elicitation` failed in **1 of 9 fresh runs** (run 0, the first run after the
+example binary was rebuilt) with:
+
+```
+Failed: MCP error -32603: Protocol error: -32603 - Dispatch oneshot channel closed
+```
+
+That is the identical error string `.planning/WINDOWS.md` entry 6 records for the in-tree
+`era_matrix` fence — the same server-to-client request-lifecycle race, here surfacing against the
+official reference client. Runs 1–8 were green (`73 passed, 1 failed`, suite exit 0, script exit 0).
+
+Two things follow, and both matter for the gate hardening in plan `118.2-11` Task 2:
+
+- **This flake is already gate-fatal today.** `2025-11-25:tools-call-elicitation` is one of the 29
+  pre-existing `BLOCKING_GREEN_SCENARIOS` entries, and run 0 failed the script on exactly that
+  assertion, at the gate's PRE-hardening settings. Adding `2025-11-25` to
+  `FULLY_SCORED_GREEN_REVISIONS` introduces **no new flake exposure** for this scenario; it adds a
+  second, independent authority over a fact the gate already enforced.
+- **Nothing was softened to accommodate it.** Per D-21, no `--expected-failures`, allowlist, or
+  known-failure baseline was introduced, and no floor was lowered. The exposure is written down here
+  and in `.planning/WINDOWS.md` instead.
+
+`ServerAcceptsWhitespaceHeaderValue` — the flake that D-16 and threat `T-118.2-11-06` actually
+anticipated — did **not** fire in any of the nine runs (`http-header-validation` 14/0 every time).
