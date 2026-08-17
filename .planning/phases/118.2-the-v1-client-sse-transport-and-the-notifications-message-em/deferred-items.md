@@ -636,3 +636,221 @@ what a conformant server does (JSON-RPC 2.0: the response id "MUST be the same a
 the id member in the Request Object"). No canned payload, cursor chain or pop order changed,
 and the correlation check was not weakened. A mock that answers with a fabricated id is
 precisely the hostile-peer shape fence 17 now refuses.
+
+---
+
+## GAP-CLOSURE ROUND (2026-08-17) — the review findings this closure DECLINES to fix
+
+**Recorded by plan `118.2-16`, the closure's leftovers ledger.** `118.2-REVIEW.md` returned thirteen
+findings. This gap closure (plans 14–18) fixed **four** of them: **CR-01** (plan 14, the unbounded
+reconnect loop), **CR-02** (plan 15, the response/request desync and the terminal-error FIFO poison),
+**WR-01** (plan 17, the reader parked on an idle-but-open stream) and **WR-02** (plan 17, the
+cross-stream resumption cursor). The remaining **nine** — four Warnings and five Info items — are
+real, were confirmed by a reviewer, and are **shipping unfixed**. They are indexed below so that a
+later audit can tell a scoped decision from an oversight.
+
+Each entry is an index into `118.2-REVIEW.md`, not a copy of it: the review holds the full analysis,
+the reproduction and the suggested fix. **Line spans are as the review recorded them, against the
+pre-closure tree** — plans 14, 15 and 17 have since shifted line numbers inside
+`src/shared/streamable_http.rs`, so locate by symbol name rather than by line.
+
+`WINDOWS.md` entries 4, 5, 6, 8 and 9 are **not** restated here; they are already correctly disclosed
+(three open, two fixed) and re-recording them would double-book them.
+
+### WR-03 — `start_sse` has a TOCTOU on `abort_handle` that can leave a second, untracked session reader
+
+- **Review:** `118.2-REVIEW.md:327`.
+- **Source:** `src/shared/streamable_http.rs:1153-1194` (`start_sse`); reachable off `&self` from
+  `post_body`'s 202 branch (`:1818`) and `send_with_options`'s resumption branch (`:1605-1607`).
+- **Consequence of leaving it:** two clones of a `Clone` transport can interleave the
+  take-abort-spawn-store sequence, so two live GET session streams exist and the client sees each
+  server-initiated message twice.
+- **Reason deferred:** the fix is a new `tokio::sync::Mutex` field plus a serialised open sequence in
+  the one function plans 14, 15 and 17 all edit; it needs its own concurrency fence (fence 4 exercises
+  the sequential case only) and it was out of the closure's fenced scope.
+- **Touches code this closure DOES modify — and the finding is now strictly NARROWER.** Plan 17 closed
+  the reader-shutdown half (WR-01) and un-shared the cursor (WR-02), so the two readers no longer
+  corrupt each other's reconnect cursor (each owns a local) and **both** are now stoppable by `close()`
+  or by a dropped transport. WR-03 has therefore been reduced from *"a second GET may exist, poison the
+  cursor, and outlive the transport"* to *"a second GET may exist"* — duplicate delivery only. The
+  TOCTOU that can create that second reader stays open. Plan 17 routed this reduction here as
+  `T-118.2-17-06` (disposition **transfer**).
+
+### WR-04 — a reconnect GET gets no 401 refresh, unlike every POST
+
+- **Review:** `118.2-REVIEW.md:370`.
+- **Source:** `src/shared/streamable_http.rs:2706-2730` (`open_sse_once`) versus `:1696-1739`
+  (`post_once`, which does implement the single-shot `provider.on_unauthorized()` retry).
+- **Consequence of leaving it:** when a bearer token expires and the gateway drops the idle session
+  stream, the reissued GET is answered `401`, the reconnect loop treats it as terminal, and the session
+  stream is lost **permanently** — server-to-client requests (sampling, roots, elicitation) are dead
+  with no recovery short of rebuilding the client, while POSTs on the same transport keep working after
+  their own refresh.
+- **Reason deferred:** it needs the refresh factored out of `post_once` plus a harness mode that
+  answers the first GET `401` and the reconnect `200`; that is an auth-path change with its own fence,
+  not part of the two Criticals the verification demanded.
+- **Touches code this closure DOES modify:** plan 14 changed the reconnect loop's **timing** (a
+  `MIN_SSE_RECONNECT_DELAY` floor and an uptime-gated budget) and not its **response handling**, so a
+  `401` on a reconnect GET remains terminal exactly as the review describes.
+
+### WR-05 — an ordinary EOF on the session stream escalates to an application-visible error, contradicting the documented taxonomy
+
+- **Review:** `118.2-REVIEW.md:405`.
+- **Source:** `src/shared/streamable_http.rs:2054` (the `Transport::receive` taxonomy row) versus
+  `:2266-2268` and `:2796-2804` (the behaviour).
+- **Consequence of leaving it:** a server that answers GET with `200` + immediate EOF — permitted by
+  the spec — costs the client three GETs and then a hard `Err` on the receive queue on every
+  connection, while the documented row promises the reader "exits silently". The doc and the code
+  disagree, and the doc is the one an integrator reads.
+- **Reason deferred:** resolving it means choosing between two contracts (stop escalating a clean EOF,
+  or correct the table row and say escalation is intended). That is a contract decision for the
+  transport's owner, not a bug fix, and picking one inside a closure scoped to CR-01/CR-02 would settle
+  it by accident.
+- **Touches code this closure DOES modify:** plan 15 rewrote how a terminal reason is **delivered**
+  (off the response FIFO onto a sticky latch) while deliberately keeping the ordinary-EOF row of the
+  taxonomy exactly as it stood, so the divergence WR-05 names survives untouched rather than
+  half-fixed. Plan 15's own summary records that non-change explicitly.
+
+### WR-06 — `logging/setLevel` reports success while silently discarding the level (stateless deployments, and batches)
+
+- **Review:** `118.2-REVIEW.md:432`.
+- **Source:** `src/server/streamable_http_server.rs:1627-1650` (`capture_v1_set_level`) and
+  `src/server/core.rs` (`set_logging_level_response`).
+- **Consequence of leaving it:** a stateless v1 deployment answers the mandated literal `{}` to every
+  `logging/setLevel` and then applies `DEFAULT_LOG_LEVEL` forever — a client that asked for `error`
+  keeps receiving `info` chatter it explicitly declined, which is unsolicited data on a channel it
+  tried to quiet. Same function, second instance: a `logging/setLevel` inside a JSON-RPC **batch** (a
+  top-level array) is never captured, because the method is read as `body.get("method")`.
+- **Reason deferred — this one is explicitly out of scope for this closure, not merely unscheduled.**
+  Fixing it would reopen **CONF-10** territory that plans 07, 08 and 13 already argued to a booked
+  conclusion, with two prior verdicts in this very file (the `118.2-08` `logging/setLevel` verdict and
+  the `118.2-13` `LogMessageParams` resolution) and two `WINDOWS.md` entries behind it. A transport
+  closure carrying none of that context is the wrong place to relitigate a settled requirement, and the
+  behaviour was left untouched on purpose. It also sits directly on top of four locked decisions —
+  D-10 (filter on both eras), D-11 (the v1 level lives in the per-session `V1State` map), D-12 (default
+  level `info`) and D-13 (both dispatch roots agree about `logging/setLevel`) — which recording rather
+  than fixing is what keeps intact.
+
+### IN-01 — the structural fences strip `//` comments only
+
+- **Review:** `118.2-REVIEW.md:466`.
+- **Source:** `tests/log_emitter.rs:557-568` (`code_lines`), `:1848` (`squeezed_code`).
+- **Consequence of leaving it:** a `/* … */` block comment or a string literal containing
+  `attach_request_log_sink(extra, None)` would satisfy `both_dispatch_roots_attach_the_log_sink`
+  without either root calling anything — a fence that can be satisfied by prose.
+- **Reason deferred:** low likelihood and test-only; the fix is to reuse the stronger stripper
+  `tests/v1_severability_tripwire.rs:435-568` already implements, which is a test-infrastructure
+  consolidation rather than a defect fix.
+
+### IN-02 — fences 13 and 14 are timing-fragile under load
+
+- **Review:** `118.2-REVIEW.md:478`.
+- **Source:** `tests/client_sse_stream.rs` (`closing_during_reconnect_backoff_issues_no_further_get`,
+  `dropping_the_transport_during_backoff_issues_no_further_get`).
+- **Consequence of leaving it:** both wait for `get_lines() >= 2` and then assert `observed == 2`
+  inside a 1.5 s backoff window, so a loaded CI box can fail them for a scheduling reason rather than a
+  defect — a flake source in a suite that already carries one known conformance flake. It fails in the
+  safe (loud) direction, not vacuously.
+- **Reason deferred:** the fix is a harness change (hold the second GET open until the test signals) to
+  two **existing** fences, and rewriting a green fence mid-closure voids its evidence for no
+  correctness gain.
+- **Touches code this closure DOES modify:** plan 14's new fence 15 is built to exactly the anti-flake
+  discipline IN-02 asks for — bounded counts and monotonic **lower** bounds, never an upper wall-clock
+  bound, measured server-side at accept time — and plans 15 and 17 followed the same rule for fences
+  16–20. The two **existing** fences IN-02 names were not rewritten.
+
+### IN-03 — the request body is fully re-parsed a third time per POST
+
+- **Review:** `118.2-REVIEW.md:490`.
+- **Source:** `src/server/streamable_http_server.rs:1687` (`raw_body_json` inside
+  `resolve_request_log_level`), called at `:4629` and `:5421`.
+- **Consequence of leaving it:** a third full `serde_json` deserialization of untrusted input per POST
+  on the hot ingress path, when the parsed `Value` is already in hand at both call sites' enclosing
+  scope. Correctness-neutral.
+- **Reason deferred:** a performance refactor on the server ingress, explicitly outside v1 performance
+  scope and outside this client-transport closure.
+
+### IN-04 — `pub` closure fields with `#[allow(dead_code)]`
+
+- **Review:** `118.2-REVIEW.md:500`.
+- **Source:** `src/server/cancellation.rs:225` (`pub log_sink`), `:231` (`pub log_level`).
+- **Consequence of leaving it:** two `pub` fields carrying live capability handles are part of the API
+  surface — `examples/s54_v2_dual_conformance.rs` already reads `extra.log_level` directly, pinning the
+  field name — so any code holding a `&mut RequestHandlerExtra` can swap the sink.
+- **Reason deferred:** moving to accessors is an API-shape change; the struct is `#[non_exhaustive]` so
+  nothing prevents it later, and doing it here would put a public-surface decision inside a closure
+  scoped to two client defects.
+
+### IN-05 — the v1 capability arm now spends ~60 s waiting out a dispatch budget
+
+- **Review:** `118.2-REVIEW.md:511`.
+- **Source:** `crates/pmcp-team-servers/tests/era_matrix.rs` (`v1_capability_arm`,
+  `DISPATCH_TIMEOUT_MARKER`).
+- **Consequence of leaving it:** two tools each wait out the server's ~30 s dispatch budget, turning a
+  sub-second test into a minute-long one in a suite CI runs with `--test-threads=1`. The arm is a
+  deliberate, documented record of the open client-lifecycle deadlock and is non-vacuous.
+- **Reason deferred:** the improvement is a shorter server-side dispatch budget in the fixture (if one
+  is configurable), which belongs with the client-lifecycle deadlock item it documents
+  (`WINDOWS.md` #6/#9, already disclosed and not re-booked here) rather than with this closure.
+
+### IN-06 — `parse_peer_log_level`'s "no rejection" rule is right; one consequence is worth stating in the rustdoc
+
+- **Review:** `118.2-REVIEW.md:522`.
+- **Source:** `src/server/streamable_http_server.rs:1603` (`parse_peer_log_level`).
+- **Consequence of leaving it:** the function returns `None` for both "absent" and "garbage". When the
+  already-recorded SEP-2575 v2 default is fixed, that two-way answer must become three-way
+  (`Absent` / `Invalid` / `Level`) or a v2 client will re-enable logging it is prohibited from receiving
+  simply by sending a malformed level — i.e. the SEP-2575 fix can land halfway and look complete.
+- **Reason deferred:** it is a forward-looking rustdoc note whose natural owner is the SEP-2575 fix
+  itself (CONF-10 territory, same reasoning as WR-06); writing it here without that fix in hand would
+  document a shape nobody is yet implementing.
+
+### Process defects this closure surfaced (not review findings, recorded so they do not recur)
+
+Two defects in the closure's own **plan files** were found by running the commands those plans
+specified. Both are already booked as OPEN deviations in `.planning/WINDOWS.md` (ids **10** and **11**,
+which are new in this round and are not among the entries this appendix declines to restate). Neither
+plan file was edited, by design — plan 18 owns the phase's traceability amendment.
+
+- **The `pmat` jq path is wrong for pmat 3.15.0.** `118.2-15-PLAN.md:391` and `118.2-17-PLAN.md:341`
+  both specify
+  `pmat analyze complexity --format json --max-cognitive 25 | jq -e '[.violations[] | select(.path | startswith("src/"))] | length == 0'`.
+  On pmat 3.15.0 — the version CLAUDE.md pins for CI — the top-level keys are exactly
+  `["files", "summary", "top_files_limit"]`: there is no top-level `.violations`, and violation records
+  key the path as `.file` with a `./` prefix. The command emits `Cannot iterate over null` and exits
+  **5**. It fails **closed** rather than false-greening, but it measures nothing. The verified-correct
+  form is
+  `jq -e '[.summary.violations[] | select(.file | startswith("./src/"))] | length == 0'` → `true`,
+  exit 0. **Related genuine false green, not to be used as a workaround:** scoping with
+  `--files <path>` exits 0 while reporting `total_files: 1, total_functions: 0`.
+- **A plan verify written as `--max-cognitive 25` is LOOSER than the CI gate it claims to predict.**
+  This is a plan-template defect, not a source defect, and it will recur wherever the spelling is
+  copied. Measured direction, established as fact: plan 17 found `read_sse_body` at cognitive
+  complexity **exactly 25**, which **passes** `pmat analyze complexity --max-cognitive 25` while
+  **failing** `pmat quality-gate --fail-on-violation --checks complexity` — the PR-blocking command
+  CLAUDE.md names. So the plan's own verify block would have let a CI-failing tree through. Plan 17
+  resolved its instance by **extracting** `end_of_frame_stop`, not by an `#[allow]`, holding the
+  zero-`#[allow]` rule. **Unconfirmed, do not cite as established:** plan 17 reported the gate's
+  effective cognitive threshold as **23**; that specific number could not be confirmed from pmat
+  3.15.0's help output, which documents only `--max-complexity-p99` (default 50) and
+  complexity-entropy (default 2.0) and lists no cognitive default. Treat the *direction* as measured
+  and the *number* as unverified — and in either case run the **gate**, not the report.
+
+### Disposition — who should own the remainder
+
+Recorded without minting phase numbers this plan has no authority to assign.
+
+**A client-transport hardening plan** is the natural owner of **WR-03**, **WR-04** and **WR-05**: all
+three live in `src/shared/streamable_http.rs`, all three need a harness mode plus a fence in
+`tests/client_sse_stream.rs`, and WR-05 additionally needs a contract decision (stop escalating a clean
+EOF, or correct the taxonomy row) that should be taken once for the whole reader rather than per
+defect. **A CONF-10 follow-up** is the natural owner of **WR-06** and **IN-06**, together with the
+already-disclosed SEP-2575 v2 default (`WINDOWS.md` #5) that IN-06's three-way answer exists to serve;
+that plan carries the D-10/D-11/D-12/D-13 context this closure deliberately did not load. **IN-01,
+IN-02, IN-03, IN-04 and IN-05** are independent hygiene items with no ordering constraint between them
+and no correctness consequence, and can ride along with whichever plan next touches their file.
+
+Separately, and **not re-booked here:** the per-id response **ROUTING** redesign that plan 15's
+discard-on-mismatch decision generates is already recorded above under
+`## DEFERRED (118.2-15): per-id response ROUTING, and the cost of discard-on-mismatch`, together with
+its accepted cost (`T-118.2-15-03`). See that entry rather than a duplicate here.
