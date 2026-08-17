@@ -177,6 +177,39 @@ const RECONNECT_QUIET: Duration = Duration::from_secs(4);
 /// The event id fence 11 pushes and then requires on the reconnect GET.
 const RESUMED_FROM: &str = "e7";
 
+/// The FLOOR the transport puts under any reconnect wait, restated here
+/// (plan 14, CR-01).
+///
+/// `MIN_SSE_RECONNECT_DELAY` is a PRIVATE constant on
+/// `src/shared/streamable_http.rs`, for the same never-a-semver-event reason
+/// [`SHIPPED_RECONNECT_BUDGET`] is, so an integration test cannot import it.
+/// Restating it follows that established precedent — and changing ONE without
+/// the other reds [`reconnect_with_one_delivered_frame_and_zero_retry_stays_bounded`],
+/// whose FLOOR arm measures the shipped spacing against this value and reports
+/// both numbers.
+const SHIPPED_MIN_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+/// Upper bound on the WHOLE zero-retry reconnect schedule (plan 14, CR-01).
+///
+/// Deliberately tighter than [`RECONNECT_BOUND`]. Against the UNFIXED tree this
+/// fence's peer drives the client through a zero-delay reconnect loop — a
+/// `retry: 0` that is honoured verbatim, plus a budget refunded on every
+/// delivered frame — so the bound is what caps how many loopback connections the
+/// RED capture is allowed to open (T-118.2-14-04). Post-fix the schedule is
+/// `SHIPPED_RECONNECT_BUDGET` x [`SHIPPED_MIN_RECONNECT_DELAY`], i.e. about one
+/// second, so 8 s is generous for the GREEN run and still short for the RED one.
+const ZERO_RETRY_BOUND: Duration = Duration::from_secs(8);
+
+/// How long the zero-retry fence watches to prove NO further GET arrives.
+///
+/// Deliberately tighter than [`RECONNECT_QUIET`], for the same RED-capture
+/// reason as [`ZERO_RETRY_BOUND`]: every extra second of observation against the
+/// unfixed tree is another second of unbounded loopback connections. It only has
+/// to outlast what is still scheduled at the moment the budget is spent, and
+/// post-fix that is one [`SHIPPED_MIN_RECONNECT_DELAY`] — so 1.5 s is three
+/// times the wait it must outlast.
+const ZERO_RETRY_QUIET: Duration = Duration::from_millis(1500);
+
 // ===========================================================================
 // The recording listener.
 //
@@ -240,6 +273,24 @@ struct Shared {
     /// The proxy-blink shape D-03 exists for, reduced to its limit: an idle
     /// timeout that fires immediately, every time.
     close_get_on_accept: AtomicBool,
+    /// When `Some(retry_ms)`, every GET is answered with a chunked
+    /// `text/event-stream` carrying exactly ONE complete event — whose `retry:`
+    /// field is `retry_ms` — and then ended (plan 14, CR-01).
+    ///
+    /// The arm [`close_get_on_accept`](Shared::close_get_on_accept) cannot reach:
+    /// that mode delivers NOTHING, so the reader's `delivered` flag is always
+    /// `false` and the budget-refund branch is never taken. This mode sets
+    /// `delivered == true` on EVERY body, which is the half of CR-01 that turns a
+    /// bounded retry budget into an unbounded one.
+    one_frame_then_close: Mutex<Option<u64>>,
+    /// When each GET was ACCEPTED, server-side, in arrival order.
+    ///
+    /// Pushed in the same place [`get_cursors`](Shared::get_cursors) is, so there
+    /// is exactly one timestamp slot per accepted GET and the two vectors index
+    /// alike. Server-side rather than client-side deliberately: the fence asserts
+    /// on the spacing the PEER observed, which is the spacing that matters for a
+    /// request flood.
+    get_instants: Mutex<Vec<std::time::Instant>>,
     /// Bumped to end every LIVE SSE body cleanly, mid-flight.
     ///
     /// A `watch` rather than a `Notify` deliberately: `Notify::notify_waiters`
@@ -285,6 +336,8 @@ impl RecordingServer {
             sse_post_methods: Mutex::new(HashSet::new()),
             get_cursors: Mutex::new(Vec::new()),
             close_get_on_accept: AtomicBool::new(false),
+            one_frame_then_close: Mutex::new(None),
+            get_instants: Mutex::new(Vec::new()),
             close_live,
         });
 
@@ -350,6 +403,23 @@ impl RecordingServer {
         self.shared
             .close_get_on_accept
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Answer every GET with a `text/event-stream` that delivers exactly ONE
+    /// complete event carrying `retry: retry_ms`, and then ends (plan 14, CR-01).
+    ///
+    /// Call BEFORE the client connects, mirroring
+    /// [`close_get_streams_on_accept`](RecordingServer::close_get_streams_on_accept).
+    /// Together the two modes are the pair the equivalence arm needs: a body that
+    /// delivers ZERO events and a body that delivers exactly ONE must settle at
+    /// the SAME bounded GET count.
+    fn deliver_one_frame_then_close_each_get(&self, retry_ms: u64) {
+        *self.shared.one_frame_then_close.lock() = Some(retry_ms);
+    }
+
+    /// When each GET was accepted, server-side, in arrival order.
+    fn get_instants(&self) -> Vec<std::time::Instant> {
+        self.shared.get_instants.lock().clone()
     }
 
     /// End every LIVE SSE body cleanly, mid-flight (plan 04).
@@ -430,6 +500,18 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
 
     if request_line.starts_with("GET ") {
         shared.get_cursors.lock().push(cursor);
+        // One timestamp slot per accepted GET, pushed in the SAME place the
+        // cursor slot is so the two vectors index alike.
+        let sequence = {
+            let mut instants = shared.get_instants.lock();
+            instants.push(std::time::Instant::now());
+            instants.len()
+        };
+        let one_frame = *shared.one_frame_then_close.lock();
+        if let Some(retry_ms) = one_frame {
+            serve_get_that_delivers_one_frame_then_ends(&mut write_half, retry_ms, sequence).await;
+            return;
+        }
         if shared.close_get_on_accept.load(Ordering::SeqCst) {
             serve_get_that_ends_at_once(&mut write_half).await;
             return;
@@ -538,6 +620,46 @@ async fn serve_get_that_ends_at_once(write_half: &mut WriteHalf<TcpStream>) {
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                 cache-control: no-cache\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
     let _ = write_half.write_all(head.as_bytes()).await;
+    let _ = write_half.flush().await;
+    let _ = write_half.shutdown().await;
+}
+
+/// Answer a GET with ONE complete SSE event and then end the body (plan 14).
+///
+/// The delivered-arm twin of [`serve_get_that_ends_at_once`], and the shape
+/// CR-01 turns on: a peer that hands the client one frame per GET — so the
+/// reader's `delivered` flag is `true` on every body — while telling it, through
+/// the SSE `retry:` field, to come straight back with no wait at all.
+///
+/// Chunked rather than `content-length`-framed because a frame has to be written
+/// after the head; the terminating zero-length chunk plus `connection: close`
+/// keep "this stream is over" as unambiguous to hyper as the zero-delivery mode
+/// makes it, so the reconnect opens a NEW connection rather than racing a pooled
+/// one.
+///
+/// `sequence` gives the event a per-GET `id:`, so the ids advance the way a real
+/// stream's do and the reconnect carries a moving cursor rather than a constant
+/// one.
+async fn serve_get_that_delivers_one_frame_then_ends(
+    write_half: &mut WriteHalf<TcpStream>,
+    retry_ms: u64,
+    sequence: usize,
+) {
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\
+                connection: close\r\n\r\n";
+    if write_half.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": "zero-retry", "progress": sequence },
+    })
+    .to_string();
+    let frame = format!("retry: {retry_ms}\nid: zr{sequence}\nevent: message\ndata: {payload}\n\n");
+    let _ = write_chunk(write_half, &frame).await;
+    let _ = write_half.write_all(b"0\r\n\r\n").await;
     let _ = write_half.flush().await;
     let _ = write_half.shutdown().await;
 }
@@ -1576,6 +1698,116 @@ async fn dropping_the_transport_during_backoff_issues_no_further_get() {
          open and reconnect to a peer with nothing left to deliver to. Observed request lines: \
          {:?}",
         server.request_lines()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 15 — a peer answering every GET with `retry: 0` PLUS one delivered
+// frame is still bounded (plan 14, CR-01).
+//
+// The arm fence 12 cannot reach. Fence 12's peer uses
+// `close_get_streams_on_accept()`, a stream that delivers NOTHING, so the
+// reader's `delivered` flag is always `false` and the budget-refund branch is
+// never taken. A peer that hands over exactly ONE frame per body takes that
+// branch on EVERY iteration — and, with `retry: 0` honoured verbatim, converts
+// the bounded retry budget into an unbounded, zero-delay request flood that also
+// re-mints an access token per iteration (T-118.2-14-01, T-118.2-14-02).
+// ===========================================================================
+
+#[tokio::test]
+async fn reconnect_with_one_delivered_frame_and_zero_retry_stays_bounded() {
+    let server = RecordingServer::start().await;
+    // Both halves of CR-01 at once: a delivered frame per body, and a
+    // peer-supplied `retry:` of zero.
+    server.deliver_one_frame_then_close_each_get(0);
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+
+    // EQUIVALENCE (the CONF-09 `empty` probe). This is the SAME expression
+    // fence 12 pins for a body that delivers ZERO events. Pinning the one
+    // expression in both fences is what makes "an empty body and a
+    // single-element body terminate at the same bounded GET count" an assertion
+    // rather than a coincidence: the delivered arm must not buy extra attempts.
+    let expected_gets = 1 + SHIPPED_RECONNECT_BUDGET;
+
+    // --- COUNT: the CR-01 subject. ---
+    assert!(
+        wait_for_within(ZERO_RETRY_BOUND, || server.get_lines() >= expected_gets).await,
+        "the initial open plus {SHIPPED_RECONNECT_BUDGET} budgeted retries must all be issued. \
+         Observed request lines: {:?}",
+        server.request_lines()
+    );
+    tokio::time::sleep(ZERO_RETRY_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        expected_gets,
+        "a peer that answers every GET with ONE frame and `retry: 0` must still get exactly the \
+         initial open plus {SHIPPED_RECONNECT_BUDGET} retries. Refunding the whole budget on any \
+         single delivered event makes the loop unbounded, and honouring `retry: 0` verbatim makes \
+         it tight — together they are a remote-triggerable denial of service against the CLIENT: \
+         a burned core, a request flood at the peer, and a fresh access-token fetch per iteration \
+         (CR-01, T-118.2-14-01/02). Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    // --- FLOOR: a lower bound on the spacing, measured SERVER-side. ---
+    let instants = server.get_instants();
+    assert!(
+        instants.len() >= expected_gets,
+        "the harness must have recorded a timestamp slot per accepted GET; got {} for {} GET \
+         line(s)",
+        instants.len(),
+        server.get_lines()
+    );
+    let budget = u32::try_from(SHIPPED_RECONNECT_BUDGET)
+        .expect("the shipped reconnect budget fits in a u32");
+    let floor = SHIPPED_MIN_RECONNECT_DELAY * budget;
+    let spanned = instants[expected_gets - 1].duration_since(instants[0]);
+    assert!(
+        spanned >= floor,
+        "the {expected_gets} GETs arrived {spanned:?} apart end to end, under the {floor:?} floor \
+         that {SHIPPED_RECONNECT_BUDGET} waits of at least {SHIPPED_MIN_RECONNECT_DELAY:?} \
+         guarantee. A peer-supplied `retry:` is remote input in BOTH directions: uncapped above it \
+         parks the reader, unfloored below it turns the reconnect loop into a request flood. A \
+         LOWER bound only — CI load can only make this larger, never smaller."
+    );
+
+    // --- TERMINAL: the named exhaustion error still surfaces, after the frames. ---
+    let mut delivered = 0usize;
+    let error = loop {
+        let next = timeout(ZERO_RETRY_BOUND, transport.receive())
+            .await
+            .expect("each delivered frame, and then the exhaustion error, arrives within bound");
+        match next {
+            Ok(message) => {
+                delivered += 1;
+                assert!(
+                    delivered <= expected_gets,
+                    "the peer wrote one frame per GET and issued {expected_gets} GET(s), so the \
+                     drain must not exceed that count; got {delivered}"
+                );
+                assert!(
+                    progress_of(&message).is_some(),
+                    "every frame this peer writes is a progress notification; got {message:?}"
+                );
+            },
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(
+        delivered, expected_gets,
+        "one frame per GET must actually have been DELIVERED — otherwise this fence never took \
+         the `delivered` arm it exists to bound, and would pass for the same reason fence 12 does"
+    );
+
+    let text = error.to_string();
+    assert!(
+        text.contains(RECONNECT_PHRASE),
+        "the exhaustion error must still NAME the budget it spent even when every body delivered. \
+         A reader that simply goes quiet is indistinguishable from a healthy idle stream; got \
+         {text:?}"
     );
 
     server.shutdown().await;

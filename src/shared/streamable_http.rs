@@ -511,9 +511,67 @@ const INITIAL_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// peer-controlled, and an uncapped one lets a peer park a client's reader task
 /// for an arbitrary duration.
 ///
+/// This is only HALF the story, and was once mistaken for the whole of it
+/// (CR-01). A ceiling bounds the direction that makes the client too SLOW; the
+/// direction that makes it too FAST is bounded by
+/// [`MIN_SSE_RECONNECT_DELAY`], and a peer that can reach either end can
+/// choose which denial of service to inflict.
+///
 /// Spelled in SECONDS rather than as the reference's literal `30000` ms for the
 /// same lint reason as [`INITIAL_SSE_RECONNECT_DELAY`]; the value is identical.
 const MAX_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+/// The FLOOR under any reconnect wait, including one a SERVER asked for
+/// (Phase 118.2 plan 14, CR-01).
+///
+/// `retry:` is remote input in BOTH directions, and the reference client bounds
+/// neither. An uncapped value parks a client's reader task for a duration the
+/// peer chose ([`MAX_SSE_RECONNECT_DELAY`] closes that end). An UNFLOORED one is
+/// worse: `SseEvent::retry` is `Option<u64>` milliseconds parsed straight off the
+/// wire, so a `retry: 0` from a hostile server — or from a broken proxy replaying
+/// a cached page — turns the reconnect loop into a tight spin that burns a core
+/// locally, floods the peer's ingress, and re-mints an access token through the
+/// configured `AuthProvider` on every single iteration
+/// (T-118.2-14-01, T-118.2-14-02).
+///
+/// 500 ms because it is short enough to be invisible against a genuine proxy
+/// blink — the case D-03 exists for, where the reference curve's first wait is
+/// already a full second — and long enough that a peer asking for zero cannot
+/// convert one SSE frame into an unbounded request rate.
+///
+/// PRIVATE, with no `with_*` override, for the same reason
+/// [`MAX_SSE_RECONNECT_ATTEMPTS`] is: every knob on this transport is private
+/// precisely so that none of them is a semver event.
+const MIN_SSE_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a re-opened stream must STAY UP to earn a fresh reconnect budget
+/// (Phase 118.2 plan 14, CR-01).
+///
+/// The budget used to be refunded on any single delivered event. That reads as
+/// generous and is in fact the other half of the unbounded-loop defect: a peer
+/// that writes ONE frame per body and then closes refunds the whole budget on
+/// every iteration, so the loop never terminates no matter how small
+/// [`MAX_SSE_RECONNECT_ATTEMPTS`] is.
+///
+/// A working stream is one that stayed up, not one that bounced with a frame
+/// attached. 30 s is comfortably longer than any single-frame bounce and
+/// comfortably shorter than the ALB-class idle timeouts (~60 s) D-03 exists to
+/// survive, so a genuinely healthy stream that blinks after an hour still earns
+/// its fresh budget.
+const RECONNECT_BUDGET_RESET_UPTIME: Duration = Duration::from_secs(30);
+
+/// Whether a body that just ended earns a FRESH reconnect budget.
+///
+/// A free function rather than an inline conjunction inside
+/// [`StreamableHttpTransport::run_session_stream`], for two reasons. That loop is
+/// already split four ways specifically to hold the repo's PMAT cog-25 budget
+/// (CLAUDE.md), and adding an `&&` with an `Instant::elapsed()` call pushes it
+/// back over. And a pure predicate is unit-testable at both sides of its
+/// threshold with no clock manipulation at all, which is what
+/// `mod reconnect_delay_bounds` does.
+fn budget_reset_earned(delivered: bool, uptime: Duration) -> bool {
+    delivered && uptime >= RECONNECT_BUDGET_RESET_UPTIME
+}
 
 /// How fast the reconnect wait grows per attempt.
 ///
@@ -2766,12 +2824,21 @@ impl SseReaderContext {
     /// relying on the abort handle.
     async fn run_session_stream(self, mut body: hyper::body::Incoming) {
         // Reconnects already made. Reset to 0 after a re-opened stream that
-        // actually delivers, so a stream that survives for hours and then blinks
-        // again earns a FRESH budget rather than inheriting a spent one. That is
-        // a deliberate choice, not an oversight: the budget bounds a burst of
-        // failures, not the lifetime of a healthy connection.
+        // STAYED UP for at least RECONNECT_BUDGET_RESET_UPTIME, so a stream that
+        // survives for hours and then blinks again earns a FRESH budget rather
+        // than inheriting a spent one: the budget bounds a burst of failures,
+        // not the lifetime of a healthy connection.
+        //
+        // The condition used to be a bare `delivered`, and that was CR-01: a peer
+        // writing ONE frame per body refunded the whole budget on every
+        // iteration, so no value of MAX_SSE_RECONNECT_ATTEMPTS bounded the loop.
+        // Uptime is what distinguishes a working stream from a one-frame bounce.
         let mut attempt: u32 = 0;
         loop {
+            // std::time::Instant, not tokio::time::Instant: the latter moves
+            // under `tokio::time::pause()`, which would make this arm's
+            // behaviour depend on whether some caller paused the clock.
+            let opened_at = std::time::Instant::now();
             let end = read_sse_body(
                 &self.sender,
                 &self.last_event_id,
@@ -2789,7 +2856,7 @@ impl SseReaderContext {
             else {
                 return;
             };
-            if delivered {
+            if budget_reset_earned(delivered, opened_at.elapsed()) {
                 attempt = 0;
             }
 
@@ -2839,16 +2906,24 @@ impl SseReaderContext {
 /// curve — unless the peer sent an SSE `retry:` field, which WINS, exactly as the
 /// reference client lets it.
 ///
-/// Unlike the reference, a peer-provided value is still CLAMPED to
-/// [`MAX_SSE_RECONNECT_DELAY`]: `retry:` is remote input, and an uncapped one
-/// parks a client's reader task for a duration the peer chose.
+/// Unlike the reference, a peer-provided value is BOUNDED ON BOTH SIDES, to
+/// [`MIN_SSE_RECONNECT_DELAY`] and [`MAX_SSE_RECONNECT_DELAY`]: `retry:` is
+/// remote input, an uncapped one parks a client's reader task for a duration the
+/// peer chose, and an unfloored one (`retry: 0`) turns the reconnect loop into a
+/// request flood (CR-01, T-118.2-14-03).
 ///
 /// Non-panicking on any `attempt`: an exponent that overflows `i32`, or a
 /// product that is infinite, falls back to the maximum rather than
 /// `unwrap`-ing a `Duration` conversion.
 fn next_reconnect_delay(attempt: u32, server_retry: Option<Duration>) -> Duration {
     if let Some(retry) = server_retry {
-        return retry.min(MAX_SSE_RECONNECT_DELAY);
+        // `.max().min()` rather than `Duration`'s `clamp`: clamp PANICS when
+        // `min > max`, and both operands here are constants a later edit could
+        // invert. The non-panicking spelling degrades an inverted pair to a
+        // value instead of to a panic inside a client's reader task.
+        return retry
+            .max(MIN_SSE_RECONNECT_DELAY)
+            .min(MAX_SSE_RECONNECT_DELAY);
     }
     let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
     let seconds = INITIAL_SSE_RECONNECT_DELAY.as_secs_f64() * SSE_RECONNECT_GROWTH.powi(exponent);
