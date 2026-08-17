@@ -656,3 +656,31 @@ fn the_log_sink_is_live_without_any_progress_reporter() {
         "and it must be the spec method, not a progress notification"
     );
 }
+
+/// Exactly ONE site turns `Server::notification_tx` into a sink.
+///
+/// The progress path, the log path and the cancellation manager all read
+/// `Server::notification_tx_sink`. Before Phase 118.2 plan 06 there were two
+/// hand-rolled `try_send` closures and the log path would have made a third —
+/// three chances to disagree about the send discipline, and the discipline is
+/// load-bearing: `try_send` on a bounded channel is what keeps a saturated
+/// client from blocking a handler, at the documented cost of silent loss.
+///
+/// Counted over non-comment lines of the ONE file that owns the field. The other
+/// `try_send(notification)` in the tree
+/// (`streamable_http_server::new_v2_progress_queue`) is a per-request v2 queue
+/// created locally, not this server-wide channel.
+#[test]
+fn exactly_one_site_converts_the_server_notification_tx_into_a_sink() {
+    let server = code_lines(SERVER_ROOT);
+    let conversions = server.matches("tx.try_send(notification)").count();
+    assert_eq!(
+        conversions, 1,
+        "src/server/mod.rs must contain exactly one `notification_tx`-to-sink conversion \
+         (`Server::notification_tx_sink`); found {conversions}"
+    );
+    assert!(
+        server.contains("fn notification_tx_sink(&self)"),
+        "and it must be the named helper, so both consumers can reach it"
+    );
+}

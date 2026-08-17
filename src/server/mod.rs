@@ -1153,13 +1153,13 @@ impl Server {
         let (notification_tx, notification_rx) = mpsc::channel(100);
         self.notification_tx = Some(notification_tx);
 
-        // Hook cancellation manager to send notifications via the same channel
-        if let Some(tx) = &self.notification_tx {
-            let tx = tx.clone();
-            self.cancellation_manager
-                .set_notification_sender(Arc::new(move |notification| {
-                    let _ = tx.try_send(notification);
-                }));
+        // Hook cancellation manager to send notifications via the same channel,
+        // through the SINGLE `notification_tx`-to-sink conversion
+        // ([`Server::notification_tx_sink`]). This site used to carry its own
+        // `try_send` closure — a third copy of the same three lines, and a third
+        // chance to disagree about the send discipline.
+        if let Some(sender) = self.notification_tx_sink() {
+            self.cancellation_manager.set_notification_sender(sender);
         }
 
         // Outbound server-to-client request channel + dispatcher. Drain task
