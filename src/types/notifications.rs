@@ -212,7 +212,25 @@ pub enum Notification {
 }
 
 /// Logging level (MCP 2025-11-25 -- full syslog severity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # The ordering derive is load-bearing
+///
+/// The variants below are declared in SYSLOG SEVERITY ORDER, least severe
+/// first. `#[derive(PartialOrd, Ord)]` on a fieldless enum compares by
+/// declaration order, so the derive yields the correct severity comparison for
+/// free: `Emergency > Alert > Critical > Error > Warning > Notice > Info >
+/// Debug`. Level filtering (see
+/// [`RequestHandlerExtra::log`](crate::RequestHandlerExtra::log)) is therefore
+/// spelled `emitted >= configured` on the typed value.
+///
+/// **Never compare the serialized strings.** Lexically `"critical" < "debug"`,
+/// so a string-based `>= "debug"` filter would SUPPRESS `debug` records while
+/// letting `critical` through — exactly backwards. `tests/log_emitter.rs`
+/// fences all 64 `(configured, emitted)` pairs, including that inversion.
+///
+/// **Do not reorder the variants.** The declaration order IS the semantics; a
+/// reorder silently changes every level filter in every downstream server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LoggingLevel {
     /// Debug messages
