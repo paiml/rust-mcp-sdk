@@ -163,8 +163,8 @@ use pmcp::types::protocol::{
 };
 use pmcp::types::sampling::{CreateMessageParams, SamplingMessage, SamplingMessageContent};
 use pmcp::types::{
-    CallToolResult, Content, GetPromptResult, ListResourcesResult, PromptArgument, PromptInfo,
-    PromptMessage, ReadResourceResult, ResourceInfo, Role, ToolInfo,
+    CallToolResult, Content, GetPromptResult, ListResourcesResult, LoggingLevel, PromptArgument,
+    PromptInfo, PromptMessage, ReadResourceResult, ResourceInfo, Role, ToolInfo,
 };
 use pmcp::{PeerHandle, PromptHandler, RequestHandlerExtra, ResourceHandler, Server};
 use serde_json::Value;
@@ -301,6 +301,30 @@ const REQUEST_STATE_KEY_VAR: &str = "PMCP_REQUEST_STATE_KEY";
 /// fixed: at the previous 50 ms the middle report was inside the window and was
 /// dropped, so the tool delivered two frames where the scenario requires three.
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Interval between the `test_tool_with_logging` records.
+///
+/// # The budget, measured rather than guessed
+///
+/// `tools-call-with-logging` calls the tool, then
+/// `await new Promise(e=>setTimeout(e,200))`, then requires
+/// `a.length >= 3`. Every millisecond this tool sleeps is a millisecond of that
+/// 200 ms window spent inside the call, so the interval buys nothing the
+/// scenario measures and costs headroom the scenario needs. The previous 50 ms
+/// spacing burned 150 ms of a 200 ms budget before dispatch latency was even
+/// counted.
+///
+/// 15 ms × 2 gaps = **30 ms total**, and the last record is emitted with NO
+/// trailing sleep — the same emit-first / sleep-only-between shape
+/// `test_tool_with_progress` uses. It is still non-zero so that the scenario's
+/// stated purpose survives ("the delays are important to test that clients can
+/// receive multiple log notifications during tool execution"): three records
+/// arrive as three separate frames rather than as one burst at completion.
+///
+/// Contrast `PROGRESS_INTERVAL` above, which is 120 ms for a REASON — it must
+/// clear `ServerProgressReporter`'s 100 ms rate-limit window. The log emitter
+/// has no rate limit (D-09), so nothing forces this number upward.
+const LOG_RECORD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
 
 /// Serves every `test://` URI the 2025-11-25 scored set names.
 ///
@@ -867,16 +891,88 @@ impl ConformanceTool {
                 )]))
             },
 
-            "test_tool_with_logging" | "test_logging_tool" => {
-                // Three info-level records, spaced so a client can receive them
-                // DURING the call rather than all at completion.
-                for message in [
-                    "Tool execution started",
-                    "Tool processing data",
-                    "Tool execution completed",
-                ] {
-                    tracing::info!("{message}");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // The two logging tools carry OPPOSITE contracts and therefore no
+            // longer share a body. `tools-call-with-logging` (2025-06-18,
+            // removed in v2) drives `test_tool_with_logging` and fails on
+            // `a.length < 3`; `sep-2575-server-no-log-without-loglevel` (v2)
+            // drives `test_logging_tool` and fails if it sees a SINGLE
+            // `notifications/message` frame. One arm answering both could only
+            // ever satisfy one of them. They were merged when neither emitted
+            // anything, which made them look identical.
+            "test_tool_with_logging" => {
+                // THREE `info` records ON THE WIRE.
+                //
+                // `tracing::info!` does NOT satisfy this scenario and never
+                // did: a `tracing` record goes to this process's subscriber
+                // (configured in `main` at `pmcp=info,s54_v2_dual_conformance=info`)
+                // and reaches the operator's terminal. `extra.log(..)` emits a
+                // `notifications/message` and reaches the CLIENT. Two
+                // audiences, two mechanisms — the referee only ever sees the
+                // second, which is why this scenario stayed red while the
+                // fixture "logged" three times per call.
+                //
+                // Both are kept, deliberately: when this fixture is run by
+                // hand against a live suite the `tracing` line is how an
+                // operator watches the tool fire, and the comment above is
+                // there so no future reader deletes `extra.log` believing
+                // `tracing` covers it.
+                //
+                // `info`, not `debug`, and not because the scenario forces it:
+                // the scenario calls `setLoggingLevel('debug')` first, so any
+                // level would pass its filter. Emitting at `info` means the
+                // three records still clear `DEFAULT_LOG_LEVEL` (D-12) if a
+                // future scenario drops the `setLevel` call, which is the
+                // difference between a fixture that passes and one that passes
+                // for a reason that can evaporate.
+                // Unrolled rather than looped: the three message strings are
+                // quoted character for character from the scenario's
+                // `**Behavior**` block, and `grep -c 'extra.log'` counting the
+                // records this tool promises is worth more than three saved
+                // lines. Emit FIRST, sleep only BETWEEN, never after the last
+                // one — the same shape as `test_tool_with_progress` above.
+                tracing::info!("Tool execution started");
+                extra.log(LoggingLevel::Info, "Tool execution started")?;
+                tokio::time::sleep(LOG_RECORD_INTERVAL).await;
+
+                tracing::info!("Tool processing data");
+                extra.log(LoggingLevel::Info, "Tool processing data")?;
+                tokio::time::sleep(LOG_RECORD_INTERVAL).await;
+
+                tracing::info!("Tool execution completed");
+                extra.log(LoggingLevel::Info, "Tool execution completed")?;
+                Ok(CallToolResult::new(vec![Content::text(
+                    "Tool with logging completed",
+                )]))
+            },
+
+            "test_logging_tool" => {
+                // SEP-2575, the NEGATIVE case: the v2 client authorizes logging
+                // per request through
+                // `params._meta["io.modelcontextprotocol/logLevel"]`, and the
+                // vendored schema is explicit — "If absent, the server MUST NOT
+                // send any notifications/message". The scenario sends this call
+                // with a `_meta` that does NOT carry the key and fails the
+                // server if any `notifications/message` frame comes back.
+                //
+                // So this tool emits ONLY when the request actually carried a
+                // level. `extra.log_level` is exactly that fact:
+                // `resolve_request_log_level` sets it from the v2 `_meta` key or
+                // from the v1 session's `logging/setLevel`, and leaves it `None`
+                // when neither happened.
+                //
+                // KNOWN SDK GAP this guard exposes rather than hides: with
+                // `log_level == None` the emitter falls back to
+                // `DEFAULT_LOG_LEVEL` (`info`, D-12), so `extra.log(..)` alone
+                // WOULD emit here and fail SEP-2575. That default is correct for
+                // v1 ("the server MAY decide which messages to send
+                // automatically") and wrong for v2, where absence is a
+                // prohibition rather than a non-answer. Fixing it means making
+                // `None` mean "no logging" on v2 inside
+                // `resolve_request_log_level` — a behaviour change in `src/`,
+                // recorded for the measurement phase rather than smuggled into
+                // an example.
+                if extra.log_level.is_some() {
+                    extra.log(LoggingLevel::Info, "Diagnostic logging authorized")?;
                 }
                 Ok(CallToolResult::new(vec![Content::text(
                     "Tool with logging completed",

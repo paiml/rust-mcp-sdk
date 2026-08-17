@@ -330,3 +330,33 @@ The no-op is defence in depth for a call site that reaches the write without
 delete a control for the exact reason it is currently working — and 118.2-08
 touches neither the session store nor the ingress. Left as-is, with 118.2-07's
 end-to-end fence continuing to pin the property that IS wire-observable.
+
+## FINDING (118.2-09): on v2, `DEFAULT_LOG_LEVEL` makes pmcp violate SEP-2575
+
+**Measured, not inferred.** With the fixture's guard removed, a v2 `tools/call`
+that carried NO `params._meta["io.modelcontextprotocol/logLevel"]` came back with
+a `notifications/message` frame on the POST body — recorded as RED mutation 2 in
+`118.2-09-SUMMARY.md`, artifact `target/118.2-09-log-records.json`.
+
+The vendored schema is explicit: *"If absent, the server MUST NOT send any
+`notifications/message`."* pmcp's `resolve_request_log_level`
+(`src/server/streamable_http_server.rs:1677`) returns `None` in that case, and its
+own rustdoc states the intent — *"`None` is not 'no logging' — it is 'nothing
+overrode the default'"* — so `DEFAULT_LOG_LEVEL` (`info`, D-12) applies at emit
+time and every `extra.log(Info, ..)` in the handler reaches the client.
+
+That default is **correct on v1** (2025-06-18: "the server MAY decide which
+messages to send automatically") and **wrong on v2**, where absence is a
+prohibition rather than a non-answer. The two eras disagree about what "nobody
+asked" means, and one constant currently answers for both.
+
+**Not fixed here.** This plan's `files_modified` are two examples and
+`Cargo.toml`; the fix is an era branch inside `resolve_request_log_level` (or a
+`None`-means-silent rule applied only when `era == Some(V2)`) — a behaviour
+change in `src/` that alters what every v2 pmcp server puts on the wire.
+
+**Disposition:** the FIXTURE honours SEP-2575 by emitting from `test_logging_tool`
+only when `extra.log_level.is_some()`, with the gap named in a comment at the
+guard so the next reader cannot mistake the guard for the fix. Appended to
+`.planning/WINDOWS.md` so it is visible at ship time. Natural owner: the phase
+that measures the suite (118.2-11) or a follow-on `src/` plan.
