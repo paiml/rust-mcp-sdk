@@ -1022,19 +1022,24 @@ const ALLOWLIST: &[Accumulation] = &[
               appended exactly once and the buffer is drained at a single exit point, which is \
               also what makes it linear rather than quadratic. The two parser buffers are bounded \
               by feed's UNCONDITIONAL pre-check over retained state plus this chunk (113-17, \
-              T-113-86). feed_complete_body skips that pre-check by design and states the byte \
-              cap as a precondition on the caller, discharged at its ONE remaining call site — the \
-              POST response in streamable_http.rs — by collect_body_within_cap (113-20, \
-              T-113-84). The GET session stream stopped being a call site in 118.2-01, which \
-              moved it to the incremental feed.",
+              T-113-86), and feed is now the parser's ONLY entry point: the unbounded \
+              complete-body sibling that used to state its byte cap as a precondition on the \
+              caller was DELETED in 118.2-03. Both of the whole-body collects it served — the GET \
+              session stream (118.2-01) and the POST response (118.2-03) in streamable_http.rs — \
+              are incremental readers under that same pre-check now, so this file carries no \
+              bound-bypassing path at all rather than one discharged by a caller's cap.",
     },
     Accumulation {
         path: "src/shared/streamable_http.rs",
         needle: "extend_from_slice(",
         count: 1,
-        why: "The GET session-stream reader appends ONE hyper frame to a byte buffer and then \
+        why: "The SSE reader appends ONE hyper frame to a byte buffer and then \
               fully drains it with take_utf8_prefix on the SAME iteration, so the residual is the \
-              incomplete-character tail of at most three bytes. What the decoded text then feeds \
+              incomplete-character tail of at most three bytes. ONE site, TWO consumers since \
+              118.2-03: the GET session stream and the POST response that answers \
+              text/event-stream both go through SseReadState + read_next_sse_frame, so this count \
+              did not move when the second whole-body collect became incremental. What the \
+              decoded text then feeds \
               is bounded by SseParser::feed's unconditional pre-check over retained state PLUS \
               this chunk (113-17, T-113-86), under the transport's own max_collected_body_bytes \
               ceiling — DEFAULT_MAX_COLLECTED_BODY_BYTES, 16 MiB, user-overridable through \
@@ -1052,7 +1057,9 @@ const ALLOWLIST: &[Accumulation] = &[
               it before it polls the body again, so the population is bounded by what a single \
               hyper frame can complete, and each completed event was itself admitted under the \
               parser's retained-state bound. Same mechanism as the src/client/subscriptions.rs \
-              entry above, on the GET session stream rather than on subscriptions/listen.",
+              entry above, on this transport's two SSE streams — the GET session stream and the \
+              POST response — rather than on subscriptions/listen. One drain site, two \
+              consumers.",
     },
     Accumulation {
         path: "src/shared/streamable_http.rs",

@@ -1129,12 +1129,43 @@ impl StreamableHttpTransport {
         // body-transforming middleware (unenforceable — the chain is a public
         // extension point) and a frame-aware middleware API (new public surface,
         // and a semver event this phase does not plan for).
+        //
+        // The session stream is the FIRST of this transport's two SSE read sites;
+        // the second is the POST response in `Self::post_body`. Both go through
+        // `Self::spawn_sse_reader`, so there is one reader shape, one parser
+        // bound, and one corrupt-frame story rather than two that can drift.
+        let handle = self.spawn_sse_reader(response.into_body());
+
+        // ONLY the session stream is tracked here: `close()` and the next
+        // `start_sse` abort whatever this slot holds, and a POST reader parked in
+        // it would be torn down by an unrelated re-open.
+        *self.abort_handle.write() = Some(handle);
+        Ok(())
+    }
+
+    /// Spawn the incremental SSE reader over one live response body, and hand
+    /// back its join handle.
+    ///
+    /// The SINGLE reader for both of this transport's `text/event-stream` sites
+    /// — the GET session stream ([`Self::start_sse`]) and the POST response that
+    /// answers `text/event-stream` ([`Self::post_body`]). Everything the two
+    /// sites must agree on lives here: the parser bound (D-02, the transport's
+    /// `max_collected_body_bytes`), the resumption-cursor write, the
+    /// message-event filter, the terminal-error taxonomy (D-02/D-05), and the
+    /// await-capacity delivery policy (D-04).
+    ///
+    /// The reader RETURNS when a send fails, which is what happens the moment the
+    /// last transport clone drops the receive queue's `Receiver`. That, not a
+    /// `Drop` impl, is what stops a reader outliving its transport: the transport
+    /// is `Clone` and shares its abort handle, so one clone's drop would kill the
+    /// original's stream. See [`Transport::receive`] rule 3.
+    fn spawn_sse_reader(&self, body: hyper::body::Incoming) -> tokio::task::JoinHandle<()> {
         let sender = self.sender.clone();
         let on_resumption = self.resumption_callback();
         let last_event_id = self.last_event_id.clone();
-        let mut state = SseReadState::new(response.into_body(), self.max_collected_body_bytes);
+        let mut state = SseReadState::new(body, self.max_collected_body_bytes);
 
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
                     if !deliver_sse_event(&sender, &last_event_id, on_resumption.as_ref(), event)
@@ -1156,10 +1187,7 @@ impl StreamableHttpTransport {
                     return;
                 }
             }
-        });
-
-        *self.abort_handle.write() = Some(handle);
-        Ok(())
+        })
     }
 
     /// Emit the two v2-only routing headers onto an outbound request builder
@@ -1567,6 +1595,25 @@ impl StreamableHttpTransport {
     ///
     /// `outbound` only selects the 202-Accepted behavior; it is not re-derived
     /// from the bytes so the typed path keeps its exact semantics.
+    ///
+    /// # A `text/event-stream` answer is a STREAM, not a body
+    ///
+    /// When the response's `Content-Type` is `text/event-stream` this method
+    /// hands the LIVE body to [`Self::spawn_sse_reader`] and returns as soon as
+    /// the stream is open, rather than collecting the body first. Such a response
+    /// stays open for the whole call and can carry notifications **and
+    /// server-to-client requests** before its result frame; collecting it whole
+    /// would deliver every one of them only after the call ended, and an in-tool
+    /// elicitation over a POST stream would deadlock outright — the client cannot
+    /// answer a request it has not parsed yet (Phase 118.2, D-01).
+    ///
+    /// On that path the HTTP response-**BODY** middleware chain is deliberately
+    /// NOT run, exactly as [`Self::post_streaming`] states for the
+    /// `subscriptions/listen` body: the chain processes a complete `Vec<u8>`
+    /// body, and a stream has none by construction.
+    /// [`Self::process_response_headers`] still runs, so HEADER-level middleware
+    /// behaviour is unchanged. A deployment with a body-rewriting middleware sees
+    /// it applied to JSON POST responses and not to a streaming one.
     async fn post_body(&self, body_bytes: Vec<u8>, outbound: OutboundFrame) -> Result<()> {
         let response = self.post_once(body_bytes).await?;
 
@@ -1654,12 +1701,29 @@ impl StreamableHttpTransport {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<usize>().ok());
 
+        // The SECOND SSE read site, decided BEFORE the collect below because
+        // there is nothing here to collect: a `text/event-stream` POST response
+        // stays open for the whole call and its body ends only when the server
+        // has finished answering. Awaiting that end is what made a
+        // server-to-client request unanswerable (Phase 118.2, D-01) — see this
+        // method's rustdoc, including why the response-BODY middleware chain does
+        // not run on this path and `Self::post_streaming` is the precedent.
+        //
+        // The reader is DETACHED rather than stored in `self.abort_handle`: that
+        // slot belongs to the GET session stream, and parking a POST reader in it
+        // would let the next `start_sse` tear down a call's own stream. Its
+        // lifetime is bounded by the send-failure rule instead — see
+        // `Self::spawn_sse_reader`.
+        if content_type.contains(TEXT_EVENT_STREAM) {
+            let _ = self.spawn_sse_reader(response.into_body());
+            return Ok(());
+        }
+
         // Collect response body under this transport's collected-body cap
         // (T-113-84).
         //
-        // Enforced HERE, before any of it reaches the parser: the parser's
-        // complete-body entry point performs no bound check of its own, so this
-        // is the only thing bounding the allocation on this path. See
+        // Every remaining branch parses a COMPLETE body, so this is the only
+        // thing bounding the allocation on those paths. See
         // `DEFAULT_MAX_COLLECTED_BODY_BYTES`.
         let body_bytes =
             Self::collect_body_within_cap(response, self.max_collected_body_bytes).await?;
@@ -1781,46 +1845,6 @@ impl StreamableHttpTransport {
                 // A CALLER-task send. See `Self::queue_from_caller`.
                 self.queue_from_caller(msg_parsed)?;
             }
-        } else if content_type.contains(TEXT_EVENT_STREAM) {
-            // SSE stream response - handle streaming
-            let sender = self.sender.clone();
-            let on_resumption = self.resumption_callback();
-            let last_event_id = self.last_event_id.clone();
-
-            tokio::spawn(async move {
-                let mut sse_parser = SseParser::new();
-                let body = String::from_utf8_lossy(&modified_body);
-
-                // Parse the SSE body.
-                //
-                // Deliberately the COMPLETE-body entry point rather than `feed`:
-                // this body was already read into memory in one piece, not a
-                // chunk of a live stream, so the parser's incremental in-flight
-                // bound does not apply to it. Its byte-cap precondition is
-                // SATISFIED above by `collect_body_within_cap` at
-                // `self.max_collected_body_bytes` — an over-cap body never
-                // reaches this task at all.
-                let events = sse_parser.feed_complete_body(&body);
-                for event in events {
-                    // Update last event ID and notify callback
-                    if let Some(id) = &event.id {
-                        *last_event_id.write() = Some(id.clone());
-                        if let Some(callback) = &on_resumption {
-                            callback(id.clone());
-                        }
-                    }
-
-                    // Only process "message" events
-                    if event.event.as_deref() == Some("message") || event.event.is_none() {
-                        // Use JSON-RPC compatibility layer
-                        if let Ok(msg) =
-                            crate::shared::StdioTransport::parse_message(event.data.as_bytes())
-                        {
-                            let _ = sender.send(Ok(msg)).await;
-                        }
-                    }
-                }
-            });
         } else if status_code == StatusCode::ACCEPTED {
             // 202 Accepted with no body is valid
             return Ok(());
@@ -3136,6 +3160,24 @@ mod tests {
             body
         }
 
+        /// A parseable JSON-RPC response of EXACTLY `len` bytes.
+        ///
+        /// The JSON twin of [`sse_body_of`], for the branches that still COLLECT
+        /// a complete body. Padding rides an ignored `result` member, so `len`
+        /// changes the byte count and nothing else.
+        fn json_body_of(len: usize) -> String {
+            let empty = r#"{"jsonrpc":"2.0","id":42,"result":{"tools":[],"pad":""}}"#;
+            let padding = len
+                .checked_sub(empty.len())
+                .expect("requested length must fit one frame");
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":42,"result":{{"tools":[],"pad":"{}"}}}}"#,
+                "p".repeat(padding)
+            );
+            assert_eq!(body.len(), len, "the body must be exactly {len} bytes");
+            body
+        }
+
         /// Assert the refusal names the limit and leaks no body content.
         fn assert_over_cap_refusal(error: &Error, cap: usize) {
             let text = error.to_string();
@@ -3153,13 +3195,28 @@ mod tests {
         // Site 1 of 2: the POST response (`post_body`).
         // --------------------------------------------------------------
 
-        /// One byte over the cap on the POST-response path is refused, and
-        /// NOTHING is dispatched — asserted on the returned `Err` and on the
-        /// silence of the message channel, never on a log line.
+        /// The POST-response path's bound is the PARSER's in-flight bound
+        /// (Phase 118.2, D-01/D-02), and its refusal arrives on `receive()`.
+        ///
+        /// The exact twin of
+        /// [`start_sse_over_the_parser_bound_ends_the_stream_with_a_named_error`]
+        /// below, and it changed for exactly the same reason. This test USED to
+        /// assert that `send` itself returned `Err` for a body one byte over the
+        /// cap. `post_body` no longer collects a `text/event-stream` response —
+        /// such a response stays open for the whole call, so there is no
+        /// end-of-body to collect to and no body SIZE to refuse: `send` returns
+        /// as soon as the reader task is spawned, and the refusal arrives where a
+        /// live stream's failures have to arrive, on the receive queue behind
+        /// every frame already delivered.
+        ///
+        /// The peer streams an unterminated `data:` line — the shape that
+        /// ACCUMULATES, and so trips the bound regardless of how the transport
+        /// happens to frame its reads.
         #[tokio::test]
-        async fn post_response_one_byte_over_the_cap_is_refused_before_the_parser() {
+        async fn post_response_over_the_parser_bound_ends_the_stream_with_a_named_error() {
             let mut server = MockServer::new_async().await;
-            let body = sse_body_of(CAP + 1);
+            // No terminating newline and no blank line: pure accumulation.
+            let body = format!("data: {}", "p".repeat(CAP * 2));
             let _mock = server
                 .mock("POST", "/")
                 .with_status(200)
@@ -3171,18 +3228,16 @@ mod tests {
                 .await;
 
             let mut transport = capped_transport(&server.url(), CAP);
-            let error = transport
+            transport
                 .send(list_tools_message())
                 .await
-                .expect_err("a body over the cap must be refused");
-            assert_over_cap_refusal(&error, CAP);
+                .expect("send returns as soon as the reader task is spawned");
 
-            assert!(
-                tokio::time::timeout(QUIET_WINDOW, transport.receive())
-                    .await
-                    .is_err(),
-                "an over-cap body must never reach the parser, so nothing can be dispatched"
-            );
+            let error = tokio::time::timeout(QUIET_WINDOW, transport.receive())
+                .await
+                .expect("the terminal error must be dispatched")
+                .expect_err("an over-bound chunk must END the stream, not be silently dropped");
+            assert_over_cap_refusal(&error, CAP);
         }
 
         /// Exactly the cap is ADMITTED and parses normally — pinning that the
@@ -3295,15 +3350,21 @@ mod tests {
 
         /// A `Content-Length` over the cap is refused BEFORE the body is read.
         /// The header is an optimisation; the refusal names the declared size.
+        ///
+        /// Measured on a JSON response, which is where the whole-body collect
+        /// now lives: since Phase 118.2 plan 03 a `text/event-stream` POST answer
+        /// is read INCREMENTALLY and never collected, so it has no declared size
+        /// to pre-check. The collected-body cap and this early refusal are
+        /// unchanged for every branch that still parses a complete body.
         #[tokio::test]
         async fn a_declared_content_length_over_the_cap_is_refused_early() {
             let mut server = MockServer::new_async().await;
             let _mock = server
                 .mock("POST", "/")
                 .with_status(200)
-                .with_header("content-type", TEXT_EVENT_STREAM)
+                .with_header("content-type", APPLICATION_JSON)
                 // `with_body` sets `Content-Length`.
-                .with_body(sse_body_of(CAP + 1))
+                .with_body(json_body_of(CAP + 1))
                 .create_async()
                 .await;
 

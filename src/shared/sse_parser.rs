@@ -350,9 +350,11 @@ impl SseParser {
     ///
     /// The parser retains at most [`Self::max_buffer_size`] bytes across its two
     /// accumulators on return; see `Self::buffered_bytes`. A chunk that would
-    /// break that is refused whole and [`Self::overflowed`] latches. Callers with
-    /// an ALREADY-CAPPED complete body, rather than a chunk of a live stream,
-    /// want `Self::feed_complete_body`.
+    /// break that is refused whole and [`Self::overflowed`] latches.
+    ///
+    /// This is the ONLY entry point. The unbounded complete-body sibling that
+    /// used to sit beside it was retired in Phase 118.2 once both of its callers
+    /// became incremental readers — see the note where it lived.
     ///
     /// # Examples
     ///
@@ -403,8 +405,9 @@ impl SseParser {
         // survives after splitting the complete events out of the chunk would
         // require parsing the whole unbounded chunk first — performing exactly
         // the allocation the bound exists to prevent (review MEDIUM-1,
-        // T-113-86). Callers holding a COMPLETE, already-capped body want
-        // `feed_complete_body` instead.
+        // T-113-86). A caller holding a COMPLETE body raises the BOUND for its
+        // parser rather than reaching for an unbounded entry point; there is no
+        // longer one to reach for.
         if self.buffered_bytes().saturating_add(data.len()) > self.max_buffer_size {
             self.overflowed = true;
             self.buffer.clear();
@@ -435,50 +438,26 @@ impl SseParser {
         events
     }
 
-    /// Feed a COMPLETE, already-size-capped SSE body, bypassing the in-flight
-    /// bound entirely.
-    ///
-    /// # Precondition — SATISFIED by its one remaining call site
-    ///
-    /// This is only sound where the caller has ALREADY enforced its own byte cap
-    /// on the collected body. It performs no bound check and never latches
-    /// [`Self::overflowed`], so the caller's cap is the ONLY thing standing
-    /// between a remote peer and this process's heap.
-    ///
-    /// Since plan 113-20 that cap is an established fact, not an obligation. The
-    /// ONE remaining call site — `StreamableHttpTransport::post_body` (the POST
-    /// response) in [`crate::shared::streamable_http`] — reads its body through
-    /// `StreamableHttpTransport::collect_body_within_cap` at the transport's
-    /// configured
-    /// [`crate::shared::streamable_http::DEFAULT_MAX_COLLECTED_BODY_BYTES`], which
-    /// refuses an over-cap body with a `TransportError` BEFORE this function is
-    /// reached. The cap is a streaming bound, so an over-cap body is never
-    /// allocated whole either (review HIGH-3, T-113-84).
-    ///
-    /// A NEW caller inherits the obligation: capping is the caller's job, and
-    /// this function will not do it for you.
-    ///
-    /// # An incremental feeder may NEVER call this
-    ///
-    /// Chunk-at-a-time feeders — [`crate::shared::http`]'s `connect_sse` reader
-    /// task, the `subscriptions/listen` client, and (since Phase 118.2 D-01) the
-    /// streamable-HTTP GET session-stream reader — must use [`Self::feed`].
-    /// Retention across chunks with no bound is precisely the unbounded
-    /// condition `feed` exists to refuse, and no per-call cap can substitute for
-    /// it because the peer chooses how many calls there are.
-    ///
-    /// `pub(crate)` deliberately: a public unbounded parser entry point is an
-    /// attractive nuisance, and keeping it crate-private also keeps this
-    /// module's semver verdict trivially additive (T-113-81).
-    pub(crate) fn feed_complete_body(&mut self, body: &str) -> Vec<SseEvent> {
-        self.drain_complete_lines(body)
-    }
+    // ── Retired: the complete-body entry point (Phase 118.2, plan 03) ────────
+    //
+    // There used to be a `feed_complete_body` here — an UNBOUNDED sibling of
+    // `feed` that parsed an already-collected body in one piece, stating its byte
+    // cap as a precondition on the caller rather than enforcing one. It existed
+    // to serve the two whole-body collects in `StreamableHttpTransport`: the GET
+    // session stream and the POST response that answers `text/event-stream`.
+    // Phase 118.2 turned BOTH of those into incremental reads under `feed`'s
+    // bound (D-01/D-02), which left it with no caller at all.
+    //
+    // It was DELETED rather than kept, because a parser entry point that performs
+    // no bound check and has nobody to serve is exactly the attractive nuisance
+    // its own documentation warned about: the next caller inherits an obligation
+    // stated only in prose, and `feed` is now correct for every case it covered.
 
     /// Append `data` and drain every COMPLETE line out of the buffer.
     ///
-    /// The shared implementation behind [`Self::feed`] (which bound-checks
-    /// first) and [`Self::feed_complete_body`] (which does not), so the two
-    /// entry points can never drift in how they tokenize.
+    /// The tokenizer behind [`Self::feed`], which bound-checks before calling
+    /// it. Kept as a separate function so the bound and the tokenization stay
+    /// visibly distinct concerns.
     fn drain_complete_lines(&mut self, data: &str) -> Vec<SseEvent> {
         // # Invariant — the retained buffer is NEWLINE-FREE on entry
         //
@@ -1617,28 +1596,6 @@ mod tests {
             events.first().map_or(0, |event| event.data.len())
         );
         assert!(parser.overflowed(), "and the refusal is observable");
-    }
-
-    /// The bypass the two whole-body transport call sites depend on: a COMPLETE
-    /// body is parsed in full regardless of the parser's in-flight bound, and
-    /// nothing latches.
-    ///
-    /// This must fail loudly if `feed_complete_body` is ever removed or quietly
-    /// re-pointed at the bounded entry point — an SSE POST response larger than
-    /// the bound would then be silently dropped instead of delivered.
-    #[test]
-    fn feed_complete_body_bypasses_the_bound() {
-        let mut parser = SseParser::with_max_buffer_size(64);
-        let body = format!("data: {}\n\n", "B".repeat(1_000_000));
-
-        let events = parser.feed_complete_body(&body);
-
-        assert_eq!(events.len(), 1, "the whole body is parsed");
-        assert_eq!(events[0].data.len(), 1_000_000);
-        assert!(
-            !parser.overflowed(),
-            "the bypass performs no bound check and latches nothing"
-        );
     }
 
     /// The default bound is the one `SseConfig` already documented — the number
