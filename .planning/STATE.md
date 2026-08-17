@@ -6,7 +6,7 @@ current_phase: 118.2
 current_phase_name: the-v1-client-sse-transport-and-the-notifications-message-em
 status: executing
 stopped_at: Completed 118.2-10-PLAN.md
-last_updated: "2026-08-17T12:20:56.313Z"
+last_updated: "2026-08-17T12:29:33.066Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 118.2 execution started
 progress:
@@ -1340,6 +1340,7 @@ yet. (Research flags per phase to be surfaced during `/gsd:plan-phase`.)
 - make lint blocked by a pre-existing clippy::let_underscore_future at src/shared/streamable_http.rs:1718 (authored by 118.2-03 at 8b19602d); one-token fix, gates every remaining plan in phase 118.2
 - SEP-2575: on v2, a request with no _meta logLevel still receives notifications/message — resolve_request_log_level returns and DEFAULT_LOG_LEVEL (info) applies. MEASURED in 118.2-09 (RED mutation 2). Fixture guards; src/ does not. Owner: 118.2-11 or a follow-on src/ plan.
 - A pmcp Client cannot answer a server-to-client request issued during its own call: Client::dispatch_request awaits transport.send(..) to complete before entering its receive loop, and the server holds the tools/call POST for the whole handler. Blocks v1 sampling/roots round trips over StreamableHttpServer (era_matrix reports no-live-stream with a 30s dispatch timeout).
+- 118.2-11 CHECKPOINT: official suite re-measured at held pin 0.2.0-alpha.11 — v1 leg 72/2 -> 71/3, exit 1. tools-call-with-logging 1/1 -> 0/2. Root cause: LogMessageParams emits 'message'; spec requires 'data'. Gate hardening (D-16) and CONF-09 booking BLOCKED on a src/ wire-format decision. See 118-CONFORMANCE-GAPS.md '## Dispositions — Phase 118.2 (amendment)'.
 
 ## Deferred Items
 
