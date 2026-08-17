@@ -252,3 +252,81 @@ END-TO-END property (no row is minted; the id is still unknown on the next
 request) rather than the no-op itself. The no-op remains as defence in depth for
 a future call site that reaches the write without the validation — the case the
 rustdoc names — and a mutation of it does NOT turn any fence red today.
+
+## VERDICT (118.2-08): the `LogMessageParams` `message`-vs-`data` divergence stays DECLARED
+
+Plan 05 recorded the divergence and named plan 08 as its owner, with an explicit
+trigger: *"if the official suite validates `params.data`, the current shape fails
+it and the type change becomes in-scope work with its own semver verdict."*
+
+**That trigger has NOT fired. Measured, not assumed.**
+
+The pinned suite does bundle the schema — its `LoggingMessageNotification`
+definition carries `required: ['data','level']`, and the vendored
+`schema/vendored/core-2026-07-28/schema.ts:2031` says the same — but **no
+scenario in the suite validates the params of an emitted
+`notifications/message`**:
+
+| Scenario | What it inspects |
+|---|---|
+| `2025-11-25:logging-set-level` | ONLY the `logging/setLevel` RPC's response (`Object.keys(r).length > 0`). It never reads a notification. |
+| `sep-2575-server-no-log-without-loglevel` | NEGATIVE: asserts NO `notifications/message` frame is emitted for a request that did not set `_meta["io.modelcontextprotocol/logLevel"]`. It looks for absence, and reports `untestable` when the server does not expose the diagnostic tool `test_logging_tool`. |
+
+Those are the only two logging scenarios in
+`conformance/node_modules/@modelcontextprotocol/conformance/dist/index.js`. So
+pmcp's `{"level":"warning","message":"hello"}` costs **zero conformance points
+today**.
+
+**Against changing it now:**
+
+1. It is a **breaking change to a public type** (`LogMessageParams`'s serde
+   shape). pmcp is at 2.18.0 with no open breaking-change window; the v2.0
+   cleanup philosophy this repo records applies to a breaking-change WINDOW, and
+   there is not one.
+2. Choosing the replacement is a **design decision**, not a bug fix: does
+   `message` become `data`? does `log(..)` set `data` to a JSON string and keep
+   `message` as an extension (legal — the schema does not close
+   `additionalProperties`)? does `log_with_data` become the only shape?
+3. `src/types/notifications.rs` is outside 118.2-08's `files_modified`, and the
+   arm this plan changed has nothing to do with the notification payload.
+
+**Disposition:** DECLARED, and now MECHANIZED.
+`the_vendored_schema_requires_data_where_pmcp_emits_message` in
+`tests/log_emitter.rs` reads the in-repo vendored schema and the live emitted
+payload and asserts BOTH sides of the disagreement, so the day either side moves
+it is a red test rather than a note in a summary nobody re-reads. The real fix
+belongs to a dedicated semver phase alongside the next major bump.
+
+## VERDICT (118.2-08): the malformed-`logging/setLevel` `400`/`-32601` finding stays OPEN, not fixed
+
+Recorded during 118.2-07 (above) with plan 08 named as its natural owner.
+Reviewed here; **not fixed**, for the same reason as the verdict above.
+
+Making a malformed `params.level` answer `{}` means loosening the
+deserialization of the PUBLIC `ClientRequest::SetLoggingLevel` variant — e.g.
+tolerating an unknown level string — which changes what every pmcp CLIENT and
+every third-party consumer of that type accepts. That is a semver-relevant
+change to a public type, and it is a *strictly more permissive* parse of
+attacker-supplied input, which is not a change to make in passing: today a
+misspelled level is refused with the peer's bytes never echoed
+(`T-118.2-07-04`), which is a defensible answer.
+
+It is also **not** a conformance gap: the suite's `logging-set-level` scenario
+sends `{ level: 'info' }`, a well-formed value, and that path answers a literal
+`{}` — pinned over the wire by
+`v1_set_logging_level_answers_a_literal_empty_object` (both ingress paths) and
+in-process by `the_v1_answer_is_an_object_with_zero_keys_on_both_roots`.
+
+**Disposition:** left OPEN in `.planning/WINDOWS.md` deliberately. A human at
+ship time should see it, because it IS a divergence between a plan's stated
+contract and the code — it is just not one this phase should close.
+
+## `set_session_log_level`'s unreachable no-op — reviewed by 118.2-08, unchanged
+
+Recorded during 118.2-07 with plan 08 as owner. Reviewed; nothing to do.
+
+The no-op is defence in depth for a call site that reaches the write without
+`validate_non_init_session`. Removing it because no fence can red it today would
+delete a control for the exact reason it is currently working — and 118.2-08
+touches neither the session store nor the ingress. Left as-is, with 118.2-07's
+end-to-end fence continuing to pin the property that IS wire-observable.

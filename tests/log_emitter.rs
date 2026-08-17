@@ -1575,3 +1575,419 @@ async fn the_level_is_honoured_behind_http_middleware_too() {
 
     teardown(handle, stream).await;
 }
+
+// ===========================================================================
+// Wire fence 9 — `logging/setLevel` answers a LITERAL empty object on v1
+// (Phase 118.2 plan 08, D-13 / Pitfall 8 / T-118.2-08-02).
+//
+// The referee's own predicate, copied VERBATIM out of the pinned suite's
+// `2025-11-25:logging-set-level` scenario
+// (`conformance/node_modules/@modelcontextprotocol/conformance/dist/index.js`):
+//
+//     let n = await e.connect(),
+//         r = await n.request(`logging/setLevel`, {level:`info`}),
+//         i = [];
+//     r && Object.keys(r).length > 0 && i.push(`Expected empty object {} response`)
+//
+// ANY non-empty object is a FAILURE — an acknowledgement object, and an echo of
+// the level just set, both red a currently-green BLOCKING scenario.
+//
+// This fence is deliberately STRICTER than the referee in one direction: `null`
+// passes the referee, because `r &&` short-circuits, but the scenario's own
+// description says "Return empty object `{}`" and a `null` result is not that.
+// So the assertion is structural in two parts — `is_object()` AND zero keys —
+// rather than a truthiness check or a bare `== json!({})`, which would accept
+// `null` on the first count and say nothing about WHY on the second.
+//
+// Both ingress paths are measured, because they deliver the reply differently:
+// the fast path frames it through the session's SSE stream and answers `202`,
+// while the middleware path always answers INLINE. That divergence predates this
+// phase and has nothing to do with logging (recorded by plan 07); the SHAPE
+// under test is the same on both, which is the point of asserting it twice.
+// ===========================================================================
+
+/// Assert a JSON-RPC reply carries a result that is an object with ZERO keys.
+fn assert_literal_empty_object(reply: &Value, what: &str) {
+    assert!(
+        reply.get("error").is_none(),
+        "{what}: `logging/setLevel` is SERVED on v1, not refused: {reply}"
+    );
+    let result = reply
+        .get("result")
+        .unwrap_or_else(|| panic!("{what}: the reply carries no `result`: {reply}"));
+    let object = result.as_object().unwrap_or_else(|| {
+        panic!(
+            "{what}: the result must be an OBJECT — `null` passes the referee's `r &&` \
+             short-circuit but is not the `{{}}` the scenario asks for: {reply}"
+        )
+    });
+    assert!(
+        object.is_empty(),
+        "{what}: the result must have ZERO keys — `Object.keys(r).length > 0` is the referee's \
+         failure predicate, so an acknowledgement object or an echo of the level just set reds a \
+         currently-green blocking scenario (and echoing would hand a caller a READ of session \
+         state through a WRITE endpoint): {reply}"
+    );
+}
+
+/// Drain a session stream until the reply to `id` arrives.
+async fn reply_on_stream(conn: &mut Conn, id: i64, what: &str) -> Value {
+    loop {
+        let frame = conn.frame(what).await;
+        if frame.get("id").and_then(Value::as_i64) == Some(id) {
+            return frame;
+        }
+    }
+}
+
+/// The JSON-RPC frame for `id` in a completed response body, whether that body is
+/// a bare JSON object or an SSE `data:`-framed stream.
+fn reply_in_body(body: &str, id: i64, what: &str) -> Value {
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(frame) = serde_json::from_str::<Value>(data.trim()) {
+                if frame.get("id").and_then(Value::as_i64) == Some(id) {
+                    return frame;
+                }
+            }
+        }
+    }
+    if let Ok(frame) = serde_json::from_str::<Value>(body.trim()) {
+        if frame.get("id").and_then(Value::as_i64) == Some(id) {
+            return frame;
+        }
+    }
+    panic!("{what}: no JSON-RPC reply for id {id} in {body}");
+}
+
+#[tokio::test]
+async fn v1_set_logging_level_answers_a_literal_empty_object() {
+    // (a) the FAST ingress path — reply framed onto the session stream.
+    let (addr, handle) = spawn_server(build_v1_server(), stateful_config()).await;
+    let session = open_session(addr).await;
+    let mut stream = open_stream(addr, &session).await;
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &set_level_body(2, &json!("info")),
+        "a well-formed v1 logging/setLevel on the fast path",
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "the fast path hands the reply to the session's SSE stream (a PRE-EXISTING ingress \
+         divergence recorded by plan 07, not a logging behaviour): {body}"
+    );
+    let reply = reply_on_stream(&mut stream, 2, "the setLevel reply on the fast path").await;
+    assert_literal_empty_object(&reply, "the fast ingress path");
+    teardown(handle, stream).await;
+
+    // (b) the MIDDLEWARE ingress path — reply answered inline.
+    let (addr, handle) = spawn_server(build_v1_server(), middleware_config()).await;
+    let session = open_session(addr).await;
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &set_level_body(2, &json!("info")),
+        "a well-formed v1 logging/setLevel behind middleware",
+    )
+    .await;
+    assert_eq!(status, 200, "the middleware path answers inline: {body}");
+    let reply = reply_in_body(&body, 2, "the setLevel reply behind middleware");
+    assert_literal_empty_object(&reply, "the middleware ingress path");
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// Scope fence — `Subscribe`, `Unsubscribe` and `Ping` are UNCHANGED.
+//
+// Without this, "only `SetLoggingLevel` moved out of the residual arm" is a
+// claim rather than a fact. `ping` in particular already carries a recorded
+// 118.1 v2 behaviour change at the transport gate; disturbing it here would be a
+// NEW divergence wearing a conformance fix's clothes.
+//
+// Both halves are asserted: the SOURCE still shows the three-method residual arm
+// intact on one root and the `-32601` catch-all still covering them on the
+// other, and the BEHAVIOUR still answers what it answered before.
+// ===========================================================================
+
+#[tokio::test]
+async fn subscribe_unsubscribe_and_ping_are_unchanged_by_this_plan() {
+    use pmcp::server::core::ProtocolHandler;
+    use pmcp::types::{ClientRequest, Request};
+
+    // --- source: the residual arm still holds exactly THREE methods.
+    let residual = "ClientRequest::Subscribe(_) | ClientRequest::Unsubscribe(_) \
+                    | ClientRequest::Ping => { Ok(serde_json::json!({})) }";
+    assert!(
+        squeezed_code(SERVER_ROOT).contains(residual),
+        "the `Subscribe | Unsubscribe | Ping` residual arm in `Server::process_client_request` \
+         must still answer `json!({{}})` — this plan removes `SetLoggingLevel` from it and \
+         NOTHING else"
+    );
+    assert!(
+        !residual.contains("SetLoggingLevel"),
+        "and the needle above must not silently re-admit the method this plan split out"
+    );
+
+    // --- source: `ServerCore`'s catch-all still covers the three.
+    assert!(
+        squeezed_code(CORE_ROOT).contains("METHOD_NOT_SUPPORTED_MESSAGE.to_string()"),
+        "`ServerCore`'s `_ =>` catch-all — the arm the three residual methods still fall through \
+         to — must still answer `METHOD_NOT_FOUND`"
+    );
+
+    // --- behaviour, `ServerCore` root: all three still fall through to -32601.
+    //
+    // `ServerCore` implements the PUBLIC `ProtocolHandler` trait, so this root
+    // can be driven directly. `Server` cannot: its `handle_request` is a private
+    // inherent method and it implements no public dispatch trait, which is why
+    // its half of this fence is the source assertion above plus the wire probe
+    // below rather than a matching in-process call.
+    let core = pmcp::server::builder::ServerCoreBuilder::new()
+        .name("residual-scope-fence-core")
+        .version("1.0.0")
+        .stateless_mode(true)
+        .build()
+        .expect("core builds");
+
+    for (name, request) in [
+        (
+            "resources/subscribe",
+            ClientRequest::Subscribe(pmcp::types::SubscribeRequest {
+                uri: "mem://x".to_string(),
+            }),
+        ),
+        (
+            "resources/unsubscribe",
+            ClientRequest::Unsubscribe(pmcp::types::UnsubscribeRequest {
+                uri: "mem://x".to_string(),
+            }),
+        ),
+        ("ping", ClientRequest::Ping),
+    ] {
+        let answer = core
+            .handle_request(
+                pmcp::RequestId::from(1i64),
+                Request::Client(Box::new(request)),
+                None,
+            )
+            .await;
+        let json = serde_json::to_value(&answer).expect("serializes");
+        assert_eq!(
+            json.pointer("/error/code"),
+            Some(&json!(-32601)),
+            "{name}: `ServerCore`'s `_ =>` catch-all must still answer -32601. The divergence \
+             from `Server`'s `{{}}` is RECORDED, not fixed — and `ping` in particular already \
+             carries a 118.1 v2 behaviour change that must not be disturbed here: {json}"
+        );
+    }
+
+    // --- behaviour, `Server` root, over the wire: v1 `ping` still answers `{}`.
+    //
+    // `ping` is the sharp one of the three: it is the only residual method with
+    // a recorded 118.1 v2 behaviour change, so a fence that only read the source
+    // would not notice this plan disturbing its v1 answer.
+    let (addr, handle) = spawn_server(build_v1_server(), middleware_config()).await;
+    let session = open_session(addr).await;
+    let (status, body) = post(
+        addr,
+        &session_header(&session),
+        &envelope("ping", 2, &json!({})),
+        "a v1 ping",
+    )
+    .await;
+    assert_eq!(status, 200, "v1 ping is served: {body}");
+    let reply = reply_in_body(&body, 2, "the v1 ping reply");
+    assert_eq!(
+        reply.get("result"),
+        Some(&json!({})),
+        "v1 `ping` must still answer a bare `{{}}` through the residual arm — unchanged by this \
+         plan: {reply}"
+    );
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// Structural fence — one shared unit, both roots, and the crate-internal
+// behavioural fences still exist.
+//
+// The v2 half of D-13 is NOT reachable from an integration test:
+// `ClientRequest::SetLoggingLevel` carries no `_meta`, so
+// `ProtocolHandler::handle_request` — the only PUBLIC dispatch entry — always
+// resolves `era == None` for it and can exercise the v1 branch only. The
+// era-bearing seams (`Server::handle_request_with_context`,
+// `ServerCore::handle_request_internal`) are `pub(crate)` and private. So the
+// behavioural v2 and twin-root fences live in `src/server/core.rs`, the one file
+// that can reach both, exactly as plan 06's sink fences do — and this fence
+// guards them from silent deletion by NAME.
+// ===========================================================================
+
+/// The crate-internal fences this file cannot host but must not lose.
+const CRATE_INTERNAL_SET_LEVEL_FENCES: [&str; 3] = [
+    "v2_set_logging_level_is_retired_on_the_dispatch_root",
+    "both_dispatch_roots_agree_about_set_logging_level",
+    "the_v1_answer_is_an_object_with_zero_keys_on_both_roots",
+];
+
+/// [`code_lines`] with every run of whitespace collapsed to a single space.
+///
+/// A needle spanning more than one token must survive `rustfmt` deciding to put
+/// a match arm on one line instead of three. Squeezing keeps the assertion about
+/// the CODE rather than about the formatter's current line-width arithmetic.
+fn squeezed_code(path: &str) -> String {
+    code_lines(path)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn both_dispatch_roots_answer_set_logging_level_from_one_shared_unit() {
+    let core_root = squeezed_code(CORE_ROOT);
+    let server_root = squeezed_code(SERVER_ROOT);
+
+    assert!(
+        core_root.contains("pub(crate) fn set_logging_level_response("),
+        "the shared unit is DEFINED in core.rs — `mod.rs` calls the units this file owns, it never \
+         defines its own (the twin-site parity rule)"
+    );
+    assert!(
+        core_root
+            .contains("ClientRequest::SetLoggingLevel { .. } => { set_logging_level_response("),
+        "`ServerCore`'s dispatch arm must CALL the shared unit rather than falling through to the \
+         `_ =>` catch-all, which answered -32601 on BOTH eras"
+    );
+    assert!(
+        server_root.contains("crate::server::core::set_logging_level_response("),
+        "`Server`'s adapter must call the SAME unit — two copies of an era branch are two chances \
+         to disagree, silently"
+    );
+    assert!(
+        core_root.contains("METHOD_NOT_SUPPORTED_MESSAGE.to_string()"),
+        "and the v2 retirement must reuse the one message literal this file's `_ =>` catch-all \
+         already answers with, so the retirement of `logging/setLevel` is spelled exactly like \
+         the retirement of its three residual siblings on this root"
+    );
+
+    // The era branch reaches the arm through the SAME projection both roots use.
+    for (label, source) in [("core.rs", &core_root), ("mod.rs", &server_root)] {
+        assert!(
+            source.contains("protocol_context.as_ref().map(|ctx| ctx.era)"),
+            "{label}: the arm must read the ALREADY-RESOLVED era off the request's \
+             `ProtocolContext` — never re-derive it, which would make this layer a second era \
+             resolver"
+        );
+    }
+
+    for fence in CRATE_INTERNAL_SET_LEVEL_FENCES {
+        assert!(
+            core_root.contains(fence),
+            "the crate-internal fence `{fence}` is gone. It cannot be rewritten here — an \
+             integration test cannot present a v2 `logging/setLevel` to a native dispatch root at \
+             all — so deleting it silently removes the only coverage the v2 half has"
+        );
+    }
+}
+
+// ===========================================================================
+// The `LogMessageParams` spec divergence — VERDICT, measured (plan 05 handed
+// this decision to plan 08).
+//
+// `schema/vendored/core-2026-07-28/schema.ts` declares
+// `LoggingMessageNotificationParams` as `{ level, logger?, data }` — `data` is
+// REQUIRED and there is no `message` member at all. pmcp's `LogMessageParams` is
+// the reverse: a REQUIRED `message: String` and an OPTIONAL `data`. So
+// `extra.log(Warning, "hello")` emits `{"level":"warning","message":"hello"}`.
+//
+// # The verdict: DEFERRED, not fixed here — and the premise for fixing it now is
+// # FALSIFIED by measurement
+//
+// Plan 05 recorded the condition under which the type change becomes in-scope:
+// "if the official suite validates `params.data`, the current shape fails it".
+// It does not. The pinned suite bundles the schema (its `LoggingMessageNotification`
+// definition carries `required: ['data','level']`), but the ONLY scenario in it
+// that touches a `notifications/message` is the NEGATIVE
+// `sep-2575-server-no-log-without-loglevel`, which asserts that NO such
+// notification is emitted for a request that did not set
+// `_meta["io.modelcontextprotocol/logLevel"]`. It never validates the params of
+// one that IS emitted. `logging-set-level`, the other logging scenario, only
+// inspects the RPC's response. So the divergence costs zero conformance points
+// today, and the trigger plan 05 named has not fired.
+//
+// Against that: changing the serde shape of `LogMessageParams` is a BREAKING
+// change to a public type — pmcp is at 2.x with no open breaking-change window —
+// and choosing the replacement (does `message` become `data`? does `log(..)` set
+// `data` to a JSON string and keep `message` as an extension?) is a design
+// decision that belongs to a semver phase, not to a dispatch-arm plan whose
+// `files_modified` does not include `src/types/notifications.rs`.
+//
+// So it stays DECLARED rather than fixed — and this fence turns the declaration
+// into a measured, in-tree, CI-visible fact by reading the vendored schema, so
+// the day someone changes either side the disagreement is a red test rather than
+// a note in a summary nobody re-reads.
+// ===========================================================================
+
+const VENDORED_V2_SCHEMA: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/schema/vendored/core-2026-07-28/schema.ts"
+);
+
+#[test]
+fn the_vendored_schema_requires_data_where_pmcp_emits_message() {
+    let schema = std::fs::read_to_string(VENDORED_V2_SCHEMA)
+        .unwrap_or_else(|e| panic!("{VENDORED_V2_SCHEMA} is readable: {e}"));
+    let start = schema
+        .find("export interface LoggingMessageNotificationParams")
+        .expect("the vendored schema declares LoggingMessageNotificationParams");
+    let body = &schema[start
+        ..start
+            + schema[start..]
+                .find("\n}")
+                .expect("the interface is closed")];
+
+    // MEMBER lines only. The `data` member's own doc comment reads "such as a
+    // string message", so an absence assertion over the whole interface body
+    // would be satisfied by prose rather than by a declaration.
+    let members: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('*') && !line.starts_with("/*") && !line.starts_with("//"))
+        .collect();
+    assert!(
+        members.contains(&"data: unknown;"),
+        "the vendored 2026-07-28 schema must still declare `data` as REQUIRED (no `?`). If this \
+         changed, the verdict recorded above changed with it: {members:?}"
+    );
+    assert!(
+        !members.iter().any(|line| line.starts_with("message")),
+        "and it must still declare NO `message` member: {members:?}"
+    );
+
+    // The other side of the divergence, from a live emission rather than from a
+    // reading of `src/` — the shape a client actually receives today.
+    let capture = Capture::default();
+    let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+    extra
+        .log(LoggingLevel::Warning, "hello")
+        .expect("the emit succeeds");
+    let records = capture.json();
+    let emitted = records.first().expect("exactly one record was emitted");
+    let params = emitted
+        .pointer("/params")
+        .unwrap_or_else(|| panic!("the record carries params: {emitted}"));
+
+    assert_eq!(
+        params.get("message").and_then(Value::as_str),
+        Some("hello"),
+        "pmcp emits the text under `message`, a member the vendored schema does not define: \
+         {params}"
+    );
+    assert!(
+        params.get("data").is_none(),
+        "and it emits NO `data`, which the vendored schema marks required. DEFERRED, not a bug \
+         to fix in passing: changing this is a breaking change to the public `LogMessageParams`, \
+         and the pinned conformance suite validates no emitted `notifications/message` params at \
+         all — see the verdict recorded above this fence: {params}"
+    );
+}

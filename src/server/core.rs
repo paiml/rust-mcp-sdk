@@ -9944,3 +9944,209 @@ mod core_log_sink_tests {
         );
     }
 }
+
+// ===========================================================================
+// `logging/setLevel` — ONE era-branched answer, BOTH native dispatch roots
+// (Phase 118.2 plan 08, CONF-10 / D-13).
+//
+// # Why these live HERE and not in `tests/log_emitter.rs`
+//
+// The plan puts all of this phase's fences in the integration file. Two of them
+// CANNOT be written there, for a reason that is itself part of the finding:
+//
+//   * `ClientRequest::SetLoggingLevel` carries no `_meta` — it is one of the
+//     variants `request_meta_value` enumerates as non-`_meta`-bearing — so
+//     `ProtocolHandler::handle_request`, the only PUBLIC dispatch entry, always
+//     resolves `era == None` for it and can exercise the v1 branch ONLY. An
+//     integration test literally cannot present a v2 `logging/setLevel` to a
+//     native root.
+//   * The era-bearing seams are `Server::handle_request_with_context`
+//     (`pub(crate)`) and `ServerCore::handle_request_internal` (private to this
+//     file). This file is the only place that can reach BOTH, which makes it the
+//     only place the D-13 twin-root claim can be stated as a test at all.
+//
+// Same placement, and the same stated reason, as `core_log_sink_tests` above and
+// 118.1's `attach_peer` suite. `tests/log_emitter.rs` carries the WIRE fence for
+// the v1 answer, the source-level scope fence over the untouched residual, and a
+// name-existence guard so these two cannot be deleted silently.
+// ===========================================================================
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod set_logging_level_tests {
+    use super::*;
+    use crate::types::protocol::{Era, ProtocolContext, ProtocolVersion};
+
+    /// A comparable projection of a dispatch answer.
+    ///
+    /// `Ok(result)` or `Err((code, message))` — enough to state "the two roots
+    /// gave the SAME answer" as an equality rather than as two separate
+    /// assertions that could both drift in the same direction.
+    fn answer_of(response: JSONRPCResponse) -> std::result::Result<Value, (i32, String)> {
+        match response.payload {
+            ResponsePayload::Result(value) => Ok(value),
+            ResponsePayload::Error(error) => Err((error.code, error.message)),
+        }
+    }
+
+    fn set_level_request() -> Request {
+        Request::Client(Box::new(ClientRequest::SetLoggingLevel {
+            level: crate::types::notifications::LoggingLevel::Info,
+        }))
+    }
+
+    fn context_for(era: Era) -> ProtocolContext {
+        let version = match era {
+            Era::V1 => "2025-11-25",
+            Era::V2 => "2026-07-28",
+        };
+        ProtocolContext::new(era, ProtocolVersion(version.to_string()))
+    }
+
+    /// A core in STATELESS mode.
+    ///
+    /// Not decoration: `v1_initialize_gate_applies` refuses every v1 request on a
+    /// stateful core that has not seen `initialize`, and that `-32002` would be
+    /// answered BEFORE the arm under test. Stateless mode removes the gate so the
+    /// fence measures the dispatch arm rather than the handshake.
+    fn bare_core() -> ServerCore {
+        crate::server::builder::ServerCoreBuilder::new()
+            .name("set-logging-level-core")
+            .version("1.0.0")
+            .stateless_mode(true)
+            .build()
+            .expect("core builds")
+    }
+
+    fn bare_server() -> crate::server::Server {
+        crate::server::Server::builder()
+            .name("set-logging-level-server")
+            .version("1.0.0")
+            .build()
+            .expect("server builds")
+    }
+
+    /// The `ServerCore` root's answer for `era`.
+    async fn core_answer(era: Option<Era>) -> std::result::Result<Value, (i32, String)> {
+        let core = bare_core();
+        answer_of(
+            core.handle_request_internal(
+                RequestId::from(1i64),
+                set_level_request(),
+                None,
+                era.map(context_for),
+                &mut DispatchEnvelopeClaim::default(),
+            )
+            .await,
+        )
+    }
+
+    /// The high-level `Server` root's answer for `era`.
+    async fn server_answer(era: Option<Era>) -> std::result::Result<Value, (i32, String)> {
+        let server = bare_server();
+        answer_of(
+            server
+                .handle_request_with_context(
+                    RequestId::from(1i64),
+                    set_level_request(),
+                    None,
+                    era.map(context_for),
+                )
+                .await,
+        )
+    }
+
+    /// T-118.2-08-01 — the v2 retirement is enforced at the DISPATCH root, not
+    /// only at the HTTP ingress.
+    ///
+    /// # Which route this fence takes, and why
+    ///
+    /// IN-PROCESS, through each root's own era-bearing dispatch entry — NOT over
+    /// HTTP. `retire_v2_method` refuses a v2 `logging/setLevel` at the header
+    /// gate, long before any dispatcher sees it, so a wire fence would prove the
+    /// PRE-EXISTING transport retirement and say nothing at all about the arm
+    /// this plan added. The whole of D-13 is that the dispatch root was the layer
+    /// that had it wrong: before this plan `Server` answered `json!({})` here on
+    /// BOTH eras, so a caller reaching it by any path other than the HTTP ingress
+    /// — in-process, or a future transport — got a success for a method the
+    /// 2026-07-28 schema removed.
+    #[tokio::test]
+    async fn v2_set_logging_level_is_retired_on_the_dispatch_root() {
+        for (root, answer) in [
+            ("Server", server_answer(Some(Era::V2)).await),
+            ("ServerCore", core_answer(Some(Era::V2)).await),
+        ] {
+            let Err((code, message)) = answer else {
+                panic!(
+                    "{root} SERVED a v2 `logging/setLevel` instead of refusing it — the retirement \
+                     is enforced only at the HTTP layer again, which is exactly the defect D-13 \
+                     closed"
+                );
+            };
+            assert_eq!(
+                code,
+                crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+                "{root} refused with {code} ({message}), not -32601. The HTTP ingress answers \
+                 `METHOD_NOT_FOUND` for the same method through `V2_RETIRED_METHODS`; a refusal \
+                 that is not a retirement would not be credited by the suite and could be a \
+                 capability or params rejection wearing a retirement's clothes"
+            );
+        }
+    }
+
+    /// The D-13 claim itself, as an equality: both roots, every era, one answer.
+    ///
+    /// The `None` row is load-bearing. A server that never opted in to protocol
+    /// negotiation resolves no era at all, and it has always been on v1; retiring
+    /// the method for it would break every default-configuration server in the
+    /// SDK. `None` must therefore answer exactly as `Some(V1)` does.
+    ///
+    /// The sibling precedent is the paired
+    /// `attach_peer_is_a_no_op_when_neither_source_is_configured`, which exists in
+    /// BOTH `src/server/core.rs` and `src/server/mod.rs`. This phase states the
+    /// pairing as one cross-root equality instead, because "the two answers are
+    /// EQUAL" is the property, and two mirrored tests can drift together while an
+    /// equality cannot.
+    #[tokio::test]
+    async fn both_dispatch_roots_agree_about_set_logging_level() {
+        for era in [None, Some(Era::V1), Some(Era::V2)] {
+            let server = server_answer(era).await;
+            let core = core_answer(era).await;
+            assert_eq!(
+                server, core,
+                "the two native dispatch roots disagree about `logging/setLevel` on era {era:?} — \
+                 `Server` said {server:?}, `ServerCore` said {core:?}. That divergence is the \
+                 whole defect D-13 closed: only one of these roots is on the HTTP path, so only \
+                 one of them is measured by the official conformance suite, and the other one is \
+                 what an in-process or future-transport caller gets"
+            );
+        }
+    }
+
+    /// Pitfall 8, at the dispatch root: the v1 answer is a LITERAL empty object.
+    ///
+    /// The pinned suite's `2025-11-25:logging-set-level` scenario fails on
+    /// `Object.keys(r).length > 0`, so an acknowledgement object — or an echo of
+    /// the level just set, which would additionally be a READ of session state
+    /// through a WRITE endpoint (T-118.2-08-02) — reds a currently-green blocking
+    /// scenario. `tests/log_emitter.rs` pins the same constraint over the wire.
+    #[tokio::test]
+    async fn the_v1_answer_is_an_object_with_zero_keys_on_both_roots() {
+        for era in [None, Some(Era::V1)] {
+            for (root, answer) in [
+                ("Server", server_answer(era).await),
+                ("ServerCore", core_answer(era).await),
+            ] {
+                let Ok(result) = answer else {
+                    panic!("{root} refused a v1 `logging/setLevel` on era {era:?}: {answer:?}");
+                };
+                let object = result.as_object().unwrap_or_else(|| {
+                    panic!("{root}: the v1 answer must be an OBJECT, got {result}")
+                });
+                assert!(
+                    object.is_empty(),
+                    "{root}: the v1 answer must have ZERO keys, got {result} — any non-empty \
+                     object fails the pinned suite's `logging-set-level` scenario"
+                );
+            }
+        }
+    }
+}
