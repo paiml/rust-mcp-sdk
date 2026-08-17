@@ -246,12 +246,34 @@ async fn test_middleware_with_multiple_http_methods() {
     // List tools (POST)
     let _tools = client.list_tools(None).await.unwrap();
 
-    // Verify middleware tracked POST methods
+    // Verify the middleware saw every request the client made.
+    //
+    // This assertion used to read "all requests should be POST in JSON mode",
+    // which was only true because of Phase 118.2's Defect A: `start_sse` sat
+    // inside `if !response.status().is_success()`, and `202 Accepted` IS a
+    // success status, so the client never opened its session stream and no GET
+    // was ever issued. It does now, exactly as the reference SDK does
+    // (`isInitializedNotification` -> `_startOrAuthSse`), and
+    // `enable_json_response` is a hint about POST response FORMAT, not a reason
+    // to skip the server-to-client channel. The old expectation encoded the
+    // defect; the new one records the corrected behaviour.
     let methods = method_tracker.methods.lock().await;
-    assert!(methods.len() >= 2, "Should have at least 2 POST requests");
-    for method in methods.iter() {
-        assert_eq!(method, "POST", "All requests should be POST in JSON mode");
-    }
+    let posts = methods.iter().filter(|m| *m == "POST").count();
+    let gets = methods.iter().filter(|m| *m == "GET").count();
+    assert!(
+        posts >= 2,
+        "Should have at least 2 POST requests: {methods:?}"
+    );
+    assert_eq!(
+        gets, 1,
+        "exactly ONE GET — the session stream opened after notifications/initialized, and not \
+         re-opened by any other notification: {methods:?}"
+    );
+    assert_eq!(
+        posts + gets,
+        methods.len(),
+        "only POST and GET are expected on this transport: {methods:?}"
+    );
 
     // Cleanup
     drop(client);

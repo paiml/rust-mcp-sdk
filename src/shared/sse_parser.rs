@@ -438,17 +438,16 @@ impl SseParser {
     /// Feed a COMPLETE, already-size-capped SSE body, bypassing the in-flight
     /// bound entirely.
     ///
-    /// # Precondition — SATISFIED by both call sites
+    /// # Precondition — SATISFIED by its one remaining call site
     ///
     /// This is only sound where the caller has ALREADY enforced its own byte cap
     /// on the collected body. It performs no bound check and never latches
     /// [`Self::overflowed`], so the caller's cap is the ONLY thing standing
     /// between a remote peer and this process's heap.
     ///
-    /// Since plan 113-20 that cap is an established fact, not an obligation. Both
-    /// call sites — `StreamableHttpTransport::post_body` (the POST response) and
-    /// `StreamableHttpTransport::start_sse` (the GET SSE stream), both in
-    /// [`crate::shared::streamable_http`] — read their body through
+    /// Since plan 113-20 that cap is an established fact, not an obligation. The
+    /// ONE remaining call site — `StreamableHttpTransport::post_body` (the POST
+    /// response) in [`crate::shared::streamable_http`] — reads its body through
     /// `StreamableHttpTransport::collect_body_within_cap` at the transport's
     /// configured
     /// [`crate::shared::streamable_http::DEFAULT_MAX_COLLECTED_BODY_BYTES`], which
@@ -462,7 +461,8 @@ impl SseParser {
     /// # An incremental feeder may NEVER call this
     ///
     /// Chunk-at-a-time feeders — [`crate::shared::http`]'s `connect_sse` reader
-    /// task and the `subscriptions/listen` client — must use [`Self::feed`].
+    /// task, the `subscriptions/listen` client, and (since Phase 118.2 D-01) the
+    /// streamable-HTTP GET session-stream reader — must use [`Self::feed`].
     /// Retention across chunks with no bound is precisely the unbounded
     /// condition `feed` exists to refuse, and no per-call cap can substitute for
     /// it because the peer chooses how many calls there are.

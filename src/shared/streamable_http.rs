@@ -1018,7 +1018,31 @@ impl StreamableHttpTransport {
         self.last_event_id.read().clone()
     }
 
-    /// Start a GET SSE stream with middleware support.
+    /// Open the GET session stream and read it INCREMENTALLY, frame at a time.
+    ///
+    /// Returns as soon as the reader task is spawned. Delivered events reach
+    /// [`Transport::receive`] while the stream is still open; a stream that ends
+    /// — cleanly or otherwise — is reported through the taxonomy documented on
+    /// that method.
+    ///
+    /// # Response-BODY middleware is bypassed on this stream
+    ///
+    /// The HTTP response-middleware chain does NOT run over the session stream's
+    /// body, for the same reason [`Self::post_streaming`] gives for the
+    /// `subscriptions/listen` body: the chain processes a complete `Vec<u8>`
+    /// body, and a stream has none by construction. Request middleware and
+    /// response-HEADER processing are unaffected. A deployment with a
+    /// body-rewriting middleware will see it applied to POST responses and not to
+    /// this stream.
+    ///
+    /// # Bound
+    ///
+    /// The parser is built at this transport's `max_collected_body_bytes` (D-02):
+    /// the collected-body cap BECOMES the in-flight parser bound rather than a
+    /// second knob, so [`Self::with_max_collected_body_bytes`] moves both. There
+    /// is deliberately no new field on [`StreamableHttpTransportConfig`] — that
+    /// struct is externally constructible with all-`pub` fields, so a new field
+    /// is a MAJOR semver event.
     ///
     /// # The cursor argument is v1-only
     ///
@@ -1095,64 +1119,41 @@ impl StreamableHttpTransport {
         // Process response headers
         self.process_response_headers(&response);
 
-        // Collect body under this transport's collected-body cap (T-113-84).
+        // The HTTP response-BODY middleware chain is deliberately NOT run over
+        // this stream, exactly as `Self::post_streaming` states for the
+        // `subscriptions/listen` body: "the chain processes a complete `Vec<u8>`
+        // body, and a stream has none by construction". `process_response_headers`
+        // above still runs, so HEADER-level middleware behaviour is unchanged.
         //
-        // Enforced HERE, before any of it reaches the parser: the parser's
-        // complete-body entry point performs no bound check of its own, so this
-        // is the only thing bounding the allocation on this path. See
-        // `DEFAULT_MAX_COLLECTED_BODY_BYTES`.
-        let body_bytes =
-            Self::collect_body_within_cap(response, self.max_collected_body_bytes).await?;
-
-        // Fast path: Check if middleware exists before creating temp response
-        let modified_body = if self.config.read().http_middleware_chain.is_some() {
-            // Run response middleware (create a minimal response for middleware processing)
-            let temp_response = HyperResponse::builder()
-                .status(200)
-                .body(Full::new(Bytes::new()))
-                .unwrap();
-            self.apply_response_middleware("GET", url.as_str(), &temp_response, body_bytes.to_vec())
-                .await?
-        } else {
-            // No middleware - use body directly (fast path)
-            body_bytes.to_vec()
-        };
-
-        // Start streaming task
+        // Rejected alternatives, recorded so they are not re-derived: prohibiting
+        // body-transforming middleware (unenforceable — the chain is a public
+        // extension point) and a frame-aware middleware API (new public surface,
+        // and a semver event this phase does not plan for).
         let sender = self.sender.clone();
         let on_resumption = self.resumption_callback();
         let last_event_id = self.last_event_id.clone();
+        let mut state = SseReadState::new(response.into_body(), self.max_collected_body_bytes);
 
         let handle = tokio::spawn(async move {
-            let mut sse_parser = SseParser::new();
-            let body = String::from_utf8_lossy(&modified_body);
-
-            // Parse SSE events.
-            //
-            // Deliberately the COMPLETE-body entry point rather than `feed`:
-            // this body was already read into memory in one piece, not a chunk
-            // of a live stream, so the parser's incremental in-flight bound does
-            // not apply to it. Its byte-cap precondition is SATISFIED above by
-            // `collect_body_within_cap` at `self.max_collected_body_bytes` — an
-            // over-cap body never reaches this task at all.
-            let events = sse_parser.feed_complete_body(&body);
-            for event in events {
-                // Update last event ID and notify callback
-                if let Some(id) = &event.id {
-                    *last_event_id.write() = Some(id.clone());
-                    if let Some(callback) = &on_resumption {
-                        callback(id.clone());
-                    }
-                }
-
-                // Only process "message" events or no event type
-                if event.event.as_deref() == Some("message") || event.event.is_none() {
-                    // Use JSON-RPC compatibility layer
-                    if let Ok(msg) =
-                        crate::shared::StdioTransport::parse_message(event.data.as_bytes())
+            loop {
+                if let Some(event) = state.pending.pop_front() {
+                    if !deliver_sse_event(&sender, &last_event_id, on_resumption.as_ref(), event)
+                        .await
                     {
-                        let _ = sender.send(Ok(msg)).await;
+                        return;
                     }
+                    continue;
+                }
+                // End-of-body drains `pending` FIRST (above), so trailing
+                // complete events are never lost to the `done` check.
+                if state.done {
+                    return;
+                }
+                if let Some(error) = read_next_sse_frame(&mut state).await {
+                    // Terminal, and latched by returning: at most ONE error per
+                    // reader, so one corrupt frame cannot become an error storm.
+                    let _ = sender.send(Err(error)).await;
+                    return;
                 }
             }
         });
@@ -1583,6 +1584,10 @@ impl StreamableHttpTransport {
         // produced two POSTs and ZERO GETs, i.e. the session stream was never
         // opened at all. Fenced by `tests/client_sse_stream.rs`.
         if response.status() == StatusCode::ACCEPTED {
+            // The guard is the `notifications/initialized` notification
+            // SPECIFICALLY, carried as a typed identity rather than as the
+            // method string — see `OutboundFrame` for why the broad
+            // "is a notification" predicate is an active regression.
             if outbound == OutboundFrame::InitializedNotification {
                 // Tolerate failure: a server answering `405 Method Not Allowed`
                 // to the GET is a perfectly valid StreamableHTTP server that
@@ -1934,6 +1939,211 @@ impl Transport for StreamableHttpTransport {
         // The v2 raw path never carries `notifications/initialized` — v2 has no
         // handshake at all — so its 202s never open a session stream.
         self.post_body(body, OutboundFrame::Other).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The GET session-stream reader (Phase 118.2, D-01/D-02/D-05).
+//
+// Lifted from `src/client/subscriptions.rs`'s `subscriptions/listen` reader —
+// the same shape, on the same parser, with the same three invariants. There is
+// deliberately NOT a second SSE tokenizer, and the four-way split below exists
+// specifically to keep every function under the repo's PMAT cog-25 budget
+// (CLAUDE.md, enforced by the PR-blocking gate). Do not collapse it.
+// ---------------------------------------------------------------------------
+
+/// How much of a malformed frame is echoed back in an error message.
+///
+/// Bounded because the frame is UNTRUSTED remote input: a hostile server must
+/// not be able to push an unbounded string into a client's logs through an error
+/// `Display` (ASVS V7, T-118.2-01-05).
+const MAX_ECHOED_SSE_FRAME: usize = 200;
+
+/// Incremental UTF-8 + SSE decoding state for one live session stream.
+struct SseReadState {
+    body: hyper::body::Incoming,
+    parser: SseParser,
+    /// Bytes received but not yet decodable as complete UTF-8.
+    bytes: Vec<u8>,
+    /// Events already parsed and waiting to be delivered.
+    pending: std::collections::VecDeque<crate::shared::sse_parser::SseEvent>,
+    /// The body reported end-of-stream (or errored) and must not be polled again.
+    done: bool,
+}
+
+impl SseReadState {
+    /// Build the state for one response body at an EXPLICIT parser bound.
+    ///
+    /// The bound is the transport's `max_collected_body_bytes` (D-02), not
+    /// `SseParser::new()`'s default, so the limit is visible at the call site and
+    /// moves with [`StreamableHttpTransport::with_max_collected_body_bytes`].
+    fn new(body: hyper::body::Incoming, max_buffer_size: usize) -> Self {
+        Self {
+            body,
+            parser: SseParser::with_max_buffer_size(max_buffer_size),
+            bytes: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+}
+
+/// Read ONE body frame into `state`, returning `Some(error)` only when the
+/// stream must END.
+///
+/// Extracted from the reader task's loop so neither exceeds the repo's
+/// cognitive-complexity budget. Three properties make this shape correct, each of
+/// which a fresh implementation gets wrong:
+///
+/// 1. `take_utf8_prefix` runs in the SAME iteration as the append, so the
+///    residual in `bytes` is at most a three-byte incomplete-character tail.
+///    Never decode per chunk with a lossy converter — that corrupts a multi-byte
+///    character split across a TCP segment into `U+FFFD` (T-118.2-01-06).
+/// 2. [`sse_stream_overflow`] is polled ONCE PER CHUNK, and the parser's flag
+///    LATCHES, so a caller cannot miss it.
+/// 3. End-of-body sets `done` without draining: the CALLER drains `pending`
+///    before it checks `done`, so trailing complete events are not lost.
+async fn read_next_sse_frame(state: &mut SseReadState) -> Option<Error> {
+    match state.body.frame().await {
+        // End of body. Anything already in `pending` is still drained by the
+        // caller's loop before the `done` check ends the stream.
+        None => {
+            state.done = true;
+            None
+        },
+        Some(Err(e)) => {
+            state.done = true;
+            Some(Error::Transport(TransportError::Request(e.to_string())))
+        },
+        Some(Ok(frame)) => {
+            if let Some(chunk) = frame.data_ref() {
+                state.bytes.extend_from_slice(chunk);
+                let text = crate::shared::sse_parser::take_utf8_prefix(&mut state.bytes);
+                state
+                    .pending
+                    .extend(drain_sse_events(&mut state.parser, &text));
+                if let Some(error) = sse_stream_overflow(&state.parser) {
+                    // The peer pushed the parser's retained state plus this chunk
+                    // past the bound, so the parser DISCARDED bytes and this byte
+                    // stream is no longer trustworthy. There is nothing
+                    // meaningful to continue to.
+                    state.done = true;
+                    return Some(error);
+                }
+            }
+            // A trailers frame carries no data; the caller loops and reads again.
+            None
+        },
+    }
+}
+
+/// Feed `chunk` to the SHARED SSE parser and return the events it completed.
+///
+/// Keeps the existing message-event filter semantics: an event whose `event`
+/// field is absent or equals `"message"`. Keep-alive comment lines never produce
+/// an event at all — the shared parser drops them — so they are skipped for free
+/// rather than by a second rule that could drift.
+fn drain_sse_events(
+    parser: &mut SseParser,
+    chunk: &str,
+) -> Vec<crate::shared::sse_parser::SseEvent> {
+    parser
+        .feed(chunk)
+        .into_iter()
+        .filter(|event| event.event.as_deref().is_none_or(|name| name == "message"))
+        .collect()
+}
+
+/// The stream-ENDING error, when the parser has discarded in-flight bytes past
+/// its bound (D-02).
+///
+/// It NAMES the limit and the peer's behaviour and nothing else — no frame
+/// content is echoed, because the bytes that tripped the bound are exactly the
+/// untrusted input [`MAX_ECHOED_SSE_FRAME`] exists to keep out of a client's
+/// logs.
+///
+/// A free function over the parser rather than an inline check in
+/// [`read_next_sse_frame`] so the condition is reachable from a test: that
+/// function owns a live `hyper::body::Incoming`, which cannot be constructed
+/// outside hyper.
+fn sse_stream_overflow(parser: &SseParser) -> Option<Error> {
+    if !parser.overflowed() {
+        return None;
+    }
+    Some(Error::Transport(TransportError::InvalidMessage(format!(
+        "a session-stream chunk pushed the buffered stream state past the {}-byte parser bound; \
+         the buffered bytes were discarded and the stream was ended",
+        parser.max_buffer_size()
+    ))))
+}
+
+/// The stream-ENDING error, when a `message` frame does not parse as JSON-RPC
+/// (D-05).
+///
+/// Deliberately terminal rather than an `if let Ok(..)` silent drop: an
+/// unparseable frame may be a server-to-client REQUEST, and swallowing it hangs
+/// both ends with no signal at either. Corruption gets ONE story, not two.
+///
+/// A free function over the already-decoded payload for the same testability
+/// reason as [`sse_stream_overflow`], and the echo is bounded by
+/// [`truncate_sse_frame`].
+fn unparseable_sse_frame(cause: &Error, data: &str) -> Error {
+    Error::Transport(TransportError::InvalidMessage(format!(
+        "a session-stream frame did not parse as a JSON-RPC message ({cause}); the stream was \
+         ended. Frame: {}",
+        truncate_sse_frame(data)
+    )))
+}
+
+/// Bound an untrusted string for inclusion in an error message.
+///
+/// Scans at most `MAX_ECHOED_SSE_FRAME + 1` characters: `chars().count()` would
+/// walk the WHOLE untrusted string, whose length a remote peer chooses, just to
+/// answer "is it longer than 200 characters?".
+fn truncate_sse_frame(text: &str) -> String {
+    let mut boundary = None;
+    for (index, (offset, _)) in text.char_indices().enumerate() {
+        if index == MAX_ECHOED_SSE_FRAME {
+            boundary = Some(offset);
+            break;
+        }
+    }
+    let Some(boundary) = boundary else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(boundary + '…'.len_utf8());
+    out.push_str(&text[..boundary]);
+    out.push('…');
+    out
+}
+
+/// Deliver ONE parsed event, returning `false` when the reader must stop.
+///
+/// Split out of the reader task's loop for the cognitive-complexity budget, and
+/// because it owns the two rules the loop must not get wrong: a resumption
+/// cursor is recorded BEFORE the payload is classified, and a failed
+/// `sender.send` means the receiver was dropped — the last transport clone is
+/// gone — so the reader RETURNS rather than retrying.
+async fn deliver_sse_event(
+    sender: &mpsc::Sender<Result<TransportMessage>>,
+    last_event_id: &Arc<RwLock<Option<String>>>,
+    on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
+    event: crate::shared::sse_parser::SseEvent,
+) -> bool {
+    if let Some(id) = &event.id {
+        *last_event_id.write() = Some(id.clone());
+        if let Some(callback) = on_resumption {
+            callback(id.clone());
+        }
+    }
+    match crate::shared::StdioTransport::parse_message(event.data.as_bytes()) {
+        Ok(message) => sender.send(Ok(message)).await.is_ok(),
+        Err(cause) => {
+            let _ = sender
+                .send(Err(unparseable_sse_frame(&cause, &event.data)))
+                .await;
+            false
+        },
     }
 }
 
@@ -3009,13 +3219,26 @@ mod tests {
         // Site 2 of 2: the GET SSE stream (`start_sse`).
         // --------------------------------------------------------------
 
-        /// The same one-byte-over refusal on the GET path. This is a SEPARATE
-        /// `collect()` call site; without its own test, uncapping it would go
-        /// unnoticed.
+        /// The GET path's bound is the PARSER's in-flight bound (Phase 118.2,
+        /// D-01/D-02), and its refusal arrives on `receive()`.
+        ///
+        /// This test USED to assert that `start_sse` itself returned `Err` for a
+        /// body one byte over the cap. `start_sse` no longer collects the body —
+        /// a session stream has no end-of-body to collect to — so it has no body
+        /// SIZE to refuse: it returns as soon as its reader task is spawned, and
+        /// the refusal arrives where a live stream's failures have to arrive, on
+        /// the receive queue behind every frame already delivered.
+        ///
+        /// What is bounded is therefore the parser's RETAINED state plus the
+        /// chunk being fed, not a whole-body total. The peer here streams an
+        /// unterminated `data:` line, which is the shape that ACCUMULATES and so
+        /// trips the bound regardless of how the transport happens to frame its
+        /// reads.
         #[tokio::test]
-        async fn start_sse_one_byte_over_the_cap_is_refused_before_the_parser() {
+        async fn start_sse_over_the_parser_bound_ends_the_stream_with_a_named_error() {
             let mut server = MockServer::new_async().await;
-            let body = sse_body_of(CAP + 1);
+            // No terminating newline and no blank line: pure accumulation.
+            let body = format!("data: {}", "p".repeat(CAP * 2));
             let _mock = server
                 .mock("GET", "/")
                 .with_status(200)
@@ -3025,21 +3248,19 @@ mod tests {
                 .await;
 
             let mut transport = capped_transport(&server.url(), CAP);
-            let error = transport
+            transport
                 .start_sse(None)
                 .await
-                .expect_err("a body over the cap must be refused");
-            assert_over_cap_refusal(&error, CAP);
+                .expect("start_sse returns as soon as its reader task is spawned");
 
-            assert!(
-                tokio::time::timeout(QUIET_WINDOW, transport.receive())
-                    .await
-                    .is_err(),
-                "an over-cap body must never reach the parser, so nothing can be dispatched"
-            );
+            let error = tokio::time::timeout(QUIET_WINDOW, transport.receive())
+                .await
+                .expect("the terminal error must be dispatched")
+                .expect_err("an over-bound chunk must END the stream, not be silently dropped");
+            assert_over_cap_refusal(&error, CAP);
         }
 
-        /// Exactly the cap is admitted on the GET path too.
+        /// Exactly the bound is admitted on the GET path too.
         #[tokio::test]
         async fn start_sse_at_the_cap_parses_normally() {
             let mut server = MockServer::new_async().await;
