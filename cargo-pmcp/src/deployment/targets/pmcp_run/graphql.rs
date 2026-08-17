@@ -2,7 +2,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::auth::{discover_graphql_url, load_cached_config, refresh_graphql_url, DEFAULT_GRAPHQL_URL};
+use super::auth::{
+    discover_graphql_url, load_cached_config, refresh_graphql_url, DEFAULT_GRAPHQL_URL,
+};
 
 /// Resolve GraphQL URL with priority: env var > discovery cache > default.
 /// This is sync to avoid an async call on every GraphQL request.
@@ -418,7 +420,9 @@ pub async fn get_deployment(access_token: &str, deployment_id: &str) -> Result<D
 /// rest as undefined. Retrying elsewhere is only worth it for this error class.
 fn looks_like_unknown_schema(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
-    msg.contains("FieldUndefined") || msg.contains("UnknownType") || msg.contains("Validation error")
+    msg.contains("FieldUndefined")
+        || msg.contains("UnknownType")
+        || msg.contains("Validation error")
 }
 
 /// Execute a GraphQL request, re-running discovery once if the endpoint reports our
@@ -1830,14 +1834,28 @@ mod tests {
         const SOURCE: &str = include_str!("graphql.rs");
         // GraphQL built-ins plus the AppSync-specific scalars this API uses.
         const KNOWN: &[&str] = &[
-            "String", "Boolean", "Int", "Float", "ID", "AWSJSON", "AWSDate", "AWSTime",
-            "AWSDateTime", "AWSTimestamp", "AWSEmail", "AWSURL", "AWSPhone", "AWSIPAddress",
+            "String",
+            "Boolean",
+            "Int",
+            "Float",
+            "ID",
+            "AWSJSON",
+            "AWSDate",
+            "AWSTime",
+            "AWSDateTime",
+            "AWSTimestamp",
+            "AWSEmail",
+            "AWSURL",
+            "AWSPhone",
+            "AWSIPAddress",
         ];
 
         let mut offenders: Vec<(usize, String)> = Vec::new();
         for (i, line) in SOURCE.lines().enumerate() {
             // Match a variable declaration inside a query string: `$name: Type` / `Type!`.
-            let Some(colon) = line.find(": ") else { continue };
+            let Some(colon) = line.find(": ") else {
+                continue;
+            };
             if !line.trim_start().starts_with('$') {
                 continue;
             }

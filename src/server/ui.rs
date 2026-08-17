@@ -295,10 +295,7 @@ mod tests {
     fn test_csp_declaration_lands_in_contents_meta() {
         let (_resource, contents) = UIResourceBuilder::new("ui://test/csp", "CSP Test")
             .html_template("<html><body>Test</body></html>")
-            .csp(
-                vec!["https://api.example.com".to_string()],
-                Vec::new(),
-            )
+            .csp(vec!["https://api.example.com".to_string()], Vec::new())
             .build_with_contents()
             .expect("Failed to build");
 

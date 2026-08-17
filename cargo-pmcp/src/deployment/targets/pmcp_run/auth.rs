@@ -1012,7 +1012,10 @@ mod cache_tests {
     fn clear_config_cache_removes_the_entry_and_is_idempotent() {
         with_isolated_env("https://dev.api.example.com", || {
             save_config_cache(&fixture_config("https://dev.mcp.example.com")).unwrap();
-            assert!(load_cached_config().is_some(), "precondition: cache present");
+            assert!(
+                load_cached_config().is_some(),
+                "precondition: cache present"
+            );
 
             clear_config_cache().unwrap();
             assert!(

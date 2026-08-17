@@ -84,7 +84,6 @@ pub fn execute(args: AddArgs, _global_flags: &GlobalFlags) -> Result<()> {
     // stale lookup, which the retry in pmcp_run::graphql also covers.
     let _ = crate::deployment::targets::pmcp_run::auth::clear_config_cache();
 
-
     eprintln!("✓ target '{}' added to {}", args.name, path.display());
     eprintln!(
         "  run `cargo pmcp configure use {}` to make it active in this workspace",
