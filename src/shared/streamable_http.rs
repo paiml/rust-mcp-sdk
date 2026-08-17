@@ -1654,12 +1654,18 @@ impl StreamableHttpTransport {
         let max_buffer_size = self.max_collected_body_bytes;
 
         tokio::spawn(async move {
+            // A POST response stream has no reconnect, so it has no cursor
+            // CONSUMER: this local is written and never read back (WR-02). Its
+            // ids still reach the transport-wide `last_event_id` for the public
+            // accessor, exactly as before.
+            let mut cursor: Option<String> = None;
             let end = read_sse_body(
                 &delivery,
                 &last_event_id,
                 on_resumption.as_ref(),
                 body,
                 max_buffer_size,
+                &mut cursor,
             )
             .await;
             // LATCHED rather than queued (CR-02): a POST response stream that
@@ -2656,12 +2662,20 @@ enum SseBodyEnd {
 /// same reason the four helpers under it are: a `hyper::body::Incoming` cannot
 /// be constructed outside hyper, so every part of this path that CAN be reached
 /// from a test is.
+/// # The `cursor` argument is PER-STREAM, and that is the whole of WR-02
+///
+/// `last_event_id` is transport-WIDE: every reader writes it, and
+/// [`StreamableHttpTransport::last_event_id`] reports it as "the most recent id
+/// seen on any stream". `cursor` is the caller's own, one per live body. MCP
+/// resumability is per-stream, so only the caller's cursor may become a
+/// `Last-Event-ID` header — see [`reconnect_cursor`].
 async fn read_sse_body(
     delivery: &ReaderDelivery,
     last_event_id: &Arc<RwLock<Option<String>>>,
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     body: hyper::body::Incoming,
     max_buffer_size: usize,
+    cursor: &mut Option<String>,
 ) -> SseBodyEnd {
     let mut state = SseReadState::new(body, max_buffer_size);
     let mut progress = SseProgress::default();
@@ -2681,6 +2695,7 @@ async fn read_sse_body(
             on_resumption,
             &mut state,
             &mut progress,
+            cursor,
         )
         .await
         {
@@ -2772,6 +2787,7 @@ async fn drain_pending_events(
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     state: &mut SseReadState,
     progress: &mut SseProgress,
+    cursor: &mut Option<String>,
 ) -> bool {
     while let Some(event) = state.pending.pop_front() {
         // Recorded BEFORE delivery, and from any event: a peer that sends
@@ -2780,12 +2796,43 @@ async fn drain_pending_events(
         if let Some(millis) = event.retry {
             progress.retry = Some(Duration::from_millis(millis));
         }
-        if !deliver_sse_event(delivery, last_event_id, on_resumption, event).await {
+        if !deliver_sse_event(delivery, last_event_id, on_resumption, event, cursor).await {
             return false;
         }
         progress.delivered = true;
     }
     true
+}
+
+/// The cursor a reconnect resumes from, given the cursor THAT STREAM delivered.
+///
+/// The `v1-compat` half: an owned copy of the caller's own per-stream cursor.
+///
+/// A free function over `Option<&str>` rather than a method reading a shared
+/// field, because a cursor is per-STREAM state (Phase 118.2, WR-02): the shared
+/// `last_event_id` is written by every reader, including one per in-flight
+/// streaming POST, so consuming it as a reconnect cursor asks the server to
+/// resume the session stream from a position belonging to a different stream.
+/// `Option<&str>` rather than `&Option<String>` because clippy's pedantic
+/// `ref_option` fires on the latter.
+#[cfg(feature = "v1-compat")]
+fn reconnect_cursor(cursor: Option<&str>) -> Option<String> {
+    cursor.map(ToString::to_string)
+}
+
+/// The null twin: a `full-v2` build has no resumption cursor, so the answer is
+/// the constant `None` regardless of what the stream delivered.
+///
+/// MCP `2026-07-28` removed SSE resumability outright. Do NOT "improve" this by
+/// returning the argument, or by reading `last_event_id` — answering here is
+/// exactly what keeps the reconnect call site free of a `#[cfg]`, and
+/// `tests/v1_severability_tripwire.rs` asserts both halves of that. A `full-v2`
+/// build cannot construct a cursor at all, which is what makes "no
+/// attacker-influenced cursor reaches the wire" a property of the compiled crate
+/// rather than of a runtime branch (T-118.2-04-03).
+#[cfg(not(feature = "v1-compat"))]
+const fn reconnect_cursor(_ignored_cursor: Option<&str>) -> Option<String> {
+    None
 }
 
 /// Read ONE body frame into `state`, returning `Some(stop)` only when the
@@ -2979,9 +3026,18 @@ async fn deliver_sse_event(
     last_event_id: &Arc<RwLock<Option<String>>>,
     on_resumption: Option<&Arc<dyn Fn(String) + Send + Sync>>,
     event: crate::shared::sse_parser::SseEvent,
+    cursor: &mut Option<String>,
 ) -> bool {
     if let Some(id) = &event.id {
+        // BOTH, and the difference between them is WR-02. The shared write is
+        // unchanged in timing and in value, so
+        // `StreamableHttpTransport::last_event_id()` and the `on_resumption`
+        // callback keep exactly the behaviour they have today — that non-change is
+        // the point. The caller's own cursor is what a RECONNECT may resume from,
+        // because a cursor minted on one stream is not a position on another
+        // (T-118.2-17-03).
         *last_event_id.write() = Some(id.clone());
+        *cursor = Some(id.clone());
         if let Some(callback) = on_resumption {
             callback(id.clone());
         }
@@ -3168,8 +3224,13 @@ struct SseReaderContext {
     /// Everything this task delivers through: plan 01's receive queue (its
     /// liveness signal too) and CR-02's terminal latch with its wake signal.
     delivery: ReaderDelivery,
-    /// Where a delivered event's id is recorded, and what
-    /// [`Self::reconnect_cursor`] reads back out on the `v1-compat` build.
+    /// Where a delivered event's id is recorded TRANSPORT-WIDE, for the public
+    /// [`StreamableHttpTransport::last_event_id`] accessor.
+    ///
+    /// NOT what a reconnect resumes from. Every reader writes this one slot,
+    /// including one per in-flight streaming POST, so the RECONNECT cursor is a
+    /// per-stream local threaded through [`read_sse_body`] instead — see
+    /// [`reconnect_cursor`] (Phase 118.2, WR-02).
     last_event_id: Arc<RwLock<Option<String>>>,
     /// Read ONCE from the paired `resumption_callback` accessor at construction,
     /// so this task carries no `#[cfg]` of its own.
@@ -3186,30 +3247,6 @@ impl SseReaderContext {
             protocol_version: &self.protocol_version,
             v2_mode: &self.v2_mode,
         }
-    }
-
-    /// The cursor a reconnect resumes from.
-    ///
-    /// The `v1-compat` half: whatever the last delivered event's id was.
-    #[cfg(feature = "v1-compat")]
-    fn reconnect_cursor(&self) -> Option<String> {
-        self.last_event_id.read().clone()
-    }
-
-    /// The null twin: a `full-v2` build has no resumption cursor, so the answer
-    /// is the constant `None`.
-    ///
-    /// MCP `2026-07-28` removed SSE resumability outright. Do NOT "improve" this
-    /// by reading `last_event_id` — answering here is exactly what keeps the
-    /// reconnect call site free of a `#[cfg]`, and
-    /// `tests/v1_severability_tripwire.rs` asserts both halves of that. A
-    /// `full-v2` build cannot construct a cursor at all, which is what makes
-    /// "no attacker-influenced cursor reaches the wire" a property of the
-    /// compiled crate rather than of a runtime branch (T-118.2-04-03).
-    #[cfg(not(feature = "v1-compat"))]
-    #[allow(clippy::unused_self)]
-    const fn reconnect_cursor(&self) -> Option<String> {
-        None
     }
 
     /// Issue ONE GET and hand back its live body.
@@ -3293,6 +3330,16 @@ impl SseReaderContext {
         // iteration, so no value of MAX_SSE_RECONNECT_ATTEMPTS bounded the loop.
         // Uptime is what distinguishes a working stream from a one-frame bounce.
         let mut attempt: u32 = 0;
+        // THIS STREAM's resumption cursor (WR-02), a LOCAL rather than a field on
+        // `Self`: on a `full-v2` build a field would be written by the reader and
+        // never read by anything, which is a `field is never read` warning under
+        // `RUSTFLAGS="-D warnings"`. A local passed by `&mut` is used on every
+        // build, because `reconnect_cursor` takes it on both.
+        //
+        // It survives across iterations deliberately: a re-opened body that
+        // delivers nothing before dropping again must still resume from the last
+        // id THIS stream saw, not from nothing.
+        let mut cursor: Option<String> = None;
         loop {
             // std::time::Instant, not tokio::time::Instant: the latter moves
             // under `tokio::time::pause()`, which would make this arm's
@@ -3304,6 +3351,7 @@ impl SseReaderContext {
                 self.on_resumption.as_ref(),
                 body,
                 self.max_collected_body_bytes,
+                &mut cursor,
             )
             .await;
 
@@ -3339,8 +3387,13 @@ impl SseReaderContext {
             attempt += 1;
 
             // The call site carries NO `#[cfg]`: `reconnect_cursor` is a paired
-            // accessor whose `full-v2` twin answers the constant `None`.
-            match self.open_sse_once(self.reconnect_cursor()).await {
+            // accessor whose `full-v2` twin answers the constant `None`. What it
+            // is handed is THIS STREAM's own cursor, never the transport-wide
+            // `last_event_id` a streaming POST also writes (WR-02).
+            match self
+                .open_sse_once(reconnect_cursor(cursor.as_deref()))
+                .await
+            {
                 Ok(Some(reopened)) => body = reopened,
                 Ok(None) => {
                     latch_terminal_reason(&self.delivery, &reconnect_stream_gone(attempt));

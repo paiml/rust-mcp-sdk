@@ -2216,14 +2216,32 @@ const GET_STREAM_EVENT_ID: &str = "get-stream-e11";
 /// must NEVER become the session stream's resume point.
 const POST_STREAM_EVENT_ID: &str = "post-stream-e97";
 
-/// How many `receive()` pops fence 20 will make while looking for its two
-/// frames.
+/// How many `receive()` pops [`drain_until_progress`] will make while looking for
+/// the frame it was asked about.
 ///
-/// One queue serves both streams, so arrival ORDER is not guaranteed and the
-/// fence matches on payload instead. The cap exists so a tree that delivers
-/// neither frame fails on its subject rather than looping forever; it is not a
+/// ONE queue serves both of fence 20's streams, so the fence matches on the
+/// PAYLOAD rather than on arrival order. The cap exists so a tree that delivers
+/// nothing fails on the fence's subject rather than looping forever; it is not a
 /// synchronisation device — each pop is itself bounded by [`BOUND`].
 const CROSS_STREAM_POPS: usize = 6;
+
+/// Pop `receive()` until a progress notification carrying `progress` arrives, or
+/// [`CROSS_STREAM_POPS`] pops have been made.
+///
+/// Identifies the frame by its own payload, never by arrival order: fence 20 has
+/// a GET session stream and a streaming POST response feeding one queue.
+async fn drain_until_progress(transport: &mut StreamableHttpTransport, progress: f64) -> bool {
+    for _ in 0..CROSS_STREAM_POPS {
+        let message = timeout(BOUND, transport.receive())
+            .await
+            .expect("a pushed frame reaches receive() within BOUND")
+            .expect("the frame parses into a transport message");
+        if progress_of(&message).is_some_and(|value| (value - progress).abs() < f64::EPSILON) {
+            return true;
+        }
+    }
+    false
+}
 
 // ===========================================================================
 // Fence 18 — WR-01, the dropped-transport half: a reader parked on an
@@ -2387,44 +2405,44 @@ async fn a_post_stream_cursor_never_becomes_the_session_streams_last_event_id() 
     );
 
     // An id-carrying frame on EACH stream, delivered through the production path
-    // rather than planted. The progress values differ so each is identifiable by
-    // its own payload: one queue serves both streams, so arrival order is not
-    // guaranteed and an order-based match would be measuring the scheduler.
+    // rather than planted — and delivered ONE AT A TIME, each observed before the
+    // next is pushed.
+    //
+    // The sequencing is load-bearing, not tidiness. Both readers write the ONE
+    // shared `last_event_id` slot, and nothing orders those two writes against
+    // each other: pushing both frames and then draining lets the GET reader's
+    // write land last under CI load, so an assertion about "the most recent id"
+    // would be measuring the scheduler. Observing each delivery before pushing the
+    // next makes the shared slot's value a fact rather than a race, because the
+    // write happens before the send that `receive()` pops.
     server
         .push_frame(progress_frame(GET_STREAM_EVENT_ID, "fence-20", 1, None))
         .await;
+    assert!(
+        drain_until_progress(&mut transport, 1.0).await,
+        "the GET session stream's id-carrying frame must be DELIVERED, so its cursor is recorded by \
+         the same production path a live stream records it on"
+    );
+    assert_eq!(
+        transport.last_event_id().as_deref(),
+        Some(GET_STREAM_EVENT_ID),
+        "with only the GET having delivered, the transport-wide accessor reports the GET's id"
+    );
+
     server
         .push_post_frame(progress_frame(POST_STREAM_EVENT_ID, "fence-20", 2, None))
         .await;
-
-    let mut seen_get_frame = false;
-    let mut seen_post_frame = false;
-    for _ in 0..CROSS_STREAM_POPS {
-        if seen_get_frame && seen_post_frame {
-            break;
-        }
-        let message = timeout(BOUND, transport.receive())
-            .await
-            .expect("each pushed frame reaches receive() within BOUND")
-            .expect("the frame parses into a transport message");
-        match progress_of(&message) {
-            Some(value) if (value - 1.0).abs() < f64::EPSILON => seen_get_frame = true,
-            Some(value) if (value - 2.0).abs() < f64::EPSILON => seen_post_frame = true,
-            _ => {},
-        }
-    }
     assert!(
-        seen_get_frame && seen_post_frame,
-        "both frames must be DELIVERED, so each stream's cursor is recorded by the same production \
-         path a live stream records it on. Observed: GET frame {seen_get_frame}, POST frame \
-         {seen_post_frame}"
+        drain_until_progress(&mut transport, 2.0).await,
+        "the streaming POST response's id-carrying frame must be DELIVERED too — a cursor that was \
+         never minted cannot be the one that leaks"
     );
 
     // The transport-wide accessor's meaning is deliberately UNCHANGED: it is
-    // "the most recent id seen on ANY stream", and here that is the POST's. This
-    // assertion is what pins that only the RECONNECT cursor was promoted to
-    // per-reader state — a fix that "corrected" this accessor to report the
-    // session stream's id would change a public, documented behaviour.
+    // "the most recent id seen on ANY stream", and the most recent here is the
+    // POST's. This assertion is what pins that only the RECONNECT cursor was
+    // promoted to per-reader state — a fix that "corrected" this accessor to
+    // report the session stream's id would change a public, documented behaviour.
     assert_eq!(
         transport.last_event_id().as_deref(),
         Some(POST_STREAM_EVENT_ID),
