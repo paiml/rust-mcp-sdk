@@ -1244,6 +1244,16 @@ impl Server {
     /// Delegates to [`crate::server::core::attach_request_peer`], the ONE unit
     /// `ServerCore::attach_peer` also calls — the precedence rule is defined
     /// once and merely invoked here (twin-site parity).
+    ///
+    /// # It attaches the LOG SINK too (Phase 118.2, CONF-10)
+    ///
+    /// The name is kept for its call-site history, but this is now the single
+    /// post-authorization site where ALL of a request's server-to-client
+    /// capability handles are attached: the peer, the log sink, and the resolved
+    /// log level. They share one site DELIBERATELY — a second method a future
+    /// dispatch site had to remember to call is exactly the drift the shared
+    /// units exist to prevent. The `ServerCore` twin does the same, in the same
+    /// order, through the same two units.
     #[inline]
     fn attach_peer(
         &self,
@@ -1251,12 +1261,39 @@ impl Server {
     ) -> crate::server::cancellation::RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            crate::server::core::attach_request_peer(extra, self.peer_handle.as_ref())
+            let extra = crate::server::core::attach_request_peer(extra, self.peer_handle.as_ref());
+            crate::server::core::attach_request_log_sink(extra, self.notification_tx_sink())
         }
         #[cfg(target_arch = "wasm32")]
         {
             extra
         }
+    }
+
+    /// The server-wide notification channel expressed as a sink, or `None` when
+    /// this server has no channel.
+    ///
+    /// The ONE place in the crate that turns `self.notification_tx` into an
+    /// `Arc<dyn Fn(Notification) + Send + Sync>`. Two consumers read it — the
+    /// progress-reporter path via [`Server::progress_notification_sink`] and the
+    /// log-sink path via [`Server::attach_peer`] — and a second `try_send`
+    /// closure would be a second chance to disagree about the send discipline.
+    ///
+    /// `try_send` and a discarded result, deliberately: this is a bounded
+    /// channel, and a full channel must never block or fail a handler. The cost
+    /// is that a saturated channel drops records silently, which is why
+    /// `RequestHandlerExtra::log`'s `Ok(())` is documented as NOT being delivery
+    /// acknowledgement.
+    ///
+    /// It is `None` on every HTTP-served server, because `StreamableHttpServer`
+    /// never calls [`Server::run`] — which is exactly why the request-scoped
+    /// `TransportBackchannel` sink has to win over it.
+    #[inline]
+    fn notification_tx_sink(&self) -> Option<Arc<dyn Fn(Notification) + Send + Sync>> {
+        let tx = self.notification_tx.as_ref()?.clone();
+        Some(Arc::new(move |notification| {
+            let _ = tx.try_send(notification);
+        }))
     }
 
     /// The one-way notification sink this request's progress reporter emits
@@ -1293,10 +1330,9 @@ impl Server {
         {
             return Some(Arc::clone(sink));
         }
-        let tx = self.notification_tx.as_ref()?.clone();
-        Some(Arc::new(move |notification| {
-            let _ = tx.try_send(notification);
-        }))
+        // The single `notification_tx`-to-sink conversion lives in
+        // `notification_tx_sink`; the log-sink path reads the same one.
+        self.notification_tx_sink()
     }
 
     /// Build this request's progress reporter, or `None` when the client asked
@@ -1316,6 +1352,11 @@ impl Server {
         meta: Option<&crate::types::protocol::RequestMeta>,
         protocol_context: Option<&crate::types::protocol::ProtocolContext>,
     ) -> Option<Arc<dyn crate::server::progress::ProgressReporter>> {
+        // DELIBERATE, and NOT to be "unified" with the log path: Phase 118.2
+        // D-07 removed the progress-token gate from the LOG sink only. Progress
+        // stays opt-in — a client that sent no `progressToken` has nothing to
+        // correlate progress notifications with — while `notifications/message`
+        // is unconditional. See `core::attach_request_log_sink`.
         let token = meta.and_then(|meta| meta.progress_token.as_ref())?;
         let sink = self.progress_notification_sink(protocol_context)?;
         let reporter = crate::server::progress::ServerProgressReporter::new(token.clone(), sink);

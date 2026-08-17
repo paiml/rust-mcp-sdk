@@ -256,6 +256,48 @@ pub struct ProtocolContext {
     /// wasm at all.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) transport_backchannel: Option<TransportBackchannel>,
+    /// The minimum [`LoggingLevel`](crate::types::LoggingLevel) this request's
+    /// client asked to receive, resolved at HTTP ingress (Phase 118.2, CONF-10).
+    ///
+    /// # The problem this field exists to solve
+    ///
+    /// The level and the emitter live at opposite ends of dispatch. The HTTP
+    /// ingress KNOWS the level — a v1 session's stored `logging/setLevel` value,
+    /// or a v2 request's `io.modelcontextprotocol/logLevel` `_meta` key — but it
+    /// never constructs a [`RequestHandlerExtra`](crate::RequestHandlerExtra):
+    /// every construction site lives in `src/server/core.rs` and
+    /// `src/server/mod.rs`. The dispatch roots construct the `extra` but know
+    /// nothing about sessions. `ProtocolContext` is the value ALREADY threaded
+    /// between the two, so it is the carrier that needs no new signature
+    /// anywhere.
+    ///
+    /// Read by `server::core::attach_request_log_sink`, the one unit both native
+    /// dispatch roots call, which applies it via
+    /// `RequestHandlerExtra::with_log_level`. `None` means "nothing resolved",
+    /// and the emitter then falls back to
+    /// [`DEFAULT_LOG_LEVEL`](crate::server::cancellation::DEFAULT_LOG_LEVEL).
+    ///
+    /// # Rejected carrier, recorded so it is not re-proposed
+    ///
+    /// `server::streamable_http_server::peer_channel::attach_session_backchannel`
+    /// looks like the natural place, but it returns EARLY when sessions are off
+    /// or the request is an `initialize`. v2 has no sessions at all, so that
+    /// route structurally cannot carry a v2 level — a carrier that works for one
+    /// era and not the other is exactly the drift this phase exists to remove.
+    ///
+    /// # Isolation
+    ///
+    /// Per-request by construction: `ProtocolContext` is built at ingress and
+    /// moved into THAT request's `RequestHandlerExtra`. It is never stored on the
+    /// shared server, so one caller's level cannot leak into another's
+    /// (T-118.2-06-05).
+    ///
+    /// Crate-private for the same reason as the MRTR fields — internal plumbing —
+    /// and additive on an already-`#[non_exhaustive]` public struct.
+    /// `Option<LoggingLevel>` is a plain `Copy` enum, so unlike
+    /// [`TransportBackchannel`] it removes no auto-trait impl (see the
+    /// `UnwindSafe`/`RefUnwindSafe` note above).
+    pub(crate) resolved_log_level: Option<crate::types::notifications::LoggingLevel>,
 }
 
 impl std::fmt::Debug for ProtocolContext {
@@ -274,7 +316,13 @@ impl std::fmt::Debug for ProtocolContext {
                 &self.request_state_token().is_some(),
             )
             .field("has_verified_continuation", &self.mrtr_verified.is_some())
-            .field("mrtr_round", &self.mrtr_round());
+            .field("mrtr_round", &self.mrtr_round())
+            // Printed VERBATIM, not as presence: a severity threshold is not
+            // sensitive, and "which level was resolved for this request" is
+            // precisely the fact a developer chasing "my log records went
+            // nowhere" needs (the same reasoning `RequestHandlerExtra`'s
+            // `Debug` applies to its own `log_level`).
+            .field("resolved_log_level", &self.resolved_log_level);
         // PRESENCE only. A peer handle and a notification sink are live
         // capability handles, so they follow the same redaction discipline as
         // the MRTR fields above (T-118.1-10-09).
@@ -301,7 +349,40 @@ impl ProtocolContext {
             mrtr_verified: None,
             #[cfg(not(target_arch = "wasm32"))]
             transport_backchannel: None,
+            resolved_log_level: None,
         }
+    }
+
+    /// The minimum log level resolved for this request, if the ingress resolved
+    /// one (Phase 118.2, CONF-10).
+    ///
+    /// Returns an OWNED `Option` rather than a borrow because `LoggingLevel` is
+    /// `Copy`. Read by `server::core::attach_request_log_sink` — see the field's
+    /// documentation for why the carrier lives here.
+    // Why `allow(dead_code)`: the sole reader is `server::core::attach_request_log_sink`,
+    // which is `#[cfg(not(target_arch = "wasm32"))]`; on wasm32 this accessor has no caller.
+    #[allow(dead_code)]
+    pub(crate) fn resolved_log_level(&self) -> Option<crate::types::notifications::LoggingLevel> {
+        self.resolved_log_level
+    }
+
+    /// Attach the log level the HTTP ingress resolved for this request.
+    ///
+    /// Called by the transport ingress ONLY, once, after the era gate has run and
+    /// the level source (a v1 session's stored `logging/setLevel` value, or a v2
+    /// request's `_meta` key) is known. Never called by dispatch: dispatch READS
+    /// this value, it does not mint one.
+    // Why `allow(dead_code)`: the WRITER is the HTTP ingress, landing in plan 07. Until then the
+    // field is always `None` and `DEFAULT_LOG_LEVEL` applies — which is the correct behaviour on
+    // its own. The carrier ships first so its fence can prove the seam BEFORE a writer exists.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_resolved_log_level(
+        mut self,
+        level: crate::types::notifications::LoggingLevel,
+    ) -> Self {
+        self.resolved_log_level = Some(level);
+        self
     }
 
     /// The per-request transport back-channel, if the transport supplied one.

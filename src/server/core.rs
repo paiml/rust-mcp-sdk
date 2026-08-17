@@ -743,11 +743,28 @@ impl ServerCore {
     /// also calls: the two dispatch roots must never disagree about which peer a
     /// handler sees, and sharing the body is what makes that structural rather
     /// than a claim two comments make about each other.
+    ///
+    /// # It attaches the LOG SINK too (Phase 118.2, CONF-10)
+    ///
+    /// The name is kept for its call-site history, but this is now the single
+    /// post-authorization site where ALL of a request's server-to-client
+    /// capability handles are attached: the peer, the log sink, and the resolved
+    /// log level. They share one site DELIBERATELY. A second method that a future
+    /// dispatch site had to remember to call is precisely the drift this file
+    /// spends its comments preventing — every existing and future `attach_peer`
+    /// caller gets the log sink for free, and cannot get one without the other.
     #[inline]
     fn attach_peer(&self, extra: RequestHandlerExtra) -> RequestHandlerExtra {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            attach_request_peer(extra, self.peer_handle.as_ref())
+            let extra = attach_request_peer(extra, self.peer_handle.as_ref());
+            // The fallback is a literal `None`, and that asymmetry with `Server`
+            // is real rather than an oversight: `ServerCore` has NO
+            // `notification_tx` of any kind — that field exists only on
+            // `Server` — so a request-scoped `TransportBackchannel` is the ONLY
+            // sink this root can ever supply. Do not "fix" this by inventing a
+            // channel here; the transport owns the back-channel.
+            attach_request_log_sink(extra, None)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -4527,6 +4544,97 @@ pub(crate) fn attach_request_peer(
     }
     if let Some(peer) = global {
         return extra.with_peer(peer.clone());
+    }
+    extra
+}
+
+/// Resolve which notification sink a handler's `extra.log(..)` emits through,
+/// and apply the log level this request resolved — request-scoped first, then
+/// the root's fallback.
+///
+/// The TWIN of [`attach_request_peer`], and one unit for the same reason: the
+/// precedence rule is the kind of thing two roots must never disagree about, and
+/// a rule spelled twice is kept in step by a comment instead of by the compiler.
+/// Phase 118.1 collapsed exactly this class of divergence for
+/// `completion/complete`, where two dispatchers gave two DIFFERENT wrong answers.
+///
+/// # Precedence, and why this order
+///
+/// 1. The `TransportBackchannel`'s `notification_sink` on THIS request's
+///    `ProtocolContext` — session-bound, attached by the transport at the one
+///    site that knows which session the request arrived on. It must win:
+///    routing a session's log records onto a server-wide channel would publish
+///    one caller's records to whoever is reading that channel
+///    (T-118.2-06-02).
+/// 2. The root's `fallback`, which on `Server` is derived from its single
+///    server-wide `notification_tx` and on [`ServerCore`] is always `None` —
+///    `ServerCore` has no notification channel of any kind.
+///
+/// Returning `extra` unchanged when neither exists leaves `extra.log_sink` as
+/// `None`, which the emitter already treats as silence rather than as an error
+/// (Phase 118.2 D-08).
+///
+/// # Why the LEVEL is applied here too
+///
+/// The sink and the level are two halves of ONE per-request decision. Attaching
+/// them at different sites is how one root ends up filtering differently from
+/// the other, so the same read of `extra.protocol_context` that resolves the
+/// sink also lifts
+/// [`ProtocolContext::resolved_log_level`](crate::types::protocol::ProtocolContext::resolved_log_level)
+/// onto the `extra`. When the context carries no level the `extra` is left
+/// alone, so the emitter's
+/// [`DEFAULT_LOG_LEVEL`](crate::server::cancellation::DEFAULT_LOG_LEVEL) applies.
+///
+/// Doing the lift once, here, also makes the emit-time filter an O(1) read of a
+/// plain `Option<LoggingLevel>` on the `extra`, instead of a lock acquisition per
+/// record.
+///
+/// # Ordering
+///
+/// Every dispatch site calls this AFTER its `tool_authorizer` check, so an
+/// unauthorized caller returns before a handler body ever runs and therefore
+/// never reaches a handler that could emit (ASVS V4, T-118.2-06-01) — the same
+/// invariant [`attach_request_peer`] states for `extra.peer()`.
+///
+/// # The progress token does NOT gate this
+///
+/// `Server::progress_reporter_for` still returns `None` for a request with no
+/// `params._meta.progressToken`, and that gate is deliberate. The LOG sink is
+/// unconditional: a client that never asked for progress still receives
+/// `notifications/message` (Phase 118.2 D-07).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn attach_request_log_sink(
+    extra: crate::server::cancellation::RequestHandlerExtra,
+    fallback: Option<Arc<dyn Fn(crate::types::Notification) + Send + Sync>>,
+) -> crate::server::cancellation::RequestHandlerExtra {
+    // Both values are cloned out of the borrow before the `with_*` builders
+    // consume `extra` — the same capture-before-move discipline
+    // `attach_request_peer` uses, and the reason this reads the sink back OFF
+    // the already-constructed `extra` rather than capturing it before
+    // `with_protocol_context` moved the context in.
+    let request_scoped = extra
+        .protocol_context
+        .as_ref()
+        .and_then(crate::types::protocol::ProtocolContext::transport_backchannel)
+        .and_then(crate::types::protocol::context::TransportBackchannel::notification_sink)
+        .cloned();
+    let resolved_level = extra
+        .protocol_context
+        .as_ref()
+        .and_then(crate::types::protocol::ProtocolContext::resolved_log_level);
+
+    let extra = match resolved_level {
+        Some(level) => extra.with_log_level(level),
+        // No resolved level: leave `extra.log_level` alone so `DEFAULT_LOG_LEVEL`
+        // applies at emit time.
+        None => extra,
+    };
+
+    if let Some(sink) = request_scoped {
+        return extra.with_log_sink(sink);
+    }
+    if let Some(sink) = fallback {
+        return extra.with_log_sink(sink);
     }
     extra
 }

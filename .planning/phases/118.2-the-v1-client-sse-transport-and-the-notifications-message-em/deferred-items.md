@@ -143,3 +143,38 @@ crates.
 **Disposition:** out of scope for phase 118.2, which touches no dependency. It is
 a THIRD pre-existing blocker on `make quality-gate`, stacked on the `fmt-check`
 and (now-cleared) `lint-plans` ones above. Needs its own dependency-hygiene pass.
+
+## `make lint` fails on a `clippy::let_underscore_future` in `src/shared/streamable_http.rs` (found during 118.2-06)
+
+`make lint` (and therefore `make quality-gate`) exits 101 at the branch tip:
+
+```
+error: non-binding `let` on a future
+    --> src/shared/streamable_http.rs:1718:13
+     |
+1718 |             let _ = self.spawn_sse_reader(response.into_body());
+     = note: `-D clippy::let-underscore-future` implied by `-D clippy::all`
+```
+
+**Provenance:** authored by plan **118.2-03** at commit `8b19602d`
+("read the POST-response SSE body incrementally, retire feed_complete_body").
+`git status --short -- src/shared/streamable_http.rs` is empty during 118.2-06,
+so this plan did not touch the file.
+
+**It is a LINT issue, not a functional one.** `spawn_sse_reader` returns a
+`tokio::task::JoinHandle`, and dropping a `JoinHandle` detaches the task rather
+than cancelling it — which is exactly the "DETACHED rather than stored in
+`self.abort_handle`" behaviour the surrounding comment describes. The task does
+run. Clippy fires only because `JoinHandle` happens to implement `Future`.
+
+**The fix is one token:** `drop(self.spawn_sse_reader(response.into_body()));`
+in place of the `let _ =`. Left to 118.2-03's owner rather than swept into this
+plan's commits, per the executor scope boundary.
+
+**Disposition:** a FOURTH pre-existing blocker on `make quality-gate`, stacked on
+`fmt-check` and `audit` above. Unlike those two it is trivially closable and it
+gates every remaining plan in the phase, so it should be swept first.
+
+**Verified during 118.2-06:** re-running the exact `make lint` clippy invocation
+with `-A clippy::let_underscore_future` appended exits **0** with zero warnings,
+so this is the ONLY lint blocker on the branch and plan 06's own surface is clean.
