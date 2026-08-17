@@ -51,3 +51,39 @@ transport is indistinguishable from a quiet handler at the call site.
 attempt with no sink, so the silence is visible in server logs without changing
 the `Ok(())` contract or breaking `RequestHandlerExtra::default()` usage in unit
 tests. Not in scope for 118.2-05.
+
+## `LogMessageParams` diverges from the vendored schema: `message` vs `data` (118.2-05, Task 3)
+
+Found while deriving the wire fence from the spec rather than from pmcp's own
+serializer (118.1 D-04). `schema/vendored/core-2026-07-28/schema.ts:2031`
+declares:
+
+```ts
+export interface LoggingMessageNotificationParams extends NotificationParams {
+  level: LoggingLevel;
+  logger?: string;
+  data: unknown;      // REQUIRED — and there is no `message` member
+}
+```
+
+pmcp's `LogMessageParams` (`src/types/notifications.rs:161`) instead carries a
+REQUIRED `message: String` and an OPTIONAL `data: Option<Value>`, skipped when
+`None`. So a plain `extra.log(level, "text")` emits
+`{"level":"warning","message":"text"}` — a payload with no `data` member at all,
+where the spec marks `data` required, plus a `message` member the spec does not
+define.
+
+**Not fixed here, deliberately.** Changing the serde shape of `LogMessageParams`
+is a breaking change to a public type well outside plan 05's
+`files_modified`, and picking the replacement shape (does `message` become
+`data`? does `log(..)` set `data` to a JSON string?) is a design decision, not a
+bug fix.
+
+**Pinned, not hidden:** `a_log_record_serializes_as_the_spec_notifications_message_shape`
+in `tests/log_emitter.rs` asserts the shape pmcp emits TODAY against literals, so
+the divergence is a visible recorded fact and any future change to it is a
+deliberate, reviewed edit rather than a silent drift.
+
+**Owner:** plan 08 (the CONF-10 conformance fence) is where this must be
+confronted — if the official suite validates `params.data`, the current shape
+fails it and the type change becomes in-scope work with its own semver verdict.

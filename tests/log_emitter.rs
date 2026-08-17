@@ -34,9 +34,13 @@
     not(target_arch = "wasm32")
 ))]
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pmcp::types::LoggingLevel;
+use serde_json::json;
+
+use pmcp::types::{LoggingLevel, Notification};
+use pmcp::RequestHandlerExtra;
 
 // ===========================================================================
 // Bounds. Every one of them is an upper bound on a wire operation, never a
@@ -184,4 +188,330 @@ fn property_log_level_ordering_is_a_total_order_over_declaration_index() {
             prop_assert!(la <= lc);
         }
     });
+}
+
+// ===========================================================================
+// Capture harness. A sink is `Arc<dyn Fn(Notification) + Send + Sync>` — it
+// returns `()` and therefore cannot report failure, which is the whole reason
+// the emitter's `Ok(())` must not be read as delivery acknowledgement.
+// ===========================================================================
+
+/// A sink that records every notification handed to it.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<Notification>>>);
+
+impl Capture {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sink to hand to `with_log_sink`.
+    fn sink(&self) -> Arc<dyn Fn(Notification) + Send + Sync> {
+        let slot = Arc::clone(&self.0);
+        Arc::new(move |notification| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Every captured notification, serialized. The fences assert on the JSON,
+    /// not on the Rust enum: a `serde_json::to_value` round trip through pmcp's
+    /// own types would only prove pmcp agrees with itself.
+    fn json(&self) -> Vec<serde_json::Value> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|n| serde_json::to_value(n).expect("a notification must serialize"))
+            .collect()
+    }
+}
+
+// ===========================================================================
+// Fence 2 — the no-sink contract (D-08).
+// ===========================================================================
+
+/// With no sink attached, both emitter methods succeed and emit nothing.
+///
+/// This is what keeps a handler callable outside a server:
+/// `RequestHandlerExtra::default()` is documented for "testing and simple tool
+/// invocations", and a handler that logs must not become un-unit-testable.
+///
+/// The accepted cost is stated at the emitter: a MISPLUMBED transport looks
+/// identical to a quiet handler. The conformance fence — a test asserting logs
+/// actually arrive over the wire — is what catches that, which is why this is a
+/// production-diagnostics hole and not a false green in the gate.
+#[test]
+fn log_with_no_sink_is_ok_and_emits_nothing() {
+    let extra = RequestHandlerExtra::default();
+
+    assert!(
+        extra.log(LoggingLevel::Error, "no sink here").is_ok(),
+        "log with no sink must be Ok(())"
+    );
+    assert!(
+        extra
+            .log_with_data(LoggingLevel::Error, "no sink here either", json!({"k": 1}))
+            .is_ok(),
+        "log_with_data with no sink must be Ok(())"
+    );
+
+    // "Emits nothing" asserted POSITIVELY rather than inferred from the absence
+    // of a panic: a live capture that stays empty across an emitter that was
+    // never called proves the harness itself reports emptiness correctly.
+    let capture = Capture::new();
+    let _observed = RequestHandlerExtra::default().with_log_sink(capture.sink());
+    assert_eq!(
+        capture.len(),
+        0,
+        "a sink that was never emitted to must hold nothing"
+    );
+}
+
+// ===========================================================================
+// Fence 3 — the wire shape.
+// ===========================================================================
+
+/// A record serializes as the spec's `notifications/message` envelope.
+///
+/// Asserted against LITERALS. Nothing here is imported from `src/`, because a
+/// test that reads its expectation out of the code under test asserts nothing.
+///
+/// # Known divergence from the vendored schema
+///
+/// `schema/vendored/core-2026-07-28/schema.ts` declares
+/// `LoggingMessageNotificationParams` as `{ level, logger?, data }` — `data` is
+/// REQUIRED and there is no `message` member. pmcp's `LogMessageParams` instead
+/// carries a required `message` and an OPTIONAL `data`. This fence pins what
+/// pmcp emits TODAY so the divergence is a recorded, visible fact rather than a
+/// surprise discovered by a conformance run. Changing `LogMessageParams` is a
+/// breaking change to a public type and is out of this plan's scope; see the
+/// phase's `deferred-items.md`.
+#[test]
+fn a_log_record_serializes_as_the_spec_notifications_message_shape() {
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+
+    extra
+        .log(LoggingLevel::Warning, "hello")
+        .expect("log must be Ok(())");
+    extra
+        .log_with_data(LoggingLevel::Error, "boom", json!({"k": 1}))
+        .expect("log_with_data must be Ok(())");
+
+    let records = capture.json();
+    assert_eq!(records.len(), 2, "both calls must reach the sink");
+
+    let warning = &records[0];
+    assert_eq!(
+        warning.get("method").and_then(serde_json::Value::as_str),
+        Some("notifications/message"),
+        "method must be the spec literal; got {warning}"
+    );
+    let params = warning.get("params").expect("params must be present");
+    assert_eq!(
+        params.get("level").and_then(serde_json::Value::as_str),
+        Some("warning"),
+        "level must serialize lowercase"
+    );
+    assert_eq!(
+        params.get("message").and_then(serde_json::Value::as_str),
+        Some("hello")
+    );
+    assert!(
+        params.get("logger").is_none(),
+        "logger must be ABSENT — the emitter does not synthesise one, because a \
+         synthesised logger name would be a guess; got {params}"
+    );
+    assert!(
+        params.get("data").is_none(),
+        "data must be absent for a plain log(..); got {params}"
+    );
+
+    let error = &records[1];
+    assert_eq!(
+        error.get("method").and_then(serde_json::Value::as_str),
+        Some("notifications/message")
+    );
+    let params = error.get("params").expect("params must be present");
+    assert_eq!(
+        params.get("level").and_then(serde_json::Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        params.get("message").and_then(serde_json::Value::as_str),
+        Some("boom")
+    );
+    assert!(
+        params.get("logger").is_none(),
+        "logger must still be ABSENT"
+    );
+    assert_eq!(
+        params.get("data"),
+        Some(&json!({"k": 1})),
+        "log_with_data must carry the structured payload verbatim"
+    );
+}
+
+// ===========================================================================
+// Fence 4 — the level filter, both directions, configured and defaulted.
+// ===========================================================================
+
+/// A record below the effective level never reaches the sink, and one at or
+/// above it always does — for an explicitly configured level AND for the D-12
+/// default.
+#[test]
+fn a_record_below_the_configured_level_is_not_sent() {
+    // --- explicitly configured at `warning` ---
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default()
+        .with_log_sink(capture.sink())
+        .with_log_level(LoggingLevel::Warning);
+
+    for suppressed in [
+        LoggingLevel::Debug,
+        LoggingLevel::Info,
+        LoggingLevel::Notice,
+    ] {
+        assert!(
+            extra.log(suppressed, "below").is_ok(),
+            "a suppressed record still returns Ok(()) — suppression is not an error"
+        );
+    }
+    assert_eq!(
+        capture.len(),
+        0,
+        "debug/info/notice must be suppressed under a `warning` filter"
+    );
+
+    let mut expected = 0usize;
+    for sent in [
+        LoggingLevel::Warning,
+        LoggingLevel::Error,
+        LoggingLevel::Emergency,
+    ] {
+        extra.log(sent, "at or above").expect("must be Ok(())");
+        expected += 1;
+        assert_eq!(
+            capture.len(),
+            expected,
+            "{sent:?} is at or above `warning` and must be delivered"
+        );
+    }
+
+    // --- unconfigured: the D-12 default is `info` ---
+    let defaulted = Capture::new();
+    let extra = RequestHandlerExtra::default().with_log_sink(defaulted.sink());
+
+    extra
+        .log(LoggingLevel::Debug, "below the default")
+        .expect("must be Ok(())");
+    assert_eq!(
+        defaulted.len(),
+        0,
+        "with NO level configured the default is `info`, so `debug` is suppressed — \
+         a chatty handler cannot flood a client that never opted in"
+    );
+
+    extra
+        .log(LoggingLevel::Info, "at the default")
+        .expect("must be Ok(())");
+    assert_eq!(
+        defaulted.len(),
+        1,
+        "`info` is AT the default and must be delivered unconfigured — which is why \
+         the conformance scenario passes without any level being set"
+    );
+}
+
+// ===========================================================================
+// Fence 5 — the downstream loss policy.
+// ===========================================================================
+
+/// How many records the modelled bounded sink holds.
+///
+/// Small on purpose. The real v2 vehicle is `new_v2_progress_queue()` with
+/// `V2_PROGRESS_QUEUE_CAPACITY`; that constant is `pub(crate)` and out of reach
+/// from an integration test, and the number is not what is under test here —
+/// the POLICY is.
+const SATURATION_CAPACITY: usize = 4;
+
+/// Records emitted past capacity, so the overflow is unambiguous.
+const SATURATION_OVERFLOW: usize = 8;
+
+/// A saturated bounded sink drops the excess; the emitter still returns `Ok`.
+///
+/// This fence exists because the v2 limitation must be a PINNED behaviour rather
+/// than prose nobody checks. The sink modelled here mirrors
+/// `new_v2_progress_queue()`'s policy exactly: an `mpsc::channel(N)` whose
+/// closure `try_send`s and swallows the error, because the closure is
+/// synchronous and must never block the handler's task.
+///
+/// The consequence, asserted rather than asserted-about: a handler emitting more
+/// than the queue's capacity in one call LOSES THE EXCESS, and every one of
+/// those losing calls returned `Ok(())`. That is precisely why the emitter's
+/// rustdoc must not claim delivery acknowledgement — `Ok(())` cannot possibly
+/// mean "delivered" when the sink's own type is `Fn(Notification) -> ()`.
+///
+/// D-09's "no rate limit" is about the EMITTER not adding a limiter of its own.
+/// It never claimed no record can be dropped downstream, and this fence is what
+/// keeps the two statements from being confused.
+#[test]
+fn a_saturated_bounded_sink_drops_the_excess_and_the_emitter_still_returns_ok() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(SATURATION_CAPACITY);
+    let sink: Arc<dyn Fn(Notification) + Send + Sync> = Arc::new(move |notification| {
+        // DROP-NEWEST on a full queue, matching `new_v2_progress_queue`.
+        let _ = tx.try_send(notification);
+    });
+
+    let extra = RequestHandlerExtra::default().with_log_sink(sink);
+
+    let total = SATURATION_CAPACITY + SATURATION_OVERFLOW;
+    for i in 0..total {
+        assert!(
+            extra
+                .log(LoggingLevel::Error, format!("record-{i}"))
+                .is_ok(),
+            "(a) the emitter never blocks and never reports downstream loss — \
+             call {i} must still be Ok(())"
+        );
+    }
+
+    let mut delivered = Vec::new();
+    while let Ok(notification) = rx.try_recv() {
+        let value = serde_json::to_value(&notification).expect("must serialize");
+        delivered.push(
+            value["params"]["message"]
+                .as_str()
+                .expect("message must be a string")
+                .to_string(),
+        );
+    }
+
+    // (b) the receiver holds exactly N.
+    assert_eq!(
+        delivered.len(),
+        SATURATION_CAPACITY,
+        "a channel of capacity {SATURATION_CAPACITY} fed {total} records must hold \
+         exactly {SATURATION_CAPACITY}"
+    );
+
+    // (c) they are the FIRST N — drop-NEWEST, not drop-oldest. A fence that only
+    // checked the count could not tell the two policies apart.
+    let expected: Vec<String> = (0..SATURATION_CAPACITY)
+        .map(|i| format!("record-{i}"))
+        .collect();
+    assert_eq!(
+        delivered, expected,
+        "the surviving records must be the FIRST {SATURATION_CAPACITY} — drop-newest, \
+         matching the vehicle rather than silently differing from it"
+    );
 }
