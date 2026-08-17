@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 4/11 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
+**Plans:** 5/11 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
 
 **Why these two, and why together.** Both are the same shape: the v1 server-to-client channel exists and is proven, and each of these is a missing surface at one end of it. The developer chose one combined phase over two at the 118.1-13 sign-off.
 
@@ -2868,7 +2868,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 118.2-04-PLAN.md — Wave 3. **D-03**: bounded reconnect with `Last-Event-ID` over an owned `SseReaderContext`, through a paired cursor accessor and with no second call-site `#[cfg]`; cancellation on close/drop during backoff; the public `decode_sse_chunks_for_fuzz` seam and its target; the `full-v2` severance build and the `cargo semver-checks` verdict (CONF-09)
+- [x] 118.2-04-PLAN.md — Wave 3. **D-03**: bounded reconnect with `Last-Event-ID` over an owned `SseReaderContext`, through a paired cursor accessor and with no second call-site `#[cfg]`; cancellation on close/drop during backoff; the public `decode_sse_chunks_for_fuzz` seam and its target; the `full-v2` severance build and the `cargo semver-checks` verdict (CONF-09)
 - [ ] 118.2-07-PLAN.md — Wave 3. **D-10/D-11/D-12**: the v1 per-session level in `V1State` with its `full-v2` null twin, the first real reader of `io.modelcontextprotocol/logLevel`, the resolved level written onto `ProtocolContext` at BOTH ingress paths, and ignore-and-default on malformed input (CONF-10)
 
 **Wave 4** *(blocked on Wave 3)*
