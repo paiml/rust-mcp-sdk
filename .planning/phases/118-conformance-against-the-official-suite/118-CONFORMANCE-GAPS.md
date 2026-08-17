@@ -337,3 +337,130 @@ measurement. All 16 named expectations (the five-method retirement loop, the `_m
 returned a nonzero hit count. **No in-tree test encoding a suite expectation needed updating**, and
 `binary(v2_conformance_pin)` runs 5 tests, 5 passed — its `SPEC_RECHECK_PINNED_SHA` is unaffected
 because the package pin did not move.
+
+## Dispositions — Phase 118.2 (amendment)
+
+**Amended:** 2026-08-17 by plan `118.2-11`. **Appends only; nothing above this line is edited or
+deleted.** D-10 requires this file to be AMENDED, never rewritten, and the two labelled
+self-corrections above are the house style being followed here.
+
+### How this was measured
+
+Both legs re-run at the HELD pin `0.2.0-alpha.11` (D-14, which repeats 118.1's D-08 verbatim), from
+ONE process, after `cargo build --example s54_v2_dual_conformance --features "streamable-http,testing"`,
+under Node v22.22.2. The pin was verified unchanged before the run and is unchanged after it, so this
+measurement is like-for-like with 118.1's closing numbers and every movement is attributable to
+Phase 118.2's SDK changes alone. Log: `target/118.2-11-conf-heldpin.log`.
+
+| Requirement set | 118.1 closing | Now | Scored scenarios red | Checks executed | Suite exit |
+|---|---|---|---|---|---|
+| `2025-11-25` | 72 passed, 2 failed | **71 passed, 3 failed** | 1 (unchanged) | 74 (unchanged) | 1 (unchanged) |
+| `2026-07-28` | 142 passed, 36 failed | **142 passed, 36 failed** | 0 (unchanged) | 178 (unchanged) | 0 (unchanged) |
+
+**The v2 leg is byte-identical to 118.1's closing measurement** — 37 of 37 scored scenarios green,
+exit 0, and all 36 failures still in the 13 not-scored scenarios (30 Tasks-extension, 1
+`json_schema_2020_12_tool`, 5 `http-custom-header-server-validation`). Phase 118.2 disturbed nothing
+on v2. `ServerAcceptsWhitespaceHeaderValue` did **not** fire this run (`http-header-validation` 14/0),
+so the characterised ~21%-per-process oscillation is not a factor in these numbers.
+
+**The v1 leg moved by exactly one check, and it moved the WRONG WAY.** The whole delta lives in one
+scenario:
+
+| Scenario | 118.1 closing | Now | Scored | Delta |
+|---|---|---|---|---|
+| `2025-11-25:tools-call-with-logging` | 1 passed, 1 failed | **0 passed, 2 failed** | yes | `ToolsCallWithLogging` still FAILS; `WireSchemaValid` **newly FAILS** |
+| every other 2025-11-25 scenario | — | unchanged | — | all 29 `BLOCKING_GREEN_SCENARIOS` entries present and entirely green |
+
+`71 + 3 = 74 = 72 + 2`: the executed-check total is unchanged, so this is a pass converting to a
+failure inside a single scenario, not a scenario appearing or disappearing.
+
+**`GAP_ATTRIBUTABLE_FAILURES = 2`, up from 1.** Both failures are the same G-3 sub-item (d), and both
+are recorded as 2 rather than restated as 0. The v1 leg's other failure, `json-schema-2020-12`, is a
+missing fixture and is not scored — unchanged, and not gap-attributable.
+
+### The disposition of the two OPEN G-3 sub-items
+
+The `## Dispositions — Phase 118.1 (amendment)` table above records G-3 as **SPLIT**, with sub-items
+(a) and (b) FIXED and sub-items (c) and (d) OPEN, both owned by Phase 118.2. Their dispositions:
+
+| Sub-item | Verdict | Artifact, with its executed count | Suite before and after |
+|---|---|---|---|
+| **(c) v1 pmcp CLIENT transport** | **FIXED** (plans 118.2-01, -03, -04, -10) | `binary(client_sse_stream)` + `binary(log_emitter)` + `binary(log_records_example_run)` + `binary(pmcp_both_ends_logging)` + both tripwires — 81 tests run, 81 passed, 1 skipped (118.2-10). `binary(http_peer_roundtrip)` — 12 run, 12 passed, byte-unchanged. Measured causes closed: `start_sse(None)` sat inside `if !response.status().is_success()` while `202 Accepted` **is** a success status, so the branch was dead and no GET was ever issued (118.2-01); and the reader called `collect_body_within_cap`, a whole-body read, on a session stream that never ends (118.2-03), with bounded `Last-Event-ID` reconnect added on top (118.2-04) | **No suite scenario attributable, by construction.** The official suite exercises pmcp only as a SERVER; the client transport is never the implementation under test. `tests/pmcp_both_ends_logging.rs` — pmcp on both ends of a live v1 session stream — is the whole proof, and it is stated here rather than an attribution being invented |
+| **(d) log notifications** | **PARTIAL — emission FIXED, WIRE SHAPE non-conformant. Still OPEN against the suite.** | `binary(log_emitter)`, `binary(log_records_example_run)` (118.2-05, -06, -07, -09) prove `extra.log` / `extra.log_with_data` reach the socket as real `notifications/message` frames from a running handler. The suite CONFIRMS the emission independently: `WireSchemaValid` reports `messagesValidated: 10` and quotes all **three** frames verbatim, so the handler-facing emitter this sub-item named as absent now exists and works | `tools-call-with-logging` **1/1 → 0/2 — WORSE.** Not the flip this phase was chartered to produce, and it is recorded as measured |
+
+### Why (d) got worse rather than green — one root cause, two checks
+
+Measured, not inferred. The suite's own artifacts name it:
+
+```
+LoggingMessageNotification/params: must have required property 'data'
+  message: {"jsonrpc":"2.0","method":"notifications/message",
+            "params":{"level":"info","message":"Tool execution started"}}
+```
+
+`src/types/notifications.rs:161-172` declares `LogMessageParams` with a **required `message: String`**
+and an **optional `data: Option<Value>`** that is `skip_serializing_if = "Option::is_none"`.
+`extra.log(..)` passes `None` for `data` (`src/server/cancellation.rs:822-825`), so the emitted params
+carry `message` and omit `data`. The specification is the other way round: `data` is REQUIRED and
+`message` does not exist at all — `schema/vendored/core-2026-07-28/schema.ts:2031-2044` declares
+`level`, optional `logger`, and `data: unknown` with no `message` member, and the suite validated
+against the `2025-11-25` schema and reported the same requirement. The divergence is era-independent.
+
+That single divergence fails **two independent checks**:
+
+1. **`WireSchemaValid`** — a per-scenario check that validates every JSON-RPC message the
+   implementation sent against the spec JSON schema. It rejects all three frames.
+2. **`ToolsCallWithLogging`** — `logCount: 0`, `logs: []`, `No log notifications received`. The frames
+   reached the wire (check 1 saw them) but never reached the scenario's collector, because the
+   scenario drives the **official reference client**, whose zod schema for the notification is
+   `LoggingMessageNotificationParamsSchema` with `data: z.unknown()` — and under the bundled zod
+   (v4) that member is **non-optional**. Reproduced directly against the pinned bundle:
+
+   ```
+   {level:'info', message:'Tool execution started'}  -> parse ok: false
+       invalid_type at params.data: expected nonoptional, received undefined
+   {level:'info', data:'Tool execution started'}     -> parse ok: true
+   ```
+
+   The reference client therefore DROPS every record pmcp emits, which is why a scenario that can see
+   the frames on the wire reports having received none.
+
+### The claim this refutes, named
+
+Plan `118.2-08` inspected the pinned suite, found its logging scenarios to be `logging-set-level`
+(which inspects the RPC response only) and a SEP-2575 negative absence check, and concluded that **no
+suite scenario validates an emitted notification's params** — on which basis the `message`/`data`
+divergence was declared and fenced rather than fixed. That conclusion is **REFUTED by measurement**:
+`WireSchemaValid` is not a logging scenario, it is a check that runs *inside* scenarios and validates
+every frame the implementation sends, so it validates the params of any notification emitted anywhere.
+The fence held on the scenarios it enumerated and missed the check that actually adjudicates.
+
+Also measured while checking: at this pin the `2026-07-28` leg runs **neither** `tools-call-with-logging`
+**nor** any `sep-2575-*` scenario (50 scenario directories, none logging-named). The open SEP-2575 v2
+finding — a v2 `tools/call` with no `_meta["io.modelcontextprotocol/logLevel"]` still receiving a
+record, because `resolve_request_log_level` returns `None` and `DEFAULT_LOG_LEVEL` applies — is
+therefore **not observable by the official suite at this pin** and remains an in-tree unmet truth in
+`.planning/WINDOWS.md`, not a suite-attributable failure.
+
+### What was NOT done, and why
+
+**The gate was not hardened and CONF-09 was not booked.** Plan `118.2-11` Task 1 instructs, verbatim,
+"If `tools-call-with-logging` is still red, STOP and report before touching the gate… Do not harden a
+gate against a red leg", and D-16's widening presupposes a `2025-11-25` leg that exits 0. It exits 1.
+
+Adding `2025-11-25` to `FULLY_SCORED_GREEN_REVISIONS` would fail on its own terms — that clause
+asserts zero scored failures AND suite exit 0, and both are violated — and the only ways to make it
+pass are the ones D-21 forbids outright. **No `--expected-failures`, no allowlist, no known-failure
+baseline, and no lowered floor was introduced anywhere.** Every gate constant in
+`scripts/run-conformance-suite.sh` is byte-unchanged by this plan.
+
+The fix is a `src/` wire-format change to a public type — the same class as G-1, which this document
+already defers for exactly that reason — and it carries a design decision that is not the executor's
+to take: whether `data` should mirror `message`, wrap it (`{"message": …}`), or whether
+`LogMessageParams` should drop `message` for `data` outright, and what that means for existing pmcp
+clients reading `message`. It is raised to the developer rather than decided in a conformance plan
+whose declared `files_modified` are a shell script and two planning documents.
+
+**G-3 therefore remains SPLIT**, now three-quarters closed: (a) FIXED, (b) FIXED, (c) FIXED, **(d)
+OPEN with its cause fully localised** — no longer "no handler-facing emitter exists" but "the emitter
+exists and emits a params shape the specification does not admit."

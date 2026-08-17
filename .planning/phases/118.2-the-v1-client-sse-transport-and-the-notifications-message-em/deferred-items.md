@@ -434,3 +434,67 @@ error — but 118.2-10 STRENGTHENED it to also pin the `detail`, so the fence no
 WHICH hop is missing instead of implying the stream is dead. The module doc records the
 fixed state, the pre-fix state, and this residual. Appended to `.planning/WINDOWS.md`.
 Natural owner: a follow-on client-lifecycle plan.
+
+---
+
+## `LogMessageParams` emits `message`, the specification requires `data` (118.2-11)
+
+**Found:** 2026-08-17, plan `118.2-11` Task 1, by re-measuring the official suite at the
+held `0.2.0-alpha.11` pin. **Not a discovery from reading — the referee said it.**
+
+`src/types/notifications.rs:161-172` declares:
+
+```rust
+pub struct LogMessageParams {
+    pub level: LoggingLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    pub message: String,                 // NOT in the specification
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,             // REQUIRED by the specification
+}
+```
+
+`schema/vendored/core-2026-07-28/schema.ts:2031-2044` declares `level`, optional `logger`
+and `data: unknown` — required, with **no `message` member at all**. The suite validated
+against the `2025-11-25` schema and reported the same requirement, so the divergence is
+era-independent.
+
+`extra.log(..)` (`src/server/cancellation.rs:822-825`) passes `None` for `data`, so the
+ergonomic emitter — the one plan 118.2-09's fixture and every future pmcp user calls —
+puts a schema-invalid frame on the wire.
+
+**Two independent checks fail on that one divergence, both measured:**
+
+1. `WireSchemaValid` rejects all three frames:
+   `LoggingMessageNotification/params: must have required property 'data'`.
+2. `ToolsCallWithLogging` reports `logCount: 0`. The frames reach the wire — check 1 saw
+   them — but the official reference client's zod schema has `data: z.unknown()`, which
+   under the bundled zod v4 is **non-optional**, so the client DROPS every record.
+   Reproduced against the pinned bundle: without `data` `parse ok: false`, with `data`
+   `parse ok: true`.
+
+Net suite effect: `2025-11-25:tools-call-with-logging` **1/1 → 0/2**, the v1 leg **72/2 →
+71/3**, `GAP_ATTRIBUTABLE_FAILURES` **1 → 2**. The v2 leg is byte-identical to baseline.
+
+**Not fixed here, and Rule 4 rather than Rule 1.** It is a wire-format change to a public
+type — the same class as G-1, which `118-CONFORMANCE-GAPS.md` already defers for exactly
+that reason — and this plan's declared `files_modified` are a shell script and two
+planning documents. Three candidate fixes, each with a different compatibility story:
+
+| Candidate | Shape | Cost |
+|---|---|---|
+| A | `emit_log_record` defaults `data` to the message when `None` | No Rust API change at all; changes emitted bytes; every existing `extra.log` caller becomes conformant. `message` stays as a pmcp extension |
+| B | Serialize `message` INTO `data` as `{"message": …}` | Same as A but a structured payload; a consumer reading `data` as a string sees an object |
+| C | Drop `message` from `LogMessageParams` in favour of `data` | Breaking Rust API change; needs a semver decision |
+
+Choosing between them — and deciding what existing pmcp clients that read `message` should
+see — is a design decision, not a bug fix.
+
+**Also measured while checking:** at this pin the `2026-07-28` leg runs **no**
+`tools-call-with-logging` and **no** `sep-2575-*` scenario, so the open SEP-2575 v2 default
+finding is not observable by the official suite and stays an in-tree unmet truth.
+
+**Disposition:** G-3 sub-item (d) stays **OPEN** with its cause fully localised. The gate
+was NOT hardened and CONF-09 was NOT booked, per the plan's own STOP instruction and D-21.
+Appended to `.planning/WINDOWS.md`. Natural owner: a follow-on plan that owns `src/`.
