@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 12/12 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate)
+**Plans:** 12/12 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
 
 - [x] 118.2-13-PLAN.md
 
@@ -2889,6 +2889,25 @@ Plans:
 **Wave 7** *(blocked on Wave 6)*
 
 - [x] 118.2-12-PLAN.md — Wave 7. **D-14**: the re-pin as the FINAL act, re-measured once, with the bump's delta reported SEPARATELY from the fixes' delta — and a blocking developer checkpoint if the bump reds the D-16 gate (CONF-09, CONF-10)
+
+**GAP CLOSURE (planned 2026-08-17).** `118.2-VERIFICATION.md` returned `gaps_found`: the four literal Success Criteria above are achieved and corroborated by the official suite, but the phase's own prose goal — "usable end to end by pmcp's OWN client" — is not safely true. Two Critical defects (CR-01, CR-02) and two Warnings (WR-01, WR-02) from `118.2-REVIEW.md` live in exactly the client code this phase shipped, and were independently confirmed against the merged source. These five plans close them. CONF-09 and CONF-10 stay booked **Complete** as literally worded; plan 18 AMENDS CONF-09's traceability evidence rather than minting a new requirement ID (D-17). WR-03..WR-06 and IN-01..IN-06 are explicitly OUT of scope and are recorded by plan 16.
+
+**Wave 8**
+
+- [ ] 118.2-14-PLAN.md — Wave 8. **CR-01, the tracer slice**: `MIN_SSE_RECONNECT_DELAY` floors a peer-supplied `retry: 0`, and the reconnect budget is refunded only on sustained uptime rather than on a single delivered frame — plus the delivered-arm fence the existing 14 fences structurally cannot reach (CONF-09)
+
+**Wave 9** *(blocked on Wave 8 — same file)*
+
+- [ ] 118.2-15-PLAN.md — Wave 9. **CR-02**: terminal reader errors move off the response FIFO onto a private sticky, write-once latch surfaced only behind an empty queue, and `Client::dispatch_request` correlates `response.id` against the awaiting `request_id` — with the idle-poisoning fence and the desync fence, both driven through a real `pmcp::Client` (CONF-09, CONF-10)
+
+**Wave 10** *(parallel — plan 16 touches no source file)*
+
+- [ ] 118.2-16-PLAN.md — Wave 10. The record: WR-03..WR-06 and IN-01..IN-06 appended to `deferred-items.md` with their review anchors and reasons, and the reasoned no-external-API `COVERAGE.md` declaration (CONF-09, CONF-10)
+- [ ] 118.2-17-PLAN.md — Wave 10. **WR-01 + WR-02**: a `watch` shutdown signal raced against the parked body read at both SSE sites (closing the idle-stream task/socket leak on drop AND on `close()`), and the resumption cursor promoted to per-reader state so a POST-stream id can never become the session GET's `Last-Event-ID` (CONF-09)
+
+**Wave 11** *(blocked on Waves 8-10)*
+
+- [ ] 118.2-18-PLAN.md — Wave 11. The close-out: CONF-09's traceability row AMENDED in place with the four fixes and their measured fence counts, the two consumer-observable behaviour changes disclosed in `WINDOWS.md`, and the phase's single authoritative `cargo semver-checks` verdict plus a D-16 regression check framed as server-side only (CONF-09, CONF-10)
 
 **Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
 
