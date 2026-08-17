@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 12/12 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
+**Plans:** 12/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
 
 - [x] 118.2-13-PLAN.md
 
