@@ -1023,8 +1023,46 @@ const ALLOWLIST: &[Accumulation] = &[
               also what makes it linear rather than quadratic. The two parser buffers are bounded \
               by feed's UNCONDITIONAL pre-check over retained state plus this chunk (113-17, \
               T-113-86). feed_complete_body skips that pre-check by design and states the byte \
-              cap as a precondition on the caller, discharged at both call sites by \
-              collect_body_within_cap (113-20, T-113-84).",
+              cap as a precondition on the caller, discharged at its ONE remaining call site — the \
+              POST response in streamable_http.rs — by collect_body_within_cap (113-20, \
+              T-113-84). The GET session stream stopped being a call site in 118.2-01, which \
+              moved it to the incremental feed.",
+    },
+    Accumulation {
+        path: "src/shared/streamable_http.rs",
+        needle: "extend_from_slice(",
+        count: 1,
+        why: "The GET session-stream reader appends ONE hyper frame to a byte buffer and then \
+              fully drains it with take_utf8_prefix on the SAME iteration, so the residual is the \
+              incomplete-character tail of at most three bytes. What the decoded text then feeds \
+              is bounded by SseParser::feed's unconditional pre-check over retained state PLUS \
+              this chunk (113-17, T-113-86), under the transport's own max_collected_body_bytes \
+              ceiling — DEFAULT_MAX_COLLECTED_BODY_BYTES, 16 MiB, user-overridable through \
+              with_max_collected_body_bytes. That reuse is Phase 118.2 D-02: the collected-body \
+              cap BECOMES the parser bound rather than a second knob, because a new field on the \
+              externally-constructible StreamableHttpTransportConfig would be a MAJOR semver \
+              event. Overflow ends the stream with a named error; it never keeps parsing.",
+    },
+    Accumulation {
+        path: "src/shared/streamable_http.rs",
+        needle: ".extend(",
+        count: 1,
+        why: "This collects the events drain_sse_events has just COMPLETED from one chunk, not \
+              bytes retained across chunks: the reader task pops every pending event and delivers \
+              it before it polls the body again, so the population is bounded by what a single \
+              hyper frame can complete, and each completed event was itself admitted under the \
+              parser's retained-state bound. Same mechanism as the src/client/subscriptions.rs \
+              entry above, on the GET session stream rather than on subscriptions/listen.",
+    },
+    Accumulation {
+        path: "src/shared/streamable_http.rs",
+        needle: "push_str(",
+        count: 1,
+        why: "truncate_sse_frame copies at most MAX_ECHOED_SSE_FRAME (200) characters into a \
+              String pre-sized to exactly that boundary. It IS a bound rather than a consumer of \
+              one: it exists so a hostile server cannot push an unbounded frame into a client's \
+              logs through an error Display (ASVS V7), and it is the only writer of that String. \
+              The twin of src/client/subscriptions.rs's truncate entry above.",
     },
     Accumulation {
         path: "src/shared/uri_template.rs",
