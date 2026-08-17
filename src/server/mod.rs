@@ -2008,6 +2008,30 @@ impl Server {
             return response;
         }
 
+        // ADAPTER (b) — `logging/setLevel`, era-branched (Phase 118.2-08, D-13).
+        //
+        // Intercepted HERE, above `process_client_request`, for the same
+        // structural reason ADAPTER (a) above intercepts `tasks/*`: this
+        // method's v2 answer is a JSON-RPC ERROR with a SPECIFIC code, and
+        // `Self::create_response` flattens EVERY `Err` returned by
+        // `process_client_request` to `-32603 INTERNAL_ERROR`. A `-32601`
+        // therefore cannot travel through that function's
+        // `Result<serde_json::Value>` return type at all — the same
+        // `JSONRPCResponse -> Result<Value>` round-trip the `tasks/*` adapter
+        // exists to avoid. Making `create_response` code-aware instead would
+        // silently change the wire code of every other handler that returns a
+        // `Error::Protocol`, which is not this plan's change to make.
+        //
+        // The ANSWER itself is not computed here: it comes from the single
+        // shared unit in `server/core.rs`, the very same one `ServerCore`'s
+        // dispatch arm calls. One era branch, two roots — that is D-13.
+        if matches!(request, ClientRequest::SetLoggingLevel { .. }) {
+            return crate::server::core::set_logging_level_response(
+                id,
+                protocol_context.as_ref().map(|ctx| ctx.era),
+            );
+        }
+
         let result = self
             .process_client_request(
                 id.clone(),
@@ -2075,22 +2099,46 @@ impl Server {
                     .await
                     .and_then(|result| serde_json::to_value(result).map_err(Into::into))
             },
+            // `logging/setLevel` (Phase 118.2-08, CONF-10 / D-13) — its OWN
+            // arm, no longer inside the residual below, and answering from the
+            // SAME shared unit in `server/core.rs` that `ServerCore`'s dispatch
+            // arm calls.
+            //
+            // Reached only when a caller drives this function DIRECTLY. On the
+            // production path `handle_client_request`'s ADAPTER (b) has already
+            // answered — it must, because the v2 half of the era branch is a
+            // `-32601` and `Self::create_response` flattens every `Err` from
+            // this function to `-32603`. The v1 half is the whole of what this
+            // arm can express, and it is spelled by calling the shared unit
+            // rather than by re-typing `json!({})`, so a future change to the
+            // measured shape (Pitfall 8) lands in exactly one place.
+            ClientRequest::SetLoggingLevel { level: _ } => {
+                Ok(crate::server::core::set_logging_level_v1_result())
+            },
             // RESIDUAL, recorded rather than silently unified (Phase 118.1-04,
-            // RESEARCH Open Question 4): these four methods STILL diverge
+            // RESEARCH Open Question 4): these THREE methods STILL diverge
             // between the two native dispatchers. Here they answer
             // `json!({})`; `ServerCore`'s `_ =>` arm
             // (`src/server/core.rs`, the arm immediately after the
-            // `ClientRequest::Complete` one) answers `-32601 Method not
+            // `ClientRequest::SetLoggingLevel` one) answers `-32601 Method not
             // supported`. Only this dispatcher is on the HTTP path, so only
             // this side is measured by the official conformance suite. G-5
             // (`resources/subscribe`, `resources/unsubscribe`,
             // `logging/setLevel`, `ping` retirement on v2) is the requirement
             // that owns them; unifying them here would smuggle a behaviour
             // change in behind a conformance fix.
-            ClientRequest::Subscribe(_)
-            | ClientRequest::Unsubscribe(_)
-            | ClientRequest::SetLoggingLevel { level: _ }
-            | ClientRequest::Ping => Ok(serde_json::json!({})),
+            //
+            // HISTORY — a residual is recorded, never silently unified, and
+            // never silently SHRUNK either: `logging/setLevel` was the FOURTH
+            // method on this arm and left it in Phase 118.2-08 under D-13,
+            // because the official suite measures that method and the two roots
+            // disagreed about it. `ping` in particular must stay here: it
+            // already carries a recorded 118.1 v2 behaviour change (HTTP 404 /
+            // `-32601` at the transport gate) and a second, differently-shaped
+            // retirement at this layer would be a new divergence, not a fix.
+            ClientRequest::Subscribe(_) | ClientRequest::Unsubscribe(_) | ClientRequest::Ping => {
+                Ok(serde_json::json!({}))
+            },
             ClientRequest::CreateMessage(req) => {
                 self.handle_create_message(request_id, *req, protocol_context)
                     .await

@@ -344,6 +344,104 @@ fn bound_completion_values(
     result
 }
 
+/// The message this file's dispatch root answers a method it does not serve.
+///
+/// ONE literal, read by the `_ =>` catch-all in
+/// [`ServerCore::handle_request_internal`] AND by
+/// [`set_logging_level_response`]'s v2 retirement, so `logging/setLevel` is
+/// refused in exactly the same words as its three residual siblings (`ping`,
+/// `resources/subscribe`, `resources/unsubscribe`) on this same root rather
+/// than acquiring a message of its own.
+///
+/// # Why this does NOT reuse the HTTP layer's wording
+///
+/// The HTTP ingress builds a richer string from `V2_RETIRED_METHODS`
+/// (`"Method not found: logging/setLevel (retired in MCP 2026-07-28; use
+/// io.modelcontextprotocol/logLevel)"`). That table lives in
+/// `crate::server::streamable_http_server`, which is gated behind
+/// `feature = "streamable-http"` and so cannot be referenced from this module
+/// at all. What the two layers DO share is the thing that matters on the wire:
+/// the same decision and the same code,
+/// [`error_codes::METHOD_NOT_FOUND`](crate::types::protocol::error_codes::METHOD_NOT_FOUND).
+/// Only the human-readable text differs — exactly the split
+/// `map_unparsed_body_for_v2`'s rustdoc already records for the two
+/// pre-existing v2 rejection routes ("Both routes emit the same code and the
+/// same status … only the message text differs").
+pub(crate) const METHOD_NOT_SUPPORTED_MESSAGE: &str = "Method not supported";
+
+/// Whether `logging/setLevel` is RETIRED for this era.
+///
+/// `None` — no era resolved, i.e. a server that never opted in to protocol
+/// negotiation — is treated as v1, which is the era such a server has always
+/// been on. Retiring a method for a caller whose era was never determined would
+/// break every non-opted-in server on the SDK's own default path.
+pub(crate) const fn set_logging_level_is_retired(era: Option<crate::types::protocol::Era>) -> bool {
+    matches!(era, Some(crate::types::protocol::Era::V2))
+}
+
+/// The v1 answer to `logging/setLevel`: a **literal empty object**.
+///
+/// # Pitfall 8 — this is a MEASURED constraint, not a style choice
+///
+/// The pinned official conformance suite's `2025-11-25:logging-set-level`
+/// scenario does
+///
+/// ```text
+/// const r = await n.request('logging/setLevel', { level: 'info' });
+/// r && Object.keys(r).length > 0 && i.push('Expected empty object {} response')
+/// ```
+///
+/// so ANY non-empty object is a FAILURE — including an acknowledgement object
+/// and including an echo of the level that was just set. That scenario is
+/// currently GREEN and is one of the entries in `BLOCKING_GREEN_SCENARIOS`;
+/// returning anything richer here would shrink the blocking surface the
+/// conformance gate claims, i.e. a regression dressed as an improvement.
+///
+/// Echoing the stored level would additionally hand a caller a READ of session
+/// state through a WRITE endpoint (T-118.2-08-02).
+///
+/// The level itself is already stored, per session, by the HTTP ingress
+/// (`streamable_http_server::capture_v1_set_level`, Phase 118.2-07). This
+/// dispatch path's only job is to ANSWER.
+pub(crate) fn set_logging_level_v1_result() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// The ONE answer both native dispatch roots give `logging/setLevel` (D-13).
+///
+/// Before Phase 118.2-08 the two roots disagreed about a method the official
+/// conformance suite measures: [`ServerCore`]'s `_ =>` catch-all answered
+/// `-32601 Method not supported` on BOTH eras, while
+/// `Server::process_client_request` answered `json!({})` on both. Phase 118.1
+/// spent real effort collapsing exactly this class of divergence for
+/// `completion/complete`; this function is the same fix for the same shape of
+/// defect.
+///
+/// | Era | Answer |
+/// |-----|--------|
+/// | `V2` | JSON-RPC error [`METHOD_NOT_FOUND`](crate::types::protocol::error_codes::METHOD_NOT_FOUND) — the RPC is retired, and `io.modelcontextprotocol/logLevel` in `params._meta` replaces it |
+/// | `V1` / no era resolved | success carrying [`set_logging_level_v1_result`] — a literal `{}` |
+///
+/// # Why the roots CALL this rather than each writing the branch
+///
+/// `src/server/mod.rs` calls the units defined here; it never defines its own.
+/// Two copies of an era branch are two chances to disagree, and the disagreement
+/// would be silent — which is precisely the state this function replaces.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_logging_level_response(
+    id: RequestId,
+    era: Option<crate::types::protocol::Era>,
+) -> JSONRPCResponse {
+    if set_logging_level_is_retired(era) {
+        return crate::server::task_dispatch::error_response(
+            id,
+            crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+            METHOD_NOT_SUPPORTED_MESSAGE.to_string(),
+        );
+    }
+    crate::server::task_dispatch::success_response(id, set_logging_level_v1_result())
+}
+
 /// Core server implementation without transport dependencies.
 ///
 /// This struct contains all the business logic for an MCP server without
@@ -4272,12 +4370,14 @@ impl ServerCore {
                     // `json!({})` — two dispatchers, two different wrong
                     // answers. Both now call the SAME shared unit.
                     //
-                    // The four other methods the twin catch-all in
+                    // The THREE other methods the twin catch-all in
                     // `server/mod.rs` still covers — `resources/subscribe`,
-                    // `resources/unsubscribe`, `logging/setLevel` and `ping` —
-                    // are deliberately NOT unified here. See the RESIDUAL note
-                    // on the `Subscribe | Unsubscribe | SetLoggingLevel | Ping`
-                    // arm in `Server::process_client_request`.
+                    // `resources/unsubscribe` and `ping` — are deliberately NOT
+                    // unified here. See the RESIDUAL note on the
+                    // `Subscribe | Unsubscribe | Ping` arm in
+                    // `Server::process_client_request`. `logging/setLevel` was
+                    // the fourth and LEFT that residual in Phase 118.2-08 under
+                    // D-13; its own arm is immediately below.
                     #[cfg(not(target_arch = "wasm32"))]
                     ClientRequest::Complete(req) => {
                         match complete_completion(self.completions.as_ref(), req).await {
@@ -4293,10 +4393,25 @@ impl ServerCore {
                             ),
                         }
                     },
+                    // `logging/setLevel` (Phase 118.2-08, D-13). Placed HERE,
+                    // ahead of the `_ =>` catch-all, for exactly the reason the
+                    // `completion/complete` arm above is: that catch-all
+                    // answered `-32601` on BOTH eras while the high-level
+                    // `Server` answered `json!({})` on both — two dispatchers,
+                    // two answers, and only the OTHER one is on the HTTP path
+                    // the official conformance suite measures. Both roots now
+                    // call the SAME era-branched shared unit, so a caller
+                    // reaching this root off-HTTP (in-process, or a future
+                    // transport) can no longer get a different answer from the
+                    // one the suite measured (T-118.2-08-01).
+                    #[cfg(not(target_arch = "wasm32"))]
+                    ClientRequest::SetLoggingLevel { .. } => {
+                        set_logging_level_response(id, protocol_context.as_ref().map(|ctx| ctx.era))
+                    },
                     _ => Self::error_response(
                         id,
                         crate::types::protocol::error_codes::METHOD_NOT_FOUND,
-                        "Method not supported".to_string(),
+                        METHOD_NOT_SUPPORTED_MESSAGE.to_string(),
                     ),
                 }
             },

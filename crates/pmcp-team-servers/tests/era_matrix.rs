@@ -597,13 +597,21 @@ fn era_transport(url: &url::Url) -> pmcp::shared::streamable_http::StreamableHtt
 /// during phase 118.1; the history is kept so a reader can tell a fix from a
 /// regression.
 ///
-/// * **v2 `logging/setLevel` is still SERVED.** `src/server/mod.rs` lumps
-///   `SetLoggingLevel` in with `Subscribe`/`Complete`/`Ping` and answers
-///   `Ok(json!({}))` with no era branch anywhere in `src/`. The REPLACEMENT
-///   mechanism works — the `_meta` arm below proves it — only the retirement of
-///   the old RPC is missing. (Gap G-5 in `118-CONFORMANCE-GAPS.md` was CLOSED by
-///   phase 118.1 plan 05 for the verbs it named; this `logging/setLevel`
-///   observation is what survives it.)
+/// * **v2 `logging/setLevel` is RETIRED, at the transport gate AND at both
+///   native dispatch roots.** Phase 118.1 plan 05 retired it by method STRING at
+///   the v2 HTTP ingress (the `V2_RETIRED_METHODS` table), which is what the
+///   arm below asserts on the wire. Until phase 118.2-08 that was the ONLY
+///   layer that knew: `src/server/mod.rs` lumped `SetLoggingLevel` in with
+///   `Subscribe`/`Unsubscribe`/`Ping` and answered `Ok(json!({}))` with no era
+///   branch anywhere in `src/`, while `ServerCore`'s `_ =>` catch-all answered
+///   `-32601` on BOTH eras — so a caller reaching a dispatch root off the HTTP
+///   path got an answer the suite had never measured. 118.2-08 (D-13) split the
+///   method out of that residual arm and gave both roots ONE era-branched
+///   shared unit, `server::core::set_logging_level_response`: a literal `{}` on
+///   v1, `-32601` on v2. The REPLACEMENT mechanism works too — the `_meta` arm
+///   below proves it. (Gap G-5 in `118-CONFORMANCE-GAPS.md` was CLOSED by phase
+///   118.1 plan 05 for the verbs it named; the residual `logging/setLevel`
+///   dispatch-root observation that survived it is closed by 118.2-08.)
 /// * **v1 Sampling/Roots now REACH the capability over `StreamableHttpServer`,
 ///   and stop one hop short of completing.** The status this file asserts is
 ///   `no-live-stream`, not `capability-not-offered`, and the difference is the
