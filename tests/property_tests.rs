@@ -391,6 +391,47 @@ mod typed_helper_properties {
         sent: Arc<Mutex<Vec<TransportMessage>>>,
     }
 
+    impl CaptureTransport {
+        /// Re-address a canned RESPONSE to the id of the request still awaiting
+        /// one (Phase 118.2, CR-02).
+        ///
+        /// [`call_response`] takes a hand-written id while `Client::call_tool`
+        /// mints a `RequestId::String` holding a UUID. Until CR-02,
+        /// `Client::dispatch_request` returned the first `Response` frame it
+        /// popped WITHOUT comparing ids, so that mismatch was invisible; it is
+        /// now refused, exactly as a fabricated id from a real peer is
+        /// (T-118.2-15-02).
+        ///
+        /// Echoing the id is what a CONFORMANT server does, so this makes the
+        /// mock conformant rather than working around the check. The captured
+        /// OUTGOING messages this transport exists to expose are untouched, and
+        /// those are what the property asserts on.
+        fn addressed_to_the_pending_request(&self, message: TransportMessage) -> TransportMessage {
+            match message {
+                TransportMessage::Response(mut response) => {
+                    if let Some(id) = self.last_request_id() {
+                        response.id = id;
+                    }
+                    TransportMessage::Response(response)
+                },
+                other => other,
+            }
+        }
+
+        /// The id of the most recent REQUEST this mock was sent.
+        fn last_request_id(&self) -> Option<RequestId> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|sent| match sent {
+                    TransportMessage::Request { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+        }
+    }
+
     #[async_trait]
     impl Transport for CaptureTransport {
         async fn send(&mut self, m: TransportMessage) -> PmcpResult<()> {
@@ -399,11 +440,13 @@ mod typed_helper_properties {
         }
 
         async fn receive(&mut self) -> PmcpResult<TransportMessage> {
-            self.responses
+            let message = self
+                .responses
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or_else(|| PmcpError::protocol_msg("no more responses"))
+                .ok_or_else(|| PmcpError::protocol_msg("no more responses"))?;
+            Ok(self.addressed_to_the_pending_request(message))
         }
 
         async fn close(&mut self) -> PmcpResult<()> {

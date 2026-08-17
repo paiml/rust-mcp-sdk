@@ -3722,6 +3722,49 @@ impl<T: Transport> Client<T> {
 
                 match response_message {
                     crate::types::TransportMessage::Response(mut response) => {
+                        // CORRELATION, before anything else (Phase 118.2, CR-02).
+                        //
+                        // This loop used to return the FIRST `Response` frame it
+                        // popped, whatever its id, and unconditionally remove
+                        // `request_id` from `active_requests`. Three things a
+                        // future reader would otherwise have to re-derive:
+                        //
+                        // 1. Equality is `RequestId`'s typed STRUCTURAL kind, so
+                        //    `String("1")` and `Number(1)` are DIFFERENT ids.
+                        //    JSON-RPC 2.0 requires exactly that — the response id
+                        //    "MUST be the same as the value of the id member in
+                        //    the Request Object" — so a lenient server that
+                        //    re-types the id now gets a wait where it previously
+                        //    got a (wrong) match. The `warn!` names BOTH ids so
+                        //    that wait is diagnosable rather than mute.
+                        // 2. A mismatched frame is DISCARDED rather than
+                        //    re-queued: a consumer of `Transport` holds no
+                        //    producer handle, so there is nowhere to put it back.
+                        // 3. Discarding converts a silent wrong answer into a
+                        //    diagnosable wait for whichever OTHER request that
+                        //    frame belonged to. Strictly better than handing one
+                        //    caller another caller's result (T-118.2-15-01), but a
+                        //    real cost, bounded by that request's own timeout
+                        //    (T-118.2-15-03). Per-id response routing — the
+                        //    `active_requests` map carrying a response channel per
+                        //    id — is the correct long-term shape and is recorded
+                        //    as a follow-up, not attempted here.
+                        //
+                        // Nothing is removed from `active_requests` on this path:
+                        // the request is STILL pending, so the `continue` sits
+                        // ahead of the inline happy-path removal below and the
+                        // WR-04 single-exit cleanup remains the only other place
+                        // the entry is removed.
+                        if response.id != request_id {
+                            tracing::warn!(
+                                awaiting = ?request_id,
+                                received = ?response.id,
+                                "discarding a JSON-RPC response whose id is not the one this \
+                                 request is awaiting; still waiting"
+                            );
+                            continue;
+                        }
+
                         // Remove from active requests (happy path)
                         self.active_requests.write().await.remove(&request_id);
 
@@ -5309,6 +5352,49 @@ mod tests {
         fn add_response(&self, response: TransportMessage) {
             self.responses.lock().unwrap().push(response);
         }
+
+        /// Re-address a canned RESPONSE to the id of the request still awaiting
+        /// one (Phase 118.2, CR-02).
+        ///
+        /// Every canned response below carries a hand-written id (`1`, `2`, ...)
+        /// while `Client` mints its own — a `RequestId::String` holding a UUID for
+        /// `call_tool`, a counter elsewhere. Until CR-02, `dispatch_request`
+        /// returned the first `Response` frame it popped WITHOUT comparing ids, so
+        /// that mismatch was invisible; it is now refused, exactly as a fabricated
+        /// id from a real peer is (T-118.2-15-02).
+        ///
+        /// Echoing the id is what a CONFORMANT server does — JSON-RPC 2.0 requires
+        /// the response id to "be the same as the value of the id member in the
+        /// Request Object" — so this makes the mock conformant rather than working
+        /// around the check. The canned `payload` is untouched, and that is what
+        /// every test here actually asserts on.
+        ///
+        /// A mock with no recorded request yet is left alone, so a test that
+        /// exercises an UNSOLICITED frame keeps the id it wrote.
+        fn addressed_to_the_pending_request(&self, message: TransportMessage) -> TransportMessage {
+            match message {
+                TransportMessage::Response(mut response) => {
+                    if let Some(id) = self.last_request_id() {
+                        response.id = id;
+                    }
+                    TransportMessage::Response(response)
+                },
+                other => other,
+            }
+        }
+
+        /// The id of the most recent REQUEST this mock was sent.
+        fn last_request_id(&self) -> Option<RequestId> {
+            self.sent_messages
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|sent| match sent {
+                    TransportMessage::Request { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+        }
     }
 
     #[async_trait]
@@ -5319,11 +5405,13 @@ mod tests {
         }
 
         async fn receive(&mut self) -> Result<TransportMessage> {
-            self.responses
+            let message = self
+                .responses
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or_else(|| Error::protocol_msg("No more responses"))
+                .ok_or_else(|| Error::protocol_msg("No more responses"))?;
+            Ok(self.addressed_to_the_pending_request(message))
         }
 
         async fn close(&mut self) -> Result<()> {

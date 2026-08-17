@@ -574,3 +574,65 @@ behalf.
 `RUSTSEC-2024-0436` (`paste 1.0.15` unmaintained, via `umya-spreadsheet 3.0.0` ->
 `pmcp-workbook-compiler`). They are pre-existing, allowed by the repo's audit configuration,
 and unrelated to this plan.
+
+## DEFERRED (118.2-15): per-id response ROUTING, and the cost of discard-on-mismatch
+
+**Recorded by plan 15 (CR-02), 2026-08-17. Explicitly not this closure's work.**
+
+CR-02's second half is now closed the way the gap-closure scope fenced it:
+`Client::dispatch_request` compares the popped response's `id` against the `request_id` it is
+awaiting, and on a mismatch it logs a `tracing::warn!` naming BOTH ids and **keeps looping**.
+Nothing is removed from `active_requests` on that path — the request is still pending — so the
+WR-04 single-exit cleanup remains the only other place the entry is removed.
+
+**The stated limitation.** A discarded frame is *gone*. If it was the answer to some OTHER
+in-flight request on the same `Client`, that request now waits out its caller's timeout instead
+of receiving its answer. That is strictly better than the pre-fix behaviour — one caller
+silently receiving another caller's tool result is a cross-request data leak inside one process
+(T-118.2-15-01) — and it is bounded by the caller's own timeout rather than unbounded. But it
+is a real cost, accepted deliberately and recorded as `T-118.2-15-03` (Denial of Service,
+medium, **accept**) rather than papered over.
+
+Two things were considered and rejected *for this plan*:
+
+- **Re-queueing the mismatched frame.** There is nowhere to put it back: a consumer of
+  `Transport` holds no producer handle to the receive queue. Handing one out to `Client` would
+  be a new public affordance minted to work around a routing gap.
+- **An orphan-response buffer on `Client`.** A holding pen fixes the symptom while leaving one
+  consumer loop deciding for every caller, and it introduces its own unbounded-growth question
+  (how long does an orphan live, and who evicts it?).
+
+**The correct long-term shape — the actual follow-up.** Per-id response ROUTING: the
+`active_requests` map carries a response channel per id, so a popped frame is *delivered to its
+owner* instead of being discarded, and no request can be starved by a frame that arrived while
+a different request happened to hold the consumer loop. That is a redesign of how `Client`
+consumes its transport, not a comparison, and it belongs in its own plan with its own
+concurrency fences. It is **not** attempted here.
+
+**Why the missing check was in scope for 118.2 at all**, since it pre-dates the phase: what
+118.2 supplied is the *stock of out-of-band queue entries* that made the desync reachable with
+no server-side bug whatsoever. Task 2's latch removed that stock; without the id check the
+poison would still be in the FIFO, and without the latch the check alone leaves it there. The
+plan's claim that neither half alone suffices was **measured**: with the latch and no id check,
+`binary(client_sse_stream)` ran 17 tests, 16 passed, 1 failed — fence 16 green, fence 17 still
+red.
+
+### Fallout the fix exposed: three test mocks were answering with ids no client ever sent
+
+Not deferred — **fixed in plan 15's task 3**, recorded here because the shape is worth not
+re-deriving. Adding the correlation check turned 25 pre-existing tests red at once:
+
+| Mock | Tests |
+|---|---|
+| `src/client/mod.rs::tests::MockTransport` | 17 |
+| `tests/common/mock_paginated.rs::MockTransport` (shared by `list_all_pagination` + `property_tests`) | 7 |
+| `tests/property_tests.rs::CaptureTransport` | 1 |
+
+Each replayed a canned response carrying a hand-written id (`1`, `2`, `i+2`, ...) while
+`Client` mints its own — a `RequestId::String` holding a UUID for `call_tool`, a counter
+elsewhere. They passed *because* `dispatch_request` did not compare ids: they were asserting on
+the defect. The fix was to make each mock **echo the id of the request it was sent**, which is
+what a conformant server does (JSON-RPC 2.0: the response id "MUST be the same as the value of
+the id member in the Request Object"). No canned payload, cursor chain or pop order changed,
+and the correlation check was not weakened. A mock that answers with a fabricated id is
+precisely the hostile-peer shape fence 17 now refuses.

@@ -42,6 +42,48 @@ impl MockTransport {
             sent_messages: Arc::new(Mutex::new(Vec::new())),
         }
     }
+
+    /// Re-address a canned RESPONSE to the id of the request still awaiting one
+    /// (Phase 118.2, CR-02).
+    ///
+    /// [`build_paginated_responses`] numbers its pages `2, 3, 4, ...` while
+    /// `Client` mints its own request ids. Until CR-02, `Client::dispatch_request`
+    /// returned the first `Response` frame it popped WITHOUT comparing ids, so
+    /// that mismatch was invisible; it is now refused, exactly as a fabricated id
+    /// from a real peer is (T-118.2-15-02).
+    ///
+    /// Echoing the id is what a CONFORMANT server does — JSON-RPC 2.0 requires the
+    /// response id to "be the same as the value of the id member in the Request
+    /// Object" — so this makes the mock conformant rather than working around the
+    /// check. The canned `payload`, its `nextCursor` chaining and the pop ORDER are
+    /// all untouched, and those are what these tests assert on.
+    ///
+    /// The twin of `src/client/mod.rs`'s in-module mock; both had the same quirk
+    /// and needed the same correction.
+    fn addressed_to_the_pending_request(&self, message: TransportMessage) -> TransportMessage {
+        match message {
+            TransportMessage::Response(mut response) => {
+                if let Some(id) = self.last_request_id() {
+                    response.id = id;
+                }
+                TransportMessage::Response(response)
+            },
+            other => other,
+        }
+    }
+
+    /// The id of the most recent REQUEST this mock was sent.
+    fn last_request_id(&self) -> Option<RequestId> {
+        self.sent_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|sent| match sent {
+                TransportMessage::Request { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+    }
 }
 
 #[async_trait]
@@ -51,11 +93,13 @@ impl Transport for MockTransport {
         Ok(())
     }
     async fn receive(&mut self) -> Result<TransportMessage> {
-        self.responses
+        let message = self
+            .responses
             .lock()
             .unwrap()
             .pop()
-            .ok_or_else(|| pmcp::Error::protocol_msg("no more responses"))
+            .ok_or_else(|| pmcp::Error::protocol_msg("no more responses"))?;
+        Ok(self.addressed_to_the_pending_request(message))
     }
     async fn close(&mut self) -> Result<()> {
         Ok(())
