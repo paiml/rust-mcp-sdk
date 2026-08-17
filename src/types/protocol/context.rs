@@ -372,9 +372,10 @@ impl ProtocolContext {
     /// the level source (a v1 session's stored `logging/setLevel` value, or a v2
     /// request's `_meta` key) is known. Never called by dispatch: dispatch READS
     /// this value, it does not mint one.
-    // Why `allow(dead_code)`: the WRITER is the HTTP ingress, landing in plan 07. Until then the
-    // field is always `None` and `DEFAULT_LOG_LEVEL` applies — which is the correct behaviour on
-    // its own. The carrier ships first so its fence can prove the seam BEFORE a writer exists.
+    // Why `allow(dead_code)`: the WRITER is the HTTP ingress
+    // (`server::streamable_http_server::resolve_request_log_level`, plan 07, which landed it at
+    // both POST ingress paths). That transport is not compiled on wasm32 or on a build without the
+    // HTTP server features, so on those configurations this builder has no caller.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_resolved_log_level(

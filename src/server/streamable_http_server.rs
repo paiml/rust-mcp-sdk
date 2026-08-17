@@ -1428,6 +1428,18 @@ fn classify_v2_request(
 /// rejection message can never be assembled from peer-supplied bytes.
 const LOG_LEVEL_REQUEST_META_KEY: &str = "io.modelcontextprotocol/logLevel";
 
+/// The MCP 2025-11-25 RPC whose only purpose is to set a session's log level.
+///
+/// Spelled once and shared by the retirement table below and by the v1 capture
+/// in [`capture_v1_set_level`]. Two literals would be two chances to disagree
+/// about which method this is — and they would disagree SILENTLY, because a
+/// capture keyed on a slightly different string simply never fires.
+///
+/// Matched by EXACT BYTE EQUALITY everywhere: no case folding, no trimming, no
+/// prefix matching, the same rule [`v2_retired_method`] applies and for the same
+/// reason (T-118.1-05-01). The method string arrives from an untrusted peer.
+const LOG_LEVEL_SET_METHOD: &str = "logging/setLevel";
+
 /// THE retirement set: every RPC the MCP `2026-07-28` core schema removes, paired
 /// with the mechanism that replaces it (`None` where the schema offers none).
 ///
@@ -1482,7 +1494,7 @@ const V2_RETIRED_METHODS: [(&str, Option<&str>); 5] = [
     ),
     // No replacement: v2 has no liveness RPC at all. See `v2_retirement_message`.
     ("ping", None),
-    ("logging/setLevel", Some(LOG_LEVEL_REQUEST_META_KEY)),
+    (LOG_LEVEL_SET_METHOD, Some(LOG_LEVEL_REQUEST_META_KEY)),
     (
         "resources/subscribe",
         Some(crate::types::subscriptions::SUBSCRIPTIONS_LISTEN_METHOD),
@@ -1526,6 +1538,164 @@ fn v2_retirement_message(retired: &'static str, replacement: Option<&'static str
             format!("Method not found: {retired} (retired in MCP 2026-07-28; use {replacement})")
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// The PER-REQUEST LOG LEVEL (Phase 118.2 plan 07, CONF-10 / D-10 / D-11 / D-12).
+//
+// Two eras, two sources, one answer:
+//
+//   * v1 sends the `logging/setLevel` RPC, which is captured HERE and stored
+//     PER SESSION in `v1::V1State` (D-11);
+//   * v2 retired that RPC and carries `io.modelcontextprotocol/logLevel` in the
+//     request's `params._meta` instead, read per request (D-10);
+//   * neither → `None`, and `DEFAULT_LOG_LEVEL` (`info`, D-12) applies at emit
+//     time.
+//
+// # Why the capture is at the HTTP INGRESS and not in the dispatch arm
+//
+// The ingress is the ONE point that holds all four facts at once: the resolved
+// era, the validated session id, the raw body, and a still-owned
+// `ProtocolContext`. Resolving here and writing the ANSWER onto the context makes
+// the read at emit time an `Option<LoggingLevel>` copy instead of a session-map
+// lock per record — and it means the v1 dispatch arm (plan 08) has nothing to do
+// but answer `Ok(json!({}))`.
+//
+// # Why the level is NOT stored on the server
+//
+// `ServerState::server` is one `Arc<tokio::sync::Mutex<Server>>` shared by every
+// session. A level held there would let client B's `setLevel` change client A's
+// filtering (T-118.2-07-01). The per-session home is also the correct lifetime:
+// `setLevel` is a v1 RPC, and on a `full-v2` build `V1State` is a zero-sized twin
+// that allocates nothing for a mechanism that build does not have.
+//
+// # `ServerCapabilities.logging` deliberately gates NOTHING here
+//
+// The sink is per request and the capability is advisory (RESEARCH Open
+// Question 6). Gating on it would make a correctly-plumbed server silently mute
+// because of a declaration it forgot to make.
+// ---------------------------------------------------------------------------
+
+/// Parse a PEER-SUPPLIED level value, or ignore it.
+///
+/// Deserializes through [`LoggingLevel`](crate::types::LoggingLevel)'s OWN serde
+/// mapping (`rename_all = "lowercase"`), so this parse can never disagree with
+/// the spelling the wire uses — a hand-written `match` over eight strings would
+/// be a second mapping free to drift from the first.
+///
+/// # Malformed input is IGNORED, never echoed, never fatal
+///
+/// Three properties, each deliberate (T-118.2-07-03 / T-118.2-07-04, ASVS V5/V7):
+///
+/// * **No panic.** `Deserialize` is fallible and the error is discarded.
+/// * **No echo.** The peer's bytes are never placed into an error message or a
+///   log line, following this crate's established rule for errors derived from
+///   peer input (`collected_body_over_cap`, `listen_overflow`). Nothing is
+///   returned but a typed value the server already knew how to name.
+/// * **No rejection.** A misspelled level falls back to the `info` default
+///   rather than becoming a `-32602`. The key is an ADVISORY, per-request
+///   diagnostic hint; failing a whole tool call because a hint was misspelled
+///   converts a logging preference into an availability failure. The v1
+///   `logging/setLevel` RPC is a request whose only purpose IS the level, so it
+///   is the arguable case — but the 2026-07-28 conformance suite pins its
+///   response to a literal `{}` (Pitfall 8), so it also stores-or-ignores and
+///   still answers `{}`.
+fn parse_peer_log_level(value: Option<&serde_json::Value>) -> Option<crate::types::LoggingLevel> {
+    <crate::types::LoggingLevel as serde::Deserialize>::deserialize(value?).ok()
+}
+
+/// Store the level a v1 `logging/setLevel` request asked for, against ITS session.
+///
+/// A no-op unless ALL of the following hold, which is what keeps the write
+/// session-scoped rather than server-scoped:
+///
+/// * sessions are live for this request (so never on v2, where the RPC is
+///   retired and the era carries no session at all);
+/// * the request has an already-VALIDATED session id — the transport passes the
+///   id `v1::resolve_session_for_request` accepted, so an unknown id was answered
+///   `404` long before this runs;
+/// * the body's `method` is EXACTLY [`LOG_LEVEL_SET_METHOD`];
+/// * `params.level` parses (see [`parse_peer_log_level`]).
+///
+/// The request then CONTINUES to dispatch unchanged — this is a capture, not a
+/// short circuit. The stored level takes effect from this request onward,
+/// including for any record the `setLevel` call's own dispatch arm emits.
+///
+/// `v1::set_session_log_level` is itself a no-op for an unknown session id, so
+/// the denial-of-service control (T-118.2-07-02) holds even if a future caller reaches this
+/// with an unvalidated id.
+fn capture_v1_set_level(
+    state: &ServerState,
+    sessions_on: bool,
+    session_id: Option<&str>,
+    body: Option<&serde_json::Value>,
+) {
+    if !sessions_on {
+        return;
+    }
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let method = body.and_then(|body| body.get("method")).and_then(|method| {
+        method
+            .as_str()
+            .filter(|method| *method == LOG_LEVEL_SET_METHOD)
+    });
+    if method.is_none() {
+        return;
+    }
+    let Some(level) = parse_peer_log_level(params_of(body).get("level")) else {
+        return;
+    };
+    v1::set_session_log_level(&state.v1, session_id, level);
+}
+
+/// THE minimum log level for this request, captured and resolved in one place.
+///
+/// # Precedence
+///
+/// 1. **v2** — `params._meta["io.modelcontextprotocol/logLevel"]`, when the era
+///    is [`Era::V2`](crate::types::protocol::Era). Per request; v2 is
+///    session-free by construction, so nothing is stored and nothing can leak
+///    into another request.
+/// 2. **v1** — the level this SESSION last set, when sessions are live for the
+///    request and it carries a session id.
+/// 3. Otherwise **`None`**: leave `ProtocolContext::resolved_log_level` unset and
+///    let `DEFAULT_LOG_LEVEL` (`info`, D-12) apply at emit time. `None` is not
+///    "no logging" — it is "nothing overrode the default".
+///
+/// The two arms cannot both apply: arm 2's `sessions_on` is `false` on v2 by
+/// [`v1::sessions_active`], which is why this reads as a precedence list rather
+/// than as a conflict rule.
+///
+/// The v1 CAPTURE runs first, unconditionally in source, so a `logging/setLevel`
+/// is recorded before arm 2 reads it back — and so the twin's no-op write is
+/// reached (rather than compiled out) on a `full-v2` build.
+///
+/// Called at BOTH POST ingress paths. See either call site for why "both or
+/// neither" is load-bearing (T-118.2-07-06).
+fn resolve_request_log_level(
+    state: &ServerState,
+    era: Option<crate::types::protocol::Era>,
+    sessions_on: bool,
+    session_id: Option<&str>,
+    raw_body: &[u8],
+) -> Option<crate::types::LoggingLevel> {
+    // ONE parse of the body for both the capture and the `_meta` read. Adversarial
+    // or non-JSON bytes yield `None` and every read below simply finds nothing.
+    let body = raw_body_json(raw_body);
+
+    capture_v1_set_level(state, sessions_on, session_id, body.as_ref());
+
+    if era == Some(crate::types::protocol::Era::V2) {
+        return parse_peer_log_level(
+            params_meta_of(body.as_ref()).and_then(|meta| meta.get(LOG_LEVEL_REQUEST_META_KEY)),
+        );
+    }
+    if sessions_on {
+        return session_id.and_then(|session_id| v1::session_log_level(&state.v1, session_id));
+    }
+    None
 }
 
 /// Turn an ACCEPTED v2 request for a retired method into its `-32601` rejection.
@@ -4444,6 +4614,30 @@ async fn handle_post_fast_path_inner(
         ),
     );
 
+    // This request's minimum log level (CONF-10 / D-10 / D-11 / D-12), captured
+    // and resolved by the one named rule and written onto the context — which is
+    // the LAST point at which the context is still owned and mutable, and is
+    // after every era-gated stage, so `era` and `sessions_on` read exactly what
+    // they read above. `server::core::attach_request_log_sink` lifts it from
+    // there onto the request's `RequestHandlerExtra` at both dispatch roots; this
+    // file never constructs one and must not pretend to.
+    //
+    // The middleware twin carries this same block at the same position. BOTH or
+    // NEITHER: a level honoured on one ingress path and ignored on the other is
+    // indistinguishable from no level at all for whichever deployment shape takes
+    // the other path (T-118.2-07-06).
+    let request_log_level = resolve_request_log_level(
+        &state,
+        era,
+        sessions_on,
+        response_session_id.as_deref(),
+        body.as_bytes(),
+    );
+    let protocol_context = match (protocol_context, request_log_level) {
+        (Some(context), Some(level)) => Some(context.with_resolved_log_level(level)),
+        (context, _) => context,
+    };
+
     Ok(dispatch_message_fast(
         &state,
         ingress,
@@ -5218,6 +5412,23 @@ async fn handle_post_with_middleware_inner(
             server_request.get_header(header::ACCEPT.as_str()),
         ),
     );
+
+    // The SAME log-level capture and resolution as the fast-path twin, from the
+    // same position in the pipeline and through the SAME named rule — see that
+    // call site for why it sits here and why a level resolved on only ONE of the
+    // two ingress paths would be a deployment-shape-dependent defect that no
+    // single-path test can see (T-118.2-07-06).
+    let request_log_level = resolve_request_log_level(
+        &state,
+        era,
+        sessions_on,
+        response_session_id.as_deref(),
+        &server_request.body,
+    );
+    let protocol_context = match (protocol_context, request_log_level) {
+        (Some(context), Some(level)) => Some(context.with_resolved_log_level(level)),
+        (context, _) => context,
+    };
 
     // `Box::pin` the dispatch future: the discover per-path assembly (Plan 112-10)
     // grows it past clippy's large_future threshold; boxing keeps the handler

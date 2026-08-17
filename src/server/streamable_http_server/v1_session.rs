@@ -145,12 +145,6 @@ struct SessionInfo {
     /// defect (T-118.2-07-01). The per-session home is also the correct LIFETIME:
     /// `logging/setLevel` is retired in MCP 2026-07-28, which carries the level
     /// per request in `_meta` instead, so a v2 build allocates none of this.
-    // Why: the only reader is `session_log_level` below, whose only caller is
-    // the HTTP-ingress resolver that lands in the NEXT commit of this plan.
-    // Without this the storage commit cannot pass `RUSTFLAGS="-D warnings"`.
-    // REMOVE IT in that commit — it is a one-commit scaffold, not a standing
-    // exemption.
-    #[allow(dead_code)]
     log_level: Option<crate::types::LoggingLevel>,
 }
 
@@ -286,9 +280,9 @@ pub(crate) fn session_protocol_version(state: &V1State, session_id: &str) -> Opt
 ///
 /// Returns an OWNED answer — [`crate::types::LoggingLevel`] is `Copy` — so the
 /// twin can produce one without a map to borrow out of.
-// Why: see `SessionInfo::log_level` — the ingress resolver that calls this lands
-// in the next commit of this plan. REMOVE the allow in that commit.
-#[allow(dead_code)]
+///
+/// Its ONE caller is `super::resolve_request_log_level`, the named rule at the
+/// HTTP ingress.
 pub(crate) fn session_log_level(
     state: &V1State,
     session_id: &str,
@@ -317,9 +311,8 @@ pub(crate) fn session_log_level(
 /// `validate_non_init_session` already accepted, so the no-op arm is defence in
 /// depth rather than the common case — but it is the arm that stays correct if a
 /// future call site forgets the validation.
-// Why: see `SessionInfo::log_level` — the ingress capture that calls this lands
-// in the next commit of this plan. REMOVE the allow in that commit.
-#[allow(dead_code)]
+///
+/// Its ONE caller is `super::capture_v1_set_level`, at the HTTP ingress.
 pub(crate) fn set_session_log_level(
     state: &V1State,
     session_id: &str,
