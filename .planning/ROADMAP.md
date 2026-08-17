@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 16/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
+**Plans:** 17/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
 
 - [x] 118.2-13-PLAN.md
 
@@ -2907,7 +2907,7 @@ Plans:
 
 **Wave 11** *(blocked on Waves 8-10)*
 
-- [ ] 118.2-18-PLAN.md — Wave 11. The close-out: CONF-09's traceability row AMENDED in place with the four fixes and their measured fence counts, the two consumer-observable behaviour changes disclosed in `WINDOWS.md`, and the phase's single authoritative `cargo semver-checks` verdict plus a D-16 regression check framed as server-side only (CONF-09, CONF-10)
+- [x] 118.2-18-PLAN.md — Wave 11. The close-out: CONF-09's traceability row AMENDED in place with the four fixes and their measured fence counts, the two consumer-observable behaviour changes disclosed in `WINDOWS.md`, and the phase's single authoritative `cargo semver-checks` verdict plus a D-16 regression check framed as server-side only (CONF-09, CONF-10)
 
 **Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
 
