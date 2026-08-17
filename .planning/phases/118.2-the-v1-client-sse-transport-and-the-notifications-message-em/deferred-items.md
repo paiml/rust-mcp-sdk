@@ -87,3 +87,32 @@ deliberate, reviewed edit rather than a silent drift.
 **Owner:** plan 08 (the CONF-10 conformance fence) is where this must be
 confronted — if the official suite validates `params.data`, the current shape
 fails it and the type change becomes in-scope work with its own semver verdict.
+
+## Pre-existing D-19 plan-lint violations block `make quality-gate` at step 1 (found during 118.2-05)
+
+`make quality-gate`'s FIRST step is `lint-plans`
+(`./scripts/lint-plan-verify-commands.sh`), which runs before `fmt-check`. At the
+branch tip it reported **8** RULE 1 violations — a build/test invocation piped
+into `tail` with no `pipefail`, so the pipeline reports the tail's status and a
+FAILING build reads as PASS. All 8 live in 118.2 PLAN.md files authored at
+`cb5d1365`, i.e. before any 118.2 execution commit:
+
+| Plan file | Line |
+|-----------|------|
+| `118.2-04-PLAN.md` | 468 |
+| `118.2-05-PLAN.md` | 277 | **fixed by 118.2-05** |
+| `118.2-06-PLAN.md` | 256 |
+| `118.2-07-PLAN.md` | 216 |
+| `118.2-07-PLAN.md` | 307 |
+| `118.2-08-PLAN.md` | 157 |
+| `118.2-09-PLAN.md` | 174 |
+| `118.2-09-PLAN.md` | 228 |
+
+118.2-05 fixed only its OWN line (277), rewriting it as two
+`bash -o pipefail -c '... | tee <log>'` invocations. The remaining **7** belong
+to plans 04, 06, 07, 08 and 09 and are out of 118.2-05's scope.
+
+**Disposition:** each plan's executor should fix its own line as its first act,
+or a single sweep should fix all 7. Until then `make quality-gate` fails at
+`lint-plans` for a reason unrelated to any source change — a SECOND pre-existing
+blocker stacked on top of the `fmt-check` one recorded above.
