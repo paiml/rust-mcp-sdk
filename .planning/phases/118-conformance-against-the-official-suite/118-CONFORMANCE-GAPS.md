@@ -587,3 +587,87 @@ Two things follow, and both matter for the gate hardening in plan `118.2-11` Tas
 
 `ServerAcceptsWhitespaceHeaderValue` — the flake that D-16 and threat `T-118.2-11-06` actually
 anticipated — did **not** fire in any of the nine runs (`http-header-validation` 14/0 every time).
+
+---
+
+## Dispositions — Phase 118.2 (amendment 3: the D-14 re-pin, and the phase's two deltas signed off)
+
+**Amended:** 2026-08-17 by plan `118.2-12`, the phase's final act.
+**Appends only; nothing above this line is edited or deleted.**
+
+### The re-pin question, asked and answered: there was nothing to bump to
+
+D-14 requires the suite pin to be moved to whatever is newest as the **final act of the phase**, so the
+bump's delta is reported separately from the SDK fixes' delta. The registry returned no target:
+
+```
+$ npm view @modelcontextprotocol/conformance dist-tags --json
+{ "latest": "0.1.16", "alpha": "0.2.0-alpha.11" }
+
+$ npm view @modelcontextprotocol/conformance versions --json   # tail
+… "0.2.0-alpha.9", "0.2.0-alpha.10", "0.2.0-alpha.11" ]
+```
+
+The `alpha` dist-tag points at the version already pinned and the version list ends there. `latest` is
+`0.1.16` — **older** than the pin, and on the `0.1.x` line that `conformance/README.md` § 3 rules out
+entirely, so taking it would be a downgrade dressed as a re-pin. **No bump was manufactured**, exactly as
+the plan sanctions. `conformance/package.json` and `conformance/package-lock.json` are byte-unchanged; no
+resolved version moved for any of the 117 packages, so the supply-chain change D-14 anticipated
+(`T-118.2-12-01`, `T-118.2-12-SC`) did not occur. Full `npm view` evidence and the re-run legitimacy
+checks are in `conformance/README.md` § 13's 2026-08-17 entry.
+
+### The phase's two deltas — separately labelled, and NEVER summed
+
+This is D-14's whole point. Three measurement rows, two deltas, no addition between them:
+
+| # | Measurement | Pin | Gate | `2025-11-25` | `2026-07-28` |
+|---|---|---|---|---|---|
+| **A** | 118.1 closing | `0.2.0-alpha.11` | pre-hardening | 72 passed, 2 failed → **leg exit 1** | 142 passed, 36 failed → exit 0 |
+| **B** | 118.2-11 held-pin | `0.2.0-alpha.11` | D-16 hardened | **73 passed, 1 failed → leg exit 0** | 142 passed, 36 failed → exit 0 |
+| **C** | 118.2-12 new-pin | `0.2.0-alpha.11` *(already newest)* | D-16 hardened | 73 passed, 1 failed → leg exit 0 | 142 passed, 36 failed → exit 0 |
+
+**Delta 1 — the SDK fixes (A → B).** `2025-11-25` `72 passed, 2 failed / exit 1` → `73 passed, 1 failed /
+exit 0`; `GAP_ATTRIBUTABLE_FAILURES` **1 → 0**; checks executed unchanged at 74, which is the evidence
+that two checks flipped inside one scenario rather than the roster moving. `2026-07-28` unchanged.
+
+**Delta 2 — the suite bump (B → C). NIL, by construction** — there was no bump available to take, so
+there is no suite-version confound to separate out. Delta 1 is therefore the whole of the phase's
+externally measured delta, and it is attributable entirely to the SDK.
+
+### Floors: all six re-verified, none moved, none lowered
+
+`MIN_CHECKS_V1` 74, `MIN_CHECKS_V2` 178, `MIN_MRTR_SCENARIOS` 14, `MIN_SCORED_SCENARIOS_V1` 30,
+`MIN_SCORED_SCENARIOS_V2` 37, `MIN_BLOCKING_GREEN_SCENARIOS` 30 — each **exactly met** by the fresh run,
+and a floor rises only when the measurement *exceeds* it. All 30 named blocking scenarios were PRESENT,
+which is the direct evidence that the absent-entry-is-a-FAILURE rule (`T-118.2-12-04`) had nothing to
+catch: the suite renamed nothing, because the suite did not change. **D-21 intact** — plan 12's edit to
+`scripts/run-conformance-suite.sh` is comment-only, `--expected-failures` occurrences stayed at 1 (the
+§ 9 prohibition), no allowlist or known-failure baseline exists, and `2025-11-25` remains in
+`FULLY_SCORED_GREEN_REVISIONS`.
+
+### Developer sign-off — 2026-08-17, **approved**
+
+The developer accepted the re-pin outcome at plan `118.2-12`'s blocking checkpoint: **hold at
+`0.2.0-alpha.11` because it is already newest, with the bump delta recorded as nil.** The plan's red-run
+branch (classify SDK-regression vs suite-side change) did not apply — the run was green, so there was no
+failure to classify. The approval covers the pin and the two deltas **only**; it closes no defect.
+
+### Three findings deliberately kept OPEN at sign-off
+
+Recorded here because a reader arriving at a green closing number is exactly the reader most likely to
+assume these went away with it. None of them did, and the developer specifically endorsed not claiming
+them:
+
+1. **`2025-11-25:tools-call-elicitation` is NOT claimed fixed** (`.planning/WINDOWS.md` entry 9). It did
+   not fire in plan 12's runs, taking the observed record to 10 green in 11 fresh runs — but further
+   green runs are evidence about *frequency*, not about the defect. It stays OPEN.
+2. **`ServerAcceptsWhitespaceHeaderValue` remains UNSCORED, exposure unchanged** (`T-118.2-12-05`). At
+   the newest pin the suite still classifies `2026-07-28:http-header-validation` as `pending` (not
+   scored), it ran 14 passed / 0 failed, and it does not appear on the v1 leg at all. The risk D-16
+   named — a future pin *scoring* it, making `exit 0` unattainable for a suite-side reason — is
+   therefore unrealised, not retired. Nothing was pre-emptively softened for it.
+3. **SEP-2575 on v2 and the client request-lifecycle deadlock both remain OPEN**
+   (`.planning/WINDOWS.md` entries 5 and 6). The v2 leg still runs no `sep-2575-*` scenario, so the
+   default-log-level defect is still not externally observable and these green numbers say nothing about
+   it either way; and a pmcp client still cannot ANSWER a server-to-client request issued during its own
+   call — delivery is fixed, the answer path deadlocks.

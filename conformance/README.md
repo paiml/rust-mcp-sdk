@@ -452,4 +452,17 @@ failures, suite exit 0; `CONF-01 gates PASSED`, script exit 0. Every number is i
 held-pin measurement, which is the expected consequence of an unchanged pin and is recorded because
 "identical" and "not re-measured" are different facts.
 
+**Signed off:** 2026-08-17, developer **approved** the outcome at plan `118.2-12`'s blocking
+checkpoint — the pin stays at `0.2.0-alpha.11` because it is already the newest published version,
+and the bump delta stands recorded as nil. Approving a *nil* bump is not a formality: it is the
+record that the question was asked and answered against the registry on this date, which is what
+distinguishes "we checked and there was nothing to move to" from "nobody looked". The approval
+covers the held pin and the nil delta **only** — it closes no defect. Three findings were explicitly
+kept open at sign-off and are not resolved by these green numbers: the `2025-11-25:tools-call-elicitation`
+flake (`.planning/WINDOWS.md` entry 9, **not** claimed fixed by further green runs),
+`ServerAcceptsWhitespaceHeaderValue` (still **unscored**, exposure unchanged, nothing pre-emptively
+softened for it per section 9), and SEP-2575 on v2 plus the client request-lifecycle deadlock
+(`.planning/WINDOWS.md` entries 5 and 6). No floor moved, and section 9's prohibitions were neither
+weakened nor exempted.
+
 **When to ask again:** unchanged from the entry above.
