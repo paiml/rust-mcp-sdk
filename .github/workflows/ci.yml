@@ -643,7 +643,7 @@ jobs:
 
     # Fences 1 and 2.
     - name: Install Node 22 (suite requires >= 22; see fence 1)
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
         node-version: '22'
         cache: 'npm'
