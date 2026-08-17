@@ -285,16 +285,23 @@ fn log_with_no_sink_is_ok_and_emits_nothing() {
 /// Asserted against LITERALS. Nothing here is imported from `src/`, because a
 /// test that reads its expectation out of the code under test asserts nothing.
 ///
-/// # Known divergence from the vendored schema
+/// # The `data` member is REQUIRED, and `message` rides alongside it
 ///
 /// `schema/vendored/core-2026-07-28/schema.ts` declares
 /// `LoggingMessageNotificationParams` as `{ level, logger?, data }` — `data` is
-/// REQUIRED and there is no `message` member. pmcp's `LogMessageParams` instead
-/// carries a required `message` and an OPTIONAL `data`. This fence pins what
-/// pmcp emits TODAY so the divergence is a recorded, visible fact rather than a
-/// surprise discovered by a conformance run. Changing `LogMessageParams` is a
-/// breaking change to a public type and is out of this plan's scope; see the
-/// phase's `deferred-items.md`.
+/// REQUIRED and there is no `message` member at all. Since plan 118.2-13 the
+/// emitter DEFAULTS `data` to the message string when the caller supplied none,
+/// so every frame pmcp puts on the wire satisfies that requirement. `message`
+/// stays alongside as a pmcp extension: the schema does not close
+/// `additionalProperties`, and the official reference client strips unknown
+/// members rather than rejecting them.
+///
+/// This fence previously asserted the OPPOSITE — `data must be absent for a
+/// plain log(..)` — under plan 118.2-08's verdict that no suite scenario
+/// validates an emitted notification's params. Plan 118.2-11 MEASURED that
+/// premise false: `WireSchemaValid` is not a scenario, it is a check that runs
+/// inside scenarios over every frame the implementation sends, and it failed
+/// with `LoggingMessageNotification/params: must have required property 'data'`.
 #[test]
 fn a_log_record_serializes_as_the_spec_notifications_message_shape() {
     let capture = Capture::new();
@@ -331,9 +338,12 @@ fn a_log_record_serializes_as_the_spec_notifications_message_shape() {
         "logger must be ABSENT — the emitter does not synthesise one, because a \
          synthesised logger name would be a guess; got {params}"
     );
-    assert!(
-        params.get("data").is_none(),
-        "data must be absent for a plain log(..); got {params}"
+    assert_eq!(
+        params.get("data").and_then(serde_json::Value::as_str),
+        Some("hello"),
+        "data must be PRESENT for a plain log(..), carrying the message string — the vendored \
+         schema marks it required and the reference client's `z.unknown()` is non-optional under \
+         zod v4, so an absent `data` makes the client drop the frame; got {params}"
     );
 
     let error = &records[1];
@@ -1891,41 +1901,50 @@ fn both_dispatch_roots_answer_set_logging_level_from_one_shared_unit() {
 }
 
 // ===========================================================================
-// The `LogMessageParams` spec divergence — VERDICT, measured (plan 05 handed
-// this decision to plan 08).
+// The `LogMessageParams` wire contract — RESOLVED (plan 118.2-13, Option A).
 //
 // `schema/vendored/core-2026-07-28/schema.ts` declares
 // `LoggingMessageNotificationParams` as `{ level, logger?, data }` — `data` is
 // REQUIRED and there is no `message` member at all. pmcp's `LogMessageParams` is
-// the reverse: a REQUIRED `message: String` and an OPTIONAL `data`. So
-// `extra.log(Warning, "hello")` emits `{"level":"warning","message":"hello"}`.
+// the reverse shape in RUST: a required `message: String` and an
+// `Option<Value> data` skipped when `None`.
 //
-// # The verdict: DEFERRED, not fixed here — and the premise for fixing it now is
-// # FALSIFIED by measurement
+// # This fence used to assert the two sides DISAGREE. They no longer do.
 //
-// Plan 05 recorded the condition under which the type change becomes in-scope:
-// "if the official suite validates `params.data`, the current shape fails it".
-// It does not. The pinned suite bundles the schema (its `LoggingMessageNotification`
-// definition carries `required: ['data','level']`), but the ONLY scenario in it
-// that touches a `notifications/message` is the NEGATIVE
-// `sep-2575-server-no-log-without-loglevel`, which asserts that NO such
-// notification is emitted for a request that did not set
-// `_meta["io.modelcontextprotocol/logLevel"]`. It never validates the params of
-// one that IS emitted. `logging-set-level`, the other logging scenario, only
-// inspects the RPC's response. So the divergence costs zero conformance points
-// today, and the trigger plan 05 named has not fired.
+// Plan 118.2-08 wrote it that way on the premise that "no suite scenario
+// validates an emitted notification's params", and on that basis DECLARED the
+// divergence rather than fixing it. Plan 118.2-11 measured the premise FALSE.
+// `WireSchemaValid` is not a scenario — it is a check that runs INSIDE scenarios
+// and validates every frame the implementation sends. At the held
+// `0.2.0-alpha.11` pin the `2025-11-25` leg regressed 72/2 -> 71/3, entirely on
+// `tools-call-with-logging` (1/1 -> 0/2), and `WireSchemaValid` newly failed with
+// `messagesValidated: 10`, quoting all three frames as
+// `LoggingMessageNotification/params: must have required property 'data'`.
+// Reproduced directly against the pinned bundle:
 //
-// Against that: changing the serde shape of `LogMessageParams` is a BREAKING
-// change to a public type — pmcp is at 2.x with no open breaking-change window —
-// and choosing the replacement (does `message` become `data`? does `log(..)` set
-// `data` to a JSON string and keep `message` as an extension?) is a design
-// decision that belongs to a semver phase, not to a dispatch-arm plan whose
-// `files_modified` does not include `src/types/notifications.rs`.
+//     {level:'info', message:'Tool execution started'}  -> parse ok: false
+//         invalid_type at params.data: expected nonoptional, received undefined
+//     {level:'info', data:'Tool execution started'}     -> parse ok: true
 //
-// So it stays DECLARED rather than fixed — and this fence turns the declaration
-// into a measured, in-tree, CI-visible fact by reading the vendored schema, so
-// the day someone changes either side the disagreement is a red test rather than
-// a note in a summary nobody re-reads.
+// The reference client's `LoggingMessageNotificationParamsSchema` uses
+// `z.unknown()`, which is NON-OPTIONAL under the bundled zod v4, so a frame
+// without `data` is dropped on the floor.
+//
+// # The resolution: Option A — default `data`, change no Rust API
+//
+// `emit_log_record` now populates `data` with the message string when the caller
+// supplied none. `message` stays on the wire as a pmcp extension: the schema does
+// not close `additionalProperties`, and the measurement above shows the
+// `data`-bearing frame parses `ok: true` even with `message` also present.
+//
+// Rejected at the same checkpoint: B (wrap `data` as `{"message": ...}`),
+// C (drop `message` — breaking), and D (change only the conformance fixture,
+// rejected as gaming the referee: it turns the suite green while every real
+// `extra.log` caller keeps emitting non-conformant frames).
+//
+// The fence keeps its valuable half — it READS the in-repo vendored schema rather
+// than a hardcoded copy, so a re-vendor still moves it — and inverts its payload
+// half: the emitted frame must now SATISFY the schema's `data` requirement.
 // ===========================================================================
 
 const VENDORED_V2_SCHEMA: &str = concat!(
@@ -1934,7 +1953,7 @@ const VENDORED_V2_SCHEMA: &str = concat!(
 );
 
 #[test]
-fn the_vendored_schema_requires_data_where_pmcp_emits_message() {
+fn the_emitted_frame_satisfies_the_vendored_schemas_required_data_member() {
     let schema = std::fs::read_to_string(VENDORED_V2_SCHEMA)
         .unwrap_or_else(|e| panic!("{VENDORED_V2_SCHEMA} is readable: {e}"));
     let start = schema
@@ -1978,16 +1997,157 @@ fn the_vendored_schema_requires_data_where_pmcp_emits_message() {
         .unwrap_or_else(|| panic!("the record carries params: {emitted}"));
 
     assert_eq!(
+        params.get("data").and_then(Value::as_str),
+        Some("hello"),
+        "the emitted frame must SATISFY the schema's required `data` member. An absent `data` is \
+         what made the reference client drop every frame — its `z.unknown()` is non-optional \
+         under zod v4 — and cost `2025-11-25:tools-call-with-logging` its 1/1: {params}"
+    );
+    assert_eq!(
         params.get("message").and_then(Value::as_str),
         Some("hello"),
-        "pmcp emits the text under `message`, a member the vendored schema does not define: \
-         {params}"
+        "and `message` still rides alongside as a pmcp extension. The schema does not close \
+         `additionalProperties` and the reference client strips unknown members rather than \
+         rejecting them, so keeping it costs nothing and removing it would be a breaking change \
+         to a public type (Option C, rejected): {params}"
+    );
+}
+
+// ===========================================================================
+// The required-`data` contract, at the emitter (plan 118.2-13).
+//
+// Four fences, in the order the plan names them: the wire shape of a plain
+// `log(..)`, the pass-through guarantee of `log_with_data(..)`, and the
+// early-return ordering the change must not disturb. The rewritten schema fence
+// above is the fourth.
+// ===========================================================================
+
+/// A plain `extra.log(level, message)` emits a `data` member holding the message.
+///
+/// The fence the whole plan exists for. `level` and `message` must still be
+/// there, and `logger` must still be ABSENT — the emitter does not synthesise
+/// one, and defaulting `data` must not have grown a second guess alongside it.
+#[test]
+fn a_plain_log_emits_the_required_data_member_carrying_the_message() {
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+
+    extra
+        .log(LoggingLevel::Info, "Tool execution started")
+        .expect("log must be Ok(())");
+
+    let records = capture.json();
+    assert_eq!(records.len(), 1, "exactly one record must reach the sink");
+    let params = records[0]
+        .pointer("/params")
+        .unwrap_or_else(|| panic!("the record carries params: {}", records[0]));
+
+    // The member the vendored schema marks REQUIRED, and the exact frame the
+    // pinned reference client parsed `ok: true` where the `message`-only one
+    // parsed `ok: false`.
+    assert_eq!(
+        params.get("data").and_then(serde_json::Value::as_str),
+        Some("Tool execution started"),
+        "`data` must be present and must carry the message string; got {params}"
+    );
+    assert_eq!(
+        params.get("level").and_then(serde_json::Value::as_str),
+        Some("info"),
+        "`level` must survive unchanged; got {params}"
+    );
+    assert_eq!(
+        params.get("message").and_then(serde_json::Value::as_str),
+        Some("Tool execution started"),
+        "`message` must survive alongside `data` — Option A keeps it as a pmcp extension rather \
+         than removing it (Option C, breaking); got {params}"
     );
     assert!(
-        params.get("data").is_none(),
-        "and it emits NO `data`, which the vendored schema marks required. DEFERRED, not a bug \
-         to fix in passing: changing this is a breaking change to the public `LogMessageParams`, \
-         and the pinned conformance suite validates no emitted `notifications/message` params at \
-         all — see the verdict recorded above this fence: {params}"
+        params.get("logger").is_none(),
+        "`logger` must remain ABSENT — a synthesised logger category is a guess that looks \
+         authoritative, and defaulting `data` is not licence to start guessing; got {params}"
+    );
+}
+
+/// An explicitly supplied `data` is emitted verbatim and is NEVER overwritten.
+///
+/// A non-string JSON object on purpose: a naive "always set `data` to the
+/// message" implementation would replace it with a string and this fence would
+/// catch that. It passes both before and after the change — it is the regression
+/// guard on the half of the behaviour that was already correct.
+#[test]
+fn an_explicitly_supplied_data_value_survives_verbatim() {
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default().with_log_sink(capture.sink());
+
+    let supplied = json!({ "elapsedMs": 1_840, "table": "orders", "message": "not this one" });
+    extra
+        .log_with_data(LoggingLevel::Warning, "slow query", supplied.clone())
+        .expect("log_with_data must be Ok(())");
+
+    let records = capture.json();
+    assert_eq!(records.len(), 1, "exactly one record must reach the sink");
+    let params = records[0]
+        .pointer("/params")
+        .unwrap_or_else(|| panic!("the record carries params: {}", records[0]));
+
+    assert_eq!(
+        params.get("data"),
+        Some(&supplied),
+        "the caller's `data` must reach the wire byte-for-byte. If this is the message string, \
+         the default was applied where a value was already supplied; got {params}"
+    );
+    assert_eq!(
+        params.get("message").and_then(serde_json::Value::as_str),
+        Some("slow query"),
+        "and `message` is still the caller's message, not the data's own `message` key; \
+         got {params}"
+    );
+}
+
+/// A record below the effective level constructs NOTHING and never reaches the
+/// sink.
+///
+/// This pins the early-return ordering the `data` default must not disturb: the
+/// level short-circuit and the no-sink return both happen BEFORE any payload is
+/// built, so a below-bar record allocates no data value. Asserted over every
+/// level strictly below the bar rather than one sample, because the ordering is a
+/// property of the function and not of a particular level.
+#[test]
+fn a_below_bar_record_never_reaches_the_sink_and_builds_no_payload() {
+    let capture = Capture::new();
+    let extra = RequestHandlerExtra::default()
+        .with_log_sink(capture.sink())
+        .with_log_level(LoggingLevel::Error);
+
+    for below in [
+        LoggingLevel::Debug,
+        LoggingLevel::Info,
+        LoggingLevel::Notice,
+        LoggingLevel::Warning,
+    ] {
+        extra
+            .log(below, "below the bar")
+            .expect("a suppressed record still returns Ok(())");
+        extra
+            .log_with_data(below, "below the bar", json!({ "k": 1 }))
+            .expect("a suppressed record still returns Ok(())");
+    }
+
+    assert_eq!(
+        capture.len(),
+        0,
+        "nothing below the bar may reach the sink — the level check must stay the FIRST thing \
+         `emit_log_record` does, ahead of the `data` default"
+    );
+
+    // And the bar itself still delivers, so the fence above is not passing
+    // because the emitter went silent altogether.
+    extra
+        .log(LoggingLevel::Error, "at the bar")
+        .expect("must be Ok(())");
+    assert_eq!(
+        capture.len(),
+        1,
+        "a record AT the bar must still be delivered"
     );
 }
