@@ -864,6 +864,32 @@ impl RequestHandlerExtra {
     /// that is a deliberate evolution seam so a future "sink refused" signal is
     /// additive rather than breaking, and it is not a claim that this body has
     /// a failure mode.
+    ///
+    /// # `data` is always populated, even when the caller supplied none
+    ///
+    /// `LoggingMessageNotificationParams` declares `data` REQUIRED with no
+    /// `message` member at all (`schema/vendored/core-2026-07-28/schema.ts`), and
+    /// the official reference client's `LoggingMessageNotificationParamsSchema`
+    /// spells it `z.unknown()` — which is NON-OPTIONAL under the bundled zod v4.
+    /// A frame without `data` therefore fails to parse and is dropped on the
+    /// floor: measured, at the pinned suite, as
+    /// `invalid_type at params.data: expected nonoptional, received undefined`.
+    ///
+    /// So when the caller used [`log`](Self::log) and supplied no data, `data` is
+    /// set to the message string. `message` still rides alongside, as a pmcp
+    /// extension the schema permits (it does not close `additionalProperties`)
+    /// and the reference client tolerates (it strips unknown members rather than
+    /// rejecting them). When the caller used
+    /// [`log_with_data`](Self::log_with_data), their value is passed through
+    /// VERBATIM and is never overwritten by the message.
+    ///
+    /// Do not "simplify" the default away: without it,
+    /// `2025-11-25:tools-call-with-logging` scores 0/2 and the suite's
+    /// `WireSchemaValid` check reports
+    /// `LoggingMessageNotification/params: must have required property 'data'`.
+    ///
+    /// Both early returns below stay AHEAD of this: a record below the effective
+    /// level, or one with no sink attached, still constructs no payload at all.
     fn emit_log_record(
         &self,
         level: crate::types::LoggingLevel,
@@ -881,13 +907,21 @@ impl RequestHandlerExtra {
             return;
         };
 
+        // `data` is REQUIRED by the wire schema, so a caller who supplied none
+        // gets the message string. See this function's rustdoc for the
+        // measurement; the short version is that the official reference client
+        // drops a frame without `data` on the floor.
+        //
+        // The `clone` is in the `None` arm ONLY and is not a borrow-checker
+        // concession: the frame genuinely carries the text twice, under `data`
+        // and under `message`, so exactly one extra allocation is the floor. The
+        // `Some` arm moves the caller's value and clones nothing.
+        let data = data.unwrap_or_else(|| serde_json::Value::String(message.clone()));
+
         // `logger` is deliberately left `None`. Synthesising one from the tool
         // name would be a guess, and a guessed logger category is worse than an
         // absent one because it looks authoritative.
-        let mut params = crate::types::LogMessageParams::new(level, message);
-        if let Some(data) = data {
-            params = params.with_data(data);
-        }
+        let params = crate::types::LogMessageParams::new(level, message).with_data(data);
 
         sink(Notification::Server(
             crate::types::ServerNotification::LogMessage(params),
