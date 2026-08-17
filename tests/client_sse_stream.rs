@@ -57,7 +57,7 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +65,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -139,6 +139,44 @@ const BACKPRESSURE_FRAME_COUNT: usize = 256;
 /// [`BACKPRESSURE_FRAME_COUNT`] channel hand-offs, not one wire operation.
 const DRAIN_BOUND: Duration = Duration::from_secs(30);
 
+/// The reconnect budget the transport ships, restated here (plan 04, D-03).
+///
+/// `MAX_SSE_RECONNECT_ATTEMPTS` is a PRIVATE constant on
+/// `src/shared/streamable_http.rs` — every knob on that transport is private
+/// precisely so that none of them is a semver event — so an integration test
+/// cannot import it. Restating it is safe because a drift is caught by the very
+/// fence that uses it: the observed GET count would stop being
+/// `1 + SHIPPED_RECONNECT_BUDGET` and
+/// [`reconnect_gives_up_after_the_retry_budget_with_a_named_error`] would fail
+/// with both numbers in its message.
+const SHIPPED_RECONNECT_BUDGET: usize = 2;
+
+/// Upper bound on an operation that has to outlast the WHOLE reconnect schedule.
+///
+/// The shipped curve is the reference client's: 1000 ms, then 1500 ms
+/// (`initialReconnectionDelay` x `reconnectionDelayGrowFactor^attempt`), i.e.
+/// 2.5 s of deliberate sleeping before the budget is spent. [`BOUND`] is an upper
+/// bound on ONE wire operation and is deliberately not stretched to cover that.
+///
+/// Deliberately NOT solved with a test-only "make the backoff shorter" knob on
+/// the transport: such a knob would have to be `pub` to be reachable from an
+/// integration test (`tests/` is a separate crate), which would put a
+/// test-shaped affordance into pmcp's public API and into its
+/// `cargo semver-checks` verdict. Waiting out the shipped curve measures the
+/// SHIPPED curve.
+const RECONNECT_BOUND: Duration = Duration::from_secs(20);
+
+/// How long a listener is watched to prove NO further GET arrives.
+///
+/// Must outlast everything still scheduled at the moment of the close — the
+/// remaining backoff plus the reconnect it would have issued — or the fence
+/// would pass merely by looking too early. Longer than [`QUIET`] for exactly
+/// that reason.
+const RECONNECT_QUIET: Duration = Duration::from_secs(4);
+
+/// The event id fence 11 pushes and then requires on the reconnect GET.
+const RESUMED_FROM: &str = "e7";
+
 // ===========================================================================
 // The recording listener.
 //
@@ -186,6 +224,29 @@ struct Shared {
     /// Empty by default, so the GET fences see exactly the harness they always
     /// did.
     sse_post_methods: Mutex<HashSet<String>>,
+    /// The `Last-Event-ID` value each GET carried, in arrival order (plan 04).
+    ///
+    /// The ONE header this harness records, recorded by NAME rather than by
+    /// capturing the header block: the module's rule is that a harness change
+    /// must not be able to leak an `Authorization` header into a CI log, and an
+    /// allow-list of exactly one non-credential header keeps that rule true
+    /// while still giving fence 11 the actual wire value to assert on. `None`
+    /// means the GET carried no such header at all, which is itself the
+    /// assertion a first-open (and a `full-v2` build) has to satisfy.
+    get_cursors: Mutex<Vec<Option<String>>>,
+    /// When set, every GET is answered with a `text/event-stream` head and a
+    /// zero-length body — a session stream that ends the instant it opens.
+    ///
+    /// The proxy-blink shape D-03 exists for, reduced to its limit: an idle
+    /// timeout that fires immediately, every time.
+    close_get_on_accept: AtomicBool,
+    /// Bumped to end every LIVE SSE body cleanly, mid-flight.
+    ///
+    /// A `watch` rather than a `Notify` deliberately: `Notify::notify_waiters`
+    /// wakes only the tasks ALREADY parked on it, so a signal raised between two
+    /// iterations of the pump loop would be lost and the fence would hang until
+    /// its bound rather than fail on its subject.
+    close_live: watch::Sender<u64>,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -212,6 +273,7 @@ impl RecordingServer {
         // socket.
         let (frames, frames_rx) = mpsc::channel::<String>(1);
         let (post_frames, post_frames_rx) = mpsc::channel::<String>(1);
+        let (close_live, _) = watch::channel(0u64);
         let shared = Arc::new(Shared {
             request_lines: Mutex::new(Vec::new()),
             post_bodies: Mutex::new(Vec::new()),
@@ -221,6 +283,9 @@ impl RecordingServer {
             frames_rx: Mutex::new(Some(frames_rx)),
             post_frames_rx: Mutex::new(Some(post_frames_rx)),
             sse_post_methods: Mutex::new(HashSet::new()),
+            get_cursors: Mutex::new(Vec::new()),
+            close_get_on_accept: AtomicBool::new(false),
+            close_live,
         });
 
         let accept = tokio::spawn({
@@ -276,6 +341,34 @@ impl RecordingServer {
             .expect("the POST frame channel is open");
     }
 
+    /// Answer every GET with a `text/event-stream` that ends the instant it
+    /// opens, instead of one held open forever (plan 04).
+    ///
+    /// Call BEFORE the client connects. This is the D-03 subject reduced to its
+    /// limit: an idle-timeout proxy that blinks every single time.
+    fn close_get_streams_on_accept(&self) {
+        self.shared
+            .close_get_on_accept
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// End every LIVE SSE body cleanly, mid-flight (plan 04).
+    ///
+    /// Writes the terminating zero-length chunk and shuts the socket down, so
+    /// the client sees an ordinary end-of-body rather than a truncation — the
+    /// shape an idle-timeout proxy produces, and the one a reconnect must
+    /// survive.
+    fn end_live_sse_streams(&self) {
+        self.shared
+            .close_live
+            .send_modify(|generation| *generation += 1);
+    }
+
+    /// The `Last-Event-ID` each observed GET carried, in arrival order.
+    fn get_cursors(&self) -> Vec<Option<String>> {
+        self.shared.get_cursors.lock().clone()
+    }
+
     fn request_lines(&self) -> Vec<String> {
         self.shared.request_lines.lock().clone()
     }
@@ -327,6 +420,10 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
     shared.request_lines.lock().push(request_line.clone());
 
     let mut content_length = 0usize;
+    // The ONE header value this harness ever retains. See `Shared::get_cursors`
+    // for why an allow-list of exactly one non-credential header name keeps the
+    // module's never-record-a-header rule intact.
+    let mut cursor: Option<String> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -340,6 +437,9 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
             }
+            if name.trim().eq_ignore_ascii_case("last-event-id") {
+                cursor = Some(value.trim().to_string());
+            }
         }
     }
 
@@ -349,6 +449,11 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
     }
 
     if request_line.starts_with("GET ") {
+        shared.get_cursors.lock().push(cursor);
+        if shared.close_get_on_accept.load(Ordering::SeqCst) {
+            serve_get_that_ends_at_once(&mut write_half).await;
+            return;
+        }
         serve_get(reader, write_half, &shared).await;
         return;
     }
@@ -405,6 +510,25 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value) {
     let _ = write_half.shutdown().await;
 }
 
+/// Answer a GET with a `text/event-stream` whose body is already over (plan 04).
+///
+/// A well-formed, successful response — the client's open SUCCEEDS — that then
+/// delivers end-of-body immediately. That is the distinction D-03 turns on: a
+/// stream that DROPPED is retryable, whereas a failed open or a corrupt frame is
+/// not, and only a response that opens cleanly exercises the retryable path.
+///
+/// `content-length: 0` rather than a chunked body with a terminating chunk, and
+/// `connection: close` rather than a poolable socket: both make "this stream is
+/// over" unambiguous to hyper, so the reconnect that follows opens a NEW
+/// connection instead of racing a pooled one this task is about to drop.
+async fn serve_get_that_ends_at_once(write_half: &mut WriteHalf<TcpStream>) {
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                cache-control: no-cache\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let _ = write_half.write_all(head.as_bytes()).await;
+    let _ = write_half.flush().await;
+    let _ = write_half.shutdown().await;
+}
+
 /// Answer a GET with the never-ending `text/event-stream` session stream.
 async fn serve_get(
     reader: BufReader<ReadHalf<TcpStream>>,
@@ -445,9 +569,14 @@ async fn serve_post_sse(
 /// Write the `text/event-stream` head, then pump pushed frames until the peer
 /// closes — counting the connection as open for exactly that span.
 ///
-/// No terminating zero-length chunk is ever written. The connection ends only
-/// when the client closes it — which is exactly what makes this the shape a
-/// whole-body `collect()` cannot read.
+/// No terminating zero-length chunk is written while the stream is LIVE. The
+/// connection ends only when the client closes it, or when a fence asks for it
+/// through [`RecordingServer::end_live_sse_streams`] — which is exactly what
+/// makes this the shape a whole-body `collect()` cannot read.
+///
+/// On the way out the terminating chunk IS written, so a fence-requested close
+/// reaches the client as an ordinary end-of-body rather than as a truncation.
+/// When the peer already went away the write simply fails and is ignored.
 async fn serve_sse_body(
     mut reader: BufReader<ReadHalf<TcpStream>>,
     mut write_half: WriteHalf<TcpStream>,
@@ -457,15 +586,30 @@ async fn serve_sse_body(
 ) {
     open.fetch_add(1, Ordering::SeqCst);
 
+    // Subscribed BEFORE the head is written, so a close raised at any point
+    // after this connection was accepted is seen rather than missed.
+    let mut close_live = shared.close_live.subscribe();
+
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\r\n";
+                cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\
+                connection: close\r\n\r\n";
     if write_half.write_all(head.as_bytes()).await.is_ok() && write_half.flush().await.is_ok() {
         let mut frames_rx = source.lock().take();
-        pump_frames(&mut reader, &mut write_half, shared, frames_rx.as_mut()).await;
+        pump_frames(
+            &mut reader,
+            &mut write_half,
+            shared,
+            frames_rx.as_mut(),
+            &mut close_live,
+        )
+        .await;
         // Hand the source back so a LATER stream on this same harness can use it.
         if let Some(rx) = frames_rx {
             *source.lock() = Some(rx);
         }
+        let _ = write_half.write_all(b"0\r\n\r\n").await;
+        let _ = write_half.flush().await;
+        let _ = write_half.shutdown().await;
     }
 
     open.fetch_sub(1, Ordering::SeqCst);
@@ -483,6 +627,7 @@ async fn pump_frames(
     write_half: &mut WriteHalf<TcpStream>,
     shared: &Shared,
     mut frames_rx: Option<&mut mpsc::Receiver<String>>,
+    close_live: &mut watch::Receiver<u64>,
 ) {
     let mut scratch = [0u8; 1024];
     loop {
@@ -501,11 +646,17 @@ async fn pump_frames(
                             return;
                         }
                     },
+                    _ = close_live.changed() => return,
                 }
             },
             None => {
-                if !matches!(reader.read(&mut scratch).await, Ok(bytes) if bytes > 0) {
-                    return;
+                tokio::select! {
+                    read = reader.read(&mut scratch) => {
+                        if !matches!(read, Ok(bytes) if bytes > 0) {
+                            return;
+                        }
+                    },
+                    _ = close_live.changed() => return,
                 }
             },
         }
@@ -537,8 +688,18 @@ fn transport_for(server: &RecordingServer) -> StreamableHttpTransport {
 }
 
 /// Poll `predicate` until it holds, or [`BOUND`] elapses.
-async fn wait_for(mut predicate: impl FnMut() -> bool) -> bool {
-    timeout(BOUND, async {
+async fn wait_for(predicate: impl FnMut() -> bool) -> bool {
+    wait_for_within(BOUND, predicate).await
+}
+
+/// Poll `predicate` until it holds, or `bound` elapses.
+///
+/// The reconnect fences wait out a schedule measured in seconds of deliberate
+/// backoff, which is not a wire operation and so is not [`BOUND`]'s business.
+/// Still a POLL inside a bound, never a fixed sleep used as a synchronisation
+/// device: the fence proceeds the moment the condition holds.
+async fn wait_for_within(bound: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    timeout(bound, async {
         loop {
             if predicate() {
                 return;
@@ -834,6 +995,12 @@ async fn an_oversized_chunk_ends_the_stream_with_an_error_naming_the_limit() {
         "the overflow error must echo NO body content — the bytes that tripped the bound are \
          exactly the untrusted input the rule keeps out of a client's logs; got {text:?}"
     );
+    assert!(
+        !text.contains(RECONNECT_PHRASE),
+        "the D-02 corruption error must be DISCRIMINABLE from D-03's reconnect-budget exhaustion: \
+         a consumer has to be able to tell a corrupted stream (do not retry) from a lifecycle end \
+         (the peer went away); got {text:?}"
+    );
 
     server.shutdown().await;
 }
@@ -967,6 +1134,11 @@ async fn an_unparseable_frame_ends_the_stream_with_a_named_error() {
     assert!(
         !text.contains(SENTINEL),
         "any echoed frame text must be truncated to the 200-character bound; got {text:?}"
+    );
+    assert!(
+        !text.contains(RECONNECT_PHRASE),
+        "the D-05 corruption error must be DISCRIMINABLE from D-03's reconnect-budget exhaustion, \
+         for the same reason the D-02 one must; got {text:?}"
     );
 
     server.shutdown().await;
@@ -1158,6 +1330,239 @@ async fn a_post_sse_reader_terminates_when_its_owning_transport_is_dropped() {
         server.frames_written(),
         written,
         "nothing may still be consuming the orphaned stream a full QUIET later"
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fences 11-14 — D-03: bounded auto-reconnect with the resumption cursor, and
+// the two ways a client can go away while the loop is asleep in its backoff.
+//
+// Why this exists at all: real deployments idle-drop long-lived streams as a
+// matter of course (ALB at ~60 s, Cloudflare, most API gateways). Without a
+// reconnect the session stream this phase just opened silently regresses to
+// "no live stream" the first time a proxy blinks — the exact symptom the phase
+// exists to remove.
+// ===========================================================================
+
+/// The phrase D-03's exhaustion error carries and the D-02 / D-05 corruption
+/// errors must not.
+///
+/// The three are checked against each other in BOTH directions — fences 5 and 7
+/// assert its absence, fence 12 asserts its presence — because "the consumer can
+/// tell corruption from a lifecycle end" is a property of the SET of messages,
+/// not of any one of them.
+const RECONNECT_PHRASE: &str = "reconnect budget";
+
+// ===========================================================================
+// Fence 11 — a dropped stream is re-opened, carrying the last event id.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_dropped_stream_is_reopened_with_the_last_event_id() {
+    let server = RecordingServer::start().await;
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the session stream must be open before it can be dropped. Observed: {:?}",
+        server.request_lines()
+    );
+
+    // A frame carrying an id, RECEIVED — so the cursor is recorded by the same
+    // production path a live stream records it on, rather than planted.
+    server
+        .push_frame(progress_frame(RESUMED_FROM, "fence-11", 1, None))
+        .await;
+    let message = timeout(BOUND, transport.receive())
+        .await
+        .expect("the id-carrying frame reaches receive() within BOUND")
+        .expect("the frame parses into a transport message");
+    assert_eq!(progress_of(&message), Some(1.0), "got {message:?}");
+
+    // The proxy blinks.
+    server.end_live_sse_streams();
+
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= 2).await,
+        "a session stream dropped mid-flight must be RE-OPENED. Without this the phase's fix \
+         regresses to no-live-stream the first time an idle-timeout proxy closes the socket, \
+         which every real deployment does. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let cursors = server.get_cursors();
+    assert!(
+        cursors.len() >= 2,
+        "the harness must have recorded a cursor slot per GET; got {cursors:?}"
+    );
+    assert_eq!(
+        cursors[0], None,
+        "the FIRST open has nothing to resume from and must carry no cursor at all; got {cursors:?}"
+    );
+    assert_eq!(
+        cursors[1].as_deref(),
+        Some(RESUMED_FROM),
+        "the re-opened GET must carry the last event id ON THE WIRE, so the server can replay from \
+         it — a reconnect that starts from nothing loses every frame emitted during the gap. \
+         Observed cursors: {cursors:?}"
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 12 — the retry budget is bounded, and its exhaustion is LOUD.
+// ===========================================================================
+
+#[tokio::test]
+async fn reconnect_gives_up_after_the_retry_budget_with_a_named_error() {
+    let server = RecordingServer::start().await;
+    // Every GET opens successfully and ends immediately: a peer that will never
+    // hold a stream, which is what a bounded budget exists to stop chasing.
+    server.close_get_streams_on_accept();
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+
+    let expected_gets = 1 + SHIPPED_RECONNECT_BUDGET;
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= expected_gets).await,
+        "the initial open plus {SHIPPED_RECONNECT_BUDGET} budgeted retries must all be issued. \
+         Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let error = timeout(RECONNECT_BOUND, transport.receive())
+        .await
+        .expect("the exhaustion error reaches receive() within RECONNECT_BOUND")
+        .expect_err(
+            "an exhausted reconnect budget must SURFACE at Transport::receive(). A reader that \
+             simply stops is indistinguishable from a healthy idle stream, and an application \
+             that cannot tell those apart waits forever for a peer that is gone",
+        );
+
+    let text = error.to_string();
+    assert!(
+        text.contains(RECONNECT_PHRASE),
+        "the exhaustion error must NAME the budget it spent, not merely report a closed channel — \
+         a generic channel-closed error is the false-green shape this phase's validation strategy \
+         exists to prevent; got {text:?}"
+    );
+    assert!(
+        text.contains(&SHIPPED_RECONNECT_BUDGET.to_string()),
+        "and it must carry the attempt count, so an operator can tell a spent budget from a \
+         never-started one; got {text:?}"
+    );
+    assert!(
+        !text.contains("parser bound"),
+        "it must be textually distinct from the D-02 overflow error; got {text:?}"
+    );
+    assert!(
+        !text.contains("did not parse as a JSON-RPC message"),
+        "and from the D-05 parse error; got {text:?}"
+    );
+
+    // And it STOPS. A budget that is announced and then exceeded is not a budget.
+    tokio::time::sleep(RECONNECT_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        expected_gets,
+        "exactly the initial open plus {SHIPPED_RECONNECT_BUDGET} retries and no more — an \
+         unbounded loop against a peer that keeps closing is a self-inflicted denial of service \
+         (T-118.2-04-01). Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 13 — close() during the backoff sleep issues no further GET.
+// ===========================================================================
+
+#[tokio::test]
+async fn closing_during_reconnect_backoff_issues_no_further_get() {
+    let server = RecordingServer::start().await;
+    server.close_get_streams_on_accept();
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+
+    // Wait for the FIRST reconnect before closing, so the fence closes a loop
+    // that is demonstrably running rather than one that never started.
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= 2).await,
+        "the reconnect loop must be running before this fence can measure its cancellation. \
+         Observed request lines: {:?}",
+        server.request_lines()
+    );
+    let observed = server.get_lines();
+    assert!(
+        observed < 1 + SHIPPED_RECONNECT_BUDGET,
+        "the budget was already spent before the close, so this fence would prove nothing: {} \
+         GET(s) observed",
+        observed
+    );
+
+    timeout(BOUND, transport.close())
+        .await
+        .expect("close() returns within BOUND")
+        .expect("close() succeeds against the harness");
+
+    tokio::time::sleep(RECONNECT_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        observed,
+        "close() during a backoff sleep must prevent the GET that sleep was scheduling. A loop \
+         that wakes up and reconnects anyway is talking to a peer nobody is listening to, and \
+         keeps a socket open against a transport its owner has already shut. Observed request \
+         lines: {:?}",
+        server.request_lines()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 14 — a DROPPED transport during the backoff sleep does the same.
+// ===========================================================================
+
+#[tokio::test]
+async fn dropping_the_transport_during_backoff_issues_no_further_get() {
+    let server = RecordingServer::start().await;
+    server.close_get_streams_on_accept();
+    let mut transport = transport_for(&server);
+    open_stream(&mut transport).await;
+
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= 2).await,
+        "the reconnect loop must be running before this fence can measure its cancellation. \
+         Observed request lines: {:?}",
+        server.request_lines()
+    );
+    let observed = server.get_lines();
+    assert!(
+        observed < 1 + SHIPPED_RECONNECT_BUDGET,
+        "the budget was already spent before the drop, so this fence would prove nothing: {} \
+         GET(s) observed",
+        observed
+    );
+
+    // No `close()` here, and deliberately so: there is no transport left to call
+    // it on, so the abort handle is not available as a mechanism. What must stop
+    // the loop instead is its own sender going closed the moment the last clone
+    // drops the receive queue's `Receiver` — which is exactly why the reader's
+    // owned context must consult its sender rather than rely on the abort handle.
+    drop(transport);
+
+    tokio::time::sleep(RECONNECT_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        observed,
+        "a reconnect loop must not outlive the transport that owns it — it would hold a socket \
+         open and reconnect to a peer with nothing left to deliver to. Observed request lines: \
+         {:?}",
+        server.request_lines()
     );
 
     server.shutdown().await;

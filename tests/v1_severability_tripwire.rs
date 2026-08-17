@@ -1392,6 +1392,146 @@ fn the_last_event_id_const_and_its_reader_are_co_gated() {
     );
 }
 
+/// A `full-v2` build names NO resumption cursor at the reconnect call site
+/// (Phase 118.2, plan 04, D-03 / T-118.2-04-03).
+///
+/// # Why this assertion lives HERE and not in `tests/client_sse_stream.rs`
+///
+/// That file's `#![cfg]` header REQUIRES `v1-compat`, so it cannot observe a
+/// `full-v2` build at all — a fence written there asserting "the reconnect GET
+/// carries no `Last-Event-ID`" would simply not compile on the build whose
+/// behaviour it claims to measure. The property is therefore asserted on the
+/// SOURCE, in the file that already owns every other severance-by-construction
+/// check, where `--features full` and `--features full-v2` see the same bytes.
+///
+/// Two things are checked, and they are the two halves of the pattern:
+///
+/// 1. `reconnect_cursor` is a `#[cfg]` PAIR — one half inside a `v1-compat`
+///    region, one half outside it. A single ungated definition reading the
+///    config would not compile on `full-v2` (the field does not exist); a single
+///    GATED definition would leave the reconnect call site needing its own
+///    `#[cfg]`, which is exactly what (2) forbids.
+/// 2. The number of `v1-compat` attributes governing a STATEMENT in
+///    [`CLIENT_TRANSPORT`] is still exactly ONE, and it is still the
+///    `apply_resumption_header` call. The file's own comment at that site says
+///    it is the only call-site `#[cfg]` in the file and asks that a second not
+///    accumulate; this is what turns that request into a gate.
+#[test]
+fn a_full_v2_build_names_no_resumption_cursor_on_reconnect() {
+    let stripped = strip_comments(&source(CLIENT_TRANSPORT));
+    let gates = gate_map(&stripped);
+
+    let halves: Vec<LineGate> = stripped
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("fn reconnect_cursor")
+                || trimmed.starts_with("const fn reconnect_cursor")
+        })
+        .map(|(index, _)| gates.get(index).copied().unwrap_or_default())
+        .collect();
+
+    assert_eq!(
+        halves.len(),
+        2,
+        "FAILURE MODE: {CLIENT_TRANSPORT} declares {} `reconnect_cursor` half/halves, not 2.\n\
+         CONSEQUENCE: the reconnect cursor is not a paired accessor. Either `full-v2` fails to \
+         compile (an ungated half reading a field that build does not have), or the reconnect call \
+         site needs its own `#[cfg]` — the second call-site gate this file exists to prevent.\n\
+         WHAT TO DO: restore the pair, modelled on `resumption_callback`. Do not delete this test.",
+        halves.len()
+    );
+    assert!(
+        halves.iter().any(|gate| gate.v1),
+        "FAILURE MODE: neither `reconnect_cursor` half sits inside a `v1-compat` region.\n\
+         CONSEQUENCE: the half that READS the stored cursor is compiled into `full-v2`, so a \
+         severed build still names a resumption cursor.\n\
+         WHAT TO DO: gate the reading half."
+    );
+    assert!(
+        halves.iter().any(|gate| !gate.v1),
+        "FAILURE MODE: both `reconnect_cursor` halves are `v1-compat`-gated.\n\
+         CONSEQUENCE: `full-v2` has no `reconnect_cursor` at all, so the reconnect call site must \
+         carry its own `#[cfg]` — the accumulation the site's comment forbids.\n\
+         WHAT TO DO: add the null twin returning the constant `None`."
+    );
+
+    let call_sites = v1_gated_statements(&stripped, &gates);
+    assert_eq!(
+        call_sites.len(),
+        1,
+        "FAILURE MODE: {CLIENT_TRANSPORT} has {} `v1-compat` attribute(s) governing a STATEMENT, \
+         not 1. Observed: {call_sites:?}\n\
+         CONSEQUENCE: the file's one unavoidable call-site gate has grown a sibling. Every such \
+         gate is a place where the two feature sets execute DIFFERENT code paths rather than the \
+         same path over a different constant, and each one has to be reasoned about separately.\n\
+         WHAT TO DO: route the new v1 read through a paired accessor whose `full-v2` twin answers \
+         a constant, exactly as `resumption_callback`, `outbound_session_from` and \
+         `reconnect_cursor` do.",
+        call_sites.len()
+    );
+    assert!(
+        call_sites[0].contains("apply_resumption_header"),
+        "FAILURE MODE: the single `v1-compat`-gated statement in {CLIENT_TRANSPORT} is \
+         `{}`, not the `apply_resumption_header` call.\n\
+         CONSEQUENCE: either the one sanctioned call site moved without this gate being updated, \
+         or the classifier below stopped recognising it — in which case the count above is \
+         measuring something other than what it claims.\n\
+         WHAT TO DO: check the site, then this classifier. Never relax the assertion.",
+        call_sites[0]
+    );
+}
+
+/// The statements — not items, not struct-expression fields — governed by a
+/// `v1-compat` attribute in `stripped`.
+///
+/// The classification is deliberately narrow, because the four OTHER `v1-compat`
+/// attributes inside function bodies in [`CLIENT_TRANSPORT`] are
+/// struct-EXPRESSION fields (`session_id: None,` in the builder's `new` and
+/// `build`). A field ends with `,`; a statement ends with `;`. Item declarations
+/// that also end with `;` — `use`, `const`, `static`, `type`, `mod` — are named
+/// and excluded, so what remains is exactly "a gated line of executable code".
+fn v1_gated_statements(stripped: &str, gates: &[LineGate]) -> Vec<String> {
+    const ITEM_STARTS: &[&str] = &[
+        "use ",
+        "pub use ",
+        "const ",
+        "pub const ",
+        "static ",
+        "pub static ",
+        "type ",
+        "pub type ",
+        "mod ",
+        "pub mod ",
+        "extern ",
+    ];
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim() != "#[cfg(feature = \"v1-compat\")]" {
+            continue;
+        }
+        // Attributes stack; the governed line is the next one that is not itself
+        // an attribute and not blank.
+        let Some(governed) = lines[index + 1..]
+            .iter()
+            .map(|next| next.trim())
+            .find(|next| !next.is_empty() && !next.starts_with("#["))
+        else {
+            continue;
+        };
+        if !governed.ends_with(';') || ITEM_STARTS.iter().any(|kw| governed.starts_with(kw)) {
+            continue;
+        }
+        if gates.get(index).copied().unwrap_or_default().test {
+            continue;
+        }
+        found.push(governed.to_string());
+    }
+    found
+}
+
 /// The v2-REQUIRED constants are still ungated — the live counter-example.
 ///
 /// Without this, a `gate_map` that returned `true` for every line would make
