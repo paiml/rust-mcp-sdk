@@ -189,3 +189,17 @@ but the level a client asked for is not yet honoured, so what the example
 
 **Owner: plan 08**, alongside the CONF-10 conformance fence, which is the first
 point at which a client-visible end-to-end story is true.
+
+### Executor note: a `make` target auto-formats `src/server/ui.rs`
+
+During 118.2-06, running the in-scope gate steps individually
+(`make build / test-unit / test-doc / test-integration / check-todos /
+check-unwraps / purity-check / comply`) left `src/server/ui.rs` MODIFIED with
+exactly the `fmt-check` diff recorded above — i.e. one of those targets shells
+out to `cargo fmt --all` rather than `--check`. It was reverted with
+`git checkout -- src/server/ui.rs` so the pre-existing state is preserved and the
+fix is not partially smuggled in (the three `cargo-pmcp` diffs are untouched by
+the root formatter, so committing only `ui.rs` would half-close the blocker).
+
+A later executor running the same targets will see the same phantom
+modification. It is not their change.
