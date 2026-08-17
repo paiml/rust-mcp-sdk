@@ -178,3 +178,14 @@ gates every remaining plan in the phase, so it should be swept first.
 **Verified during 118.2-06:** re-running the exact `make lint` clippy invocation
 with `-A clippy::let_underscore_future` appended exits **0** with zero warnings,
 so this is the ONLY lint blocker on the branch and plan 06's own surface is clean.
+
+## An `extra.log(..)` EXAMPLE is deferred to plan 08 (recorded during 118.2-06)
+
+CLAUDE.md's ALWAYS-requirements ask every new feature for a working
+`cargo run --example`. Plan 06 wires the sink; plan 07 wires the LEVEL source.
+An example shipped now would demonstrate a half-wired feature — records emit,
+but the level a client asked for is not yet honoured, so what the example
+"shows" would change under the reader's feet one plan later.
+
+**Owner: plan 08**, alongside the CONF-10 conformance fence, which is the first
+point at which a client-visible end-to-end story is true.
