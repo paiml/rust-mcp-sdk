@@ -236,6 +236,25 @@ const MISMATCH_BOUND: Duration = Duration::from_secs(2);
 /// "this frame was addressed to nobody" rather than as an off-by-one.
 const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
 
+/// How long fence 22 waits for a `receive()` that must NOT answer (plan 19,
+/// BLOCKER 1).
+///
+/// # This bound is NOT a synchronisation device, and the asymmetry is the reason
+///
+/// It is the same asymmetry [`MISMATCH_BOUND`] records. Post-fix the wait NEVER
+/// completes: a successful `start_sse` re-open clears the terminal latch, the
+/// queue is empty and no POST-response reader is in flight, so `receive()` parks
+/// and this bound only decides how long the fence waits before concluding so.
+///
+/// Pre-fix the stale answer arrives in MICROSECONDS — the latch is written once,
+/// `Arc`-shared across every clone, and cleared by no constructor, no
+/// `start_sse` and no `close`, so `drain_or_latch` surfaces it on the first
+/// `Empty` poll. CI load therefore makes this fence SAFER rather than flakier: a
+/// slow machine cannot turn a returned stale reason into a timeout, it can only
+/// make the (already-passing) wait longer. The fence never asserts on an upper
+/// time bound as its SUBJECT.
+const LATCH_RESET_BOUND: Duration = Duration::from_secs(2);
+
 // ===========================================================================
 // The recording listener.
 //
@@ -342,6 +361,20 @@ struct Shared {
     /// is: fences 1-15 assert on a listener that answers every non-`initialize`
     /// POST `202 Accepted`.
     answer_calls: AtomicBool,
+    /// When set, an answered call's JSON-RPC success is delivered over a
+    /// `text/event-stream` POST response rather than as an
+    /// `application/json` body (plan 19, BLOCKER 1).
+    ///
+    /// The shape fence 16 cannot reach, and the whole reason BLOCKER 1 shipped
+    /// green. A JSON-answered POST lands its response on the receive queue
+    /// SYNCHRONOUSLY inside `send()`, so the queue-wins-over-latch rule always
+    /// fires; an SSE-answered POST is read by a DETACHED reader that is spawned
+    /// after `post_body` has already returned `Ok(())`, so the queue is
+    /// legitimately, transiently EMPTY while a real answer is still on the wire.
+    ///
+    /// Default OFF, so fences 1-20 see byte-identical answers to the ones they
+    /// always did.
+    answer_calls_with_sse: AtomicBool,
     /// When set, the NEXT answered call is addressed to [`MISMATCHED_CALL_ID`]
     /// rather than to the id it was asked with (plan 15, CR-02).
     ///
@@ -398,6 +431,7 @@ impl RecordingServer {
             close_live,
             advertise_tools: AtomicBool::new(false),
             answer_calls: AtomicBool::new(false),
+            answer_calls_with_sse: AtomicBool::new(false),
             next_call_id_is_mismatched: AtomicBool::new(false),
             calls_answered: AtomicUsize::new(0),
         });
@@ -500,6 +534,38 @@ impl RecordingServer {
     /// call 1's result" observable — see [`Shared::calls_answered`].
     fn answer_calls_with_an_echoing_result(&self) {
         self.shared.answer_calls.store(true, Ordering::SeqCst);
+    }
+
+    /// Deliver an answered call's JSON-RPC success over a `text/event-stream`
+    /// POST response instead of as an `application/json` body (plan 19).
+    ///
+    /// Call BEFORE the client connects, and TOGETHER with
+    /// [`answer_calls_with_an_echoing_result`](RecordingServer::answer_calls_with_an_echoing_result)
+    /// — this switch decides how an answer is FRAMED, not whether there is one.
+    ///
+    /// The same per-answer [`call_marker`] numbering is reused, which is what
+    /// makes "call 2 got call 2's marker" assertable on this path too. See
+    /// [`Shared::answer_calls_with_sse`] for why this framing is the one that
+    /// reaches BLOCKER 1.
+    fn answer_calls_with_sse(&self) {
+        self.shared
+            .answer_calls_with_sse
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Stop ending every GET at once and go back to holding it open (plan 19).
+    ///
+    /// The inverse of
+    /// [`close_get_streams_on_accept`](RecordingServer::close_get_streams_on_accept),
+    /// and the ONLY way to prove a RECOVERED transport: a fence has to move a
+    /// harness from the budget-spending shape to the ordinary held-open shape
+    /// MID-TEST, because a transport whose session stream never failed has no
+    /// latch to clear. That recovery is precisely what the `start_sse` reset seam
+    /// exists for.
+    fn reopen_get_streams_held_open(&self) {
+        self.shared
+            .close_get_on_accept
+            .store(false, Ordering::SeqCst);
     }
 
     /// Address the NEXT answered call to [`MISMATCHED_CALL_ID`] instead of to the
@@ -622,9 +688,21 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
     let streams = shared.sse_post_methods.lock().contains(&method);
     if streams {
         serve_post_sse(reader, write_half, &shared).await;
-    } else {
-        serve_post(&mut write_half, &value, &shared).await;
+        return;
     }
+
+    // The SSE-ANSWERED call path (plan 19). Checked before `serve_post` and only
+    // when the flag is on, so `call_answer_body`'s per-answer sequence is
+    // consumed exactly once per answered call on either framing — a speculative
+    // call here would skew `call_marker` numbering for every existing fence.
+    if shared.answer_calls_with_sse.load(Ordering::SeqCst) {
+        if let Some(body) = call_answer_body(&value, &method, &shared) {
+            serve_post_sse_answer(&mut write_half, &body, &shared).await;
+            return;
+        }
+    }
+
+    serve_post(&mut write_half, &value, &shared).await;
 }
 
 /// Read the request's header block, returning `(content-length, Last-Event-ID)`.
@@ -711,8 +789,32 @@ fn advertised_capabilities(shared: &Shared) -> Value {
     }
 }
 
-/// The JSON-RPC success answering ONE id-bearing, non-`initialize` POST, or
-/// `None` when this harness is not in answering mode (plan 15, CR-02).
+/// The JSON-RPC success answering ONE id-bearing, non-`initialize` POST, in the
+/// `application/json` HTTP envelope [`serve_post`] writes, or `None` when this
+/// harness is not in answering mode (plan 15, CR-02).
+///
+/// Split from [`call_answer_body`] by plan 19 so the SAME per-answer numbering
+/// can be delivered over a `text/event-stream` POST response instead — see
+/// [`serve_post_sse_answer`]. The head written here is byte-identical to the one
+/// this function wrote before the split, so every existing fence observes
+/// exactly the bytes it always did.
+fn call_answer(value: &Value, method: &str, shared: &Shared) -> Option<String> {
+    let body = call_answer_body(value, method, shared)?;
+    Some(format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    ))
+}
+
+/// The JSON-RPC success BODY answering one id-bearing, non-`initialize` POST,
+/// with no HTTP envelope around it.
+///
+/// Owns the whole of the answering decision — the mode guard, the `initialize`
+/// exclusion, the id-bearing filter, the per-answer sequence and its
+/// [`call_marker`], and the single-shot mis-addressing consumption — so the two
+/// framings ([`call_answer`] and [`serve_post_sse_answer`]) cannot drift over
+/// WHAT is answered while differing over how it is delivered.
 ///
 /// Two properties the fences depend on:
 ///
@@ -722,7 +824,7 @@ fn advertised_capabilities(shared: &Shared) -> Value {
 /// 2. The `id` echoes the request's own, EXCEPT when
 ///    [`RecordingServer::answer_the_next_call_with_a_mismatched_id`] armed a
 ///    single mis-addressed answer — consumed here on use.
-fn call_answer(value: &Value, method: &str, shared: &Shared) -> Option<String> {
+fn call_answer_body(value: &Value, method: &str, shared: &Shared) -> Option<String> {
     if !shared.answer_calls.load(Ordering::SeqCst) {
         return None;
     }
@@ -744,17 +846,14 @@ fn call_answer(value: &Value, method: &str, shared: &Shared) -> Option<String> {
     } else {
         asked_with
     };
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": addressed_to,
-        "result": { "content": [ { "type": "text", "text": call_marker(sequence) } ] },
-    })
-    .to_string();
-    Some(format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-         content-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    ))
+    Some(
+        json!({
+            "jsonrpc": "2.0",
+            "id": addressed_to,
+            "result": { "content": [ { "type": "text", "text": call_marker(sequence) } ] },
+        })
+        .to_string(),
+    )
 }
 
 /// The marker answer *n* carries, so answer *n* is distinguishable from answer
@@ -857,6 +956,41 @@ async fn serve_post_sse(
         &shared.post_frames_rx,
     )
     .await;
+}
+
+/// Answer a POST with a `text/event-stream` carrying ONE complete `message`
+/// frame — the call's own JSON-RPC result — and then end the body (plan 19).
+///
+/// Deliberately NOT [`serve_post_sse`], which fences 8-10 and 19 depend on:
+/// that mode holds the body open forever and pumps frames a fence pushes, and
+/// this one delivers the answer and finishes. Both are `text/event-stream` POST
+/// responses, which is the property BLOCKER 1 turns on — `post_body` spawns a
+/// DETACHED reader and returns `Ok(())` before either has delivered anything, so
+/// the receive queue is transiently empty while a real answer is on the wire.
+///
+/// Chunked rather than `content-length`-framed for the reason
+/// [`serve_get_that_delivers_one_frame_then_ends`] records: a frame has to be
+/// written after the head. The terminating zero-length chunk plus
+/// `connection: close` make "this answer is complete" unambiguous to hyper.
+///
+/// `open_posts` is incremented for exactly the span the body is live, mirroring
+/// [`serve_sse_body`], so `open_post_connections()` keeps meaning the same thing
+/// on both POST-SSE modes.
+async fn serve_post_sse_answer(write_half: &mut WriteHalf<TcpStream>, body: &str, shared: &Shared) {
+    shared.open_posts.fetch_add(1, Ordering::SeqCst);
+
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\
+                connection: close\r\n\r\n";
+    if write_half.write_all(head.as_bytes()).await.is_ok() && write_half.flush().await.is_ok() {
+        let frame = format!("event: message\ndata: {body}\n\n");
+        let _ = write_chunk(write_half, &frame).await;
+        let _ = write_half.write_all(b"0\r\n\r\n").await;
+        let _ = write_half.flush().await;
+        let _ = write_half.shutdown().await;
+    }
+
+    shared.open_posts.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Write the `text/event-stream` head, then pump pushed frames until the peer
@@ -2477,6 +2611,226 @@ async fn a_post_stream_cursor_never_becomes_the_session_streams_last_event_id() 
          exactly the failure the reconnect exists to prevent, and is indistinguishable from a \
          healthy resume (T-118.2-17-03). Observed cursors: {cursors:?}"
     );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fences 21 and 22 — BLOCKER 1: the terminal latch pre-empts an in-flight,
+// SSE-delivered POST response, permanently.
+//
+// `118.2-15` moved terminal stream reasons off the response FIFO onto a
+// write-once latch, and `drain_or_latch` surfaces that latch the moment
+// `try_recv()` reports `Empty`. On the POST-answered-with-`text/event-stream`
+// path this phase introduced for D-01, `post_body` spawns a DETACHED reader and
+// returns `Ok(())` BEFORE the answer lands on the queue — so the queue is
+// legitimately, transiently empty while a real answer is still on the wire, and
+// the latch wins instantly with a stale reason belonging to a DIFFERENT stream.
+//
+// Fence 16 cannot reach it: its harness answers `content-type:
+// application/json`, so the response lands on the queue synchronously inside
+// `send()` and the queue-wins-over-latch rule always fires. That is precisely
+// why this defect shipped green, and why fence 21 re-runs fence 16's scenario
+// against an SSE-ANSWERED POST.
+// ===========================================================================
+
+// ===========================================================================
+// Fence 21 — a latched session-stream reason does not pre-empt a caller whose
+// own POST-response stream is still in flight, and does not do so forever.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_latched_session_stream_does_not_pre_empt_an_sse_answered_call() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    // The whole difference from fence 16: the SAME answers, delivered over a
+    // `text/event-stream` POST response by a detached reader, AFTER `post_body`
+    // has already returned.
+    server.answer_calls_with_sse();
+    // Fence 16's preamble verbatim in structure: every GET opens successfully and
+    // ends at once, so the session stream spends its WHOLE reconnect budget and
+    // latches its named terminal reason while the application is idle.
+    server.close_get_streams_on_accept();
+
+    // Bound only to keep the transport alive for the whole fence. `receive()` is
+    // NEVER called on it: it shares the receive queue with the clone the client
+    // owns, so a read here would STEAL the very response these assertions are
+    // about.
+    let (client, _observer) = handshake(&server).await;
+
+    let expected_gets = 1 + SHIPPED_RECONNECT_BUDGET;
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= expected_gets).await,
+        "the session stream must spend its budget before the fence calls anything — otherwise \
+         there is no latched reason to be pre-empted by. Observed request lines: {:?}",
+        server.request_lines()
+    );
+    // An OBSERVATION window, not a synchronisation device: it proves the
+    // reconnect loop has STOPPED, which establishes both halves of the
+    // precondition — the terminal reason has been latched, and it was latched
+    // with NO request in flight. Every wait after this point goes through a bound.
+    tokio::time::sleep(RECONNECT_QUIET).await;
+    assert_eq!(
+        server.get_lines(),
+        expected_gets,
+        "the budget must be spent and the loop finished before the first call. Observed request \
+         lines: {:?}",
+        server.request_lines()
+    );
+
+    // --- Call 1: its OWN answer, delivered off-queue by a detached reader. ---
+    let first = timeout(
+        BOUND,
+        client.call_tool("fence-21-one".to_string(), json!({})),
+    )
+    .await
+    .expect("the first call completes within BOUND")
+    .unwrap_or_else(|error| {
+        panic!(
+            "a tools/call answered over text/event-stream came back reporting a SESSION-STREAM \
+             failure raised while the application was idle. `post_body` spawns a DETACHED reader \
+             for a `text/event-stream` response and returns Ok(()) before the answer lands on the \
+             queue, so `drain_or_latch` sees an EMPTY queue with a real answer still on the wire \
+             and surfaces another stream's diagnosis as this caller's result. The latch is \
+             Arc-shared across every clone, written once, and cleared by no constructor, no \
+             start_sse and no close — so the FIRST trip fails every later call against an \
+             SSE-answering server for the life of the process (BLOCKER 1). Got: {error}"
+        )
+    });
+    let first_text = text_of(&first);
+    assert_eq!(
+        first_text.as_deref(),
+        Some(call_marker(1).as_str()),
+        "call 1 must receive call 1's OWN result. Expected {:?}, got {first_text:?}",
+        call_marker(1)
+    );
+
+    // --- Call 2: proves the failure is not merely delayed, but not PERMANENT. ---
+    //
+    // A latch with no reset seam converts one transient session-stream event into
+    // a process-lifetime failure, which is a severity WORSENING over the
+    // pre-closure behaviour where a bad terminal reason could poison at most one
+    // call. A second call with its own distinct marker is what measures that.
+    let second = timeout(
+        BOUND,
+        client.call_tool("fence-21-two".to_string(), json!({})),
+    )
+    .await
+    .expect("the second call completes within BOUND")
+    .unwrap_or_else(|error| {
+        panic!(
+            "the SECOND SSE-answered call also failed with a latched reason. One latched \
+             session-stream reason must not poison the transport for the life of the process \
+             (BLOCKER 1). Got: {error}"
+        )
+    });
+    let second_text = text_of(&second);
+    assert_eq!(
+        second_text.as_deref(),
+        Some(call_marker(2).as_str()),
+        "call 2 must receive call 2's OWN distinct result, not call 1's. Expected {:?}, got \
+         {second_text:?}",
+        call_marker(2)
+    );
+
+    assert_eq!(
+        calls_observed(&server),
+        2,
+        "both calls must actually have reached the wire — a fence that asserts on results it \
+         never asked for would pass against any tree. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 22 — a successful session-stream re-open CLEARS the terminal latch.
+//
+// Drives the transport directly rather than through a `Client`: a client receive
+// loop would compete for the very queue this fence reads.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_reopened_session_stream_clears_the_terminal_latch() {
+    let server = RecordingServer::start().await;
+    server.close_get_streams_on_accept();
+    let mut transport = transport_for(&server);
+
+    open_stream(&mut transport).await;
+
+    let expected_gets = 1 + SHIPPED_RECONNECT_BUDGET;
+    assert!(
+        wait_for_within(RECONNECT_BOUND, || server.get_lines() >= expected_gets).await,
+        "the session stream must spend its budget, so there IS a latched reason to clear. \
+         Observed request lines: {:?}",
+        server.request_lines()
+    );
+    tokio::time::sleep(RECONNECT_QUIET).await;
+
+    // With nothing in flight and no recovery yet, answering the latched reason is
+    // CORRECT behaviour — that is the CR-02 contract and this fence does not
+    // weaken it. It is asserted here so the fence's second half cannot pass
+    // merely because no reason was ever raised.
+    let latched = timeout(BOUND, transport.receive())
+        .await
+        .expect("with the budget spent and nothing in flight, receive() answers within BOUND")
+        .expect_err("a spent reconnect budget is a terminal reason, not a message");
+    let latched_text = latched.to_string();
+    assert!(
+        latched_text.contains(RECONNECT_PHRASE),
+        "the latched reason must be the spent reconnect budget, or this fence's second half is \
+         measuring something else. Got: {latched_text:?}"
+    );
+
+    // Now the peer recovers: GETs are held open again, and the transport re-opens
+    // its session stream successfully.
+    server.reopen_get_streams_held_open();
+    timeout(BOUND, transport.start_sse(None))
+        .await
+        .expect("the re-open completes within BOUND")
+        .expect("the harness answers the re-opened GET 200 text/event-stream");
+    assert!(
+        wait_for(|| server.open_get_connections() >= 1).await,
+        "the re-opened session stream must actually be LIVE — a re-open that never connected \
+         proves nothing about the reset seam. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    // The subject: with the queue empty, no reader in flight and a RECOVERED
+    // session stream, receive() must WAIT rather than answer the stale reason.
+    //
+    // `started` is a DIAGNOSTIC, reported only on the failing arms. It is never
+    // asserted on: an elapse here is a cancellation ceiling, not the thing under
+    // test, and a fence that asserted an upper time bound as its subject would be
+    // measuring CI load. Reporting it is what makes the RED capture quantitative
+    // — a stale answer arrives in microseconds where a correct wait cannot.
+    let started = std::time::Instant::now();
+    match timeout(LATCH_RESET_BOUND, transport.receive()).await {
+        Err(_elapsed) => {},
+        Ok(Ok(message)) => panic!(
+            "receive() returned a message on a stream nothing was pushed down after {:?}; this \
+             fence's subject is that it WAITS. Got: {message:?}",
+            started.elapsed()
+        ),
+        Ok(Err(error)) => {
+            let text = error.to_string();
+            let elapsed = started.elapsed();
+            assert!(
+                !text.contains(RECONNECT_PHRASE),
+                "a transport whose session stream RECOVERED still answered the stale terminal \
+                 reason from before the recovery, after {elapsed:?}. The latch is written once and \
+                 cleared by no constructor, no start_sse and no close, so a transient network \
+                 event becomes a permanent, process-lifetime failure with no way back (BLOCKER 1). \
+                 A successful start_sse re-open must clear it. Got: {text:?}"
+            );
+            panic!(
+                "receive() answered an error after {elapsed:?} on a recovered transport with \
+                 nothing in flight. Got: {text:?}"
+            );
+        },
+    }
 
     server.shutdown().await;
 }
