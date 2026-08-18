@@ -1188,3 +1188,34 @@ Measured independently by the orchestrator during this round; neither wave recor
   `cargo nextest run -E 'binary(client_sse_stream)' --features full --test-threads 4` and say so wherever
   the count is quoted, so the number is reproducible rather than luck. **Never** a `test(/…/)` selector —
   it silently selects ZERO tests and still exits 0.
+
+#### `make validate-always`'s FUZZ step is a FALSE GREEN — it reports success having fuzzed nothing
+
+Measured by plan `118.2-21`'s own closing gate run, and recorded here because a closing verification
+that quotes a green it did not interrogate is the failure mode this whole phase exists to refuse.
+
+- **Where:** `Makefile:247`, the `test-fuzz` target, reached by `validate-always` step 1 and therefore by
+  `make quality-gate`:
+  `timeout 30s $(CARGO) fuzz run $$target || echo "Fuzz target $$target completed"`.
+- **What actually happens:** `$(CARGO)` is **stable** cargo. `cargo-fuzz` builds with
+  `-Zsanitizer=address`, which stable rejects — `error: the option 'Z' is only accepted on the nightly
+  compiler`. **Every** fuzz target fails to **build**; the `||` arm then prints
+  `Fuzz target <name> completed` in yellow, the `while` loop continues to the next target, and the
+  recipe exits **0**. `✓ Fuzz testing completed`, `✅ ALL ALWAYS requirements validated!` and
+  `✅ ALL TOYOTA WAY QUALITY CHECKS PASSED` are all printed having executed **zero fuzz iterations**.
+  Verbatim in `target/118.2-21-gate.log` and `target/118.2-21-always.log`: one build error per target,
+  and **no target reports a run count**.
+- **Consequence:** CLAUDE.md's ALWAYS-fuzz requirement **cannot** be discharged by the gate, and any
+  plan that cites "`make validate-always` exit 0" as its fuzz evidence has cited nothing. This is the
+  same class of defect as `WINDOWS.md` entries 10 and 11 — a verify command that exits without
+  measuring — located in the Makefile rather than in a plan file.
+- **Provenance — NOT this round's:** `git diff --name-only 45929873..HEAD -- Makefile fuzz/` returns
+  **0** lines. Neither file was touched by plans `118.2-19`, `-20` or `-21`.
+- **The REAL fuzz discharge for this round** is plan `118.2-19`'s explicit nightly invocation —
+  `cargo +nightly fuzz run streamable_sse_frames -- -runs=20000`, **20000 runs, exit 0**, with
+  `fuzz/artifacts/streamable_sse_frames/` empty before and after — not the Makefile step.
+- **Reason not fixed:** pre-existing, off this round's path, and the fix is a build-tooling decision
+  (pin `+nightly` in the recipe, or **fail closed** on a non-nightly toolchain instead of swallowing
+  the error) that belongs with whoever owns the Makefile's test targets.
+- **OWNER:** whichever plan next touches the Makefile's ALWAYS targets. Booked OPEN as `WINDOWS.md`
+  entry 22.
