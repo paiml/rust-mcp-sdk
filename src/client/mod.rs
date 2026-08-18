@@ -214,6 +214,143 @@ const TASKS_LIST_V2_REPLACEMENT: &str = "client-side task tracking";
 /// concrete `Future` that satisfies the bound.
 type NoInputResponder = fn(InputRequests) -> std::future::Ready<Result<InputResponses>>;
 
+/// How long [`Client::dispatch_request`] keeps waiting for its OWN answer after
+/// the FIRST mis-addressed response frame (Phase 118.2, BLOCKER 2).
+///
+/// # Why a ceiling exists at all, and why it is this one
+///
+/// Before this constant the alternative was a PERMANENT wedge: the correlation
+/// check discards a frame whose id is not the one this request awaits, and a
+/// peer that never sends the right id therefore parked the caller forever. A
+/// loud bounded failure beats a silent unbounded one — an operator can see a
+/// timeout, and cannot see a hang.
+///
+/// Ten seconds is deliberately generous relative to any real round trip and
+/// deliberately finite. It is armed ONLY once a mismatch has actually been
+/// observed, so an ordinary long-running `tools/call` — which is entitled to
+/// take minutes — never comes near it.
+///
+/// This is a WORKAROUND for a routing gap, not the fix. Per-id response routing
+/// (`active_requests` carrying a response channel per id, so a popped frame is
+/// DELIVERED to its owner rather than discarded) removes the need for it
+/// entirely, and is the recorded follow-up.
+const MISMATCH_DISCARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest ONE bounded receive attempt may hold the transport write lock
+/// while the discard path is active (Phase 118.2, BLOCKER 2 half A).
+///
+/// # This constant is about the OTHER callers, not about this one
+///
+/// `Client`'s transport lives behind one `RwLock`, so `send_notification`,
+/// `call_tool`, `close` and the discard loop all contend for the same guard.
+/// Holding that guard across an unbounded `receive().await` means one
+/// mis-addressed frame serialises every other operation on the client behind a
+/// wait that never ends. Slicing the receive puts a ceiling on how long any
+/// other caller can be made to wait: at most one slice.
+///
+/// 250 ms is short enough to be imperceptible to a caller who has to wait for
+/// it, and long enough that a peer streaming mis-addressed frames cannot make
+/// the loop spin — the re-acquisition cost is paid four times a second, not
+/// continuously.
+const MISMATCH_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many mis-addressed frames are discarded before the call fails loudly
+/// rather than continuing to wait (Phase 118.2, BLOCKER 2).
+///
+/// A peer emitting a mis-addressed frame every few milliseconds keeps the
+/// discard loop busy and productive-looking right up to
+/// [`MISMATCH_DISCARD_TIMEOUT`], and the caller then sees only a timeout — true
+/// but undiagnosable. The cap converts that shape into a named failure carrying
+/// the count and both ids, so the difference between "the peer went quiet" and
+/// "the peer is spraying wrong ids" is visible in the error itself.
+///
+/// Thirty-two is far above anything a correct peer produces (a correct peer
+/// produces zero) and far below anything that could be mistaken for progress.
+const MAX_ID_MISMATCH_DISCARDS: usize = 32;
+
+/// What one `dispatch_request` has spent on mis-addressed response frames.
+///
+/// Its own type rather than two locals in the receive loop for two reasons: the
+/// arming rule (the deadline is set on the FIRST discard and never moves) is a
+/// correctness property worth unit-testing in isolation, and keeping it out of
+/// [`Client::dispatch_request`] is what holds that function under the repo's
+/// cognitive-complexity budget without an `#[allow]`.
+#[derive(Debug, Default)]
+struct MismatchBudget {
+    /// How many mis-addressed frames this request has discarded.
+    discards: usize,
+    /// When the discard wait expires — `None` until the FIRST mismatch.
+    ///
+    /// `None` is not "no deadline yet, use a default"; it is the load-bearing
+    /// signal that NO mismatch has been observed, which is what keeps the
+    /// ordinary receive path uncancelled.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl MismatchBudget {
+    /// Book one discarded frame.
+    ///
+    /// The deadline is set on the FIRST discard ONLY. Re-arming it per frame
+    /// would let a peer emitting a steady drip of wrong ids extend the wait
+    /// indefinitely — the ceiling would exist and never fire, which is the
+    /// defect this type closes wearing a fix's clothes.
+    fn record(&mut self) {
+        self.discards += 1;
+        if self.deadline.is_none() {
+            self.deadline = Some(tokio::time::Instant::now() + MISMATCH_DISCARD_TIMEOUT);
+        }
+    }
+
+    /// When this request's discard wait expires, or `None` if it has seen no
+    /// mis-addressed frame.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// This attempt's receive slice, or `None` once `deadline` has passed.
+    ///
+    /// Pure, total, and the ONLY place the slice arithmetic happens. `None` is
+    /// the sole way a non-positive slice can be expressed, so no caller can
+    /// construct a negative or wrapped `Duration`: the `now >= deadline` guard
+    /// runs BEFORE the subtraction (`Instant - Instant` panics on underflow),
+    /// and `min` can only shrink the result. The remaining budget wins whenever
+    /// it is the smaller of the two, so the final attempt before the deadline is
+    /// short rather than overshooting it.
+    fn slice_until(
+        deadline: tokio::time::Instant,
+        now: tokio::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if now >= deadline {
+            return None;
+        }
+        Some((deadline - now).min(MISMATCH_RECEIVE_SLICE))
+    }
+
+    /// The failure once the discard cap is reached, or `None` while under it.
+    ///
+    /// Both ids are rendered in their typed `Debug` form deliberately:
+    /// [`RequestId`] equality is structural and typed, so `String("1")` and
+    /// `Number(1)` are DIFFERENT ids as JSON-RPC 2.0 requires. Rendered as bare
+    /// strings the two would read identically and the error would look like a
+    /// contradiction; rendered as `String("1")` and `Number(1)` the re-typing is
+    /// the first thing the reader sees.
+    fn exhausted(&self, awaiting: &RequestId, received: &RequestId) -> Option<Error> {
+        if self.discards < MAX_ID_MISMATCH_DISCARDS {
+            return None;
+        }
+        Some(Error::Transport(
+            crate::error::TransportError::InvalidMessage(format!(
+                "discarded {} consecutive response frames whose id was not the one this request \
+                 is awaiting (cap {MAX_ID_MISMATCH_DISCARDS}); awaiting {awaiting:?}, last \
+                 received {received:?}. Ids are compared structurally AND by type, so a re-typed \
+                 id never matches. Per-id response routing is the recorded follow-up that removes \
+                 this discard entirely.",
+                self.discards
+            )),
+        ))
+    }
+}
+
 /// Why a host request could not be answered.
 ///
 /// Shared by the v1 server-initiated dispatch and the v2 MRTR fold so both
@@ -3653,6 +3790,71 @@ impl<T: Transport> Client<T> {
             .await
     }
 
+    /// Take the next transport message, holding the write lock for at most one
+    /// slice ONCE a mis-addressed frame has been seen (Phase 118.2, BLOCKER 2).
+    ///
+    /// `Ok(None)` means "no message yet, the transport write guard has been
+    /// RELEASED, call me again". It is never an end of stream — a transport that
+    /// is finished reports that as an `Err`, exactly as before.
+    ///
+    /// # The two paths are deliberately different, and that asymmetry is the design
+    ///
+    /// With no deadline armed — no mismatch observed — this is byte-for-byte the
+    /// behaviour of every prior release: take the lock, await `receive()` with no
+    /// ceiling and no cancellation. It has to be. `Transport` is a trait and not
+    /// every implementation's `receive()` is cancel-safe; cancelling a stdio read
+    /// mid-line would lose bytes (T-118.2-20-05). A peer that has done nothing
+    /// wrong must gain no new failure mode, so a long-running `tools/call` still
+    /// waits as long as it likes.
+    ///
+    /// With a deadline armed the peer is already misbehaving and the alternative
+    /// is a permanently wedged client, so the receive is sliced. The transport
+    /// this phase is about — `StreamableHttpTransport::receive()` — selects over
+    /// an `mpsc::Receiver::recv()`, which tokio documents as cancel-safe:
+    /// dropping the future loses no message.
+    async fn receive_bounded(
+        &self,
+        budget: &MismatchBudget,
+    ) -> Result<Option<crate::types::TransportMessage>> {
+        let Some(deadline) = budget.deadline() else {
+            // The ordinary path. NO `tokio::time::timeout` here, on purpose:
+            // see the asymmetry note above.
+            //
+            // The guard is bound to a NAMED local rather than left as a
+            // temporary in a `self.transport.write().await.receive().await`
+            // chain. Semantically identical — either way it lives until this
+            // function returns — but the whole of BLOCKER 2 was a temporary's
+            // lifetime being invisible at the call site, so this path spells it
+            // out. It is still held across an unbounded receive, which is the
+            // pre-existing and deliberate behaviour: no mismatch has been
+            // observed, the loop below is not discarding anything, and nothing
+            // re-takes the guard on a `continue`.
+            let mut transport = self.transport.write().await;
+            return transport.receive().await.map(Some);
+        };
+
+        let Some(slice) = MismatchBudget::slice_until(deadline, tokio::time::Instant::now()) else {
+            // The ceiling fired. The caller gets a NAMED failure stating the
+            // bound it waited out, which is the whole difference from the
+            // permanent, mute wait this replaced.
+            return Err(Error::timeout(
+                u64::try_from(MISMATCH_DISCARD_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            ));
+        };
+
+        // The guard's scope ENDS with this block, so it is dropped before the
+        // match below — which is the whole point. Every other operation on this
+        // client gets its turn at the lock at least once per slice.
+        let received = {
+            let mut transport = self.transport.write().await;
+            tokio::time::timeout(slice, transport.receive()).await
+        };
+        match received {
+            Ok(message) => message.map(Some),
+            Err(_elapsed) => Ok(None),
+        }
+    }
+
     /// The ONE place a client request is put on the wire and its response awaited.
     ///
     /// `typed` carries the original [`Request`] for the v1 path, which sends the
@@ -3716,9 +3918,19 @@ impl<T: Transport> Client<T> {
                 self.transport.write().await.send(message).await?;
             }
 
-            // Wait for response, dispatching any unsolicited notifications along the way
+            // Wait for response, dispatching any unsolicited notifications along the way.
+            //
+            // The budget lives ACROSS iterations: it is what makes the discard
+            // ceiling belong to this request rather than to one receive attempt.
+            let mut mismatch_budget = MismatchBudget::default();
             loop {
-                let response_message = self.transport.write().await.receive().await?;
+                let Some(response_message) = self.receive_bounded(&mismatch_budget).await? else {
+                    // A receive slice expired with nothing delivered. The
+                    // transport write guard has already been released, so
+                    // another operation on this client could take it before we
+                    // ask again. NOT an end of stream.
+                    continue;
+                };
 
                 match response_message {
                     crate::types::TransportMessage::Response(mut response) => {
@@ -3744,8 +3956,24 @@ impl<T: Transport> Client<T> {
                         //    diagnosable wait for whichever OTHER request that
                         //    frame belonged to. Strictly better than handing one
                         //    caller another caller's result (T-118.2-15-01), but a
-                        //    real cost, bounded by that request's own timeout
-                        //    (T-118.2-15-03). Per-id response routing — the
+                        //    real cost, and the ONLY things that bound it are
+                        //    `MISMATCH_DISCARD_TIMEOUT` and
+                        //    `MAX_ID_MISMATCH_DISCARDS`, both private constants in
+                        //    this file. `RequestOptions::timeout` exists on the
+                        //    PUBLIC `RequestOptions` type and is NOT read by
+                        //    `dispatch_request`, so a caller who sets it gets no
+                        //    protection from it whatsoever. The earlier record
+                        //    here claimed otherwise; it was wrong, and phase
+                        //    118.2's verification classified that claim as a
+                        //    blocker in its own right (T-118.2-20-04).
+                        //
+                        //    Why that public field was NOT plumbed in instead:
+                        //    reading a field that has never been read would
+                        //    silently change behaviour for every existing caller
+                        //    who already sets it, with no version signal and no
+                        //    way to walk it back except another behaviour change.
+                        //    A private ceiling is the smaller and reversible
+                        //    choice. Per-id response routing — the
                         //    `active_requests` map carrying a response channel per
                         //    id — is the correct long-term shape and is recorded
                         //    as a follow-up, not attempted here.
@@ -3762,6 +3990,15 @@ impl<T: Transport> Client<T> {
                                 "discarding a JSON-RPC response whose id is not the one this \
                                  request is awaiting; still waiting"
                             );
+                            mismatch_budget.record();
+                            if let Some(capped) =
+                                mismatch_budget.exhausted(&request_id, &response.id)
+                            {
+                                // Returned from INSIDE the inner future, so the
+                                // single WR-04 exit cleanup below still reaps the
+                                // pending `active_requests` entry.
+                                return Err(capped);
+                            }
                             continue;
                         }
 
@@ -7789,6 +8026,204 @@ mod tests {
                 assert!(
                     raw.lock().unwrap().is_empty(),
                     "{method}: v1 never uses the raw path"
+                );
+            }
+        }
+    }
+
+    // =======================================================================
+    // `MismatchBudget` — the discard ceiling, its arming rule, its cap, and the
+    // slice arithmetic (Phase 118.2 plan 20, BLOCKER 2).
+    //
+    // Unit-testable in isolation precisely because the budget is its own type
+    // rather than two locals inside `dispatch_request`: the arming rule (the
+    // deadline is set on the FIRST discard and never moves) is the property that
+    // separates a real ceiling from one a dripping peer can extend forever, and
+    // it is invisible from the outside.
+    // =======================================================================
+
+    mod mismatch_budget {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn a_fresh_budget_has_no_deadline_and_no_error() {
+            let budget = MismatchBudget::default();
+            assert!(
+                budget.deadline().is_none(),
+                "a request that has seen no mis-addressed frame must carry NO deadline. `None` is \
+                 not 'unset, use a default' — it is what keeps the ordinary receive path \
+                 uncancelled, so a `Some` here would put a ceiling on every well-behaved call in \
+                 the SDK (T-118.2-20-05)."
+            );
+            assert!(
+                budget
+                    .exhausted(&RequestId::from("a"), &RequestId::from("b"))
+                    .is_none(),
+                "a budget that has discarded nothing cannot be exhausted"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_deadline_is_set_on_the_first_discard_only() {
+            let mut budget = MismatchBudget::default();
+            budget.record();
+            let armed = budget
+                .deadline()
+                .expect("the first discard arms the deadline");
+
+            // Advance real time between discards, so a re-arming implementation
+            // could not coincidentally produce the same Instant.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            budget.record();
+            assert_eq!(
+                budget.deadline(),
+                Some(armed),
+                "the deadline moved on the SECOND discard. Re-arming per frame means a peer \
+                 emitting a steady drip of wrong ids extends the wait indefinitely — the ceiling \
+                 exists and never fires, which is the defect wearing a fix's clothes \
+                 (T-118.2-20-03)."
+            );
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            budget.record();
+            assert_eq!(
+                budget.deadline(),
+                Some(armed),
+                "the deadline moved on the THIRD discard"
+            );
+        }
+
+        #[test]
+        fn the_cap_fires_at_the_limit_and_not_one_below() {
+            let awaiting = RequestId::from("awaiting");
+            let received = RequestId::from("received");
+
+            let mut budget = MismatchBudget::default();
+            for _ in 0..MAX_ID_MISMATCH_DISCARDS - 1 {
+                budget.record();
+            }
+            assert!(
+                budget.exhausted(&awaiting, &received).is_none(),
+                "the cap fired one discard EARLY at {} of {MAX_ID_MISMATCH_DISCARDS}",
+                MAX_ID_MISMATCH_DISCARDS - 1
+            );
+
+            budget.record();
+            assert!(
+                budget.exhausted(&awaiting, &received).is_some(),
+                "the cap did not fire AT {MAX_ID_MISMATCH_DISCARDS}. A cap that never fires leaves \
+                 a frame-spraying peer indistinguishable from a peer that went quiet — the caller \
+                 sees only a timeout and cannot tell which."
+            );
+        }
+
+        #[test]
+        fn the_cap_error_names_the_count_and_both_ids() {
+            let awaiting = RequestId::from("1");
+            let received = RequestId::Number(1);
+
+            let mut budget = MismatchBudget::default();
+            for _ in 0..MAX_ID_MISMATCH_DISCARDS {
+                budget.record();
+            }
+            let error = budget
+                .exhausted(&awaiting, &received)
+                .expect("the cap fires at the limit");
+            let text = error.to_string();
+
+            assert!(
+                text.contains(&MAX_ID_MISMATCH_DISCARDS.to_string()),
+                "the error must name the discard count, or the failure is not diagnosable. Got: \
+                 {text:?}"
+            );
+            // The CONF-09 encoding probe, re-resolved. `String("1")` and
+            // `Number(1)` are DIFFERENT ids because `RequestId` equality is
+            // typed and structural, exactly as JSON-RPC 2.0 requires. Rendered
+            // as bare strings both would read `1` and the error would look like
+            // a contradiction; the typed debug form makes the re-typing the
+            // first thing the reader sees.
+            assert!(
+                text.contains("String(\"1\")"),
+                "the awaited id must be rendered in its TYPED debug form. Got: {text:?}"
+            );
+            assert!(
+                text.contains("Number(1)"),
+                "the received id must be rendered in its TYPED debug form, so a re-typed id is \
+                 visible rather than reading identically to the one it did not match. Got: \
+                 {text:?}"
+            );
+        }
+
+        #[test]
+        fn the_receive_slice_never_exceeds_the_remaining_budget() {
+            let now = tokio::time::Instant::now();
+
+            // Remaining GREATER than the slice: the fixed slice wins, so the
+            // lock is released four times a second regardless of how much
+            // budget is left.
+            let far = now + MISMATCH_RECEIVE_SLICE + Duration::from_secs(1);
+            assert_eq!(
+                MismatchBudget::slice_until(far, now),
+                Some(MISMATCH_RECEIVE_SLICE),
+                "with budget to spare the slice is the fixed one"
+            );
+
+            // Remaining LESS than the slice: the remainder wins, so the final
+            // attempt cannot overshoot the deadline.
+            let near = now + Duration::from_millis(10);
+            assert_eq!(
+                MismatchBudget::slice_until(near, now),
+                Some(Duration::from_millis(10)),
+                "with less budget than one slice the REMAINDER wins, or the last attempt \
+                 overshoots the ceiling it exists to enforce"
+            );
+
+            // Remaining EXACTLY zero, and negative. Both must be `None` rather
+            // than a zero or wrapped duration: `Instant - Instant` panics on
+            // underflow, and a zero slice would hot-spin the loop.
+            assert_eq!(
+                MismatchBudget::slice_until(now, now),
+                None,
+                "a spent budget yields NO slice"
+            );
+            assert_eq!(
+                MismatchBudget::slice_until(now, now + Duration::from_secs(1)),
+                None,
+                "a deadline already in the past yields NO slice — never a negative or wrapped \
+                 duration"
+            );
+        }
+
+        proptest::proptest! {
+            /// The slice is never longer than the remaining budget, never
+            /// longer than the fixed slice, and never zero.
+            ///
+            /// The property arm the ALWAYS requirement asks for on this change:
+            /// the ceiling is `Instant` arithmetic, and arithmetic that
+            /// underflowed would produce either a panic or an immediate spin, so
+            /// the relationship between the remainder and the slice is the
+            /// invariant worth generating over rather than any single pair of
+            /// values.
+            #[test]
+            fn property_the_slice_never_exceeds_the_remaining_budget(
+                remaining_ms in 1u64..60_000,
+            ) {
+                let now = tokio::time::Instant::now();
+                let remaining = Duration::from_millis(remaining_ms);
+                let slice = MismatchBudget::slice_until(now + remaining, now)
+                    .expect("a positive remainder always yields a slice");
+                proptest::prop_assert!(
+                    slice <= remaining,
+                    "the slice {slice:?} overshot the remaining budget {remaining:?}"
+                );
+                proptest::prop_assert!(
+                    slice <= MISMATCH_RECEIVE_SLICE,
+                    "the slice {slice:?} exceeded MISMATCH_RECEIVE_SLICE"
+                );
+                proptest::prop_assert!(
+                    !slice.is_zero(),
+                    "a zero slice would hot-spin the discard loop"
                 );
             }
         }
