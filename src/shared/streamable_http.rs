@@ -724,6 +724,43 @@ enum TerminalKind {
     Request,
 }
 
+/// WHICH of this transport's streams a terminal reason belongs to (Phase 118.2,
+/// BLOCKER 1).
+///
+/// # The transport is not the owner of a terminal reason; a STREAM is
+///
+/// Before Phase 118.2 this transport had exactly ONE SSE stream, the GET session
+/// stream, so "the transport's stream ended" was a well-formed sentence. D-01
+/// added a second KIND — one detached reader per streaming POST response — and a
+/// transport now has N streams: one session stream plus one per in-flight
+/// streaming POST. One stream's terminal end is NOT the transport's.
+///
+/// The primary fact is therefore per-stream, and the transport-wide reading is a
+/// DERIVED view: the latched reason, surfaced only when no POST-response reader
+/// is live. Carrying the kind is what lets a caller tell an unrelated stream's
+/// diagnosis from its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamKind {
+    /// The GET session stream. The only one that reconnects (D-03).
+    Session,
+    /// One streaming POST response — a call's own answer arriving.
+    PostResponse,
+}
+
+impl StreamKind {
+    /// How this stream names itself in a message handed to a caller.
+    ///
+    /// Written from the CALLER's point of view, because the caller is who reads
+    /// it: the question a reader of the message is asking is "is this about MY
+    /// request, or about something else?".
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Session => "the GET session stream",
+            Self::PostResponse => "this call's own POST response stream",
+        }
+    }
+}
+
 /// Why this transport's stream ended, stored so it can be handed to EVERY later
 /// [`Transport::receive`] rather than to whichever caller happened to be next.
 ///
@@ -741,12 +778,25 @@ enum TerminalKind {
 struct TerminalReason {
     kind: TerminalKind,
     message: String,
+    /// WHICH stream raised it. See [`StreamKind`].
+    stream: StreamKind,
 }
 
 impl TerminalReason {
-    /// Rebuild the [`Error`] this reason stands for.
+    /// Rebuild the [`Error`] this reason stands for, NAMING the stream that
+    /// raised it.
+    ///
+    /// The name is a PREFIX and the original message body is preserved verbatim,
+    /// which is not cosmetic in either direction. Naming the stream is the point:
+    /// a caller handed "the reconnect budget is exhausted" for a `tools/call`
+    /// that succeeded on the wire is told a falsehood about its own request, and
+    /// an operator debugging from that message investigates the wrong subsystem
+    /// (T-118.2-19-02). Preserving the body verbatim keeps every substring the
+    /// fences match on — `tests/client_sse_stream.rs`'s `RECONNECT_PHRASE`, the
+    /// named parser bound, the truncated frame echo — intact, so this diagnosis
+    /// is bought without weakening any existing assertion.
     fn to_error(&self) -> Error {
-        let message = self.message.clone();
+        let message = format!("{} ended: {}", self.stream.describe(), self.message);
         Error::Transport(match self.kind {
             TerminalKind::InvalidMessage => TransportError::InvalidMessage(message),
             TerminalKind::Request => TransportError::Request(message),
@@ -767,19 +817,26 @@ impl TerminalReason {
 /// [`sse_stream_overflow`] names the limit and echoes NOTHING, and
 /// [`unparseable_sse_frame`] truncates at [`MAX_ECHOED_SSE_FRAME`]. Storing the
 /// message changes its LIFETIME, not its content (T-118.2-15-06).
-fn terminal_reason_of(error: &Error) -> TerminalReason {
+/// `stream` is a PARAMETER rather than something this function guesses: the
+/// error text alone cannot tell a session-stream parse failure from a
+/// POST-response one, and a mislabelled stream is precisely the failure BLOCKER 1
+/// is about.
+fn terminal_reason_of(error: &Error, stream: StreamKind) -> TerminalReason {
     match error {
         Error::Transport(TransportError::InvalidMessage(message)) => TerminalReason {
             kind: TerminalKind::InvalidMessage,
             message: message.clone(),
+            stream,
         },
         Error::Transport(TransportError::Request(message)) => TerminalReason {
             kind: TerminalKind::Request,
             message: message.clone(),
+            stream,
         },
         other => TerminalReason {
             kind: TerminalKind::Request,
             message: other.to_string(),
+            stream,
         },
     }
 }
@@ -802,6 +859,11 @@ struct ReaderDelivery {
     /// Plan 01's `Result`-carrying receive queue. Only `Ok(msg)` rides it now —
     /// D-04's await-capacity, never-drop policy for those is unchanged.
     sender: mpsc::Sender<Result<TransportMessage>>,
+    /// WHICH of this transport's streams this reader is reading (BLOCKER 1).
+    ///
+    /// Stamped onto every reason this reader latches, so a caller can tell an
+    /// unrelated stream's diagnosis from its own. See [`StreamKind`].
+    stream: StreamKind,
     /// The write-once terminal slot. See [`StreamableHttpTransport::terminal`].
     terminal: Arc<RwLock<Option<TerminalReason>>>,
     /// The wake signal. See [`StreamableHttpTransport::terminal_signal`].
@@ -854,7 +916,7 @@ fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
         if slot.is_some() {
             return;
         }
-        *slot = Some(terminal_reason_of(error));
+        *slot = Some(terminal_reason_of(error, delivery.stream));
     }
     // Bumped only on the write that WON, and after the guard is dropped: a woken
     // consumer reads the latch, and waking it while still holding the write lock
@@ -864,6 +926,49 @@ fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
         .send_modify(|generation| *generation += 1);
 }
 
+/// An RAII count of the POST-response readers currently in flight (Phase 118.2,
+/// BLOCKER 1).
+///
+/// # Why a count and not a flag
+///
+/// A transport can have several streaming POSTs outstanding at once — nothing
+/// bounds how many `send()` calls are in flight — so a boolean would be reset by
+/// whichever reader finished first while others were still reading.
+///
+/// # Why RAII and not an explicit decrement
+///
+/// [`read_sse_body`] ends four ways (clean end-of-body, a transport failure
+/// mid-body, a D-02/D-05 corruption, and the shutdown race), and a reader task
+/// can also be dropped mid-body. A decrement written at any subset of those exits
+/// leaks the count UPWARD, and a count that never returns to zero would mean the
+/// latch is never surfaced again — trading BLOCKER 1's permanent failure for a
+/// permanent unexplained HANG, which is not an improvement (T-118.2-19-03).
+/// `Drop` runs on every one of those paths, including a panic unwind.
+struct PostReaderGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PostReaderGuard {
+    /// Count one POST-response reader as live.
+    ///
+    /// MUST be called SYNCHRONOUSLY, before the `tokio::spawn` whose future holds
+    /// the guard. Acquiring inside the spawned task would let
+    /// `Client::dispatch_request` reach [`Transport::receive`] first and observe a
+    /// count of zero — which IS the race, not a smaller version of it.
+    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for PostReaderGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The queue-then-latch decision inside [`Transport::receive`], as ONE step.
 ///
 /// `None` means neither the queue nor the latch has anything YET, so the caller
@@ -871,11 +976,32 @@ fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
 /// that ordering is what makes "every message already delivered is seen before
 /// the failure" true under a latch rather than under FIFO.
 ///
+/// # The in-flight gate (Phase 118.2, BLOCKER 1)
+///
+/// An empty queue with a live POST-response reader means the answer is ON THE
+/// WIRE, not that there is no answer. `post_body`'s `text/event-stream` branch
+/// spawns a DETACHED reader and returns `Ok(())` before anything has been
+/// delivered, so the queue is legitimately, transiently EMPTY while a real
+/// response is still arriving — and surfacing the latch on that first `Empty`
+/// poll hands the caller a stale reason belonging to a DIFFERENT stream, as this
+/// call's own answer.
+///
+/// So when `open_post_readers` is non-zero this answers `None` and the caller
+/// keeps waiting. It is not a delay: the reader either delivers the answer onto
+/// the queue, or latches its OWN terminal reason and drops its guard on the way
+/// out — and that latch write bumps the wake generation
+/// [`Transport::receive`] is parked on, so the caller is woken either way.
+///
+/// The `Disconnected` arm and the queue-wins-over-latch ordering are unchanged:
+/// a gone `Receiver` is not a stream diagnosis, and a queued message must still
+/// be delivered ahead of any reason.
+///
 /// Extracted from [`Transport::receive`] so neither it nor this exceeds the
 /// repo's cognitive-complexity budget (CLAUDE.md, cog 25) without an `#[allow]`.
 fn drain_or_latch(
     receiver: &mut mpsc::Receiver<Result<TransportMessage>>,
     terminal: &Arc<RwLock<Option<TerminalReason>>>,
+    open_post_readers: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Option<Result<TransportMessage>> {
     match receiver.try_recv() {
         Ok(queued) => return Some(queued),
@@ -883,6 +1009,9 @@ fn drain_or_latch(
             return Some(Err(Error::Transport(TransportError::ConnectionClosed)))
         },
         Err(mpsc::error::TryRecvError::Empty) => {},
+    }
+    if open_post_readers.load(Ordering::SeqCst) > 0 {
+        return None;
     }
     let latched = terminal.read().as_ref().map(TerminalReason::to_error);
     latched.map(Err)
@@ -983,6 +1112,30 @@ pub struct StreamableHttpTransport {
     /// the cheaper story: one shared sender, no ambiguity about what
     /// `send_modify` on a second producer would mean.
     terminal_signal: Arc<watch::Sender<u64>>,
+    /// How many POST-response readers are in flight right now (Phase 118.2,
+    /// BLOCKER 1).
+    ///
+    /// The gate on [`Self::terminal`]: a latched reason is surfaced only when
+    /// this is ZERO. `post_body`'s `text/event-stream` branch spawns a DETACHED
+    /// reader and returns `Ok(())` before the answer lands on the queue, so an
+    /// empty queue with a live reader means the answer is on the wire — and
+    /// answering the latch there hands a caller another stream's diagnosis as its
+    /// own result, permanently, because the latch is write-once and `Arc`-shared
+    /// across every clone.
+    ///
+    /// Maintained ONLY through [`PostReaderGuard`], whose `Drop` covers every
+    /// reader exit path; nothing increments or decrements it directly. See
+    /// [`drain_or_latch`] for the rule and [`Self::spawn_sse_reader`] for why the
+    /// acquire happens before the spawn rather than inside it.
+    ///
+    /// A `std::sync::atomic::AtomicUsize` and NOT a new dependency: the count is
+    /// read on the receive hot path under no lock, and the wake it pairs with is
+    /// the tokio `watch` channel already compiled in.
+    ///
+    /// PRIVATE on a struct whose fields are already all private, so it is
+    /// invisible to `cargo semver-checks` for the measured reason
+    /// [`Self::max_collected_body_bytes`]'s rustdoc records (T-113-95).
+    open_post_readers: Arc<std::sync::atomic::AtomicUsize>,
     /// Set once by [`Transport::close`], and raced against every reader's parked
     /// body read (Phase 118.2, WR-01).
     ///
@@ -1098,6 +1251,7 @@ impl StreamableHttpTransport {
             max_collected_body_bytes: DEFAULT_MAX_COLLECTED_BODY_BYTES,
             terminal: Arc::new(RwLock::new(None)),
             terminal_signal: Arc::new(terminal_signal),
+            open_post_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown: Arc::new(shutdown),
         }
     }
@@ -1107,9 +1261,16 @@ impl StreamableHttpTransport {
     /// One place, so the GET session-stream reader and every streaming-POST
     /// reader cannot drift over which queue they push to or which latch they
     /// write.
-    fn reader_delivery(&self) -> ReaderDelivery {
+    ///
+    /// `stream` is REQUIRED and deliberately has no default. The two call sites —
+    /// [`Self::sse_reader_context`] and [`Self::spawn_sse_reader`] — are the only
+    /// ones, and they must state which stream they are: a default would silently
+    /// mislabel one of them, and a mislabelled stream is exactly the failure this
+    /// parameter exists to prevent (BLOCKER 1).
+    fn reader_delivery(&self, stream: StreamKind) -> ReaderDelivery {
         ReaderDelivery {
             sender: self.sender.clone(),
+            stream,
             terminal: Arc::clone(&self.terminal),
             terminal_signal: Arc::clone(&self.terminal_signal),
             shutdown: Arc::clone(&self.shutdown),
@@ -1510,6 +1671,30 @@ impl StreamableHttpTransport {
             return Ok(());
         };
 
+        // THE RESET SEAM (Phase 118.2, BLOCKER 1).
+        //
+        // A confirmed live re-open, and the ONE point at which a terminal reason
+        // stops being true. Without this the latch is write-once, `Arc`-shared
+        // across every clone, and cleared by no constructor, no `start_sse` and
+        // no `close` — so one transient session-stream event (a proxy blink that
+        // outlasts `MAX_SSE_RECONNECT_ATTEMPTS`, a 405 on reconnect) becomes a
+        // PERMANENT, process-lifetime failure with no way back.
+        //
+        // Deliberately NOT on the `Ok(None)` 405 arm above: a server that offers
+        // no GET stream at all has recovered nothing, and clearing there would
+        // erase a real diagnosis and leave the failure undiagnosable
+        // (T-118.2-19-04). Deliberately NOT in `close()` or in any constructor
+        // either.
+        //
+        // The latch remains STICKY BETWEEN reset seams by design: a one-shot
+        // reason restores the CR-02 hazard `118.2-15` removed, where the reason
+        // is consumed by whichever caller is next and every later caller hangs
+        // unexplained. See `Transport::receive`.
+        //
+        // Cleared BEFORE the reader is spawned, so the fresh reader can never
+        // race its own new reason against this clear.
+        *self.terminal.write() = None;
+
         // The HTTP response-BODY middleware chain is deliberately NOT run over
         // this stream, exactly as `Self::post_streaming` states for the
         // `subscriptions/listen` body: "the chain processes a complete `Vec<u8>`
@@ -1606,7 +1791,7 @@ impl StreamableHttpTransport {
             config: Arc::clone(&self.config),
             protocol_version: Arc::clone(&self.protocol_version),
             v2_mode: Arc::clone(&self.v2_mode),
-            delivery: self.reader_delivery(),
+            delivery: self.reader_delivery(StreamKind::Session),
             last_event_id: Arc::clone(&self.last_event_id),
             // Read ONCE, here, through the paired accessor, so the spawned task
             // itself carries no `#[cfg]` at all.
@@ -1647,13 +1832,25 @@ impl StreamableHttpTransport {
     ///    (1) cannot — a stream the peer holds OPEN and IDLE gives this reader no
     ///    send to fail, and `close()` aborts only the GET session reader's handle,
     ///    never this detached one (Phase 118.2, WR-01, T-118.2-17-02).
+    /// # The in-flight guard is acquired HERE, not inside the task
+    ///
+    /// [`PostReaderGuard::acquire`] runs SYNCHRONOUSLY, before `tokio::spawn`,
+    /// and the guard is moved into the spawned future so it drops when the reader
+    /// ends — on a clean end-of-body, on a corrupt frame, on shutdown, and on a
+    /// drop mid-body alike. Acquiring inside the task would let
+    /// `Client::dispatch_request` reach [`Transport::receive`] first and observe a
+    /// count of zero, which IS the race the gate exists to close (BLOCKER 1).
     fn spawn_sse_reader(&self, body: hyper::body::Incoming) -> tokio::task::JoinHandle<()> {
-        let delivery = self.reader_delivery();
+        let delivery = self.reader_delivery(StreamKind::PostResponse);
         let on_resumption = self.resumption_callback();
         let last_event_id = Arc::clone(&self.last_event_id);
         let max_buffer_size = self.max_collected_body_bytes;
+        let in_flight = PostReaderGuard::acquire(&self.open_post_readers);
 
         tokio::spawn(async move {
+            // Moved in so its `Drop` marks this reader finished on EVERY exit
+            // path. See `PostReaderGuard`.
+            let _in_flight = in_flight;
             // A POST response stream has no reconnect, so it has no cursor
             // CONSUMER: this local is written and never read back (WR-02). Its
             // ids still reach the transport-wide `last_event_id` for the public
@@ -2412,7 +2609,12 @@ impl Transport for StreamableHttpTransport {
     /// | Reconnect budget exhausted (D-03) | LATCHED as `TransportError::Request`, naming the exhausted budget | as above |
     /// | Ordinary EOF, or a deliberate [`Transport::close`] / last-transport-drop | NOTHING — the reader exits silently | this keeps awaiting, exactly as before |
     ///
-    /// Three rules make that taxonomy hold:
+    /// Every latched reason NAMES the stream that raised it — the GET session
+    /// stream, or this call's own POST response stream — ahead of its own
+    /// message, so a caller can tell an unrelated diagnosis from its own. See
+    /// [`StreamKind`].
+    ///
+    /// Four rules make that taxonomy hold:
     ///
     /// 1. **The queue is drained before the latch is consulted.** Every message
     ///    already queued is delivered BEFORE the reason is surfaced, so a
@@ -2432,6 +2634,12 @@ impl Transport for StreamableHttpTransport {
     ///    clone terminates the reader" true without a `Drop` impl — impossible
     ///    here anyway, since the transport is `Clone` and shares its abort
     ///    handle, so one clone's drop would kill the original's stream.
+    /// 4. **A latched reason is surfaced only when NO POST-response reader is
+    ///    live**, so a caller with an answer still in flight is never pre-empted
+    ///    by another stream's diagnosis. `post_body`'s `text/event-stream` branch
+    ///    spawns a DETACHED reader and returns before anything is delivered, so an
+    ///    empty queue with a live reader means the answer is on the wire — not
+    ///    that there is none. See [`drain_or_latch`].
     ///
     /// # The terminal reason is STICKY — stop on it, do not loop
     ///
@@ -2445,6 +2653,12 @@ impl Transport for StreamableHttpTransport {
     /// whichever caller happened to be next and every caller after that gets an
     /// unexplained hang.
     ///
+    /// Sticky is not PERMANENT, and the difference is the whole of BLOCKER 1. A
+    /// successful [`Self::start_sse`] re-open CLEARS the latch, so a transport
+    /// whose session stream recovered is usable again rather than answering the
+    /// stale reason for the life of the process. The latch stays sticky BETWEEN
+    /// those reset seams.
+    ///
     /// The public signature is unchanged, and both the queue's element type and
     /// the latch are private, which `cargo semver-checks` cannot see.
     async fn receive(&mut self) -> Result<TransportMessage> {
@@ -2455,7 +2669,9 @@ impl Transport for StreamableHttpTransport {
         let mut signal = self.terminal_signal.subscribe();
         let mut receiver = self.receiver.lock().await;
         loop {
-            if let Some(outcome) = drain_or_latch(&mut receiver, &self.terminal) {
+            if let Some(outcome) =
+                drain_or_latch(&mut receiver, &self.terminal, &self.open_post_readers)
+            {
                 return outcome;
             }
             tokio::select! {
@@ -5115,6 +5331,407 @@ mod tests {
                     next_reconnect_delay(attempt, server_retry),
                     next_reconnect_delay(attempt, server_retry),
                     "two identical calls disagreed for attempt {attempt}, retry {retry_millis:?}"
+                );
+            }
+        }
+    }
+    // ------------------------------------------------------------------
+    // The latch gate (Phase 118.2, BLOCKER 1).
+    //
+    // `drain_or_latch` used to surface the terminal latch the moment
+    // `try_recv()` reported `Empty`. On the POST-answered-with-
+    // `text/event-stream` path, `post_body` spawns a DETACHED reader and
+    // returns `Ok(())` BEFORE the answer lands on the queue, so an empty
+    // queue with a live reader means the answer is on the wire — and the
+    // latch won instantly with a stale reason belonging to a different
+    // stream, permanently, because nothing ever cleared it.
+    //
+    // These arms pin BOTH sides of the gate and both sides of the reset
+    // seam. A gate tested only on its open side is untested.
+    // ------------------------------------------------------------------
+    mod latch_gate {
+        use super::*;
+
+        /// A delivery bundle whose queue, latch and wake signal the caller
+        /// keeps, so an arm can drive `drain_or_latch` against exactly the
+        /// state it set up.
+        ///
+        /// The `watch::Receiver` halves are dropped deliberately:
+        /// `latch_terminal_reason` wakes with `send_modify`, which — unlike
+        /// `send` — does not error when nobody is listening, and these arms
+        /// measure the LATCH rather than the wake.
+        fn delivery_for(
+            stream: StreamKind,
+            terminal: &Arc<RwLock<Option<TerminalReason>>>,
+        ) -> (ReaderDelivery, mpsc::Receiver<Result<TransportMessage>>) {
+            let (sender, receiver) = mpsc::channel(CLIENT_RECEIVE_QUEUE_CAPACITY);
+            let (terminal_signal, _) = watch::channel(0u64);
+            let (shutdown, _) = watch::channel(false);
+            (
+                ReaderDelivery {
+                    sender,
+                    stream,
+                    terminal: Arc::clone(terminal),
+                    terminal_signal: Arc::new(terminal_signal),
+                    shutdown: Arc::new(shutdown),
+                },
+                receiver,
+            )
+        }
+
+        /// The reason a spent reconnect budget latches, as the session stream
+        /// raises it.
+        fn budget_reason() -> Error {
+            reconnect_budget_exhausted(MAX_SSE_RECONNECT_ATTEMPTS, None)
+        }
+
+        /// BOTH sides of the gate: at zero a latched reason IS surfaced, at
+        /// one it is NOT (CONF-09 boundary probe).
+        ///
+        /// The zero side alone would pass against the unfixed tree, which is
+        /// exactly how BLOCKER 1 shipped green.
+        #[test]
+        fn latch_gate_boundary_at_zero_and_one_in_flight_readers() {
+            let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+            let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
+            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            latch_terminal_reason(&delivery, &budget_reason());
+
+            // ZERO in flight: nobody is waiting on an answer, so the reason is
+            // the truest thing this transport can say.
+            let at_zero = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            assert!(
+                matches!(at_zero, Some(Err(_))),
+                "with an empty queue, a set latch and NO reader in flight, the latched reason \
+                 must be surfaced — that is the CR-02 contract and this gate does not weaken it"
+            );
+
+            // ONE in flight: an empty queue means the answer is on the wire.
+            let guard = PostReaderGuard::acquire(&open_post_readers);
+            assert_eq!(
+                open_post_readers.load(Ordering::SeqCst),
+                1,
+                "the guard must count itself the moment it is acquired, synchronously"
+            );
+            let at_one = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            assert!(
+                at_one.is_none(),
+                "with a POST-response reader still live, `drain_or_latch` must answer None and \
+                 the caller must keep waiting. Surfacing the latch here hands a caller another \
+                 stream's diagnosis as its own result (BLOCKER 1)"
+            );
+
+            // And back: the gate opens again once the reader is done, so a
+            // genuinely dead session stream is never traded for a silent hang.
+            drop(guard);
+            let after = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            assert!(
+                matches!(after, Some(Err(_))),
+                "once the last reader is gone the latch must be surfaced again, or the gate has \
+                 traded a permanent failure for a permanent hang (T-118.2-19-03)"
+            );
+        }
+
+        /// A queued message still wins over a set latch, even with a reader in
+        /// flight.
+        ///
+        /// The ordering rule the gate must not disturb: every message already
+        /// delivered is seen BEFORE any failure.
+        #[test]
+        fn a_queued_message_still_wins_over_a_set_latch() {
+            let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+            let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
+            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            latch_terminal_reason(&delivery, &budget_reason());
+            delivery
+                .sender
+                .try_send(Ok(TransportMessage::Notification(
+                    crate::types::Notification::Client(
+                        crate::types::ClientNotification::Initialized,
+                    ),
+                )))
+                .expect("the bounded queue has capacity for one message");
+
+            let drained = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            assert!(
+                matches!(drained, Some(Ok(_))),
+                "the queue is drained before the latch is consulted; a message that arrived \
+                 before the failure must still be delivered ahead of it"
+            );
+        }
+
+        /// The count returns to zero on every exit path, including a reader
+        /// that delivered NOTHING (CONF-09 empty probe).
+        ///
+        /// A count that leaked upward would mean the latch is never surfaced
+        /// again — a permanent unexplained hang in place of a permanent
+        /// failure, which is not an improvement (T-118.2-19-03).
+        #[test]
+        fn post_reader_guard_returns_the_count_to_zero() {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            // An answer that delivered ZERO events: acquired, and gone again
+            // with nothing ever having reached the queue.
+            {
+                let _empty = PostReaderGuard::acquire(&counter);
+                assert_eq!(counter.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "a POST-response reader that delivered zero events must still return the count \
+                 to zero, or an empty answer permanently gates the transport"
+            );
+
+            // Nested readers — several streaming POSTs outstanding at once,
+            // which is why this is a COUNT and not a flag.
+            {
+                let _first = PostReaderGuard::acquire(&counter);
+                let _second = PostReaderGuard::acquire(&counter);
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
+                {
+                    let _third = PostReaderGuard::acquire(&counter);
+                    assert_eq!(counter.load(Ordering::SeqCst), 3);
+                }
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    2,
+                    "one reader finishing must not clear the others"
+                );
+            }
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "every nested guard must unwind to zero"
+            );
+
+            // A reader that PANICS mid-body: `Drop` runs on the unwind, so the
+            // count is returned even on the path no explicit decrement covers.
+            let unwound = Arc::clone(&counter);
+            let panicked = std::panic::catch_unwind(move || {
+                let _guard = PostReaderGuard::acquire(&unwound);
+                panic!("a reader failing mid-body");
+            });
+            assert!(panicked.is_err(), "the arm must actually have panicked");
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "a reader that panicked mid-body must still return the count to zero — that is \
+                 why the count is RAII and not an explicit decrement at each exit"
+            );
+        }
+
+        /// Clearing is idempotent, and a cleared reason is never resurrected
+        /// (CONF-09 idempotency probe).
+        ///
+        /// RE-RESOLVED: the prior round answered this probe with "the sticky
+        /// write-once latch", and BLOCKER 1 is what that answer cost —
+        /// stickiness with no reset seam is PERMANENCE, not idempotence.
+        #[test]
+        fn clearing_an_already_clear_latch_is_a_no_op() {
+            let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+            let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
+            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            latch_terminal_reason(&delivery, &budget_reason());
+            assert!(terminal.read().is_some(), "the latch is set");
+
+            // The reset seam, as `start_sse` runs it.
+            *terminal.write() = None;
+            assert!(terminal.read().is_none(), "one reset clears it");
+            // And again: running the seam twice must leave EXACTLY the state
+            // running it once left.
+            *terminal.write() = None;
+            assert!(
+                terminal.read().is_none(),
+                "clearing an already-clear latch must be a no-op"
+            );
+            assert!(
+                drain_or_latch(&mut receiver, &terminal, &open_post_readers).is_none(),
+                "a recovered transport with an empty queue and nothing in flight must WAIT, not \
+                 answer the stale reason"
+            );
+
+            // A cleared reason is never resurrected: the NEXT latch write is a
+            // fresh first-writer-wins, carrying the new reason and not the old.
+            let (post_delivery, _post_receiver) = delivery_for(StreamKind::PostResponse, &terminal);
+            latch_terminal_reason(
+                &post_delivery,
+                &Error::Transport(TransportError::Request("a fresh reason".to_string())),
+            );
+            let resurrected = terminal.read().clone().expect("the fresh reason is stored");
+            assert_eq!(
+                resurrected.stream,
+                StreamKind::PostResponse,
+                "after a reset, the next write wins outright — the cleared reason must not come \
+                 back"
+            );
+            assert!(
+                resurrected.message.contains("a fresh reason"),
+                "got {:?}",
+                resurrected.message
+            );
+        }
+
+        /// Write-once holds under two genuinely concurrent writers, one per
+        /// stream kind (CONF-09 concurrency probe).
+        ///
+        /// RE-RESOLVED: the prior round answered this probe with
+        /// "queue-drains-before-latch plus a biased select". That rule does
+        /// NOT hold for an SSE-answered POST, where the queue is empty
+        /// precisely because the answer has not landed yet — which is the
+        /// whole of BLOCKER 1. Real threads, not an interleaving argued on
+        /// paper.
+        #[test]
+        fn write_once_holds_under_two_racing_latch_writers() {
+            let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+            let (session, _session_rx) = delivery_for(StreamKind::Session, &terminal);
+            let (post, _post_rx) = delivery_for(StreamKind::PostResponse, &terminal);
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let session_barrier = Arc::clone(&barrier);
+            let post_barrier = Arc::clone(&barrier);
+            let session_writer = std::thread::spawn(move || {
+                session_barrier.wait();
+                latch_terminal_reason(&session, &budget_reason());
+            });
+            let post_writer = std::thread::spawn(move || {
+                post_barrier.wait();
+                latch_terminal_reason(
+                    &post,
+                    &Error::Transport(TransportError::Request(
+                        "the POST response stream dropped".to_string(),
+                    )),
+                );
+            });
+            session_writer.join().expect("the session writer finishes");
+            post_writer.join().expect("the POST writer finishes");
+
+            let stored = terminal.read().clone().expect("one of them won");
+            let is_one_of_the_two = (stored.stream == StreamKind::Session
+                && stored.message.contains("reconnect budget"))
+                || (stored.stream == StreamKind::PostResponse
+                    && stored.message.contains("the POST response stream dropped"));
+            assert!(
+                is_one_of_the_two,
+                "exactly ONE reason must be stored, whole and unmixed: a slot holding one \
+                 writer's stream kind beside the other's message would tell a caller a \
+                 falsehood about which stream ended. Got {stored:?}"
+            );
+        }
+
+        /// The gate still answers `None` while a reader is live, no matter
+        /// which stream latched.
+        ///
+        /// The half of the concurrency probe fence 21 measures end to end,
+        /// pinned here in isolation so a failure cannot be blamed on the wire.
+        #[test]
+        fn a_post_reader_in_flight_gates_a_reason_from_either_stream() {
+            for stream in [StreamKind::Session, StreamKind::PostResponse] {
+                let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+                let (delivery, mut receiver) = delivery_for(stream, &terminal);
+                let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let _guard = PostReaderGuard::acquire(&open_post_readers);
+                latch_terminal_reason(&delivery, &budget_reason());
+                assert!(
+                    drain_or_latch(&mut receiver, &terminal, &open_post_readers).is_none(),
+                    "a {stream:?} reason must not pre-empt a caller whose own POST-response \
+                     stream is still live"
+                );
+            }
+        }
+
+        /// The rendered text NAMES the stream AND preserves the message body
+        /// verbatim.
+        ///
+        /// Both halves matter. Naming the stream is the diagnosis the review
+        /// asked for; preserving the body is what keeps
+        /// `tests/client_sse_stream.rs`'s `RECONNECT_PHRASE` — matched at four
+        /// sites, including fences 12 and 13 — intact.
+        #[test]
+        fn to_error_names_the_stream_and_preserves_the_message_body() {
+            let session = terminal_reason_of(&budget_reason(), StreamKind::Session);
+            let rendered = session.to_error().to_string();
+            assert!(
+                rendered.contains("reconnect budget"),
+                "the message BODY must survive the stream-name prefix verbatim, or fences 12 \
+                 and 13 stop measuring what they were written to measure. Got {rendered:?}"
+            );
+            assert!(
+                rendered.contains("the GET session stream"),
+                "a caller must be able to tell an unrelated stream's diagnosis from its own \
+                 (T-118.2-19-02). Got {rendered:?}"
+            );
+            assert!(
+                matches!(
+                    session.to_error(),
+                    Error::Transport(TransportError::Request(_))
+                ),
+                "a spent budget is a LIFECYCLE end, not corruption; the variant must not move"
+            );
+
+            let post = terminal_reason_of(
+                &unparseable_sse_frame(
+                    &Error::Transport(TransportError::InvalidMessage("bad json".to_string())),
+                    "{",
+                ),
+                StreamKind::PostResponse,
+            );
+            let post_rendered = post.to_error().to_string();
+            assert!(
+                post_rendered.contains("this call's own POST response stream"),
+                "the POST half must name itself distinctly from the session stream. Got \
+                 {post_rendered:?}"
+            );
+            assert!(
+                matches!(
+                    post.to_error(),
+                    Error::Transport(TransportError::InvalidMessage(_))
+                ),
+                "a parse failure is CORRUPTION; the D-02/D-05 taxonomy must not move"
+            );
+            assert_ne!(
+                rendered, post_rendered,
+                "two streams ending for different reasons must render differently"
+            );
+        }
+
+        proptest::proptest! {
+            /// The count is exactly the number of guards held, at every
+            /// prefix, and returns to exactly zero.
+            ///
+            /// The property arm the ALWAYS requirement asks for on this
+            /// change: the gate is a boolean over a COUNTER, so the counter's
+            /// monotonic accounting is the invariant worth generating over.
+            /// Bounded at 32 because the property is about the accounting, not
+            /// about scale.
+            #[test]
+            fn property_the_in_flight_count_is_exactly_the_guards_held(
+                held in 0usize..32,
+            ) {
+                let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut guards = Vec::with_capacity(held);
+                for expected in 1..=held {
+                    guards.push(PostReaderGuard::acquire(&counter));
+                    assert_eq!(
+                        counter.load(Ordering::SeqCst),
+                        expected,
+                        "the count must equal the guards held at every prefix"
+                    );
+                }
+                while let Some(guard) = guards.pop() {
+                    let before = counter.load(Ordering::SeqCst);
+                    drop(guard);
+                    assert_eq!(
+                        counter.load(Ordering::SeqCst),
+                        before - 1,
+                        "each drop must return exactly one"
+                    );
+                }
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    0,
+                    "every guard dropped must leave the count at exactly zero, for any number \
+                     of concurrently outstanding streaming POSTs"
                 );
             }
         }
