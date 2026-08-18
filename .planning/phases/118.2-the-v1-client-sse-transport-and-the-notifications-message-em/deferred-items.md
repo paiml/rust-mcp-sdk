@@ -586,12 +586,33 @@ Nothing is removed from `active_requests` on that path — the request is still 
 WR-04 single-exit cleanup remains the only other place the entry is removed.
 
 **The stated limitation.** A discarded frame is *gone*. If it was the answer to some OTHER
-in-flight request on the same `Client`, that request now waits out its caller's timeout instead
-of receiving its answer. That is strictly better than the pre-fix behaviour — one caller
-silently receiving another caller's tool result is a cross-request data leak inside one process
-(T-118.2-15-01) — and it is bounded by the caller's own timeout rather than unbounded. But it
-is a real cost, accepted deliberately and recorded as `T-118.2-15-03` (Denial of Service,
-medium, **accept**) rather than papered over.
+in-flight request on the same `Client`, that request does not receive its answer. That is
+strictly better than the pre-fix behaviour — one caller silently receiving another caller's tool
+result is a cross-request data leak inside one process (T-118.2-15-01). **The COST, stated
+correctly:** as plan `118.2-15` shipped it, the discard wait was bounded by **nothing at all** —
+`Client::dispatch_request` applies no `tokio::time::timeout` and never reads
+`RequestOptions::timeout`, so the "caller's own timeout" that an earlier version of this
+paragraph named as the ceiling **does not exist in `pmcp::Client`**. Worse, the discard loop held
+the transport **write** lock across an unbounded `receive().await` and re-took it on every
+`continue`, so a single mis-addressed frame wedged **every** operation on that `Client`, not only
+the mismatched caller. Since plan `118.2-20` the wait is bounded by `MISMATCH_DISCARD_TIMEOUT`
+(10 s, armed on the FIRST mismatch only) and capped by `MAX_ID_MISMATCH_DISCARDS` (32), both
+**private constants in `src/client/mod.rs`**, and the write guard is released and re-taken on a
+`MISMATCH_RECEIVE_SLICE` (250 ms) so another operation waits at most one slice. It remains a real
+cost, accepted deliberately and recorded as `T-118.2-15-03` (Denial of Service, medium,
+**accept**) rather than papered over.
+
+> **CORRECTION, 2026-08-17, by plan `118.2-21`.** The clause immediately above was **rewritten in
+> place**, not annotated beneath, and this is the one deliberate exception to this file's
+> append-only convention. The superseded text asserted the discard wait was "bounded by the
+> caller's own timeout rather than unbounded". `118.2-VERIFICATION.md` classified that assertion
+> as a **Blocker in its own right** — a documentation-of-record error, because a reader auditing
+> residual risk would conclude the defect was already mitigated and stop looking — and
+> `118.2-REVIEW-closure.md`'s CR-02 proved mechanically that no such timeout exists anywhere in
+> `Client`. A false claim of record cannot be left standing beside its own correction, so it is
+> gone rather than struck through. `118.2-15-SUMMARY.md` carries the same superseded claim and is
+> **NOT** edited: a plan summary is a historical record of what that plan believed at the time.
+> **This paragraph is the superseding statement**; where the two disagree, this one governs.
 
 Two things were considered and rejected *for this plan*:
 
@@ -934,3 +955,236 @@ next person to run the suite locally does not read either refusal as a conforman
   CONF-09's own stated limitation (i) — and this closure changed CLIENT code only
   (`src/shared/streamable_http.rs`'s client half and `src/client/mod.rs`). Run 2's green is a
   regression check on the server-side gate, not validation of CR-01, CR-02, WR-01 or WR-02.
+
+## SECOND GAP-CLOSURE ROUND (plans 118.2-19..21) — what it closed, and what it DECLINES
+
+**Appended by plan `118.2-21`, 2026-08-17, the second round's leftovers ledger.** Append-only: nothing
+above is rewritten by this appendix, and plan 16's declined-findings appendix is cross-referenced rather
+than re-litigated. (The single in-place correction this round makes is in the `## DEFERRED (118.2-15)`
+section above, and it carries its own boxed CORRECTION note explaining why.)
+
+### ⚠ A NAMING COLLISION — read this before following any WR/IN id in this appendix
+
+There are **two** review files for this phase and they use **overlapping ids for entirely different
+findings**:
+
+- `118.2-REVIEW.md` (the FIRST review, of plans 01–13) numbered its findings **WR-01..WR-06** and
+  **IN-01..IN-06**. Those are the ids indexed by the `## GAP-CLOSURE ROUND (2026-08-17)` appendix above.
+- `118.2-REVIEW-closure.md` (the SECOND review, of the gap closure ITSELF) **restarted** at
+  **WR-01..WR-05** and **IN-01..IN-04** over completely different findings.
+
+So `WR-01` means one thing in the appendix above and a different thing in this one. **Every reference in
+this appendix names the FILE as well as the id.** A later auditor who follows a bare id will read the
+wrong entry.
+
+### What this round CLOSED
+
+Both were Criticals raised by `118.2-REVIEW-closure.md` and **independently confirmed against the merged
+source** by `118.2-VERIFICATION.md` before any fix was written. Both were introduced by the FIRST gap
+closure's own CR-02 fix (plan `118.2-15`) — i.e. this round is closing defects that a closure created.
+
+**BLOCKER 1 — the sticky terminal latch pre-empted an in-flight, SSE-answered POST response, permanently.**
+`118.2-REVIEW-closure.md` CR-01. Closed by plan **`118.2-19`** in `src/shared/streamable_http.rs`.
+
+- *What it was:* `drain_or_latch` surfaced the write-once terminal latch as soon as `try_recv()` reported
+  `Empty`. On the POST-answered-with-`text/event-stream` path, `post_body` spawns a detached reader and
+  returns `Ok(())` **before** the answer lands on the queue, so the queue is legitimately, transiently
+  empty while a real answer is on the wire — and the latch won instantly with a stale, unrelated reason.
+  The latch is `Arc`-shared across every clone, written once, and had **no reset seam anywhere**, so the
+  FIRST trip failed every later `tools/call` against an SSE-answering server **for the life of the
+  process**. Reachability is ordinary, not adversarial: a spent `MAX_SSE_RECONNECT_ATTEMPTS = 2` budget,
+  a 405 on reconnect, or one earlier truncated streaming-POST response.
+- *The fix:* stream identity (`StreamKind`) stamped on every `TerminalReason`; an in-flight POST-reader
+  gate (`open_post_readers` + the RAII `PostReaderGuard`, acquired synchronously **before** `tokio::spawn`)
+  so `drain_or_latch` answers "keep waiting" while a POST answer is outstanding; and a reset seam on a
+  successful `start_sse` re-open (`src/shared/streamable_http.rs:1728`).
+- *Fences and PARSED counts, quoted from `118.2-19-SUMMARY.md`:*
+  `a_latched_session_stream_does_not_pre_empt_an_sse_answered_call` and
+  `a_reopened_session_stream_clears_the_terminal_latch`, in `binary(client_sse_stream)` —
+  **22 run, 22 passed, 0 skipped** (`target/118.2-19-green.log`); `binary(pmcp) and test(latch_gate)`
+  **9 run, 9 passed** (`target/118.2-19-latchgate.log`).
+- *RED measurement, not retakeable:* `target/118.2-19-red.log` — **22 run, 20 passed, 2 failed**, exactly
+  the two new fences. Call 1 came back reporting the GET session stream's reconnect-budget error although
+  it had **succeeded on the wire**; fence 22 measured `receive()` answering the latch **6.625 µs** after a
+  *successful* session-stream re-open, which is what proves the failure was permanent rather than delayed.
+
+**BLOCKER 2 — the id-mismatch discard held the transport write lock across an unbounded receive.**
+`118.2-REVIEW-closure.md` CR-02. Closed by plan **`118.2-20`** in `src/client/mod.rs`.
+
+- *What it was:* two halves. (a) `let response_message = self.transport.write().await.receive().await?;`
+  held the `RwLockWriteGuard` **temporary** across the await, and the discard loop `continue`d, re-taking
+  and re-holding it — so one mis-addressed frame blocked every other `send`/`call_tool`/`close` on that
+  `Client`. (b) The wait had **no ceiling at all**; the comment booking it as "bounded by that request's
+  own timeout" named a timeout that does not exist.
+- *The fix:* `MISMATCH_DISCARD_TIMEOUT` (10 s, armed on the FIRST mismatch only, so a dripping peer cannot
+  extend it), `MAX_ID_MISMATCH_DISCARDS` (32, failing loudly and naming the count and both typed ids), and
+  `Client::receive_bounded` taking the guard in an inner scope under a `MISMATCH_RECEIVE_SLICE` (250 ms)
+  so the lock is released and re-taken each slice.
+- *Fences and PARSED counts, quoted from `118.2-20-SUMMARY.md`:*
+  `a_mismatched_frame_does_not_block_another_operation_on_the_same_client` and
+  `a_mismatched_frame_fails_this_call_within_a_bound_instead_of_waiting_forever`, in
+  `binary(client_sse_stream)` — **24 run, 24 passed, 0 skipped** (`target/118.2-20-green.log`);
+  `binary(pmcp) and test(mismatch_budget)` **6 run, 6 passed** (`target/118.2-20-unit.log`).
+- *RED measurement, not retakeable:* `target/118.2-20-red.log` — **24 run, 22 passed, 2 failed**. Fence 23's
+  lock probe **never returned** within `LOCK_PROBE_BOUND` (5 s), and `server.post_bodies()` at the elapse
+  held `initialize` / `notifications/initialized` / `tools/call` and **no `notifications/cancelled`** —
+  that absence is the measurement: `cancel_request` never reached the wire because `send_notification` was
+  parked on the same `transport.write()` the discard loop held. Fence 24's call was **still parked at 20 s**
+  (`MISMATCH_TIMEOUT_BOUND`), neither `Ok` nor `Err`.
+
+**Not deferred:** `118.2-REVIEW-closure.md` **WR-05** (fence 17 passed on *any* error, including ones that
+never reach the correlation check) is **CLOSED** — plan `118.2-20` tightened that arm so an
+`Ok(Err(..))` now panics with an explanatory message instead of counting as a pass. Recorded there.
+
+### What this round DECLINES, each with an owner
+
+Named here because **an unnamed residual going unre-verified is exactly how the previous round shipped two
+Blockers.** Source locations are given by **SYMBOL, not by line** — this round edited both files, so any
+line number recorded in a review is already stale.
+
+#### `118.2-REVIEW-closure.md` WR-01 — `deliver_sse_event`'s queue send is a bare await, not raced against shutdown
+
+- **Source (by symbol):** `deliver_sse_event` in `src/shared/streamable_http.rs` —
+  `delivery.sender.send(Ok(message)).await` (confirmed still a bare await at this round's final HEAD;
+  `.is_ok()` on an unraced `send`).
+- **User-visible consequence if left:** after `close()` the application stops draining; a peer that keeps
+  writing fills the 64-slot receive queue and the detached POST reader parks in `send()` **forever**.
+  `close()` does not drop the `Receiver` (the transport is still alive) and its abort reaches only the GET
+  reader, so **the task and its TCP socket leak**. The first review's WR-01 fix raced the *body read* only —
+  the leak **moved one await down** rather than being eliminated. Fence 19 misses it because its POST
+  stream is idle, so the reader is parked in `body.frame()`, which *is* raced.
+- **STATED PLAINLY: this residual was RECORDED by the previous round and then NEVER RE-VERIFIED.**
+  `118.2-VERIFICATION.md` marks 5c ⚠️ PARTIAL and says so in as many words ("Not independently re-verified
+  end-to-end here"). It is named here **with an owner** precisely because being unnamed and unre-verified
+  is how it survived a whole closure round.
+- **Reason not taken now:** Warning severity, and it is **not** one of the five items in
+  `118.2-VERIFICATION.md`'s `missing:` scope contract. Its fence needs the 4 MiB backpressure shape whose
+  drain bound is 30 seconds; loading that into a round that must close two permanent-failure Blockers
+  dilutes the round's own verification.
+- **OWNER: the client-transport hardening plan** already named in this file's
+  `### Disposition — who should own the remainder` section (the same owner that holds the first review's
+  WR-03/WR-04/WR-05).
+
+#### `118.2-REVIEW-closure.md` WR-02 — `biased;` in `read_next_sse_frame` starves both shutdown arms
+
+- **Source (by symbol):** `read_next_sse_frame` in `src/shared/streamable_http.rs`.
+- **User-visible consequence if left:** `biased;` polls `state.body.frame()` first and returns on the first
+  `Ready`, so `delivery.sender.closed()` and `shutdown.changed()` are never polled while a firehose peer —
+  or simply a fast server on loopback — keeps the body ready. **`close()` is not observed for as long as
+  the peer keeps writing.** Combined with WR-01 above, a busy stream escapes both.
+- **Reason not taken:** the bias is **deliberate and correct** for the frame arm (D-04 — never drop a
+  burst-then-close server's last frames). Adding a fairness escape (a frame counter that periodically
+  checks `*shutdown.borrow()`) is a tuning decision on the reader loop, and it belongs with WR-01's fix,
+  which touches the same loop.
+- **OWNER: the same client-transport hardening plan.**
+
+#### `118.2-REVIEW-closure.md` WR-03 — the `shutdown` flag is never reset — and this round's NEAR MISS
+
+- **Source (by symbol):** `close`, `read_sse_body`, `start_sse` and `is_connected` in
+  `src/shared/streamable_http.rs`.
+- **User-visible consequence if left:** `close()` does `shutdown.send_replace(true)` and nothing sets it
+  back. After any `close()`, `start_sse()` issues the GET, gets a live body, spawns a reader and returns
+  **`Ok(())`** — over a reader that exits immediately. The caller is told the stream opened; it did not.
+  Every subsequent streaming-POST reader dies the same way, so an SSE-delivered response is silently
+  dropped and its `dispatch_request` hangs. `is_connected()` still answers **`true`** unconditionally, so
+  nothing tells the caller. `shutdown` is `Arc`-shared and the transport is `Clone`, so **one component
+  closing its clone permanently disables SSE on every other clone.**
+- **Reason not taken, and this is the NEAR MISS worth recording:** plan `118.2-19` added a reset seam to
+  `start_sse` **for the TERMINAL LATCH** and deliberately did **not** add one for the `shutdown` flag. The
+  review offers two *contradictory* contracts — (a) reset the flag and document close-then-restart as
+  supported, or (b) make close observably terminal, with `start_sse`/`send` returning
+  `Err(ConnectionClosed)` and `is_connected()` reporting it — and picking one **inside a Blocker closure
+  would settle a public contract by accident**. This is the same reasoning `118.2-16` used to defer the
+  FIRST review's WR-05.
+- **OWNER: the same client-transport hardening plan, which should decide BOTH reset seams together** — the
+  latch seam this round shipped and the shutdown seam it declined are one design question, not two.
+
+#### `118.2-REVIEW-closure.md` WR-04 — the test mocks re-address EVERY response once any request has been recorded
+
+- **Source (by symbol):** `addressed_to_the_pending_request` + `last_request_id`, copy-pasted verbatim into
+  `src/client/mod.rs`'s `tests::MockTransport`, `tests/common/mock_paginated.rs` and
+  `tests/property_tests.rs`'s `CaptureTransport`.
+- **User-visible consequence if left:** the rewrite is unconditional once `last_request_id()` is `Some`, so
+  a fixture **deliberately** carrying a foreign id is silently converted into a matching one. **A negative
+  test written to prove the client rejects a stray response would prove nothing and still pass** — a false
+  green in exactly the surface BLOCKER 2 lived in. The rustdoc's "a test that exercises an UNSOLICITED
+  frame keeps the id it wrote" is true only *before the first request*.
+- **Reason not taken:** test-infrastructure consolidation across three files (gate the rewrite on an
+  explicit opt-out, and lift the shared pair into `tests/common/`); correctness-neutral for shipped code.
+- **OWNER: whichever plan next touches `tests/common/`.**
+
+#### `118.2-REVIEW-closure.md` IN-01 through IN-04 — hygiene, no correctness consequence
+
+- **IN-01** — a stale comment in `read_sse_body` still says the D-05 terminal error is "already sent"; as
+  of the first closure it is **latched**, not sent. The comment describes the exact behaviour CR-02 removed.
+- **IN-02** — the dead `state.done = true` write on the shutdown path: `end_of_frame_stop` maps
+  `SseFrameStop::Shutdown` to `SseBodyEnd::Ended` unconditionally and `read_sse_body` returns at once, so
+  the field is never read again. Harmless, but it implies a drain that does not happen.
+- **IN-03** — `MIN_SSE_RECONNECT_DELAY` is applied to the peer-`retry:` branch only, not at the exit of
+  `next_reconnect_delay`. The computed curve satisfies the floor only *incidentally*, because
+  `INITIAL_SSE_RECONNECT_DELAY` (1 s) happens to exceed it. The coupling is implicit rather than wrong.
+- **IN-04** — `spawn_sse_reader`'s write-only cursor local, documented as deliberate and genuinely needed
+  to satisfy the shared `read_sse_body` signature. Recorded so a later reader does not "clean it up" and
+  accidentally re-share the cursor, which would be the first review's WR-02 all over again.
+- **Reason not taken:** hygiene; no correctness consequence and **no ordering constraint** between them.
+- **OWNER: ride along with whichever plan next touches the file.**
+
+### The FIRST review's residuals are unchanged by this round
+
+`118.2-REVIEW.md`'s **WR-03, WR-04, WR-05 and WR-06** and its **IN-01..IN-06** remain **OPEN exactly as
+the `## GAP-CLOSURE ROUND (2026-08-17)` appendix above records them**. This round changed **no** status
+among them, re-litigated none of them, and their owners are unchanged (the client-transport hardening plan
+for WR-03/04/05; a CONF-10 follow-up for WR-06 and IN-06). See that appendix, not this one, for their
+anchors, consequences and reasons.
+
+### Environmental findings this round measured — recorded so they are not re-diagnosed as code regressions
+
+#### The macOS keychain `-36` panic: waves 1 and 2 CONTRADICT each other, and no remedy is established
+
+- **Where:** `.with_native_roots().expect("Failed to load native root certificates")` in
+  `src/shared/streamable_http.rs` (and its HTTP/2 twin). **Provenance is NOT this phase's:** `git blame`
+  attributes it to **`1564e6226`** (2026-01-03), which predates Phase 118.2 entirely — the exact commit
+  the `## CLOSING VERIFICATION (118.2-18)` section above already records.
+- **The existing record's attribution is WRONG, and both waves agree on that much.** That section
+  attributes the panic to **disk pressure** ("the volume was under the pressure the gate's own
+  example-build step created"). Disk pressure is **not** a sufficient explanation: plan `118.2-20`
+  measured it firing with `df` at **14 % used, 78 GiB free**, and `security find-certificate` read **158
+  root certificates** fine while it was happening — so it is not a wedged daemon either.
+- **What IS established:** the **thread count affects it**. Beyond that the two waves disagree and the
+  disagreement is not resolved:
+  - `118.2-19-SUMMARY.md` reports `--test-threads 4` eliminating it *"deterministically, to zero, on every
+    subsequent run"* (3206 passed, 0 panics), and infers a concurrency defect against the shared macOS
+    trust-store daemon.
+  - `118.2-20-SUMMARY.md` **REFUTES that**: the panic fired **three times** during that plan on three
+    unrelated test sets, `RUST_TEST_THREADS=4 make quality-gate` **still failed** (4 tests in
+    `collected_body_cap`), and only `RUST_TEST_THREADS=1` passed. It further notes that `cargo test --test X`
+    parallelises **within** a binary, so `make quality-gate` has **no structural immunity** — plan 19's
+    claim that it "has never shown it" describes luck, not a property.
+- **THE REMEDY IS UNESTABLISHED.** `--test-threads 4` is **not** a proven fix and must not be recorded as
+  one; plan 19's "deterministically, to zero" claim is **not carried forward as fact** by this appendix.
+  What is known: fewer threads makes it less likely, `RUST_TEST_THREADS=1` (CLAUDE.md's own stated CI
+  convention) is the only setting no wave observed failing, and the identical binaries pass on re-run with
+  no rebuild — so it is environmental, not a code regression.
+- **Reason not fixed:** unchanged from the record above — pre-existing, off this phase's path, and turning
+  an `.expect` into a propagated error changes a **public** constructor's failure mode.
+- **OWNER:** whoever owns the connector's error contract. Unchanged.
+
+#### `binary(client_sse_stream)` is LOAD-SENSITIVE at full parallelism — a spurious-red trap
+
+Measured independently by the orchestrator during this round; neither wave recorded it.
+
+- **What was measured:** at full nextest parallelism on a loaded machine, `binary(client_sse_stream)` fails
+  **non-deterministically**, and a **DIFFERENT set of fences** times out at ~27 s on each run — two
+  different failing pairs on two consecutive runs of identical source. With `--test-threads 4`:
+  **24 run, 24 passed**, reproducibly. Disk was fine (61 GB free) and there was no `syspolicyd` wedge, so
+  this is **not** the keychain item above.
+- **Why:** these fences bind **real TCP listeners** and assert against real wall-clock bounds of roughly
+  20–27 s (`LATCH_RESET_BOUND`, `LOCK_PROBE_BOUND`, `MISMATCH_TIMEOUT_BOUND`, the reconnect budget bounds).
+  Under CPU contention the bound elapses before the behaviour under test completes.
+- **Consequence if unrecorded:** a developer running a bare `cargo nextest run` on a busy machine sees red
+  in this binary and may "fix" a non-bug — or, worse, loosen a bound that is load-bearing.
+- **CI is unaffected:** project `CLAUDE.md` records that CI runs tests with `--test-threads=1`.
+- **The convention this round adopted, and the one to keep:** run
+  `cargo nextest run -E 'binary(client_sse_stream)' --features full --test-threads 4` and say so wherever
+  the count is quoted, so the number is reproducible rather than luck. **Never** a `test(/…/)` selector —
+  it silently selects ZERO tests and still exits 0.
