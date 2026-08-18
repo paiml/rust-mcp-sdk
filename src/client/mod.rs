@@ -214,6 +214,44 @@ const TASKS_LIST_V2_REPLACEMENT: &str = "client-side task tracking";
 /// concrete `Future` that satisfies the bound.
 type NoInputResponder = fn(InputRequests) -> std::future::Ready<Result<InputResponses>>;
 
+/// How long ONE pump attempt waits for a frame before releasing the transport.
+///
+/// `Transport::send` and `Transport::receive` both take `&mut self`, so a client
+/// holds ONE lock for both directions and whoever is receiving blocks every
+/// sender. Slicing the receive is therefore not an optimisation — it is the only
+/// reason a second operation on the same `Client` can make progress while a call
+/// is outstanding.
+///
+/// Slicing drops the in-flight `receive()` future, which
+/// [`Transport::receive`](crate::shared::Transport::receive) documents that
+/// implementors MUST tolerate without losing already-consumed bytes.
+const PUMP_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What one in-flight client request is waiting on.
+///
+/// # Why the response channel lives here
+///
+/// `Transport::receive()` is a single, unaddressed FIFO, but JSON-RPC responses
+/// are id-addressed. Before this type the last stage of demultiplexing was left
+/// to every caller: each popped frames itself and, on finding a frame that was
+/// not its own, had nowhere to put it — a `Transport` consumer holds no producer
+/// handle — so it DISCARDED it, destroying some other caller's answer.
+///
+/// Registering the answer channel by id moves that demultiplexing to one place.
+/// A frame is delivered to whoever awaits its id; a frame nobody awaits is
+/// dropped, which is harmless precisely because no caller is blocked on it.
+struct Pending {
+    /// Signalled by [`Client::cancel_request`].
+    cancel: oneshot::Sender<()>,
+    /// This request's answer, delivered by whichever task is pumping.
+    ///
+    /// Success only. A transport-level failure is deliberately NOT fanned out
+    /// here: a terminal reason is sticky by contract, so every waiter that
+    /// resumes pumping observes it and builds its OWN owned [`Error`]. That is
+    /// what lets this channel stay `Clone`-free — [`Error`] is not `Clone`.
+    response: oneshot::Sender<crate::types::JSONRPCResponse>,
+}
+
 /// How long [`Client::dispatch_request`] keeps waiting for its OWN answer after
 /// the FIRST mis-addressed response frame (Phase 118.2, BLOCKER 2).
 ///
@@ -234,6 +272,12 @@ type NoInputResponder = fn(InputRequests) -> std::future::Ready<Result<InputResp
 /// (`active_requests` carrying a response channel per id, so a popped frame is
 /// DELIVERED to its owner rather than discarded) removes the need for it
 /// entirely, and is the recorded follow-up.
+// Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+// delivers a frame to its owner instead of discarding it, so there is nothing
+// left to budget. Kept dead for ONE commit deliberately: the router is verified
+// on its own first, so if it needs rework the mitigation it replaces has not
+// already been deleted in the same breath. Removed in the follow-up commit.
+#[allow(dead_code)]
 const MISMATCH_DISCARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The longest ONE bounded receive attempt may hold the transport write lock
@@ -252,6 +296,12 @@ const MISMATCH_DISCARD_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// it, and long enough that a peer streaming mis-addressed frames cannot make
 /// the loop spin — the re-acquisition cost is paid four times a second, not
 /// continuously.
+// Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+// delivers a frame to its owner instead of discarding it, so there is nothing
+// left to budget. Kept dead for ONE commit deliberately: the router is verified
+// on its own first, so if it needs rework the mitigation it replaces has not
+// already been deleted in the same breath. Removed in the follow-up commit.
+#[allow(dead_code)]
 const MISMATCH_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How many mis-addressed frames are discarded before the call fails loudly
@@ -266,6 +316,12 @@ const MISMATCH_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_mi
 ///
 /// Thirty-two is far above anything a correct peer produces (a correct peer
 /// produces zero) and far below anything that could be mistaken for progress.
+// Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+// delivers a frame to its owner instead of discarding it, so there is nothing
+// left to budget. Kept dead for ONE commit deliberately: the router is verified
+// on its own first, so if it needs rework the mitigation it replaces has not
+// already been deleted in the same breath. Removed in the follow-up commit.
+#[allow(dead_code)]
 const MAX_ID_MISMATCH_DISCARDS: usize = 32;
 
 /// What one `dispatch_request` has spent on mis-addressed response frames.
@@ -276,6 +332,12 @@ const MAX_ID_MISMATCH_DISCARDS: usize = 32;
 /// [`Client::dispatch_request`] is what holds that function under the repo's
 /// cognitive-complexity budget without an `#[allow]`.
 #[derive(Debug, Default)]
+// Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+// delivers a frame to its owner instead of discarding it, so there is nothing
+// left to budget. Kept dead for ONE commit deliberately: the router is verified
+// on its own first, so if it needs rework the mitigation it replaces has not
+// already been deleted in the same breath. Removed in the follow-up commit.
+#[allow(dead_code)]
 struct MismatchBudget {
     /// How many mis-addressed frames this request has discarded.
     discards: usize,
@@ -287,6 +349,12 @@ struct MismatchBudget {
     deadline: Option<web_time::Instant>,
 }
 
+// Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+// delivers a frame to its owner instead of discarding it, so there is nothing
+// left to budget. Kept dead for ONE commit deliberately: the router is verified
+// on its own first, so if it needs rework the mitigation it replaces has not
+// already been deleted in the same breath. Removed in the follow-up commit.
+#[allow(dead_code)]
 impl MismatchBudget {
     /// Book one discarded frame.
     ///
@@ -441,7 +509,7 @@ pub struct Client<T: Transport> {
     initialized: bool,
     info: Implementation,
     notification_tx: Option<mpsc::Sender<Notification>>,
-    active_requests: Arc<RwLock<HashMap<RequestId, oneshot::Sender<()>>>>,
+    active_requests: Arc<RwLock<HashMap<RequestId, Pending>>>,
     options: ClientOptions,
     /// Registered host handlers answering inbound server -> client requests
     /// (sampling / elicitation / roots). Immutable after construction.
@@ -3509,10 +3577,13 @@ impl<T: Transport> Client<T> {
         ))
         .await?;
 
-        // Cancel any local tracking
-        let sender = self.active_requests.write().await.remove(request_id);
-        if let Some(sender) = sender {
-            let _ = sender.send(());
+        // Cancel any local tracking. Dropping the `Pending` also drops its
+        // response sender, so a `dispatch_request` still awaiting this id sees
+        // its channel close and stops waiting instead of blocking on a peer
+        // that will never answer.
+        let pending = self.active_requests.write().await.remove(request_id);
+        if let Some(pending) = pending {
+            let _ = pending.cancel.send(());
         }
 
         Ok(())
@@ -3806,6 +3877,12 @@ impl<T: Transport> Client<T> {
     /// this phase is about — `StreamableHttpTransport::receive()` — selects over
     /// an `mpsc::Receiver::recv()`, which tokio documents as cancel-safe:
     /// dropping the future loses no message.
+    // Why: superseded by the per-id router (`Pending` + `Client::pump_once`), which
+    // delivers a frame to its owner instead of discarding it, so there is nothing
+    // left to budget. Kept dead for ONE commit deliberately: the router is verified
+    // on its own first, so if it needs rework the mitigation it replaces has not
+    // already been deleted in the same breath. Removed in the follow-up commit.
+    #[allow(dead_code)]
     async fn receive_bounded(
         &self,
         budget: &MismatchBudget,
@@ -3874,12 +3951,18 @@ impl<T: Transport> Client<T> {
         typed: Option<Request>,
         mut jsonrpc_request: crate::types::JSONRPCRequest<serde_json::Value>,
     ) -> Result<crate::types::JSONRPCResponse> {
-        // Track request for cancellation
+        // Register this request's ANSWER CHANNEL before it goes on the wire, so
+        // whichever task ends up pumping can deliver the response to its owner
+        // rather than to whoever happened to pop it.
         let (cancel_tx, _cancel_rx) = oneshot::channel();
-        self.active_requests
-            .write()
-            .await
-            .insert(request_id.clone(), cancel_tx);
+        let (response_tx, mut response_rx) = oneshot::channel();
+        self.active_requests.write().await.insert(
+            request_id.clone(),
+            Pending {
+                cancel: cancel_tx,
+                response: response_tx,
+            },
+        );
 
         // Create middleware context
         let context = MiddlewareContext::with_request_id(request_id.to_string());
@@ -3923,165 +4006,146 @@ impl<T: Transport> Client<T> {
                 self.transport.write().await.send(message).await?;
             }
 
-            // Wait for response, dispatching any unsolicited notifications along the way.
+            // Await THIS request's own answer, pumping the transport whenever
+            // nobody else is.
             //
-            // The budget lives ACROSS iterations: it is what makes the discard
-            // ceiling belong to this request rather than to one receive attempt.
-            let mut mismatch_budget = MismatchBudget::default();
+            // Every waiter queues for the transport lock; whoever gets it moves
+            // exactly one sliced receive forward, routes the frame to its owner
+            // and releases. So there is no pump to hand off and no pump to lose:
+            // when the current pump returns with its own answer, the next waiter
+            // in the queue simply becomes the pump.
             loop {
-                let Some(response_message) = self.receive_bounded(&mismatch_budget).await? else {
-                    // A receive slice expired with nothing delivered. The
-                    // transport write guard has already been released, so
-                    // another operation on this client could take it before we
-                    // ask again. NOT an end of stream.
-                    continue;
-                };
-
-                match response_message {
-                    crate::types::TransportMessage::Response(mut response) => {
-                        // CORRELATION, before anything else (Phase 118.2, CR-02).
-                        //
-                        // This loop used to return the FIRST `Response` frame it
-                        // popped, whatever its id, and unconditionally remove
-                        // `request_id` from `active_requests`. Three things a
-                        // future reader would otherwise have to re-derive:
-                        //
-                        // 1. Equality is `RequestId`'s typed STRUCTURAL kind, so
-                        //    `String("1")` and `Number(1)` are DIFFERENT ids.
-                        //    JSON-RPC 2.0 requires exactly that — the response id
-                        //    "MUST be the same as the value of the id member in
-                        //    the Request Object" — so a lenient server that
-                        //    re-types the id now gets a wait where it previously
-                        //    got a (wrong) match. The `warn!` names BOTH ids so
-                        //    that wait is diagnosable rather than mute.
-                        // 2. A mismatched frame is DISCARDED rather than
-                        //    re-queued: a consumer of `Transport` holds no
-                        //    producer handle, so there is nowhere to put it back.
-                        // 3. Discarding converts a silent wrong answer into a
-                        //    diagnosable wait for whichever OTHER request that
-                        //    frame belonged to. Strictly better than handing one
-                        //    caller another caller's result (T-118.2-15-01), but a
-                        //    real cost, and the ONLY things that bound it are
-                        //    `MISMATCH_DISCARD_TIMEOUT` and
-                        //    `MAX_ID_MISMATCH_DISCARDS`, both private constants in
-                        //    this file. `RequestOptions::timeout` exists on the
-                        //    PUBLIC `RequestOptions` type and is NOT read by
-                        //    `dispatch_request`, so a caller who sets it gets no
-                        //    protection from it whatsoever. The earlier record
-                        //    here claimed otherwise; it was wrong, and phase
-                        //    118.2's verification classified that claim as a
-                        //    blocker in its own right (T-118.2-20-04).
-                        //
-                        //    Why that public field was NOT plumbed in instead:
-                        //    reading a field that has never been read would
-                        //    silently change behaviour for every existing caller
-                        //    who already sets it, with no version signal and no
-                        //    way to walk it back except another behaviour change.
-                        //    A private ceiling is the smaller and reversible
-                        //    choice. Per-id response routing — the
-                        //    `active_requests` map carrying a response channel per
-                        //    id — is the correct long-term shape and is recorded
-                        //    as a follow-up, not attempted here.
-                        //
-                        // Nothing is removed from `active_requests` on this path:
-                        // the request is STILL pending, so the `continue` sits
-                        // ahead of the inline happy-path removal below and the
-                        // WR-04 single-exit cleanup remains the only other place
-                        // the entry is removed.
-                        if response.id != request_id {
-                            tracing::warn!(
-                                awaiting = ?request_id,
-                                received = ?response.id,
-                                "discarding a JSON-RPC response whose id is not the one this \
-                                 request is awaiting; still waiting"
-                            );
-                            mismatch_budget.record();
-                            if let Some(capped) =
-                                mismatch_budget.exhausted(&request_id, &response.id)
-                            {
-                                // Returned from INSIDE the inner future, so the
-                                // single WR-04 exit cleanup below still reaps the
-                                // pending `active_requests` entry.
-                                return Err(capped);
-                            }
-                            continue;
-                        }
-
-                        // Remove from active requests (happy path)
-                        self.active_requests.write().await.remove(&request_id);
-
-                        // Process response through middleware chain (read-only access)
-                        self.middleware_chain
-                            .read()
-                            .await
-                            .process_response_with_context(&mut response, &context)
-                            .await?;
-                        return Ok(response);
-                    },
-                    crate::types::TransportMessage::Notification(notification) => {
-                        // Unsolicited notification (e.g., progress, resource changes, SSE events)
-                        // Convert to JSONRPC notification for middleware processing
-                        use crate::shared::protocol_helpers::create_notification;
-                        let mut jsonrpc_notification = create_notification(notification.clone());
-
-                        // Process through protocol middleware chain
-                        let notif_context = MiddlewareContext::default();
-
-                        if let Err(e) = self
-                            .middleware_chain
-                            .write()
-                            .await
-                            .process_notification_with_context(
-                                &mut jsonrpc_notification,
-                                &notif_context,
-                            )
-                            .await
-                        {
-                            // Log error but don't terminate dispatcher - continue processing
-                            tracing::warn!(
-                                "Notification middleware processing failed for {}: {}",
-                                jsonrpc_notification.method,
-                                e
-                            );
-                        }
-
-                        // Forward to notification handler if registered
-                        if let Some(tx) = &self.notification_tx {
-                            // Clone the sender because send() requires &mut self
-                            #[allow(unused_mut)]
-                            let mut tx_clone = tx.clone();
-                            if let Err(e) = tx_clone.send(notification).await {
-                                tracing::debug!("Notification channel closed: {}", e);
-                            }
-                        }
-
-                        // Continue loop to wait for the actual response
-                    },
-                    crate::types::TransportMessage::Request { id, request } => {
-                        // Any inbound request at a client is server -> client by
-                        // definition (the MCP host direction). Answer it from the
-                        // registered host handlers, then keep waiting for the
-                        // original response (request_id stays pending). A failed
-                        // reply `send` propagates via `?` and is cleaned up at
-                        // the single exit point below.
-                        let response = self.dispatch_host_request(id, request).await;
-                        self.transport
-                            .write()
-                            .await
-                            .send(crate::types::TransportMessage::Response(response))
-                            .await?;
-                    },
+                // `now_or_never` rather than `try_recv`: the oneshot is
+                // `tokio::sync` on native and `futures_channel` on wasm32 and
+                // their `try_recv` signatures differ, but both `Receiver`s are
+                // `Unpin` futures, so polling once is portable. Polling a
+                // pending oneshot does not consume anything.
+                //
+                // The answer is deliberately NOT raced against `pump_once`:
+                // cancelling a pump between `receive()` returning and the frame
+                // being delivered would destroy that frame, which is the very
+                // defect this router exists to remove. A pump step always runs
+                // to completion; it is bounded by PUMP_RECEIVE_SLICE.
+                if let Some(answer) = futures::FutureExt::now_or_never(&mut response_rx) {
+                    let mut response = answer.map_err(|_| {
+                        // The registration was removed without an answer, which
+                        // only `cancel_request` does. Stop waiting rather than
+                        // blocking on a peer that will never reply.
+                        Error::InvalidState(format!(
+                            "request {request_id:?} was cancelled before it was answered"
+                        ))
+                    })?;
+                    self.middleware_chain
+                        .read()
+                        .await
+                        .process_response_with_context(&mut response, &context)
+                        .await?;
+                    return Ok(response);
                 }
+
+                self.pump_once().await?;
             }
         }
         .await;
 
-        // Single WR-04 exit-cleanup invariant: remove the pending entry on any
-        // error path (the happy path already removed it above).
-        if result.is_err() {
-            self.active_requests.write().await.remove(&request_id);
-        }
+        // Single WR-04 exit-cleanup invariant. On the happy path the pump has
+        // already removed the entry to take ownership of the answer channel, so
+        // this is a no-op; on every error path it is the one place the pending
+        // id (and its cancel sender) is reaped, so a `Client` that outlives a
+        // failed request never leaks the id or collides with a later reuse.
+        self.active_requests.write().await.remove(&request_id);
         result
+    }
+
+    /// Move the transport forward by at most one frame and route it to its owner.
+    ///
+    /// This is the whole of the per-id router. It takes the transport lock for a
+    /// single SLICED receive and releases it before doing anything with what it
+    /// got, so no other operation on this client is serialised behind either the
+    /// peer's think-time or this task's routing work.
+    ///
+    /// A `Response` is delivered to whoever registered its id. A response nobody
+    /// is awaiting is dropped with a `warn!` — harmless, because no caller is
+    /// blocked on it, which is exactly what was NOT true when each caller popped
+    /// frames for itself and had to discard the ones that were not its own.
+    async fn pump_once(&self) -> Result<()> {
+        let received = {
+            let mut transport = self.transport.write().await;
+            let receive = std::pin::pin!(transport.receive());
+            let slice = std::pin::pin!(crate::runtime::sleep(PUMP_RECEIVE_SLICE));
+            match futures::future::select(receive, slice).await {
+                futures::future::Either::Left((message, _)) => Some(message),
+                futures::future::Either::Right(((), _)) => None,
+            }
+        };
+
+        // The slice expired with nothing delivered. Not an end of stream — the
+        // point is that the lock has now been released, so anyone waiting to
+        // send gets their turn before we ask again.
+        let Some(message) = received else {
+            return Ok(());
+        };
+
+        match message? {
+            crate::types::TransportMessage::Response(response) => {
+                let owner = self.active_requests.write().await.remove(&response.id);
+                match owner {
+                    Some(pending) => {
+                        // The receiver is gone only if that caller has already
+                        // stopped waiting; dropping the answer is then correct.
+                        let _ = pending.response.send(response);
+                    },
+                    None => {
+                        tracing::warn!(
+                            id = ?response.id,
+                            "dropping a JSON-RPC response no request is awaiting"
+                        );
+                    },
+                }
+            },
+            crate::types::TransportMessage::Notification(notification) => {
+                use crate::shared::protocol_helpers::create_notification;
+                let mut jsonrpc_notification = create_notification(notification.clone());
+                let notif_context = MiddlewareContext::default();
+
+                if let Err(e) = self
+                    .middleware_chain
+                    .write()
+                    .await
+                    .process_notification_with_context(&mut jsonrpc_notification, &notif_context)
+                    .await
+                {
+                    // Log but do not terminate the pump - other requests are
+                    // still waiting on frames behind this one.
+                    tracing::warn!(
+                        "Notification middleware processing failed for {}: {}",
+                        jsonrpc_notification.method,
+                        e
+                    );
+                }
+
+                if let Some(tx) = &self.notification_tx {
+                    #[allow(unused_mut)]
+                    let mut tx_clone = tx.clone();
+                    if let Err(e) = tx_clone.send(notification).await {
+                        tracing::debug!("Notification channel closed: {}", e);
+                    }
+                }
+            },
+            crate::types::TransportMessage::Request { id, request } => {
+                // Any inbound request at a client is server -> client by
+                // definition. Answer it from the registered host handlers and
+                // reply. The transport lock was released above, so this reply
+                // does not have to wait for a receive to finish first.
+                let response = self.dispatch_host_request(id, request).await;
+                self.transport
+                    .write()
+                    .await
+                    .send(crate::types::TransportMessage::Response(response))
+                    .await?;
+            },
+        }
+        Ok(())
     }
 
     /// Answer an inbound server -> client request from the host registry.

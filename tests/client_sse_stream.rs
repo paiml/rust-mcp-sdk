@@ -256,21 +256,6 @@ const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
 /// twenty slices of headroom over the one slice the probe must outlast.
 const LOCK_PROBE_BOUND: Duration = Duration::from_secs(5);
 
-/// The outer cancellation ceiling on fence 24's call (plan 20, BLOCKER 2 half B).
-///
-/// # Deliberately ABOVE the discard ceiling, for the opposite reason
-///
-/// Post-fix the call fails at `MISMATCH_DISCARD_TIMEOUT` (10 s), so this bound
-/// exists only so a REGRESSION that restores the unbounded wait fails the run
-/// instead of hanging CI forever. Elapsing here is the RED signal, never the
-/// pass condition — which is exactly the inversion fence 17 could not make,
-/// because before this plan there was no ceiling for a fence to be above.
-///
-/// Twice the ceiling: enough headroom that a loaded machine finishing its 10 s
-/// wait late still returns well inside it, and short enough that a genuinely
-/// unbounded wait is reported in twenty seconds rather than never.
-const MISMATCH_TIMEOUT_BOUND: Duration = Duration::from_secs(20);
-
 /// How long fence 22 waits for a `receive()` that must NOT answer (plan 19,
 /// BLOCKER 1).
 ///
@@ -423,6 +408,20 @@ struct Shared {
     /// The desync fence 16 measures is "call 2 was handed call 1's result", and a
     /// result that is byte-identical between the two cannot detect it.
     calls_answered: AtomicUsize,
+    /// Hold the FIRST answerable call's response until a later one has been
+    /// flushed, so two concurrent calls are answered newest-first (plan 22).
+    ///
+    /// Without this a two-caller fence is order-dependent: if the transport
+    /// happens to hand the first caller its OWN answer first, the defect never
+    /// fires and the fence passes while measuring nothing.
+    stagger_answers: AtomicBool,
+    /// How many answerable calls have reached the stagger gate.
+    answerable_gated: AtomicUsize,
+    /// How many call answers have been written AND flushed to a socket.
+    ///
+    /// Distinct from [`Self::calls_answered`], which counts answers BUILT — the
+    /// gate needs "the other answer is on the wire", not "it exists".
+    answers_flushed: AtomicUsize,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -469,6 +468,9 @@ impl RecordingServer {
             answer_calls_with_sse: AtomicBool::new(false),
             next_call_id_is_mismatched: AtomicBool::new(false),
             calls_answered: AtomicUsize::new(0),
+            stagger_answers: AtomicBool::new(false),
+            answerable_gated: AtomicUsize::new(0),
+            answers_flushed: AtomicUsize::new(0),
         });
 
         let accept = tokio::spawn({
@@ -608,6 +610,20 @@ impl RecordingServer {
     ///
     /// Call BEFORE the client connects. Consumed on use, so exactly one call is
     /// mis-addressed.
+    /// Answer two concurrent calls NEWEST-FIRST (plan 22).
+    ///
+    /// The first answerable call's response is held until a later call's
+    /// response has been flushed. Call BEFORE the client connects, together with
+    /// [`answer_calls_with_an_echoing_result`](RecordingServer::answer_calls_with_an_echoing_result).
+    ///
+    /// This exists because the defect it measures is order-dependent. A client
+    /// that pops a frame belonging to another caller only misbehaves when it
+    /// pops the OTHER caller's frame first; left to chance, the fence would pass
+    /// roughly half the time while measuring nothing.
+    fn answer_calls_newest_first(&self) {
+        self.shared.stagger_answers.store(true, Ordering::SeqCst);
+    }
+
     fn answer_the_next_call_with_a_mismatched_id(&self) {
         self.shared
             .next_call_id_is_mismatched
@@ -794,6 +810,7 @@ async fn read_headers(
 async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared: &Shared) {
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
 
+    let mut is_call_answer = false;
     let response = if method == "initialize" {
         let result = json!({
             "jsonrpc": "2.0",
@@ -811,6 +828,7 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared
             result.len()
         )
     } else if let Some(answer) = call_answer(value, method, shared) {
+        is_call_answer = true;
         answer
     } else {
         // Every notification — initialized or not — is acknowledged with the
@@ -821,6 +839,9 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared
 
     let _ = write_half.write_all(response.as_bytes()).await;
     let _ = write_half.flush().await;
+    if is_call_answer {
+        shared.answers_flushed.fetch_add(1, Ordering::SeqCst);
+    }
     let _ = write_half.shutdown().await;
 }
 
@@ -1030,8 +1051,32 @@ async fn serve_post_sse_answer(write_half: &mut WriteHalf<TcpStream>, body: &str
                 cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\
                 connection: close\r\n\r\n";
     if write_half.write_all(head.as_bytes()).await.is_ok() && write_half.flush().await.is_ok() {
+        // Newest-first staggering (plan 22), placed AFTER the head is flushed
+        // and BEFORE the data frame — which is the only seam that produces a
+        // genuinely outstanding call. `StreamableHttpTransport::send()` awaits
+        // the HTTP response, so holding a JSON-answered POST blocks the client
+        // INSIDE `send()`, still holding the transport lock and never reaching
+        // the receive path at all. Holding the FRAME instead lets `send()`
+        // return and the answer arrive asynchronously on the queue, which is
+        // the shape per-id routing exists for.
+        if shared.stagger_answers.load(Ordering::SeqCst)
+            && shared.answerable_gated.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            // 20 s of patience — deliberately ABOVE both fence bounds that use
+            // this gate, so "the other caller never got its answer" surfaces as
+            // a fence failure rather than being papered over by the gate giving
+            // up first. Bounded rather than infinite only so a regression
+            // cannot hang CI.
+            for _ in 0..2000 {
+                if shared.answers_flushed.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let frame = format!("event: message\ndata: {body}\n\n");
         let _ = write_chunk(write_half, &frame).await;
+        shared.answers_flushed.fetch_add(1, Ordering::SeqCst);
         let _ = write_half.write_all(b"0\r\n\r\n").await;
         let _ = write_half.flush().await;
         let _ = write_half.shutdown().await;
@@ -3030,22 +3075,32 @@ async fn a_mismatched_frame_does_not_block_another_operation_on_the_same_client(
 }
 
 // ===========================================================================
-// Fence 24 — BLOCKER 2, half B: the discard wait has a REAL ceiling.
+// Fence 24 — per-id routing: a frame nobody is awaiting is nobody's answer.
 //
-// `118.2-15`'s in-code comment and its ledger entry both booked the discard cost
-// as "bounded by that request's own timeout". It is not:
-// `src/client/mod.rs` contains ZERO occurrences of `tokio::time::timeout`, and
-// `RequestOptions::timeout` is never read by `dispatch_request`. A caller who
-// sets it gets no protection from it. The wait was unbounded, and the record
-// said otherwise — which is worse than the defect, because a reader trusting the
-// record treats a live risk as already mitigated (T-118.2-20-04).
+// This fence previously asserted `Error::Timeout` within a bound — the error
+// KIND of plan 20's private discard ceiling. That ceiling existed only because a
+// popped frame had nowhere to go, so whichever caller popped it had to decide
+// what to do with a frame that was not its own. Per-id routing removes the
+// decision: the pump delivers a frame to whoever registered its id, and drops
+// one nobody registered. Asserting the workaround's error kind would now pin
+// machinery that is deliberately gone.
 //
-// This fence issues NO second operation. Its subject is the call's own return
-// within a bound; fence 23 owns the lock.
+// WHAT THIS FENCE DELIBERATELY DOES NOT ASSERT: that the call eventually fails.
+// The harness mis-addresses this call's ONLY answer, so no answer for it is ever
+// sent, and `pmcp::Client` applies no request timeout — `RequestOptions::timeout`
+// is public but unreachable (no API accepts a `RequestOptions`) and
+// `dispatch_request` has never read it. A call whose answer never arrives
+// therefore waits, exactly as it did before plan 20 and exactly as any other
+// unanswered request does. That gap is REAL and OPEN; it is recorded rather than
+// papered over, and its fix is a per-request deadline, not a mismatch-specific
+// ceiling.
+//
+// Liveness of the REST of the client under this same condition is fences 25 and
+// 26's job, so a pass here cannot come from the client being wedged.
 // ===========================================================================
 
 #[tokio::test]
-async fn a_mismatched_frame_fails_this_call_within_a_bound_instead_of_waiting_forever() {
+async fn a_mismatched_frame_is_not_delivered_as_this_calls_answer() {
     let server = RecordingServer::start().await;
     server.advertise_tools();
     server.answer_calls_with_an_echoing_result();
@@ -3059,62 +3114,173 @@ async fn a_mismatched_frame_fails_this_call_within_a_bound_instead_of_waiting_fo
         server.request_lines()
     );
 
-    let started = std::time::Instant::now();
     let outcome = timeout(
-        MISMATCH_TIMEOUT_BOUND,
+        MISMATCH_STILL_WAITING,
         client.call_tool("fence-24".to_string(), json!({})),
     )
     .await;
 
-    let Ok(returned) = outcome else {
+    match outcome {
+        Err(_still_waiting) => {
+            // Routed to nobody; this call is still waiting for an answer that
+            // was never sent. Correct.
+        },
+        Ok(Ok(result)) => panic!(
+            "the client returned a server response addressed to {MISMATCHED_CALL_ID:?} as the \
+             answer to a request it never identified. Per-id routing must deliver a frame only \
+             to the caller that registered its id. Returned result: {:?}",
+            text_of(&result)
+        ),
+        Ok(Err(error)) => panic!(
+            "the call FAILED rather than continuing to wait. A frame addressed to another id is \
+             not this call's business and must not fail it — that would let one peer's \
+             mis-addressed frame break an unrelated in-flight request. Error: {error}"
+        ),
+    }
+}
+
+/// How long two concurrent calls get to BOTH complete (plan 22, fence 25).
+///
+/// Generous on purpose: the point is to separate "both answered" from "one
+/// caller's answer was destroyed", not to measure latency. It sits above
+/// `MISMATCH_DISCARD_TIMEOUT` so a run that fails does so because the answer is
+/// gone, not because this bound is tighter than the mechanism under test.
+/// How long fence 24 watches a call that must still be WAITING (plan 22).
+///
+/// Short on purpose: it is proving a negative ("has not returned"), and a longer
+/// watch buys no extra confidence while costing wall clock on every run.
+const MISMATCH_STILL_WAITING: Duration = Duration::from_secs(3);
+
+const CONCURRENT_CALLS_BOUND: Duration = Duration::from_secs(15);
+
+/// Fence 25 (plan 22, CR-02): two concurrent calls on ONE client each receive
+/// their OWN answer.
+///
+/// The harness answers newest-first, so the client is guaranteed to pop a frame
+/// belonging to the OTHER caller before it pops its own. Before per-id routing
+/// there was nowhere to put that frame — a `Transport` consumer holds no
+/// producer handle — so it was DISCARDED, and the caller it belonged to waited
+/// out `MISMATCH_DISCARD_TIMEOUT` for an answer that had already been destroyed.
+/// That is the whole of CR-02: not a wrong answer, a deleted one.
+///
+/// The assertion is deliberately on the SET of markers rather than on which
+/// caller got which. Answer numbering follows arrival order at the server, which
+/// is not the property under test; "two distinct real answers, one per caller"
+/// is.
+#[tokio::test]
+async fn two_concurrent_calls_each_receive_their_own_answer() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_calls_with_sse();
+    server.answer_calls_newest_first();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so nothing here can be blamed on a terminal \
+         reason. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let both = timeout(CONCURRENT_CALLS_BOUND, async {
+        tokio::join!(
+            client.call_tool("fence-25-a".to_string(), json!({})),
+            client.call_tool("fence-25-b".to_string(), json!({})),
+        )
+    })
+    .await;
+
+    let Ok((first, second)) = both else {
         panic!(
-            "the call was still waiting at {MISMATCH_TIMEOUT_BOUND:?}. The discard wait has no \
-             ceiling at all: `dispatch_request` never applies `tokio::time::timeout`, and the \
-             public `RequestOptions::timeout` field it was booked against is never read by \
-             `Client`. A single mis-addressed frame therefore parks the caller forever \
-             (T-118.2-20-02). Observed POST bodies: {:?}",
+            "two concurrent calls on one client did not BOTH complete in \
+             {CONCURRENT_CALLS_BOUND:?}. One caller's answer was popped by the other caller and \
+             discarded, because a popped frame had no owner to be delivered to. Observed POST \
+             bodies: {:?}",
             server.post_bodies()
         )
     };
-    match returned {
-        Ok(result) => panic!(
-            "the client returned a server response addressed to {MISMATCHED_CALL_ID:?} as the \
-             answer to a request it never identified — the pre-correlation defect \
-             (T-118.2-15-01/02), which fence 17 already pins. Returned result: {:?}",
-            text_of(&result)
-        ),
-        Err(error) => {
-            let elapsed = started.elapsed();
-            let text = error.to_string();
-            // Assert the SHAPE, by KIND. Accepting "some error" here would let a
-            // future regression that fails the call early for an unrelated
-            // reason keep this fence green — the same hole WR-05 recorded in
-            // fence 17 and this plan closed there.
-            assert!(
-                matches!(error, pmcp::Error::Timeout(_)),
-                "the call failed after {elapsed:?}, but not as a TIMEOUT. This fence's subject is \
-                 that the discard wait has a ceiling; an error of any other kind means the call \
-                 left the receive loop for some other reason and the ceiling is unmeasured. Got: \
-                 {error:?}"
-            );
-            // A ceiling of zero milliseconds would satisfy the kind check while
-            // meaning the call never waited at all, so the rendered bound is
-            // asserted to be a real, non-zero duration.
-            assert!(
-                matches!(error, pmcp::Error::Timeout(ms) if ms > 0),
-                "the timeout must name a NON-ZERO bound, or the 'ceiling' is an immediate failure \
-                 wearing a timeout's clothes. Rendered: {text:?}"
-            );
-        },
-    }
 
+    let first = first.expect("the first concurrent call must be answered, not destroyed");
+    let second = second.expect("the second concurrent call must be answered, not destroyed");
+
+    let mut markers = vec![
+        text_of(&first).expect("the first call's result must carry its marker"),
+        text_of(&second).expect("the second call's result must carry its marker"),
+    ];
+    assert_ne!(
+        markers[0], markers[1],
+        "each caller must receive its OWN answer; identical markers mean one answer was \
+         delivered twice and the other was lost"
+    );
+    markers.sort();
     assert_eq!(
-        calls_observed(&server),
-        1,
-        "the call must actually have reached the wire — a fence that concludes anything about a \
-         request that was never sent would pass against any tree. Observed POST bodies: {:?}",
-        server.post_bodies()
+        markers,
+        vec![call_marker(1), call_marker(2)],
+        "between them the two callers must hold exactly the two answers the server wrote"
+    );
+}
+
+/// Fence 26 (plan 22, CR-01): an outstanding call does not serialise every other
+/// operation on the same client.
+///
+/// The transport is ONE object behind ONE lock — `send` and `receive` both take
+/// `&mut self` — so whoever is receiving holds the write guard. Before this plan
+/// the guard was held across an UNBOUNDED `receive()` on the ordinary path, so a
+/// perfectly well-behaved long-running call blocked every other `send`,
+/// `call_tool` and `close` on the client for as long as the peer chose.
+///
+/// Here the harness holds the first call's answer, so a call IS outstanding, and
+/// the fence asserts a second, unrelated operation still completes. It asserts
+/// nothing about the call itself — fence 25 owns that — so a pass cannot come
+/// from the call finishing early.
+#[tokio::test]
+async fn an_outstanding_call_does_not_block_another_operation() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_calls_with_sse();
+    server.answer_calls_newest_first();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open. Observed request lines: {:?}",
+        server.request_lines()
     );
 
-    server.shutdown().await;
+    let probed = timeout(LOCK_PROBE_BOUND, async {
+        tokio::select! {
+            _call = client.call_tool("fence-26-held".to_string(), json!({})) => None,
+            probe = async {
+                // Wait until the held call is genuinely in flight — its POST has
+                // arrived and the harness has begun holding its answer — so the
+                // probe cannot pass by running before there is any contention.
+                assert!(
+                    wait_for(|| server.post_bodies().len() >= 3).await,
+                    "the held call's POST must have arrived, or this fence probes an \
+                     uncontended lock. Observed POST bodies: {:?}",
+                    server.post_bodies()
+                );
+                Some(client.cancel_request(&RequestId::from("fence-26-probe")).await)
+            } => probe,
+        }
+    })
+    .await;
+
+    let Ok(outcome) = probed else {
+        panic!(
+            "a second operation on the same client never completed in {LOCK_PROBE_BOUND:?} while \
+             an ordinary call was outstanding. The transport write guard is held across an \
+             unbounded `receive().await`, so every other operation on this client is serialised \
+             behind however long the peer takes to answer. Observed POST bodies at the elapse: \
+             {:?}",
+            server.post_bodies()
+        )
+    };
+    assert!(
+        outcome.is_some(),
+        "the outstanding call completed before the probe could run, so this fence measured \
+         nothing. The harness must hold that answer until the probe has finished."
+    );
 }
