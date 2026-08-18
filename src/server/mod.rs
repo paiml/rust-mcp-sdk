@@ -1262,7 +1262,11 @@ impl Server {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let extra = crate::server::core::attach_request_peer(extra, self.peer_handle.as_ref());
-            crate::server::core::attach_request_log_sink(extra, self.notification_tx_sink())
+            // The fallback is passed as a THUNK: `attach_request_log_sink` prefers
+            // this request's `TransportBackchannel` sink and never reads it on any
+            // HTTP-served request, so building it eagerly allocated one
+            // `Arc<dyn Fn(..)>` per dispatch only to drop it.
+            crate::server::core::attach_request_log_sink(extra, || self.notification_tx_sink())
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1278,6 +1282,10 @@ impl Server {
     /// progress-reporter path via [`Server::progress_notification_sink`] and the
     /// log-sink path via [`Server::attach_peer`] — and a second `try_send`
     /// closure would be a second chance to disagree about the send discipline.
+    ///
+    /// Both consumers call it only once they have decided they need it: the
+    /// `Arc` allocation happens on the branch that uses the value, never
+    /// speculatively ahead of the request-scoped sink that outranks it.
     ///
     /// `try_send` and a discarded result, deliberately: this is a bounded
     /// channel, and a full channel must never block or fail a handler. The cost

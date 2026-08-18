@@ -6,34 +6,34 @@ use super::auth::{
     discover_graphql_url, load_cached_config, refresh_graphql_url, DEFAULT_GRAPHQL_URL,
 };
 
-/// Resolve GraphQL URL with priority: env var > discovery cache > default.
-/// This is sync to avoid an async call on every GraphQL request.
-fn get_graphql_url() -> String {
-    // 1. Legacy env var (highest priority)
-    if let Ok(url) = std::env::var("PMCP_RUN_GRAPHQL_URL") {
-        return url;
+/// The explicit endpoint override, when it is set to something usable.
+///
+/// An EMPTY (or whitespace-only) `PMCP_RUN_GRAPHQL_URL` is treated as ABSENT,
+/// which is what `auth::refresh_graphql_url` already does through its own
+/// `nonempty_env`. The two must agree: a bare `std::env::var(..).ok()` here
+/// would post to the empty string while the refresh path decided no override
+/// existed and re-ran discovery, so the same variable would mean two different
+/// things on the two halves of one retry.
+fn graphql_url_override() -> Option<String> {
+    let value = std::env::var("PMCP_RUN_GRAPHQL_URL").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-
-    // 2. Discovery cache (sync read, no network)
-    if let Some(config) = load_cached_config() {
-        if let Some(url) = config.graphql_url {
-            return url;
-        }
-    }
-
-    // 3. Default
-    DEFAULT_GRAPHQL_URL.to_string()
 }
 
 /// Async endpoint resolution: env var > discovery cache > **discovery** > default.
 ///
-/// Identical to [`get_graphql_url`] except for the third step. The sync version
-/// cannot perform discovery, so it degrades to `DEFAULT_GRAPHQL_URL` whenever the
-/// cache is cold — and that default resolves to nothing, turning a recoverable
-/// cache miss into an opaque "Failed to send GraphQL request". Every caller that is
-/// already in async context should prefer this.
+/// The sync predecessor (`get_graphql_url`) could not perform discovery, so it
+/// degraded to `DEFAULT_GRAPHQL_URL` whenever the cache was cold — and that
+/// default resolves to nothing, turning a recoverable cache miss into an opaque
+/// "Failed to send GraphQL request". Every caller in this file is already async,
+/// so the sync ladder was deleted rather than left as a second, weaker copy of
+/// this one.
 async fn resolve_graphql_url() -> String {
-    if let Ok(url) = std::env::var("PMCP_RUN_GRAPHQL_URL") {
+    if let Some(url) = graphql_url_override() {
         return url;
     }
     if let Some(url) = load_cached_config().and_then(|c| c.graphql_url) {

@@ -250,7 +250,7 @@ pub(crate) fn clear_config_cache() -> Result<()> {
 
 /// Run discovery (populating the cache) and return the advertised `graphql_url`.
 ///
-/// For the COLD-cache case, where the sync `get_graphql_url()` would otherwise fall
+/// For the COLD-cache case, where a sync resolver would otherwise fall
 /// through to `DEFAULT_GRAPHQL_URL`. That default does not resolve, so a missing
 /// cache — a fresh machine, or a user told to delete the file — produced an opaque
 /// transport failure naming no endpoint. Returns `None` if discovery is unreachable
@@ -267,8 +267,9 @@ pub(crate) async fn discover_graphql_url() -> Option<String> {
 /// `graphql_url` — so callers can distinguish "no better answer available" from
 /// "here is a different endpoint to try".
 pub(crate) async fn refresh_graphql_url() -> Option<String> {
-    // An explicit override outranks discovery in get_graphql_url(); re-fetching
-    // would change nothing and would cost a network round-trip on every failure.
+    // An explicit override outranks discovery in graphql::resolve_graphql_url(),
+    // so re-fetching would change nothing and would cost a network round-trip on
+    // every failure.
     if nonempty_env("PMCP_RUN_GRAPHQL_URL").is_some() {
         return None;
     }

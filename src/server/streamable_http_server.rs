@@ -1679,17 +1679,18 @@ fn resolve_request_log_level(
     era: Option<crate::types::protocol::Era>,
     sessions_on: bool,
     session_id: Option<&str>,
-    raw_body: &[u8],
+    body: &PostBody<'_>,
 ) -> Option<crate::types::LoggingLevel> {
-    // ONE parse of the body for both the capture and the `_meta` read. Adversarial
-    // or non-JSON bytes yield `None` and every read below simply finds nothing.
-    let body = raw_body_json(raw_body);
+    // The SAME parse the v2 gate already paid for, serving both the capture and
+    // the `_meta` read. Adversarial or non-JSON bytes yield `None` and every read
+    // below simply finds nothing.
+    let body = body.json();
 
-    capture_v1_set_level(state, sessions_on, session_id, body.as_ref());
+    capture_v1_set_level(state, sessions_on, session_id, body);
 
     if era == Some(crate::types::protocol::Era::V2) {
         return parse_peer_log_level(
-            params_meta_of(body.as_ref()).and_then(|meta| meta.get(LOG_LEVEL_REQUEST_META_KEY)),
+            params_meta_of(body).and_then(|meta| meta.get(LOG_LEVEL_REQUEST_META_KEY)),
         );
     }
     if sessions_on {
@@ -1862,6 +1863,52 @@ fn raw_body_json(body: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice::<serde_json::Value>(body).ok()
 }
 
+/// One POST body's raw bytes plus its JSON, parsed AT MOST ONCE per request.
+///
+/// # Why a memo and not an eager parse
+///
+/// Two stages of the POST pipeline read the parsed body — the v2 header gate
+/// ([`run_v2_header_gate`]) and the log-level rule
+/// ([`resolve_request_log_level`]) — and each used to call [`raw_body_json`]
+/// itself, so every POST to an opted-in server walked the whole request body
+/// through `serde_json` TWICE.
+///
+/// A single eager parse at the top of the handler would remove the duplication
+/// and cost D-04: a server that never opted into `2026-07-28` short-circuits out
+/// of the gate BEFORE the parse, and a request rejected by the gate, session
+/// resolution, the legacy-version guard or auth is refused without an
+/// attacker-sized body ever being parsed. The memo keeps both properties —
+/// nothing parses until a reader actually asks, and the second ask is free.
+///
+/// [`std::sync::OnceLock`] rather than [`std::cell::OnceCell`] because this value
+/// is borrowed across the gate's `.await` points, and a non-`Sync` cell would
+/// make the handler futures non-`Send`.
+struct PostBody<'a> {
+    raw: &'a [u8],
+    json: std::sync::OnceLock<Option<serde_json::Value>>,
+}
+
+impl<'a> PostBody<'a> {
+    /// Wrap the raw request bytes. Parses nothing.
+    fn new(raw: &'a [u8]) -> Self {
+        Self {
+            raw,
+            json: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The raw bytes, for the readers that must see the LITERAL wire value a WAF
+    /// would see (D-06) rather than a re-serialization of the parse.
+    fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// The parsed body, parsing on the FIRST call only.
+    fn json(&self) -> Option<&serde_json::Value> {
+        self.json.get_or_init(|| raw_body_json(self.raw)).as_ref()
+    }
+}
+
 /// [`raw_params_meta`] over an ALREADY-PARSED body.
 ///
 /// BORROWS out of `value` rather than cloning. Every consumer
@@ -2019,7 +2066,7 @@ fn attach_v2_mrtr_params(
 async fn run_v2_header_gate(
     state: &ServerState,
     headers: &HeaderMap,
-    raw_body: &[u8],
+    body: &PostBody<'_>,
     body_method_override: Option<&str>,
 ) -> (
     Option<crate::types::protocol::ProtocolContext>,
@@ -2035,12 +2082,13 @@ async fn run_v2_header_gate(
             return (None, V2GateOutcome::Passthrough);
         }
     }
-    // ONE parse of the raw body, shared by the era read, the header cross-check
-    // and the MRTR params read — they can never disagree about what it says.
-    // Deliberately OUTSIDE the lock: parsing an attacker-sized body while holding
-    // the server mutex would serialize every other request behind it.
-    let body_json = raw_body_json(raw_body);
-    let raw_meta = params_meta_of(body_json.as_ref());
+    // ONE parse of the raw body, shared by the era read, the header cross-check,
+    // the MRTR params read and the log-level rule downstream — they can never
+    // disagree about what it says. Deliberately OUTSIDE the lock: parsing an
+    // attacker-sized body while holding the server mutex would serialize every
+    // other request behind it.
+    let body_json = body.json();
+    let raw_meta = params_meta_of(body_json);
     // THE THREE-WAY `_meta` VERDICT (CONF-06 / gaps G-6 + G-8), computed from the
     // RAW header and the RAW `_meta` — i.e. BEFORE the accept list below.
     //
@@ -2094,7 +2142,7 @@ async fn run_v2_header_gate(
     if context.is_none() {
         return (None, V2GateOutcome::Passthrough);
     }
-    let (extracted_method, body_name) = method_and_name_of(body_json.as_ref());
+    let (extracted_method, body_name) = method_and_name_of(body_json);
     let body_method = body_method_override.or(extracted_method.as_deref());
     let outcome = classify_v2_request(headers, verdict, body_method, body_name.as_deref());
     // v2 METHOD RETIREMENT (CONF-05 / G-5), keyed on the method STRING and
@@ -2110,7 +2158,7 @@ async fn run_v2_header_gate(
     // MRTR-ELIGIBLE method; a present but unusable field becomes an
     // `INVALID_PARAMS` rejection here, BEFORE dispatch. `body_method` is the
     // value `classify_v2_request` just cross-checked, reused rather than re-read.
-    attach_v2_mrtr_params(context, outcome, body_json.as_ref(), body_method)
+    attach_v2_mrtr_params(context, outcome, body_json, body_method)
 }
 
 /// Crate-LOCAL ingress classification for the POST pipeline (Phase 112, VERS-04).
@@ -3170,7 +3218,7 @@ type V2GateResolved = (
 async fn resolve_v2_gate(
     state: &ServerState,
     headers: &HeaderMap,
-    raw_body: &[u8],
+    body: &PostBody<'_>,
     ingress: &HttpIngress,
 ) -> std::result::Result<V2GateResolved, Response> {
     match ingress {
@@ -3184,7 +3232,7 @@ async fn resolve_v2_gate(
         | HttpIngress::TasksUpdate { .. } => {
             let method_override = matches!(ingress, HttpIngress::Discover { .. })
                 .then_some(crate::types::protocol::SERVER_DISCOVER_METHOD);
-            let (ctx, gate) = run_v2_header_gate(state, headers, raw_body, method_override).await;
+            let (ctx, gate) = run_v2_header_gate(state, headers, body, method_override).await;
             match gate {
                 V2GateOutcome::Reject {
                     code,
@@ -3192,7 +3240,13 @@ async fn resolve_v2_gate(
                     data,
                 } => {
                     let era = ctx.as_ref().map(|pc| pc.era);
-                    Err(v2_gate_reject_response(raw_body, era, code, &message, data))
+                    Err(v2_gate_reject_response(
+                        body.raw(),
+                        era,
+                        code,
+                        &message,
+                        data,
+                    ))
                 },
                 V2GateOutcome::Passthrough => Ok((ctx, None)),
                 V2GateOutcome::EnforceOk { method, name } => Ok((ctx, Some((method, name)))),
@@ -4559,8 +4613,12 @@ async fn handle_post_fast_path_inner(
     // v2 required-header gate (VERS-05). The ordering constraints this call
     // carries — gate BEFORE session resolution and BEFORE the legacy
     // protocol-version check — are documented on `resolve_v2_gate` itself.
+    //
+    // `post_body` is THE request body for the rest of this pipeline: the gate and
+    // the log-level rule below share its single lazy parse (see `PostBody`).
+    let post_body = PostBody::new(body.as_bytes());
     let (protocol_context, v2_outbound) =
-        resolve_v2_gate(&state, &headers, body.as_bytes(), &ingress).await?;
+        resolve_v2_gate(&state, &headers, &post_body, &ingress).await?;
     let is_v2_request = v2_outbound.is_some();
     let era = protocol_context.as_ref().map(|pc| pc.era);
     let sessions_on = v1::sessions_active(&state, era);
@@ -4631,7 +4689,7 @@ async fn handle_post_fast_path_inner(
         era,
         sessions_on,
         response_session_id.as_deref(),
-        body.as_bytes(),
+        &post_body,
     );
     let protocol_context = match (protocol_context, request_log_level) {
         (Some(context), Some(level)) => Some(context.with_resolved_log_level(level)),
@@ -4754,12 +4812,12 @@ async fn validate_protocol_version_with_error_hook(
 async fn resolve_v2_gate_with_error_hook(
     state: &ServerState,
     headers: &HeaderMap,
-    raw_body: &[u8],
+    body: &PostBody<'_>,
     ingress: &HttpIngress,
     http_middleware: &ServerHttpMiddlewareChain,
     http_context: &ServerHttpContext,
 ) -> std::result::Result<V2GateResolved, Response> {
-    match resolve_v2_gate(state, headers, raw_body, ingress).await {
+    match resolve_v2_gate(state, headers, body, ingress).await {
         Ok(resolved) => Ok(resolved),
         Err(error_response) => {
             report_middleware_error(http_middleware, http_context, "v2 header gate rejected").await;
@@ -5350,10 +5408,13 @@ async fn handle_post_with_middleware_inner(
     // v2 required-header gate (VERS-05). The ordering constraints this call
     // carries — gate BEFORE session resolution and BEFORE the legacy
     // protocol-version check — are documented on `resolve_v2_gate` itself.
+    // The fast-path twin's shared body — see that call site for why one lazy
+    // parse is threaded through both the gate and the log-level rule.
+    let post_body = PostBody::new(&server_request.body);
     let (protocol_context, v2_outbound) = resolve_v2_gate_with_error_hook(
         &state,
         &server_request.headers,
-        &server_request.body,
+        &post_body,
         &ingress,
         http_middleware,
         &http_context,
@@ -5423,7 +5484,7 @@ async fn handle_post_with_middleware_inner(
         era,
         sessions_on,
         response_session_id.as_deref(),
-        &server_request.body,
+        &post_body,
     );
     let protocol_context = match (protocol_context, request_log_level) {
         (Some(context), Some(level)) => Some(context.with_resolved_log_level(level)),
@@ -7163,6 +7224,53 @@ mod tests {
         );
     }
 
+    /// THE memo claim: one parse, however many readers ask for it.
+    ///
+    /// Before `PostBody` the v2 gate and the log-level rule each called
+    /// `raw_body_json` themselves, so every POST to an opted-in server walked the
+    /// whole request body through `serde_json` twice. Comparing the two borrows by
+    /// ADDRESS is what makes this a fence rather than a restatement: a re-parse
+    /// hands back a different allocation, so weakening the memo into a
+    /// parse-per-call reds this test. It pins the MECHANISM, not the call sites —
+    /// a reader that goes back to calling `raw_body_json` directly instead of
+    /// asking `PostBody` is a review catch, not a test catch.
+    #[test]
+    fn post_body_parses_once_and_not_before_it_is_asked() {
+        let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let body = PostBody::new(raw);
+        assert!(
+            body.json.get().is_none(),
+            "construction must parse NOTHING — D-04's non-opted-in short-circuit and every \
+             pre-auth rejection refuse an attacker-sized body without ever parsing it"
+        );
+
+        let first = body.json().expect("a well-formed body parses");
+        let second = body.json().expect("the memo still holds it");
+        assert!(
+            std::ptr::eq(first, second),
+            "the second read must BE the first read's value, not an equal-looking re-parse"
+        );
+        assert_eq!(
+            body.raw(),
+            raw,
+            "the raw bytes are handed through verbatim, for the readers that must see the \
+             literal wire value (D-06)"
+        );
+    }
+
+    /// Adversarial bytes are `None` rather than a panic — and that `None` is
+    /// memoized too, so a malformed body is not re-parsed once per reader either.
+    #[test]
+    fn post_body_memoizes_a_failed_parse() {
+        let body = PostBody::new(b"not json at all");
+        assert!(body.json().is_none(), "non-JSON bytes read as nothing");
+        assert!(body.json().is_none(), "and keep reading as nothing");
+        assert!(
+            body.json.get().is_some(),
+            "the memo is FILLED with the `None` outcome, so the failed parse is paid for once"
+        );
+    }
+
     /// D-04 ordering: a NON-opted-in server short-circuits to Passthrough EVEN
     /// WITH a v2 `_meta` present — it must NOT reject as an unsupported version
     /// (the v2 `_meta` is never inspected).
@@ -7174,7 +7282,7 @@ mod tests {
         let (ctx, outcome) = run_v2_header_gate(
             &state,
             &headers,
-            &body,
+            &PostBody::new(&body),
             Some(crate::types::protocol::SERVER_DISCOVER_METHOD),
         )
         .await;
@@ -7203,7 +7311,8 @@ mod tests {
         ] {
             let body = v2_body_bytes(method, "_meta");
             let (ctx, outcome) =
-                run_v2_header_gate(&state, &v2_headers_for(method), &body, None).await;
+                run_v2_header_gate(&state, &v2_headers_for(method), &PostBody::new(&body), None)
+                    .await;
             assert_eq!(
                 ctx.map(|c| c.era),
                 Some(crate::types::protocol::Era::V2),
@@ -7231,7 +7340,7 @@ mod tests {
         let (ctx, outcome) = run_v2_header_gate(
             &state,
             &headers,
-            &body,
+            &PostBody::new(&body),
             Some(crate::types::protocol::SERVER_DISCOVER_METHOD),
         )
         .await;
@@ -7251,7 +7360,8 @@ mod tests {
         // No MCP-Protocol-Version header → conflict cell → Reject.
         let headers = headers_from(&[(MCP_METHOD, "tools/list"), (MCP_NAME, "")]);
         let body = v2_body_bytes("tools/list", "_meta");
-        let (_ctx, outcome) = run_v2_header_gate(&state, &headers, &body, None).await;
+        let (_ctx, outcome) =
+            run_v2_header_gate(&state, &headers, &PostBody::new(&body), None).await;
         assert!(matches!(outcome, V2GateOutcome::Reject { .. }));
     }
 

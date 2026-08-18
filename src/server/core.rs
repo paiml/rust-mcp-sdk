@@ -862,7 +862,7 @@ impl ServerCore {
             // `Server` — so a request-scoped `TransportBackchannel` is the ONLY
             // sink this root can ever supply. Do not "fix" this by inventing a
             // channel here; the transport owns the back-channel.
-            attach_request_log_sink(extra, None)
+            attach_request_log_sink(extra, || None)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -4685,6 +4685,12 @@ pub(crate) fn attach_request_peer(
 ///    server-wide `notification_tx` and on [`ServerCore`] is always `None` —
 ///    `ServerCore` has no notification channel of any kind.
 ///
+/// The fallback is taken as a THUNK, not as a value: arm 1 wins on every
+/// HTTP-served request, so an eagerly-built `Server` fallback allocated one
+/// `Arc<dyn Fn(..)>` per dispatch that this function then dropped unread. Passing
+/// it lazily keeps that allocation off the hot path without moving the
+/// precedence rule back out to the two call sites.
+///
 /// Returning `extra` unchanged when neither exists leaves `extra.log_sink` as
 /// `None`, which the emitter already treats as silence rather than as an error
 /// (Phase 118.2 D-08).
@@ -4720,7 +4726,7 @@ pub(crate) fn attach_request_peer(
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn attach_request_log_sink(
     extra: crate::server::cancellation::RequestHandlerExtra,
-    fallback: Option<Arc<dyn Fn(crate::types::Notification) + Send + Sync>>,
+    fallback: impl FnOnce() -> Option<Arc<dyn Fn(crate::types::Notification) + Send + Sync>>,
 ) -> crate::server::cancellation::RequestHandlerExtra {
     // Both values are cloned out of the borrow before the `with_*` builders
     // consume `extra` — the same capture-before-move discipline
@@ -4748,7 +4754,8 @@ pub(crate) fn attach_request_log_sink(
     if let Some(sink) = request_scoped {
         return extra.with_log_sink(sink);
     }
-    if let Some(sink) = fallback {
+    // Only NOW is the root's fallback built — see the precedence note above.
+    if let Some(sink) = fallback() {
         return extra.with_log_sink(sink);
     }
     extra
@@ -9803,7 +9810,7 @@ mod core_log_sink_tests {
 
         let extra = attach_request_log_sink(
             extra_with_context(Some(context_with_sink(&request_scoped))),
-            Some(fallback.sink()),
+            || Some(fallback.sink()),
         );
         extra
             .log(LoggingLevel::Warning, "which sink received me?")
@@ -9828,10 +9835,9 @@ mod core_log_sink_tests {
     fn the_root_fallback_is_used_when_no_request_scoped_sink_exists() {
         let fallback = Capture::default();
 
-        let extra = attach_request_log_sink(
-            extra_with_context(Some(bare_context())),
-            Some(fallback.sink()),
-        );
+        let extra = attach_request_log_sink(extra_with_context(Some(bare_context())), || {
+            Some(fallback.sink())
+        });
         extra
             .log(LoggingLevel::Warning, "no backchannel on this request")
             .expect("the emitter always returns Ok");
@@ -9848,7 +9854,7 @@ mod core_log_sink_tests {
     /// rather than an error (D-08).
     #[test]
     fn attach_request_log_sink_is_a_no_op_when_neither_source_exists() {
-        let extra = attach_request_log_sink(extra_with_context(Some(bare_context())), None);
+        let extra = attach_request_log_sink(extra_with_context(Some(bare_context())), || None);
         assert!(
             extra.log_sink.is_none(),
             "with no fallback and no backchannel, `extra.log_sink` stays None"
@@ -9869,7 +9875,7 @@ mod core_log_sink_tests {
     fn a_resolved_log_level_on_the_context_reaches_the_extra() {
         let with_level = Capture::default();
         let context = context_with_sink(&with_level).with_resolved_log_level(LoggingLevel::Debug);
-        let extra = attach_request_log_sink(extra_with_context(Some(context)), None);
+        let extra = attach_request_log_sink(extra_with_context(Some(context)), || None);
 
         assert_eq!(
             extra.log_level,
@@ -9891,7 +9897,7 @@ mod core_log_sink_tests {
         let defaulted = Capture::default();
         let extra = attach_request_log_sink(
             extra_with_context(Some(context_with_sink(&defaulted))),
-            None,
+            || None,
         );
         assert!(
             extra.log_level.is_none(),

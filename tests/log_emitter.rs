@@ -577,13 +577,19 @@ fn both_dispatch_roots_attach_the_log_sink() {
         "the shared unit must be DEFINED in src/server/core.rs, beside its `attach_request_peer` \
          twin"
     );
+    // The fallback is a THUNK at both roots: `attach_request_log_sink` prefers
+    // the request-scoped `TransportBackchannel` sink and never reads the fallback
+    // on an HTTP-served request, so `Server` must not allocate its
+    // `Arc<dyn Fn(..)>` before that branch is taken. The claim the fence pins is
+    // unchanged — `ServerCore` supplies NOTHING, `Server` supplies its
+    // notification_tx-derived sink — only the spelling of how it is handed over.
     assert!(
-        core.contains("attach_request_log_sink(extra, None)"),
+        core.contains("attach_request_log_sink(extra, || None)"),
         "the `ServerCore` root must call the shared unit, with the literal `None` fallback it has \
          no notification channel to fill"
     );
     assert!(
-        server.contains("attach_request_log_sink(extra, self.notification_tx_sink())"),
+        server.contains("attach_request_log_sink(extra, || self.notification_tx_sink())"),
         "the `Server` root must call the SAME unit, passing its notification_tx-derived fallback \
          — changing one root and not the other is this phase's most likely silent defect"
     );

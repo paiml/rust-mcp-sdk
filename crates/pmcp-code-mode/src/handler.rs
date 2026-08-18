@@ -314,15 +314,20 @@ impl CodeModeToolBuilder {
         vec![self.build_validate_tool(), self.build_execute_tool()]
     }
 
-    /// Build the validate_code tool definition.
-    /// Annotations shared by both code-mode tools today: a pure read that
-    /// touches no external state and can be retried freely.
+    /// The annotations for `validate_code`, and ONLY for `validate_code`: a pure
+    /// static analysis that touches no external state and can be retried freely.
     ///
-    /// Always true for `validate_code` (static analysis; the approval token
-    /// varies per call, but the effect does not). For `execute_code` it is an
-    /// assumption about the app's op surface — see the KNOWN LIMITATION on
-    /// [`Self::build_execute_tool`]. When hint derivation lands, only
-    /// `build_execute_tool` stops calling this.
+    /// **Do not hand these to [`Self::build_execute_tool`].** They were shared by
+    /// both tools briefly and that was wrong in the one direction that matters:
+    /// `readOnlyHint`/`destructiveHint` are the hints a host reads to decide
+    /// whether a call needs human confirmation, so declaring them on a tool that
+    /// EXECUTES caller-supplied code tells every host it may auto-approve
+    /// arbitrary execution. The claim was only ever true for apps whose declared
+    /// op surface is all reads (`OperationEntry { category: "read" }`, and for
+    /// GraphQL `allow_mutations = false`), and nothing enforces that — so the
+    /// truthful answer for `execute_code` is to declare NOTHING and let the MCP
+    /// defaults (`readOnlyHint = false`, `destructiveHint = true`) stand until
+    /// the hints can be DERIVED per app.
     fn safe_read_annotations() -> ToolAnnotations {
         ToolAnnotations::new()
             .with_read_only(true)
@@ -369,20 +374,22 @@ impl CodeModeToolBuilder {
 
     /// Build the execute_code tool definition.
     ///
-    /// KNOWN LIMITATION: the read-only annotations are truthful only for apps
-    /// whose declared op surface is all reads — every `OperationEntry` with
-    /// `category = "read"` (config.rs) and, for GraphQL, `allow_mutations =
-    /// false`. That holds for every consumer shipped today, but nothing here
-    /// enforces it: an app that exposes a mutating op inherits untruthful
-    /// hints. The durable fix is to derive the hints instead of hardcoding —
-    /// the pieces already converge: `OperationRegistry::lookup_category`
-    /// (config.rs), the `ValidationPipeline` the generated handler already
-    /// owns at its `metadata()` call site (pmcp-code-mode-derive), and the
-    /// per-script fold precedent in javascript.rs (`is_read_only`); the full
-    /// Cedar/AVP design layers on policy_annotations.rs. See the
-    /// hint-aggregation proposal.
+    /// Deliberately carries NO annotations. `readOnlyHint`/`destructiveHint` are
+    /// the hints a host reads to decide whether a call needs human confirmation,
+    /// and this tool runs caller-supplied code against the app's op surface — a
+    /// hardcoded "read-only, non-destructive, idempotent" would be a false safety
+    /// claim for any app that exposes a single mutating op, and nothing here
+    /// enforces that it does not.
+    ///
+    /// The durable fix is to DERIVE the hints rather than hardcode them, and the
+    /// pieces already converge: `OperationRegistry::lookup_category` (config.rs),
+    /// the `ValidationPipeline` the generated handler already owns at its
+    /// `metadata()` call site (pmcp-code-mode-derive), and the per-script fold
+    /// precedent in javascript.rs (`is_read_only`); the full Cedar/AVP design
+    /// layers on policy_annotations.rs. Until then the MCP defaults
+    /// (`readOnlyHint = false`, `destructiveHint = true`) are the honest answer.
     pub fn build_execute_tool(&self) -> ToolInfo {
-        ToolInfo::with_annotations(
+        ToolInfo::new(
             "execute_code",
             Some(
                 "Executes validated code using an approval token. \
@@ -407,7 +414,6 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code", "approval_token"]
             }),
-            Self::safe_read_annotations(),
         )
     }
 }
