@@ -6,12 +6,12 @@ current_phase: 118.2
 current_phase_name: the-v1-client-sse-transport-and-the-notifications-message-em
 status: executing
 stopped_at: Completed 118.2-18-PLAN.md — gap closure record closed
-last_updated: "2026-08-18T00:19:25.397Z"
+last_updated: "2026-08-18T00:44:04.587Z"
 last_activity: 2026-08-17
 last_activity_desc: Phase 118.2 execution started
 progress:
   total_phases: 11
-  completed_phases: 10
+  completed_phases: 9
   total_plans: 162
   completed_plans: 159
   percent: 82
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-07-22) · .planning/ROADMAP.md (v2.5 mil
 ## Current Position
 
 Phase: 118.2 (the-v1-client-sse-transport-and-the-notifications-message-em) — EXECUTING
-Plan: 17 of 17 — all plan files complete (01, 03-18); the gap-closure round (14-18) closed CR-01, CR-02, WR-01, WR-02 and amended CONF-09's evidence
+Plan: 1 of 20
 from 118.2-11's checkpoint). 118.2-12 was the phase's final act: the D-14 re-pin, held at
 `0.2.0-alpha.11` because it is already newest, bump delta NIL, developer approved 2026-08-17.
 Two deltas, never summed — SDK fixes `72/2 exit 1` → `73/1 exit 0` (`GAP_ATTRIBUTABLE_FAILURES`
@@ -37,7 +37,7 @@ Two deltas, never summed — SDK fixes `72/2 exit 1` → `73/1 exit 0` (`GAP_ATT
 Plans complete: **3 of 14** for Phase 118.1 (118.1-01, 118.1-02, 118.1-03); Phase 118 itself is
 10/10 with `118-VERIFICATION.md` status `passed`, merged to `main` as `aec3a947`
 Remaining: Phase 118.1 plans 04-14 (G-3..G-9), then Phase 119 (docs)
-Status: Ready to execute
+Status: Executing Phase 118.2
 deliberately-RED fences were turned green by 118.1-03's emitter fix, not by weakening them:
 `tests/embedded_resource_golden.rs` is 10/10 with `git diff` on that file EMPTY since `2ab06a44`,
 and `cargo +nightly fuzz run content_tolerant_reader -- -max_total_time=300` completes 5,713,406
