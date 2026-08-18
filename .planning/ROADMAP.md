@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 17/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed
+**Plans:** 17/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed, plus 3 SECOND-ROUND gap-closure plans (19-21) in waves 12-14 closing the two Critical defects that closure's own code introduced — 20 plans total, 17 executed and 3 planned
 
 - [x] 118.2-13-PLAN.md
 
@@ -2908,6 +2908,20 @@ Plans:
 **Wave 11** *(blocked on Waves 8-10)*
 
 - [x] 118.2-18-PLAN.md — Wave 11. The close-out: CONF-09's traceability row AMENDED in place with the four fixes and their measured fence counts, the two consumer-observable behaviour changes disclosed in `WINDOWS.md`, and the phase's single authoritative `cargo semver-checks` verdict plus a D-16 regression check framed as server-side only (CONF-09, CONF-10)
+
+**SECOND GAP CLOSURE (planned 2026-08-17).** The re-verification returned `gaps_found` again, 4/5. The first round genuinely closed CR-01 and WR-02, but its OWN code for CR-02 introduced two NEW Critical defects on the same client path — the sticky, unresettable latch pre-empting an in-flight SSE-answered POST response (permanently, for the life of the process), and an id-mismatch discard that holds the transport write lock across a wait bounded by a timeout `pmcp::Client` does not have — plus a documentation-of-record error that books the second as bounded. Plans 19-21 close both, add the SSE-answered-POST fence shape the existing fences miss, and correct every document that carries the false premise.
+
+**Wave 12**
+
+- [ ] 118.2-19-PLAN.md — Wave 12. **BLOCKER 1, the tracer slice**: the terminal reason gains the identity of the stream that raised it, `drain_or_latch` never surfaces a latch while a POST-response reader is live, and a successful `start_sse` re-open CLEARS the latch — fenced by the SSE-answered-POST shape fence 16 could not reach (CONF-09)
+
+**Wave 13** *(blocked on Wave 12 — same test file)*
+
+- [ ] 118.2-20-PLAN.md — Wave 13. **BLOCKER 2, both halves independently fenced**: the discard wait gains a real ceiling (`MISMATCH_DISCARD_TIMEOUT`) and a discard cap (`MAX_ID_MISMATCH_DISCARDS`), the transport write guard is released on a `MISMATCH_RECEIVE_SLICE` so one bad frame can no longer wedge the whole `Client`, and the in-code claim of a caller-supplied timeout is corrected (CONF-09)
+
+**Wave 14** *(blocked on Waves 12-13)*
+
+- [ ] 118.2-21-PLAN.md — Wave 14. The record: the false ceiling premise REMOVED in place from `deferred-items.md`, CONF-09's limitation (vi) corrected and BLOCKER 1 disclosed as (vii), `WINDOWS.md` entries 12/13 restated at the severity found and entry 16 cross-referenced, every declined finding named with an owner, and the round's closing semver, gate and D-16 verdict (CONF-09, CONF-10)
 
 **Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
 
