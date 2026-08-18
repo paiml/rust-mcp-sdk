@@ -954,26 +954,20 @@ impl ConformanceTool {
                 // with a `_meta` that does NOT carry the key and fails the
                 // server if any `notifications/message` frame comes back.
                 //
-                // So this tool emits ONLY when the request actually carried a
-                // level. `extra.log_level` is exactly that fact:
-                // `resolve_request_log_level` sets it from the v2 `_meta` key or
-                // from the v1 session's `logging/setLevel`, and leaves it `None`
-                // when neither happened.
+                // This tool emits UNCONDITIONALLY, and that is the point: the
+                // rule lives in `src/`, not in this fixture. The gap it used to
+                // work around — with no resolved level the emitter fell back to
+                // `DEFAULT_LOG_LEVEL` (`info`, D-12) and emitted, failing
+                // SEP-2575 — is closed in
+                // `server::core::attach_request_log_sink`, which now attaches NO
+                // sink for a v2 request that carried no level. A sinkless emit is
+                // silence (D-08).
                 //
-                // KNOWN SDK GAP this guard exposes rather than hides: with
-                // `log_level == None` the emitter falls back to
-                // `DEFAULT_LOG_LEVEL` (`info`, D-12), so `extra.log(..)` alone
-                // WOULD emit here and fail SEP-2575. That default is correct for
-                // v1 ("the server MAY decide which messages to send
-                // automatically") and wrong for v2, where absence is a
-                // prohibition rather than a non-answer. Fixing it means making
-                // `None` mean "no logging" on v2 inside
-                // `resolve_request_log_level` — a behaviour change in `src/`,
-                // recorded for the measurement phase rather than smuggled into
-                // an example.
-                if extra.log_level.is_some() {
-                    extra.log(LoggingLevel::Info, "Diagnostic logging authorized")?;
-                }
+                // Kept unguarded deliberately: a fixture that checks
+                // `extra.log_level.is_some()` first would pass whether or not
+                // `src/` implements the rule, and every OTHER pmcp server — none
+                // of which carries such a guard — would still violate it.
+                extra.log(LoggingLevel::Info, "Diagnostic logging authorized")?;
                 Ok(CallToolResult::new(vec![Content::text(
                     "Tool with logging completed",
                 )]))

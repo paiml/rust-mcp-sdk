@@ -1660,9 +1660,23 @@ fn capture_v1_set_level(
 ///    into another request.
 /// 2. **v1** — the level this SESSION last set, when sessions are live for the
 ///    request and it carries a session id.
-/// 3. Otherwise **`None`**: leave `ProtocolContext::resolved_log_level` unset and
-///    let `DEFAULT_LOG_LEVEL` (`info`, D-12) apply at emit time. `None` is not
-///    "no logging" — it is "nothing overrode the default".
+/// 3. Otherwise **`None`**: leave `ProtocolContext::resolved_log_level` unset.
+///
+/// # `None` means two different things, and the ERA decides which
+///
+/// On **v1** it is "nothing overrode the default", so `DEFAULT_LOG_LEVEL`
+/// (`info`, D-12) applies at emit time — MCP 2025-11-25 says the server MAY
+/// decide which messages to send automatically.
+///
+/// On **v2** it is a PROHIBITION. SEP-2575 is explicit: *"If absent, the server
+/// MUST NOT send any notifications/message"*. This function still answers `None`
+/// for that case — the distinction is not expressible in its return type, and
+/// inventing a tri-state here would push the era rule into every reader of
+/// `resolved_log_level`. It is applied ONCE, at the far end, by
+/// [`attach_request_log_sink`](crate::server::core::attach_request_log_sink),
+/// which withholds the log SINK entirely for a v2 request with no resolved
+/// level; a sinkless emit is silence (D-08). See that function for why the sink
+/// rather than the level carries the rule.
 ///
 /// The two arms cannot both apply: arm 2's `sessions_on` is `false` on v2 by
 /// [`v1::sessions_active`], which is why this reads as a precedence list rather

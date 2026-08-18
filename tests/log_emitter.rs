@@ -1258,10 +1258,14 @@ async fn a_v1_handler_log_record_reaches_the_live_session_stream() {
 async fn a_v2_handler_log_record_rides_the_multi_frame_post_body() {
     let (addr, handle) = spawn_server(build_dual_era_server(), stateful_config()).await;
 
+    // The request AUTHORIZES logging. This fence is about the CARRIER — that a
+    // v2 record rides the POST response body rather than a session stream — and
+    // on v2 there is no record at all unless the caller asked for one
+    // (SEP-2575; see `a_v2_request_without_a_log_level_emits_nothing`).
     let (status, body) = post(
         addr,
         &v2_call_headers(),
-        &v2_call_body(2, None),
+        &v2_call_body(2, Some(&json!("info"))),
         "the v2 logging call",
     )
     .await;
@@ -1276,6 +1280,46 @@ async fn a_v2_handler_log_record_rides_the_multi_frame_post_body() {
     assert!(
         body.rfind("\"result\"") > body.find(LOG_METHOD),
         "and the result frame comes AFTER the record, not before it: {body}"
+    );
+
+    teardown(handle, ()).await;
+}
+
+/// THE SEP-2575 negative, on the wire.
+///
+/// The vendored 2026-07-28 schema is explicit about the absent key: *"If absent,
+/// the server MUST NOT send any notifications/message"*. The official suite's
+/// `sep-2575-server-no-log-without-loglevel` scenario reds the server on a
+/// SINGLE frame, so the assertion here is zero records, not few.
+///
+/// pmcp used to fail this: with no resolved level the emitter fell back to
+/// `DEFAULT_LOG_LEVEL` (`info`, D-12) and emitted. That default is right for v1,
+/// where absence means "the server MAY decide", and wrong for v2, where absence
+/// is a prohibition. The rule now lives in
+/// `server::core::attach_request_log_sink`, which gives such a request no log
+/// SINK at all — so it holds for every handler rather than only the ones that
+/// remember to check `extra.log_level`.
+#[tokio::test]
+async fn a_v2_request_without_a_log_level_emits_nothing() {
+    let (addr, handle) = spawn_server(build_dual_era_server(), stateful_config()).await;
+
+    let (status, body) = post(
+        addr,
+        &v2_call_headers(),
+        &v2_call_body(2, None),
+        "the v2 call carrying no log level",
+    )
+    .await;
+
+    assert_eq!(
+        status, 200,
+        "the call still SERVES — logging is not authorized, which is not a failure: {body}"
+    );
+    assert_eq!(
+        messages_of(&records_in_body(&body)),
+        Vec::<String>::new(),
+        "not ONE `notifications/message` frame: the handler emits unconditionally, so anything \
+         here means the emitter still has a vehicle the client never authorized: {body}"
     );
 
     teardown(handle, ()).await;
@@ -1370,10 +1414,10 @@ async fn the_v2_meta_key_sets_the_level_for_that_request_only() {
     );
     assert_eq!(
         messages_of(&records_in_body(&without_key)),
-        vec![INFO_MESSAGE.to_string()],
-        "and the very next request, which carried no key, is back at the default — v2 is \
-         session-free, so a level that persisted would be state the era does not have: \
-         {without_key}"
+        Vec::<String>::new(),
+        "and the very next request, which carried no key, receives NOTHING — v2 is session-free, \
+         so a level that persisted would be state the era does not have, and on v2 an absent key \
+         is a prohibition rather than a fall-back to the default (SEP-2575): {without_key}"
     );
 
     teardown(handle, ()).await;
@@ -1437,8 +1481,9 @@ async fn a_malformed_level_value_is_ignored_and_not_echoed() {
     let records = records_in_body(&body);
     assert_eq!(
         messages_of(&records),
-        vec![INFO_MESSAGE.to_string()],
-        "the effective level falls back to the `info` default: {body}"
+        Vec::<String>::new(),
+        "an unparseable level is no level, and on v2 no level is a PROHIBITION (SEP-2575) — the \
+         fail-closed reading, so a peer cannot obtain logging it did not correctly ask for: {body}"
     );
     for record in &records {
         assert!(

@@ -227,6 +227,164 @@ type NoInputResponder = fn(InputRequests) -> std::future::Ready<Result<InputResp
 /// implementors MUST tolerate without losing already-consumed bytes.
 const PUMP_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The longest a request keeps waiting once the peer has begun answering with
+/// ids NOBODY is awaiting (code review of Phase 118.2).
+///
+/// # Why a ceiling exists at all
+///
+/// [`RequestId`] equality is structural AND typed, as JSON-RPC 2.0 requires: a
+/// peer that answers `"id": "7"` for a request this client minted as
+/// `RequestId::Number(7)` produces a response that matches nothing. The router
+/// drops it with a `warn!` and [`Client::dispatch_request`] goes on waiting —
+/// forever, because pmcp has no request timeout (`RequestOptions::timeout` is
+/// public but unreachable). A hang is the worst of the available answers: it is
+/// indistinguishable from a slow tool call, and it holds an `active_requests`
+/// entry and a caller task for the life of the process.
+///
+/// Phase 118.2 shipped exactly this ceiling, the per-id router replaced the
+/// discard loop it was written for, and the follow-up commit deleted it — but
+/// the router only removed the discarding of frames that DO match an id.
+/// A frame matching NO id is still dropped, so the failure mode came back
+/// wearing the router's clothes, and silently instead of loudly. This restores
+/// the bound at the one site that can still observe the discard.
+///
+/// It fires ONLY once a mis-addressed frame has actually been seen. A request
+/// whose peer has simply gone quiet is NOT bounded here, deliberately: that is
+/// the pre-existing no-default-timeout behaviour, and giving every call a
+/// blanket deadline would break long-running `tools/call` handlers, which is a
+/// product decision rather than a review fix.
+const UNMATCHED_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many unmatched response frames ONE request tolerates before failing.
+///
+/// A peer emitting a mis-addressed frame every few milliseconds keeps the wait
+/// busy and productive-looking right up to [`UNMATCHED_RESPONSE_TIMEOUT`], and
+/// the caller then sees only a timeout — true but undiagnosable. The cap turns
+/// that shape into a named failure carrying the count and the offending id, so
+/// "the peer went quiet" and "the peer is spraying wrong ids" are distinguishable
+/// from the error alone.
+///
+/// Thirty-two is far above anything a correct peer produces (a correct peer
+/// produces zero) and far below anything that could be mistaken for progress.
+const MAX_UNMATCHED_RESPONSES: usize = 32;
+
+/// The longest peer-chosen [`RequestId`] rendering this client will put into a
+/// log line or an error (code review of Phase 118.2).
+///
+/// A response id is remote input of unbounded length: `RequestId::String` comes
+/// straight off the wire, and a hostile or broken server can stream 1 MiB ids as
+/// fast as it likes. The transport already bounds its own untrusted echo with
+/// `MAX_ECHOED_SSE_FRAME` and states the rule — a hostile server must not be
+/// able to push an unbounded string into a client's logs — and the router has to
+/// follow it.
+///
+/// 128 bytes is far longer than any id a real peer mints (a counter, a UUID)
+/// and short enough that a flood costs the log a bounded amount per line.
+const MAX_ECHOED_REQUEST_ID: usize = 128;
+
+/// Render a peer-supplied [`RequestId`] for a log line or an error, BOUNDED.
+///
+/// The typed `Debug` form deliberately, not the bare value: `RequestId` equality
+/// is structural and typed, so `String("7")` and `Number(7)` are DIFFERENT ids.
+/// Rendered as bare strings the two read identically and a re-typing report
+/// looks like a contradiction; rendered as `String("7")` and `Number(7)` the
+/// re-typing is the first thing the reader sees.
+///
+/// Truncation lands on a `char` boundary — `&str[..n]` PANICS mid-codepoint, and
+/// a peer choosing a multi-byte id must not be able to panic a client's log line
+/// — and names the number of bytes withheld so a truncated echo is never
+/// mistaken for a short id.
+fn echoed_request_id(id: &RequestId) -> String {
+    let rendered = format!("{id:?}");
+    if rendered.len() <= MAX_ECHOED_REQUEST_ID {
+        return rendered;
+    }
+    let mut cut = MAX_ECHOED_REQUEST_ID;
+    while cut > 0 && !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}… (+{} bytes withheld)",
+        &rendered[..cut],
+        rendered.len() - cut
+    )
+}
+
+/// What ONE `dispatch_request` has spent on response frames addressed to nobody.
+///
+/// Its own type rather than two locals in the wait loop for two reasons: the
+/// arming rule (the deadline is set on the FIRST unmatched frame and never
+/// moves) is a correctness property worth unit-testing in isolation, and keeping
+/// it out of [`Client::dispatch_request`] is what holds that function under the
+/// repo's cognitive-complexity budget without an `#[allow]`.
+#[derive(Debug, Default)]
+struct UnmatchedBudget {
+    /// How many unmatched frames this request has observed.
+    seen: usize,
+    /// When the wait expires — `None` until the FIRST unmatched frame.
+    ///
+    /// `None` is not "no deadline yet, use a default"; it is the load-bearing
+    /// signal that the peer has not misbehaved, which is what keeps an ordinary
+    /// slow call unbounded.
+    deadline: Option<web_time::Instant>,
+}
+
+impl UnmatchedBudget {
+    /// Book one unmatched frame.
+    ///
+    /// The deadline is armed on the FIRST one ONLY. Re-arming it per frame would
+    /// let a peer emitting a steady drip of wrong ids extend the wait
+    /// indefinitely — the ceiling would exist and never fire, which is the defect
+    /// this type closes wearing a fix's clothes.
+    fn record(&mut self) {
+        self.seen += 1;
+        if self.deadline.is_none() {
+            self.deadline = Some(web_time::Instant::now() + UNMATCHED_RESPONSE_TIMEOUT);
+        }
+    }
+
+    /// The failure this budget has reached, or `None` while it still has room.
+    ///
+    /// Either bound alone is sufficient: the count catches a fast sprayer and the
+    /// deadline catches a slow drip, and a peer can choose which one to walk into.
+    /// `last` is the already-bounded rendering of the most recent offending id —
+    /// see [`echoed_request_id`] for why it is bounded and why it is typed.
+    fn exhausted(&self, awaiting: &RequestId, last: Option<&str>) -> Option<Error> {
+        let expired = self
+            .deadline
+            .is_some_and(|deadline| web_time::Instant::now() >= deadline);
+        if self.seen < MAX_UNMATCHED_RESPONSES && !expired {
+            return None;
+        }
+        let last = last.unwrap_or("<none>");
+        Some(Error::Transport(crate::error::TransportError::Request(
+            format!(
+                "the peer answered with {seen} response id(s) no request is awaiting while \
+                 {awaiting:?} was outstanding (most recently {last}); JSON-RPC 2.0 ids are typed, \
+                 so a re-typed id — \"7\" for 7 — matches nothing and this request would \
+                 otherwise wait forever",
+                seen = self.seen,
+            ),
+        )))
+    }
+}
+
+/// One step of [`Client::pump_once`], from the waiting caller's point of view.
+///
+/// Three outcomes rather than `Result<()>` because the caller has to distinguish
+/// them: its own answer ends the wait, an unmatched frame spends budget, and
+/// everything else is ordinary progress.
+enum PumpStep<T> {
+    /// THIS caller's own answer arrived, raced inside the pump's own `select`.
+    Answered(T),
+    /// A response arrived that no request is awaiting, and was dropped. Carries
+    /// the already-bounded rendering of its id (see [`echoed_request_id`]).
+    Unmatched(String),
+    /// A routed response, a notification, an inbound request, or an expired
+    /// slice — anything that is neither of the above.
+    Progressed,
+}
+
 /// What one in-flight client request is waiting on.
 ///
 /// # Why the response channel lives here
@@ -3771,6 +3929,8 @@ impl<T: Transport> Client<T> {
             // and releases. So there is no pump to hand off and no pump to lose:
             // when the current pump returns with its own answer, the next waiter
             // in the queue simply becomes the pump.
+            let mut budget = UnmatchedBudget::default();
+            let mut last_unmatched: Option<String> = None;
             loop {
                 // `now_or_never` rather than `try_recv`: the oneshot is
                 // `tokio::sync` on native and `futures_channel` on wasm32 and
@@ -3778,29 +3938,60 @@ impl<T: Transport> Client<T> {
                 // `Unpin` futures, so polling once is portable. Polling a
                 // pending oneshot does not consume anything.
                 //
-                // The answer is deliberately NOT raced against `pump_once`:
-                // cancelling a pump between `receive()` returning and the frame
-                // being delivered would destroy that frame, which is the very
-                // defect this router exists to remove. A pump step always runs
-                // to completion; it is bounded by PUMP_RECEIVE_SLICE.
-                if let Some(answer) = futures::FutureExt::now_or_never(&mut response_rx) {
-                    let mut response = answer.map_err(|_| {
-                        // The registration was removed without an answer, which
-                        // only `cancel_request` does. Stop waiting rather than
-                        // blocking on a peer that will never reply.
-                        Error::InvalidState(format!(
-                            "request {request_id:?} was cancelled before it was answered"
-                        ))
-                    })?;
-                    self.middleware_chain
-                        .read()
-                        .await
-                        .process_response_with_context(&mut response, &context)
-                        .await?;
-                    return Ok(response);
-                }
+                // Checked here AND raced inside the pump. This first poll is what
+                // catches an answer another task's pump already delivered while
+                // this one was queued for the transport lock; the pump's own arm
+                // is what catches one delivered DURING a slice.
+                let answered = match futures::FutureExt::now_or_never(&mut response_rx) {
+                    Some(answer) => Some(answer),
+                    None => {
+                        // The answer is raced against the pump's RECEIVE, never
+                        // against the pump as a whole: cancelling a pump between
+                        // `receive()` returning and the frame being delivered
+                        // would destroy that frame, which is the very defect this
+                        // router exists to remove. Inside the `select` the
+                        // receive arm is polled first, so a frame that is ready
+                        // is always routed; only a PENDING receive is dropped,
+                        // which `Transport::receive` documents implementors must
+                        // tolerate.
+                        match self.pump_once(&mut response_rx).await? {
+                            PumpStep::Answered(answer) => Some(answer),
+                            PumpStep::Unmatched(id) => {
+                                budget.record();
+                                last_unmatched = Some(id);
+                                None
+                            },
+                            PumpStep::Progressed => None,
+                        }
+                    },
+                };
 
-                self.pump_once().await?;
+                let Some(answer) = answered else {
+                    // Checked on EVERY step that produced no answer, not only on
+                    // the ones that booked an offence: a drip of wrong ids can go
+                    // quiet after the last one, and a deadline that could only
+                    // fire on the NEXT offence is a ceiling that exists and never
+                    // fires. `exhausted` is `None` for an unarmed budget, so an
+                    // honest but slow peer is still unbounded here.
+                    if let Some(error) = budget.exhausted(&request_id, last_unmatched.as_deref()) {
+                        return Err(error);
+                    }
+                    continue;
+                };
+                let mut response = answer.map_err(|_| {
+                    // The registration was removed without an answer, which
+                    // only `cancel_request` does. Stop waiting rather than
+                    // blocking on a peer that will never reply.
+                    Error::InvalidState(format!(
+                        "request {request_id:?} was cancelled before it was answered"
+                    ))
+                })?;
+                self.middleware_chain
+                    .read()
+                    .await
+                    .process_response_with_context(&mut response, &context)
+                    .await?;
+                return Ok(response);
             }
         }
         .await;
@@ -3822,17 +4013,50 @@ impl<T: Transport> Client<T> {
     /// peer's think-time or this task's routing work.
     ///
     /// A `Response` is delivered to whoever registered its id. A response nobody
-    /// is awaiting is dropped with a `warn!` — harmless, because no caller is
-    /// blocked on it, which is exactly what was NOT true when each caller popped
-    /// frames for itself and had to discard the ones that were not its own.
-    async fn pump_once(&self) -> Result<()> {
+    /// is awaiting is dropped with a `warn!` and REPORTED as
+    /// [`PumpStep::Unmatched`] — harmless to the other waiters, because no caller
+    /// is blocked on it, but the caller of this step has to know it happened:
+    /// a peer that re-types an id answers nothing, forever, and
+    /// [`UnmatchedBudget`] is what turns that into a named failure.
+    ///
+    /// # `answer` is raced INSIDE the select, not around this call
+    ///
+    /// The caller's own answer channel is polled in the same `select` as the
+    /// receive, with the receive arm first. That is what removes a full
+    /// [`PUMP_RECEIVE_SLICE`] of latency from the common two-caller case: with
+    /// the answer polled only BETWEEN steps, a request whose response another
+    /// task's pump had already delivered still sat through an entire 250 ms
+    /// slice — holding the transport write lock, and so blocking that other task
+    /// too — before it looked.
+    ///
+    /// Racing it here is safe where racing `pump_once` as a whole is not: a
+    /// message the receive arm has already produced is always routed, because
+    /// `futures::future::select` polls its first future first, and only a
+    /// PENDING receive is ever dropped — which
+    /// [`Transport::receive`](crate::shared::Transport::receive) documents
+    /// implementors must tolerate without losing consumed bytes. Cancelling the
+    /// whole step, by contrast, could drop a frame BETWEEN `receive()` returning
+    /// it and this function routing it, which is the defect the router exists to
+    /// remove.
+    async fn pump_once<A>(&self, answer: &mut A) -> Result<PumpStep<A::Output>>
+    where
+        A: std::future::Future + Unpin,
+    {
         let received = {
             let mut transport = self.transport.write().await;
             let receive = std::pin::pin!(transport.receive());
             let slice = std::pin::pin!(crate::runtime::sleep(PUMP_RECEIVE_SLICE));
-            match futures::future::select(receive, slice).await {
+            // Nested so the RECEIVE keeps first-poll priority: `select` polls its
+            // first argument first, so a ready frame always wins over a ready
+            // answer, and the answer wins over the slice.
+            match futures::future::select(receive, futures::future::select(answer, slice)).await {
                 futures::future::Either::Left((message, _)) => Some(message),
-                futures::future::Either::Right(((), _)) => None,
+                futures::future::Either::Right((rest, _)) => match rest {
+                    futures::future::Either::Left((answered, _)) => {
+                        return Ok(PumpStep::Answered(answered))
+                    },
+                    futures::future::Either::Right(((), _)) => None,
+                },
             }
         };
 
@@ -3840,25 +4064,22 @@ impl<T: Transport> Client<T> {
         // point is that the lock has now been released, so anyone waiting to
         // send gets their turn before we ask again.
         let Some(message) = received else {
-            return Ok(());
+            return Ok(PumpStep::Progressed);
         };
 
         match message? {
             crate::types::TransportMessage::Response(response) => {
                 let owner = self.active_requests.write().await.remove(&response.id);
-                match owner {
-                    Some(pending) => {
-                        // The receiver is gone only if that caller has already
-                        // stopped waiting; dropping the answer is then correct.
-                        let _ = pending.response.send(response);
-                    },
-                    None => {
-                        tracing::warn!(
-                            id = ?response.id,
-                            "dropping a JSON-RPC response no request is awaiting"
-                        );
-                    },
-                }
+                let Some(pending) = owner else {
+                    // BOUNDED echo: the id is remote input of unbounded length.
+                    // See `echoed_request_id`.
+                    let id = echoed_request_id(&response.id);
+                    tracing::warn!(%id, "dropping a JSON-RPC response no request is awaiting");
+                    return Ok(PumpStep::Unmatched(id));
+                };
+                // The receiver is gone only if that caller has already stopped
+                // waiting; dropping the answer is then correct.
+                let _ = pending.response.send(response);
             },
             crate::types::TransportMessage::Notification(notification) => {
                 use crate::shared::protocol_helpers::create_notification;
@@ -3902,7 +4123,7 @@ impl<T: Transport> Client<T> {
                     .await?;
             },
         }
-        Ok(())
+        Ok(PumpStep::Progressed)
     }
 
     /// Answer an inbound server -> client request from the host registry.
@@ -5434,6 +5655,18 @@ mod tests {
         ///
         /// A mock with no recorded request yet is left alone, so a test that
         /// exercises an UNSOLICITED frame keeps the id it wrote.
+        ///
+        /// # What this mock CANNOT prove, and where that coverage lives
+        ///
+        /// Because it forces every id to match, a client that routes by id and a
+        /// client that simply returns the next `Response` frame behave
+        /// identically under it — so no suite built on this mock can tell the two
+        /// apart. (A BROKEN lookup is still caught: a response that matches
+        /// nothing is never delivered, and the awaiting call fails.) The
+        /// discriminating arm is
+        /// [`a_re_typed_response_id_fails_the_call_rather_than_hanging`], which
+        /// answers with a deliberately mis-typed id and asserts the call refuses
+        /// it. Keep that arm alive if this helper is ever changed.
         fn addressed_to_the_pending_request(&self, message: TransportMessage) -> TransportMessage {
             match message {
                 TransportMessage::Response(mut response) => {
@@ -5479,6 +5712,170 @@ mod tests {
 
         async fn close(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    /// A transport that answers every request with a RE-TYPED id.
+    ///
+    /// JSON-RPC 2.0 ids are typed, so `String("1")` is not `Number(1)`. This is
+    /// the peer shape the router cannot route and must therefore refuse.
+    #[derive(Debug, Default)]
+    struct RetypingTransport {
+        answered: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Transport for RetypingTransport {
+        async fn send(&mut self, _message: TransportMessage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn receive(&mut self) -> Result<TransportMessage> {
+            let mut answered = self.answered.lock().unwrap();
+            *answered += 1;
+            Ok(TransportMessage::Response(
+                crate::types::JSONRPCResponse::success(
+                    // A STRING id, whatever the client minted. A conformant peer
+                    // echoes the request's id verbatim, type included.
+                    RequestId::String(format!("{answered}")),
+                    serde_json::json!({}),
+                ),
+            ))
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// THE ceiling claim (code review of Phase 118.2).
+    ///
+    /// `pump_once` drops a response no request is awaiting. With no ceiling —
+    /// and pmcp has no request timeout — a peer that re-types an id leaves
+    /// `dispatch_request` polling at 4 Hz forever, holding an `active_requests`
+    /// entry and a caller task for the life of the process. The commit that
+    /// introduced the router deleted the bound that covered exactly this.
+    ///
+    /// It is ALSO the arm that proves the client routes BY id at all: the
+    /// re-addressing `MockTransport` above forces every id to match, so no suite
+    /// built on it can distinguish routing from "return the next frame".
+    ///
+    /// Bounded by `timeout`, because the defect is a HANG: without the bound a
+    /// regression would wedge the suite rather than fail it.
+    #[tokio::test]
+    async fn a_re_typed_response_id_fails_the_call_rather_than_hanging() {
+        let client = Client::new(RetypingTransport::default());
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.send_request(
+                RequestId::Number(1),
+                Request::Client(Box::new(crate::types::ClientRequest::ListTools(
+                    crate::types::ListToolsRequest { cursor: None },
+                ))),
+            ),
+        )
+        .await
+        .expect("the call must FAIL, not hang — hanging is the defect this arm fences")
+        .expect_err("a peer that answers nothing this client asked for cannot succeed");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("no request is awaiting"),
+            "the failure must NAME the defect so a re-typed id is not mistaken for a slow peer; \
+             got {rendered}"
+        );
+    }
+
+    /// The budget arms on the FIRST unmatched frame and never re-arms.
+    ///
+    /// Re-arming per frame would let a peer emitting a steady drip of wrong ids
+    /// extend the wait indefinitely: the ceiling would exist and never fire.
+    #[test]
+    fn the_unmatched_budget_arms_once_and_never_moves() {
+        let mut budget = UnmatchedBudget::default();
+        assert!(
+            budget.deadline.is_none(),
+            "an untouched budget must NOT be armed — a slow but honest peer is not bounded here"
+        );
+        assert!(
+            budget.exhausted(&RequestId::Number(1), None).is_none(),
+            "and an unarmed budget can never be exhausted"
+        );
+
+        budget.record();
+        let armed = budget.deadline.expect("the first unmatched frame arms it");
+        for _ in 0..8 {
+            budget.record();
+        }
+        assert_eq!(
+            budget.deadline,
+            Some(armed),
+            "later frames must not push the deadline out; that is how a ceiling exists and never \
+             fires"
+        );
+        assert_eq!(budget.seen, 9, "every frame is counted");
+    }
+
+    /// The COUNT bound fires on its own, so a fast sprayer does not get to run
+    /// out the full timeout first.
+    #[test]
+    fn the_unmatched_budget_fails_on_the_count_alone() {
+        let mut budget = UnmatchedBudget::default();
+        for _ in 0..MAX_UNMATCHED_RESPONSES {
+            budget.record();
+        }
+        let error = budget
+            .exhausted(&RequestId::Number(1), Some("String(\"1\")"))
+            .expect("the count bound must fire without waiting for the deadline");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("String(\"1\")"),
+            "the offending id must be named — it is the whole diagnosis; got {rendered}"
+        );
+    }
+
+    /// THE echo bound (code review of Phase 118.2).
+    ///
+    /// A response id is remote input of unbounded length. The transport bounds
+    /// its own untrusted echo with `MAX_ECHOED_SSE_FRAME` and states the rule;
+    /// the router has to follow it.
+    #[test]
+    fn an_echoed_request_id_is_bounded_and_typed() {
+        let short = echoed_request_id(&RequestId::Number(7));
+        assert_eq!(
+            short, "Number(7)",
+            "a short id is rendered in its TYPED form, so a re-typing report does not read as a \
+             contradiction"
+        );
+        assert_eq!(
+            echoed_request_id(&RequestId::String("7".to_string())),
+            "String(\"7\")",
+            "and the string twin is visibly a different id"
+        );
+
+        let hostile = echoed_request_id(&RequestId::String("A".repeat(1024 * 1024)));
+        assert!(
+            hostile.len() < MAX_ECHOED_REQUEST_ID + 64,
+            "a 1 MiB id must not reach a log line verbatim; got {} bytes",
+            hostile.len()
+        );
+        assert!(
+            hostile.contains("withheld"),
+            "and a truncated echo must SAY it was truncated, or it reads as a short id"
+        );
+    }
+
+    /// Truncation lands on a `char` boundary: `&str[..n]` panics mid-codepoint,
+    /// and a peer choosing a multi-byte id must not be able to panic a client.
+    #[test]
+    fn an_echoed_request_id_never_splits_a_codepoint() {
+        for pad in 0..8 {
+            let id = RequestId::String(format!("{}{}", "x".repeat(pad), "é".repeat(512)));
+            let rendered = echoed_request_id(&id);
+            assert!(
+                rendered.contains("withheld"),
+                "the fixture must actually exceed the cap at pad {pad}"
+            );
         }
     }
 

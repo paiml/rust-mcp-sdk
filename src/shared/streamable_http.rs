@@ -562,15 +562,49 @@ const RECONNECT_BUDGET_RESET_UPTIME: Duration = Duration::from_secs(30);
 
 /// Whether a body that just ended earns a FRESH reconnect budget.
 ///
-/// A free function rather than an inline conjunction inside
+/// UPTIME IS THE WHOLE PREDICATE, and the absence of a delivery conjunct is the
+/// correction rather than an omission. The first form of this rule was
+/// `delivered && uptime >= RECONNECT_BUDGET_RESET_UPTIME`, which made a healthy
+/// but QUIET stream unable to earn anything back: an idle MCP session emits only
+/// SSE keep-alive comments, `SseParser::process_line` discards those at its
+/// `line.starts_with(':')` arm, and so no `SseEvent` — and therefore no
+/// "delivered" — is ever produced no matter how long the stream stays up. A
+/// client sitting behind an ALB with a 60 s idle timeout then spent one budget
+/// unit per blink and, after [`MAX_SSE_RECONNECT_ATTEMPTS`] of them, latched
+/// `reconnect_budget_exhausted` PERMANENTLY: nothing re-opens the session stream
+/// (`start_sse` is called only from the `notifications/initialized` 202 handler),
+/// so the transport lost every server-to-client notification, sampling and
+/// elicitation request, and log record for the life of the process.
+///
+/// CR-01 is closed by the uptime half ALONE, which is why dropping the conjunct
+/// is safe: the one-frame-bounce peer that motivated CR-01 closes its body
+/// immediately, so it cannot reach 30 s of uptime and never earns a refund. The
+/// same holds for T-118.2-04-01's peer that keeps closing — a fast-closing server
+/// is still bounded at [`MAX_SSE_RECONNECT_ATTEMPTS`].
+///
+/// # The residual, stated rather than hidden
+///
+/// A peer that accepts the connection, writes NOTHING, holds it open past 30 s
+/// and then closes now earns a refund every iteration, so it is reconnected
+/// indefinitely at roughly one attempt per 30 s. That is accepted: it is
+/// rate-bounded rather than a spin, and it is byte-for-byte indistinguishable
+/// from the healthy-idle-stream-behind-a-proxy case D-03 exists to survive. A
+/// liveness signal that could tell them apart would have to count received
+/// BYTES (a keep-alive comment is an HTTP data frame even though it is not an
+/// event), which means threading a flag out of `read_next_sse_frame`'s chunk arm
+/// through the four functions this reader is split into for the repo's cog-25
+/// budget. Worth doing if a black-hole peer is ever observed; not worth doing
+/// speculatively.
+///
+/// A free function rather than an inline comparison inside
 /// [`StreamableHttpTransport::run_session_stream`], for two reasons. That loop is
 /// already split four ways specifically to hold the repo's PMAT cog-25 budget
-/// (CLAUDE.md), and adding an `&&` with an `Instant::elapsed()` call pushes it
-/// back over. And a pure predicate is unit-testable at both sides of its
-/// threshold with no clock manipulation at all, which is what
-/// `mod reconnect_delay_bounds` does.
-fn budget_reset_earned(delivered: bool, uptime: Duration) -> bool {
-    delivered && uptime >= RECONNECT_BUDGET_RESET_UPTIME
+/// (CLAUDE.md), and adding an `Instant::elapsed()` comparison pushes it back
+/// over. And a pure predicate is unit-testable at both sides of its threshold
+/// with no clock manipulation at all, which is what `mod reconnect_delay_bounds`
+/// does.
+fn budget_reset_earned(uptime: Duration) -> bool {
+    uptime >= RECONNECT_BUDGET_RESET_UPTIME
 }
 
 /// How fast the reconnect wait grows per attempt.
@@ -722,6 +756,15 @@ enum TerminalKind {
     /// A spent reconnect budget, a `405` on reconnect, a failed re-open, or a
     /// POST response stream dropped mid-body.
     Request,
+    /// The APPLICATION closed this transport. Rebuilds
+    /// [`TransportError::ConnectionClosed`] rather than either peer-facing
+    /// family, because nothing failed: the owner said stop.
+    ///
+    /// Distinct from `Request` deliberately. A consumer that matches on the
+    /// error family to decide whether to retry must be able to tell "the peer
+    /// went away" from "my own code called `close()`", and collapsing the two
+    /// would make an orderly shutdown look like a transport fault.
+    Closed,
 }
 
 /// WHICH of this transport's streams a terminal reason belongs to (Phase 118.2,
@@ -745,6 +788,15 @@ enum StreamKind {
     Session,
     /// One streaming POST response — a call's own answer arriving.
     PostResponse,
+    /// Not a stream at all: the TRANSPORT itself, closed by the application.
+    ///
+    /// It shares the latch because it answers the same question every latched
+    /// reason answers — "why will no further message arrive?" — and because a
+    /// separate flag would need the same write-once rule, the same wake, and the
+    /// same ordering behind already-queued messages. Its own variant, rather
+    /// than borrowing [`Self::Session`], so [`StreamableHttpTransport::start_sse`]
+    /// cannot mistake a close for a session-stream reason and clear it.
+    Transport,
 }
 
 impl StreamKind {
@@ -757,6 +809,7 @@ impl StreamKind {
         match self {
             Self::Session => "the GET session stream",
             Self::PostResponse => "this call's own POST response stream",
+            Self::Transport => "this transport",
         }
     }
 }
@@ -800,6 +853,9 @@ impl TerminalReason {
         Error::Transport(match self.kind {
             TerminalKind::InvalidMessage => TransportError::InvalidMessage(message),
             TerminalKind::Request => TransportError::Request(message),
+            // Carries no message: `ConnectionClosed` is a unit variant, and the
+            // fact it states — this transport is closed — needs no elaboration.
+            TerminalKind::Closed => TransportError::ConnectionClosed,
         })
     }
 }
@@ -911,19 +967,36 @@ impl ReaderDelivery {
 /// nobody is currently receiving on, and treating that as a failure would make
 /// the latch write look broken every time it mattered least.
 fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
+    latch_reason(
+        &delivery.terminal,
+        &delivery.terminal_signal,
+        terminal_reason_of(error, delivery.stream),
+    );
+}
+
+/// The write-once latch WRITE, shared by every site that produces a reason.
+///
+/// Two kinds of caller reach it: reader tasks, through
+/// [`latch_terminal_reason`], and the application's own task, through
+/// [`Transport::close`]. One function rather than two spellings of
+/// check-then-write-then-wake, because the write-once rule and the wake ordering
+/// are exactly the kind of pair that drifts when it is written twice.
+fn latch_reason(
+    terminal: &Arc<RwLock<Option<TerminalReason>>>,
+    signal: &watch::Sender<u64>,
+    reason: TerminalReason,
+) {
     {
-        let mut slot = delivery.terminal.write();
+        let mut slot = terminal.write();
         if slot.is_some() {
             return;
         }
-        *slot = Some(terminal_reason_of(error, delivery.stream));
+        *slot = Some(reason);
     }
     // Bumped only on the write that WON, and after the guard is dropped: a woken
     // consumer reads the latch, and waking it while still holding the write lock
     // would hand it a lock it has to wait for.
-    delivery
-        .terminal_signal
-        .send_modify(|generation| *generation += 1);
+    signal.send_modify(|generation| *generation += 1);
 }
 
 /// An RAII count of the POST-response readers currently in flight (Phase 118.2,
@@ -1025,19 +1098,46 @@ impl Drop for PostReaderGuard {
 /// a gone `Receiver` is not a stream diagnosis, and a queued message must still
 /// be delivered ahead of any reason.
 ///
+/// # Two lanes, drained in FIFO order
+///
+/// `overflow` is [`StreamableHttpTransport::caller_overflow`], which
+/// [`StreamableHttpTransport::queue_from_caller`] diverts into when the bounded
+/// queue is full. It is read AFTER `receiver` and BEFORE the in-flight gate, and
+/// both positions are deliberate. After the receiver, because an entry only ever
+/// lands in the overflow lane while the bounded queue was FULL, so every message
+/// already in `receiver` is strictly older — draining overflow first would
+/// reorder them. Before the gate, because an overflowed entry is a MESSAGE, and
+/// the gate exists only to suppress a stale LATCH while an answer is still on the
+/// wire.
+///
 /// Extracted from [`Transport::receive`] so neither it nor this exceeds the
 /// repo's cognitive-complexity budget (CLAUDE.md, cog 25) without an `#[allow]`.
 fn drain_or_latch(
     receiver: &mut mpsc::Receiver<Result<TransportMessage>>,
+    overflow: &RwLock<std::collections::VecDeque<Result<TransportMessage>>>,
     terminal: &Arc<RwLock<Option<TerminalReason>>>,
     open_post_readers: &AtomicUsize,
 ) -> Option<Result<TransportMessage>> {
     match receiver.try_recv() {
         Ok(queued) => return Some(queued),
         Err(mpsc::error::TryRecvError::Disconnected) => {
-            return Some(Err(Error::Transport(TransportError::ConnectionClosed)))
+            // Still hand back anything the caller lane holds: a gone `Receiver`
+            // must not swallow this client's own already-produced answers.
+            return Some(
+                overflow
+                    .write()
+                    .pop_front()
+                    .unwrap_or(Err(Error::Transport(TransportError::ConnectionClosed))),
+            );
         },
         Err(mpsc::error::TryRecvError::Empty) => {},
+    }
+    // The guard is dropped by the end of THIS statement rather than living
+    // across the `if let` body, so a future body that touched the lane again
+    // could not deadlock against itself.
+    let overflowed = overflow.write().pop_front();
+    if let Some(overflowed) = overflowed {
+        return Some(overflowed);
     }
     if open_post_readers.load(Ordering::SeqCst) > 0 {
         return None;
@@ -1071,6 +1171,14 @@ pub struct StreamableHttpTransport {
     receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<TransportMessage>>>>,
     /// Sender for messages. See [`Self::receiver`].
     sender: mpsc::Sender<Result<TransportMessage>>,
+    /// Messages a CALLER task produced while [`Self::receiver`]'s bounded queue
+    /// was full.
+    ///
+    /// Read by [`drain_or_latch`] immediately after the bounded queue, so the two
+    /// lanes are drained in FIFO order. See
+    /// [`Self::queue_from_caller`] for why a caller-task send may not block, may
+    /// not fail, and may not be bounded by D-04's peer-facing capacity.
+    caller_overflow: Arc<RwLock<std::collections::VecDeque<Result<TransportMessage>>>>,
     /// Protocol version negotiated with server
     protocol_version: Arc<RwLock<Option<String>>>,
     /// Whether the CLIENT explicitly selected the v2 (`2026-07-28`) era
@@ -1282,6 +1390,7 @@ impl StreamableHttpTransport {
             terminal_signal: Arc::new(terminal_signal),
             open_post_readers: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(shutdown),
+            caller_overflow: Arc::new(RwLock::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -1402,26 +1511,55 @@ impl StreamableHttpTransport {
     /// capacity: [`crate::Client`]'s `dispatch_request` calls `send()` and only
     /// THEN loops on `receive()`, so a caller-task site that blocked on a full
     /// queue could never be drained by the consumer that is inside it — a
-    /// self-deadlock. Failing loudly with an error naming
-    /// [`CLIENT_RECEIVE_QUEUE_CAPACITY`] satisfies D-04's never-silently-drop
-    /// rule while keeping the send path non-blocking.
+    /// self-deadlock.
     ///
-    /// A closed channel maps to the same [`TransportError::Send`] family the
+    /// # A full queue OVERFLOWS here; it does not fail
+    ///
+    /// Returning `Err` on `Full` was a PERMANENT client wedge, and the code
+    /// review of this phase caught it. `Client::dispatch_request` does
+    /// `transport.send(..).await?` and only reaches its pump loop afterwards, so
+    /// an error raised here returns on the `?` BEFORE anything drains the queue —
+    /// and the queue can only be drained by that pump. Once 64 reader-delivered
+    /// messages were pending, every subsequent call failed identically, forever,
+    /// with no way back. The unbounded channel this replaced could not produce
+    /// that.
+    ///
+    /// So a full queue diverts into [`Self::caller_overflow`] instead.
+    ///
+    /// # Why an unbounded overflow is not a hole in D-04
+    ///
+    /// D-04 bounds what a PEER can make this process retain: reader tasks deliver
+    /// server-pushed frames, and a peer that writes faster than the application
+    /// reads must be backpressured. Nothing about that argument applies here. A
+    /// caller-task send happens once per `Transport::send` the APPLICATION itself
+    /// issued, so its depth is bounded by the application's own in-flight
+    /// concurrency and a peer cannot add a single entry to it. The bounded lane
+    /// still bounds the peer; the overflow lane holds only this client's own
+    /// answers.
+    ///
+    /// A closed channel still maps to the [`TransportError::Send`] family the
     /// unbounded sender's failure mapped to, so a caller matching on the error
     /// family sees no new shape.
     fn queue_from_caller(&self, message: TransportMessage) -> Result<()> {
-        self.sender.try_send(Ok(message)).map_err(|error| {
-            Error::Transport(TransportError::Send(match error {
-                mpsc::error::TrySendError::Full(_) => format!(
-                    "the client receive queue is full at its {CLIENT_RECEIVE_QUEUE_CAPACITY}-message \
-                     capacity (CLIENT_RECEIVE_QUEUE_CAPACITY); the application is not draining \
-                     Transport::receive() fast enough"
-                ),
-                mpsc::error::TrySendError::Closed(_) => {
-                    "the client receive queue is closed".to_string()
-                },
-            }))
-        })
+        let full = match self.sender.try_send(Ok(message)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(message)) => message,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(Error::Transport(TransportError::Send(
+                    "the client receive queue is closed".to_string(),
+                )))
+            },
+        };
+        self.caller_overflow.write().push_back(full);
+        // The wake is load-bearing, not belt-and-braces. The consumer can drain
+        // the last queued message and park in `Transport::receive`'s `select!`
+        // between the `try_send` above and this push, at which point nothing else
+        // would ever tell it that a message is waiting in the overflow lane.
+        // `drain_or_latch` re-reads both lanes on every wakeup, so one bump is
+        // enough.
+        self.terminal_signal
+            .send_modify(|generation| *generation += 1);
+        Ok(())
     }
 
     /// Whether this connection speaks the v2 (`2026-07-28`) wire contract.
@@ -1722,7 +1860,27 @@ impl StreamableHttpTransport {
         //
         // Cleared BEFORE the reader is spawned, so the fresh reader can never
         // race its own new reason against this clear.
-        *self.terminal.write() = None;
+        //
+        // SCOPED to the session stream's own reasons (code review of this phase).
+        // The latch is transport-WIDE but this seam is keyed to ONE stream's
+        // recovery, and an unconditional clear erased reasons it had no claim on:
+        // a streaming `tools/call` that hit a D-05 unparseable frame latches a
+        // `PostResponse` reason, and its caller cannot observe that reason until
+        // the in-flight gate opens — so a concurrent `notifications/initialized`
+        // 202 re-opening the session stream deleted the diagnosis out from under
+        // it and left it on an empty queue with no latch and no live reader,
+        // which is a hang rather than an error. A `Transport` close reason is out
+        // of scope for the same rule, and for the stronger reason that a closed
+        // transport has recovered nothing.
+        {
+            let mut slot = self.terminal.write();
+            if slot
+                .as_ref()
+                .is_some_and(|reason| reason.stream == StreamKind::Session)
+            {
+                *slot = None;
+            }
+        }
 
         // The HTTP response-BODY middleware chain is deliberately NOT run over
         // this stream, exactly as `Self::post_streaming` states for the
@@ -2698,9 +2856,12 @@ impl Transport for StreamableHttpTransport {
         let mut signal = self.terminal_signal.subscribe();
         let mut receiver = self.receiver.lock().await;
         loop {
-            if let Some(outcome) =
-                drain_or_latch(&mut receiver, &self.terminal, &self.open_post_readers)
-            {
+            if let Some(outcome) = drain_or_latch(
+                &mut receiver,
+                &self.caller_overflow,
+                &self.terminal,
+                &self.open_post_readers,
+            ) {
                 return outcome;
             }
             tokio::select! {
@@ -2747,6 +2908,37 @@ impl Transport for StreamableHttpTransport {
         if let Some(handle) = handle {
             handle.abort();
         }
+
+        // LATCH the close, so a later `receive()` cannot park forever (code
+        // review of this phase).
+        //
+        // Setting `shutdown` and aborting the session reader stops the readers,
+        // but it leaves nothing for a consumer to observe: this transport holds
+        // its own `sender` clone, so `receiver.recv()` never resolves to `None`;
+        // the readers exit through `SseFrameStop::Shutdown`, which latches
+        // nothing on purpose (an intentional close is not a stream failure); and
+        // `drain_or_latch` therefore saw Empty, no overflow, no latch, and
+        // answered "keep waiting" about a transport that will never speak again.
+        // `Client::pump_once` degenerated into a 250 ms-slice poll re-acquiring
+        // the transport write lock four times a second, forever.
+        //
+        // Latched rather than dropped: the queue must still be DRAINED first —
+        // `drain_or_latch` reads both message lanes before the latch — so
+        // messages that arrived before the close are still delivered, and only
+        // then does `receive()` answer `ConnectionClosed`.
+        //
+        // Write-once, so a real stream diagnosis raised BEFORE the close still
+        // wins: that reason is the causal one, and "the application closed it" is
+        // the less informative answer of the two.
+        latch_reason(
+            &self.terminal,
+            &self.terminal_signal,
+            TerminalReason {
+                kind: TerminalKind::Closed,
+                message: "closed by the application".to_string(),
+                stream: StreamKind::Transport,
+            },
+        );
 
         // Optionally send a DELETE request to terminate the session.
         //
@@ -2879,13 +3071,13 @@ enum SseBodyEnd {
     /// end-of-body (`cause: None`) or a transport failure mid-body
     /// (`cause: Some`).
     ///
-    /// `delivered` records whether this body produced at least one event, which
-    /// is what lets a long-lived stream that blinks again earn a FRESH reconnect
-    /// budget rather than inheriting a spent one. `retry` is the last
-    /// server-provided SSE `retry:` value seen on it.
+    /// `retry` is the last server-provided SSE `retry:` value seen on this body.
+    ///
+    /// It carries no delivery flag: the reconnect budget is earned by UPTIME
+    /// alone, because an idle-but-healthy stream delivers no events at all (see
+    /// [`budget_reset_earned`]).
     Dropped {
         cause: Option<Error>,
-        delivered: bool,
         retry: Option<Duration>,
     },
     /// The stream ended for a reason that is not a drop: a D-02 overflow, a D-05
@@ -2995,13 +3187,10 @@ fn end_of_frame_stop(
     }
 }
 
-/// What one body has produced so far, for the two facts the reconnect loop
-/// needs from a stream that then dropped.
+/// What one body has produced so far, for the fact the reconnect loop needs
+/// from a stream that then dropped.
 #[derive(Default)]
 struct SseProgress {
-    /// At least one event was delivered, so a re-opened stream that WORKED
-    /// earns a fresh reconnect budget.
-    delivered: bool,
     /// The last server-provided SSE `retry:` value, which
     /// [`next_reconnect_delay`] lets win over the computed backoff.
     retry: Option<Duration>,
@@ -3013,7 +3202,6 @@ impl SseProgress {
     fn dropped(&self, cause: Option<Error>) -> SseBodyEnd {
         SseBodyEnd::Dropped {
             cause,
-            delivered: self.delivered,
             retry: self.retry,
         }
     }
@@ -3044,7 +3232,6 @@ async fn drain_pending_events(
         if !deliver_sse_event(delivery, last_event_id, on_resumption, event, cursor).await {
             return false;
         }
-        progress.delivered = true;
     }
     true
 }
@@ -3573,7 +3760,9 @@ impl SseReaderContext {
         // The condition used to be a bare `delivered`, and that was CR-01: a peer
         // writing ONE frame per body refunded the whole budget on every
         // iteration, so no value of MAX_SSE_RECONNECT_ATTEMPTS bounded the loop.
-        // Uptime is what distinguishes a working stream from a one-frame bounce.
+        // Uptime is what distinguishes a working stream from a one-frame bounce —
+        // and it is the WHOLE condition, because an idle-but-healthy stream
+        // delivers no events either. See `budget_reset_earned`.
         let mut attempt: u32 = 0;
         // THIS STREAM's resumption cursor (WR-02), a LOCAL rather than a field on
         // `Self`: on a `full-v2` build a field would be written by the reader and
@@ -3600,15 +3789,10 @@ impl SseReaderContext {
             )
             .await;
 
-            let SseBodyEnd::Dropped {
-                cause,
-                delivered,
-                retry,
-            } = end
-            else {
+            let SseBodyEnd::Dropped { cause, retry } = end else {
                 return;
             };
-            if budget_reset_earned(delivered, opened_at.elapsed()) {
+            if budget_reset_earned(opened_at.elapsed()) {
                 attempt = 0;
             }
 
@@ -5144,43 +5328,54 @@ mod tests {
             }
         }
 
+        /// THE idle-stream claim, and the reason the `delivered` conjunct is
+        /// gone.
+        ///
+        /// An idle MCP session emits only SSE keep-alive comments, which
+        /// `SseParser::process_line` discards at its `line.starts_with(':')`
+        /// arm — so a perfectly healthy stream can stay up for hours having
+        /// "delivered" nothing. Under the old conjunct that stream spent one
+        /// budget unit per proxy blink and, after [`MAX_SSE_RECONNECT_ATTEMPTS`] of
+        /// them, latched `reconnect_budget_exhausted` for the life of the
+        /// process. Uptime must be sufficient on its own.
         #[test]
-        fn a_body_that_delivered_nothing_never_earns_a_fresh_budget() {
+        fn a_quiet_stream_that_stayed_up_earns_a_fresh_budget() {
             assert!(
-                !budget_reset_earned(false, RECONNECT_BUDGET_RESET_UPTIME),
-                "uptime alone is not delivery: a stream that stayed up delivering nothing is a \
-                 stream that is not working"
+                budget_reset_earned(RECONNECT_BUDGET_RESET_UPTIME),
+                "a stream that stayed up past the threshold having emitted only keep-alive \
+                 comments is a WORKING stream: nothing else distinguishes an idle MCP session \
+                 from a dead one, and refusing it here kills the session stream permanently"
             );
             assert!(
-                !budget_reset_earned(false, Duration::MAX),
-                "and no amount of uptime changes that"
+                budget_reset_earned(Duration::MAX),
+                "and more uptime cannot make it less true"
             );
         }
 
         #[test]
-        fn a_one_frame_bounce_never_earns_a_fresh_budget() {
+        fn a_short_bounce_never_earns_a_fresh_budget() {
             assert!(
-                !budget_reset_earned(true, Duration::ZERO),
-                "this is the CR-01 shape exactly: one frame, then the body ends. Refunding here \
+                !budget_reset_earned(Duration::ZERO),
+                "this is the CR-01 shape exactly: a body that ends immediately. Refunding here \
                  makes the reconnect loop unbounded for any budget value"
             );
             assert!(
                 !budget_reset_earned(
-                    true,
                     RECONNECT_BUDGET_RESET_UPTIME.saturating_sub(Duration::from_millis(1))
                 ),
-                "one millisecond under the threshold is still a bounce"
+                "one millisecond under the threshold is still a bounce — which is what keeps \
+                 T-118.2-04-01's keeps-closing peer bounded at MAX_SSE_RECONNECT_ATTEMPTS"
             );
         }
 
         #[test]
-        fn a_stream_that_stayed_up_and_delivered_earns_a_fresh_budget() {
+        fn a_stream_that_stayed_up_earns_a_fresh_budget() {
             assert!(
-                budget_reset_earned(true, RECONNECT_BUDGET_RESET_UPTIME),
+                budget_reset_earned(RECONNECT_BUDGET_RESET_UPTIME),
                 "the threshold is inclusive"
             );
             assert!(
-                budget_reset_earned(true, RECONNECT_BUDGET_RESET_UPTIME * 120),
+                budget_reset_earned(RECONNECT_BUDGET_RESET_UPTIME * 120),
                 "a stream that worked for an hour and then blinked must not inherit a spent \
                  budget — that is the case D-03 exists for"
             );
@@ -5381,6 +5576,266 @@ mod tests {
     mod latch_gate {
         use super::*;
 
+        /// An EMPTY caller-overflow lane.
+        ///
+        /// These arms exercise the BOUNDED queue, the in-flight gate and the
+        /// latch; the overflow lane has its own arms below. A fresh empty lane
+        /// per call keeps each arm independent.
+        fn no_overflow() -> RwLock<std::collections::VecDeque<Result<TransportMessage>>> {
+            RwLock::new(std::collections::VecDeque::new())
+        }
+
+        /// A transport pointed at a URL nothing listens on.
+        ///
+        /// Every arm below drives the RECEIVE side — the queue, the overflow
+        /// lane, the latch — and none of them issues a request, so the address
+        /// is never dialled.
+        fn offline_transport() -> StreamableHttpTransport {
+            StreamableHttpTransport::new(
+                StreamableHttpTransportConfigBuilder::new(
+                    url::Url::parse("http://127.0.0.1:1/mcp").expect("the fixture URL parses"),
+                )
+                .build(),
+            )
+        }
+
+        /// [`CLIENT_RECEIVE_QUEUE_CAPACITY`] as a tag range.
+        ///
+        /// `i64` rather than a cast at each use: the capacity is a small
+        /// compile-time constant, so the conversion is infallible here and saying
+        /// so once beats three `as` casts clippy is right to flag.
+        fn queue_capacity_tags() -> i64 {
+            i64::try_from(CLIENT_RECEIVE_QUEUE_CAPACITY)
+                .expect("the queue capacity is a small constant")
+        }
+
+        /// A message carrying `n` as its id, so an arm can assert WHICH message
+        /// came back and in what order.
+        fn tagged(n: i64) -> TransportMessage {
+            TransportMessage::Response(crate::types::JSONRPCResponse {
+                jsonrpc: "2.0".to_string(),
+                id: crate::types::RequestId::Number(n),
+                payload: crate::types::jsonrpc::ResponsePayload::Result(serde_json::Value::Null),
+            })
+        }
+
+        /// `receive()` under a bound.
+        ///
+        /// Every arm below asserts that a `receive()` RESOLVES; the defect each
+        /// of them fences is a `receive()` that parks forever. Without the bound
+        /// a regression would HANG the suite instead of failing it, which reads
+        /// as an infrastructure problem rather than as the defect it is.
+        async fn receive_within(
+            transport: &mut StreamableHttpTransport,
+        ) -> Result<TransportMessage> {
+            tokio::time::timeout(Duration::from_secs(5), transport.receive())
+                .await
+                .expect("receive() must resolve — parking here IS the defect this arm fences")
+        }
+
+        /// Read back the tag [`tagged`] wrote.
+        fn tag_of(message: &TransportMessage) -> i64 {
+            match message {
+                TransportMessage::Response(response) => match &response.id {
+                    crate::types::RequestId::Number(n) => *n,
+                    other @ crate::types::RequestId::String(_) => {
+                        panic!("the fixture only mints numeric ids, got {other:?}")
+                    },
+                },
+                other => panic!("the fixture only mints responses, got {other:?}"),
+            }
+        }
+
+        /// THE wedge claim (code review of this phase).
+        ///
+        /// `queue_from_caller` used to return `Err` once the bounded queue was
+        /// full. `Client::dispatch_request` does `transport.send(..).await?` and
+        /// only THEN pumps, so that error returned on the `?` before anything
+        /// could drain the queue — and the queue's only drain IS that pump. The
+        /// client was wedged permanently: every later call failed identically.
+        ///
+        /// So: fill the queue to capacity, then assert the next caller-task send
+        /// still succeeds.
+        #[tokio::test]
+        async fn a_full_queue_diverts_a_caller_send_instead_of_failing() {
+            let transport = offline_transport();
+            for tag in 0..queue_capacity_tags() {
+                transport
+                    .queue_from_caller(tagged(tag))
+                    .expect("the bounded queue accepts up to its capacity");
+            }
+            assert!(
+                transport.sender.try_send(Ok(tagged(-1))).is_err(),
+                "the bounded queue must actually be FULL, or this arm proves nothing"
+            );
+
+            transport.queue_from_caller(tagged(-2)).expect(
+                "a caller-task send must NEVER fail on a full queue: the only consumer that could \
+                 drain it is the caller itself, which never reaches its pump if this returns Err",
+            );
+            assert_eq!(
+                transport.caller_overflow.read().len(),
+                1,
+                "the diverted message must be RETAINED, not dropped — D-04's never-silently-drop \
+                 rule applies to the overflow lane too"
+            );
+        }
+
+        /// The two lanes drain in FIFO order: everything already in the bounded
+        /// queue is older than anything that overflowed, because a message only
+        /// reaches the overflow lane while the bounded queue is full.
+        #[tokio::test]
+        async fn the_overflow_lane_is_drained_after_the_bounded_queue() {
+            let mut transport = offline_transport();
+            for tag in 0..queue_capacity_tags() {
+                transport
+                    .queue_from_caller(tagged(tag))
+                    .expect("fills the bounded queue");
+            }
+            transport
+                .queue_from_caller(tagged(9999))
+                .expect("diverts to the overflow lane");
+
+            for tag in 0..queue_capacity_tags() {
+                assert_eq!(
+                    tag_of(
+                        &receive_within(&mut transport)
+                            .await
+                            .expect("a queued message")
+                    ),
+                    tag,
+                    "the bounded queue must drain in order, and drain FIRST"
+                );
+            }
+            assert_eq!(
+                tag_of(
+                    &receive_within(&mut transport)
+                        .await
+                        .expect("the overflowed message")
+                ),
+                9999,
+                "and the overflow lane follows it, preserving global FIFO"
+            );
+        }
+
+        /// THE close claim (code review of this phase).
+        ///
+        /// `close()` sets the shutdown flag and aborts the session reader, but
+        /// the transport holds its own `sender` clone, so `receiver.recv()` never
+        /// resolves; the readers exit through `SseFrameStop::Shutdown`, which
+        /// latches nothing on purpose. With no latch, `receive()` parked forever
+        /// and `Client::pump_once` became an unbounded 4 Hz poll on a closed
+        /// transport.
+        #[tokio::test]
+        async fn receive_after_close_reports_connection_closed_rather_than_parking() {
+            let mut transport = offline_transport();
+            transport.close().await.expect("close on an idle transport");
+
+            let error = receive_within(&mut transport)
+                .await
+                .expect_err("a closed transport must not hand back a message");
+            assert!(
+                matches!(error, Error::Transport(TransportError::ConnectionClosed)),
+                "a close is not a stream failure and must not be reported as one; got {error:?}"
+            );
+        }
+
+        /// A close does not swallow what already arrived: `drain_or_latch` reads
+        /// both message lanes before it reads the latch.
+        #[tokio::test]
+        async fn a_close_still_delivers_messages_that_arrived_before_it() {
+            let mut transport = offline_transport();
+            transport
+                .queue_from_caller(tagged(7))
+                .expect("the queue is empty");
+            transport.close().await.expect("close");
+
+            assert_eq!(
+                tag_of(
+                    &receive_within(&mut transport)
+                        .await
+                        .expect("the pre-close message")
+                ),
+                7,
+                "a queued message must be delivered ahead of any reason, close included"
+            );
+            assert!(
+                matches!(
+                    receive_within(&mut transport).await,
+                    Err(Error::Transport(TransportError::ConnectionClosed))
+                ),
+                "and only then does the close surface"
+            );
+        }
+
+        /// A real stream diagnosis raised BEFORE a close still wins: it is the
+        /// causal reason, and "the application closed it" is the less
+        /// informative of the two.
+        #[tokio::test]
+        async fn a_close_does_not_overwrite_an_earlier_stream_reason() {
+            let mut transport = offline_transport();
+            let (delivery, _receiver) = delivery_for(StreamKind::Session, &transport.terminal);
+            latch_terminal_reason(
+                &delivery,
+                &Error::Transport(TransportError::InvalidMessage(
+                    "a corrupt frame".to_string(),
+                )),
+            );
+            transport.close().await.expect("close");
+
+            let error = receive_within(&mut transport)
+                .await
+                .expect_err("the latch surfaces");
+            assert!(
+                matches!(error, Error::Transport(TransportError::InvalidMessage(_))),
+                "the FIRST reason is the causal one and must survive a later close; got {error:?}"
+            );
+        }
+
+        /// THE reset-seam scope claim (code review of this phase).
+        ///
+        /// `start_sse`'s successful re-open used to clear the latch
+        /// unconditionally. The latch is transport-WIDE, so that erased a
+        /// `PostResponse` reason no caller had observed yet — leaving that caller
+        /// on an empty queue with no latch and no live reader, which is a hang
+        /// rather than an error.
+        ///
+        /// Driven through the predicate `start_sse` applies rather than through
+        /// `start_sse` itself, which needs a live server. All three kinds run in
+        /// one loop so the pair cannot be satisfied by never clearing at all.
+        #[test]
+        fn the_reset_seam_leaves_another_streams_reason_alone() {
+            for (stream, cleared) in [
+                (StreamKind::Session, true),
+                (StreamKind::PostResponse, false),
+                (StreamKind::Transport, false),
+            ] {
+                let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
+                let (delivery, _receiver) = delivery_for(stream, &terminal);
+                latch_terminal_reason(
+                    &delivery,
+                    &Error::Transport(TransportError::Request("a reason".to_string())),
+                );
+
+                {
+                    let mut slot = terminal.write();
+                    if slot
+                        .as_ref()
+                        .is_some_and(|reason| reason.stream == StreamKind::Session)
+                    {
+                        *slot = None;
+                    }
+                }
+
+                assert_eq!(
+                    terminal.read().is_none(),
+                    cleared,
+                    "a re-opened SESSION stream forgives its OWN reason and nothing else; \
+                     {stream:?} was handled wrongly"
+                );
+            }
+        }
+
         /// A delivery bundle whose queue, latch and wake signal the caller
         /// keeps, so an arm can drive `drain_or_latch` against exactly the
         /// state it set up.
@@ -5440,7 +5895,8 @@ mod tests {
 
             // ZERO in flight: nobody is waiting on an answer, so the reason is
             // the truest thing this transport can say.
-            let at_zero = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            let at_zero =
+                drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers);
             assert!(
                 matches!(at_zero, Some(Err(_))),
                 "with an empty queue, a set latch and NO reader in flight, the latched reason \
@@ -5454,7 +5910,8 @@ mod tests {
                 1,
                 "the guard must count itself the moment it is acquired, synchronously"
             );
-            let at_one = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            let at_one =
+                drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers);
             assert!(
                 at_one.is_none(),
                 "with a POST-response reader still live, `drain_or_latch` must answer None and \
@@ -5465,7 +5922,8 @@ mod tests {
             // And back: the gate opens again once the reader is done, so a
             // genuinely dead session stream is never traded for a silent hang.
             drop(guard);
-            let after = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            let after =
+                drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers);
             assert!(
                 matches!(after, Some(Err(_))),
                 "once the last reader is gone the latch must be surfaced again, or the gate has \
@@ -5493,7 +5951,8 @@ mod tests {
                 )))
                 .expect("the bounded queue has capacity for one message");
 
-            let drained = drain_or_latch(&mut receiver, &terminal, &open_post_readers);
+            let drained =
+                drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers);
             assert!(
                 matches!(drained, Some(Ok(_))),
                 "the queue is drained before the latch is consulted; a message that arrived \
@@ -5637,7 +6096,8 @@ mod tests {
                 "clearing an already-clear latch must be a no-op"
             );
             assert!(
-                drain_or_latch(&mut receiver, &terminal, &open_post_readers).is_none(),
+                drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers)
+                    .is_none(),
                 "a recovered transport with an empty queue and nothing in flight must WAIT, not \
                  answer the stale reason"
             );
@@ -5725,7 +6185,8 @@ mod tests {
                 let _guard = PostReaderGuard::acquire(&open_post_readers, &wake);
                 latch_terminal_reason(&delivery, &budget_reason());
                 assert!(
-                    drain_or_latch(&mut receiver, &terminal, &open_post_readers).is_none(),
+                    drain_or_latch(&mut receiver, &no_overflow(), &terminal, &open_post_readers)
+                        .is_none(),
                     "a {stream:?} reason must not pre-empt a caller whose own POST-response \
                      stream is still live"
                 );

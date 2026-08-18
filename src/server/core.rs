@@ -4695,6 +4695,24 @@ pub(crate) fn attach_request_peer(
 /// `None`, which the emitter already treats as silence rather than as an error
 /// (Phase 118.2 D-08).
 ///
+/// # On v2, an ABSENT level is a prohibition (SEP-2575)
+///
+/// The 2026-07-28 client authorizes logging per request through
+/// `params._meta["io.modelcontextprotocol/logLevel"]`, and the schema is
+/// explicit: *"If absent, the server MUST NOT send any notifications/message"*.
+/// `None` therefore means two different things on the two eras — on v1 it is "the
+/// client did not choose, so the server MAY decide", which is what
+/// [`DEFAULT_LOG_LEVEL`](crate::server::cancellation::DEFAULT_LOG_LEVEL) (`info`,
+/// D-12) implements, and on v2 it is "do not log".
+///
+/// Expressed by withholding the SINK rather than by inventing a third level
+/// value. The emitter already treats a sinkless `extra` as silence (D-08), so
+/// this needs no new state on `RequestHandlerExtra`, no tri-state on
+/// `ProtocolContext::resolved_log_level`, and no change to the emitter — and it
+/// is fail-closed: a handler that logs anyway emits nothing, rather than relying
+/// on every handler to check a flag. `examples/s54_v2_dual_conformance.rs`
+/// carried exactly such a per-handler guard while this gap was open; it is gone.
+///
 /// # Why the LEVEL is applied here too
 ///
 /// The sink and the level are two halves of ONE per-request decision. Attaching
@@ -4743,6 +4761,14 @@ pub(crate) fn attach_request_log_sink(
         .protocol_context
         .as_ref()
         .and_then(crate::types::protocol::ProtocolContext::resolved_log_level);
+    // SEP-2575: on v2, absence is a prohibition rather than a non-answer. See
+    // this function's rustdoc for why the sink is withheld instead of a third
+    // level value being invented.
+    let v2_logging_unauthorized = resolved_level.is_none()
+        && extra
+            .protocol_context
+            .as_ref()
+            .is_some_and(|context| context.era == crate::types::protocol::Era::V2);
 
     let extra = match resolved_level {
         Some(level) => extra.with_log_level(level),
@@ -4751,6 +4777,12 @@ pub(crate) fn attach_request_log_sink(
         None => extra,
     };
 
+    if v2_logging_unauthorized {
+        // No sink at all, so `extra.log(..)` is silent by construction. Returned
+        // BEFORE both precedence arms, so neither the request-scoped sink nor the
+        // root fallback can reintroduce a vehicle the client did not authorize.
+        return extra;
+    }
     if let Some(sink) = request_scoped {
         return extra.with_log_sink(sink);
     }
@@ -9777,6 +9809,101 @@ mod core_log_sink_tests {
         bare_context().with_transport_backchannel(
             TransportBackchannel::new().with_notification_sink(capture.sink()),
         )
+    }
+
+    /// A 2026-07-28 context carrying a live back-channel — the shape SEP-2575
+    /// governs.
+    fn v2_context_with_sink(capture: &Capture) -> ProtocolContext {
+        ProtocolContext::new(
+            Era::V2,
+            ProtocolVersion(crate::types::protocol::PROTOCOL_VERSION_2026_07_28.to_string()),
+        )
+        .with_transport_backchannel(
+            TransportBackchannel::new().with_notification_sink(capture.sink()),
+        )
+    }
+
+    /// THE SEP-2575 claim: on v2, an ABSENT `_meta` log level is a PROHIBITION.
+    ///
+    /// The vendored schema is explicit — "If absent, the server MUST NOT send any
+    /// notifications/message" — and the conformance scenario
+    /// `sep-2575-server-no-log-without-loglevel` reds the server on a single
+    /// frame. Before this rule, `resolve_request_log_level` answered `None`, the
+    /// emitter fell back to `DEFAULT_LOG_LEVEL` (`info`, D-12) and emitted, so
+    /// every pmcp server violated it; the only thing standing between the suite
+    /// and a red was a hand-written `if extra.log_level.is_some()` guard inside
+    /// one example's handler.
+    #[test]
+    fn a_v2_request_with_no_resolved_level_gets_no_log_sink_at_all() {
+        let capture = Capture::default();
+        let extra = attach_request_log_sink(
+            extra_with_context(Some(v2_context_with_sink(&capture))),
+            || None,
+        );
+
+        assert!(
+            extra.log_sink.is_none(),
+            "a v2 request that carried no `io.modelcontextprotocol/logLevel` must be given NO \
+             vehicle: withholding the sink is what makes the rule hold for every handler rather \
+             than only the ones that remember to check"
+        );
+        extra
+            .log(LoggingLevel::Error, "this must not reach the wire")
+            .expect("a sinkless emit is silence, not an error (D-08)");
+        assert_eq!(
+            capture.len(),
+            0,
+            "not one `notifications/message` frame — the scenario fails the server on the first"
+        );
+    }
+
+    /// The mirror: a v2 request that DID authorize logging still gets its sink,
+    /// so the rule is a gate and not a blanket refusal.
+    #[test]
+    fn a_v2_request_that_authorized_logging_still_gets_its_sink() {
+        let capture = Capture::default();
+        let context = v2_context_with_sink(&capture).with_resolved_log_level(LoggingLevel::Debug);
+        let extra = attach_request_log_sink(extra_with_context(Some(context)), || None);
+
+        assert_eq!(
+            extra.log_level,
+            Some(LoggingLevel::Debug),
+            "the authorized level still reaches the emitter"
+        );
+        extra
+            .log(LoggingLevel::Debug, "authorized")
+            .expect("the emitter always returns Ok");
+        assert_eq!(
+            capture.len(),
+            1,
+            "and the record is delivered — v2 logging is GATED, not disabled"
+        );
+    }
+
+    /// v1 is untouched: there, `None` means "the client did not choose, so the
+    /// server MAY decide", which is exactly what `DEFAULT_LOG_LEVEL` implements.
+    /// Reading the two eras the same way is what the fix would break if it were
+    /// applied unconditionally.
+    #[test]
+    fn a_v1_request_with_no_resolved_level_still_logs_at_the_default() {
+        let capture = Capture::default();
+        let extra = attach_request_log_sink(
+            extra_with_context(Some(context_with_sink(&capture))),
+            || None,
+        );
+
+        assert!(
+            extra.log_sink.is_some(),
+            "v1 absence is a non-answer, not a prohibition"
+        );
+        extra
+            .log(LoggingLevel::Info, "info is at the default bar")
+            .expect("the emitter always returns Ok");
+        assert_eq!(
+            capture.len(),
+            1,
+            "MCP 2025-11-25 says the server MAY decide which messages to send automatically"
+        );
     }
 
     fn extra_with_context(
