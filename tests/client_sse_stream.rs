@@ -236,6 +236,41 @@ const MISMATCH_BOUND: Duration = Duration::from_secs(2);
 /// "this frame was addressed to nobody" rather than as an off-by-one.
 const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
 
+/// How long fence 23 gives a SECOND operation on the same client to complete
+/// while a mis-addressed frame is being discarded (plan 20, BLOCKER 2 half A).
+///
+/// # Deliberately BELOW the discard ceiling, and that is the whole design
+///
+/// `src/client/mod.rs`'s `MISMATCH_DISCARD_TIMEOUT` is 10 s. This bound is 5 s,
+/// so a pass CANNOT be manufactured by the ceiling firing, returning the call
+/// and releasing the transport write lock as a side effect. The fence's subject
+/// is the lock being released *during* the discard — once per
+/// `MISMATCH_RECEIVE_SLICE` (250 ms) — not at the end of it. If this constant
+/// were ever raised above the ceiling the fence would silently stop measuring
+/// half A and start measuring half B, which fence 24 already owns.
+///
+/// Pre-fix the second operation NEVER returns: the guard is held across an
+/// unbounded `receive().await` and re-taken on every `continue`. So CI load
+/// makes this fence safer rather than flakier — a slow machine cannot turn a
+/// wedged client into a pass, only a passing one into a longer wait, and 5 s is
+/// twenty slices of headroom over the one slice the probe must outlast.
+const LOCK_PROBE_BOUND: Duration = Duration::from_secs(5);
+
+/// The outer cancellation ceiling on fence 24's call (plan 20, BLOCKER 2 half B).
+///
+/// # Deliberately ABOVE the discard ceiling, for the opposite reason
+///
+/// Post-fix the call fails at `MISMATCH_DISCARD_TIMEOUT` (10 s), so this bound
+/// exists only so a REGRESSION that restores the unbounded wait fails the run
+/// instead of hanging CI forever. Elapsing here is the RED signal, never the
+/// pass condition — which is exactly the inversion fence 17 could not make,
+/// because before this plan there was no ceiling for a fence to be above.
+///
+/// Twice the ceiling: enough headroom that a loaded machine finishing its 10 s
+/// wait late still returns well inside it, and short enough that a genuinely
+/// unbounded wait is reported in twenty seconds rather than never.
+const MISMATCH_TIMEOUT_BOUND: Duration = Duration::from_secs(20);
+
 /// How long fence 22 waits for a `receive()` that must NOT answer (plan 19,
 /// BLOCKER 1).
 ///
@@ -613,6 +648,18 @@ impl RecordingServer {
 
     fn frames_written(&self) -> usize {
         self.shared.frames_written.load(Ordering::SeqCst)
+    }
+
+    /// How many call answers this harness has WRITTEN (plan 20, BLOCKER 2).
+    ///
+    /// Distinct from [`calls_observed`], which counts `tools/call` POST bodies
+    /// that ARRIVED. Fence 23 needs the stronger fact: the mis-addressed answer
+    /// must already be on its way back, because only then has the client's
+    /// receive loop had something to pop, mismatch on, and start discarding. A
+    /// probe that contended for the transport write lock before anybody had
+    /// taken it would pass against any tree at all.
+    fn answers_written(&self) -> usize {
+        self.shared.calls_answered.load(Ordering::SeqCst)
     }
 
     /// A sender the test can hand to its own producer task.
@@ -2295,11 +2342,26 @@ async fn a_response_whose_id_does_not_match_is_not_returned_as_this_calls_answer
              (T-118.2-15-01). Returned result: {:?}",
             text_of(&result)
         ),
-        // An error is not this call's answer either, so it does not falsify the
-        // fence's subject. It is a DIFFERENT outcome from the intended one, and
-        // is accepted rather than asserted on so that this fence stays about
-        // correlation alone.
-        Ok(Err(_not_an_answer)) => {},
+        // WR-05, closed by plan 20. This arm used to accept the WHOLE error
+        // space on the reasoning that "an error is not this call's answer
+        // either". True, but not sufficient: a regression that fails the call
+        // early — for any reason at all, before the receive loop ever pops a
+        // frame — kept this fence green while the correlation branch never
+        // executed. A fence that passes when its subject never runs measures
+        // nothing.
+        //
+        // At MISMATCH_BOUND (2 s) the intended outcome is STILL WAITING, and it
+        // stays that way after plan 20: the discard ceiling
+        // (MISMATCH_DISCARD_TIMEOUT, 10 s) is five times this bound, so the
+        // bounded failure fence 24 owns cannot reach this arm either.
+        Ok(Err(not_an_answer)) => panic!(
+            "call_tool returned an ERROR at {MISMATCH_BOUND:?}, where this fence's subject \
+             requires it to be STILL WAITING — the mis-addressed frame discarded and the \
+             correlation branch holding for the response that carries this call's own id. Any \
+             error here means the receive loop was left before the correlation decision was \
+             reached, so accepting it would keep this fence green on a tree where the branch it \
+             exists to pin never ran (WR-05). Got: {not_an_answer}"
+        ),
     }
 
     assert_eq!(
@@ -2831,6 +2893,225 @@ async fn a_reopened_session_stream_clears_the_terminal_latch() {
             );
         },
     }
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 23 — BLOCKER 2, half A: a mis-addressed frame must not wedge every
+// OTHER operation on the same client.
+//
+// The defect is a STATEMENT SHAPE, not a logic error:
+//
+//     let response_message = self.transport.write().await.receive().await?;
+//
+// The `RwLockWriteGuard` temporary lives to the end of the `let` STATEMENT, so
+// it is held across `.receive().await`. The correlation branch `continue`s
+// rather than returning, so the guard is re-taken and re-held on every
+// mis-addressed frame — and `send_notification`, `call_tool` and `close` all
+// need that same lock. One frame with a re-typed id therefore takes the whole
+// client down: no error, no log after the first `warn!`, no recovery.
+//
+// This fence's subject is the LOCK, and it deliberately says nothing about the
+// call's return value — that is fence 24's subject. One fence cannot stand for
+// both: a fence that watched the call would pass on a tree that released the
+// lock only by failing the call, and a fence that watched only the failure would
+// pass on a tree that still serialised every other caller behind it.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_mismatched_frame_does_not_block_another_operation_on_the_same_client() {
+    /// Which `select!` arm finished first. Named rather than a bool so the
+    /// failure message can say what actually happened.
+    enum Arm {
+        /// The `tools/call` returned — this fence is then measuring nothing,
+        /// because there is no discard in flight to contend with.
+        Call,
+        /// The second operation completed while the discard was running.
+        Probe(pmcp::Result<()>),
+    }
+
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_the_next_call_with_a_mismatched_id();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so nothing here can be blamed on a terminal \
+         reason. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = timeout(LOCK_PROBE_BOUND, async {
+        tokio::select! {
+            _called = client.call_tool("fence-23".to_string(), json!({})) => Arm::Call,
+            probed = async {
+                // Wait for the mis-addressed answer to have been WRITTEN, not
+                // merely for the POST to have arrived. Only then has the client
+                // had a frame to pop, mismatch on and begin discarding — so only
+                // then is there a held lock to contend for.
+                assert!(
+                    wait_for(|| server.answers_written() >= 1).await,
+                    "the harness must have written the mis-addressed answer, or this fence would \
+                     be probing a lock nobody has taken. Observed POST bodies: {:?}",
+                    server.post_bodies()
+                );
+                // An observation window, not a synchronisation device: it proves
+                // the client has had time to pop the frame and settle into the
+                // discard loop, so a pass cannot come from probing before the
+                // loop ever started.
+                tokio::time::sleep(QUIET).await;
+                client
+                    .cancel_request(&RequestId::from("fence-23-probe"))
+                    .await
+            } => Arm::Probe(probed),
+        }
+    })
+    .await;
+
+    let Ok(finished) = outcome else {
+        panic!(
+            "a SECOND operation on the same client never completed in {LOCK_PROBE_BOUND:?} while \
+             a mis-addressed response frame was being discarded. The transport write guard is \
+             held across an unbounded `receive().await` and re-taken on every discard, so every \
+             other `send`, `call_tool` and `close` on this client is serialised behind a wait \
+             that never ends — one frame from a hostile or merely lenient peer takes the whole \
+             client down (T-118.2-20-01). Observed POST bodies at the elapse: {:?}",
+            server.post_bodies()
+        )
+    };
+    match finished {
+        Arm::Call => panic!(
+            "the `tools/call` returned after {:?}, before the probe ran. This fence's subject is \
+             the lock being released DURING the discard, so a run in which the discard was no \
+             longer in flight measures nothing. LOCK_PROBE_BOUND ({LOCK_PROBE_BOUND:?}) must stay \
+             below the client's discard ceiling for that reason. Observed POST bodies: {:?}",
+            started.elapsed(),
+            server.post_bodies()
+        ),
+        Arm::Probe(result) => {
+            result.expect("the second operation reached the wire and was answered 202");
+        },
+    }
+
+    // Vacuity guards. Both are needed: the call must have been sent (or there
+    // was no discard), and the probe must have reached the WIRE (or "the second
+    // operation completed" is a statement about a no-op).
+    assert_eq!(
+        calls_observed(&server),
+        1,
+        "the `tools/call` must actually have been sent, or there is no discard for the probe to \
+         contend with. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
+    let cancelled_frames = server
+        .post_bodies()
+        .iter()
+        .filter(|body| {
+            body.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        })
+        .count();
+    assert_eq!(
+        cancelled_frames,
+        1,
+        "the probe's notification must be observable on the wire — a fence concluding 'the second \
+         operation completed' about an operation that never left the process would pass against \
+         any tree. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 24 — BLOCKER 2, half B: the discard wait has a REAL ceiling.
+//
+// `118.2-15`'s in-code comment and its ledger entry both booked the discard cost
+// as "bounded by that request's own timeout". It is not:
+// `src/client/mod.rs` contains ZERO occurrences of `tokio::time::timeout`, and
+// `RequestOptions::timeout` is never read by `dispatch_request`. A caller who
+// sets it gets no protection from it. The wait was unbounded, and the record
+// said otherwise — which is worse than the defect, because a reader trusting the
+// record treats a live risk as already mitigated (T-118.2-20-04).
+//
+// This fence issues NO second operation. Its subject is the call's own return
+// within a bound; fence 23 owns the lock.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_mismatched_frame_fails_this_call_within_a_bound_instead_of_waiting_forever() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_the_next_call_with_a_mismatched_id();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so nothing here can be blamed on a terminal \
+         reason. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = timeout(
+        MISMATCH_TIMEOUT_BOUND,
+        client.call_tool("fence-24".to_string(), json!({})),
+    )
+    .await;
+
+    let Ok(returned) = outcome else {
+        panic!(
+            "the call was still waiting at {MISMATCH_TIMEOUT_BOUND:?}. The discard wait has no \
+             ceiling at all: `dispatch_request` never applies `tokio::time::timeout`, and the \
+             public `RequestOptions::timeout` field it was booked against is never read by \
+             `Client`. A single mis-addressed frame therefore parks the caller forever \
+             (T-118.2-20-02). Observed POST bodies: {:?}",
+            server.post_bodies()
+        )
+    };
+    match returned {
+        Ok(result) => panic!(
+            "the client returned a server response addressed to {MISMATCHED_CALL_ID:?} as the \
+             answer to a request it never identified — the pre-correlation defect \
+             (T-118.2-15-01/02), which fence 17 already pins. Returned result: {:?}",
+            text_of(&result)
+        ),
+        Err(error) => {
+            let elapsed = started.elapsed();
+            let text = error.to_string();
+            // Assert the SHAPE, by KIND. Accepting "some error" here would let a
+            // future regression that fails the call early for an unrelated
+            // reason keep this fence green — the same hole WR-05 recorded in
+            // fence 17 and this plan closed there.
+            assert!(
+                matches!(error, pmcp::Error::Timeout(_)),
+                "the call failed after {elapsed:?}, but not as a TIMEOUT. This fence's subject is \
+                 that the discard wait has a ceiling; an error of any other kind means the call \
+                 left the receive loop for some other reason and the ceiling is unmeasured. Got: \
+                 {error:?}"
+            );
+            // A ceiling of zero milliseconds would satisfy the kind check while
+            // meaning the call never waited at all, so the rendered bound is
+            // asserted to be a real, non-zero duration.
+            assert!(
+                matches!(error, pmcp::Error::Timeout(ms) if ms > 0),
+                "the timeout must name a NON-ZERO bound, or the 'ceiling' is an immediate failure \
+                 wearing a timeout's clothes. Rendered: {text:?}"
+            );
+        },
+    }
+
+    assert_eq!(
+        calls_observed(&server),
+        1,
+        "the call must actually have reached the wire — a fence that concludes anything about a \
+         request that was never sent would pass against any tree. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
 
     server.shutdown().await;
 }
