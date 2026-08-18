@@ -943,9 +943,30 @@ fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
 /// leaks the count UPWARD, and a count that never returns to zero would mean the
 /// latch is never surfaced again — trading BLOCKER 1's permanent failure for a
 /// permanent unexplained HANG, which is not an improvement (T-118.2-19-03).
-/// `Drop` runs on every one of those paths, including a panic unwind.
+/// `Drop` runs on every one of those paths, including a panic unwind and a
+/// spawned future that is DROPPED before it is ever polled — the guard is moved
+/// into the future's captured state, so dropping the future drops it.
+///
+/// # It also WAKES on the way out, and that is not decoration
+///
+/// A reader exiting CLEANLY latches nothing: an ordinary end-of-body and the
+/// [`SseFrameStop::Shutdown`] race both return without calling
+/// [`latch_terminal_reason`], so neither bumps the terminal wake generation. A
+/// consumer that parked in [`Transport::receive`] while the gate was CLOSED
+/// would therefore stay parked after the last reader was gone, even though the
+/// latch is surfaceable again — a lost wakeup, and the shape it takes is
+/// `close()` racing an in-flight streaming POST.
+///
+/// So the LAST guard out bumps the generation. The wake is raised after the
+/// decrement, and [`Transport::receive`] subscribes before its first latch read,
+/// so a consumer that parks between the two still observes the bump as a
+/// generation it has not yet seen. Only the 1 -> 0 transition wakes: while
+/// another reader is still live the gate is still closed and there is nothing new
+/// to observe.
 struct PostReaderGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// The wake signal. See [`StreamableHttpTransport::terminal_signal`].
+    signal: Arc<watch::Sender<u64>>,
 }
 
 impl PostReaderGuard {
@@ -955,17 +976,28 @@ impl PostReaderGuard {
     /// the guard. Acquiring inside the spawned task would let
     /// `Client::dispatch_request` reach [`Transport::receive`] first and observe a
     /// count of zero — which IS the race, not a smaller version of it.
-    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn acquire(
+        counter: &Arc<std::sync::atomic::AtomicUsize>,
+        signal: &Arc<watch::Sender<u64>>,
+    ) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             counter: Arc::clone(counter),
+            signal: Arc::clone(signal),
         }
     }
 }
 
 impl Drop for PostReaderGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
+        // `fetch_sub` returns the value BEFORE the subtraction, so `1` means this
+        // guard was the last one out.
+        if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // `send_modify` and never `send`: `watch::Sender::send` returns `Err`
+            // when no receiver exists, which is the ordinary case for a transport
+            // nobody is currently receiving on. See `latch_terminal_reason`.
+            self.signal.send_modify(|generation| *generation += 1);
+        }
     }
 }
 
@@ -1845,7 +1877,7 @@ impl StreamableHttpTransport {
         let on_resumption = self.resumption_callback();
         let last_event_id = Arc::clone(&self.last_event_id);
         let max_buffer_size = self.max_collected_body_bytes;
-        let in_flight = PostReaderGuard::acquire(&self.open_post_readers);
+        let in_flight = PostReaderGuard::acquire(&self.open_post_readers, &self.terminal_signal);
 
         tokio::spawn(async move {
             // Moved in so its `Drop` marks this reader finished on EVERY exit
@@ -5379,6 +5411,17 @@ mod tests {
             )
         }
 
+        /// A wake sender for the guard to bump on its way out.
+        ///
+        /// The `watch::Receiver` is dropped deliberately: `send_modify` — unlike
+        /// `send` — does not error when nobody is listening, and these arms
+        /// measure the COUNT rather than the wake. The wake itself is measured
+        /// end to end by fence 21, where a real consumer is parked.
+        fn wake_signal() -> Arc<watch::Sender<u64>> {
+            let (signal, _) = watch::channel(0u64);
+            Arc::new(signal)
+        }
+
         /// The reason a spent reconnect budget latches, as the session stream
         /// raises it.
         fn budget_reason() -> Error {
@@ -5395,6 +5438,7 @@ mod tests {
             let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
             let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
             let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake = wake_signal();
             latch_terminal_reason(&delivery, &budget_reason());
 
             // ZERO in flight: nobody is waiting on an answer, so the reason is
@@ -5407,7 +5451,7 @@ mod tests {
             );
 
             // ONE in flight: an empty queue means the answer is on the wire.
-            let guard = PostReaderGuard::acquire(&open_post_readers);
+            let guard = PostReaderGuard::acquire(&open_post_readers, &wake);
             assert_eq!(
                 open_post_readers.load(Ordering::SeqCst),
                 1,
@@ -5469,11 +5513,12 @@ mod tests {
         #[test]
         fn post_reader_guard_returns_the_count_to_zero() {
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake = wake_signal();
 
             // An answer that delivered ZERO events: acquired, and gone again
             // with nothing ever having reached the queue.
             {
-                let _empty = PostReaderGuard::acquire(&counter);
+                let _empty = PostReaderGuard::acquire(&counter, &wake);
                 assert_eq!(counter.load(Ordering::SeqCst), 1);
             }
             assert_eq!(
@@ -5486,11 +5531,11 @@ mod tests {
             // Nested readers — several streaming POSTs outstanding at once,
             // which is why this is a COUNT and not a flag.
             {
-                let _first = PostReaderGuard::acquire(&counter);
-                let _second = PostReaderGuard::acquire(&counter);
+                let _first = PostReaderGuard::acquire(&counter, &wake);
+                let _second = PostReaderGuard::acquire(&counter, &wake);
                 assert_eq!(counter.load(Ordering::SeqCst), 2);
                 {
-                    let _third = PostReaderGuard::acquire(&counter);
+                    let _third = PostReaderGuard::acquire(&counter, &wake);
                     assert_eq!(counter.load(Ordering::SeqCst), 3);
                 }
                 assert_eq!(
@@ -5508,16 +5553,65 @@ mod tests {
             // A reader that PANICS mid-body: `Drop` runs on the unwind, so the
             // count is returned even on the path no explicit decrement covers.
             let unwound = Arc::clone(&counter);
-            let panicked = std::panic::catch_unwind(move || {
-                let _guard = PostReaderGuard::acquire(&unwound);
+            let unwound_wake = Arc::clone(&wake);
+            // `AssertUnwindSafe` because `Arc<watch::Sender<_>>` is not
+            // `UnwindSafe`, and that bound is exactly what this arm is
+            // interrogating rather than assuming: nothing observed after the
+            // unwind reads through the sender's interior state — the assertion
+            // below reads the ATOMIC — so there is no half-updated invariant to
+            // be exposed to.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = PostReaderGuard::acquire(&unwound, &unwound_wake);
                 panic!("a reader failing mid-body");
-            });
+            }));
             assert!(panicked.is_err(), "the arm must actually have panicked");
             assert_eq!(
                 counter.load(Ordering::SeqCst),
                 0,
                 "a reader that panicked mid-body must still return the count to zero — that is \
                  why the count is RAII and not an explicit decrement at each exit"
+            );
+        }
+
+        /// The LAST guard out bumps the wake generation; earlier ones do not.
+        ///
+        /// The lost-wakeup hole the gate would otherwise open. A reader exiting
+        /// cleanly — an ordinary end-of-body, or the `close()` shutdown race —
+        /// latches nothing, so nothing else bumps the generation. Without this,
+        /// a consumer that parked in `Transport::receive` while the gate was
+        /// CLOSED would stay parked after the last reader was gone, with the
+        /// latch surfaceable and nobody to tell it.
+        #[test]
+        fn the_last_post_reader_out_wakes_a_parked_consumer() {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake = wake_signal();
+            let mut observer = wake.subscribe();
+            let before = *observer.borrow_and_update();
+
+            let first = PostReaderGuard::acquire(&counter, &wake);
+            let second = PostReaderGuard::acquire(&counter, &wake);
+            drop(first);
+            assert_eq!(
+                *wake.borrow(),
+                before,
+                "a reader finishing while ANOTHER is still live changes nothing a consumer \
+                 could act on — the gate is still closed, so waking would be a spurious \
+                 re-poll"
+            );
+
+            drop(second);
+            assert_eq!(
+                *wake.borrow(),
+                before + 1,
+                "the LAST reader out must bump the generation, or a consumer parked while the \
+                 gate was closed never learns that it re-opened. A clean reader exit latches \
+                 nothing, so this is the only wake on that path"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                0,
+                "and the count must be zero when that wake is raised, so the woken consumer \
+                 re-reads an OPEN gate rather than being sent back to sleep"
             );
         }
 
@@ -5630,7 +5724,8 @@ mod tests {
                 let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
                 let (delivery, mut receiver) = delivery_for(stream, &terminal);
                 let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let _guard = PostReaderGuard::acquire(&open_post_readers);
+                let wake = wake_signal();
+                let _guard = PostReaderGuard::acquire(&open_post_readers, &wake);
                 latch_terminal_reason(&delivery, &budget_reason());
                 assert!(
                     drain_or_latch(&mut receiver, &terminal, &open_post_readers).is_none(),
@@ -5709,9 +5804,10 @@ mod tests {
                 held in 0usize..32,
             ) {
                 let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let wake = wake_signal();
                 let mut guards = Vec::with_capacity(held);
                 for expected in 1..=held {
-                    guards.push(PostReaderGuard::acquire(&counter));
+                    guards.push(PostReaderGuard::acquire(&counter, &wake));
                     assert_eq!(
                         counter.load(Ordering::SeqCst),
                         expected,
