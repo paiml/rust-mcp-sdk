@@ -2829,7 +2829,10 @@ async fn a_reopened_session_stream_clears_the_terminal_latch() {
          Observed request lines: {:?}",
         server.request_lines()
     );
-    tokio::time::sleep(RECONNECT_QUIET).await;
+    // No quiet window is needed here (unlike fence 21, whose `assert_eq!` on the
+    // GET count requires one). The assertion below is CAUSAL: `receive()` parks
+    // until the latch is written, and the latch is only written once the budget
+    // is spent and `run_session_stream` returns. BOUND covers that.
 
     // With nothing in flight and no recovery yet, answering the latched reason is
     // CORRECT behaviour — that is the CR-02 contract and this fence does not

@@ -284,7 +284,7 @@ struct MismatchBudget {
     /// `None` is not "no deadline yet, use a default"; it is the load-bearing
     /// signal that NO mismatch has been observed, which is what keeps the
     /// ordinary receive path uncancelled.
-    deadline: Option<tokio::time::Instant>,
+    deadline: Option<web_time::Instant>,
 }
 
 impl MismatchBudget {
@@ -297,14 +297,8 @@ impl MismatchBudget {
     fn record(&mut self) {
         self.discards += 1;
         if self.deadline.is_none() {
-            self.deadline = Some(tokio::time::Instant::now() + MISMATCH_DISCARD_TIMEOUT);
+            self.deadline = Some(web_time::Instant::now() + MISMATCH_DISCARD_TIMEOUT);
         }
-    }
-
-    /// When this request's discard wait expires, or `None` if it has seen no
-    /// mis-addressed frame.
-    fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.deadline
     }
 
     /// This attempt's receive slice, or `None` once `deadline` has passed.
@@ -317,8 +311,8 @@ impl MismatchBudget {
     /// it is the smaller of the two, so the final attempt before the deadline is
     /// short rather than overshooting it.
     fn slice_until(
-        deadline: tokio::time::Instant,
-        now: tokio::time::Instant,
+        deadline: web_time::Instant,
+        now: web_time::Instant,
     ) -> Option<std::time::Duration> {
         if now >= deadline {
             return None;
@@ -3816,7 +3810,7 @@ impl<T: Transport> Client<T> {
         &self,
         budget: &MismatchBudget,
     ) -> Result<Option<crate::types::TransportMessage>> {
-        let Some(deadline) = budget.deadline() else {
+        let Some(deadline) = budget.deadline else {
             // The ordinary path. NO `tokio::time::timeout` here, on purpose:
             // see the asymmetry note above.
             //
@@ -3833,7 +3827,7 @@ impl<T: Transport> Client<T> {
             return transport.receive().await.map(Some);
         };
 
-        let Some(slice) = MismatchBudget::slice_until(deadline, tokio::time::Instant::now()) else {
+        let Some(slice) = MismatchBudget::slice_until(deadline, web_time::Instant::now()) else {
             // The ceiling fired. The caller gets a NAMED failure stating the
             // bound it waited out, which is the whole difference from the
             // permanent, mute wait this replaced.
@@ -3847,11 +3841,22 @@ impl<T: Transport> Client<T> {
         // client gets its turn at the lock at least once per slice.
         let received = {
             let mut transport = self.transport.write().await;
-            tokio::time::timeout(slice, transport.receive()).await
+            // `crate::runtime::sleep` + `futures::future::select` rather than
+            // `tokio::time::timeout`: `tokio` is a
+            // `cfg(not(target_arch = "wasm32"))` dependency, and `Client`
+            // compiles for wasm32. The behaviour is identical on native — the
+            // receive is dropped when the slice elapses — but this form also
+            // builds in the browser, which the `wasm32-purity` CI job requires.
+            let receive = std::pin::pin!(transport.receive());
+            let elapsed = std::pin::pin!(crate::runtime::sleep(slice));
+            match futures::future::select(receive, elapsed).await {
+                futures::future::Either::Left((message, _)) => Some(message),
+                futures::future::Either::Right(((), _)) => None,
+            }
         };
         match received {
-            Ok(message) => message.map(Some),
-            Err(_elapsed) => Ok(None),
+            Some(message) => message.map(Some),
+            None => Ok(None),
         }
     }
 
@@ -8050,7 +8055,7 @@ mod tests {
         fn a_fresh_budget_has_no_deadline_and_no_error() {
             let budget = MismatchBudget::default();
             assert!(
-                budget.deadline().is_none(),
+                budget.deadline.is_none(),
                 "a request that has seen no mis-addressed frame must carry NO deadline. `None` is \
                  not 'unset, use a default' — it is what keeps the ordinary receive path \
                  uncancelled, so a `Some` here would put a ceiling on every well-behaved call in \
@@ -8069,7 +8074,7 @@ mod tests {
             let mut budget = MismatchBudget::default();
             budget.record();
             let armed = budget
-                .deadline()
+                .deadline
                 .expect("the first discard arms the deadline");
 
             // Advance real time between discards, so a re-arming implementation
@@ -8077,7 +8082,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             budget.record();
             assert_eq!(
-                budget.deadline(),
+                budget.deadline,
                 Some(armed),
                 "the deadline moved on the SECOND discard. Re-arming per frame means a peer \
                  emitting a steady drip of wrong ids extends the wait indefinitely — the ceiling \
@@ -8088,7 +8093,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             budget.record();
             assert_eq!(
-                budget.deadline(),
+                budget.deadline,
                 Some(armed),
                 "the deadline moved on the THIRD discard"
             );
@@ -8157,7 +8162,7 @@ mod tests {
 
         #[test]
         fn the_receive_slice_never_exceeds_the_remaining_budget() {
-            let now = tokio::time::Instant::now();
+            let now = web_time::Instant::now();
 
             // Remaining GREATER than the slice: the fixed slice wins, so the
             // lock is released four times a second regardless of how much
@@ -8209,7 +8214,7 @@ mod tests {
             fn property_the_slice_never_exceeds_the_remaining_budget(
                 remaining_ms in 1u64..60_000,
             ) {
-                let now = tokio::time::Instant::now();
+                let now = web_time::Instant::now();
                 let remaining = Duration::from_millis(remaining_ms);
                 let slice = MismatchBudget::slice_until(now + remaining, now)
                     .expect("a positive remainder always yields a slice");

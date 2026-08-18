@@ -22,7 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::RwLock;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -964,7 +964,7 @@ fn latch_terminal_reason(delivery: &ReaderDelivery, error: &Error) {
 /// another reader is still live the gate is still closed and there is nothing new
 /// to observe.
 struct PostReaderGuard {
-    counter: Arc<std::sync::atomic::AtomicUsize>,
+    counter: Arc<AtomicUsize>,
     /// The wake signal. See [`StreamableHttpTransport::terminal_signal`].
     signal: Arc<watch::Sender<u64>>,
 }
@@ -976,10 +976,7 @@ impl PostReaderGuard {
     /// the guard. Acquiring inside the spawned task would let
     /// `Client::dispatch_request` reach [`Transport::receive`] first and observe a
     /// count of zero — which IS the race, not a smaller version of it.
-    fn acquire(
-        counter: &Arc<std::sync::atomic::AtomicUsize>,
-        signal: &Arc<watch::Sender<u64>>,
-    ) -> Self {
+    fn acquire(counter: &Arc<AtomicUsize>, signal: &Arc<watch::Sender<u64>>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             counter: Arc::clone(counter),
@@ -1033,7 +1030,7 @@ impl Drop for PostReaderGuard {
 fn drain_or_latch(
     receiver: &mut mpsc::Receiver<Result<TransportMessage>>,
     terminal: &Arc<RwLock<Option<TerminalReason>>>,
-    open_post_readers: &Arc<std::sync::atomic::AtomicUsize>,
+    open_post_readers: &AtomicUsize,
 ) -> Option<Result<TransportMessage>> {
     match receiver.try_recv() {
         Ok(queued) => return Some(queued),
@@ -1160,14 +1157,14 @@ pub struct StreamableHttpTransport {
     /// [`drain_or_latch`] for the rule and [`Self::spawn_sse_reader`] for why the
     /// acquire happens before the spawn rather than inside it.
     ///
-    /// A `std::sync::atomic::AtomicUsize` and NOT a new dependency: the count is
+    /// A `AtomicUsize` and NOT a new dependency: the count is
     /// read on the receive hot path under no lock, and the wake it pairs with is
     /// the tokio `watch` channel already compiled in.
     ///
     /// PRIVATE on a struct whose fields are already all private, so it is
     /// invisible to `cargo semver-checks` for the measured reason
     /// [`Self::max_collected_body_bytes`]'s rustdoc records (T-113-95).
-    open_post_readers: Arc<std::sync::atomic::AtomicUsize>,
+    open_post_readers: Arc<AtomicUsize>,
     /// Set once by [`Transport::close`], and raced against every reader's parked
     /// body read (Phase 118.2, WR-01).
     ///
@@ -1283,7 +1280,7 @@ impl StreamableHttpTransport {
             max_collected_body_bytes: DEFAULT_MAX_COLLECTED_BODY_BYTES,
             terminal: Arc::new(RwLock::new(None)),
             terminal_signal: Arc::new(terminal_signal),
-            open_post_readers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            open_post_readers: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(shutdown),
         }
     }
@@ -5437,7 +5434,7 @@ mod tests {
         fn latch_gate_boundary_at_zero_and_one_in_flight_readers() {
             let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
             let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
-            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open_post_readers = Arc::new(AtomicUsize::new(0));
             let wake = wake_signal();
             latch_terminal_reason(&delivery, &budget_reason());
 
@@ -5485,7 +5482,7 @@ mod tests {
         fn a_queued_message_still_wins_over_a_set_latch() {
             let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
             let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
-            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open_post_readers = Arc::new(AtomicUsize::new(0));
             latch_terminal_reason(&delivery, &budget_reason());
             delivery
                 .sender
@@ -5512,7 +5509,7 @@ mod tests {
         /// failure, which is not an improvement (T-118.2-19-03).
         #[test]
         fn post_reader_guard_returns_the_count_to_zero() {
-            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::new(AtomicUsize::new(0));
             let wake = wake_signal();
 
             // An answer that delivered ZERO events: acquired, and gone again
@@ -5583,7 +5580,7 @@ mod tests {
         /// latch surfaceable and nobody to tell it.
         #[test]
         fn the_last_post_reader_out_wakes_a_parked_consumer() {
-            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::new(AtomicUsize::new(0));
             let wake = wake_signal();
             let mut observer = wake.subscribe();
             let before = *observer.borrow_and_update();
@@ -5625,7 +5622,7 @@ mod tests {
         fn clearing_an_already_clear_latch_is_a_no_op() {
             let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
             let (delivery, mut receiver) = delivery_for(StreamKind::Session, &terminal);
-            let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open_post_readers = Arc::new(AtomicUsize::new(0));
             latch_terminal_reason(&delivery, &budget_reason());
             assert!(terminal.read().is_some(), "the latch is set");
 
@@ -5723,7 +5720,7 @@ mod tests {
             for stream in [StreamKind::Session, StreamKind::PostResponse] {
                 let terminal: Arc<RwLock<Option<TerminalReason>>> = Arc::new(RwLock::new(None));
                 let (delivery, mut receiver) = delivery_for(stream, &terminal);
-                let open_post_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let open_post_readers = Arc::new(AtomicUsize::new(0));
                 let wake = wake_signal();
                 let _guard = PostReaderGuard::acquire(&open_post_readers, &wake);
                 latch_terminal_reason(&delivery, &budget_reason());
@@ -5803,7 +5800,7 @@ mod tests {
             fn property_the_in_flight_count_is_exactly_the_guards_held(
                 held in 0usize..32,
             ) {
-                let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counter = Arc::new(AtomicUsize::new(0));
                 let wake = wake_signal();
                 let mut guards = Vec::with_capacity(held);
                 for expected in 1..=held {
