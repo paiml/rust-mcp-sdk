@@ -1219,3 +1219,88 @@ that quotes a green it did not interrogate is the failure mode this whole phase 
   the error) that belongs with whoever owns the Makefile's test targets.
 - **OWNER:** whichever plan next touches the Makefile's ALWAYS targets. Booked OPEN as `WINDOWS.md`
   entry 22.
+
+## THIRD ROUND — post-review code fixes and the UAT that measured them (2026-08-18)
+
+Three commits landed after `118.2-VERIFICATION.md` was written (`d01b87e2`, `2d385d60`,
+`26447f94`), closing all fifteen findings of the `/code-review 118.2` pass. `118.2-UAT.md`
+then re-measured the phase's four Success Criteria and its safety truth against `26447f94`.
+Five of six checkpoints passed. This appendix records the one that did not, and one
+correction to the record.
+
+### CR-01 and CR-02 — CLOSED STRUCTURALLY, not patched
+
+Both were closed by replacing the machinery they lived in rather than by bounding it.
+`receive_bounded`, `MismatchBudget` and `MISMATCH_DISCARD_TIMEOUT` have **zero references**
+anywhere in the crate at HEAD.
+
+- **CR-01** (the ceiling did not cover lock ACQUISITION, only the `receive()` once held):
+  there is no longer an unbounded lock hold for anyone to queue behind. `pump_once` holds the
+  transport write guard across a receive bounded by `PUMP_RECEIVE_SLICE` (250 ms) and releases
+  it every slice.
+- **CR-02** (a discarded call's real answer poisoning the next call, permanently, for any peer
+  slower than 10 s): responses are routed **by id**. `pump_once` looks up `active_requests` and
+  delivers into that caller's own oneshot, so a frame belonging to call A can no longer be
+  popped by call B. Failed calls funnel through one cleanup point, so a dead id cannot linger.
+  Fenced by `a_mismatched_frame_does_not_block_another_operation_on_the_same_client`,
+  `an_idle_terminal_error_does_not_fail_the_next_unrelated_call` and
+  `two_concurrent_calls_each_receive_their_own_answer`.
+
+### CR-03 — OPEN, DEFERRED BY DEVELOPER DECISION, and re-measured MILDER than recorded
+
+`drain_or_latch` still gates the terminal latch on `open_post_readers.load(Ordering::SeqCst) > 0`
+— a **transport-wide** count answering a **per-caller** question — and `PostReaderGuard::drop`
+still wakes only on the `1 -> 0` transition. Confirmed open at HEAD by direct source read.
+
+- **Trigger, stated precisely:** `concurrency >= 2` SSE-answered POST responses on one transport
+  **AND** a terminal failure on one of them. It is **not** load-dependent — two concurrent
+  streaming tool calls suffice, which is ordinary for an agent doing parallel tool invocation.
+  The rare half is the transport failure, not the concurrency.
+- **Mitigation already present:** the always-open v1 session GET stream does **not** gate.
+  `PostReaderGuard::acquire` appears only in `spawn_sse_reader`, the POST-response path, so the
+  single-caller case is clean.
+- **CORRECTION TO THE RECORD.** `118.2-VERIFICATION.md` describes CR-03 as an "unbounded, silent
+  hang" lasting "the process lifetime". That was accurate against `31a80a75` and is **no longer
+  accurate** at HEAD. After the per-id router, the failed call receives a **delayed error bounded
+  by the other reader's lifetime** — the last guard's drop fires the wake and the latch then
+  surfaces. No answer is lost, none is mis-delivered to the wrong caller, and nothing is starved.
+  Re-confirmed by reading `ReaderDelivery`: it carries the **shared** sender and **shared**
+  terminal latch, so reader ERRORS are not per-caller routed even though successful RESPONSES now
+  are. That asymmetry is the whole of what remains.
+- **Why deferred (developer, 2026-08-18):** the architecture is moving away from SSE toward
+  stateless calls with MCP Tasks and task-store polling for progress. This defect lives
+  exclusively in the POST-response SSE reader path — the v1 surface being deprecated. The v2
+  stateless/Tasks direction does not create concurrent POST readers at all, so the affected
+  population shrinks rather than grows. Deferred as a **Warning**. **Not closed and not waived**;
+  no fix is scheduled and none may be implied.
+- **A sibling defect to fix WITH it:** the unit test
+  `a_post_reader_in_flight_gates_a_reason_from_either_stream` **asserts the defective shape is
+  correct** and pins the single-reader case only. A future fixer will read it as a deliberate
+  invariant and mistake their own fix for a regression. There is **no** two-concurrent-reader
+  fence anywhere in the crate — searched at HEAD.
+- **The durable fix, for whoever picks this up:** scope the gate to the stream that owns the
+  question — let a `StreamKind::PostResponse` reason surface immediately regardless of
+  `open_post_readers`, reserving the transport-wide gate for `StreamKind::Session` reasons. The
+  fully durable form is a reason per reader delivered to its owning caller, the same per-id
+  routing `d01b87e2` already applied to responses.
+- **OWNER:** the client-transport hardening plan named in this file's `### Disposition` section —
+  the same owner as closure-review WR-01/WR-02/WR-03 (`WINDOWS.md` entry 21), which touch the
+  same loop and should be decided together. Booked OPEN as **`WINDOWS.md` entry 23**.
+
+### Environmental findings from the UAT run — recorded so they are not re-diagnosed as code
+
+- **`make test-conformance` needs Node >= 22; `~/.nvm/alias/default` is pinned to 20.8.1 and the
+  repo carries no `.nvmrc`.** v22.22.2 IS installed and `nvm use 22` switches cleanly, so this is
+  a default-selection problem, not a missing toolchain. A fresh shell in this repo gets Node 20
+  and the suite dies at module load on `globSync`. CI is unaffected (`actions/setup-node` with 22).
+  A one-line `.nvmrc` containing `22` would close it. OWNER: whichever plan next touches the
+  conformance runner's environment guards.
+- **Run-to-run variance is real and non-scored.** Two back-to-back full runs at HEAD differed:
+  `http-header-validation` 13/1 vs 14/0 — the known `ServerAcceptsWhitespaceHeaderValue` flake,
+  already refuted as an SDK defect. Both runs gate-PASSED identically.
+- **Two false greens hit while measuring, both of the shape this ledger already tracks.**
+  `make test-conformance > log 2>&1; echo $?` reports the ECHO's exit status, not make's — the
+  first conformance attempt appeared to exit 0 while make had exited 1. And
+  `diff <(grep ...) <(grep ...) && echo IDENTICAL` printed "Files are identical" for two files
+  that differ, under the rtk proxy — the same output corruption already recorded for `git diff`
+  and `gh pr checks`. Use `/usr/bin/` absolute paths for comparisons and read the real exit code.
