@@ -2936,7 +2936,7 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: 5/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+**Plans**: 9/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
 
 Plans:
 **Wave 1**
@@ -2955,10 +2955,10 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 119-06-PLAN.md — pmcp-course Part VIII ch24 Agents & Teams chapter + tiered exercises (D-09). Moved out of Wave 3 by the cross-AI review: its Exercise 2/3 pass predicates must name the same banners `tests/docs04_examples_run.rs` asserts, and 119-04 writes two of those legs
-- [ ] 119-07-PLAN.md — Agent Teams book chapter, completing Phase 111's three named chapters (D-08)
-- [ ] 119-08-PLAN.md — In-place era amendments: `ch12-7-tasks.md` with a provisionality callout (D-07) and the two `ch10` transport chapters, no code block touched (D-16)
-- [ ] 119-09-PLAN.md — README `## Protocol Versions`, refreshed release header, extended Examples block, CHANGELOG heading fixes (D-11)
+- [x] 119-06-PLAN.md — pmcp-course Part VIII ch24 Agents & Teams chapter + tiered exercises (D-09). Moved out of Wave 3 by the cross-AI review: its Exercise 2/3 pass predicates must name the same banners `tests/docs04_examples_run.rs` asserts, and 119-04 writes two of those legs
+- [x] 119-07-PLAN.md — Agent Teams book chapter, completing Phase 111's three named chapters (D-08)
+- [x] 119-08-PLAN.md — In-place era amendments: `ch12-7-tasks.md` with a provisionality callout (D-07) and the two `ch10` transport chapters, no code block touched (D-16)
+- [x] 119-09-PLAN.md — README `## Protocol Versions`, refreshed release header, extended Examples block, CHANGELOG heading fixes (D-11)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
