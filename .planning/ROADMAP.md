@@ -2936,7 +2936,7 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: 1/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+**Plans**: 2/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
 
 Plans:
 **Wave 1**
@@ -2945,7 +2945,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 119-02-PLAN.md — TRACER: "Agents as MCP Clients" end-to-end across three shapes — chapter + SUMMARY re-parent + README section + run-test helper + `mdbook build` negative control
+- [x] 119-02-PLAN.md — TRACER: "Agents as MCP Clients" end-to-end across three shapes — chapter + SUMMARY re-parent + README section + run-test helper + `mdbook build` negative control
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
