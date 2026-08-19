@@ -231,26 +231,43 @@ Nothing in the research wire contract was contradicted by the schema itself. Two
 
 ## Verdict
 
-PENDING — no `schema/2026-07-28` directory exists in the upstream spec repository as of
-2026-07-25 (three days before the 2026-07-28 publication date). The record above was produced
-against `schema/draft/schema.ts` @ `71e306956a4959c9655e5036be215d41986596e6` (2026-07-16),
-which is the strongest source available today but is **not** the final schema.
+**PUBLISHED-CONFIRMED** — `schema/2026-07-28/` exists upstream, and steps 2–3 agree with every
+value landed under the exception. This is **row 1** of the arm-1 step-4 landing table (*"the
+directory EXISTS and steps 2-3 agree"*). It supersedes the verdict first recorded on 2026-07-25
+and re-confirmed unchanged on 2026-07-26; both earlier runs remain on the record below, and the
+re-verification obligation is now **DISCHARGED**.
 
-All thirteen mandated tokens were FOUND in the draft and every value matches the research wire
-contract, including the three error-code constants at exactly `-32020` / `-32021` / `-32022`
-under exactly the identifiers `HEADER_MISMATCH`, `MISSING_REQUIRED_CLIENT_CAPABILITY`,
-`UNSUPPORTED_PROTOCOL_VERSION`. **That corroboration does not upgrade the verdict.** The
-verdict is a statement about the SOURCE, not about agreement: REQUIREMENTS.md lists
-"Hard-coding new `-3202x`/`-32602` error codes before the final schema" as explicitly OUT OF
-SCOPE, and VERS-06 says the values come from the final `schema.json` ONLY.
+**The source changed, which is what moved the verdict.** The original record was produced against
+`schema/draft/schema.ts` @ `71e306956a4959c9655e5036be215d41986596e6` (2026-07-16) — the strongest
+source then available, but explicitly *not* the final schema. This verdict is produced against the
+**published, versioned** `schema/2026-07-28/`, read from the vendored copy at
+`schema/vendored/core-2026-07-28/`, whose two blobs were re-proved byte-identical to upstream
+`main` at the moment of this run (`schema.ts` `9b55feeb…` / 98426 B; `schema.json` `213c58f6…` /
+181474 B). The verdict was always a statement about the SOURCE rather than about agreement — and
+the source is now the final one, so VERS-06's values-from-final-schema-only rule and
+REQUIREMENTS.md's Out-of-Scope entry are both satisfied on their own terms rather than spent
+against.
 
-**Consequence for Task 3:** under this PENDING verdict, Task 3 may NOT land the three
-constants in `src/types/protocol/error_codes.rs` unless a `## Recorded Exception` section
-exists below, written by the developer at the Task 2 checkpoint. The `Cargo.toml` half of
-Task 3 (the `ring` + `zeroize` promotion) is unaffected by this verdict — it is gated only on
-the package-legitimacy half of the Task 2 checkpoint.
+**BOTH arms have been run and recorded**, which is what the shared landing rule requires and what
+makes the flips valid:
 
-**The exception WAS granted.** See `## Recorded Exception` immediately below.
+- **Arm 1 (schema)** — run by Phase 119 plan 119-01 task zero on 2026-08-18; the full literal
+  output is transcribed at `### Verdict re-verification — Phase 119 task zero (2026-08-18)` below.
+- **Arm 2 (conformance predicate)** — recorded NO DRIFT on 2026-07-27 at `§ B.6.5`, **and re-run
+  by this same task zero** against a newer conformance `main` HEAD (`74edef34…`, 2026-08-17) with
+  the same NO-DRIFT result and `v2_conformance_pin` passing 5/5.
+
+A verdict upgraded on arm 1 alone would be invalid; this one is not.
+
+**Consequence.** The eleven requirements this gate holds — HTTP-01 … HTTP-08, CLNT-01, CLNT-02,
+CLNT-05 — are consequently flipped from `[~]` to `[x]` in `.planning/REQUIREMENTS.md` by the same
+plan. The three constants `-32020` / `-32021` / `-32022` in
+`src/types/protocol/error_codes.rs` are no longer pre-final values held under an exception: they
+are confirmed against the published schema. **TASK-01 … TASK-06 are NOT covered by this verdict** —
+they are governed by `114-SPEC-RECHECK.md` under a different trigger, and remain `[~]`.
+
+**The exception WAS granted**, and is now spent down rather than rolling forward. See
+`## Recorded Exception` immediately below.
 
 ### Verdict re-verification — plan 12 Task 3 (2026-07-26)
 
@@ -289,6 +306,206 @@ event**, not an advisory.
 > becomes runnable when a **versioned schema directory exists**, not when a date passes. The
 > measurement recorded above — five directories, no `2026-07-28`, on 2026-07-26 — is unchanged
 > and remains the historical record of that run.
+
+### Verdict re-verification — Phase 119 task zero (2026-08-18)
+
+**Run by:** Phase 119, plan `119-01`, Task 1. **Run at:** 2026-08-19T04:24:41Z UTC (local date
+2026-08-18). **Result: `PUBLISHED-CONFIRMED` — obligation DISCHARGED.**
+
+Every command below was executed by this run and its output transcribed literally. Nothing here
+is cited from `119-RESEARCH.md`; that document's command block was treated as a script to execute,
+not as a result to quote.
+
+**(1) Arm 1, step 1 — the trigger condition. The directory EXISTS.**
+
+```
+$ gh api repos/modelcontextprotocol/modelcontextprotocol/contents/schema --jq '.[].name'
+2024-11-05
+2025-03-26
+2025-06-18
+2025-11-25
+2026-07-28
+draft
+```
+
+Six directories, against the five recorded on 2026-07-26. `2026-07-28` is present, so the
+TRIGGER — *a versioned schema directory exists* — is MET and arm 1 is runnable.
+
+**(2) Arm 1, step 1b — the pin resolves, and nothing has touched the path since.**
+
+```
+$ gh api repos/modelcontextprotocol/modelcontextprotocol/commits/271ecc9accafdd9b83a3c869fa67c22953b2af80 \
+    --jq '{sha:.sha,date:.commit.committer.date,subject:(.commit.message|split("\n")[0])}'
+{"date":"2026-07-28T16:42:34Z","sha":"271ecc9accafdd9b83a3c869fa67c22953b2af80","subject":"fix(schema): apply subscriptions/listen envelope and MetaObject rename to 2026-07-28"}
+
+$ gh api "repos/modelcontextprotocol/modelcontextprotocol/commits?path=schema/2026-07-28&sha=main" \
+    --jq '.[] | "\(.sha[0:12])  \(.commit.committer.date)  \(.commit.message|split("\n")[0])"'
+271ecc9accaf  2026-07-28T16:42:34Z  fix(schema): apply subscriptions/listen envelope and MetaObject rename to 2026-07-28
+b488c16623e5  2026-07-28T15:56:05Z  Add 2026-07-28 MCP specification
+```
+
+The **newest** commit on `schema/2026-07-28` is still the pinned commit
+`271ecc9accafdd9b83a3c869fa67c22953b2af80`. Only two commits have ever touched the path — the
+publication and its 46-minute-later fix — so the directory has been unchanged for 22 days.
+
+**(3) Arm 1, step 1c — `main` blob SHAs and sizes against `PROVENANCE.md`. THE GATE.**
+
+```
+$ gh api "repos/modelcontextprotocol/modelcontextprotocol/contents/schema/2026-07-28?ref=main" \
+    --jq '.[] | "\(.name)  sha=\(.sha)  size=\(.size)"'
+schema.json  sha=213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8  size=181474
+schema.ts    sha=9b55feeb412bc3ae877f2eac10b5c01ba29a2eed  size=98426
+
+$ git hash-object schema/vendored/core-2026-07-28/schema.ts schema/vendored/core-2026-07-28/schema.json
+9b55feeb412bc3ae877f2eac10b5c01ba29a2eed
+213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8
+```
+
+| File | `PROVENANCE.md § Independent corroboration` | Upstream `main` today | Local vendored | Size | Match |
+|---|---|---|---|---|---|
+| `schema.ts` | `9b55feeb412bc3ae877f2eac10b5c01ba29a2eed` | same | same | 98426 | ✓ |
+| `schema.json` | `213c58f6d9a1c2ce6ad055afe90bbdb095a29ee8` | same | same | 181474 | ✓ |
+
+**The gate passes.** This is the load-bearing check of the whole run: it is what makes steps 2 and
+3 valid when read from the vendored copy rather than a fresh fetch. Had either blob differed, the
+landing state would not have been `PUBLISHED-CONFIRMED`, no verdict would have been upgraded and
+no requirement flipped — a pre-final wire constant baked into a released SDK is a wire-visible
+break for every downstream client (threat T-113-43).
+
+**(4) Arm 1, step 2 — the three identifiers, two hits each.**
+
+```
+$ grep -n 'HEADER_MISMATCH' schema/vendored/core-2026-07-28/schema.ts
+434:export const HEADER_MISMATCH = -32020;
+468:    code: typeof HEADER_MISMATCH;
+
+$ grep -n 'MISSING_REQUIRED_CLIENT_CAPABILITY' schema/vendored/core-2026-07-28/schema.ts
+442:export const MISSING_REQUIRED_CLIENT_CAPABILITY = -32021;
+518:    code: typeof MISSING_REQUIRED_CLIENT_CAPABILITY;
+
+$ grep -n 'UNSUPPORTED_PROTOCOL_VERSION' schema/vendored/core-2026-07-28/schema.ts
+450:export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+488:    code: typeof UNSUPPORTED_PROTOCOL_VERSION;
+```
+
+Six hits, exactly two per identifier — one `const` declaration and one `code: typeof …` field —
+which is the expected shape.
+
+**(5) Arm 1, step 3 — the nine assertions.**
+
+| # | Assertion | Measured | Line | Verdict |
+|---|---|---|---|---|
+| 1 | `HEADER_MISMATCH` = `-32020` | `export const HEADER_MISMATCH = -32020;` | `:434` | ✓ |
+| 2 | `MISSING_REQUIRED_CLIENT_CAPABILITY` = `-32021` | `export const MISSING_REQUIRED_CLIENT_CAPABILITY = -32021;` | `:442` | ✓ |
+| 3 | `UNSUPPORTED_PROTOCOL_VERSION` = `-32022` | `export const UNSUPPORTED_PROTOCOL_VERSION = -32022;` | `:450` | ✓ |
+| 4 | `HeaderMismatchError` → HTTP `400 Bad Request` | ``status code MUST be `400 Bad Request`.`` | `:456` | ✓ |
+| 5 | `UnsupportedProtocolVersionError` → HTTP `400 Bad Request` | ``` `400 Bad Request`. ``` | `:476` | ✓ |
+| 6 | `MissingRequiredClientCapabilityError` → HTTP `400 Bad Request` | ``` `400 Bad Request`. ``` | `:506` | ✓ |
+| 7 | `supported` is a string array | `supported: string[];` | `:494` | ✓ |
+| 8 | `requested` is a string | `requested: string;` | `:498` | ✓ |
+| 9 | `requiredCapabilities` is a `ClientCapabilities` object | `requiredCapabilities: ClientCapabilities;` | `:523` | ✓ |
+
+All nine agree with the values landed under the exception. Steps 2–3 therefore **agree**, which
+selects row 1 of the step-4 table.
+
+**(6) PR #2678 re-check — mandated by `## Third Outcome Policy` at EVERY run.**
+
+```
+$ gh api repos/modelcontextprotocol/modelcontextprotocol/pulls/2678 \
+    --jq '{number,state,merged,draft,title,updated_at,additions,deletions,changed_files}'
+{"additions":582,"changed_files":7,"deletions":0,"draft":false,"merged":false,"number":2678,
+ "state":"open","title":"SEP-2678: Introduce additional error codes to protocol",
+ "updated_at":"2026-06-23T18:02:47Z"}
+```
+
+| Field | Value |
+|---|---|
+| `state` | **`open`** |
+| `merged` | `false` |
+| `draft` | `false` |
+| `updated_at` | `2026-06-23T18:02:47Z` — **unchanged** since plan 113-28 measured it |
+
+**PR #2678 does NOT touch the three constants under exception.** Its seven changed files are
+confined to `docs/` and `schema/draft/`; it touches no versioned schema directory, and grepping
+its full patch for `-32020`, `-32021`, `-32022`, `HEADER_MISMATCH`,
+`MISSING_REQUIRED_CLIENT_CAPABILITY` and `UNSUPPORTED_PROTOCOL_VERSION` returns **zero hits**. It
+proposes only the adjacent implementation-defined range:
+
+```
++export const SERVER_ERROR = -32000;
++export const NOT_FOUND = -32001;
++export const RESOURCE_NOT_FOUND = -32002;
+```
+
+The 2026-06-23 assessment stands unchanged, and it is now moot for this obligation in any case:
+the constants are confirmed against a **published** versioned directory, which a change to
+`schema/draft/` cannot retroactively alter.
+
+**(7) Arm 2 — RE-RUN by this task zero, not merely cited.**
+
+Half (a), the upstream predicate. The § B.1 pin still resolves
+(`a865118206d4d8cc8dbc5f5201607839281d0c3b`, 2026-07-23). Conformance `main` HEAD today is
+`74edef34d674f563537be8c6587cebaa58e830ca` (2026-08-17) — **newer than the
+`5cc567c39912bc6105b14287d42abed2956e7955` the 2026-07-27 run measured**, so this is a genuinely
+new observation rather than a repeat. `advertisesSubscriptions` has moved to `:997` (block
+`992-1025`), and a byte-level `diff` of § B.6.2's verbatim quotation against that range is
+**empty, 34 lines against 34 lines**. The disjunct set is unchanged:
+
+```
+discoverCapabilities?.tools?.listChanged
+discoverCapabilities?.prompts?.listChanged
+discoverCapabilities?.resources?.listChanged
+discoverCapabilities?.resources?.subscribe
+```
+
+Per § B.6.3, a changed line number is not drift and a changed disjunct set is. The set is
+identical, so the result is **NO DRIFT**.
+
+Half (b), the in-repo half:
+
+```
+$ cargo nextest run -E 'binary(v2_conformance_pin)' --features full
+    Starting 5 tests across 1 binary (132 binaries skipped)
+        PASS pmcp::v2_conformance_pin pinned_disjunct_list_matches_pmcp_supported_flags
+        PASS pmcp::v2_conformance_pin b6_quotes_the_predicate_verbatim
+        PASS pmcp::v2_conformance_pin every_pinned_disjunct_maps_to_a_pmcp_counterpart
+        PASS pmcp::v2_conformance_pin advertises_subscriptions_over_the_pinned_combination_space
+        PASS pmcp::v2_conformance_pin b6_and_b1_record_the_same_conformance_sha
+     Summary [   0.009s] 5 tests run: 5 passed, 0 skipped
+```
+
+**5 tests run — a non-zero count, asserted deliberately.** The selector is `binary(...)`, never
+`test(...)`; `test(...)` matches zero tests here and still exits 0, and a zero-count run would be
+a failure of this check masquerading as a pass.
+
+Arm 2 is therefore recorded **twice**: by its 2026-07-27 NO-DRIFT run at `§ B.6.5`, and by this
+independent re-run against newer upstream. The ambiguity in *"both arms run and recorded"* — over
+whether "run" means "run by the discharging plan" — is removed rather than argued.
+
+**(8) Computed landing state.**
+
+| Step-1 result | Landing state | This run |
+|---|---|---|
+| the directory EXISTS and steps 2-3 agree | `PUBLISHED-CONFIRMED` | ← **this row** |
+| the directory EXISTS and steps 2-3 disagree | `PUBLISHED-DRIFT` | not reached |
+| the directory still DOES NOT EXIST | `STILL-ABSENT` | not reached (2026-07-26's row) |
+
+**Landing state: `PUBLISHED-CONFIRMED`, via row 1.** Both arms have been run and recorded, which
+is the shared landing rule's precondition, so the `## Verdict` above is upgraded and the eleven
+requirements — HTTP-01 … HTTP-08, CLNT-01, CLNT-02, CLNT-05 — are flipped `[~]` → `[x]` in
+`.planning/REQUIREMENTS.md` by this same plan. The obligation is **DISCHARGED**; it no longer
+rolls forward.
+
+#### Boundary of this discharge — what it does NOT cover
+
+This discharge covers **only** the eleven requirements named in
+`## Third Outcome Policy § The rule` item 2. **TASK-01 … TASK-06 are untouched and remain `[~]`.**
+They are governed by a different record — `.planning/phases/114-tasks-extension-migration/114-SPEC-RECHECK.md`
+— under the DQ6 *both-repositories* trigger, whose landing state is **`STILL-ABSENT`**. That was
+re-measured during this run rather than assumed: `modelcontextprotocol/ext-tasks` carries only
+`draft/` under `schema/`, with **zero tags and zero releases**. The core half of DQ6 is satisfied
+by `schema/2026-07-28/` above; the `ext-tasks` half is not, and a both-repositories trigger is not
+met by one repository. No requirement outside the eleven was flipped by this run.
 
 ---
 
