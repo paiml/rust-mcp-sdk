@@ -21,25 +21,36 @@
 
 ### Stateless HTTP & Multi-Round-Trip (HTTP)
 
-> **Status marker `[~]` — implemented, gated on the final schema.** Every `[~]` HTTP-0x and CLNT-0x
-> requirement below is **implemented and green** at Phase-113 HEAD, but none is marked complete.
-> **HTTP-09 was the exception: it was `[ ]`, not `[~]`** — a genuine open gap rather than a
-> publication-gated one, which is why it did not clear on 2026-07-28. It was **closed on the
-> merits by Phase 113.1** and now reads `[x]`; the hold below applies to the remaining `[~]`
-> requirements only.
-> `113-SPEC-RECHECK.md`'s `## Verdict` is still `PENDING`: as re-verified on 2026-07-26 there is
-> no `schema/2026-07-28` directory upstream, so the wire constants Phase 113 landed
-> (`-32020`/`-32021`/`-32022`) are **pre-final values held under a written developer exception**.
-> The exception's re-verification obligation is binding and a mismatch is a phase-reopening
-> event. Re-run the checkpoint on or after 2026-07-28 and flip these to `[x]` only then.
+> **✅ HOLD DISCHARGED 2026-08-18 — these requirements are now `[x]`.** Phase 119 task zero (plan
+> `119-01`) ran **both arms** of `113-SPEC-RECHECK.md`'s re-verification obligation and upgraded
+> its `## Verdict` from `PENDING` to **`PUBLISHED-CONFIRMED`**. `schema/2026-07-28/` exists
+> upstream; its two blobs are byte-identical to the vendored pin at
+> `schema/vendored/core-2026-07-28/` (`9b55feeb…`/98426, `213c58f6…`/181474); and the three wire
+> constants `-32020`/`-32021`/`-32022` are **confirmed against the published schema** rather than
+> held as pre-final values under the developer exception. Arm 2 (the conformance predicate) was
+> re-run in the same pass with NO DRIFT and `binary(v2_conformance_pin)` passing 5/5. The full
+> dated run record is `113-SPEC-RECHECK.md` `### Verdict re-verification — Phase 119 task zero
+> (2026-08-18)`.
+>
+> *Historical note, retained rather than deleted:* every HTTP-0x and CLNT-0x requirement below
+> carried `[~]` — implemented and green at Phase-113 HEAD, but gated on publication — from
+> Phase 113 until this discharge. **HTTP-09 was the exception: it was `[ ]`, not `[~]`** — a
+> genuine open gap rather than a publication-gated one, which is why it did not clear on
+> 2026-07-28; it was **closed on the merits by Phase 113.1**. The obligation was re-verified
+> `STILL-ABSENT` on 2026-07-26 and rolled forward from there.
+>
+> **⚠ This discharge covers ONLY the eleven HTTP-0x / CLNT-0x requirements. TASK-01..06 remain
+> `[~]`** — they are gated by `114-SPEC-RECHECK.md` under the DQ6 *both-repositories* trigger,
+> which is still **`STILL-ABSENT`**: re-measured 2026-08-18, `modelcontextprotocol/ext-tasks`
+> carries only `draft/` under `schema/`, with zero tags and zero releases.
 
-- [~] **HTTP-01**: v2 HTTP requests run with no `initialize` handshake and no `Mcp-Session-Id`, era-gated onto the existing `stateless()` branch; v1 session behavior is unchanged — *implemented; pending final schema*
-- [~] **HTTP-02**: A server handler can return `input_required` with `inputRequests` and an opaque `requestState` that is integrity-protected, principal-bound, and TTL'd — *implemented; pending final schema*
-- [~] **HTTP-03**: A client retry of the original request carrying `inputResponses` + echoed `requestState` resumes the operation correctly (multi-round-trip elicitation end-to-end) — *implemented; pending final schema*
-- [~] **HTTP-04**: On the v2 path, `resources/subscribe`/`unsubscribe` are removed and change notifications are instead delivered over a `subscriptions/listen` long-lived stream — *implemented; pending final schema*
-- [~] **HTTP-05**: SSE resumability (`Last-Event-ID`) is not offered on the v2 path, and a regression test proves response JSON-RPC ids are always derived from the live request (the id-replay / discovery-cache bug class) — *implemented; pending final schema*
-- [~] **HTTP-06**: The HTTP GET stream endpoint is not served on the v2 path (transport-level removal, distinct from HTTP-04's method-level removal) — *implemented; pending final schema*
-- [~] **HTTP-07**: The `subscriptions/listen` stream's frame protocol: `notifications/subscriptions/acknowledged` is the mandatory first frame, and every notification **delivered on a subscription stream** carries `io.modelcontextprotocol/subscriptionId` tagging (the key is REQUIRED on `SubscriptionsListenResultMeta` but OPTIONAL on `NotificationMetaObject` — it is absent for notifications not delivered via a subscription, so this is a stream-path obligation, not a universal type requirement) — *implemented; pending final schema*
+- [x] **HTTP-01**: v2 HTTP requests run with no `initialize` handshake and no `Mcp-Session-Id`, era-gated onto the existing `stateless()` branch; v1 session behavior is unchanged — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-02**: A server handler can return `input_required` with `inputRequests` and an opaque `requestState` that is integrity-protected, principal-bound, and TTL'd — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-03**: A client retry of the original request carrying `inputResponses` + echoed `requestState` resumes the operation correctly (multi-round-trip elicitation end-to-end) — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-04**: On the v2 path, `resources/subscribe`/`unsubscribe` are removed and change notifications are instead delivered over a `subscriptions/listen` long-lived stream — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-05**: SSE resumability (`Last-Event-ID`) is not offered on the v2 path, and a regression test proves response JSON-RPC ids are always derived from the live request (the id-replay / discovery-cache bug class) — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-06**: The HTTP GET stream endpoint is not served on the v2 path (transport-level removal, distinct from HTTP-04's method-level removal) — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **HTTP-07**: The `subscriptions/listen` stream's frame protocol: `notifications/subscriptions/acknowledged` is the mandatory first frame, and every notification **delivered on a subscription stream** carries `io.modelcontextprotocol/subscriptionId` tagging (the key is REQUIRED on `SubscriptionsListenResultMeta` but OPTIONAL on `NotificationMetaObject` — it is absent for notifications not delivered via a subscription, so this is a stream-path obligation, not a universal type requirement) — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
 
 > **⚠ HTTP-07 rests on the least-settled part of the spec.** Both its obligations are **post-RC
 > additions**: at tag `2026-07-28-RC`, `grep -c subscriptionId` = 0, and the acknowledgement
@@ -47,13 +58,21 @@
 > **PR #3006 still targets this exact surface**. This is the highest-drift-risk requirement in the
 > phase — see `113-SPEC-RECHECK-ADDENDUM-2026-07-26.md` Finding 9.
 
-- [~] **HTTP-08**: Subscription delivery is opt-in and self-consistent: the four capability opt-ins (`toolsListChanged`/`promptsListChanged`/`resourcesListChanged`/`resourceSubscriptions`) gate the stream; a server advertising none may answer `subscriptions/listen` with method-not-found and remain conformant **per the conformance suite's SKIPPED grading and the spec's generic method-not-found rule** (the spec says nothing about this for `subscriptions/listen` specifically); a tripwire test enforces that advertising any subscription capability obliges serving the stream — **this advertise-implies-serve rule is CONFORMANCE-SUITE POLICY, not spec: it comes from `conformance/src/scenarios/server/stateless.ts:988-1015`, and no spec sentence creates it** — *implemented; pending final schema*
+- [x] **HTTP-08**: Subscription delivery is opt-in and self-consistent: the four capability opt-ins (`toolsListChanged`/`promptsListChanged`/`resourcesListChanged`/`resources.subscribe`) gate the stream; a server advertising none may answer `subscriptions/listen` with method-not-found and remain conformant **per the conformance suite's SKIPPED grading and the spec's generic method-not-found rule** (the spec says nothing about this for `subscriptions/listen` specifically); a tripwire test enforces that advertising any subscription capability obliges serving the stream — **this advertise-implies-serve rule is CONFORMANCE-SUITE POLICY, not spec: it comes from `conformance/src/scenarios/server/stateless.ts:983-1016`, and no spec sentence creates it** — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
 
 > **⚠ HTTP-08 is gated on a source the schema re-check cannot see.** Its predicate lives in the
 > **conformance repo**, not the schema — `subscriptions.mdx` contains no capability-gating rule and
 > `ServerCapabilities` has no `subscriptions` capability. `113-SPEC-RECHECK.md` pins only a schema
 > sha, so drift in `advertisesSubscriptions` is undetectable by the current gate. The gate needs a
 > second arm pinning a conformance-repo sha (currently `a865118206d4d8cc8dbc5f5201607839281d0c3b`).
+>
+> **✅ SATISFIED — plan 113-32 added exactly that second arm.** See `113-SPEC-RECHECK.md` `§ B.6`
+> (the `advertisesSubscriptions` predicate pinned verbatim) and `§ Arm 2` of the re-verification
+> obligation. The arm is live and has been run twice: NO DRIFT on 2026-07-27 (`§ B.6.5`), and NO
+> DRIFT again on 2026-08-18 by Phase 119 task zero against a newer conformance `main` HEAD
+> (`74edef34…`), where the predicate diffed byte-identical (34/34 lines) and
+> `binary(v2_conformance_pin)` passed 5/5. The gate can now see this source; the sentence above is
+> retained as the record of what was missing, not as an open item.
 
 - [x] **HTTP-09**: Every peer-controlled read on the v2 transport path is memory-bounded. Closure is **enumerable, not narrative**: a tripwire test asserts that no unbounded whole-body read (`.collect()`, `read_to_end`) and no unbounded accumulation over peer-supplied bytes exists in `src/shared/`, `src/client/subscriptions.rs`, or `src/server/streamable_http_server.rs` outside an explicit reviewed allowlist, and that no scan over peer-chosen input is worse than O(n).
 
@@ -908,11 +927,11 @@ checkboxes a verifier can fail on.
 
 ### Client & Agents on v2 (CLNT)
 
-- [~] **CLNT-01**: The pmcp `Client` can speak v2: per-request `_meta` emission, `server/discover`, required headers, no `initialize` — selected explicitly per connection — *implemented; pending final schema*
-- [~] **CLNT-02**: The pmcp `Client` fulfills MRTR `input_required` results by producing `inputResponses` — the Phase-106 host handlers (sampling/elicitation/roots) are folded into this flow on v2 — *implemented; pending final schema*
+- [x] **CLNT-01**: The pmcp `Client` can speak v2: per-request `_meta` emission, `server/discover`, required headers, no `initialize` — selected explicitly per connection — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
+- [x] **CLNT-02**: The pmcp `Client` fulfills MRTR `input_required` results by producing `inputResponses` — the Phase-106 host handlers (sampling/elicitation/roots) are folded into this flow on v2 — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
 - [x] **CLNT-03**: `pmcp-agent` (including its `ToolInvoker` and task polling) works end-to-end against a v2 server
 - [x] **CLNT-04**: `mcp-tester` can exercise a v2 server (headers, discover, stateless flow) for dual-version testing
-- [~] **CLNT-05**: The pmcp `Client` exposes `subscriptions_listen` returning a typed `SubscriptionStream` of notifications, and the retired `subscribe_resource`/`unsubscribe_resource` methods fail fast with a typed `retired_on_v2` error on v2 (client half of HTTP-04/07/08) — *implemented; pending final schema*
+- [x] **CLNT-05**: The pmcp `Client` exposes `subscriptions_listen` returning a typed `SubscriptionStream` of notifications, and the retired `subscribe_resource`/`unsubscribe_resource` methods fail fast with a typed `retired_on_v2` error on v2 (client half of HTTP-04/07/08) — *verified 2026-08-18; 113-SPEC-RECHECK PUBLISHED-CONFIRMED*
 
 ### Simplification & v1 Sunset (SMPL)
 
