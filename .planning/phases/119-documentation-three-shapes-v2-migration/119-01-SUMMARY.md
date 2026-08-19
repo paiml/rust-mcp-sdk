@@ -37,6 +37,7 @@ decisions:
   - "Proceed on the one-way ledger discharge was taken by the user at the Task-0 checkpoint, conditional on this plan's own re-run agreeing with the recorded evidence."
   - "Arm 2 was RE-RUN rather than cited (A-03). It landed against a newer conformance main HEAD (74edef34, 2026-08-17) than the 2026-07-27 record, so it is an independent observation rather than a restatement."
   - "The trailing `— *implemented; pending final schema*` annotation was updated on the eleven flipped lines. It is `[~]`-marker metadata, not requirement prose — see Deviation 1."
+  - "DOCS-05 was NOT booked complete by this plan, despite being in its frontmatter — this plan writes no documentation, and five later plans in the phase also claim it. See Deviation 4."
 
 metrics:
   duration: "~35 min"
@@ -108,6 +109,14 @@ Three deviations, all **Rule 1** (auto-fix a defect *introduced by this task's o
 - **Issue:** It asserted "`## Verdict` is still `PENDING`" and "**Arm 1 remains open** and the obligation as a whole is still undischarged". Plan Edit C named only the checklist clause at `:2219`, but this block is part of the same Phase 113 marker and directly contradicted the new state.
 - **Fix:** Rewrote to record reason (2) discharged and both arms run, while stating twice that **reason (1) is untouched**. Scoped `Edit`, never `Write`.
 - **Files:** `.planning/ROADMAP.md` — **Commit:** `34836231`
+
+**4. [Rule 1 — Bug] DOCS-05 was booked `[x]` by the state-update step and REVERTED**
+
+- **Found during:** post-task state updates
+- **Issue:** The GSD state-update convention says to pass the plan frontmatter's `requirements:` IDs to `requirements mark-complete`. This plan's frontmatter carries `[DOCS-05]`, so that call flipped `DOCS-05` to `[x]` (`:957`) and its traceability row to `Complete` (`:1129`). **Both are false.** DOCS-05 is *"v2 migration guide + dual-version documentation"* — and this plan wrote **no documentation at all**; it is a ledger-discharge plan. DOCS-05 is claimed by **six** plans in this phase (`119-01/05/08/09/10` plus `119-06`'s sibling coverage), and the migration chapter itself — `ch12-17-migrating-to-mcp-2026-07-28.md`, plan `119-05` — does not yet exist. The convention assumes a 1:1 requirement↔plan mapping that does not hold here.
+- **Fix:** `git checkout -- .planning/REQUIREMENTS.md` to restore the committed state. `DOCS-05` reads `[ ]` / `Pending` again; the eleven HTTP/CLNT flips and the six `[~]` TASK rows are unaffected (re-verified: `x_inscope=11`, `task_tilde=6`). **DOCS-05 should be booked by the last plan that actually satisfies it, not by this one.**
+- **Why this matters here specifically:** booking a requirement complete on evidence that does not support it is the exact defect class this entire plan exists to prevent — and `REQUIREMENTS.md` already carries two recorded instances of it (`:301`, *"`115-13`'s `[x]` was premature — for the SECOND time on this requirement"*). Letting it through in the commit that settles eleven other requirements would have been self-refuting.
+- **Files:** `.planning/REQUIREMENTS.md` (reverted; net zero change) — **Commit:** n/a (no false state was committed)
 
 **Not a deviation, worth recording:** Task 1 produced **no commit**, by design — the plan scopes it to a gitignored scratch capture (`target/`). Its evidence is durable because Task 2 transcribes it into the ledger.
 

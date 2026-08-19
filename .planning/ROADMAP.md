@@ -2936,12 +2936,12 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: 10 plans across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+**Plans**: 1/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
 
 Plans:
 **Wave 1**
 
-- [ ] 119-01-PLAN.md — Task zero: discharge the Phase-113 arm-1 hold, upgrade the `## Verdict` to `PUBLISHED-CONFIRMED`, flip the eleven HTTP/CLNT requirements (D-01, one-way, checkpoint-gated)
+- [x] 119-01-PLAN.md — Task zero: discharge the Phase-113 arm-1 hold, upgrade the `## Verdict` to `PUBLISHED-CONFIRMED`, flip the eleven HTTP/CLNT requirements (D-01, one-way, checkpoint-gated)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
