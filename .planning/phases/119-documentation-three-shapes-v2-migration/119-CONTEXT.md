@@ -33,9 +33,9 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
 
 ### Relationship to Phase 113's undischarged hold
 
-- **D-01: Phase 119's first plan is "task zero" — it formally runs and records Phase 113's
+- **D-01: Phase 119's first plan is "task zero"** — it formally runs and records Phase 113's
   arm-1 re-verification, upgrades `113-SPEC-RECHECK.md`'s `## Verdict`, and flips HTTP-01..08
-  and CLNT-01/02/05 from `[~]` to `[x]`.** Docs are then written against a settled, recorded
+  and CLNT-01/02/05 from `[~]` to `[x]`. Docs are then written against a settled, recorded
   surface with no `[~]` hedging anywhere.
 
   **The measurement is already done — it was taken during this discussion (2026-08-18) and
@@ -95,8 +95,8 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
   - `pmcp-book/src/ch21-migration.md` — an 11-line "Coming Soon" stub in *Part VI: TypeScript
     SDK Compatibility*, i.e. **TypeScript → Rust**
 
-- **D-05: Naming convention — protocol eras keep `v1`/`v2`; the crate is ALWAYS written with its
-  name attached ("pmcp 2.19"), never bare "v2.0".** Era naming matches the entrenched code
+- **D-05: Naming convention** — protocol eras keep `v1`/`v2`; the crate is ALWAYS written with its
+  name attached ("pmcp 2.19"), never bare "v2.0". Era naming matches the entrenched code
   vocabulary a reader will meet (`v1-compat`, `full-v2`, `v1_session.rs`, `s47_v2_*`,
   `docs/v1-sunset-policy.md`). Each new doc opens with a one-line disambiguation callout.
   Rejected: always-dated eras ("MCP 2026-07-28") — unambiguous in prose but diverges from the
@@ -140,8 +140,8 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
   chapter** — book-and-README only. This tracks the requirement wording literally: DOCS-04 names
   "README/course"; DOCS-05 does not mention the course.
 
-- **D-10: Docs cite examples by their FULL runnable cargo invocation, never a bare number.
-  No renumbering, no new index page.** e.g.
+- **D-10: Docs cite examples by their FULL runnable cargo invocation, never a bare number.**
+  No renumbering, no new index page. e.g.
   `cargo run -p pmcp-agent --example s50_standalone_vs_sampled`.
 
   The numbered namespace has collided — `s49` appears twice in root `examples/`
@@ -160,8 +160,8 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
 
 ### Runnable v2 examples (DOCS-06)
 
-- **D-12: The existing examples satisfy DOCS-06's runnable requirement as-is — the phase writes
-  NO new example code.** "Lambda-style" is read as the **stateless architecture**, which
+- **D-12: The existing examples satisfy DOCS-06's runnable requirement as-is** — the phase writes
+  NO new example code. "Lambda-style" is read as the **stateless architecture**, which
   `examples/s47_v2_stateless_mrtr.rs` already demonstrates (no `initialize`, no
   `Mcp-Session-Id`, AEAD-sealed `requestState`, resumption across an independent HTTP request).
   What is missing is **prose**, and that is what the phase adds:
@@ -176,8 +176,8 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
   Rejected: writing a new Lambda-deployable example (new code in a docs phase, plus a deploy
   story to keep working), and making the lambda crate era-aware (touches a shipped crate).
 
-- **D-13: "Verified against the shipped code" gets a real mechanism — spawn-and-assert run tests
-  for the cited examples, PLUS a repair of `make test-examples`.**
+- **D-13: "Verified against the shipped code" gets a real mechanism** — spawn-and-assert run tests
+  for the cited examples, PLUS a repair of `make test-examples`.
 
   Neither existing mechanism verifies anything today:
   - `Makefile:255` `test-examples` states "Examples are built but **not run** to avoid blocking
@@ -200,7 +200,7 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
   `examples/26-server-tester`'s 8 residual errors logged). The gate lands green against a
   **recorded baseline**, not against zero.
 
-- **D-15: The cited/gated set is SIX examples across three crates:**
+- **D-15: The cited/gated set is SIX examples across three crates**:
 
   | Example | Crate | Requirement |
   |---|---|---|
@@ -214,6 +214,54 @@ doctests; renumbering examples; UNAS-01 (SEP-2243 `x-mcp-header`, carried to v2.
   Requirement-named, plus the one pairing that makes a named example usable.
   `s54_v2_dual_conformance` was considered and left out — it already runs under the conformance
   suite and widening the gated set beyond what DOCS-04/06 name was declined.
+
+### The ch10 transport chapters (resolved after research, 2026-08-18)
+
+- **D-16: The two stale `ch10` transport chapters are scoped IN, minimal-touch** (research option
+  B) — as a single plan task, with an explicit acceptance criterion that NO code block in either
+  chapter is modified. This settles the `<deferred>` item below; the researcher measured the
+  surface and the user chose option B over leaving it out (A) or rewriting the taxonomy (C).
+
+  What the task does, and nothing more:
+
+  1. Make the two protocol-version lines era-aware — `pmcp-book/src/ch10-transports.md:572` and
+     `pmcp-book/src/ch10-03-streamable-http.md:73`, both under a "Headers enforced by the server"
+     bullet, both currently naming only `2025-11-25`. Two-token edits.
+  2. Add ONE `> **Era note**` callout at the head of `## Understanding Streamable HTTP Modes`
+     (`ch10-transports.md:184-273`) stating that the three modes documented there are **v1
+     build-time** modes and that v2 statelessness is **per-request and orthogonal**, linking the
+     new migration chapter's server track (D-06). **The callout must ALSO cover SSE resumption**
+     — see the correction below.
+  3. Add the D-05 one-line era-disambiguation callout at the top of each of the two chapters.
+
+  **CORRECTION to research § F-1 (found by the pattern mapper, verified 2026-08-18).** F-1
+  reported that `Last-Event-ID` appears **zero** times in either chapter and concluded "the
+  exposure is omission, not contradiction." That grep used the wrong casing. The real spelling is
+  `Last-Event-Id`, and it appears **three** times:
+
+  | Location | Text |
+  |---|---|
+  | `ch10-transports.md:257` | `- Supports resumption via \`Last-Event-Id\` header` — **inside Mode 3 of the very taxonomy D-16.2 targets** |
+  | `ch10-transports.md:577` | `- **\`Last-Event-Id\`**: For SSE resumption after reconnection` |
+  | `ch10-03-streamable-http.md:76` | `- \`Last-Event-Id\`: For SSE resumption` |
+
+  So the chapters DO make resumption claims, and those claims are v1-only. The `> **Era note**`
+  in step 2 must therefore state that **SSE resumption via `Last-Event-Id` is a v1 mechanism**
+  alongside the sessions point — otherwise the callout leaves a live contradiction in the same
+  section it is there to fix. Option B still holds: this is additional callout prose, not a
+  code-block edit and not a rewrite.
+
+  **Why this and not the alternatives.** The measured protocol-version staleness is one line per
+  chapter. The real defect is that
+  `## Understanding Streamable HTTP Modes` teaches statelessness as a build-time config choice
+  (`session_id_generator: None`, `ch10-transports.md:188-206`), which
+  `examples/s47_v2_stateless_mrtr.rs:19-22` falsifies for v2 in its own header — a reader chasing
+  v2 statelessness would disable v1 sessions unnecessarily. That is behavioural, not cosmetic, and
+  it contradicts the very example this phase cites as DOCS-06's proof. Option C (a ~250-line
+  four-mode rewrite) was rejected: it duplicates D-06's server track and re-opens three further
+  sections, turning a docs phase into a chapter rewrite.
+  — **Reversibility:** reversible — additive prose in two existing chapters, no code blocks
+  touched, no structural or ledger change.
 
 ### Claude's Discretion
 
@@ -369,6 +417,8 @@ None — every area presented was decided explicitly.
   `Last-Event-ID`). Raised, explicitly not settled — the user chose to move on rather than scope
   it. **The researcher should scope this and propose in/out**; the same D-07 argument (fix
   staleness where readers already are) applies, but so does the docs-phase scope limit.
+  — **RESOLVED 2026-08-18 after research (§ F-1): scoped IN, minimal-touch. See D-16 above.**
+  No longer deferred.
 - **Enabling mdbook doctests** — `pmcp-book/book.toml:77-79` disables them behind a
   `TODO: Enable when PMCP is published or configure test dependencies`. Declined in D-13 as the
   largest-scope option. Two live consequences: no book code block is compile-checked, and that

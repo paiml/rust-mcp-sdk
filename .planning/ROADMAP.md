@@ -2936,7 +2936,19 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: TBD
+**Plans**: 10 plans across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+
+Plans:
+- [ ] 119-01-PLAN.md — Task zero: discharge the Phase-113 arm-1 hold, upgrade the `## Verdict` to `PUBLISHED-CONFIRMED`, flip the eleven HTTP/CLNT requirements (D-01, one-way, checkpoint-gated)
+- [ ] 119-02-PLAN.md — TRACER: "Agents as MCP Clients" end-to-end across three shapes — chapter + SUMMARY re-parent + README section + run-test helper + `mdbook build` negative control
+- [ ] 119-03-PLAN.md — Example-build gate: baseline the pre-existing surface (D-14), then make `make test-examples` strict and observe it red (D-13)
+- [ ] 119-04-PLAN.md — Example run-test completion: the remaining DOCS-04 legs plus the DOCS-06 s47/s48/s53 socket leg (D-15)
+- [ ] 119-05-PLAN.md — v2 migration chapter by role (server/client/agent) + the `[CONSUMER-OBSERVABLE]` disclosure sentinel (D-02/D-03a/D-04/D-05/D-06/D-12)
+- [ ] 119-06-PLAN.md — pmcp-course Part VIII ch24 Agents & Teams chapter + tiered exercises (D-09)
+- [ ] 119-07-PLAN.md — Agent Teams book chapter, completing Phase 111's three named chapters (D-08)
+- [ ] 119-08-PLAN.md — In-place era amendments: `ch12-7-tasks.md` with a provisionality callout (D-07) and the two `ch10` transport chapters, no code block touched (D-16)
+- [ ] 119-09-PLAN.md — README `## Protocol Versions`, refreshed release header, extended Examples block, CHANGELOG heading fixes (D-11)
+- [ ] 119-10-PLAN.md — Disclosure tripwire (D-03b) + the full phase gate (quality-gate, both `mdbook build`s, ledger parse, packaging review)
 
 ## Progress — v2.5 Milestone (MCP Spec 2026-07-28 v2 Support)
 
