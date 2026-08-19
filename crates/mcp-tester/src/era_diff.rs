@@ -52,7 +52,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::era_observations::{EraObservations, ObservedValue};
-use crate::report::TestReport;
+use crate::report::{TestReport, TestResult, TestStatus};
 
 /// One expected v1-vs-v2 difference: a difference that is CORRECT BY DESIGN.
 ///
@@ -434,6 +434,32 @@ impl DualRunReport {
             writeln!(w, "Note        : {note}")?;
         }
         writeln!(w)?;
+
+        // The v2 suite's FAILING tests, named.
+        //
+        // Only v2 is rendered here, and that asymmetry is deliberate: the v1
+        // report is the one this command RETURNS, so `handle_command_result`
+        // already prints it in full as `TEST RESULTS`. The v2 report has no
+        // such outlet — before this block it existed in `DualRunReport` and was
+        // never shown, so `v2 suite : N tests, 1 failed` was the entire signal a
+        // user got. A count without an identity cannot be acted on; a real
+        // deployed server is what exposed it.
+        let v2_failures: Vec<&TestResult> = self
+            .v2_report
+            .tests
+            .iter()
+            .filter(|t| t.status == TestStatus::Failed)
+            .collect();
+        if !v2_failures.is_empty() {
+            writeln!(w, "V2 SUITE FAILURES ({})", v2_failures.len())?;
+            for test in v2_failures {
+                writeln!(w, "  {} [{:?}]", test.name, test.category)?;
+                if let Some(error) = &test.error {
+                    writeln!(w, "      {error}")?;
+                }
+            }
+            writeln!(w)?;
+        }
 
         for class in [
             DifferenceClass::Unexpected,
@@ -848,6 +874,67 @@ mod comparison {
         assert!(
             text.contains("method.initialize (ERA-01)\n"),
             "a non-provisional MISSING must NOT be marked:\n{text}"
+        );
+    }
+
+    /// A v2-only failure must be IDENTIFIABLE from the dual-run render.
+    ///
+    /// Regression fence for the gap a real deployed server exposed: the header
+    /// said `v2 suite : 19 tests, 1 failed` and NOTHING anywhere named the
+    /// failing test — not in `pretty`, not in `json`, not at `-v 3`. A failure
+    /// count with no failure identity is the "a red that says only `assertion
+    /// failed`" shape this repository polices everywhere else; for a tool whose
+    /// entire job is diagnosing someone else's server it is the difference
+    /// between a usable report and a dead end.
+    ///
+    /// The data was never missing — `DualRunReport` has always carried
+    /// `v2_report` in full. Only the renderer dropped it.
+    #[test]
+    fn a_v2_only_failure_is_named_in_the_render() {
+        use crate::report::TestCategory;
+        use std::time::Duration;
+
+        let mut v2_report = TestReport::new();
+        v2_report.add_test(TestResult::failed(
+            "Core: initialize handshake",
+            TestCategory::Core,
+            Duration::from_millis(12),
+            "expected no initialize on v2, server answered one",
+        ));
+        v2_report.add_test(TestResult::passed(
+            "Tools: list returns valid ToolInfo",
+            TestCategory::Tools,
+            Duration::from_millis(3),
+            "Found 10 tools",
+        ));
+
+        let report = DualRunReport {
+            schema_version: 1,
+            era_support: "dual".into(),
+            v1_report: TestReport::new(),
+            v2_report,
+            v1_observations: EraObservations::default(),
+            v2_observations: EraObservations::default(),
+            differences: Vec::new(),
+            suspicion: None,
+            note: None,
+        };
+        let mut sink = Vec::<u8>::new();
+        report.print_to_writer(&mut sink).expect("render");
+        let text = String::from_utf8(sink).expect("utf8");
+
+        assert!(
+            text.contains("Core: initialize handshake"),
+            "the failing v2 test must be NAMED, not just counted:\n{text}"
+        );
+        assert!(
+            text.contains("expected no initialize on v2, server answered one"),
+            "the failure REASON must travel with the name:\n{text}"
+        );
+        assert!(
+            !text.contains("Tools: list returns valid ToolInfo"),
+            "only FAILURES belong in this section; a passing v2 test would bury \
+             the signal:\n{text}"
         );
     }
 
