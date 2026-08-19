@@ -89,6 +89,17 @@ jobs:
     - name: Build
       run: cargo build --all-features --verbose
     
+    # `tests/docs04_examples_run.rs` RUNS two example binaries that live in
+    # OTHER workspace packages, and it FAILS (by design, never skips) when they
+    # are absent. `cargo test --all-features` below does not produce them:
+    # default target selection compiles examples only for the selected package,
+    # and at the workspace root that is `pmcp` alone — `crates/*/examples/` is
+    # never reached. Measured by deleting
+    # `target/debug/examples/s50_standalone_vs_sampled` and running
+    # `cargo build --all-features --examples`, which did not recreate it.
+    - name: Build cross-crate example binaries the run legs assert on
+      run: cargo build -p pmcp-agent -p pmcp-team-servers --all-features --examples
+
     - name: Run tests
       run: cargo test --all-features --verbose -- --test-threads=1
 

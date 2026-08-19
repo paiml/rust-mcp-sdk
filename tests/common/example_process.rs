@@ -69,19 +69,6 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Spawn a built example binary at `target/{rel_path}`, handing it `bind_addr` as
-/// its sole argument, and return the parsed address plus the reaping guard.
-///
-/// FAILS rather than skipping when the binary is absent, by design: a skip would
-/// restore the unenforced "the example demonstrates the fix" criterion that the
-/// consuming legs exist to close.
-///
-/// Both streams are `Stdio::null()`, matching what the two consuming legs did
-/// independently: the child logs to stderr, which would otherwise interleave with
-/// the harness' own captured output for no diagnostic gain. Do not "improve" this
-/// to `Stdio::piped()` without also draining the pipe — a full buffer would wedge
-/// the example mid-run and present as a bind timeout rather than as the block it
-/// is.
 /// Resolve `target/{rel_path}` to a built example binary, or FAIL.
 ///
 /// Shared by [`spawn_example`] and [`run_example_to_completion`] so the
@@ -113,6 +100,20 @@ fn resolve_example_binary(
     (binary, example_name)
 }
 
+/// Spawn a built example binary at `target/{rel_path}`, handing it `bind_addr` as
+/// its sole argument, and return the parsed address plus the reaping guard.
+///
+/// FAILS rather than skipping when the binary is absent, by design: a skip would
+/// restore the unenforced "the example demonstrates the fix" criterion that the
+/// consuming legs exist to close.
+///
+/// Both streams are `Stdio::null()`, matching what the two consuming legs did
+/// independently: the child logs to stderr, which would otherwise interleave with
+/// the harness' own captured output for no diagnostic gain. Do not "improve" this
+/// to `Stdio::piped()` without also draining the pipe — a full buffer would wedge
+/// the example mid-run and present as a bind timeout rather than as the block it
+/// is. [`run_example_to_completion`] is the piped-AND-drained shape for the legs
+/// whose evidence is what the child prints.
 pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard) {
     let (binary, _example_name) = resolve_example_binary(rel_path, |name| {
         format!("`cargo build --features full --example {name}`")
@@ -162,11 +163,18 @@ impl Drain {
     }
 
     /// Everything read SO FAR. Never blocks on the reader.
+    ///
+    /// A POISONED mutex still yields its bytes. `unwrap_or_default()` was wrong
+    /// here: a drain thread that panicked mid-`extend_from_slice` would poison
+    /// the lock, this would answer with an EMPTY buffer, and the leg would report
+    /// "exited 0 but printed nothing on stdout" — blaming the example for the
+    /// harness' own panic, and discarding the captured evidence that would have
+    /// said so.
     fn captured(&self) -> Vec<u8> {
         self.captured
             .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -177,15 +185,24 @@ impl Drain {
 /// the child is still running: a timeout report that can only show output the
 /// reader already finished collecting would show nothing in exactly the case that
 /// matters.
+/// `ErrorKind::Interrupted` is RESUMED rather than treated as EOF. A signal
+/// delivered to the test process (`SIGCHLD` from the very child being polled,
+/// `SIGWINCH`, a debugger attach) can interrupt the blocking read, and treating
+/// that as end-of-stream would truncate the capture and report a successful run
+/// as "printed nothing on stdout". Every other error IS terminal: the write end
+/// is gone or the pipe is broken, and there is nothing further to read.
 fn drain_into(mut source: impl Read, sink: &Drain) {
     let mut chunk = [0_u8; 8192];
     loop {
         match source.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(_) => break,
             Ok(count) => {
-                if let Ok(mut buffer) = sink.captured.lock() {
-                    buffer.extend_from_slice(&chunk[..count]);
-                }
+                sink.captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..count]);
             },
         }
     }
@@ -244,6 +261,11 @@ pub struct ExampleLeg<'a> {
 /// of them now reaches every leg instead of the subset someone remembered.
 pub fn assert_ran_and_printed_banner(leg: &ExampleLeg<'_>, output: &Output) {
     let rel_path = leg.rel_path;
+    // Decoded ONCE and reused by all three assertions below: the previous shape
+    // decoded stdout twice (lazily inside the first assertion's format arguments,
+    // then eagerly for the banner match), which is one more place for the two
+    // renderings to drift apart in a message whose whole job is to be quotable.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
         "`{rel_path}` exited with {} rather than succeeding. {}\n\
@@ -252,11 +274,10 @@ pub fn assert_ran_and_printed_banner(leg: &ExampleLeg<'_>, output: &Output) {
         output.status,
         leg.claim,
         leg.rebuild,
-        String::from_utf8_lossy(&output.stdout),
+        stdout,
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stdout.trim().is_empty(),
         "`{rel_path}` exited 0 but printed nothing on stdout. The evidence this leg asserts on \
@@ -445,6 +466,17 @@ pub fn run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duratio
 /// before `test-integration`; CI's `test` job runs `cargo test --all-features`
 /// with default target selection, which compiles examples. A fresh checkout gives
 /// every source the same checkout mtime and the build necessarily follows it.
+///
+/// SCOPE, corrected: "default target selection compiles examples" is true only
+/// for the SELECTED PACKAGE. `cargo test --all-features` at the workspace root
+/// selects `pmcp` alone (there is no `default-members`), so it compiles ROOT
+/// `examples/` and NOTHING under `crates/*/examples/` — measured by deleting
+/// `target/debug/examples/s50_standalone_vs_sampled` and running
+/// `cargo build --all-features --examples`, which did not recreate it. Any leg
+/// resolving a `crates/*` example therefore needs an explicit
+/// `cargo build -p <crate> --examples` on every path that runs it; the
+/// exists-check in [`resolve_example_binary`], not this staleness guard, is what
+/// fails when that build is missing.
 fn assert_binary_is_not_stale(binary: &Path, example_name: &str) {
     let Some(binary_mtime) = modified_at(binary) else {
         // Unreadable metadata is not a staleness signal, and inventing one here

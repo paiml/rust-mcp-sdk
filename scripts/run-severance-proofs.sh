@@ -119,6 +119,24 @@ done
 # what stops the severed configuration silently rotting between releases: unlike
 # the lib-only build step, this one compiles every test target and every example
 # under `full-v2`.
+# `tests/docs04_examples_run.rs` RUNS two example binaries owned by OTHER
+# packages and FAILS (never skips) when they are absent. The aggregate command
+# below is `-p pmcp`, so cargo's default target selection never reaches
+# `crates/*/examples/` — measured: deleting
+# `target/debug/examples/s50_standalone_vs_sampled` and running
+# `cargo build --all-features --examples` does not recreate it.
+#
+# These two builds say NOTHING about pmcp's severed feature set — they are
+# separate packages with their own feature lists, built here purely so the leg
+# has its inputs. `--all-features` is deliberately NOT used (it is forbidden in
+# this script's commands by `tests/ci_severance_gate_wiring.rs`, and it would be
+# meaningless here anyway); `doc_review_team` declares
+# `required-features = ["runtime"]`, which is why that one build names it.
+echo ""
+echo "=== Example binaries the run legs assert on (separate packages) ==="
+cargo build -p pmcp-agent --examples
+cargo build -p pmcp-team-servers --features runtime --examples
+
 echo ""
 echo "=== Aggregate severed test build ==="
 aggregate_log="$log_dir/aggregate.log"

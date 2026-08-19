@@ -203,9 +203,19 @@ fn s49_sampling_host_runs_to_completion() {
 /// guard. The guard is therefore weaker here than for `S49_REL_PATH`, not
 /// vacuous. The compensating control is that every path which runs this leg
 /// builds the binary first with the explicit `-p pmcp-team-servers` command
-/// above: `make test-examples` before `test-integration` under
-/// `make quality-gate`, CI's `cargo test --all-features` (default target
-/// selection compiles examples), and this plan's own verification step.
+/// above: `make test-examples` (which runs `scripts/run-example-builds.sh`, and
+/// covers all three trees) before `test-integration` under `make quality-gate`,
+/// the explicit build step in the CI `test` job, the two `cargo build -p …
+/// --examples` lines in `scripts/run-severance-proofs.sh`, and this plan's own
+/// verification step.
+///
+/// CORRECTION, because an earlier version of this note named the wrong control:
+/// CI's `cargo test --all-features` does **not** build this binary. Default
+/// target selection compiles examples only for the SELECTED PACKAGE, and at the
+/// workspace root that is `pmcp` alone — `crates/*/examples/` is never reached.
+/// Measured: deleting `target/debug/examples/doc_review_team` and running
+/// `cargo build --all-features --examples` does not recreate it. That is why the
+/// explicit per-crate build steps above exist rather than being redundant.
 const DOC_REVIEW_TEAM_REL_PATH: &str = "debug/examples/doc_review_team";
 
 /// The budget for the `doc_review_team` leg.

@@ -101,6 +101,16 @@ exclude = [
     # This entry and the two paths it reads must never be split: exclude all three
     # or ship all three. That invariant is prose only — nothing enforces it.
     "tests/windows_disclosure_tripwire.rs",
+    # Same disposition as the four readers above, for a different missing input:
+    # two of this file's three legs run example binaries owned by
+    # `crates/pmcp-agent` and `crates/pmcp-team-servers`, and those directories
+    # carry their own Cargo.toml so cargo never packages them into `pmcp`. The
+    # leg FAILS rather than skips when a binary is absent — deliberately — so a
+    # shipped copy would panic under a downstream `cargo test` on the published
+    # crate with a binary it has no way to build. Its sibling
+    # tests/docs06_v2_examples_run.rs SHIPS, because every example it runs is a
+    # ROOT `examples/` target that does ship and that `cargo test` builds.
+    "tests/docs04_examples_run.rs",
 ]
 
 [dependencies]

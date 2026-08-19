@@ -56,6 +56,14 @@
 //! either client is diagnosed against a recording of both. This is the same house
 //! rule `tests/embedded_resource_example_run.rs` follows.
 //!
+//! ONE case is outside that rule, stated rather than implied: a client that
+//! never EXITS. `run_example_to_completion` panics on its own deadline, so an
+//! `s48` that hangs aborts this test before `s53` runs and before the artifact
+//! is written. Nothing is lost by it — that panic already carries the hung
+//! client's partial stdout and stderr, which is the same evidence the artifact
+//! would have held for that leg — but do not read the artifact's absence as
+//! "the legs did not run". A timeout red is diagnosed from the panic body.
+//!
 //! # Why the client legs need a budget at all
 //!
 //! These two are the highest-risk callers of `run_example_to_completion` in the
