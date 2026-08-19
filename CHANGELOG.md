@@ -96,7 +96,7 @@ gains `blob` and nothing else.
 
 Phase 119's migration guide is written against this section.
 
-## [2.18.0] - Unreleased
+## [2.18.0] - 2026-08-16
 
 SEP-2352 credential storage and OAuth discovery hardening (Phase 116). `pmcp`
 gains a credential-storage seam addressed by `(issuer, account, server)`, and
@@ -173,7 +173,7 @@ behaviour changes are called out below because both are visible to operators.
   and the header/body cross-check is unchanged wherever a name exists. Nothing
   about 2025-11-25 changes — the era decision is per request.
 
-## [2.17.0] - Unreleased
+## [2.17.0] - 2026-07-19
 
 Hosted-agent loop enablement (Phase 108). Three paired, fully **additive** core
 changes that let a tool handler call back into its client mid-request without

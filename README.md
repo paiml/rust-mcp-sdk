@@ -485,18 +485,51 @@ cargo run -p pmcp-agent --example s50_standalone_vs_sampled
 
 ---
 
-## Latest Release: v2.0.0
+## Protocol Versions
 
-**PMCP v2.0 — aligned with the MCP TypeScript SDK v2.0 release (2026-03-22):**
+PMCP speaks **two MCP protocol eras out of one binary**: **v1** (`2025-11-25`) and **v2**
+(`2026-07-28`). The era is negotiated **per request**, not per process — the same server answers a
+v1 client with sessions and a v2 client without them, concurrently, on the same port. You do not
+run two fleets, and you do not choose an era at build time.
 
-- **Protocol v2025-11-25**: Full alignment with the latest MCP specification, backward compatible with `2024-11-05`
+Throughout this project an era is written `v1`/`v2` with its date string, while the crate is always
+written with its name attached — "pmcp 2.18". A bare version number never means a protocol era.
+
+**Opting in, by role:**
+
+- **Servers** — nothing to do. A server built with the default features (or with `full`) already answers both eras.
+- **Clients** — one explicit call, `ClientBuilder::with_protocol_version(...)`. Without it a client stays on v1, exactly as before.
+- **Agents** — already done for you. `pmcp-agent`'s invoker prefers v2 and falls back to v1, so an agent scaffolded with `cargo pmcp agent new` speaks v2 wherever the server supports it.
+
+The only server-side lever is the *opposite* one — opting **out** of v1:
+
+```bash
+cargo build -p pmcp --no-default-features --features full-v2
+```
+
+`--no-default-features` on its own proves nothing (it also strips the HTTP transport, so v1 would
+appear severed only because nothing was compiled). `full-v2` is the positive feature list: exactly
+what `full` carries, minus `v1-compat`.
+
+**Learn more**: [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](https://paiml.github.io/rust-mcp-sdk/book/ch12-17-migrating-to-mcp-2026-07-28.html) | [v1 sunset policy](docs/v1-sunset-policy.md)
+
+---
+
+## Latest Release: pmcp 2.18.0
+
+**Published 2026-08-16.** The in-flight line is **pmcp 2.19.0**, still unreleased — its entry at the
+top of the changelog is the authoritative list of what is landing next.
+
+- **Two protocol eras, one binary**: pmcp serves both MCP `2025-11-25` (v1) and `2026-07-28` (v2), negotiated per request — see [Protocol Versions](#protocol-versions) above
+- **Credential storage (2.18.0)**: one machine, one credential store — `pmcp::shared::credential_store` addressed by `(issuer, account, server)`, with an on-disk `FileCredentialStore` that `cargo pmcp auth` writes through
+- **Agents & Teams**: the `pmcp-agent` loop, four reference team servers, and the portable AI-Package format — see [Agents & Teams](#agents--teams) above
 - **MCP Apps**: Rich interactive HTML UI widgets served from MCP servers — works with ChatGPT, Claude Desktop, and other MCP clients. Live preview with browser-style DevTools (resizable panel, network/events/protocol/bridge tabs)
-- **MCP Tasks**: Experimental shared client/server state with DynamoDB-backed task lifecycle management and task variables
+- **MCP Tasks**: Shared client/server task lifecycle with pluggable stores (in-memory and DynamoDB) and task variables — the v2 shape is an extension and is still provisional
 - **Conformance Test Suite**: 19-scenario conformance engine across 5 domains with `cargo pmcp test conformance` and `mcp-tester conformance` CLI integration
 - **Tower Middleware**: DNS rebinding protection, CORS with origin-locked headers, configurable security headers — production-ready HTTP stack
 - **PMCP Server**: MCP server exposing SDK developer tools (test, scaffold, schema export) via Streamable HTTP, deployed on AWS Lambda
 - **Uniform Constructor DX**: Default impls, builders, and constructors for all protocol types — dramatically improved ergonomics
-- **60+ Examples**: Comprehensive coverage of all SDK features
+- **85 examples in [`examples/`](examples/)**: runnable coverage of the SDK surface (119 example targets across the whole workspace)
 
 **Full changelog**: [CHANGELOG.md](CHANGELOG.md)
 
@@ -555,7 +588,7 @@ cargo run -p pmcp-agent --example s50_standalone_vs_sampled
 
 ### 📚 Additional Resources
 
-- **[Examples](examples/)** - 200+ working examples
+- **[Examples](examples/)** - 85 working examples in `examples/` (119 example targets workspace-wide)
 - **[CHANGELOG](CHANGELOG.md)** - Version history
 - **[Migration Guides](docs/)** - Upgrade instructions
 - **[Contributing](CONTRIBUTING.md)** - How to contribute
@@ -572,7 +605,8 @@ cargo run -p pmcp-agent --example s50_standalone_vs_sampled
 
 ## Examples
 
-The SDK includes 60+ comprehensive examples covering all features:
+The SDK ships **85 runnable examples** in [`examples/`](examples/) — 119 example targets across the
+whole workspace — covering the full SDK surface:
 
 ```bash
 # Basic examples
@@ -592,6 +626,21 @@ cargo run --example m01_basic_middleware    # Middleware chain
 # Agent Skills (SEP-2640) — dual-surface skill + prompt
 cargo run --example s44_server_skills --features skills,full
 cargo run --example c10_client_skills --features skills,full
+
+# Agents & Teams — an agent loop, and four reference servers cooperating
+cargo run --example s49_sampling_host
+cargo run -p pmcp-agent --example s50_standalone_vs_sampled
+cargo run -p pmcp-team-servers --example doc_review_team --features runtime
+
+# MCP 2026-07-28 (v2) — start the SERVER first, in its own terminal; each client
+# takes the server address as its argument and defaults to where the server binds
+cargo run --example s47_v2_stateless_mrtr --features full   # serves on 127.0.0.1:8147
+cargo run --example s48_v2_mrtr_client --features full      # then, in another terminal
+cargo run --example s53_v2_agent_client --features full     # the pmcp-agent connector, v2 with v1 fallback
+
+# MCP 2026-07-28 (v2) Tasks — same rule: server first, then the agent
+cargo run --example s50_v2_tasks_server --features full     # serves on 127.0.0.1:8150
+cargo run --example s51_v2_tasks_agent --features full
 
 # Testing (mcp-tester is a standalone Cargo project in examples/26-server-tester)
 cargo install mcp-tester && mcp-tester test http://localhost:8080
