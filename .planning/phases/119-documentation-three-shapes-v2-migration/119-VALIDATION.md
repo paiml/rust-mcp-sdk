@@ -8,7 +8,7 @@ nyquist_compliant: false
 # wave_0_complete: TRUE only when every box in `## Wave 0 Requirements` below is ticked.
 # Owner of the flip: plan 119-10 (the closing gate), because 119-10 writes the last Wave-0
 # item (`tests/windows_disclosure_tripwire.rs`). Plan 119-02 must NOT set it.
-wave_0_complete: false
+wave_0_complete: true
 # framework_ready: the NARROWER fact — the harness and tooling Wave 0 exists to unblock are
 # present and exercised (mdbook + mdbook-mermaid on PATH; `run_example_to_completion` in
 # `tests/common/example_process.rs`; `tests/docs04_examples_run.rs` green on its first leg) —
@@ -99,9 +99,9 @@ plan executes.
 | 119-09 · T1 | DOCS-04 | README gains `## Protocol Versions` and stale references are refreshed | structural | `test "$(grep -c '^## Protocol Versions' README.md)" -eq 1 && …` | ⬜ pending (wave 4) |
 | 119-09 · T2 | DOCS-04 | The `## Examples` block's cited invocations build | build | `cargo build --features full --example s50_v2_tasks_server --example s51_v2_tasks_agent` — **`--features full` is REQUIRED and was missing from this row.** Corrected by the orchestrator after plan 119-08 measured it and the orchestrator re-measured independently: flagless, `s51_v2_tasks_agent` fails with `error[E0433]: cannot find 'testing' in 'pmcp'` (`pub mod testing` is feature-gated at `src/lib.rs:63`, and `default = ["logging", "v1-compat"]`). The original row encoded a false premise — that the absence of an `[[example]]` block implies no required features — so it would have failed against a correct README. | ⬜ pending (wave 4) |
 | 119-09 · T3 | DOCS-05 | The two mislabelled CHANGELOG headings are corrected | structural | `test "$(grep -c '^## \[2.19.0\] - Unreleased' CHANGELOG.md)" -eq 1 && …` | ⬜ pending (wave 4) |
-| 119-10 · T1 | DOCS-05 | The derived-not-enumerated disclosure tripwire passes | tripwire (D-03) | `cargo test --features full --test windows_disclosure_tripwire` | ⬜ pending (wave 5) |
-| 119-10 · T2 | DOCS-05 | Removing one citation turns the tripwire RED | negative control | `cargo test --features full --test windows_disclosure_tripwire && git diff --quiet …` | ⬜ pending (wave 5) |
-| 119-10 · T3 | all | The full phase gate passes | full suite | `make quality-gate` | ⬜ pending (wave 5) |
+| 119-10 · T1 | DOCS-05 | The derived-not-enumerated disclosure tripwire passes | tripwire (D-03) | `cargo test --features full --test windows_disclosure_tripwire` | ✅ green — `1 passed`; derived set = ledger entries 12, 13, 19, 20, 23, computed from the sentinel, never enumerated |
+| 119-10 · T2 | DOCS-05 | Removing one citation turns the tripwire RED — **and so does marking a NEW entry** | negative control ×2 | `cargo test --features full --test windows_disclosure_tripwire && git diff --quiet …` | ✅ green — **Control A** (entry 19's citation deleted) → `entries [19] … not cited`; **Control B** (sentinel added to previously-unmarked entry 1) → `entries [1] … not cited`, proving derivation. Both files restored byte-identical; `open_count: 17` / `total_count: 23` unchanged |
+| 119-10 · T3 | all | The full phase gate passes | full suite | `make quality-gate` | ✅ green — exit 0 to the `✅ ALL TOYOTA WAY QUALITY CHECKS PASSED` banner; `mdbook build` ×2 exit 0; ledger parses; `cargo package --list` reviewed. **Caveat on record:** the gate's FUZZ leg fuzzed nothing (42 targets "completed" over 25 `-Z … nightly compiler` errors on stable — ledger entry 22), so this green is NOT fuzz coverage |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -114,6 +114,18 @@ plan executes.
 > `wave_0_complete` stays `false` until every box below is ticked; **plan 119-10's closing gate
 > owns that flip**. A `wave_0_complete: true` sitting above open boxes would be a false green in a
 > field `/gsd-audit-milestone` parses (`gsd-core/workflows/audit-milestone.md:167`).
+>
+> **What a tick means here — read this before trusting the flag.** For the four mandatory items a
+> tick means BUILT AND MEASURED GREEN, and plan 119-10 re-ran each one itself rather than
+> inheriting a prior plan's SUMMARY claim (the measured commands and counts are named inline
+> below). For the two items prefixed `Optional:` a tick means DISPOSITIONED, **not** built: both
+> were explicitly DECLINED for this phase by plan 119-02 on blast-radius grounds, each carries its
+> compensating control in its own text, and neither will be found in the tree. Ticking a declined
+> optional item is what lets `wave_0_complete` and this checklist agree without either one
+> overclaiming; a reader who needs "was it built?" must read the item, not the box.
+>
+> **Flipped to `true` by plan 119-10 on 2026-08-19**, after walking all six items against fresh
+> measurements taken in a clean worktree.
 
 - [x] **Local `mdbook` + `mdbook-mermaid`** — installed and exercised by plan 119-02.
       Measured **v0.4.52** locally versus CI's pinned v0.4.40 (`docs.yml`), and `mdbook-exercises`
@@ -121,14 +133,18 @@ plan executes.
       119-RESEARCH's "missing locally" entry, which is why assumption A6 (the
       `create-missing = false` gate had never actually been observed failing) could finally be
       discharged — see the 119-02 · T2 rows above
-- [ ] `tests/docs06_v2_examples_run.rs` — DOCS-06's s47/s48/s53 leg (socket shape, port 8161)
-      — **owner: plan 119-04**
-- [ ] `tests/docs04_examples_run.rs` — the REMAINING DOCS-04 legs (`s49_sampling_host`,
+- [x] `tests/docs06_v2_examples_run.rs` — DOCS-06's s47/s48/s53 leg (socket shape, port 8161)
+      — **owner: plan 119-04**. **VERIFIED by plan 119-10's closing gate**, not inherited from a
+      SUMMARY: `cargo test --features full --test docs06_v2_examples_run` → `1 passed` (0.86 s)
+- [x] `tests/docs04_examples_run.rs` — the REMAINING DOCS-04 legs (`s49_sampling_host`,
       `doc_review_team`) — **owner: plan 119-04**. The file itself now exists and is green on its
-      first leg (`s50_standalone_vs_sampled`, plan 119-02); this box tracks the other two
-- [ ] `tests/windows_disclosure_tripwire.rs` — D-03, with the `v2_conformance_pin` excluded-tree
+      first leg (`s50_standalone_vs_sampled`, plan 119-02); this box tracks the other two.
+      **VERIFIED by plan 119-10's closing gate**: `cargo test --test docs04_examples_run` →
+      `3 passed` (0.06 s), i.e. all three legs, not just the two this box tracks
+- [x] `tests/windows_disclosure_tripwire.rs` — D-03, with the `v2_conformance_pin` excluded-tree
       guard applied twice (research § F-3: the packaging fork excludes **two** trees)
-      — **owner: plan 119-10**
+      — **owner: plan 119-10**. **DONE**: `1 passed`, and OBSERVED RED twice (a removed citation,
+      and a newly-marked ledger entry the test had never seen) before being trusted
 - [x] A **run-to-completion helper** in `tests/common/example_process.rs`:
       `run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duration) -> Output` —
       three of the six examples need it; `spawn_example`'s `Stdio::null()` + `wait_until_listening`
@@ -143,7 +159,7 @@ plan executes.
       child's forked grandchild still held the pipe, so the drains now publish into shared buffers
       that are readable without a join. `S50_TIMEOUT` lives in `tests/docs04_examples_run.rs`, per
       the "timeouts are arguments" house rule
-- [ ] Optional: generalize `assert_binary_is_not_stale`'s source roots to reach
+- [x] Optional: generalize `assert_binary_is_not_stale`'s source roots to reach
       `crates/*/examples/` and `crates/*/src/` (research § F-7 gap)
       — **DECLINED for this phase (plan 119-02).** This is the recorded disposition of the cross-AI
       review's staleness-guard finding (119-02 `<review_dispositions>`, downgraded by consensus to
@@ -153,7 +169,7 @@ plan executes.
       comment, rather than silently inherited. **Compensating control:** every path that runs these
       legs builds the binary first with an explicit `-p <crate>` invocation, and that same command
       is named in the panic messages the guard would otherwise raise
-- [ ] Optional: a `make book` / `make course` target so the docs gate is reachable from the dev loop
+- [x] Optional: a `make book` / `make course` target so the docs gate is reachable from the dev loop
       — **DECLINED for this phase (plan 119-02)**, same blast-radius reasoning. Plan 119-10's
       closing gate runs both `mdbook build` invocations explicitly instead, so the docs gate is
       still executed before the phase closes; it just is not reachable from a `make` target
