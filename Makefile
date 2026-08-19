@@ -251,21 +251,41 @@ test-fuzz:
 	fi
 	@echo "$(GREEN)✓ Fuzz testing completed$(NC)"
 
+# Phase 119 (D-13/D-14) — BUILD every example, and FAIL when one does not
+# compile.
+#
+# This target IS chained into `quality-gate`, through `test-all`, and must stay
+# chained: `test-all` runs `test-examples` immediately before `test-integration`,
+# and that ordering is how the run tests (`tests/docs04_examples_run.rs`,
+# `tests/docs06_v2_examples_run.rs`, `tests/v2_sse_progress.rs` and the other
+# `spawn_example` legs) get example binaries that are not stale. Unchaining it
+# would leave those tests asserting against whatever happened to be in
+# `target/debug/examples` from an earlier session — the exact staleness defect
+# recorded at the Phase 118.1 Wave 10 merge.
+#
+# The recipe was previously NON-BLOCKING and the change to strict is deliberate.
+# The old inline loop reported a build failure as "skipped" and exited 0, threw
+# the compiler diagnostic away with `2>/dev/null`, and iterated `ls examples/*.rs`
+# so it never reached the two `crates/*/examples/` trees at all. The delegated
+# script (see `scripts/` — the same delegation shape as `test-severance`) fixes
+# all three and carries the rationale in its header.
+#
+# The baseline this strictness lands against is MEASURED, not assumed to be
+# zero: `.planning/phases/119-documentation-three-shapes-v2-migration/`
+# `deferred-items.md` records all 87 example targets building clean at commit
+# `aa0e6c9a`, immediately before this change, together with the sub-crates that
+# are deliberately left outside the gate and why. A red here that names a target
+# in one of the three covered trees is a real regression, not inherited debt.
+#
+# NOTE: examples are BUILT here, not run. They used to be un-run entirely; that
+# is no longer the whole truth — `tests/docs04_examples_run.rs` and
+# `tests/docs06_v2_examples_run.rs` do run several of them, under
+# `test-integration`, against the binaries this target produces.
 .PHONY: test-examples
 test-examples:
-	@echo "$(BLUE)Running example tests (ALWAYS required for new features)...$(NC)"
-	@echo "$(YELLOW)Note: Examples are built but not run to avoid blocking on I/O$(NC)"
-	@for example in $$(ls examples/*.rs 2>/dev/null | sed 's/examples\///g' | sed 's/\.rs$$//g'); do \
-		echo "$(BLUE)Building example: $$example$(NC)"; \
-		if $(CARGO) build --example $$example --all-features 2>/dev/null; then \
-			echo "$(GREEN)✓ Example $$example built successfully$(NC)"; \
-		elif $(CARGO) build --example $$example --features "full" 2>/dev/null; then \
-			echo "$(GREEN)✓ Example $$example built successfully$(NC)"; \
-		else \
-			echo "$(YELLOW)⚠ Example $$example requires specific features (skipped)$(NC)"; \
-		fi; \
-	done
-	@echo "$(GREEN)✓ All examples processed successfully$(NC)"
+	@echo "$(BLUE)Building every example in all three workspace example trees...$(NC)"
+	./scripts/run-example-builds.sh
+	@echo "$(GREEN)✓ Every example built — counted, non-zero, zero failures$(NC)"
 
 # MCP Tester Integration
 .PHONY: build-tester
