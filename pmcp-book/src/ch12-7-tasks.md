@@ -1,5 +1,7 @@
 # Chapter 12.7: MCP Tasks -- Long-Running Operations
 
+> **Note on vocabulary**: **v1** means the MCP protocol revision `2025-11-25` and **v2** means `2026-07-28`. These are *protocol eras*, not crate versions — the crate is always written with its name attached ("pmcp 2.18"), so a bare "2.18" can never be mistaken for a protocol revision. One pmcp binary speaks both. Unless a passage says otherwise, this chapter describes the **v1** task surface; the v2 differences are collected in [Era delta (v1 vs v2)](#era-delta-v1-vs-v2) near the end, and the full v2 migration story lives in [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md).
+
 When a tool takes five seconds, request/response is fine. When it takes five minutes -- deploying infrastructure, processing a large dataset, running a multi-step pipeline -- the caller needs more than silence followed by a result. MCP Tasks solve this with a stateless polling model that works everywhere from local development to serverless Lambda functions.
 
 This chapter covers the design rationale, the protocol flow, and how to integrate tasks into your PMCP server.
@@ -774,6 +776,67 @@ let security = TaskSecurityConfig::default()
 ```
 
 When `allow_anonymous` is `false` (the default), every task operation requires a valid owner ID derived from the request's auth context. This prevents a public client from reading tasks created by an authenticated user.
+
+---
+
+## Era delta (v1 vs v2)
+
+Everything above describes tasks as MCP **v1** (`2025-11-25`) defines them. MCP **v2** (`2026-07-28`) moved Tasks out of the core specification and onto the Extensions Track, and that move is observable on the wire in four places: where the capability is negotiated, what triggers task creation, which `tasks/*` methods a server answers, and what a create response looks like.
+
+> **These wire values are provisional.** The Tasks extension is still published only as a `draft/` schema upstream (`modelcontextprotocol/ext-tasks`) — no versioned schema directory, no tagged release. Every v2 Tasks value pmcp emits is read from that draft, so it may change before the extension is final. The SDK says the same thing to Rust readers at the definition site: see the `This value is PRE-FINAL` note on `TASKS_EXTENSION_KEY` in `src/types/capabilities.rs`. Read this section as a description of what pmcp does today, not as a stable contract — do not pin production behaviour to it yet.
+
+### Where task support is negotiated
+
+On v1, task support is a field of the capability object, exactly as [Server Capability Advertisement](#server-capability-advertisement) above describes. On v2 it is an entry in the **extensions map**, keyed by the reverse-DNS identifier `io.modelcontextprotocol/tasks`, whose value is always the empty object.
+
+| Era | Server advertises under | Client declares under |
+|---|---|---|
+| v1 (`2025-11-25`) | `capabilities.tasks` (legacy router path: `experimental.tasks`) | the per-request `task` field on `tools/call` |
+| v2 (`2026-07-28`) | `capabilities.extensions["io.modelcontextprotocol/tasks"]` | `params._meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]` |
+
+Both spellings and both negotiation directions are documented on `TASKS_EXTENSION_KEY` in `src/types/capabilities.rs`. Tasks moved to `extensions` precisely *because* they left the core specification — the v1 `capabilities.tasks` field has no v2 counterpart.
+
+### The create trigger changes, and each era ignores the other's signal
+
+This is the part most likely to surprise a reader arriving from [Capability Negotiation](#capability-negotiation) above. On v1 the per-request `task` field is the signal that a call should become a task. **On v2 that field is not consulted at all** — it does not exist in the v2 extension — and the client's own extension declaration on that request is what opens the create gate instead. Symmetrically, a v1-era request that carries an extension declaration is unaffected by it.
+
+| Negotiated era | What triggers task creation | The other era's signal |
+|---|---|---|
+| v1 / no era code | `CallToolRequest.task` is present | a declaration is ignored |
+| v2 | the client declared `io.modelcontextprotocol/tasks` on this request | the `task` field is ignored |
+
+The gate is a conformance requirement rather than a pmcp preference: a v2 server must not hand a task handle to a client that never declared it could read one. See `create_gate` and `maybe_build_task_created` in `src/server/task_dispatch.rs`. The stateless, per-request character of the negotiation is unchanged — only the field that carries it moves.
+
+### Which `tasks/*` methods each era serves
+
+| Method | v1 (`2025-11-25`) | v2 (`2026-07-28`) |
+|---|---|---|
+| `tasks/get` | served | served |
+| `tasks/cancel` | served | served |
+| `tasks/result` | served | **retired** — answers `-32601` |
+| `tasks/list` | served | **retired** — answers `-32601` |
+| `tasks/update` | — | served |
+
+The per-era sets are documented on `Tool::with_task_support` in `src/types/tools.rs`; `tasks/update` is defined in `src/types/mrtr.rs`.
+
+**`tasks/list` was retired for a security reason, not as a simplification.** The SDK states it at the type itself, on `ListTasksResult` in `src/types/tasks.rs`: the removal is a security improvement, because *with no enumeration primitive a server cannot leak the existence of one caller's tasks to another*. On v1, a server whose owner scoping is wrong exposes an enumeration surface; on v2 there is no method that returns a list, so that surface does not exist to get wrong.
+
+`tasks/result` is retired alongside it. On v2 a terminal task's outcome is read inline from the same `tasks/get` payload that reports its status, so the separate result call has nothing left to do. `tasks/update` is the new method in the set: it is how a client delivers answers back to a task that paused to ask for input.
+
+### The create response shape
+
+The v1 create response is the nested envelope this chapter shows throughout — `CreateTaskResult`, i.e. `{"task": { … }}` — and it is frozen in that shape. The v2 create response is **flat**: the task's own fields sit at the top level of `result`, carrying the envelope discriminator `resultType: "task"`. Both eras attach the related-task pointer under `_meta`. See `v1_create_result_value` and `v2_create_result_value` in `src/server/task_dispatch.rs`.
+
+### Runnable v2 examples
+
+Two examples exercise the v2 surface end to end. Start the server, then run the agent against it in a second terminal:
+
+```bash
+cargo run --example s50_v2_tasks_server --features full
+cargo run --example s51_v2_tasks_agent --features full
+```
+
+`s51_v2_tasks_agent` is an executable assertion rather than a printout: it exits non-zero if any step diverges from what is documented here. Between them the pair demonstrates explicit `server/discover` negotiation, the paused-task round trip through `tasks/update`, an undeclaring client correctly receiving an ordinary `CallToolResult`, and both retirements refused from both sides.
 
 ---
 
