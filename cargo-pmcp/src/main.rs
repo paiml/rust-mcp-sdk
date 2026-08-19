@@ -50,6 +50,23 @@ use commands::GlobalFlags;
   cargo pmcp doctor                  Diagnose workspace health
   cargo pmcp completions zsh         Generate shell completions")]
 struct Cli {
+    /// Dump every HTTP request and response the SDK puts on the wire.
+    ///
+    /// Answers "what did we actually send?" — the first question when a
+    /// deployed server rejects something. Shows the request line, the headers
+    /// (including the v2 routing trio `MCP-Protocol-Version` / `Mcp-Method` /
+    /// `Mcp-Name`) and the body, plus the response status and headers.
+    ///
+    /// Credential and session headers are REDACTED: a wire dump is exactly the
+    /// artifact that ends up in a bug report or a CI artifact.
+    ///
+    /// A preset over the SDK's `pmcp::wire` tracing target, so the equivalent
+    /// without the flag is `RUST_LOG=pmcp::wire=debug`, and any
+    /// `tracing_subscriber` layer composes with it. Most useful with
+    /// `cargo pmcp test conformance` and the post-deploy verifiers.
+    #[arg(long, global = true)]
+    dump_wire: bool,
+
     /// Enable verbose output for debugging
     #[arg(long, short, global = true)]
     verbose: bool,
@@ -450,6 +467,42 @@ enum AddCommands {
     },
 }
 
+/// Install the tracing subscriber that collects the SDK's wire events.
+///
+/// `cargo-pmcp` drives the SDK as a LIBRARY, so `pmcp::wire` events are emitted
+/// on every request it makes — but until this call nothing collected them, and a
+/// `--dump-wire` here would have printed nothing at all. That is the whole gap
+/// this closes: the same instrumentation `mcp-tester --dump-wire` surfaces is
+/// available to `cargo pmcp test conformance` and the post-deploy verifiers.
+///
+/// A preset, not a parallel logger: `RUST_LOG` wins when set, and the flag is
+/// ADDITIVE to it. With neither, no subscriber is installed and the SDK's
+/// `enabled()` guards keep every wire path from allocating.
+fn init_wire_tracing(dump_wire: bool) {
+    let wire_directive = format!("{}=debug", pmcp::shared::wire_trace::WIRE_TARGET);
+    let filter = match (std::env::var("RUST_LOG").is_ok(), dump_wire) {
+        // An explicit RUST_LOG is a deliberate choice; the flag adds to it.
+        (true, true) => tracing_subscriber::EnvFilter::from_default_env().add_directive(
+            wire_directive
+                .parse()
+                .expect("the wire directive is a compile-time constant"),
+        ),
+        (true, false) => tracing_subscriber::EnvFilter::from_default_env(),
+        // Wire frames ONLY: turning on `pmcp=debug` wholesale would bury the
+        // frames the user asked for under unrelated SDK output.
+        (false, true) => tracing_subscriber::EnvFilter::new(wire_directive),
+        // Nothing requested — install nothing, so there is no subscriber to pay
+        // for and the SDK's guards short-circuit.
+        (false, false) => return,
+    };
+    // `try_init`, not `init`: a subscriber may already be installed by an
+    // embedding process, and a diagnostic flag must never panic the CLI.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> Result<()> {
     // Handle cargo subcommand invocation
     // When called as `cargo pmcp`, cargo passes "pmcp" as the first argument
@@ -494,6 +547,10 @@ fn main() -> Result<()> {
     if effective_quiet {
         std::env::set_var("PMCP_QUIET", "1");
     }
+
+    // Install the wire-trace subscriber BEFORE any command runs, so a dump
+    // covers the whole invocation rather than starting mid-flight.
+    init_wire_tracing(cli.dump_wire);
 
     let global_flags = GlobalFlags {
         verbose: cli.verbose,

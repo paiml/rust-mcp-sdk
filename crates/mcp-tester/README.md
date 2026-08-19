@@ -95,6 +95,42 @@ mcp-tester conformance http://localhost:3000 --domain core,tools
 cargo pmcp test conformance http://localhost:3000
 ```
 
+### Dual-era comparison (`--dual-run`)
+
+A v2 (2026-07-28) server usually serves v1 (2025-11-25) too. `--dual-run` detects
+that, runs the suite against BOTH eras, and classifies every v1-vs-v2 difference
+against the checked-in baseline (`baselines/era-deltas.yaml`):
+
+```bash
+mcp-tester conformance --dual-run http://localhost:3000
+```
+
+```text
+Era support : dual
+v1 suite    : 19 tests, 0 failed
+v2 suite    : 19 tests, 1 failed
+Differences : 4 expected, 0 unexpected, 10 missing
+
+V2 SUITE FAILURES (1)
+  Resources: read first resource [Resources]
+      resources/read failed: Protocol error: -32020 - …
+```
+
+A listed delta is correct by design, an unlisted one is a finding, and a listed
+one that no longer reproduces is also a finding. Against a single-era server this
+degrades to one run and says so.
+
+**By default `--dual-run` REPORTS but does not GATE.** The exit code keeps
+meaning "did the v1 suite pass", so adding the flag to an existing CI job cannot
+change its verdict. To make the findings fail the job:
+
+```bash
+mcp-tester conformance --dual-run --fail-on-era-findings http://localhost:3000
+```
+
+That folds v2-suite failures and UNEXPECTED era differences in as named
+`[v2 suite]` / `[era]` failures and exits non-zero. It requires `--dual-run`.
+
 Output includes a per-domain CI summary line:
 
 ```
@@ -192,7 +228,7 @@ cargo pmcp test run --server my-server --scenarios tests/
 |---------|-------------|
 | `test` | Full test suite — protocol, tools, resources, prompts |
 | `quick` | Fast connectivity and protocol check |
-| `conformance` | MCP protocol conformance validation (19 scenarios across 5 domains) |
+| `conformance` | MCP protocol conformance validation (19 scenarios across 5 domains); `--dual-run` compares v1 vs v2, `--fail-on-era-findings` gates on the result |
 | `tools` | Discover tools and validate schemas |
 | `resources` | Test resource discovery and reading |
 | `prompts` | Validate prompt templates and arguments |
@@ -202,6 +238,16 @@ cargo pmcp test run --server my-server --scenarios tests/
 | `diagnose` | Layer-by-layer connection diagnostics |
 | `compare` | Compare two servers side-by-side |
 | `health` | Health check endpoint |
+
+### Global flags
+
+| Flag | Description |
+|------|-------------|
+| `--dump-wire` | Dump every HTTP request/response on the wire, credentials redacted. Equivalent to `RUST_LOG=pmcp::wire=debug`. See [Wire Debugging](#wire-debugging---dump-wire). |
+| `--format` | `pretty` (default), `json`, `minimal`, `verbose` |
+| `-v, --verbose` | Verbosity 0–3 |
+| `--insecure` | Skip TLS verification |
+| `--api-key` | Bearer credential (also `MCP_API_KEY`) |
 
 ## Key Features
 

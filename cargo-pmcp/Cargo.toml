@@ -67,6 +67,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # credential through that seam.
 pmcp = { version = "2.18.0", path = "..", features = ["streamable-http", "oauth"] }
 mcp-tester = { version = "0.7.0", path = "../crates/mcp-tester" }
+# Collects the SDK's `pmcp::wire` tracing target for `--dump-wire`. The SDK emits
+# those events unconditionally-but-guarded; without a subscriber installed here
+# they would go nowhere, which is exactly the gap `--dump-wire` closes.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 mcp-preview = { version = "0.3.1", path = "../crates/mcp-preview" }
 pmcp-workbook-compiler = { version = "0.1.0", path = "../crates/pmcp-workbook-compiler" }
 # Phase 110 agent/team/package verbs. Path wins locally; the version req applies
