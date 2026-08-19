@@ -5,7 +5,15 @@ slug: documentation-three-shapes-v2-migration
 # audit-milestone §5.5 distinguishes NOT-VALIDATED (draft) from PARTIAL (validated + nyquist_compliant: false) (#2117)
 status: draft
 nyquist_compliant: false
+# wave_0_complete: TRUE only when every box in `## Wave 0 Requirements` below is ticked.
+# Owner of the flip: plan 119-10 (the closing gate), because 119-10 writes the last Wave-0
+# item (`tests/windows_disclosure_tripwire.rs`). Plan 119-02 must NOT set it.
 wave_0_complete: false
+# framework_ready: the NARROWER fact — the harness and tooling Wave 0 exists to unblock are
+# present and exercised (mdbook + mdbook-mermaid on PATH; `run_example_to_completion` in
+# `tests/common/example_process.rs`; `tests/docs04_examples_run.rs` green on its first leg) —
+# independently of whether every Wave-0 checklist item has been written yet. Set by plan 119-02.
+framework_ready: false
 created: 2026-08-18
 ---
 
@@ -86,9 +94,13 @@ guards (a *future* `WINDOWS.md` entry) changes on a cadence this phase does not 
       socket-shaped
 - [ ] `tests/windows_disclosure_tripwire.rs` — D-03, with the `v2_conformance_pin` excluded-tree
       guard applied twice (research § F-3: the packaging fork excludes **two** trees)
-- [ ] A **run-to-completion helper** in `tests/common/example_process.rs` (e.g.
-      `run_example_to_completion(rel_path, args) -> Output`) — three of the six examples need it;
-      `spawn_example`'s `Stdio::null()` + `wait_until_listening` are wrong for them
+- [ ] A **run-to-completion helper** in `tests/common/example_process.rs`:
+      `run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duration) -> Output` —
+      three of the six examples need it; `spawn_example`'s `Stdio::null()` + `wait_until_listening`
+      are wrong for them. The `timeout` argument is MANDATORY (cross-AI review, HIGH): the helper
+      must drain both streams concurrently, poll to a deadline, and kill + reap + panic with the
+      captured partial output on expiry, so a non-terminating example fails the suite rather than
+      hanging it. Each leg declares its own budget constant in its own test file
 - [ ] Optional: generalize `assert_binary_is_not_stale`'s source roots to reach
       `crates/*/examples/` and `crates/*/src/` (research § F-7 gap)
 - [ ] Optional: a `make book` / `make course` target so the docs gate is reachable from the dev loop

@@ -2952,10 +2952,10 @@ Plans:
 - [ ] 119-03-PLAN.md — Example-build gate: baseline the pre-existing surface (D-14), then make `make test-examples` strict and observe it red (D-13)
 - [ ] 119-04-PLAN.md — Example run-test completion: the remaining DOCS-04 legs plus the DOCS-06 s47/s48/s53 socket leg (D-15)
 - [ ] 119-05-PLAN.md — v2 migration chapter by role (server/client/agent) + the `[CONSUMER-OBSERVABLE]` disclosure sentinel (D-02/D-03a/D-04/D-05/D-06/D-12)
-- [ ] 119-06-PLAN.md — pmcp-course Part VIII ch24 Agents & Teams chapter + tiered exercises (D-09)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
+- [ ] 119-06-PLAN.md — pmcp-course Part VIII ch24 Agents & Teams chapter + tiered exercises (D-09). Moved out of Wave 3 by the cross-AI review: its Exercise 2/3 pass predicates must name the same banners `tests/docs04_examples_run.rs` asserts, and 119-04 writes two of those legs
 - [ ] 119-07-PLAN.md — Agent Teams book chapter, completing Phase 111's three named chapters (D-08)
 - [ ] 119-08-PLAN.md — In-place era amendments: `ch12-7-tasks.md` with a provisionality callout (D-07) and the two `ch10` transport chapters, no code block touched (D-16)
 - [ ] 119-09-PLAN.md — README `## Protocol Versions`, refreshed release header, extended Examples block, CHANGELOG heading fixes (D-11)
