@@ -78,17 +78,14 @@ the dependency graph enabling a negative feature would silently strip v1 for
 every other consumer of that same build. An inverted feature was considered and
 rejected for exactly that reason.
 
-`v1-compat` is a dependency-free marker feature that gates the `initialize`
-session lifecycle and SSE resumability (`Last-Event-ID` plus the event store).
-SSE *framing and parsing* are shared with v2 and are deliberately not gated — v2
-uses SSE too, for `subscriptions/listen`.
+`v1-compat` is a dependency-free marker feature. SSE *framing and parsing* stay
+compiled either way — v2 uses SSE too, for `subscriptions/listen` — so this is
+not a "drop SSE" switch.
 
-Note what the severance build changes for a v1 client that still connects to it:
-`GET /` and `DELETE /` answer `405 Method Not Allowed` (refused, not unrouted —
-a `404` would say "no such endpoint", which is a different claim), no
-`Mcp-Session-Id` is minted or echoed, and no `Last-Event-ID` is honoured. That
-is the severance working, not a defect. On a `v1-compat` build — which is what
-every published consumer gets — v1 request and response bytes are unchanged.
+A `full-v2` build necessarily answers a v1 client differently: that is the
+severance, not a defect. Exactly what it gates and exactly how a v1 client's
+experience differs are enumerated normatively in the sunset policy — see
+[The v1 sunset](#the-v1-sunset) below rather than reasoning from this paragraph.
 
 ### Statelessness is a per-request gate, not a build switch
 
