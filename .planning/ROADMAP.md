@@ -2936,7 +2936,7 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: 9/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+**Plans**: 10/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
 
 Plans:
 **Wave 1**
@@ -2962,7 +2962,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 119-10-PLAN.md — Disclosure tripwire (D-03b) + the full phase gate (quality-gate, both `mdbook build`s, ledger parse, packaging review)
+- [x] 119-10-PLAN.md — Disclosure tripwire (D-03b) + the full phase gate (quality-gate, both `mdbook build`s, ledger parse, packaging review)
 
 ## Progress — v2.5 Milestone (MCP Spec 2026-07-28 v2 Support)
 
