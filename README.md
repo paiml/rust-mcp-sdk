@@ -627,6 +627,21 @@ cargo run --example m01_basic_middleware    # Middleware chain
 cargo run --example s44_server_skills --features skills,full
 cargo run --example c10_client_skills --features skills,full
 
+# Agents & Teams — an agent loop, and four reference servers cooperating
+cargo run --example s49_sampling_host
+cargo run -p pmcp-agent --example s50_standalone_vs_sampled
+cargo run -p pmcp-team-servers --example doc_review_team --features runtime
+
+# MCP 2026-07-28 (v2) — start the SERVER first, in its own terminal; each client
+# takes the server address as its argument and defaults to where the server binds
+cargo run --example s47_v2_stateless_mrtr --features full   # serves on 127.0.0.1:8147
+cargo run --example s48_v2_mrtr_client --features full      # then, in another terminal
+cargo run --example s53_v2_agent_client --features full     # the pmcp-agent connector, v2 with v1 fallback
+
+# MCP 2026-07-28 (v2) Tasks — same rule: server first, then the agent
+cargo run --example s50_v2_tasks_server --features full     # serves on 127.0.0.1:8150
+cargo run --example s51_v2_tasks_agent --features full
+
 # Testing (mcp-tester is a standalone Cargo project in examples/26-server-tester)
 cargo install mcp-tester && mcp-tester test http://localhost:8080
 
