@@ -57,6 +57,24 @@ struct Cli {
     #[arg(short, long, global = true, default_value = "pretty")]
     format: OutputFormat,
 
+    /// Dump every HTTP request and response this tool puts on the wire.
+    ///
+    /// Answers "what did we actually send?" — the first question in any
+    /// conformance dispute, and one this tool previously could not answer about
+    /// itself. Shows the request line, the headers (including the v2 routing
+    /// trio `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`) and the body,
+    /// plus the response status and headers.
+    ///
+    /// Credential and session headers are REDACTED — a wire dump is exactly the
+    /// artifact that ends up pasted into a bug report.
+    ///
+    /// This is a preset over the SDK's `pmcp::wire` tracing target, not a
+    /// separate logger, so the equivalent without the flag is
+    /// `RUST_LOG=pmcp::wire=debug`, and any `tracing_subscriber` layer (JSON for
+    /// CI, for instance) composes with it.
+    #[arg(long, global = true)]
+    dump_wire: bool,
+
     /// Verbosity level (0-3)
     #[arg(short, long, global = true, default_value = "0")]
     verbose: u8,
@@ -287,7 +305,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    init_tracing(cli.verbose, cli.dump_wire);
 
     if matches!(cli.format, OutputFormat::Pretty) {
         print_header();
@@ -306,10 +324,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Initialize tracing/logging from RUST_LOG or the `--verbose` count.
-fn init_tracing(verbose: u8) {
+/// Initialize tracing/logging from RUST_LOG, `--verbose`, or `--dump-wire`.
+///
+/// `--dump-wire` is a PRESET, not a parallel logger: it adds the SDK's
+/// `pmcp::wire` target at `debug` to whatever filter is already in force. That
+/// composition is the point —
+///
+/// - `--dump-wire` alone gives wire frames and nothing else, so the signal is
+///   not buried under unrelated SDK debug output;
+/// - `RUST_LOG=...` still wins for anything else, and a user who already knows
+///   `RUST_LOG=pmcp::wire=debug` needs no flag at all;
+/// - a CI job can swap in `tracing_subscriber`'s JSON layer and archive the
+///   frames as a machine-readable artifact, because these are ordinary tracing
+///   events rather than `println!`.
+fn init_tracing(verbose: u8, dump_wire: bool) {
+    let wire_directive = format!("{}=debug", pmcp::shared::wire_trace::WIRE_TARGET);
     let env_filter = if std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::EnvFilter::from_default_env()
+        let base = tracing_subscriber::EnvFilter::from_default_env();
+        if dump_wire {
+            // ADD to the user's filter rather than replacing it: an explicit
+            // RUST_LOG is a deliberate choice and the flag is additive to it.
+            base.add_directive(
+                wire_directive
+                    .parse()
+                    .expect("the wire directive is a compile-time constant"),
+            )
+        } else {
+            base
+        }
+    } else if dump_wire {
+        // Wire frames ONLY. Turning on `pmcp=debug` wholesale here would bury
+        // the frames the user asked for under every other SDK debug line.
+        tracing_subscriber::EnvFilter::new(wire_directive)
     } else {
         let log_level = match verbose {
             0 => "error",

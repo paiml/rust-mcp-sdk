@@ -118,6 +118,8 @@ pub mod simd_parsing;
     allow(dead_code)
 )]
 pub mod sse_parser;
+/// Wire-level request/response tracing (`pmcp::wire` target).
+pub mod wire_trace;
 
 #[cfg(feature = "sse")]
 pub mod sse_optimized;

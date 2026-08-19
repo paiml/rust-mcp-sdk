@@ -227,6 +227,78 @@ cargo pmcp test run --server my-server --scenarios tests/
 mcp-tester test "$SERVER_URL" --format minimal
 ```
 
+## Wire Debugging (`--dump-wire`)
+
+The first question in any conformance dispute is *what did we actually send?*
+`--dump-wire` answers it — the request line, every header (including the v2
+routing trio `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`), the body, and
+the response status and headers.
+
+```bash
+mcp-tester conformance --dual-run --dump-wire "$SERVER_URL"
+```
+
+```text
+DEBUG pmcp::wire: outgoing MCP request direction="request" method=POST
+  headers=mcp-protocol-version: 2026-07-28
+          mcp-method: resources/read
+          mcp-name: ui://app/keypad
+  body={"jsonrpc":"2.0","id":"…","method":"resources/read","params":{…}}
+```
+
+**Credentials are redacted by default.** `Authorization`, `Cookie`,
+`Mcp-Session-Id` and friends render as `<redacted N bytes>` — the name and length
+survive (so "present but empty" stays distinguishable from "present with a
+value") but the secret never reaches a log you might paste into an issue.
+
+### It is `tracing`, so it composes
+
+`--dump-wire` is a preset over the SDK's `pmcp::wire` target, not a separate
+logger. The flag is a convenience; these are equivalent:
+
+```bash
+mcp-tester conformance --dump-wire "$SERVER_URL"
+RUST_LOG=pmcp::wire=debug mcp-tester conformance "$SERVER_URL"
+```
+
+Because it is its own target, you get wire frames **without** turning on every
+other SDK debug line — and you can widen when you want both:
+
+```bash
+RUST_LOG=pmcp::wire=debug,pmcp=info mcp-tester conformance "$SERVER_URL"
+```
+
+With neither the flag nor `RUST_LOG`, nothing is emitted and nothing is built:
+every entry point is guarded before it allocates a diagnostic string, so leaving
+the instrumentation compiled in costs a production request nothing.
+
+### In CI
+
+Wire frames are ordinary `tracing` events, so a job can archive them as a
+machine-readable artifact and attach it to a failure:
+
+```yaml
+- name: Conformance (with wire capture on failure)
+  run: |
+    mcp-tester conformance --dual-run --fail-on-era-findings "$SERVER_URL" \
+      || {
+        echo "conformance failed — re-running with wire capture"
+        mcp-tester conformance --dual-run --dump-wire "$SERVER_URL" 2> wire.log || true
+        exit 1
+      }
+
+- name: Upload wire capture
+  if: failure()
+  uses: actions/upload-artifact@v4
+  with:
+    name: mcp-wire-capture
+    path: wire.log
+```
+
+Pair it with `--fail-on-era-findings` (see `conformance --help`) so a v2-suite
+failure or an unexpected v1/v2 difference actually fails the job — without it,
+`--dual-run` reports but does not gate.
+
 ## Documentation
 
 - [Scenario Format Reference](SCENARIO_FORMAT.md) — YAML/JSON scenario structure, operations, and assertions

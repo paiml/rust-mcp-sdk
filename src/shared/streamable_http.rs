@@ -2226,6 +2226,28 @@ impl StreamableHttpTransport {
         // Extract headers from temp request
         let headers = temp_req.headers();
 
+        // Wire trace: the ONE point every outgoing request is fully assembled,
+        // so instrumenting here cannot miss a path the way per-method logging
+        // would. Guarded by `enabled()` so a production request pays nothing
+        // for a debugging feature nobody turned on — see `wire_trace`'s module
+        // docs. Credential and session headers are redacted by that module.
+        if crate::shared::wire_trace::enabled() {
+            let rendered = crate::shared::wire_trace::render_headers(
+                headers
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v))),
+            );
+            tracing::debug!(
+                target: crate::shared::wire_trace::WIRE_TARGET,
+                direction = "request",
+                %url,
+                method = %method,
+                headers = %rendered,
+                body = %crate::shared::wire_trace::render_body(&body),
+                "outgoing MCP request"
+            );
+        }
+
         // Run HTTP middleware if configured
         if let Some(chain) = middleware_chain {
             // Create HttpRequest from hyper components
@@ -2456,6 +2478,26 @@ impl StreamableHttpTransport {
             .map_err(|e| Error::Transport(TransportError::Request(e.to_string())))?;
 
         if response.status() != StatusCode::UNAUTHORIZED {
+            // Wire trace, response half. Status + headers only: the BODY is a
+            // stream at this point and consuming it here to log it would change
+            // behaviour, which a diagnostic must never do. Status and headers
+            // are what a header/body dispute — the whole reason this exists —
+            // is actually argued over.
+            if crate::shared::wire_trace::enabled() {
+                let rendered = crate::shared::wire_trace::render_headers(
+                    response
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v))),
+                );
+                tracing::debug!(
+                    target: crate::shared::wire_trace::WIRE_TARGET,
+                    direction = "response",
+                    status = response.status().as_u16(),
+                    headers = %rendered,
+                    "incoming MCP response"
+                );
+            }
             return Ok(response);
         }
 
