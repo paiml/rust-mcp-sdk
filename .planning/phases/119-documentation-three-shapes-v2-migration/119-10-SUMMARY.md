@@ -315,3 +315,13 @@ files (79,271 chars) — the figure is **19,818**. Both are well under the 50,00
 is mostly reading (nine sibling SUMMARYs, the ledger, the chapter, `Cargo.toml`'s exclude
 commentary) rather than writing, which the diff scale does not capture at all. Recorded unrounded
 and un-flattered so later calibration measures the work, not the measurement method.
+
+## Self-Check: PASSED
+
+- `tests/windows_disclosure_tripwire.rs` — FOUND on disk (10,752 bytes)
+- `.planning/phases/119-documentation-three-shapes-v2-migration/119-10-SUMMARY.md` — FOUND
+- commit `cd5daf62` — FOUND in `git log`
+- commit `04fe181c` — FOUND in `git log`
+- `git diff --diff-filter=D` across all three commits — no file deletions
+- `git status --porcelain --untracked-files=all` — clean (`.pmat/` and
+  `pmcp-course/src/theme/` tooling churn restored)
