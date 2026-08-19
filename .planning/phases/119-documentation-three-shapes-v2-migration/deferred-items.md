@@ -119,3 +119,62 @@ negative control exists specifically to prove that widening is real rather than 
   `119-VALIDATION.md` is outside this plan's file scope and is written by sibling plans in the
   same wave. Owner: plan 119-10 (the closing gate) or the orchestrator at merge — the fix is to
   point that row at `deferred-items.md`.
+
+
+---
+
+## DEFERRED (119-10): two new test files SHIP while depending on example binaries a published-crate `cargo test` can never produce
+
+Plan 119-10's closing gate was required to review the packaging disposition of all three test
+files this phase added and confirm each is a **deliberate decision rather than an accident**.
+One is deliberate; two are accidents, and they are recorded here rather than fixed.
+
+**Measured, not inferred.** This worktree started with an empty `target/`, which reproduced the
+downstream shape exactly. `cargo test --test docs04_examples_run` failed **3 of 3** legs with
+`target/debug/examples/<name> is missing. This leg FAILS rather than skipping, by design`
+(`tests/common/example_process.rs:104`). The legs only went green after the three example
+binaries were built by hand.
+
+| File | `cargo package --list` | Deliberate? |
+|---|---|---|
+| `tests/windows_disclosure_tripwire.rs` | **excluded** | **Yes** — decided and reasoned in 119-10 Task 1, with a `# Why:` block in `Cargo.toml` |
+| `tests/docs04_examples_run.rs` | ships | **No** — no plan recorded a disposition |
+| `tests/docs06_v2_examples_run.rs` | ships | **No** — no plan recorded a disposition |
+
+**Why the two that ship are a hazard.** Neither can pass on the published crate:
+
+- `docs04_examples_run` runs `s50_standalone_vs_sampled` (`crates/pmcp-agent/examples/`) and
+  `doc_review_team` (`crates/pmcp-team-servers/examples/`). Those crates are not part of the
+  published `pmcp` crate, so those binaries can never exist downstream.
+- `docs06_v2_examples_run` runs `s47_v2_stateless_mrtr`, `s48_v2_mrtr_client` and
+  `s53_v2_agent_client`. All three declare `required-features` absent from
+  `default = ["logging", "v1-compat"]` (`Cargo.toml:711,716,760`), so a downstream
+  `cargo test` never builds them. `s53` additionally needs the **path-only** `pmcp-agent`
+  dev-dependency (`Cargo.toml:251`), which is stripped on publish.
+
+The missing-binary path **panics**; it does not skip. That is deliberate and correct in-repo —
+a skip would restore the unenforced criterion these legs exist to close — but it is the exact
+failure `Cargo.toml`'s own exclude commentary warns about: *"shipping the reader while excluding
+the paths it reads would make `cargo test` panic on the published crate."*
+
+**Why it was NOT fixed here.** This is a **pre-existing repo-wide pattern**, not something phase
+119 introduced. `tests/embedded_resource_example_run.rs` and `tests/log_records_example_run.rs`
+already ship today and both read `target/debug/examples/s54_v2_dual_conformance`, which likewise
+declares `required-features = ["streamable-http", "testing"]` (`Cargo.toml:785`). Excluding only
+the two new files would fix two of four instances and leave the convention *less* consistent than
+it is now. Choosing between "every example-run test is excluded" and "the run-to-completion
+helper degrades to a skip on the published crate only" is a repository-wide convention call with
+a blast radius beyond a documentation phase, so it is handed forward rather than taken.
+
+**Owner:** whoever next revisits the example-run test convention, or a release engineer who hits
+it during a `cargo publish` dry run. **The fix is cheap either way** — four `exclude` entries, or
+one publish-aware branch in `tests/common/example_process.rs`. **Not filed as a `WINDOWS.md`
+entry on purpose:** plan 119-10's own acceptance criteria pin the ledger at `open_count: 17` /
+`total_count: 23`, and appending mid-gate would have invalidated the closing measurement — the
+same reasoning plan 119-05 used when it declined to append.
+
+### Resolved by the orchestrator before this plan ran
+
+- The `119-03-BASELINE.md` item immediately above is **CLOSED**. `119-VALIDATION.md`'s
+  119-03 · T1 row now asserts `test -f "$D/deferred-items.md"` plus a `git merge-base
+  --is-ancestor 5b90fdd2 9aefc939` ordering proof, exactly the fix that item requested.
