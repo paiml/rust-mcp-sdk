@@ -12,8 +12,9 @@
 //! migration chapter is the only place a downstream consumer learns of the change.
 //! Without a mechanical fence, the next such disclosure lands in the ledger, never
 //! reaches the guide, and a consumer is surprised by a wire change with no record.
-//! That is the exact repudiation failure ledger entries 12, 13, 19 and 20 each note
-//! in their own text.
+//! That is the exact repudiation failure the marked ledger entries note in their own
+//! text. (Deliberately not enumerated here: a by-hand id list in this header would
+//! need the same manual sync the test below exists to eliminate.)
 //!
 //! # Derived, never enumerated
 //!
@@ -57,6 +58,25 @@ const LEDGER_REL: &str = ".planning/WINDOWS.md";
 /// The migration guide, relative to the repository root.
 const CHAPTER_REL: &str = "pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md";
 
+/// The number of `[CONSUMER-OBSERVABLE]` entries the ledger carried when this gate
+/// was written, used as a FLOOR rather than as an expected set.
+///
+/// `!marked.is_empty()` alone is too weak: four of the five marked entries could
+/// lose their sentinel — a `gsd-tools windows` re-record, or a description rewritten
+/// in place, which entries in this ledger explicitly document happening ("SEVERITY
+/// CORRECTED IN PLACE", "RESTATED … rewritten in place") — and one survivor would
+/// still satisfy it. Coverage would shrink with no signal at all, and the gate would
+/// keep reporting green while checking less.
+///
+/// This is the same never-lower-the-floor doctrine as `MINIMUM_GATE_NEEDS` in
+/// `tests/ci_conformance_gate_wiring.rs` and `MIN_FULL_ENTRIES` in
+/// `tests/v1_severability_tripwire.rs`. If it fires, FIX THE LEDGER or the reader —
+/// raise this floor when entries are added, never lower it to make a red go green.
+///
+/// NOTE this is a floor on the COUNT only. The id set itself stays derived; nothing
+/// here enumerates which entries are marked.
+const MIN_MARKED_ENTRIES: usize = 5;
+
 /// One broken-windows ledger entry.
 ///
 /// Only the two fields this gate reasons about are declared; the ledger carries
@@ -68,56 +88,52 @@ struct Window {
     description: String,
 }
 
-/// Primitive shared with `tests/keyword_list_mirrors.rs` and
-/// `tests/phase115_contract_bindings.rs`. Cargo compiles each integration test as
-/// its own binary, so they cannot import across files; duplicating the helper is
-/// the documented house choice.
+/// Primitive restated from `tests/keyword_list_mirrors.rs` and
+/// `tests/phase115_contract_bindings.rs`.
+///
+/// KNOWN DEBT, stated accurately. This is a CHOICE, not a constraint. An earlier
+/// version of this note claimed integration tests "cannot import across files, so
+/// duplicating the helper is the documented house choice" — that is false, and
+/// `tests/common/mod.rs` says so in its own header: files under `tests/common/` are
+/// not compiled as their own test binaries and are the correct home for shared
+/// helpers, which 42 files in this tree already consume via `mod common;`.
+/// `tests/v1_byte_identity_after_cut.rs` retracts the identical false claim.
+/// The standing fix is a `tests/common/planning.rs` carrying this plus
+/// [`read_guarded`], consumed by the four readers that now restate them.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// `.planning/WINDOWS.md`, or `None` when the whole `.planning/` tree is absent.
+/// The contents of a repo-relative planning/doc file, or `None` when the whole
+/// tree that would contain it is absent.
 ///
-/// Guard semantics carried from `tests/v2_conformance_pin.rs:96-111`: `.planning/`
-/// is excluded from the published crate, so a checkout that does not carry the tree
-/// at all genuinely has nothing to read and returns early. A `.planning/` directory
-/// that EXISTS but has no `WINDOWS.md` is a FAILURE — that is a deleted gate, not a
-/// packaging artifact.
-fn ledger() -> Option<String> {
-    let tree = repo_root().join(".planning");
-    if let Ok(text) = fs::read_to_string(tree.join("WINDOWS.md")) {
+/// Guard semantics carried from `recheck_doc` in `tests/v2_conformance_pin.rs`
+/// (cited by symbol, not line: line citations in doc comments drift on every edit
+/// to the cited file). `.planning/` and `pmcp-book/` are each excluded from the
+/// published crate, so a checkout that does not carry the tree at all genuinely has
+/// nothing to read and returns early. A tree that EXISTS but is missing the file is
+/// a FAILURE — that is a deleted gate, not a packaging artifact. The fork is
+/// evaluated per tree, which is why the tree is derived from the file's own path
+/// rather than passed in.
+///
+/// The read goes through `rel` — the SAME constant the failure message tells the
+/// reader to update. An earlier shape named the path in a `*_REL` const but rebuilt
+/// it from separate literals to read it, so following the printed remedy changed
+/// nothing and left the gate red with the same message.
+fn read_guarded(rel: &str, consequence: &str) -> Option<String> {
+    let path = repo_root().join(rel);
+    if let Ok(text) = fs::read_to_string(&path) {
         return Some(text);
     }
+    let tree = path
+        .parent()
+        .expect("a repo-relative file path always has a parent directory");
     assert!(
         !tree.exists(),
-        "FAILURE MODE: `.planning/` exists but `{LEDGER_REL}` is missing. The \
-         broken-windows ledger is the source of truth for which behaviour changes are \
-         consumer-observable, so deleting it silently disarms this tripwire and every \
-         future undisclosed change ships unnoticed.\n\
-         WHAT TO DO: restore `{LEDGER_REL}`, or update `LEDGER_REL` in this test if the \
-         ledger moved — do not delete the assertion."
-    );
-    None
-}
-
-/// The migration chapter, or `None` when the whole `pmcp-book/src/` tree is absent.
-///
-/// Same two-branch guard as [`ledger`], applied independently: `pmcp-book/` is its
-/// own entry in `Cargo.toml`'s `exclude` array, so the absent-tree fork has to be
-/// evaluated per tree rather than once for both.
-fn migration_chapter() -> Option<String> {
-    let tree = repo_root().join("pmcp-book").join("src");
-    if let Ok(text) = fs::read_to_string(repo_root().join(CHAPTER_REL)) {
-        return Some(text);
-    }
-    assert!(
-        !tree.exists(),
-        "FAILURE MODE: `pmcp-book/src/` exists but `{CHAPTER_REL}` is missing. That \
-         chapter is the ONLY place a downstream consumer learns of a behaviour change \
-         that ships with no semver signal, so removing it repudiates every disclosure \
-         the ledger records.\n\
-         WHAT TO DO: restore `{CHAPTER_REL}`, or update `CHAPTER_REL` in this test if the \
-         chapter was renamed — do not delete the assertion."
+        "FAILURE MODE: `{}` exists but `{rel}` is missing. {consequence}\n\
+         WHAT TO DO: restore `{rel}`, or update its `*_REL` constant in this test if it \
+         moved — do not delete the assertion.",
+        tree.display()
     );
     None
 }
@@ -168,27 +184,55 @@ fn ledger_entries(markdown: &str) -> Vec<Window> {
 /// The matcher is deliberately tighter than a bare number search: entry `12` must
 /// not be satisfied by `12` appearing inside a version string such as `pmcp 2.19`
 /// or a line reference. It requires the citation phrase plan 119-05 used
-/// (`WINDOWS.md entry <id>`) AND that the id is not a prefix of a longer number,
-/// so a citation of entry `23` cannot stand in for a missing entry `2`.
+/// (`WINDOWS.md entry <id>`) AND that the id is bounded by a non-alphanumeric on
+/// BOTH sides, so a citation of entry `23` cannot stand in for a missing entry `2`
+/// and `entry 12a` cannot stand in for entry `12`.
+///
+/// The left bound is asserted rather than inherited from the literal prefix. An
+/// earlier shape checked only the character AFTER the id and relied on the trailing
+/// space in `"WINDOWS.md entry "` to bound the left — true today, but it made the
+/// stated guarantee an accident of the citation wording, so rewording the phrase
+/// would have silently dropped it. Same both-sides rule as `numeric_hits` in
+/// `tests/v2_tasks_tripwires.rs` and `contains_word` in
+/// `tests/phase115_contract_bindings.rs`.
 fn cites_entry(chapter: &str, id: u64) -> bool {
     let needle = format!("WINDOWS.md entry {id}");
     chapter.match_indices(&needle).any(|(at, _)| {
-        chapter[at + needle.len()..]
+        let before_ok = chapter[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|prev| !prev.is_ascii_alphanumeric());
+        let after_ok = chapter[at + needle.len()..]
             .chars()
             .next()
-            .is_none_or(|next| !next.is_ascii_digit())
+            .is_none_or(|next| !next.is_ascii_alphanumeric());
+        before_ok && after_ok
     })
 }
 
 #[test]
 fn every_consumer_observable_window_is_cited_in_the_migration_chapter() {
-    let (Some(ledger_md), Some(chapter)) = (ledger(), migration_chapter()) else {
+    let (Some(ledger_md), Some(chapter)) = (
+        read_guarded(
+            LEDGER_REL,
+            "The broken-windows ledger is the source of truth for which behaviour changes \
+             are consumer-observable, so deleting it silently disarms this tripwire and \
+             every future undisclosed change ships unnoticed.",
+        ),
+        read_guarded(
+            CHAPTER_REL,
+            "That chapter is the ONLY place a downstream consumer learns of a behaviour \
+             change that ships with no semver signal, so removing it repudiates every \
+             disclosure the ledger records.",
+        ),
+    ) else {
         return;
     };
 
-    let marked: Vec<Window> = ledger_entries(&ledger_md)
+    let marked: Vec<u64> = ledger_entries(&ledger_md)
         .into_iter()
         .filter(|entry| entry.description.contains(SENTINEL))
+        .map(|entry| entry.id)
         .collect();
 
     // Positive control. A run that selects zero entries would then vacuously
@@ -196,19 +240,22 @@ fn every_consumer_observable_window_is_cited_in_the_migration_chapter() {
     // shape, and one this repository has recorded before. The non-empty assertion is
     // what makes this test's success mean something.
     assert!(
-        !marked.is_empty(),
-        "FAILURE MODE: no `{SENTINEL}` entry was found in `{LEDGER_REL}`, so this gate \
-         checked nothing and would have passed regardless of the chapter's contents. \
-         Either the sentinel was stripped from every entry, or the description field this \
-         gate reads was renamed.\n\
-         WHAT TO DO: confirm the entries plan 119-05 marked still carry the literal \
-         `{SENTINEL}` in their `description`; if the marking convention changed, update \
-         `SENTINEL` here — do not delete the assertion."
+        marked.len() >= MIN_MARKED_ENTRIES,
+        "FAILURE MODE: only {} `{SENTINEL}` entries were found in `{LEDGER_REL}`, below the \
+         floor of {MIN_MARKED_ENTRIES}. At zero this gate would check nothing and pass \
+         regardless of the chapter's contents; below the floor it silently checks LESS than \
+         it did when it was written. Either the sentinel was stripped from entries that \
+         still need it, or the description field this gate reads was renamed.\n\
+         WHAT TO DO: confirm every consumer-observable entry still carries the literal \
+         `{SENTINEL}` in its `description`; if the marking convention changed, update \
+         `SENTINEL` here. Raise `MIN_MARKED_ENTRIES` when entries are added — never lower \
+         it to make this red go green, and do not delete the assertion.",
+        marked.len()
     );
 
     let uncited: Vec<u64> = marked
         .iter()
-        .map(|entry| entry.id)
+        .copied()
         .filter(|id| !cites_entry(&chapter, *id))
         .collect();
 

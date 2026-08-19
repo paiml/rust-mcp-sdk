@@ -83,15 +83,23 @@ exclude = [
     "presentations/",
     # Why: the D-03 disclosure tripwire reads BOTH .planning/WINDOWS.md and
     # pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md at runtime, and both
-    # trees are excluded above. Same disposition as tests/ci_conformance_gate_wiring.rs
-    # and for the same reason recorded there: this reader's whole job is to FAIL
-    # when a consumer-observable disclosure is missing, so the ship-with-guard
-    # tolerance that is deliberate for tests/v2_conformance_pin.rs (a pin that may
-    # degrade to a no-op downstream) is WRONG here — a silent skip is the vacuous
-    # gate the guard exists to prevent. Excluding the test removes the downstream
-    # skip path entirely rather than relying on it. The absent-tree guards inside
-    # the file remain, covering sparse/partial checkouts. This entry and the two
-    # paths it reads must never be split: exclude all three or ship all three.
+    # trees are excluded above. THIS ENTRY IS LOAD-BEARING, and the reason is
+    # precise: the test keeps the tolerant absent-tree guard (it returns early
+    # rather than panicking, so a sparse checkout is not a false red). Downstream,
+    # BOTH trees are absent, so a shipped copy would take that early return and
+    # PASS SILENTLY — the vacuous green this gate exists to prevent. Excluding it
+    # is what removes that path; the in-file guard does not, and cannot.
+    #
+    # (Contrast, stated accurately because an earlier version of this note got it
+    # backwards: tests/ci_conformance_gate_wiring.rs panics on a missing input, so
+    # shipped it would fail LOUDLY, and its exclusion prevents a downstream red
+    # rather than a downstream false green. tests/v2_conformance_pin.rs takes the
+    # tolerant shape deliberately, since a pin degrading to a no-op downstream is
+    # acceptable. This file takes the tolerant shape but is NOT tolerant of a
+    # vacuous pass — hence exclusion, not a shape change.)
+    #
+    # This entry and the two paths it reads must never be split: exclude all three
+    # or ship all three. That invariant is prose only — nothing enforces it.
     "tests/windows_disclosure_tripwire.rs",
 ]
 
