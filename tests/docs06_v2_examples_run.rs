@@ -89,7 +89,8 @@
 mod common;
 
 use common::example_process::{
-    run_example_to_completion, spawn_example, target_dir, wait_until_listening, wait_until_released,
+    assert_ran_and_printed_banner, run_example_to_completion, spawn_example, target_dir,
+    wait_until_listening, wait_until_released, ExampleLeg,
 };
 use serde_json::json;
 use std::process::Output;
@@ -166,14 +167,21 @@ const S53_TIMEOUT: Duration = Duration::from_mins(1);
 /// also satisfy.
 const CLIENT_BANNER: &str = "All three demonstrations behaved as documented.";
 
+/// The argv both client legs are invoked with.
+///
+/// Shared by the run and by [`record`] so the artifact cannot describe an
+/// invocation that did not happen — the artifact's whole value is being a
+/// trustworthy record of what actually ran.
+const CLIENT_ARGS: &[&str] = &[BIND_ADDR];
+
 /// Turn one client's captured `Output` into the artifact's record of that leg.
 ///
 /// Both streams go in as TEXT, not just the one asserted on: a red whose stdout
 /// says nothing usually has the reason on stderr.
-fn record(rel_path: &str, output: &Output) -> serde_json::Value {
+fn record(rel_path: &str, args: &[&str], output: &Output) -> serde_json::Value {
     json!({
         "binary": format!("target/{rel_path}"),
-        "args": [BIND_ADDR],
+        "args": args,
         "exit_status": output.status.to_string(),
         "exit_success": output.status.success(),
         "stdout": String::from_utf8_lossy(&output.stdout),
@@ -189,35 +197,20 @@ fn record(rel_path: &str, output: &Output) -> serde_json::Value {
 /// expected, and carries the captured body — a red that says only
 /// `assertion failed` is a red that says nothing.
 fn assert_client_leg(rel_path: &str, output: &Output) {
-    assert!(
-        output.status.success(),
-        "`{rel_path}` exited with {} rather than succeeding while \
-         `{S47_REL_PATH}` was serving {BIND_ADDR}. DOCS-06 claims these v2 examples ship AND \
-         pass, so a non-zero exit here is a broken documented command.\n\
-         Rebuild all three with \
-         `cargo build --features full --example s47_v2_stateless_mrtr --example \
-         s48_v2_mrtr_client --example s53_v2_agent_client` — note that \
-         `cargo test --test docs06_v2_examples_run` does NOT rebuild examples.\n\
-         --- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "`{rel_path}` exited 0 but printed nothing on stdout. The evidence this leg asserts on \
-         IS the printed transcript, so an empty stdout means the exchange proved nothing.\n\
-         --- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains(CLIENT_BANNER),
-        "`{rel_path}` exited 0 but never printed {CLIENT_BANNER:?}. That line is printed only \
-         after all three of the client's demonstrations have run against the live server, so its \
-         absence means the round trip did not complete — which is the whole of what DOCS-06 \
-         claims about this pair.\n--- stdout ---\n{stdout}"
+    assert_ran_and_printed_banner(
+        &ExampleLeg {
+            rel_path,
+            banner: CLIENT_BANNER,
+            rebuild: "`cargo build --features full --example s47_v2_stateless_mrtr --example \
+                      s48_v2_mrtr_client --example s53_v2_agent_client`",
+            claim: "DOCS-06 claims these v2 examples ship AND pass, so a non-zero exit here is \
+                    a broken documented command.",
+            banner_means: "That line is printed only after all three of the client's \
+                           demonstrations have run against the live server, so its absence means \
+                           the round trip did not complete — which is the whole of what DOCS-06 \
+                           claims about this pair.",
+        },
+        output,
     );
 }
 
@@ -229,8 +222,8 @@ async fn s47_serves_both_v2_client_examples_end_to_end() {
     wait_until_listening(addr, &mut guard, READY_TIMEOUT).await;
 
     // BOTH client legs run before EITHER is asserted — see the module header.
-    let s48 = run_example_to_completion(S48_REL_PATH, &[BIND_ADDR], S48_TIMEOUT);
-    let s53 = run_example_to_completion(S53_REL_PATH, &[BIND_ADDR], S53_TIMEOUT);
+    let s48 = run_example_to_completion(S48_REL_PATH, CLIENT_ARGS, S48_TIMEOUT);
+    let s53 = run_example_to_completion(S53_REL_PATH, CLIENT_ARGS, S53_TIMEOUT);
 
     let artifact = json!({
         "note": format!(
@@ -240,8 +233,8 @@ async fn s47_serves_both_v2_client_examples_end_to_end() {
         ),
         "server": format!("target/{S47_REL_PATH}"),
         "bind_addr": BIND_ADDR,
-        "s48_v2_mrtr_client": record(S48_REL_PATH, &s48),
-        "s53_v2_agent_client": record(S53_REL_PATH, &s53),
+        "s48_v2_mrtr_client": record(S48_REL_PATH, CLIENT_ARGS, &s48),
+        "s53_v2_agent_client": record(S53_REL_PATH, CLIENT_ARGS, &s53),
     });
     let artifact_path = target_dir().join(ARTIFACT_REL_PATH);
     std::fs::write(

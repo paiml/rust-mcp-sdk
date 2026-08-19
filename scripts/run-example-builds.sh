@@ -86,7 +86,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 total_examples=0
-tree_count=0
+trees_built=0
 
 log_dir="$(mktemp -d)"
 trap 'rm -rf "$log_dir"' EXIT
@@ -97,15 +97,17 @@ fail() {
   exit 1
 }
 
-# build_tree <label> <examples-dir> <cargo package selector...>
+# build_tree <package> <examples-dir>
 #
-# The root tree is selected with an explicit `-p pmcp` rather than a bare
-# `cargo build`. The two are identical today — the workspace root is itself a
-# package, so a bare build selects only it — but the explicit spelling stays
-# correct if `default-members` is ever added.
+# The package is always selected with an explicit `-p <package>` rather than a
+# bare `cargo build`. For the root tree the two are identical today — the
+# workspace root is itself the `pmcp` package, so a bare build selects only it —
+# but the explicit spelling stays correct if `default-members` is ever added.
+#
+# The package name doubles as the tree's label: there is no case where a tree
+# needs a display name different from the package it builds.
 build_tree() {
   local label="$1" dir="$2"
-  shift 2
 
   if [ ! -d "$dir" ]; then
     fail "$(cat <<EOF
@@ -145,7 +147,7 @@ EOF
   # the opposite of the `2>/dev/null` this replaced. `set -o pipefail` (from
   # `set -euo pipefail` above) is what makes the pipeline report cargo's status
   # rather than tee's.
-  if ! cargo build "$@" --all-features --examples 2>&1 | tee "$log"; then
+  if ! cargo build -p "$label" --all-features --examples 2>&1 | tee "$log"; then
     echo ""
     echo "FAILURE: tree '$label' failed to build." >&2
     echo "Failing targets, as cargo named them:" >&2
@@ -161,18 +163,22 @@ EOF
   fi
 
   total_examples=$((total_examples + count))
-  tree_count=$((tree_count + 1))
+  trees_built=$((trees_built + 1))
 }
 
 echo "=== Example build gate (D-13) ==="
 
-build_tree root                examples                             -p pmcp
-build_tree pmcp-agent          crates/pmcp-agent/examples           -p pmcp-agent
-build_tree pmcp-team-servers   crates/pmcp-team-servers/examples    -p pmcp-team-servers
+build_tree pmcp                examples
+build_tree pmcp-agent          crates/pmcp-agent/examples
+build_tree pmcp-team-servers   crates/pmcp-team-servers/examples
 
-if [ "$total_examples" -eq 0 ]; then
-  fail "no examples were built at all."
-fi
+# No aggregate zero-guard here: it would be unreachable. Every build_tree call
+# either exits non-zero via `fail` (which is a bare `exit`, not a `return`) or
+# adds count >= 1, so reaching this line already implies total_examples >= 1.
+# The guard that does the real work is the PER-TREE one inside build_tree.
 
 echo ""
-echo "$total_examples examples built across $tree_count trees, 0 failures."
+echo "$total_examples examples built across $trees_built covered trees, 0 failures."
+echo "Scope: the trees listed above ONLY — this is not every example in the"
+echo "workspace. The packages deliberately outside the gate, and why, are in"
+echo "this script's header."

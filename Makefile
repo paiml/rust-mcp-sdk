@@ -264,18 +264,10 @@ test-fuzz:
 # recorded at the Phase 118.1 Wave 10 merge.
 #
 # The recipe was previously NON-BLOCKING and the change to strict is deliberate.
-# The old inline loop reported a build failure as "skipped" and exited 0, threw
-# the compiler diagnostic away with `2>/dev/null`, and iterated `ls examples/*.rs`
-# so it never reached the two `crates/*/examples/` trees at all. The delegated
-# script (see `scripts/` — the same delegation shape as `test-severance`) fixes
-# all three and carries the rationale in its header.
-#
-# The baseline this strictness lands against is MEASURED, not assumed to be
-# zero: `.planning/phases/119-documentation-three-shapes-v2-migration/`
-# `deferred-items.md` records all 87 example targets building clean at commit
-# `aa0e6c9a`, immediately before this change, together with the sub-crates that
-# are deliberately left outside the gate and why. A red here that names a target
-# in one of the three covered trees is a real regression, not inherited debt.
+# The full rationale — the three defects in the old inline loop, the measured
+# pre-change baseline, and the list of example trees deliberately left outside
+# the gate — lives ONCE, in the header of `scripts/run-example-builds.sh`.
+# Do not restate it here; two copies in two languages drift.
 #
 # NOTE: examples are BUILT here, not run. They used to be un-run entirely; that
 # is no longer the whole truth — `tests/docs04_examples_run.rs` and
@@ -283,9 +275,7 @@ test-fuzz:
 # `test-integration`, against the binaries this target produces.
 .PHONY: test-examples
 test-examples:
-	@echo "$(BLUE)Building every example in all three workspace example trees...$(NC)"
 	./scripts/run-example-builds.sh
-	@echo "$(GREEN)✓ Every example built — counted, non-zero, zero failures$(NC)"
 
 # MCP Tester Integration
 .PHONY: build-tester

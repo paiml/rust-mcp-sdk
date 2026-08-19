@@ -82,7 +82,20 @@ impl Drop for ChildGuard {
 /// to `Stdio::piped()` without also draining the pipe — a full buffer would wedge
 /// the example mid-run and present as a bind timeout rather than as the block it
 /// is.
-pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard) {
+/// Resolve `target/{rel_path}` to a built example binary, or FAIL.
+///
+/// Shared by [`spawn_example`] and [`run_example_to_completion`] so the
+/// exists-check, the name extraction and the staleness guard have exactly one
+/// definition. They previously carried a character-for-character copy each —
+/// the same duplication this module's header was written to stop.
+///
+/// `build_hint` is the ONE genuinely per-caller part: each entry point names the
+/// build command appropriate to the binaries it runs, so a red says how to fix
+/// itself.
+fn resolve_example_binary(
+    rel_path: &str,
+    build_hint: impl FnOnce(&str) -> String,
+) -> (PathBuf, &str) {
     let binary = target_dir().join(rel_path);
     let example_name = Path::new(rel_path)
         .file_name()
@@ -92,11 +105,18 @@ pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard
         binary.is_file(),
         "{} is missing. This leg FAILS rather than skipping, by design: a skip would \
          restore the unenforced 'the example demonstrates the fix' criterion it exists \
-         to close. Build it first with \
-         `cargo build --features full --example {example_name}`.",
-        binary.display()
+         to close. Build it first with {}.",
+        binary.display(),
+        build_hint(example_name)
     );
     assert_binary_is_not_stale(&binary, example_name);
+    (binary, example_name)
+}
+
+pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard) {
+    let (binary, _example_name) = resolve_example_binary(rel_path, |name| {
+        format!("`cargo build --features full --example {name}`")
+    });
 
     let addr: SocketAddr = bind_addr
         .parse()
@@ -125,27 +145,19 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// One child stream, drained on its own thread into a buffer the test thread can
 /// read at ANY time — including while the reader is still blocked.
 ///
-/// The `finished` flag is what makes [`settle`] bounded: it reports that a reader
-/// has hit EOF without anyone having to join it.
+/// "Has this reader hit EOF?" is asked of the reader thread's own
+/// [`JoinHandle::is_finished`], not of a flag maintained alongside it — the
+/// thread ending IS the condition [`settle`] waits on, so a second hand-written
+/// representation of it could only ever drift.
+#[derive(Clone)]
 struct Drain {
     captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drain {
     fn new() -> Self {
         Self {
             captured: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    /// A handle for the reader thread. Not `Clone` on purpose: the reader half
-    /// and the observer half are used differently and naming that is worth a line.
-    fn clone_for_reader(&self) -> Self {
-        Self {
-            captured: std::sync::Arc::clone(&self.captured),
-            finished: std::sync::Arc::clone(&self.finished),
         }
     }
 
@@ -155,10 +167,6 @@ impl Drain {
             .lock()
             .map(|buffer| buffer.clone())
             .unwrap_or_default()
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -181,22 +189,88 @@ fn drain_into(mut source: impl Read, sink: &Drain) {
             },
         }
     }
-    sink.finished
-        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Give every drain up to [`DRAIN_GRACE`] to reach EOF, then return regardless.
+/// Give every reader up to [`DRAIN_GRACE`] to reach EOF, then return regardless.
 ///
 /// The "then return regardless" is the whole point: this is a bounded settle, not
-/// a join.
-fn settle(drains: &[&Drain]) {
+/// a join. The handles are POLLED with [`JoinHandle::is_finished`] and then
+/// dropped, which detaches them exactly as before. Do NOT "simplify" this into a
+/// `join()`: an earlier draft did, and hung forever whenever the killed child had
+/// forked a grandchild that kept the pipe open — the reader never saw EOF, so the
+/// join never returned.
+fn settle(readers: &[&std::thread::JoinHandle<()>]) {
     let deadline = Instant::now() + DRAIN_GRACE;
     while Instant::now() < deadline {
-        if drains.iter().all(|drain| drain.is_finished()) {
+        if readers.iter().all(|reader| reader.is_finished()) {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// One documented example run, and the four things a red about it must say.
+///
+/// Every field is per-leg on purpose. The house rule these legs enforce is that
+/// "a red that says only `assertion failed` is a red that says nothing", so the
+/// rebuild command and the documentation claim travel WITH the leg rather than
+/// being generalized away into one shared sentence.
+pub struct ExampleLeg<'a> {
+    /// The compiled binary's path relative to the target dir.
+    pub rel_path: &'a str,
+    /// The completion banner the example prints only on the success path.
+    pub banner: &'a str,
+    /// The exact `cargo build …` line that rebuilds THIS leg.
+    pub rebuild: &'a str,
+    /// What the docs promise about this example, quoted when the exit is non-zero.
+    pub claim: &'a str,
+    /// What the banner's ABSENCE proves, quoted when the banner is missing.
+    pub banner_means: &'a str,
+}
+
+/// Assert a documented example ran to completion and printed its banner.
+///
+/// The three assertions, in this order, are the shared shape that four legs
+/// across two files previously spelled out by hand:
+///
+/// 1. exit status FIRST — a banner check on a crashed run reports the wrong defect;
+/// 2. stdout is non-empty — the printed transcript IS the evidence, so an empty
+///    one means the run proved nothing;
+/// 3. the banner is PRESENT — a positive marker, never the absence of an error
+///    string, which is the false-green shape recorded in
+///    `tests/log_records_example_run.rs`.
+///
+/// Ordering and message content are the point of hoisting this: a change to any
+/// of them now reaches every leg instead of the subset someone remembered.
+pub fn assert_ran_and_printed_banner(leg: &ExampleLeg<'_>, output: &Output) {
+    let rel_path = leg.rel_path;
+    assert!(
+        output.status.success(),
+        "`{rel_path}` exited with {} rather than succeeding. {}\n\
+         Rebuild with {} — note that `cargo test` does NOT rebuild examples.\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        leg.claim,
+        leg.rebuild,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "`{rel_path}` exited 0 but printed nothing on stdout. The evidence this leg asserts on \
+         IS the printed transcript, so an empty stdout means the run proved nothing.\n\
+         --- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(leg.banner),
+        "`{rel_path}` exited 0 but never printed its completion banner {:?}. {}\n\
+         --- stdout ---\n{stdout}",
+        leg.banner,
+        leg.banner_means
+    );
 }
 
 /// Run a built example binary at `target/{rel_path}` to completion under a
@@ -260,20 +334,12 @@ fn settle(drains: &[&Drain]) {
 /// these legs builds the binary first with an explicit `-p <crate>` invocation,
 /// which is the same command the panic messages below name.
 pub fn run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duration) -> Output {
-    let binary = target_dir().join(rel_path);
-    let example_name = Path::new(rel_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(rel_path);
-    assert!(
-        binary.is_file(),
-        "{} is missing. This leg FAILS rather than skipping, by design: a skip would \
-         restore the unenforced 'the example demonstrates the fix' criterion it exists \
-         to close. Build it first with `cargo build --example {example_name}` (add \
-         `-p <crate>` when the example lives under `crates/*/examples/`).",
-        binary.display()
-    );
-    assert_binary_is_not_stale(&binary, example_name);
+    let (binary, example_name) = resolve_example_binary(rel_path, |name| {
+        format!(
+            "`cargo build --example {name}` (add `-p <crate>` when the example lives under \
+             `crates/*/examples/`)"
+        )
+    });
 
     let mut child = Command::new(&binary)
         .args(args)
@@ -294,20 +360,20 @@ pub fn run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duratio
         .expect("stderr was piped, so the handle is present");
     let stdout_drain = Drain::new();
     let stderr_drain = Drain::new();
-    {
-        let sink = stdout_drain.clone_for_reader();
-        std::thread::spawn(move || drain_into(stdout_pipe, &sink));
-    }
-    {
-        let sink = stderr_drain.clone_for_reader();
-        std::thread::spawn(move || drain_into(stderr_pipe, &sink));
-    }
+    let stdout_reader = {
+        let sink = stdout_drain.clone();
+        std::thread::spawn(move || drain_into(stdout_pipe, &sink))
+    };
+    let stderr_reader = {
+        let sink = stderr_drain.clone();
+        std::thread::spawn(move || drain_into(stderr_pipe, &sink))
+    };
 
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                settle(&[&stdout_drain, &stderr_drain]);
+                settle(&[&stdout_reader, &stderr_reader]);
                 return Output {
                     status,
                     stdout: stdout_drain.captured(),
@@ -322,7 +388,7 @@ pub fn run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duratio
             // Kill AND reap: a kill alone leaves a zombie for the rest of the run.
             let _ = child.kill();
             let _ = child.wait();
-            settle(&[&stdout_drain, &stderr_drain]);
+            settle(&[&stdout_reader, &stderr_reader]);
             let stdout = stdout_drain.captured();
             let stderr = stderr_drain.captured();
             panic!(

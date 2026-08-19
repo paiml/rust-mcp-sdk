@@ -79,7 +79,9 @@
 
 mod common;
 
-use common::example_process::run_example_to_completion;
+use common::example_process::{
+    assert_ran_and_printed_banner, run_example_to_completion, ExampleLeg,
+};
 use std::time::Duration;
 
 /// `s50_standalone_vs_sampled`'s compiled path, relative to the target dir.
@@ -126,36 +128,15 @@ const S50_BANNER: &str = "Done — the same AgentEngine ran standalone and hoste
 /// The example Chapter 12.15 cites runs to completion and prints its banner.
 #[test]
 fn s50_standalone_vs_sampled_runs_to_completion() {
-    let output = run_example_to_completion(S50_REL_PATH, &[], S50_TIMEOUT);
-
-    // Status FIRST — see the module header.
-    assert!(
-        output.status.success(),
-        "`{S50_REL_PATH}` exited with {} rather than succeeding. Chapter 12.15 tells readers to \
-         run `cargo run -p pmcp-agent --example s50_standalone_vs_sampled`, so a non-zero exit \
-         here is a broken documented command.\n\
-         Rebuild with `cargo build -p pmcp-agent --example s50_standalone_vs_sampled` — note \
-         that `cargo test --test docs04_examples_run` does NOT rebuild examples.\n\
-         --- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "`{S50_REL_PATH}` exited 0 but printed nothing on stdout. The evidence this leg asserts \
-         on IS the printed transcript, so an empty stdout means the run proved nothing.\n\
-         --- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains(S50_BANNER),
-        "`{S50_REL_PATH}` exited 0 but never printed its completion banner {S50_BANNER:?}. The \
-         example prints that line only after BOTH the standalone and the hosted-sampled run \
-         finish, so its absence means one of the two halves did not complete — the exact claim \
-         Chapter 12.15 makes about this example.\n--- stdout ---\n{stdout}"
+    assert_ran_and_printed_banner(
+        &ExampleLeg {
+            rel_path: S50_REL_PATH,
+            banner: S50_BANNER,
+            rebuild: "`cargo build -p pmcp-agent --example s50_standalone_vs_sampled`",
+            claim: "Chapter 12.15 tells readers to run `cargo run -p pmcp-agent --example s50_standalone_vs_sampled`, so a non-zero exit here is a broken documented command.",
+            banner_means: "The example prints that line only after BOTH the standalone and the hosted-sampled run finish, so its absence means one of the two halves did not complete — the exact claim Chapter 12.15 makes about this example.",
+        },
+        &run_example_to_completion(S50_REL_PATH, &[], S50_TIMEOUT),
     );
 }
 
@@ -196,37 +177,15 @@ const S49_BANNER: &str = "Round-trip complete. Server received completion:";
 /// The `s49_sampling_host` example runs to completion and prints its banner.
 #[test]
 fn s49_sampling_host_runs_to_completion() {
-    let output = run_example_to_completion(S49_REL_PATH, &[], S49_TIMEOUT);
-
-    // Status FIRST — see the module header.
-    assert!(
-        output.status.success(),
-        "`{S49_REL_PATH}` exited with {} rather than succeeding. The host-sampling documentation \
-         tells readers to run `cargo run --example s49_sampling_host`, so a non-zero exit here \
-         is a broken documented command.\n\
-         Rebuild with `cargo build --example s49_sampling_host` — note that \
-         `cargo test --test docs04_examples_run` does NOT rebuild examples.\n\
-         --- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "`{S49_REL_PATH}` exited 0 but printed nothing on stdout. The evidence this leg asserts \
-         on IS the printed transcript, so an empty stdout means the run proved nothing.\n\
-         --- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains(S49_BANNER),
-        "`{S49_REL_PATH}` exited 0 but never printed its completion banner {S49_BANNER:?}. The \
-         example prints that line only after the client's registered host handler has answered \
-         an inbound `sampling/createMessage` AND the mock server has read the completion back, \
-         so its absence means the inverse-direction round trip did not close — the exact claim \
-         the example exists to demonstrate.\n--- stdout ---\n{stdout}"
+    assert_ran_and_printed_banner(
+        &ExampleLeg {
+            rel_path: S49_REL_PATH,
+            banner: S49_BANNER,
+            rebuild: "`cargo build --example s49_sampling_host`",
+            claim: "The host-sampling documentation tells readers to run `cargo run --example s49_sampling_host`, so a non-zero exit here is a broken documented command.",
+            banner_means: "The example prints that line only after the client's registered host handler has answered an inbound `sampling/createMessage` AND the mock server has read the completion back, so its absence means the inverse-direction round trip did not close — the exact claim the example exists to demonstrate.",
+        },
+        &run_example_to_completion(S49_REL_PATH, &[], S49_TIMEOUT),
     );
 }
 
@@ -280,38 +239,14 @@ const DOC_REVIEW_TEAM_BANNER: &str = "doc-review flow complete";
 /// The four-reference-server `doc_review_team` example runs to completion.
 #[test]
 fn doc_review_team_runs_to_completion() {
-    let output = run_example_to_completion(DOC_REVIEW_TEAM_REL_PATH, &[], DOC_REVIEW_TEAM_TIMEOUT);
-
-    // Status FIRST — see the module header.
-    assert!(
-        output.status.success(),
-        "`{DOC_REVIEW_TEAM_REL_PATH}` exited with {} rather than succeeding. The Agent Teams \
-         documentation cites this example as its end-to-end demonstration, so a non-zero exit \
-         here is a broken documented command.\n\
-         Rebuild with \
-         `cargo build -p pmcp-team-servers --example doc_review_team --features runtime` — note \
-         that `cargo test --test docs04_examples_run` does NOT rebuild examples, and that this \
-         example will not build at all without that feature flag.\n\
-         --- stdout ---\n{}\n--- stderr ---\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "`{DOC_REVIEW_TEAM_REL_PATH}` exited 0 but printed nothing on stdout. This example IS a \
-         printed narrative — the BA-followable transcript is the whole deliverable — so an empty \
-         stdout means the run proved nothing.\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains(DOC_REVIEW_TEAM_BANNER),
-        "`{DOC_REVIEW_TEAM_REL_PATH}` exited 0 but never printed its completion banner \
-         {DOC_REVIEW_TEAM_BANNER:?}. The example prints that line only after all five flow steps \
-         have run against all four reference servers and every hosting task has been torn down, \
-         so its absence means the team did not finish the review — the exact claim the example \
-         exists to demonstrate.\n--- stdout ---\n{stdout}"
+    assert_ran_and_printed_banner(
+        &ExampleLeg {
+            rel_path: DOC_REVIEW_TEAM_REL_PATH,
+            banner: DOC_REVIEW_TEAM_BANNER,
+            rebuild: "`cargo build -p pmcp-team-servers --example doc_review_team --features runtime` (this example does not build at all without that feature flag)",
+            claim: "The Agent Teams documentation cites this example as its end-to-end demonstration, so a non-zero exit here is a broken documented command.",
+            banner_means: "The example prints that line only after all five flow steps have run against all four reference servers and every hosting task has been torn down, so its absence means the team did not finish the review — the exact claim the example exists to demonstrate.",
+        },
+        &run_example_to_completion(DOC_REVIEW_TEAM_REL_PATH, &[], DOC_REVIEW_TEAM_TIMEOUT),
     );
 }
