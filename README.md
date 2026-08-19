@@ -444,6 +444,47 @@ cargo pmcp app build --url https://my-server.example.com
 
 ---
 
+## Agents & Teams
+
+Everything so far builds MCP **servers** — things that wait to be called. An agent is
+the other side: it owns a decision loop, so it *is* an MCP client. PMCP ships that loop
+as a crate and scaffolds it from the CLI, so you can watch an agent make decisions
+before writing any Rust.
+
+```bash
+# Scaffold a runnable agent package (AgentPackage manifest + crate)
+cargo pmcp agent new research-agent
+cd research-agent
+
+# Run the loop offline first — no network, no API key
+cargo pmcp agent dev --source fixed
+
+# Then against a local model (defaults to Ollama at http://localhost:11434/v1)
+cargo pmcp agent dev --source openai-compat --model llama3.2
+
+# Run a two-member reference team in one process
+cargo pmcp team dev
+```
+
+The agent's identity — instructions, model slot, token and iteration limits — lives in
+an `agent.package.json` manifest, not in code, so the same package moves from your
+laptop to a deployment unedited. Only `--source` changes when you swap where completions
+come from; the loop does not.
+
+**The crates behind it:**
+- **🤖 `pmcp-agent`** - The `AgentEngine` loop over three seams (completion source, tool invoker, store), plus `AgentServer` for exposing an agent as an MCP tool that is sampled by its caller
+- **👥 `pmcp-team-servers`** - Four reference team servers and the in-process composition runtime `cargo pmcp team dev` drives
+- **📦 `pmcp-package`** - The portable AI-Package format (`AgentPackage`, `TeamPackage`) that makes an agent a description rather than a binary
+
+```bash
+# One AgentEngine, run twice: standalone, then hosted-sampled — no network, no key
+cargo run -p pmcp-agent --example s50_standalone_vs_sampled
+```
+
+**Learn more**: [Chapter 12.15: Agents as MCP Clients](https://paiml.github.io/rust-mcp-sdk/book/ch12-15-agents-as-mcp-clients.html) | [`pmcp-agent`](crates/pmcp-agent/) | [`pmcp-team-servers`](crates/pmcp-team-servers/)
+
+---
+
 ## Latest Release: v2.0.0
 
 **PMCP v2.0 — aligned with the MCP TypeScript SDK v2.0 release (2026-03-22):**
