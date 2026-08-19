@@ -1,5 +1,7 @@
 # Chapter 10: Transport Layers — Write Once, Run Anywhere
 
+> **Note on vocabulary**: **v1** means the MCP protocol revision `2025-11-25` and **v2** means `2026-07-28`. These are *protocol eras*, not crate versions — the crate is always written with its name attached ("pmcp 2.18"), so a bare "2.18" can never be mistaken for a protocol revision. One pmcp binary speaks both, negotiated per request. Unless a passage says otherwise, this chapter describes the **v1** transport behaviour; for the v2 story see [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md).
+
 This chapter introduces the transport layer architecture of MCP—the foundation that enables you to write your server logic once and deploy it across diverse environments without modification. Just as a web application can be deployed behind different web servers (nginx, Apache, Cloudflare), your MCP server can run over different transport mechanisms (stdio, HTTP, WebSocket) without changing a single line of business logic.
 
 ## The Power of Transport Abstraction
@@ -182,6 +184,8 @@ pmcp = { version = "2.0", features = ["wasm"] }
 - `wasm`: WASM-compatible transports for browser use
 
 ## Understanding Streamable HTTP Modes
+
+> **Era note**: the three modes below are **v1 build-time** modes — points on the stateful/stateless spectrum that you choose when you construct the server. **v2 statelessness is per-request and orthogonal to all three.** A server built with the *stateful* default HTTP config still mints sessions for v1 clients and still returns no session id on a v2-negotiated request, because the era gate sits at the request rather than at the build: `cargo run --example s47_v2_stateless_mrtr --features full` demonstrates exactly that. So do not reach for Mode 1 in order to "get" v2 statelessness — you would be disabling v1 sessions you could have kept. Relatedly, **SSE resumption via `Last-Event-Id` is a v1 mechanism**; where Mode 3 below describes it, read that as v1-only. The full v2 server story is in [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md#for-servers).
 
 Streamable HTTP is PMCP's most flexible transport, offering different operational modes for different deployment scenarios:
 
@@ -569,7 +573,7 @@ let (bound_addr, handle) = http_server.start().await?;
 
 The Streamable HTTP server enforces MCP-specific headers:
 
-- **`mcp-protocol-version`**: Protocol version header (e.g., `2025-11-25`)
+- **`mcp-protocol-version`**: Protocol version header — `2025-11-25` (v1) or `2026-07-28` (v2)
 - **`mcp-session-id`**: Session identifier (stateful mode only)
 - **`Accept`**: Must include `application/json` or `text/event-stream`
   - `Accept: application/json` → Simple JSON responses
