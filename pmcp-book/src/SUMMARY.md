@@ -42,6 +42,7 @@
 - [Chapter 12.14: Workbook Table Authoring — Your Excel Process as an MCP Tool](workbook-table-authoring.md)
 - [Chapter 12.15: Agents as MCP Clients](ch12-15-agents-as-mcp-clients.md)
   - [Sampling & Hosting](ch17-04-sampling-hosting.md)
+- [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md)
 
 ## Part IV: Real-World Applications
 
