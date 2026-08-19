@@ -22,9 +22,10 @@
 // two example-running legs consume it. Same rationale as `common/v2.rs`.
 #![allow(dead_code)]
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// The target directory, honouring `CARGO_TARGET_DIR` when it is set.
@@ -109,6 +110,238 @@ pub fn spawn_example(rel_path: &str, bind_addr: &str) -> (SocketAddr, ChildGuard
         .unwrap_or_else(|error| panic!("could not spawn {}: {error}", binary.display()));
 
     (addr, ChildGuard::new(child))
+}
+
+/// How long [`run_example_to_completion`] lets a reader thread finish before it
+/// takes whatever has been captured and moves on.
+///
+/// Deliberately short. Once the child is gone the reader has at most one pipe
+/// buffer left to consume, which takes microseconds; anything still outstanding
+/// after this window means a surviving grandchild holds the write end, and no
+/// amount of further waiting will end it — see "Why the drains publish into a
+/// shared buffer" on [`run_example_to_completion`].
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// One child stream, drained on its own thread into a buffer the test thread can
+/// read at ANY time — including while the reader is still blocked.
+///
+/// The `finished` flag is what makes [`settle`] bounded: it reports that a reader
+/// has hit EOF without anyone having to join it.
+struct Drain {
+    captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drain {
+    fn new() -> Self {
+        Self {
+            captured: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// A handle for the reader thread. Not `Clone` on purpose: the reader half
+    /// and the observer half are used differently and naming that is worth a line.
+    fn clone_for_reader(&self) -> Self {
+        Self {
+            captured: std::sync::Arc::clone(&self.captured),
+            finished: std::sync::Arc::clone(&self.finished),
+        }
+    }
+
+    /// Everything read SO FAR. Never blocks on the reader.
+    fn captured(&self) -> Vec<u8> {
+        self.captured
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Read `source` to EOF in chunks, publishing each chunk into `sink` as it
+/// arrives.
+///
+/// Chunked rather than `read_to_end` so that partial output is observable while
+/// the child is still running: a timeout report that can only show output the
+/// reader already finished collecting would show nothing in exactly the case that
+/// matters.
+fn drain_into(mut source: impl Read, sink: &Drain) {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match source.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                if let Ok(mut buffer) = sink.captured.lock() {
+                    buffer.extend_from_slice(&chunk[..count]);
+                }
+            },
+        }
+    }
+    sink.finished
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Give every drain up to [`DRAIN_GRACE`] to reach EOF, then return regardless.
+///
+/// The "then return regardless" is the whole point: this is a bounded settle, not
+/// a join.
+fn settle(drains: &[&Drain]) {
+    let deadline = Instant::now() + DRAIN_GRACE;
+    while Instant::now() < deadline {
+        if drains.iter().all(|drain| drain.is_finished()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run a built example binary at `target/{rel_path}` to completion under a
+/// caller-supplied deadline, returning its status and BOTH captured streams.
+///
+/// # Why this exists beside [`spawn_example`]
+///
+/// [`spawn_example`] serves the socket-shaped legs: it discards both streams and
+/// the caller then waits for a port with [`wait_until_listening`]. A
+/// run-to-completion example binds nothing, so there is no port to poll, and the
+/// evidence it produces is the banner it PRINTS. `Stdio::null()` would discard
+/// exactly the bytes such a leg asserts on, so this helper pipes instead.
+///
+/// # Why the drain threads are load-bearing, not defensive
+///
+/// [`spawn_example`]'s own rustdoc records the trap: piping WITHOUT draining
+/// wedges the child the moment it fills a pipe buffer. That block would happen
+/// *before* the deadline below is ever consulted on a chatty example, so the
+/// deadline alone does not save us — each stream is drained on its own thread,
+/// both started BEFORE the wait. Reading one stream to end and only then touching
+/// the other reintroduces the same deadlock.
+///
+/// # Why the drains publish into a shared buffer instead of being joined
+///
+/// MEASURED during Phase 119-02, on a probe that ran `sh -c 'echo …; sleep 300'`
+/// under a 2 s budget: the first draft killed and reaped the child on expiry and
+/// then JOINED the reader threads — and hung anyway, past 60 s. `sh` had forked
+/// `sleep`, killing `sh` did not kill the grandchild, and the grandchild still
+/// held the write end of the pipe, so `read_to_end` never returned and the join
+/// blocked forever. That is the very failure this deadline exists to prevent,
+/// reintroduced one layer down.
+///
+/// So the readers append into `Arc<Mutex<Vec<u8>>>` buffers that are readable at
+/// ANY moment, and neither exit path joins them. Both paths instead allow a short
+/// bounded settle window ([`DRAIN_GRACE`]) for a reader to finish what is already
+/// in the pipe — at most one pipe buffer once the child is gone, so microseconds
+/// in practice — and then take whatever has been captured. A reader still blocked
+/// on an orphan's inherited pipe is simply left detached; it costs a parked thread
+/// for the rest of the test binary's life, which is the correct trade against
+/// hanging the suite.
+///
+/// # Why `timeout` is a parameter
+///
+/// The module header's rule ("Timeouts are ARGUMENTS, not constants") applies
+/// here for the usual reason plus a sharper one: a wait with no ceiling turns a
+/// deadlocked or non-terminating example into a HUNG integration suite rather
+/// than a red one. On expiry the child is killed AND reaped — a kill alone leaves
+/// a zombie — and the panic carries both partial streams, because a timeout that
+/// prints nothing is indistinguishable from the hang it replaced.
+///
+/// # Staleness-guard limitation for non-root examples
+///
+/// [`assert_binary_is_not_stale`] compares against two roots: the root
+/// `examples/<name>.rs` path and root `src/`. For a `crates/*/examples/` binary
+/// the first root resolves to a path that does not exist and `crates/*/src/` is
+/// never consulted, so edits to the owning crate's sources are INVISIBLE to the
+/// guard. It is not vacuous — root `src/` is still compared — but it is weaker
+/// than its own rustdoc advertises. Generalizing the root set would change a
+/// guard four existing legs already depend on, so this is DOCUMENTED rather than
+/// silently inherited; the compensating control is that every path which runs
+/// these legs builds the binary first with an explicit `-p <crate>` invocation,
+/// which is the same command the panic messages below name.
+pub fn run_example_to_completion(rel_path: &str, args: &[&str], timeout: Duration) -> Output {
+    let binary = target_dir().join(rel_path);
+    let example_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(rel_path);
+    assert!(
+        binary.is_file(),
+        "{} is missing. This leg FAILS rather than skipping, by design: a skip would \
+         restore the unenforced 'the example demonstrates the fix' criterion it exists \
+         to close. Build it first with `cargo build --example {example_name}` (add \
+         `-p <crate>` when the example lives under `crates/*/examples/`).",
+        binary.display()
+    );
+    assert_binary_is_not_stale(&binary, example_name);
+
+    let mut child = Command::new(&binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("could not spawn {}: {error}", binary.display()));
+
+    // Both drains start BEFORE the wait: see "Why the drain threads are
+    // load-bearing" above.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .expect("stdout was piped, so the handle is present");
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("stderr was piped, so the handle is present");
+    let stdout_drain = Drain::new();
+    let stderr_drain = Drain::new();
+    {
+        let sink = stdout_drain.clone_for_reader();
+        std::thread::spawn(move || drain_into(stdout_pipe, &sink));
+    }
+    {
+        let sink = stderr_drain.clone_for_reader();
+        std::thread::spawn(move || drain_into(stderr_pipe, &sink));
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                settle(&[&stdout_drain, &stderr_drain]);
+                return Output {
+                    status,
+                    stdout: stdout_drain.captured(),
+                    stderr: stderr_drain.captured(),
+                };
+            },
+            Ok(None) => {},
+            Err(error) => panic!("cannot poll {}: {error}", binary.display()),
+        }
+
+        if Instant::now() >= deadline {
+            // Kill AND reap: a kill alone leaves a zombie for the rest of the run.
+            let _ = child.kill();
+            let _ = child.wait();
+            settle(&[&stdout_drain, &stderr_drain]);
+            let stdout = stdout_drain.captured();
+            let stderr = stderr_drain.captured();
+            panic!(
+                "{} did not exit within {timeout:?}: this leg converts a hang into a red rather \
+                 than blocking the integration suite forever. The child was killed and reaped.\n\
+                 If the example is simply slower than its budget, raise the budget constant in \
+                 the OWNING test file (budgets are per-leg by design); if it is wedged, rebuild \
+                 it with `cargo build --example {example_name}` (add `-p <crate>` for a \
+                 `crates/*/examples/` binary) and run it by hand.\n\
+                 --- partial stdout ---\n{}\n--- partial stderr ---\n{}",
+                binary.display(),
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+
+        // 50 ms matches `wait_until_listening`'s cadence.
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Fail if the example binary is OLDER than any source it is built from.
