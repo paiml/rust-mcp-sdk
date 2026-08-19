@@ -214,6 +214,12 @@ None. Both files use only `std`, `serde_json` and the existing `tests/common/` m
 - 119-10's closing `make quality-gate` gate has one fewer unknown: both new binaries already run green inside it.
 - Wave-4 prose plans (119-06, 119-07, 119-09) can now cite these examples knowing the citations are enforced by a running test, provided they use the `--features runtime` form for `doc_review_team`.
 
+## Self-Check: PASSED
+
+- Files: `tests/docs04_examples_run.rs`, `tests/docs06_v2_examples_run.rs`, `119-04-SUMMARY.md`, `target/119-04-v2-example-run.json` — all present.
+- Commits: `5c1945fc`, `6791cad3`, `3a078d03`, `19145d36` — all resolve to commit objects.
+- Working tree clean (`.pmat/*` cache churn from the gate restored with `git checkout -- .pmat/`).
+
 ---
 *Phase: 119-documentation-three-shapes-v2-migration*
 *Completed: 2026-08-18*
