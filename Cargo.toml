@@ -81,6 +81,18 @@ exclude = [
     # scaffolding, not crate content. Also blew the 10MB limit during v2.2.0.
     ".planning/",
     "presentations/",
+    # Why: the D-03 disclosure tripwire reads BOTH .planning/WINDOWS.md and
+    # pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md at runtime, and both
+    # trees are excluded above. Same disposition as tests/ci_conformance_gate_wiring.rs
+    # and for the same reason recorded there: this reader's whole job is to FAIL
+    # when a consumer-observable disclosure is missing, so the ship-with-guard
+    # tolerance that is deliberate for tests/v2_conformance_pin.rs (a pin that may
+    # degrade to a no-op downstream) is WRONG here — a silent skip is the vacuous
+    # gate the guard exists to prevent. Excluding the test removes the downstream
+    # skip path entirely rather than relying on it. The absent-tree guards inside
+    # the file remain, covering sparse/partial checkouts. This entry and the two
+    # paths it reads must never be split: exclude all three or ship all three.
+    "tests/windows_disclosure_tripwire.rs",
 ]
 
 [dependencies]
