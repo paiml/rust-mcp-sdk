@@ -106,10 +106,16 @@ const S50_REL_PATH: &str = "debug/examples/s50_standalone_vs_sampled";
 /// THIS file and is never imported from a shared location, where it would
 /// silently re-tune a leg that was deliberately given more or less room.
 ///
-/// Expressed in SECONDS rather than the equivalent `Duration::from_mins(1)` so
-/// that all three budgets in this file are stated in one unit and can be
-/// compared — and audited for accidental copying — at a glance.
-const S50_TIMEOUT: Duration = Duration::from_secs(60);
+/// UNIT NOTE, so the next reader does not repeat a failed edit: this is
+/// `from_mins`, not the equivalent `Duration::from_secs(60)`, because
+/// `make lint` runs clippy's nursery group and
+/// `clippy::duration_suboptimal_units` REJECTS a whole-minute duration written in
+/// seconds ("constructing a `Duration` using a smaller unit when a larger unit
+/// would be more readable"). Normalising the three budgets in this file to
+/// `from_secs` for easier comparison was tried during 119-04 and turned
+/// `make lint` red; the budgets are therefore stated in whichever unit the lint
+/// accepts, and their comparability lives in their doc comments instead.
+const S50_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// The stable tail banner `s50_standalone_vs_sampled` prints once BOTH styles
 /// have run. A substring rather than a full-transcript comparison: the transcript
@@ -174,7 +180,9 @@ const S49_REL_PATH: &str = "debug/examples/s49_sampling_host";
 /// convert a HANG into a red, not to police performance. A budget tight enough to
 /// notice a slow run would fail spuriously on a loaded CI box, which is a worse
 /// failure than the one it would catch.
-const S49_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Written in minutes for the lint reason recorded on [`S50_TIMEOUT`].
+const S49_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// The line `s49_sampling_host` prints once the host handler's completion has
 /// travelled back to the server side.
@@ -254,7 +262,11 @@ const DOC_REVIEW_TEAM_REL_PATH: &str = "debug/examples/doc_review_team";
 /// several in-process servers must each reach readiness before the flow can
 /// begin. As with its siblings, the budget converts a hang into a red; it does
 /// not police performance.
-const DOC_REVIEW_TEAM_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Written in minutes for the lint reason recorded on [`S50_TIMEOUT`]. The
+/// DOUBLE is visible in the literal: `from_mins(2)` against its siblings'
+/// `from_mins(1)`.
+const DOC_REVIEW_TEAM_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// The line `doc_review_team` prints once all four reference servers have
 /// cooperated and every hosting task has been torn down.
