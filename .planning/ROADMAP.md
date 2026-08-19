@@ -2936,7 +2936,7 @@ Plans:
   2. A v2 migration guide + dual-version documentation ships: how to opt into v2, the dual-version story, Tasks extension migration, and the legacy sunset policy (DOCS-05)
   3. Runnable v2 examples ship and pass: a stateless (Lambda-style) v2 server and a v2 client/agent example (DOCS-06)
 
-**Plans**: 2/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
+**Plans**: 5/10 plans executed across 5 waves (tracer-first; D-14 before D-13; sentinel before tripwire)
 
 Plans:
 **Wave 1**
@@ -2949,9 +2949,9 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 119-03-PLAN.md — Example-build gate: baseline the pre-existing surface (D-14), then make `make test-examples` strict and observe it red (D-13)
-- [ ] 119-04-PLAN.md — Example run-test completion: the remaining DOCS-04 legs plus the DOCS-06 s47/s48/s53 socket leg (D-15)
-- [ ] 119-05-PLAN.md — v2 migration chapter by role (server/client/agent) + the `[CONSUMER-OBSERVABLE]` disclosure sentinel (D-02/D-03a/D-04/D-05/D-06/D-12)
+- [x] 119-03-PLAN.md — Example-build gate: baseline the pre-existing surface (D-14), then make `make test-examples` strict and observe it red (D-13)
+- [x] 119-04-PLAN.md — Example run-test completion: the remaining DOCS-04 legs plus the DOCS-06 s47/s48/s53 socket leg (D-15)
+- [x] 119-05-PLAN.md — v2 migration chapter by role (server/client/agent) + the `[CONSUMER-OBSERVABLE]` disclosure sentinel (D-02/D-03a/D-04/D-05/D-06/D-12)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
