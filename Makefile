@@ -226,6 +226,43 @@ test-unit:
 	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test --lib --features "full"
 	@echo "$(GREEN)✓ Unit tests passed$(NC)"
 
+# The GATE's reach beyond the root `pmcp` package.
+#
+# Every other target in `test-all` runs against the root package only — `--lib`,
+# `--doc`, `--test '*'` all resolve to `pmcp` because the workspace root IS a
+# package. `crates/mcp-tester` therefore had 338 tests across 12 binaries that
+# `make quality-gate` never executed, and `.github/workflows/ci.yml` records the
+# same hole from the CI side: `org-gate-checks.yml`'s `workspace-test` runs
+# `--lib --bins` (excluding `tests/`) and is absent from `gate.needs`.
+#
+# A pre-existing `dual_run` failure survived a full phase inside that hole. This
+# target closes it for the crate that demonstrated the cost, and because CI's
+# `quality-gate` job runs `make quality-gate` and IS in `gate.needs`, adding it
+# here makes it merge-blocking without promoting `workspace-test` — which
+# `ci.yml` D-15 deliberately keeps deferred, since that job carries unrelated
+# unreviewed scope.
+#
+# `mcp-tester` declares no `[features]`, so a bare `-p` run reaches every test;
+# there is no silent feature-gated subset like the one `scripts/run-era-matrix.sh`
+# documents for `pmcp-team-servers`.
+#
+# The count assertion is not ceremony. The failure this target exists to prevent
+# is "the gate does not reach this crate", and a run that selects zero tests
+# EXITS 0 — reproducing exactly that hole while looking green.
+.PHONY: test-tester
+test-tester:
+	@echo "$(BLUE)Running mcp-tester's own tests...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p mcp-tester 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ mcp-tester reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ mcp-tester tests passed ($$ran tests)$(NC)"
+
 .PHONY: test-doc
 test-doc:
 	@echo "$(BLUE)Running doctests...$(NC)"
@@ -497,7 +534,7 @@ test-playwright-ui:
 	@cd tests/playwright && npm run test:ui
 
 .PHONY: test-all
-test-all: test-unit test-doc test-property test-examples test-integration
+test-all: test-unit test-doc test-property test-examples test-integration test-tester
 	@echo "$(GREEN)✓ All test suites passed (ALWAYS requirements met)$(NC)"
 
 # ALWAYS Requirements Validation (for new features)
