@@ -118,6 +118,30 @@ behaviour changes are called out below because both are visible to operators.
   `with_interactivity`, and `Interactivity::RefreshOnly` for callers (scripts,
   CI) that must never be handed a browser.
 
+### Fixed
+
+- **stdin EOF disabled stdout, dropping responses to requests the server had
+  already accepted** (#316). `StdioTransport` tracked both directions with a
+  single `closed` flag, so the moment stdin reached EOF the transport refused
+  to *write* as well — `stdio.rs:172` set the flag on read EOF and `send()` at
+  `:79` returned `ConnectionClosed` on that same flag. A client that writes
+  its requests and closes stdin — the ordinary shape for a batch or one-shot
+  invocation — is a client that has already handed the server work; those
+  responses were silently discarded, and from the client's side the server
+  looked like it had hung or answered nothing.
+
+  The flag is now split into `read_closed` and `write_closed`. EOF on stdin
+  closes the read side only; the write side latches shut on a real write error
+  or an explicit `close()`, so the server can still deliver what it owes.
+  Downstream impact, stated precisely: pmat worked around this with a
+  three-layer mitigation, the last layer of which exists *only* because of this
+  defect — it catches the response pmcp refuses to write and re-emits it
+  through `serialize_message` so the bytes match what the transport would have
+  produced. That layer can now be deleted. The other two layers address
+  separate races (a session ending while a consumed request is in flight, and
+  the actor's `select!` breaking without draining its outbound queue) and are
+  still needed.
+
 ### Changed
 
 - **RFC 8414 §3.3: a trailing-slash issuer is now REFUSED when the
