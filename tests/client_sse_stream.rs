@@ -3899,6 +3899,27 @@ impl CachingAuthProvider {
         }
     }
 
+    /// A provider whose cache is EMPTY — the state every process starts in.
+    ///
+    /// [`Self::primed`]'s warm cache is what makes fence 28 measure the `401`
+    /// RECOVERY specifically. Fence 30 needs the opposite: the cold cache a
+    /// first request meets, where the vend happens during the ORDINARY request
+    /// build and no `401` is involved at all.
+    fn cold() -> Self {
+        let (release, _) = watch::channel(false);
+        Self {
+            cached: Mutex::new(None),
+            vends: AtomicUsize::new(0),
+            vends_live: AtomicUsize::new(0),
+            vends_peak: AtomicUsize::new(0),
+            purges: AtomicUsize::new(0),
+            purges_live: AtomicUsize::new(0),
+            purges_peak: AtomicUsize::new(0),
+            minted: AtomicUsize::new(0),
+            release,
+        }
+    }
+
     fn vends(&self) -> usize {
         self.vends.load(Ordering::SeqCst)
     }
@@ -4364,5 +4385,104 @@ async fn a_peer_that_never_writes_response_headers_does_not_serialise_the_client
 
     // Release the park so the run finishes without waiting out STALLED_POST_PARK.
     server.release_the_stalled_post();
+    server.shutdown().await;
+}
+
+/// Fence 31 (T-118.2-25-01): a COLD-START fan-out on one transport vends once.
+///
+/// # What this measures that fence 28 does not
+///
+/// Fence 28 drives the `401` RECOVERY, which `refresh_lock` single-flights.
+/// This one drives the path a process reaches FIRST — several concurrent
+/// requests on one cloned transport against an empty credential cache, with no
+/// `401` anywhere in the run. That path had no gate at all: the recovery was
+/// guarded while the ordinary request build called `get_access_token` directly,
+/// so the mitigation existed only on the surface the threat row named and not
+/// on the path that reaches the consequence it named.
+///
+/// # Why the consequence is permanent, not transient
+///
+/// Against a ROTATING refresh token the identity provider accepts exactly one
+/// presentation and rejects the rest, and each rejection invalidates the token
+/// the winner just cached. The transport is then holding a dead credential with
+/// no way back except an out-of-band re-auth. That is why the assertion is
+/// `vends_peak() <= 1` and not merely "the requests succeeded": every request
+/// here succeeds on the unfixed tree too, because this harness's provider mints
+/// happily. The defect is invisible in the responses and visible only in the
+/// concurrency of the vend.
+///
+/// # The release strategy, and why it is not a sleep
+///
+/// Every vend parks inside the provider until released. On the UNFIXED tree all
+/// `COLD_FANOUT` callers reach the vend, so the count arm fires quickly and the
+/// peak is observed while they are all still inside it. On the FIXED tree only
+/// one ever gets in, the count arm never fires, and the grace arm releases so
+/// the fence does not hang on its own fix. Same two-armed shape fence 28 uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_start_fanout_on_one_transport_vends_once() {
+    /// Enough concurrent first requests that an ungated tree cannot flatten
+    /// them by scheduling luck alone.
+    const COLD_FANOUT: usize = 4;
+
+    let server = RecordingServer::start().await;
+
+    // COLD, not primed: no token cached, so the very first request build is
+    // what vends. No 401 is issued anywhere in this fence.
+    let provider = Arc::new(CachingAuthProvider::cold());
+    let transport = StreamableHttpTransport::new(
+        StreamableHttpTransportConfigBuilder::new(
+            url::Url::parse(&server.url()).expect("the harness URL parses"),
+        )
+        .with_auth_provider(Arc::clone(&provider) as Arc<dyn AuthProvider>)
+        .build(),
+    );
+
+    // Clones of ONE transport — the durable-agent shape, and the reason all
+    // these callers share one credential cache.
+    let senders: Vec<_> = (0..COLD_FANOUT)
+        .map(|_| {
+            let mut clone = transport.clone();
+            // Not `notifications/initialized`, so no send reaches `start_sse`
+            // and this fence measures the auth path only.
+            tokio::spawn(async move { timeout(BOUND, clone.send(cancelled())).await })
+        })
+        .collect();
+
+    // Count arm: on an ungated tree every caller piles into the vend.
+    // Grace arm: on the gated tree only one does, so release anyway.
+    let _ = wait_for_within(VEND_RENDEZVOUS_GRACE, || provider.vends() >= COLD_FANOUT).await;
+    provider.release_vends();
+
+    for sender in senders {
+        let _ = sender.await.expect("no cold-start sender task panics");
+    }
+
+    assert!(
+        provider.vends_peak() <= 1,
+        "at most ONE caller may be inside get_access_token's VEND path at a time on a COLD \
+         cache; {} were. {COLD_FANOUT} concurrent first requests on one cloned transport each \
+         presented the rotating refresh token to the IdP, which accepts one and rejects the \
+         rest — and each rejection invalidates the token the winner cached, so this transport's \
+         auth fails PERMANENTLY before a single 401 has ever been seen. NOTE: fence 28 cannot \
+         catch this; it drives the 401 recovery, which refresh_lock already guarded",
+        provider.vends_peak(),
+    );
+    assert_eq!(
+        provider.vends(),
+        1,
+        "exactly ONE vend may reach the identity provider across a cold-start fan-out — every \
+         later caller's token must come from the cache the winner warmed. Observed {} vends \
+         across {COLD_FANOUT} concurrent first requests",
+        provider.vends(),
+    );
+    assert_eq!(
+        provider.purges(),
+        0,
+        "this fence must not involve a 401 at all: {} purges were observed, which means it \
+         drifted onto the recovery path fence 28 already covers and stopped measuring the \
+         cold-start path",
+        provider.purges(),
+    );
+
     server.shutdown().await;
 }

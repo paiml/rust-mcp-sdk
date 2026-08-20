@@ -714,6 +714,13 @@ struct RequestParts<'a> {
     config: &'a Arc<RwLock<StreamableHttpTransportConfig>>,
     protocol_version: &'a Arc<RwLock<Option<String>>>,
     v2_mode: &'a Arc<AtomicBool>,
+    /// Serialises the auth vend while the provider cache is cold. Carried on
+    /// `RequestParts` rather than reached through `self` because
+    /// [`StreamableHttpTransport::build_request_from_parts`] is an associated
+    /// function shared with the spawned reconnect path — a reconnect GET must
+    /// go through the same gate as a caller-task POST, or the fan-out reopens
+    /// on the reconnect path. See [`ColdVendGate`].
+    cold_vend_gate: &'a Arc<ColdVendGate>,
 }
 
 impl RequestParts<'_> {
@@ -1146,6 +1153,103 @@ fn drain_or_latch(
     latched.map(Err)
 }
 
+/// Serialises token vends across a provider cache this transport believes is
+/// COLD (Phase 118.2, T-118.2-25-01).
+///
+/// # The gap this closes
+///
+/// [`StreamableHttpTransport::refresh_lock`] single-flights the `401` RECOVERY
+/// vend. It does not — and structurally cannot — cover the ORDINARY vend every
+/// request build performs: the retry request is built INSIDE `refresh_lock`
+/// (see `handle_401_retry`), so a build path that also took that mutex would
+/// self-deadlock on the first `401`. The recovery path was therefore guarded
+/// while the path every deployment reaches FIRST was not, and N concurrent
+/// first requests on one cloned transport vended N times against an empty
+/// cache. Against a rotating refresh token the `IdP` accepts one and rejects the
+/// rest, and each rejection invalidates the token the winner cached: permanent
+/// auth failure before a single `401` has ever been seen.
+///
+/// # Why a second gate rather than a wider one
+///
+/// Lock order is always `refresh_lock` -> `ColdVendGate`, never the reverse:
+/// nothing takes `refresh_lock` while holding this gate, so no cycle exists. By
+/// the time a `401` recovery runs, a request has already gone out and the gate
+/// is armed, so the recovery's rebuild takes the uncontended path and does not
+/// touch this mutex at all.
+///
+/// # Why it is not a bottleneck
+///
+/// [`Self::primed`] is the fast path: once one vend has returned, every later
+/// build reads a relaxed-ordering `AtomicBool` and calls the provider with NO
+/// lock held. The mutex is reached only while the cache is believed cold — at
+/// construction, and again after [`AuthProvider::on_unauthorized`] evicts. That
+/// is what keeps this from re-creating the whole-transport bottleneck plan 23
+/// removed and T-118.2-25-03 prohibits.
+///
+/// # The residual, stated rather than implied
+///
+/// This gate makes the losers call the provider AFTER the winner has returned,
+/// so a provider that CACHES serves them from cache and exactly one vend
+/// reaches the `IdP`. Against a provider that does NOT cache, every caller vends
+/// regardless and this gate changes nothing — the identical residual
+/// [`StreamableHttpTransport::token_generation`] already carries, and for the
+/// identical reason: [`AuthProvider`] states no caching contract. Closing THAT
+/// requires a contract change with an external-implementor cost, recorded in
+/// `.planning/WINDOWS.md` entry 26 and owned by the client-transport hardening
+/// plan, not by this gate.
+#[derive(Debug)]
+struct ColdVendGate {
+    /// `false` means "the provider cache is believed COLD" — the next vend goes
+    /// through [`Self::lock`]. Set `true` by the first vend to return, cleared
+    /// whenever this transport evicts the cached token.
+    ///
+    /// `Relaxed` is sufficient in both directions: the flag guards nothing but
+    /// its own mutex acquisition, and a stale read costs at most one redundant
+    /// trip through an uncontended lock. It never causes a MISSED vend, which
+    /// is the only direction that would be a defect.
+    primed: AtomicBool,
+    /// Held only while a cold-cache vend is in flight.
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl ColdVendGate {
+    /// A gate whose cache is believed cold, which is true of a new transport.
+    fn new() -> Self {
+        Self {
+            primed: AtomicBool::new(false),
+            lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Vend a token, serialising the call only while the cache is cold.
+    ///
+    /// The losers of a cold-start race deliberately still CALL the provider
+    /// after taking the lock rather than waiting for the winner's return value:
+    /// this gate holds no token and caching is the provider's job, so asking it
+    /// again is what reads the value the winner just cached. On a caching
+    /// provider that is a cache hit; on a non-caching one it is the documented
+    /// residual above.
+    async fn vend(&self, provider: &Arc<dyn AuthProvider>) -> Result<String> {
+        if self.primed.load(Ordering::Relaxed) {
+            return provider.get_access_token().await;
+        }
+        let _cold = self.lock.lock().await;
+        let token = provider.get_access_token().await?;
+        self.primed.store(true, Ordering::Relaxed);
+        Ok(token)
+    }
+
+    /// Mark the cache cold again, so the next vends re-serialise.
+    ///
+    /// Called after an eviction. Without this the gate would guard only the
+    /// FIRST cold window: a post-`401` purge empties the cache, and concurrent
+    /// ordinary builds would then fan out against it exactly as they did at
+    /// startup.
+    fn mark_cold(&self) {
+        self.primed.store(false, Ordering::Relaxed);
+    }
+}
+
 /// A streamable HTTP transport for MCP.
 ///
 /// This transport supports both stateless and stateful operation modes:
@@ -1165,7 +1269,7 @@ fn drain_or_latch(
 /// terminal latch. A durable agent holding one transport across concurrent tasks
 /// has exactly that shape.
 ///
-/// Three transport-wide things a concurrent POST path touches, and what makes
+/// Four transport-wide things a concurrent POST path touches, and what makes
 /// each safe:
 ///
 /// 1. **The POST-reader accounting** ([`Self::open_post_readers`]). An
@@ -1176,7 +1280,14 @@ fn drain_or_latch(
 ///    Single-flighted from the purge through the retry request's BUILD, so
 ///    exactly one caller purges and — for a caching provider — exactly one vends.
 ///    The retry SEND is outside the lock.
-/// 3. **The session-stream restart** ([`Self::restart_lock`]). The
+/// 3. **The ORDINARY vend while the cache is cold**
+///    ([`Self::cold_vend_gate`]). Item 2 covers RECOVERY only, and cannot be
+///    widened to cover the request build without self-deadlocking, because the
+///    retry is built inside `refresh_lock`. Without a second gate the path
+///    every deployment reaches FIRST — N concurrent first requests on one
+///    cloned transport, empty cache — vended N times. See [`ColdVendGate`],
+///    including the non-caching-provider residual it does NOT close.
+/// 4. **The session-stream restart** ([`Self::restart_lock`]). The
 ///    take-and-abort / open / reset / respawn sequence is indivisible, so two
 ///    overlapping restarts leave exactly one reader and `close()` reaches it.
 ///
@@ -1389,6 +1500,13 @@ pub struct StreamableHttpTransport {
     /// lock would protect nothing: the hazard is exactly two clones sharing one
     /// provider.
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Single-flights the ORDINARY vend while the provider cache is cold — the
+    /// half [`Self::refresh_lock`] structurally cannot cover.
+    ///
+    /// `Arc`-shared for the same reason `refresh_lock` is: the hazard is two
+    /// clones sharing one provider, so a per-clone gate would guard nothing.
+    /// See [`ColdVendGate`] for the lock order and the residual.
+    cold_vend_gate: Arc<ColdVendGate>,
     /// The vintage of the access token a request presented, bumped once per
     /// completed `401` refresh (Phase 118.2, plan 25).
     ///
@@ -1536,6 +1654,7 @@ impl StreamableHttpTransport {
             shutdown: Arc::new(shutdown),
             caller_overflow: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cold_vend_gate: Arc::new(ColdVendGate::new()),
             // Generation ZERO. Its absolute value is never read — only whether
             // it has MOVED since a request captured it — so any starting point
             // does.
@@ -2145,6 +2264,7 @@ impl StreamableHttpTransport {
             config: Arc::clone(&self.config),
             protocol_version: Arc::clone(&self.protocol_version),
             v2_mode: Arc::clone(&self.v2_mode),
+            cold_vend_gate: Arc::clone(&self.cold_vend_gate),
             delivery: self.reader_delivery(StreamKind::Session),
             last_event_id: Arc::clone(&self.last_event_id),
             // Read ONCE, here, through the paired accessor, so the spawned task
@@ -2279,6 +2399,7 @@ impl StreamableHttpTransport {
             config: &self.config,
             protocol_version: &self.protocol_version,
             v2_mode: &self.v2_mode,
+            cold_vend_gate: &self.cold_vend_gate,
         }
     }
 
@@ -2344,7 +2465,12 @@ impl StreamableHttpTransport {
 
         // Add auth header if provider is present (highest priority)
         let has_auth = if let Some(auth_provider) = auth_provider {
-            let token = auth_provider.get_access_token().await?;
+            // Through the gate, NOT straight to the provider (T-118.2-25-01).
+            // While the cache is believed cold this serialises; once one vend
+            // has returned it is an atomic load and a direct call. See
+            // `ColdVendGate` for why `refresh_lock` cannot be widened to cover
+            // this site instead.
+            let token = parts.cold_vend_gate.vend(&auth_provider).await?;
             request_builder = request_builder.header("Authorization", format!("Bearer {}", token));
             true
         } else {
@@ -2740,6 +2866,14 @@ impl StreamableHttpTransport {
             if self.token_generation.load(Ordering::SeqCst) == presented_generation {
                 provider.on_unauthorized().await?;
                 self.token_generation.fetch_add(1, Ordering::SeqCst);
+                // The purge just emptied the cache, so the gate's belief that
+                // it is warm is now FALSE. Re-arm it, or the ordinary builds
+                // that follow this recovery fan out against an empty cache
+                // exactly as they would have at startup — the same defect one
+                // eviction later. Safe to do while holding `refresh_lock`:
+                // this only stores an atomic and the lock order is
+                // `refresh_lock` -> `ColdVendGate`, never the reverse.
+                self.cold_vend_gate.mark_cold();
             }
 
             // Step 2: rebuild the request using the byte-identical body
@@ -4007,6 +4141,11 @@ struct SseReaderContext {
     /// Read by the shared request builder to decide session-header suppression
     /// and v2 routing headers.
     v2_mode: Arc<AtomicBool>,
+    /// The transport's cold-cache vend gate, so a reconnect GET vends through
+    /// the same single-flight a caller-task POST does. A reconnect storm
+    /// against a cold cache is the same fan-out as a cold start, so leaving
+    /// this path ungated would reopen T-118.2-25-01 on the reconnect side.
+    cold_vend_gate: Arc<ColdVendGate>,
     /// Everything this task delivers through: plan 01's receive queue (its
     /// liveness signal too) and CR-02's terminal latch with its wake signal.
     delivery: ReaderDelivery,
@@ -4032,6 +4171,7 @@ impl SseReaderContext {
             config: &self.config,
             protocol_version: &self.protocol_version,
             v2_mode: &self.v2_mode,
+            cold_vend_gate: &self.cold_vend_gate,
         }
     }
 

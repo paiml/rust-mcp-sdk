@@ -511,12 +511,12 @@ tripwire passes.
   other, and the loser's purge destroys the token the winner had just cached, so
   the transport's auth fails permanently until you re-authenticate out of band.
   That sequence is now single-flighted from the purge through the retry's token
-  fetch. Two limits on that, both real: the single-flight covers the `401`
-  RECOVERY only — the ordinary token fetch that every request build performs is
-  not serialised, so a **cold-start fan-out** (N concurrent first requests
-  against an empty cache) still reaches `get_access_token()` N times — and a
-  second `401` on the retry is returned to you unchanged rather than triggering
-  another refresh. Separately, two overlapping session-stream **restarts** can
+  fetch. A **cold-start fan-out** — N concurrent first requests against an empty
+  cache, with no `401` involved — is single-flighted too, by a separate gate
+  that engages only while the cache is cold, so a warm transport takes no lock
+  per request. One limit remains: a second `401` on the retry is returned to you
+  unchanged rather than triggering another refresh. Separately, two overlapping
+  session-stream **restarts** can
   no longer leave an orphaned reader that `close()` cannot reach; a restart
   overlapping a concurrent `close()` is a different pairing, and there the
   reader is stopped by the transport's shutdown signal rather than by `close()`'s
