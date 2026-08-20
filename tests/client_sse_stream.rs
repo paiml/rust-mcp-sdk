@@ -61,6 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -70,7 +71,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use pmcp::shared::streamable_http::{
-    StreamableHttpTransport, StreamableHttpTransportConfigBuilder,
+    AuthProvider, StreamableHttpTransport, StreamableHttpTransportConfigBuilder,
 };
 use pmcp::shared::Transport;
 use pmcp::types::protocol::LATEST_PROTOCOL_VERSION;
@@ -448,6 +449,35 @@ struct Shared {
     /// The serial appended to each sprayed frame's id, so no two sprayed frames
     /// anywhere in a run share an id.
     unowned_sprayed: AtomicUsize,
+    /// How many further POSTs are answered with a bare `401 Unauthorized`
+    /// instead of being served normally (plan 25).
+    ///
+    /// Decremented on each POST it consumes, so a fence arms exactly as many
+    /// 401s as it has concurrent callers and every LATER POST — the retries —
+    /// is served the way it always was. ZERO by default, so every existing
+    /// fence observes byte-identical answers, the same rule
+    /// [`answer_calls_with_sse`](Shared::answer_calls_with_sse) states.
+    unauthorized_posts_remaining: AtomicUsize,
+    /// How many bare `401` answers this harness has written AND flushed.
+    ///
+    /// The observable a concurrency fence gates on: "both callers are inside
+    /// their 401 recovery" is not something the client exposes, but "both POSTs
+    /// were answered 401" is, and it happens strictly before it.
+    unauthorized_answers: AtomicUsize,
+    /// When `Some(grace)`, a GET's response HEAD is withheld until a SECOND GET
+    /// has arrived or `grace` elapses, whichever comes first (plan 25).
+    ///
+    /// The grace is load-bearing and is NOT a settle time. A pure
+    /// two-arrival barrier would DEADLOCK the serialised tree: there the second
+    /// `start_sse` cannot put its GET on the wire until the first has finished,
+    /// so a gate that waits for two arrivals would be measuring the fix by
+    /// hanging on it. Releasing on arrival-count OR grace makes BOTH trees
+    /// terminate, and the fence then asserts on the END state rather than on
+    /// the gate.
+    ///
+    /// `None` by default, so every existing GET fence sees the listener it
+    /// always did.
+    get_head_rendezvous: Mutex<Option<Duration>>,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -499,6 +529,9 @@ impl RecordingServer {
             answers_flushed: AtomicUsize::new(0),
             unowned_spray_schedule: Mutex::new(VecDeque::new()),
             unowned_sprayed: AtomicUsize::new(0),
+            unauthorized_posts_remaining: AtomicUsize::new(0),
+            unauthorized_answers: AtomicUsize::new(0),
+            get_head_rendezvous: Mutex::new(None),
         });
 
         let accept = tokio::spawn({
@@ -670,6 +703,33 @@ impl RecordingServer {
         *self.shared.unowned_spray_schedule.lock() = schedule.iter().copied().collect();
     }
 
+    /// Answer the next `count` POSTs with a bare `401 Unauthorized` (plan 25).
+    ///
+    /// Call BEFORE the client connects. Every POST after those `count` — the
+    /// retries the transport's single-shot refresh sends — is served exactly the
+    /// way it always was, so a fence arming two 401s observes two recoveries and
+    /// then ordinary behaviour rather than an endless auth loop.
+    fn answer_the_next_posts_unauthorized(&self, count: usize) {
+        self.shared
+            .unauthorized_posts_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    /// How many bare `401` answers have been written AND flushed.
+    fn unauthorized_answers(&self) -> usize {
+        self.shared.unauthorized_answers.load(Ordering::SeqCst)
+    }
+
+    /// Withhold each GET's response head until a second GET arrives or `grace`
+    /// elapses (plan 25).
+    ///
+    /// Call BEFORE the client connects. See
+    /// [`get_head_rendezvous`](Shared::get_head_rendezvous) for why the grace is
+    /// part of the construction and not a settle time.
+    fn hold_each_get_head_until_two_arrive(&self, grace: Duration) {
+        *self.shared.get_head_rendezvous.lock() = Some(grace);
+    }
+
     fn answer_the_next_call_with_a_mismatched_id(&self) {
         self.shared
             .next_call_id_is_mismatched
@@ -782,12 +842,34 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) {
             serve_get_that_ends_at_once(&mut write_half).await;
             return;
         }
+        // The rendezvous gate (plan 25), placed BEFORE the head is written and
+        // only when armed. `open_gets` is bumped inside `serve_sse_body`, i.e.
+        // strictly after this, so a connection parked here is not yet counted as
+        // an open stream — which is what keeps the END-state assertion honest.
+        await_get_head_rendezvous(&shared).await;
         serve_get(reader, write_half, &shared).await;
         return;
     }
 
     let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     shared.post_bodies.lock().push(value.clone());
+
+    // The bare-401 mode (plan 25). Consumed BEFORE any other POST dispatch and
+    // only while the arming count is non-zero, so the retry that follows falls
+    // through to the ordinary paths and every unarmed fence is untouched.
+    // `checked_sub` on zero returns `None`, which makes `fetch_update` fail —
+    // the decrement and the decision are therefore one atomic step and two
+    // concurrent POSTs cannot both consume the same unit.
+    if shared
+        .unauthorized_posts_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        serve_post_unauthorized(&mut write_half, &shared).await;
+        return;
+    }
 
     let method = value
         .get("method")
@@ -889,6 +971,55 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared
         shared.answers_flushed.fetch_add(1, Ordering::SeqCst);
     }
     let _ = write_half.shutdown().await;
+}
+
+/// Answer a POST with a bare `401 Unauthorized` (plan 25).
+///
+/// No `WWW-Authenticate`, no body: the transport's refresh branch keys on the
+/// STATUS alone, and adding a challenge header would make this fence depend on
+/// header parsing it does not measure. `connection: close` for the reason every
+/// other answer on this harness carries it — one connection per request keeps
+/// `request_lines()` an exact, ordered record.
+async fn serve_post_unauthorized(write_half: &mut WriteHalf<TcpStream>, shared: &Shared) {
+    let response = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let _ = write_half.write_all(response.as_bytes()).await;
+    let _ = write_half.flush().await;
+    // Counted AFTER the flush, so `unauthorized_answers()` means "the client can
+    // already see this" rather than "the harness intends to send it".
+    shared.unauthorized_answers.fetch_add(1, Ordering::SeqCst);
+    let _ = write_half.shutdown().await;
+}
+
+/// How many GETs release the rendezvous gate (plan 25).
+///
+/// Two, because the hazard is two overlapping restarts and nothing larger adds
+/// anything: a third would only widen the window the second already opens.
+const GET_RENDEZVOUS_PARTY: usize = 2;
+
+/// Withhold this GET's response head until a second GET has arrived, or until
+/// the armed grace elapses — whichever happens FIRST (plan 25).
+///
+/// A no-op unless [`RecordingServer::hold_each_get_head_until_two_arrive`] armed
+/// it. `get_instants` is the arrival record — pushed once per accepted GET,
+/// before this is reached — so its length IS the arrival count and no second
+/// counter can drift from it.
+///
+/// The OR is the whole design. On a tree where two restarts overlap, both GETs
+/// arrive and the gate opens at once. On a tree where the restart is
+/// serialised, the second GET cannot exist until the first restart has
+/// finished, so only the grace can open the gate — a pure barrier would hang
+/// the fixed tree forever and report the fix as a timeout.
+async fn await_get_head_rendezvous(shared: &Shared) {
+    let Some(grace) = *shared.get_head_rendezvous.lock() else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + grace;
+    while shared.get_instants.lock().len() < GET_RENDEZVOUS_PARTY {
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// The `capabilities` member of this harness's `initialize` result.
@@ -3535,6 +3666,386 @@ async fn debris_from_a_dead_call_does_not_charge_the_next_calls_budget() {
          was DELIVERED to a live caller rather than absorbed, which is a routing defect and not \
          a budget one",
         call_marker(1),
+    );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 28 — plan 25: two concurrent 401s on ONE transport must refresh the
+// token ONCE, and must VEND it once.
+// ===========================================================================
+
+/// Upper bound on the rendezvous that puts both 401 recoveries in flight at the
+/// same time (plan 25).
+///
+/// NOT a settle time and NOT the subject: nothing in fence 28 is timed. It is
+/// the same OR-shaped construction
+/// [`get_head_rendezvous`](Shared::get_head_rendezvous) documents, applied to
+/// the token vend. On a tree where both callers vend, both park and the gate
+/// opens the instant the second arrives — this bound is never reached. On a
+/// tree where exactly one caller vends, a pure two-arrival barrier would hang
+/// forever, so the grace is what lets the FIXED tree terminate and be asserted
+/// on. Deliberately far below [`BOUND`], so the sends it delays cannot time out
+/// because of it.
+const VEND_RENDEZVOUS_GRACE: Duration = Duration::from_millis(750);
+
+/// The token [`CachingAuthProvider`] starts life holding.
+///
+/// Primed rather than empty so the FIRST request build on each caller is a
+/// cache HIT. An empty cache would put two vends on the wire before any 401 had
+/// happened, and the fence's subject — vends performed during the 401 recovery
+/// — would be buried under them.
+const PRIMED_TOKEN: &str = "primed-token";
+
+/// An `AuthProvider` double that MODELS A CACHE, and records concurrency inside
+/// the VEND path (plan 25).
+///
+/// The cache is not decoration. `on_unauthorized` only EVICTS; the network round
+/// trip that presents a rotating refresh token happens in the SUBSEQUENT
+/// `get_access_token`, which the transport reaches while REBUILDING the retry
+/// request — the trait's own rustdoc states that division. A double whose
+/// `get_access_token` merely returns a `String` therefore measures the operation
+/// ADJACENT to the one that breaks, and would go green with the hazard live.
+#[derive(Debug)]
+struct CachingAuthProvider {
+    /// The cached access token, `None` once evicted.
+    cached: Mutex<Option<String>>,
+    /// How many times `get_access_token` took the VEND path (cache miss).
+    vends: AtomicUsize,
+    /// Vends currently INSIDE the vend path.
+    vends_live: AtomicUsize,
+    /// The high-water mark of [`Self::vends_live`] — the number this fence
+    /// exists to hold at one.
+    vends_peak: AtomicUsize,
+    /// How many times `on_unauthorized` was called.
+    purges: AtomicUsize,
+    /// Purges currently inside `on_unauthorized`.
+    purges_live: AtomicUsize,
+    /// The high-water mark of [`Self::purges_live`].
+    purges_peak: AtomicUsize,
+    /// The serial of the next minted token, so two vends are distinguishable.
+    minted: AtomicUsize,
+    /// The gate every vend parks on until the fence releases it.
+    ///
+    /// A `watch` rather than a `Notify` for the reason
+    /// [`close_live`](Shared::close_live) records: `notify_waiters` wakes only
+    /// tasks ALREADY parked, so a release raised before the second vend arrived
+    /// would be lost and the fence would hang instead of failing on its subject.
+    release: watch::Sender<bool>,
+}
+
+impl CachingAuthProvider {
+    fn primed(token: &str) -> Self {
+        let (release, _) = watch::channel(false);
+        Self {
+            cached: Mutex::new(Some(token.to_string())),
+            vends: AtomicUsize::new(0),
+            vends_live: AtomicUsize::new(0),
+            vends_peak: AtomicUsize::new(0),
+            purges: AtomicUsize::new(0),
+            purges_live: AtomicUsize::new(0),
+            purges_peak: AtomicUsize::new(0),
+            minted: AtomicUsize::new(0),
+            release,
+        }
+    }
+
+    fn vends(&self) -> usize {
+        self.vends.load(Ordering::SeqCst)
+    }
+
+    fn vends_peak(&self) -> usize {
+        self.vends_peak.load(Ordering::SeqCst)
+    }
+
+    fn purges(&self) -> usize {
+        self.purges.load(Ordering::SeqCst)
+    }
+
+    fn purges_peak(&self) -> usize {
+        self.purges_peak.load(Ordering::SeqCst)
+    }
+
+    /// Let every parked vend proceed, and every later one through unhindered.
+    fn release_vends(&self) {
+        self.release.send_replace(true);
+    }
+}
+
+#[async_trait]
+impl AuthProvider for CachingAuthProvider {
+    async fn get_access_token(&self) -> pmcp::Result<String> {
+        // A cache HIT is the loser's path on a fixed tree: no IdP is touched, so
+        // nothing is recorded and no gate is entered.
+        if let Some(token) = self.cached.lock().clone() {
+            return Ok(token);
+        }
+
+        // THE VEND. Everything this fence measures happens here.
+        self.vends.fetch_add(1, Ordering::SeqCst);
+        let live = self.vends_live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.vends_peak.fetch_max(live, Ordering::SeqCst);
+
+        // Park INSIDE the vend, so the peak above is observed while both callers
+        // are still holding it rather than after one has already left.
+        let mut release = self.release.subscribe();
+        if !*release.borrow() {
+            let _ = release.wait_for(|open| *open).await;
+        }
+
+        let serial = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
+        let token = format!("vended-{serial}");
+        *self.cached.lock() = Some(token.clone());
+        self.vends_live.fetch_sub(1, Ordering::SeqCst);
+        Ok(token)
+    }
+
+    async fn on_unauthorized(&self) -> pmcp::Result<()> {
+        self.purges.fetch_add(1, Ordering::SeqCst);
+        let live = self.purges_live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.purges_peak.fetch_max(live, Ordering::SeqCst);
+        *self.cached.lock() = None;
+        // A yield, so two purges that genuinely overlap are OBSERVED to overlap
+        // rather than being flattened by a single-threaded runtime running each
+        // to completion. The purge peak is a secondary assertion for exactly
+        // this reason — see the fence's doc comment.
+        tokio::task::yield_now().await;
+        self.purges_live.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Fence 28 (plan 25): two concurrent POSTs on ONE transport that both receive a
+/// `401` produce exactly ONE `on_unauthorized` call and exactly ONE token VEND.
+///
+/// # Why this is reachable TODAY, before plan 23
+///
+/// `StreamableHttpTransport` is `#[derive(Clone)]` with every field an `Arc`, so
+/// two clones share one config and therefore ONE `AuthProvider`. A durable agent
+/// holding one transport across concurrent tasks has exactly this shape. The
+/// fence drives two clones directly rather than a `Client`, so nothing about the
+/// client's outer transport guard is in the picture.
+///
+/// # THE TWO PURGE ASSERTIONS ALONE ARE INSUFFICIENT
+///
+/// Do not simplify this fence back to counting `on_unauthorized`. That call only
+/// EVICTS the cached token. The rotating refresh token is presented to the IdP
+/// by the SUBSEQUENT `get_access_token`, which the transport reaches while
+/// rebuilding the retry request. A serialisation that ended at the purge would
+/// let both callers reach `get_access_token` concurrently one step later —
+/// against a cache the winner had just emptied, so both would vend — which is
+/// the ORIGINAL defect with one extra step and is INVISIBLE to any fence that
+/// counts purges. The vend assertions are the subject; the purge assertions are
+/// corroboration.
+///
+/// # What a failure MEANS
+///
+/// Two callers presented a refresh token at the same time. Against a rotating
+/// refresh token the IdP accepts the first and REJECTS the second, and the
+/// second's rejection also destroys the token the first just cached — so the
+/// transport's auth fails permanently until an out-of-band re-auth.
+///
+/// # Why the RED is by construction and not by racing
+///
+/// Every vend parks on a gate the fence releases, and the fence releases it only
+/// after BOTH 401s are on the wire AND either two vends are parked or
+/// [`VEND_RENDEZVOUS_GRACE`] has elapsed. On a tree with no single-flight both
+/// callers reach the vend and park, so the peak is two before anything is
+/// released. On a serialised tree only one caller can vend, the grace opens the
+/// gate, and the loser's `get_access_token` is a cache hit. Neither tree can
+/// deadlock: the gate has an escape on the count AND on the grace, and the
+/// serialisation the fix adds is released before the retry POST is sent.
+#[tokio::test]
+async fn two_concurrent_401s_refresh_the_token_once() {
+    let server = RecordingServer::start().await;
+    // Exactly two, one per caller's FIRST POST. Both retries fall through to the
+    // ordinary 202, so a passing recovery is observable as a successful send.
+    server.answer_the_next_posts_unauthorized(2);
+
+    let provider = Arc::new(CachingAuthProvider::primed(PRIMED_TOKEN));
+    let transport = StreamableHttpTransport::new(
+        StreamableHttpTransportConfigBuilder::new(
+            url::Url::parse(&server.url()).expect("the harness URL parses"),
+        )
+        .with_auth_provider(Arc::clone(&provider) as Arc<dyn AuthProvider>)
+        .build(),
+    );
+
+    // Two CLONES of one transport — the durable-agent shape, and the reason both
+    // callers share one credential cache.
+    let mut one = transport.clone();
+    let mut two = transport;
+
+    // A notification that is NOT `notifications/initialized`, so neither send
+    // reaches `start_sse` and this fence measures the auth path only.
+    let first = tokio::spawn(async move { timeout(BOUND, one.send(cancelled())).await });
+    let second = tokio::spawn(async move { timeout(BOUND, two.send(cancelled())).await });
+
+    assert!(
+        wait_for(|| server.unauthorized_answers() >= 2).await,
+        "both concurrent POSTs must be answered 401 before the recovery is measured; only {} \
+         were. Observed request lines: {:?}",
+        server.unauthorized_answers(),
+        server.request_lines(),
+    );
+
+    // Release on arrival-count OR grace. See the doc comment: the count arm is
+    // what makes the unfixed tree's peak observable, the grace arm is what keeps
+    // the fixed tree from hanging on its own fix.
+    let _ = wait_for_within(VEND_RENDEZVOUS_GRACE, || provider.vends() >= 2).await;
+    provider.release_vends();
+
+    let first = first.await.expect("the first sender task does not panic");
+    let second = second.await.expect("the second sender task does not panic");
+
+    assert!(
+        provider.vends_peak() <= 1,
+        "at most ONE caller may be inside get_access_token's VEND path at a time; {} were. Two \
+         callers presented the rotating refresh token to the IdP simultaneously — the second is \
+         rejected and its failure destroys the token the first had just cached, so the \
+         transport's auth fails permanently. NOTE: this is the assertion a purge-only \
+         single-flight cannot satisfy; on_unauthorized merely EVICTS, and the vend happens one \
+         step later in the retry's request rebuild",
+        provider.vends_peak(),
+    );
+    assert_eq!(
+        provider.vends(),
+        1,
+        "exactly ONE vend may occur across the whole 401 recovery — the loser's retry token must \
+         come from the cache the winner warmed, not from a second round trip to the IdP. \
+         Observed {} vends, {} purges",
+        provider.vends(),
+        provider.purges(),
+    );
+    assert!(
+        provider.purges_peak() <= 1,
+        "at most ONE caller may be inside on_unauthorized at a time; {} were",
+        provider.purges_peak(),
+    );
+    assert_eq!(
+        provider.purges(),
+        1,
+        "exactly ONE on_unauthorized call may happen: the loser's token generation was already \
+         superseded by the winner's refresh, so it has nothing to purge and purging anyway would \
+         evict the token the winner just cached",
+    );
+
+    first
+        .expect("the first send returns within BOUND — a hang here is the fix deadlocking")
+        .expect("the first send must SUCCEED after its 401 recovery; a caller may not be starved");
+    second
+        .expect("the second send returns within BOUND — a hang here is the fix deadlocking")
+        .expect(
+            "the second send must SUCCEED after its 401 recovery. A failure here means the \
+             generation check skipped a refresh the caller genuinely needed, which turns a \
+             token-rotation fix into a permanent auth failure",
+        );
+
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 29 — plan 25: two concurrent session-stream restarts leave ONE reader,
+// and `close()` reaches it.
+// ===========================================================================
+
+/// How long the harness withholds the FIRST GET's head while waiting for a
+/// second (plan 25).
+///
+/// Paid exactly once, on the serialised tree, and far below [`BOUND`] so the
+/// `start_sse` it delays cannot time out because of it. On the unfixed tree it
+/// is never reached at all: the second GET arrives immediately.
+const GET_RENDEZVOUS_GRACE: Duration = Duration::from_millis(500);
+
+/// Fence 29 (plan 25): two CONCURRENT session-stream restarts must leave exactly
+/// one live reader, and the transport's `close()` must reach it.
+///
+/// # Not a duplicate of fence 4
+///
+/// [`repeated_initialized_notifications_leave_exactly_one_live_reader`] asserts
+/// a near-identical postcondition and passes today, but it restarts the stream
+/// SEQUENTIALLY — three opens in a loop, each completing before the next begins
+/// — so what it proves is that the abort-then-respawn ORDERING is correct when
+/// there is no overlap. This is the CONCURRENT case: two restarts whose awaits
+/// interleave, which fence 4 cannot construct and does not cover. Neither
+/// subsumes the other; deleting this one because "fence 4 already checks the
+/// reader count" would delete the only coverage of the interleave.
+///
+/// # The defect
+///
+/// `start_sse` takes-and-aborts the abort handle, opens a GET ACROSS AN AWAIT,
+/// clears the terminal latch and only then stores the new handle — a
+/// transport-wide read-modify-write with an await in the middle. Two overlapping
+/// calls each take a `None` handle, each open, and the second's store orphans
+/// the first's reader. `close()` aborts exactly ONE `JoinHandle`, so the orphan
+/// outlives the transport holding a live TCP connection nothing can reach.
+///
+/// # Why the interleave is by construction
+///
+/// The harness withholds each GET's response head until a second GET arrives OR
+/// [`GET_RENDEZVOUS_GRACE`] elapses, which pins both callers inside the await
+/// that the defect lives across. The OR is what keeps the SERIALISED tree from
+/// deadlocking on the gate — there the second GET cannot exist until the first
+/// restart has returned, so only the grace can open it.
+///
+/// # Why both assertions settle rather than snap
+///
+/// On the fixed tree the aborted reader's TCP close is observed ASYNCHRONOUSLY
+/// from the server's side, so an instantaneous `assert_eq!` can transiently read
+/// two and fail on a loaded machine. `wait_for` turns "eventually one" into a
+/// bounded settle and reports the last observed value.
+#[tokio::test]
+async fn two_concurrent_session_stream_restarts_leave_one_reader() {
+    let server = RecordingServer::start().await;
+    server.hold_each_get_head_until_two_arrive(GET_RENDEZVOUS_GRACE);
+
+    let transport = transport_for(&server);
+    let one = transport.clone();
+    let two = transport.clone();
+
+    let first = tokio::spawn(async move { timeout(BOUND, one.start_sse(None)).await });
+    let second = tokio::spawn(async move { timeout(BOUND, two.start_sse(None)).await });
+
+    first
+        .await
+        .expect("the first restart task does not panic")
+        .expect("the first start_sse returns within BOUND — a hang here is the fix deadlocking")
+        .expect("the harness answers the first GET");
+    second
+        .await
+        .expect("the second restart task does not panic")
+        .expect("the second start_sse returns within BOUND — a hang here is the fix deadlocking")
+        .expect("the harness answers the second GET");
+
+    assert_eq!(
+        server.get_lines(),
+        2,
+        "both restarts must actually put a GET on the wire, or this fence measures nothing. \
+         Observed: {:?}",
+        server.request_lines(),
+    );
+    assert!(
+        wait_for(|| server.open_get_connections() == 1).await,
+        "exactly ONE session-stream reader may survive two concurrent restarts; {} GET \
+         connections were still open. Two overlapping restarts each aborted a handle the other \
+         had not yet stored, so one reader is live with NO handle pointing at it — and the \
+         transport's close() reaches exactly one handle, which makes that reader unreachable \
+         rather than merely redundant",
+        server.open_get_connections(),
+    );
+
+    let mut closer = transport;
+    timeout(BOUND, closer.close())
+        .await
+        .expect("close returns within BOUND")
+        .expect("close succeeds");
+
+    assert!(
+        wait_for(|| server.open_get_connections() == 0).await,
+        "close() must reach the SURVIVING reader — that is what proves it is reachable rather \
+         than merely alone. {} GET connections were still open after close",
+        server.open_get_connections(),
     );
 
     server.shutdown().await;
