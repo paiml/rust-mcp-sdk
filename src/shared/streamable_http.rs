@@ -22,7 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use parking_lot::RwLock;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1300,6 +1300,85 @@ pub struct StreamableHttpTransport {
     /// its own `Clone` impl only in a later tokio than the `1.46` this crate's
     /// manifest declares as its minimum.
     shutdown: Arc<watch::Sender<bool>>,
+    /// Serialises the `401` refresh: the purge, the generation bump, and the
+    /// retry request's BUILD (Phase 118.2, plan 25).
+    ///
+    /// # Why the transport and not the trait
+    ///
+    /// [`AuthProvider`]'s own guarantee is at-most-once per REQUEST. It says
+    /// nothing about two requests, and it must not: concurrency across requests
+    /// is a property of the thing that HAS the requests. Moving a concurrency
+    /// contract into the trait would silently impose a new obligation on every
+    /// external implementor. The transport is the thing with the concurrency, so
+    /// the single-flight lives here.
+    ///
+    /// # The boundary, as three steps
+    ///
+    /// 1. **Purge — INSIDE.** `on_unauthorized()` evicts the cached token, and a
+    ///    second caller evicting again would destroy the token the first just
+    ///    cached.
+    /// 2. **Build — INSIDE.** This is the step that makes the lock worth
+    ///    anything. `on_unauthorized` only EVICTS; the rotating refresh token is
+    ///    presented to the IdP by the retry rebuild's `get_access_token`
+    ///    ([`Self::build_request_from_parts`]). A lock that ended at the purge
+    ///    would release two callers into `get_access_token` concurrently,
+    ///    against the cache the winner had just emptied — the original defect,
+    ///    one step later, and invisible to any fence that counts purges.
+    /// 3. **Send — OUTSIDE.** The retry POST is NOT under this lock. Serialising
+    ///    it would re-create, inside the transport, exactly the whole-client
+    ///    bottleneck the client-side transport guard is being removed to escape.
+    ///
+    /// # What is preserved by construction rather than by this lock
+    ///
+    /// The retry being at-most-once is STRUCTURAL — [`Self::post_once`] returns
+    /// the retry's response directly, so there is no loop to go around twice.
+    /// This lock does not create that property and cannot be relied on for it.
+    ///
+    /// # PRECONDITION: the provider caches what it vends
+    ///
+    /// "Exactly one vend" holds only if the [`AuthProvider`] implementation
+    /// CACHES the token `get_access_token` mints before returning it. Nothing in
+    /// the trait requires that — `on_unauthorized` defaults to a no-op and
+    /// `get_access_token` is unconstrained — so this is an ASSUMPTION about
+    /// downstream code, not an invariant this crate enforces. It is
+    /// well-founded rather than arbitrary: the trait's own rustdoc tells
+    /// implementors to evict the cached token "so that the subsequent
+    /// `get_access_token()` call ... returns a freshly-vended token", which only
+    /// means anything for a provider that has a cache.
+    ///
+    /// Against a NON-caching provider the generation check is inert, the loser
+    /// vends too, and all this lock buys is that the two vends are SERIALISED
+    /// rather than simultaneous — which a rotating refresh token still rejects.
+    /// That residual is deliberately left open here. Closing it by adding a
+    /// caching requirement to the trait would be a new contract on every
+    /// external implementor, which is a decision rather than a transport fix.
+    ///
+    /// A [`tokio::sync::Mutex`] and not the [`parking_lot::RwLock`] this file
+    /// uses for `config`, `terminal` and `abort_handle`: it is held across two
+    /// awaits (the purge and the rebuild), which is precisely the split
+    /// [`Self::receiver`] already follows.
+    ///
+    /// `Arc`-shared, so CLONES of this transport share one lock. A per-clone
+    /// lock would protect nothing: the hazard is exactly two clones sharing one
+    /// provider.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The vintage of the access token a request presented, bumped once per
+    /// completed `401` refresh (Phase 118.2, plan 25).
+    ///
+    /// Read immediately BEFORE a request is built — the build is where
+    /// `get_access_token` runs, so that is the moment the token's vintage is
+    /// fixed — and compared again inside [`Self::refresh_lock`]. A caller whose
+    /// captured vintage is still CURRENT received a genuinely new `401` and must
+    /// refresh. A caller whose vintage has already been superseded lost the race
+    /// to a refresh that happened while its request was in flight, so it skips
+    /// the purge and takes its retry token from the cache the winner warmed.
+    ///
+    /// Getting that comparison backwards would skip a refresh a caller genuinely
+    /// needed and turn a token-rotation fix into a permanent auth failure, which
+    /// is why "already moved" and not "differs from zero" is the test.
+    ///
+    /// `Arc`-shared for the reason [`Self::refresh_lock`] gives.
+    token_generation: Arc<AtomicU64>,
 }
 
 impl Debug for StreamableHttpTransport {
@@ -1391,6 +1470,11 @@ impl StreamableHttpTransport {
             open_post_readers: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(shutdown),
             caller_overflow: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            // Generation ZERO. Its absolute value is never read — only whether
+            // it has MOVED since a request captured it — so any starting point
+            // does.
+            token_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2458,11 +2542,30 @@ impl StreamableHttpTransport {
     /// The retry is structurally at-most-once: it returns directly from this
     /// function, so there is no loop to go around twice. A second `401` on the
     /// retry is returned to the caller unchanged.
+    ///
+    /// # The refresh is SINGLE-FLIGHTED across the transport (plan 25)
+    ///
+    /// Two concurrent POSTs on one transport — two clones of a `#[derive(Clone)]`
+    /// transport share one config, and therefore one [`AuthProvider`] — can both
+    /// receive a `401`. Left alone, both purge and, worse, both VEND: against a
+    /// rotating refresh token the second presents an already-rotated one and
+    /// fails, and its purge destroys the token the first just cached.
+    ///
+    /// [`Self::refresh_lock`] and [`Self::token_generation`] close that, and
+    /// their rustdoc carries the exact boundary — purge INSIDE, retry BUILD
+    /// inside, retry SEND outside. The at-most-once property above is NOT
+    /// produced by that lock; it is structural, and stays true with the lock
+    /// removed.
     async fn post_once(&self, body_bytes: Vec<u8>) -> Result<HyperResponse<hyper::body::Incoming>> {
         // Clone body_bytes so we can retry with the identical payload on 401.
         let body_bytes_snapshot = body_bytes.clone();
 
         let url = self.config.read().url.clone();
+
+        // The vintage of the token THIS attempt is about to present, captured
+        // immediately before the build because the build is where
+        // `get_access_token` runs. See `Self::token_generation`.
+        let presented_generation = self.token_generation.load(Ordering::SeqCst);
 
         // Build POST request with middleware integration
         let mut request = self
@@ -2507,16 +2610,45 @@ impl StreamableHttpTransport {
             return Ok(response);
         };
 
-        // Step 1: purge cached token (on_unauthorized BEFORE get_access_token — Test 5).
-        provider.on_unauthorized().await?;
+        // THE GUARDED REGION (plan 25). It runs from here to the point the retry
+        // request is BUILT, and no further — see `Self::refresh_lock` for why
+        // each of its three steps is on the side of the boundary it is on.
+        let retry_request = {
+            let _refresh = self.refresh_lock.lock().await;
 
-        // Step 2: rebuild the request using the byte-identical body snapshot.
-        let mut retry_request = self
-            .build_request_with_middleware(Method::POST, url.as_str(), body_bytes_snapshot)
-            .await?;
-        Self::apply_post_headers(&mut retry_request)?;
+            // Step 1: purge the cached token — but ONLY if nobody already did.
+            //
+            // `on_unauthorized` BEFORE `get_access_token` (Test 5) still holds
+            // for the caller that actually refreshes. A caller whose captured
+            // vintage has ALREADY been superseded lost the race to a refresh
+            // that completed while its request was in flight: its 401 is stale,
+            // it has nothing of its own to purge, and purging anyway would evict
+            // the token the winner just cached. A caller whose vintage is still
+            // CURRENT received a genuinely new 401 and refreshes normally.
+            if self.token_generation.load(Ordering::SeqCst) == presented_generation {
+                provider.on_unauthorized().await?;
+                self.token_generation.fetch_add(1, Ordering::SeqCst);
+            }
 
-        // Step 3: send retry — do NOT retry again on a second 401.
+            // Step 2: rebuild the request using the byte-identical body
+            // snapshot — STILL HOLDING THE LOCK.
+            //
+            // This is the step the lock exists for. `on_unauthorized` only
+            // EVICTS; this rebuild's `get_access_token` is what presents the
+            // rotating refresh token to the IdP. Releasing after the purge would
+            // let two callers vend concurrently against the cache the winner had
+            // just emptied — the original defect, one step later.
+            let mut retry_request = self
+                .build_request_with_middleware(Method::POST, url.as_str(), body_bytes_snapshot)
+                .await?;
+            Self::apply_post_headers(&mut retry_request)?;
+            retry_request
+        };
+
+        // Step 3: send retry — OUTSIDE the lock, so two recoveries that have both
+        // obtained their token proceed concurrently and this transport does not
+        // grow a whole-transport bottleneck. Still at-most-once: this returns
+        // directly, so a second 401 goes back to the caller unchanged.
         self.client
             .request(retry_request)
             .await
@@ -6331,5 +6463,353 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Plan 25: the transport-wide single-flight around the 401 refresh.
+    //
+    // Five fences, one per behaviour in plan 25 task 2. The DETERMINISTIC
+    // concurrency RED lives in `tests/client_sse_stream.rs` fence 28, which
+    // drives two clones of one transport through a recording listener; these
+    // pin the surrounding contract that fence cannot see — the generation
+    // bookkeeping, the no-provider path, and the lock BOUNDARY.
+    // ------------------------------------------------------------------
+
+    /// A caching `AuthProvider` double: `on_unauthorized` evicts, and
+    /// `get_access_token` VENDS only on a miss.
+    ///
+    /// The cache is the point. `on_unauthorized` merely evicts; the rotating
+    /// refresh token is presented by the SUBSEQUENT `get_access_token`, so a
+    /// double that always returns a `String` measures the operation adjacent to
+    /// the one that breaks.
+    #[derive(Debug)]
+    struct CachingProbe {
+        cached: StdMutex<Option<String>>,
+        vends: AtomicUsize,
+        purges: AtomicUsize,
+        minted: AtomicUsize,
+        /// Released by the test; every vend parks on it so two vends that
+        /// overlap are OBSERVED to overlap rather than being run to completion
+        /// one after another by a single-threaded runtime.
+        release: watch::Sender<bool>,
+    }
+
+    impl CachingProbe {
+        fn primed(token: &str) -> Self {
+            let (release, _) = watch::channel(false);
+            Self {
+                cached: StdMutex::new(Some(token.to_string())),
+                vends: AtomicUsize::new(0),
+                purges: AtomicUsize::new(0),
+                minted: AtomicUsize::new(0),
+                release,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AuthProvider for CachingProbe {
+        async fn get_access_token(&self) -> Result<String> {
+            if let Some(token) = self.cached.lock().unwrap().clone() {
+                return Ok(token);
+            }
+            self.vends.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.subscribe();
+            if !*release.borrow() {
+                let _ = release.wait_for(|open| *open).await;
+            }
+            let serial = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
+            let token = format!("vended-{serial}");
+            *self.cached.lock().unwrap() = Some(token.clone());
+            Ok(token)
+        }
+
+        async fn on_unauthorized(&self) -> Result<()> {
+            self.purges.fetch_add(1, Ordering::SeqCst);
+            *self.cached.lock().unwrap() = None;
+            tokio::task::yield_now().await;
+            Ok(())
+        }
+    }
+
+    /// Answer the first `unauthorized` POSTs `401` and every later one `200`,
+    /// recording — for each request — whether the transport's refresh lock was
+    /// held at the moment the request was SERVED.
+    ///
+    /// The lock probe is what makes "the retry POST is not under the lock"
+    /// observable at all: a retry sent inside the guarded region would find the
+    /// mutex locked from the server's side.
+    async fn spawn_401_then_ok_listener(
+        unauthorized: usize,
+        refresh_lock: Arc<tokio::sync::Mutex<()>>,
+        seen: Arc<StdMutex<Vec<(u16, bool)>>>,
+    ) -> Url {
+        use hyper::service::service_fn;
+        use hyper_util::server::conn::auto::Builder as ServerBuilder;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let refresh_lock = Arc::clone(&refresh_lock);
+                let seen = Arc::clone(&seen);
+                let io = hyper_util::rt::TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let _ = ServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(
+                            io,
+                            service_fn(move |req: Request<hyper::body::Incoming>| {
+                                let refresh_lock = Arc::clone(&refresh_lock);
+                                let seen = Arc::clone(&seen);
+                                async move {
+                                    let _ = req.collect().await;
+                                    let lock_free = refresh_lock.try_lock().is_ok();
+                                    let status = {
+                                        let mut seen = seen.lock().unwrap();
+                                        let status = if seen.len() < unauthorized {
+                                            401u16
+                                        } else {
+                                            200u16
+                                        };
+                                        seen.push((status, lock_free));
+                                        status
+                                    };
+                                    Ok::<_, hyper::Error>(
+                                        HyperResponse::builder()
+                                            .status(status)
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(if status == 200 {
+                                                r#"{"jsonrpc":"2.0","id":42,"result":{}}"#
+                                            } else {
+                                                r#"{"error":"unauthorized"}"#
+                                            })))
+                                            .unwrap(),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        Url::parse(&format!("http://127.0.0.1:{}", addr.port())).unwrap()
+    }
+
+    // Plan 25 fence A: a SOLO caller behaves exactly as it always did, and the
+    // generation moves exactly once.
+    #[tokio::test]
+    async fn a_solo_401_recovery_purges_once_and_bumps_the_generation_once() {
+        let mut server = MockServer::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let provider = Arc::new(CountingProvider::new("initial-token"));
+        let url = Url::parse(&server.url()).unwrap();
+        let mut transport = make_transport(url, Some(provider.clone() as Arc<dyn AuthProvider>));
+
+        let _ = transport.send(ping_message()).await;
+
+        assert_eq!(
+            provider.unauthorized_count.load(Ordering::SeqCst),
+            1,
+            "a solo caller purges exactly once; the second 401 — on the retry — is returned \
+             unchanged, which is STRUCTURAL and not something the new lock provides"
+        );
+        assert_eq!(
+            transport.token_generation.load(Ordering::SeqCst),
+            1,
+            "one completed refresh must move the generation exactly one step"
+        );
+        assert!(
+            transport.refresh_lock.try_lock().is_ok(),
+            "the refresh lock must be released on every exit path, including the error one"
+        );
+    }
+
+    // Plan 25 fence B: no provider — the 401 comes back unchanged and NO lock is
+    // taken, so an unauthenticated transport pays nothing for this fix.
+    #[tokio::test]
+    async fn a_401_with_no_provider_is_returned_unchanged_and_moves_no_generation() {
+        let mut server = MockServer::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let url = Url::parse(&server.url()).unwrap();
+        let mut transport = make_transport(url, None);
+
+        let result = transport.send(ping_message()).await;
+
+        assert!(
+            result.is_err(),
+            "a 401 with no provider is an ordinary failed request"
+        );
+        assert_eq!(
+            transport.token_generation.load(Ordering::SeqCst),
+            0,
+            "the no-provider path returns BEFORE the guarded region, so nothing may move"
+        );
+        assert!(
+            transport.refresh_lock.try_lock().is_ok(),
+            "the no-provider path must not take the lock at all"
+        );
+    }
+
+    // Plan 25 fence C: a genuinely NEW 401 is never skipped. Getting the
+    // generation comparison backwards would turn a token-rotation fix into a
+    // permanent auth failure, so this is the fence that pins its direction.
+    #[tokio::test]
+    async fn a_401_on_a_current_generation_still_refreshes() {
+        let mut server = MockServer::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .expect(4)
+            .create_async()
+            .await;
+
+        let provider = Arc::new(CountingProvider::new("initial-token"));
+        let url = Url::parse(&server.url()).unwrap();
+        let mut transport = make_transport(url, Some(provider.clone() as Arc<dyn AuthProvider>));
+
+        // Two SEQUENTIAL sends. The second captures the generation the first
+        // left behind, so its 401 is genuinely new and must refresh again.
+        let _ = transport.send(ping_message()).await;
+        let _ = transport.send(ping_message()).await;
+
+        assert_eq!(
+            provider.unauthorized_count.load(Ordering::SeqCst),
+            2,
+            "each caller whose captured generation is CURRENT must refresh; skipping the second \
+             would leave it presenting an invalid token forever"
+        );
+        assert_eq!(
+            transport.token_generation.load(Ordering::SeqCst),
+            2,
+            "two genuinely new 401s are two refreshes, so two generation steps"
+        );
+    }
+
+    // Plan 25 fence D: the retry POST is NOT sent under the refresh lock.
+    //
+    // Serialising the retry SEND would re-create, inside the transport, exactly
+    // the whole-transport bottleneck this round exists to remove. The listener
+    // probes the lock from the SERVER's side while it serves each request, so
+    // the boundary is measured on the wire rather than asserted in prose.
+    #[tokio::test]
+    async fn the_retry_post_is_sent_outside_the_refresh_lock() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(CountingProvider::new("initial-token"));
+
+        // The listener has to hold the very lock the transport uses, and the
+        // listener must exist before the transport can be pointed at it. Mint
+        // the lock first, hand a clone to the listener, and install it on the
+        // transport — an `Arc` swap on a private field, in the module that owns
+        // it, rather than a new constructor or a public accessor.
+        let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let url = spawn_401_then_ok_listener(1, Arc::clone(&refresh_lock), Arc::clone(&seen)).await;
+        let mut transport = make_transport(url, Some(provider.clone() as Arc<dyn AuthProvider>));
+        transport.refresh_lock = refresh_lock;
+
+        let _ = transport
+            .send_with_options(list_tools_message(), SendOptions::default())
+            .await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected the original POST and exactly one retry; observed {seen:?}"
+        );
+        assert_eq!(seen[0].0, 401, "the first attempt is the 401");
+        assert_eq!(seen[1].0, 200, "the retry is served normally");
+        assert!(
+            seen[1].1,
+            "the RETRY POST must be on the wire with the refresh lock RELEASED. A held lock here \
+             means the guarded region was drawn around the send as well as the build, which \
+             re-creates the whole-transport bottleneck the client-side guard is being removed to \
+             escape"
+        );
+    }
+
+    // Plan 25 fence E: two concurrent 401s on ONE transport take one purge and
+    // one VEND, and the loser is served from the cache the winner warmed.
+    #[tokio::test]
+    async fn two_concurrent_401s_take_one_purge_and_one_vend() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(CachingProbe::primed("primed-token"));
+
+        let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let url = spawn_401_then_ok_listener(2, Arc::clone(&refresh_lock), Arc::clone(&seen)).await;
+        let mut transport = make_transport(url, Some(provider.clone() as Arc<dyn AuthProvider>));
+        transport.refresh_lock = Arc::clone(&refresh_lock);
+
+        // Two CLONES of ONE transport — they share the config, and therefore the
+        // provider, the lock and the generation.
+        let mut one = transport.clone();
+        let mut two = transport.clone();
+        let first = tokio::spawn(async move {
+            one.send_with_options(list_tools_message(), SendOptions::default())
+                .await
+        });
+        let second = tokio::spawn(async move {
+            two.send_with_options(list_tools_message(), SendOptions::default())
+                .await
+        });
+
+        // Wait until both 401s are on the wire, then release the vend gate. The
+        // gate makes the interleave a construction rather than a race; releasing
+        // it on a bound as well as on the count is what keeps the SERIALISED
+        // tree — where only one caller ever vends — from hanging on its own fix.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+        loop {
+            let answered_401 = seen.lock().unwrap().iter().filter(|e| e.0 == 401).count();
+            if answered_401 >= 2 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+        while provider.vends.load(Ordering::SeqCst) < 2 {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = provider.release.send_replace(true);
+
+        let _ = first.await.unwrap();
+        let _ = second.await.unwrap();
+
+        assert_eq!(
+            provider.vends.load(Ordering::SeqCst),
+            1,
+            "exactly ONE vend may occur across the whole recovery — the loser's retry token comes \
+             from the cache the winner warmed, not from a second round trip to the IdP"
+        );
+        assert_eq!(
+            provider.purges.load(Ordering::SeqCst),
+            1,
+            "the loser's captured generation was already superseded, so it has nothing to purge"
+        );
+        assert_eq!(
+            transport.token_generation.load(Ordering::SeqCst),
+            1,
+            "one refresh, one generation step"
+        );
     }
 }
