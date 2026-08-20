@@ -3353,11 +3353,14 @@ async fn a_mismatched_frame_does_not_block_another_operation_on_the_same_client(
     let Ok(finished) = outcome else {
         panic!(
             "a SECOND operation on the same client never completed in {LOCK_PROBE_BOUND:?} while \
-             a mis-addressed response frame was being discarded. The transport write guard is \
-             held across an unbounded `receive().await` and re-taken on every discard, so every \
-             other `send`, `call_tool` and `close` on this client is serialised behind a wait \
-             that never ends — one frame from a hostile or merely lenient peer takes the whole \
-             client down (T-118.2-20-01). Observed POST bodies at the elapse: {:?}",
+             a mis-addressed response frame was in flight. What can fail this at THIS head is a \
+             pump step that does not release the transport write guard between slices: \
+             `pump_once` takes the guard, races ONE `receive()` against `PUMP_RECEIVE_SLICE`, \
+             routes whatever arrived, and drops the guard before looping. A guard held across an \
+             unsliced receive — or re-taken without being released — serialises every other \
+             `send`, `call_tool` and `close` on this client behind a wait that never ends, so one \
+             frame from a hostile or merely lenient peer takes the whole client down \
+             (T-118.2-20-01). Observed POST bodies at the elapse: {:?}",
             server.post_bodies()
         )
     };
@@ -3573,6 +3576,12 @@ async fn two_concurrent_calls_each_receive_their_own_answer() {
 /// the fence asserts a second, unrelated operation still completes. It asserts
 /// nothing about the call itself — fence 25 owns that — so a pass cannot come
 /// from the call finishing early.
+///
+/// This fence covers the RECEIVE path and fence 30 covers the SEND path;
+/// NEITHER subsumes the other. The harness here answers the POST head promptly
+/// and holds the answer FRAME, which lets `send()` return, so a tree that
+/// released the guard around the receive but kept it across the send passes this
+/// fence and fails fence 30.
 #[tokio::test]
 async fn an_outstanding_call_does_not_block_another_operation() {
     let server = RecordingServer::start().await;
@@ -3610,10 +3619,14 @@ async fn an_outstanding_call_does_not_block_another_operation() {
     let Ok(outcome) = probed else {
         panic!(
             "a second operation on the same client never completed in {LOCK_PROBE_BOUND:?} while \
-             an ordinary call was outstanding. The transport write guard is held across an \
-             unbounded `receive().await`, so every other operation on this client is serialised \
-             behind however long the peer takes to answer. Observed POST bodies at the elapse: \
-             {:?}",
+             an ordinary call was outstanding. What can fail this at THIS head is a pump step \
+             that does not release the transport write guard between slices: `pump_once` takes \
+             the guard, races one `receive()` against `PUMP_RECEIVE_SLICE`, and must DROP it \
+             before looping, so a waiter gets its turn once per slice. A guard re-taken without \
+             being released — or a receive awaited outside the slice race — serialises every \
+             other operation on this client behind however long the peer takes to answer. (The \
+             SEND-path twin of this is fence 30's subject, not this one's.) Observed POST bodies \
+             at the elapse: {:?}",
             server.post_bodies()
         )
     };
@@ -4216,7 +4229,14 @@ async fn a_peer_that_never_writes_response_headers_does_not_serialise_the_client
         /// nothing, because there is no held POST to contend with.
         Call,
         /// Both probe operations completed while the POST was still parked.
-        Probe(pmcp::Result<()>, pmcp::Result<pmcp::types::CallToolResult>),
+        ///
+        /// The call's result is BOXED: a `CallToolResult` is ~280 bytes and the
+        /// other variant carries none, which `clippy::large_enum_variant`
+        /// rejects. The indirection is invisible to the assertion.
+        Probe(
+            pmcp::Result<()>,
+            Box<pmcp::Result<pmcp::types::CallToolResult>>,
+        ),
     }
 
     let server = RecordingServer::start().await;
@@ -4253,8 +4273,10 @@ async fn a_peer_that_never_writes_response_headers_does_not_serialise_the_client
                 let notified = client
                     .cancel_request(&RequestId::from("fence-30-probe"))
                     .await;
-                let called = client.call_tool("fence-30-probe".to_string(), json!({})).await;
-                Arm::Probe(notified, called)
+                let called = client
+                    .call_tool("fence-30-probe".to_string(), json!({}))
+                    .await;
+                Arm::Probe(notified, Box::new(called))
             } => probe,
         }
     })
@@ -4289,7 +4311,8 @@ async fn a_peer_that_never_writes_response_headers_does_not_serialise_the_client
         },
         Arm::Probe(notified, called) => {
             notified.expect("the probe's notification must reach the wire and be answered 202");
-            called.expect("the probe's own call must be answered while the other POST is stalled");
+            (*called)
+                .expect("the probe's own call must be answered while the other POST is stalled");
         },
     }
 

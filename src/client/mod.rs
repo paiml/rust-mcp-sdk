@@ -4023,7 +4023,10 @@ impl<T: Transport> Client<T> {
                 self.splice_v2_meta(&mut jsonrpc_request.params);
                 let body = serde_json::to_vec(&jsonrpc_request)
                     .map_err(|e| Error::parse(format!("Failed to serialize v2 request: {e}")))?;
-                self.transport.write().await.send_raw(body).await?;
+                // Through `send_frame`, so the transport guard is NOT held
+                // across the round trip — see its rustdoc. Order is unchanged:
+                // `_meta` is stamped and the frame serialized before it goes.
+                self.send_frame(ClientFrame::Raw(body)).await?;
             } else {
                 // v1: byte-identical to every prior release — the typed message
                 // is re-serialized by the transport exactly as before.
@@ -4034,7 +4037,9 @@ impl<T: Transport> Client<T> {
                     id: request_id.clone(),
                     request,
                 };
-                self.transport.write().await.send(message).await?;
+                // Through `send_frame`, for the same reason the v2 branch above
+                // does: no transport guard across the round trip.
+                self.send_frame(ClientFrame::Typed(message)).await?;
             }
 
             // Await THIS request's own answer, pumping the transport whenever
@@ -4259,11 +4264,15 @@ impl<T: Transport> Client<T> {
                 // reply. The transport lock was released above, so this reply
                 // does not have to wait for a receive to finish first.
                 let response = self.dispatch_host_request(id, request).await;
-                self.transport
-                    .write()
-                    .await
-                    .send(crate::types::TransportMessage::Response(response))
-                    .await?;
+                // The transport lock was released above, so this reply does not
+                // have to wait for a receive to finish — and it goes through
+                // `send_frame`, so it does not hold the lock across its own
+                // round trip either. An in-tool elicitation answered against a
+                // slow peer must not freeze the client that is answering it.
+                self.send_frame(ClientFrame::Typed(
+                    crate::types::TransportMessage::Response(response),
+                ))
+                .await?;
             },
         }
         Ok(PumpStep::Progressed)
@@ -5098,8 +5107,75 @@ impl<T: Transport> Client<T> {
     /// Send a notification.
     async fn send_notification(&self, notification: Notification) -> Result<()> {
         let message = crate::types::TransportMessage::Notification(notification);
-        self.transport.write().await.send(message).await
+        // Off the guard, like every other client-side send. `cancel_request` and
+        // every notification path reach the wire through here.
+        self.send_frame(ClientFrame::Typed(message)).await
     }
+
+    /// Put ONE outbound frame on the wire WITHOUT holding the transport guard
+    /// across the round trip (Phase 118.2, plan 23).
+    ///
+    /// # The invariant this whole plan rests on
+    ///
+    /// No transport guard in this file is held across an HTTP round trip. The
+    /// guard is taken for exactly as long as it takes to ASK the transport for
+    /// a [`SharedSender`], dropped explicitly, and only then is the send
+    /// awaited. Without that, a peer that accepts a POST and never writes its
+    /// response HEAD holds the single transport lock forever and every other
+    /// operation on this client — a second call, a notification, a
+    /// cancellation, [`Transport::close`] — blocks at acquisition with nothing
+    /// to bound it (T-118.2-23-01). Fenced by
+    /// `a_peer_that_never_writes_response_headers_does_not_serialise_the_client`
+    /// in `tests/client_sse_stream.rs`.
+    ///
+    /// A READ guard would NOT do: tokio's `RwLock` is fair, so a pending writer
+    /// parks every later reader behind it, and a read guard held across a round
+    /// trip wedges [`Self::pump_once`] and `close` exactly as a write guard
+    /// does. The read guard here is momentary and contains no `await` of its
+    /// own.
+    ///
+    /// # The fallback is today's path, unchanged
+    ///
+    /// A transport that answers `None` — every transport that has not opted in,
+    /// including every external one — is sent through the exclusive `&mut`
+    /// path exactly as before, byte for byte.
+    async fn send_frame(&self, frame: ClientFrame) -> Result<()> {
+        // Scoped so the guard's drop point is VISIBLE rather than inferred from
+        // where the temporary happens to end. `shared_sender` is not async and
+        // performs no I/O, so nothing is awaited while it is held.
+        let handle = {
+            let transport = self.transport.read().await;
+            transport.shared_sender()
+        };
+
+        if let Some(handle) = handle {
+            return match frame {
+                ClientFrame::Typed(message) => handle.send_shared(message).await,
+                ClientFrame::Raw(body) => handle.send_raw_shared(body).await,
+            };
+        }
+
+        let mut transport = self.transport.write().await;
+        match frame {
+            ClientFrame::Typed(message) => transport.send(message).await,
+            ClientFrame::Raw(body) => transport.send_raw(body).await,
+        }
+    }
+}
+
+/// One outbound frame, in whichever of the two shapes the era produced it
+/// (Phase 118.2, plan 23).
+///
+/// Exists so [`Client::send_frame`] is ONE function rather than four copies of
+/// the same lock discipline — the shape in which three of the four sites were
+/// left unfixed when the receive-path twin of this defect was closed.
+enum ClientFrame {
+    /// A typed message, re-serialized by the transport: the v1 path, and every
+    /// notification and inbound-request reply on both eras.
+    Typed(crate::types::TransportMessage),
+    /// An already-encoded JSON-RPC frame, sent verbatim: the v2 request path,
+    /// whose `params._meta` was stamped onto these very bytes.
+    Raw(Vec<u8>),
 }
 
 // ===========================================================================
@@ -5239,6 +5315,22 @@ where
             // A READ lock: the stream outlives this call and owns its own HTTP
             // response, so nothing here may hold the transport for the lifetime
             // of the subscription.
+            //
+            // KNOWN RESIDUAL (Phase 118.2, plan 23). This guard IS held across
+            // one HTTP round trip — the `subscriptions/listen` POST's response
+            // HEAD — and a read guard is no better than a write guard for that:
+            // tokio's `RwLock` is fair, so a writer arriving meanwhile parks and
+            // every later reader parks behind it. A peer that accepts this POST
+            // and never answers therefore still serialises the client, exactly
+            // as `dispatch_request` did before `send_frame`. It is NOT closed
+            // here because the seam that closes it — an owned handle taken
+            // before the await, see `Transport::shared_sender` — does not exist
+            // on `EventStreamTransport`, whose `open_event_stream` is reached
+            // through the generic `T` with no way to own one. Adding it is a
+            // public-trait change and belongs to a decision, not to this
+            // gap-closure round. Blast radius: callers of
+            // `subscriptions/listen` only; every other client-side send is off
+            // the guard.
             let transport = self.transport.read().await;
             transport.open_event_stream(body).await?
         };
