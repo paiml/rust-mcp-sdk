@@ -520,8 +520,23 @@ tripwire passes.
   no longer leave an orphaned reader that `close()` cannot reach; a restart
   overlapping a concurrent `close()` is a different pairing, and there the
   reader is stopped by the transport's shutdown signal rather than by `close()`'s
-  abort. **What you must check on your side:** "exactly one vend" holds only if
-  your `AuthProvider` **caches what
+  abort. ⚠ **One cost of that restart lock, which you can observe:** it is held
+  across the session-stream `GET`'s response head, and pmcp has no request
+  timeout on any path. A peer that **accepts** the `GET` and then never writes
+  its response head therefore holds a transport-wide lock indefinitely, and
+  every later session-stream restart on that transport — a resumption-cursor
+  send, or a second handshake on a cloned transport — waits behind it with
+  nothing to bound the wait. This is a known, accepted residual, not a
+  regression: it is the duration cost of the lock, not a hole in the "exactly
+  one reader" guarantee above. Closing it needs a bounded-request decision this
+  release deliberately did not take: pmcp has **no default request timeout**,
+  and activating the public `RequestOptions::timeout` field — which has never
+  been read — was rejected because it would silently change behaviour for every
+  existing caller who already sets it, with no version signal, and because a
+  blanket deadline would break long-running `tools/call` handlers. If your peers
+  can stall mid-response, impose your own deadline around the call.
+  **What you must check on your side:** "exactly one vend" holds
+  only if your `AuthProvider` **caches what
   `get_access_token` returns**. The trait does not require that, and pmcp cannot
   enforce it. Against a non-caching provider the two vends are merely serialised
   rather than simultaneous, which a rotating refresh token still rejects — so if
