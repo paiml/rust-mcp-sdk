@@ -146,6 +146,30 @@ jobs:
         echo "Disk usage after cleanup:"
         df -h
 
+    # The run-legs spawn REAL example binaries and FAIL (never skip) when one is
+    # absent -- deliberately, so "the example demonstrates the fix" cannot pass
+    # unenforced. Two things conspire to make them absent in THIS job: the clean
+    # step above wipes target/, and `cargo llvm-cov` builds into
+    # target/llvm-cov-target while `tests/common/example_process.rs::target_dir`
+    # resolves CARGO_TARGET_DIR-or-<manifest>/target -- i.e. target/debug/examples,
+    # which the coverage build never repopulates because `cargo test --tests`
+    # does not build examples at all.
+    #
+    # Enumerated rather than `--examples` because the clean step above exists for
+    # DISK, and this job builds everything twice as it is. KEEP THIS LIST IN SYNC
+    # with the `*_REL_PATH` constants in tests/ -- `grep -rh 'REL_PATH: &str =
+    # "debug/examples/' tests/` prints exactly what belongs here.
+    - name: Build the example binaries the coverage run-legs spawn
+      run: |
+        cargo build --all-features \
+          --example s47_v2_stateless_mrtr \
+          --example s48_v2_mrtr_client \
+          --example s49_sampling_host \
+          --example s53_v2_agent_client \
+          --example s54_v2_dual_conformance
+        cargo build -p pmcp-agent --examples
+        cargo build -p pmcp-team-servers --features runtime --examples
+
     - name: Run coverage
       run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
