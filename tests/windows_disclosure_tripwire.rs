@@ -75,7 +75,12 @@ const CHAPTER_REL: &str = "pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md"
 ///
 /// NOTE this is a floor on the COUNT only. The id set itself stays derived; nothing
 /// here enumerates which entries are marked.
-const MIN_MARKED_ENTRIES: usize = 5;
+///
+/// RAISED 5 -> 9 by Phase 118.2 plan 24, which appended four marked entries (24, 25,
+/// 26, 27). Raised, per the doctrine two paragraphs up, because a floor left at the
+/// old value keeps reporting green while checking less: four of the nine could lose
+/// their sentinel and a floor of 5 would still pass.
+const MIN_MARKED_ENTRIES: usize = 9;
 
 /// One broken-windows ledger entry.
 ///
