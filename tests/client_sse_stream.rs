@@ -115,30 +115,44 @@ const SENTINEL: &str = "SENTINEL-0123456789abcdef-ABCDEF";
 
 /// Per-frame payload size for the backpressure fence.
 ///
-/// Chosen so that [`BACKPRESSURE_FRAME_COUNT`] frames (4 MiB in total) exceed the
-/// sum of everything that can absorb them without the consumer running: the
-/// client's own bounded receive queue (64 messages, so 1 MiB at this frame size),
+/// Chosen so that [`BACKPRESSURE_FRAME_COUNT`] frames (32 MiB in total) exceed
+/// the sum of everything that can absorb them without the consumer running: the
+/// client's own bounded receive queue (64 messages, so 4 MiB at this frame size),
 /// hyper's read buffer, and both kernel socket buffers. A frame small enough that
 /// the whole push fits in those buffers makes the fence VACUOUS — the producer
 /// never blocks and nothing proves the reader ever hit a full queue.
 ///
-/// Deliberately larger than the 8 KiB the plan sized this at: 128 x 8 KiB is
-/// 1 MiB total against a queue that alone holds 512 KiB, which leaves too little
-/// slack over an auto-tuned loopback socket buffer for the stall assertion to be
-/// reliable.
-const BACKPRESSURE_FRAME_BYTES: usize = 16 * 1024;
+/// # Sized for LINUX, not for the machine it was written on
+///
+/// This was 16 KiB x 256 = 4 MiB, which stalls reliably on macOS and NOT on a
+/// GitHub Actions Linux runner, where it wrote all 256 frames and tripped the
+/// fence's own "measured nothing" guard on its first CI run. Loopback socket
+/// buffers there are AUTO-TUNED and far larger than macOS's: `tcp_wmem` and
+/// `tcp_rmem` maxima are commonly 4 MiB and 6 MiB RESPECTIVELY, so ~10 MiB of
+/// kernel buffering alone could swallow the whole 4 MiB push before the server's
+/// write ever blocked.
+///
+/// The budget now is 32 MiB pushed against roughly 15 MiB of absorbers (4 MiB
+/// queue + ~10 MiB kernel + hyper), leaving ~17 MiB of slack rather than a
+/// deficit. Do not shrink either constant without re-deriving that sum: the
+/// failure mode is not a red test but a GREEN one that measured nothing, which
+/// the guard at the assertion site exists to catch.
+const BACKPRESSURE_FRAME_BYTES: usize = 64 * 1024;
 
 /// How many frames the backpressure fence pushes.
 ///
 /// Comfortably more than the receive-queue capacity the transport mints, so the
-/// queue is provably saturated rather than merely filled.
-const BACKPRESSURE_FRAME_COUNT: usize = 256;
+/// queue is provably saturated rather than merely filled. Raised from 256
+/// alongside [`BACKPRESSURE_FRAME_BYTES`] — see that constant for the Linux
+/// socket-buffer arithmetic that made the old total absorbable.
+const BACKPRESSURE_FRAME_COUNT: usize = 512;
 
 /// Upper bound on draining every backpressure frame.
 ///
-/// Larger than [`BOUND`] because it covers 4 MiB of transfer plus
+/// Larger than [`BOUND`] because it covers 32 MiB of transfer plus
 /// [`BACKPRESSURE_FRAME_COUNT`] channel hand-offs, not one wire operation.
-const DRAIN_BOUND: Duration = Duration::from_secs(30);
+/// Raised with the volume, and with headroom for a loaded shared CI runner.
+const DRAIN_BOUND: Duration = Duration::from_secs(60);
 
 /// The reconnect budget the transport ships, restated here (plan 04, D-03).
 ///
