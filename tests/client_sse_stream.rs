@@ -246,24 +246,35 @@ const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
 /// assertion text.
 const UNOWNED_SPRAY_ID_PREFIX: &str = "an-id-no-pmcp-client-request-ever-produced-spray-";
 
-/// How long fence 23 gives a SECOND operation on the same client to complete
-/// while a mis-addressed frame is being discarded (plan 20, BLOCKER 2 half A).
+/// How long a SECOND operation on the same client gets to complete while a
+/// first one is stuck (plan 20, BLOCKER 2 half A; now shared by the three
+/// liveness fences `a_mismatched_frame_does_not_block_another_operation_on_the_same_client`,
+/// `an_outstanding_call_does_not_block_another_operation` and
+/// `a_peer_that_never_writes_response_headers_does_not_serialise_the_client`).
 ///
-/// # Deliberately BELOW the discard ceiling, and that is the whole design
+/// # Deliberately BELOW the ceiling, and that is the whole design
 ///
-/// `src/client/mod.rs`'s `MISMATCH_DISCARD_TIMEOUT` is 10 s. This bound is 5 s,
-/// so a pass CANNOT be manufactured by the ceiling firing, returning the call
-/// and releasing the transport write lock as a side effect. The fence's subject
-/// is the lock being released *during* the discard — once per
-/// `MISMATCH_RECEIVE_SLICE` (250 ms) — not at the end of it. If this constant
-/// were ever raised above the ceiling the fence would silently stop measuring
-/// half A and start measuring half B, which fence 24 already owns.
+/// `src/client/mod.rs`'s ceiling on frames nobody awaits is
+/// `UNMATCHED_RESPONSE_TIMEOUT`, 10 s. This bound is 5 s, so a pass CANNOT be
+/// manufactured by the ceiling firing, returning the stuck call and releasing
+/// the transport guard as a side effect. The fence's subject is the guard being
+/// released *while* the first operation is still stuck — the pump takes it,
+/// races one `receive()` against `PUMP_RECEIVE_SLICE` (250 ms), and drops it —
+/// not at the end of it. If this constant were ever raised above the ceiling
+/// these fences would silently stop measuring liveness and start measuring the
+/// bounded failure, which `debris_from_a_dead_call_does_not_charge_the_next_calls_budget`
+/// owns.
 ///
-/// Pre-fix the second operation NEVER returns: the guard is held across an
-/// unbounded `receive().await` and re-taken on every `continue`. So CI load
-/// makes this fence safer rather than flakier — a slow machine cannot turn a
-/// wedged client into a pass, only a passing one into a longer wait, and 5 s is
-/// twenty slices of headroom over the one slice the probe must outlast.
+/// The count bound `MAX_UNMATCHED_RESPONSES` (32) cannot reach these fences
+/// either: each sprays at most one un-owned frame, so only the clock is in play.
+///
+/// On the RED tree the second operation NEVER returns — the guard was held
+/// across an unbounded `receive().await` and re-taken on every `continue`
+/// (receive path, closed by the router), and later across the POST's response
+/// head (send path, closed by `Client::send_frame`). So CI load makes these
+/// fences safer rather than flakier: a slow machine cannot turn a wedged client
+/// into a pass, only a passing one into a longer wait, and 5 s is twenty
+/// `PUMP_RECEIVE_SLICE`s of headroom over the one slice the probe must outlast.
 const LOCK_PROBE_BOUND: Duration = Duration::from_secs(5);
 
 /// How long fence 22 waits for a `receive()` that must NOT answer (plan 19,
@@ -2725,10 +2736,13 @@ async fn a_response_whose_id_does_not_match_is_not_returned_as_this_calls_answer
         // executed. A fence that passes when its subject never runs measures
         // nothing.
         //
-        // At MISMATCH_BOUND (2 s) the intended outcome is STILL WAITING, and it
-        // stays that way after plan 20: the discard ceiling
-        // (MISMATCH_DISCARD_TIMEOUT, 10 s) is five times this bound, so the
-        // bounded failure fence 24 owns cannot reach this arm either.
+        // At MISMATCH_BOUND (2 s) the intended outcome is STILL WAITING, and
+        // it stays that way at this HEAD: the ceiling on frames nobody awaits
+        // (UNMATCHED_RESPONSE_TIMEOUT, 10 s) is five times this bound, and its
+        // sibling count bound (MAX_UNMATCHED_RESPONSES, 32) needs 32 un-owned
+        // frames where this fence sends one — so the bounded failure, owned by
+        // debris_from_a_dead_call_does_not_charge_the_next_calls_budget, cannot
+        // reach this arm either.
         Ok(Err(not_an_answer)) => panic!(
             "call_tool returned an ERROR at {MISMATCH_BOUND:?}, where this fence's subject \
              requires it to be STILL WAITING — the mis-addressed frame discarded and the \
@@ -3472,18 +3486,24 @@ async fn a_mismatched_frame_is_not_delivered_as_this_calls_answer() {
     }
 }
 
-/// How long two concurrent calls get to BOTH complete (plan 22, fence 25).
-///
-/// Generous on purpose: the point is to separate "both answered" from "one
-/// caller's answer was destroyed", not to measure latency. It sits above
-/// `MISMATCH_DISCARD_TIMEOUT` so a run that fails does so because the answer is
-/// gone, not because this bound is tighter than the mechanism under test.
 /// How long fence 24 watches a call that must still be WAITING (plan 22).
 ///
 /// Short on purpose: it is proving a negative ("has not returned"), and a longer
 /// watch buys no extra confidence while costing wall clock on every run.
 const MISMATCH_STILL_WAITING: Duration = Duration::from_secs(3);
 
+/// How long two concurrent calls get to BOTH complete (plan 22, fence 25).
+///
+/// Generous on purpose: the point is to separate "both answered" from "one
+/// caller's answer was destroyed", not to measure latency. It sits above
+/// `UNMATCHED_RESPONSE_TIMEOUT` (10 s), the ceiling a call can die at, so a run
+/// that fails does so because an answer is gone, not because this bound is
+/// tighter than the mechanism under test.
+///
+/// (This doc block previously sat glued to the END of `MISMATCH_STILL_WAITING`'s,
+/// so rustdoc attributed it to that constant and `CONCURRENT_CALLS_BOUND` had
+/// none at all. Reattached by plan 24 in the same pass that corrected the
+/// constant it names.)
 const CONCURRENT_CALLS_BOUND: Duration = Duration::from_secs(15);
 
 /// Fence 25 (plan 22, CR-02): two concurrent calls on ONE client each receive
@@ -3493,8 +3513,9 @@ const CONCURRENT_CALLS_BOUND: Duration = Duration::from_secs(15);
 /// belonging to the OTHER caller before it pops its own. Before per-id routing
 /// there was nowhere to put that frame — a `Transport` consumer holds no
 /// producer handle — so it was DISCARDED, and the caller it belonged to waited
-/// out `MISMATCH_DISCARD_TIMEOUT` for an answer that had already been destroyed.
-/// That is the whole of CR-02: not a wrong answer, a deleted one.
+/// for an answer that had already been destroyed, until the then-current ceiling
+/// (10 s, today `UNMATCHED_RESPONSE_TIMEOUT`) failed it. That is the whole of
+/// CR-02: not a wrong answer, a deleted one.
 ///
 /// The assertion is deliberately on the SET of markers rather than on which
 /// caller got which. Answer numbering follows arrival order at the server, which
