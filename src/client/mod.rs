@@ -27,7 +27,7 @@ use crate::types::{
     ReadResourceRequest, ReadResourceResult, Request, RequestId, ResourceInfo, ResourceTemplate,
     ServerCapabilities, SubscribeRequest, ToolInfo, UnsubscribeRequest,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -369,6 +369,79 @@ impl UnmatchedBudget {
     }
 }
 
+/// How many abandoned request ids ONE client remembers at a time.
+///
+/// Sized far above the number of requests a client abandons in the window
+/// between an abandonment and the arrival of that request's answer — in practice
+/// one, occasionally a handful under a peer that is spraying — and far below
+/// anything that could matter for memory: a [`RequestId`] is a `u64` or a short
+/// `String`, so sixty-four of them is measured in kilobytes at worst.
+///
+/// A PRIVATE constant, exactly as [`UNMATCHED_RESPONSE_TIMEOUT`],
+/// [`MAX_UNMATCHED_RESPONSES`] and [`PUMP_RECEIVE_SLICE`] are: none of this
+/// client's correlation knobs is a semver event.
+const MAX_ABANDONED_REQUEST_IDS: usize = 64;
+
+/// Ids this client MINTED whose owner stopped waiting before the answer landed.
+///
+/// # What it is for
+///
+/// [`Client::pump_once`] used to answer one question — "does any LIVE request
+/// await this id?" — and treat both `no` answers alike. But they are not alike.
+/// A frame the peer mis-addressed is genuine misbehaviour and must spend the
+/// awaiting call's [`UnmatchedBudget`]; a frame this client asked for and then
+/// stopped waiting for is our OWN debris and must charge nobody. Conflating them
+/// is self-sustaining: a call that dies at its ceiling leaves its real answer on
+/// the shared receive queue, the next call pops it, books it unmatched and arms
+/// its own deadline on frame one — so one stray frame plus a slow peer failed
+/// every later call on that client, permanently.
+///
+/// # The three properties this type is read against
+///
+/// 1. **Bounded by construction.** A fixed [`MAX_ABANDONED_REQUEST_IDS`] cap
+///    with oldest-eviction, not a time-based expiry and not a reaper task: there
+///    is no arrival pattern under which it grows.
+/// 2. **Only locally-minted ids can enter it.** Every call site records an id
+///    that came back from `active_requests::remove`, i.e. one this client minted
+///    and registered. Nothing that arrived off the wire is ever recorded, so a
+///    hostile peer cannot grow it at all — the memory bound is a property of the
+///    type rather than a hope about peer behaviour.
+/// 3. **An entry is consumed on FIRST use.** A peer that replays one abandoned
+///    id N times is absorbed exactly once; the remaining N-1 replays are booked
+///    against the budget as the misbehaviour they are.
+#[derive(Debug, Default)]
+struct AbandonedRequestIds {
+    /// Oldest first, so eviction is a `pop_front`.
+    ids: VecDeque<RequestId>,
+}
+
+impl AbandonedRequestIds {
+    /// Remember one id whose owner stopped waiting, evicting the oldest when the
+    /// cap is already reached.
+    ///
+    /// The caller MUST have obtained `id` from a live `active_requests`
+    /// registration — see property 2 on the type.
+    fn record(&mut self, id: RequestId) {
+        while self.ids.len() >= MAX_ABANDONED_REQUEST_IDS {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(id);
+    }
+
+    /// Consume the entry for `id`, reporting whether there was one.
+    ///
+    /// `true` means "this is our own debris, absorb it"; `false` means "nobody
+    /// here ever asked for this id", which is the peer misbehaviour the budget
+    /// exists for. Removing on the way out is what makes a replay cost the peer.
+    fn take(&mut self, id: &RequestId) -> bool {
+        let Some(position) = self.ids.iter().position(|known| known == id) else {
+            return false;
+        };
+        self.ids.remove(position);
+        true
+    }
+}
+
 /// One step of [`Client::pump_once`], from the waiting caller's point of view.
 ///
 /// Three outcomes rather than `Result<()>` because the caller has to distinguish
@@ -507,6 +580,15 @@ pub struct Client<T: Transport> {
     info: Implementation,
     notification_tx: Option<mpsc::Sender<Notification>>,
     active_requests: Arc<RwLock<HashMap<RequestId, Pending>>>,
+    /// Ids this client minted whose owner stopped waiting before the answer
+    /// arrived — see [`AbandonedRequestIds`].
+    ///
+    /// Behind the SAME `Arc<RwLock<..>>` shape as `active_requests` and cloned
+    /// alongside it, because the two are read together in [`Client::pump_once`]
+    /// and a clone that shared one but not the other would be a split brain: a
+    /// caller on one clone could abandon an id that a pump on another clone then
+    /// booked as the peer's misbehaviour.
+    abandoned_requests: Arc<RwLock<AbandonedRequestIds>>,
     options: ClientOptions,
     /// Registered host handlers answering inbound server -> client requests
     /// (sampling / elicitation / roots). Immutable after construction.
@@ -601,6 +683,7 @@ impl<T: Transport> Client<T> {
             info: client_info,
             notification_tx: None,
             active_requests: Arc::new(RwLock::new(HashMap::new())),
+            abandoned_requests: Arc::new(RwLock::new(AbandonedRequestIds::default())),
             options: ClientOptions::default(),
             host_registry: crate::client::host::ClientHostRegistry::default(),
             negotiated_protocol_version: None,
@@ -648,6 +731,7 @@ impl<T: Transport> Client<T> {
             info: client_info,
             notification_tx: None,
             active_requests: Arc::new(RwLock::new(HashMap::new())),
+            abandoned_requests: Arc::new(RwLock::new(AbandonedRequestIds::default())),
             options: ClientOptions::default(),
             host_registry: crate::client::host::ClientHostRegistry::default(),
             negotiated_protocol_version: None,
@@ -691,6 +775,7 @@ impl<T: Transport> Client<T> {
             info: Implementation::default(),
             notification_tx: None,
             active_requests: Arc::new(RwLock::new(HashMap::new())),
+            abandoned_requests: Arc::new(RwLock::new(AbandonedRequestIds::default())),
             options,
             host_registry: crate::client::host::ClientHostRegistry::default(),
             negotiated_protocol_version: None,
@@ -3581,6 +3666,16 @@ impl<T: Transport> Client<T> {
         let pending = self.active_requests.write().await.remove(request_id);
         if let Some(pending) = pending {
             let _ = pending.cancel.send(());
+            // `Some` means the registration was still LIVE, so no answer had been
+            // delivered and the peer may yet send one. Record the id so that late
+            // answer is absorbed as our own debris rather than charged to whichever
+            // unrelated call happens to be pumping when it lands — see
+            // [`AbandonedRequestIds`]. A cancellation is a request to stop waiting,
+            // not a claim that the peer will stop answering.
+            self.abandoned_requests
+                .write()
+                .await
+                .record(request_id.clone());
         }
 
         Ok(())
@@ -3871,6 +3966,12 @@ impl<T: Transport> Client<T> {
         // rather than to whoever happened to pop it.
         let (cancel_tx, _cancel_rx) = oneshot::channel();
         let (response_tx, mut response_rx) = oneshot::channel();
+        // A LIVE registration must never be shadowed by debris from a previous
+        // life of the same id: a client whose id counter wrapped, or a caller
+        // that reused an explicit id, would otherwise have its real answer
+        // absorbed as somebody else's leftovers. Taking the entry here costs one
+        // scan of a bounded deque and removes the whole class.
+        self.abandoned_requests.write().await.take(&request_id);
         self.active_requests.write().await.insert(
             request_id.clone(),
             Pending {
@@ -4001,7 +4102,26 @@ impl<T: Transport> Client<T> {
         // this is a no-op; on every error path it is the one place the pending
         // id (and its cancel sender) is reaped, so a `Client` that outlives a
         // failed request never leaks the id or collides with a later reuse.
-        self.active_requests.write().await.remove(&request_id);
+        //
+        // And it is the one place the ABANDONMENT is recorded, for the same
+        // reason it is the one place the removal happens: the `Option<Pending>`
+        // this `remove` returns is exactly the distinction the ledger needs.
+        // `Some` means the registration was still live, so no answer had been
+        // delivered and the peer's real answer may still be on the wire behind
+        // whatever killed this call — that is the debris. `None` means the pump
+        // already took the registration to deliver the answer, so there is
+        // nothing to absorb. Recording at each individual error site instead
+        // would have to re-derive that distinction once per site and could not
+        // see the happy path at all.
+        if self
+            .active_requests
+            .write()
+            .await
+            .remove(&request_id)
+            .is_some()
+        {
+            self.abandoned_requests.write().await.record(request_id);
+        }
         result
     }
 
@@ -4071,8 +4191,16 @@ impl<T: Transport> Client<T> {
             crate::types::TransportMessage::Response(response) => {
                 let owner = self.active_requests.write().await.remove(&response.id);
                 let Some(pending) = owner else {
-                    // BOUNDED echo: the id is remote input of unbounded length.
-                    // See `echoed_request_id`.
+                    // ORDER IS LOAD-BEARING. A LIVE owner is looked for FIRST,
+                    // exactly as before, so nothing that is answered today stops
+                    // being answered. Only when there is none does the ledger get
+                    // asked, and it answers the question the live lookup cannot:
+                    // is this our own debris, or the peer's misbehaviour?
+                    if self.absorb_abandoned(&response.id).await {
+                        return Ok(PumpStep::Progressed);
+                    }
+                    // Nobody here ever asked for this id. BOUNDED echo: the id is
+                    // remote input of unbounded length. See `echoed_request_id`.
                     let id = echoed_request_id(&response.id);
                     tracing::warn!(%id, "dropping a JSON-RPC response no request is awaiting");
                     return Ok(PumpStep::Unmatched(id));
@@ -4124,6 +4252,38 @@ impl<T: Transport> Client<T> {
             },
         }
         Ok(PumpStep::Progressed)
+    }
+
+    /// Is this un-owned response frame OUR OWN debris, rather than the peer's
+    /// misbehaviour?
+    ///
+    /// `true` when the id was recorded as abandoned — the answer to a request
+    /// whose caller stopped waiting — in which case the entry is CONSUMED, the
+    /// frame is ordinary progress and no budget moves. `false` when nothing here
+    /// ever asked for this id, which is the case [`UnmatchedBudget`] exists for.
+    ///
+    /// Its own function rather than an inline branch in [`Client::pump_once`]
+    /// purely to keep that function inside the repo's cognitive-complexity
+    /// budget without an `#[allow]` — the same reason [`UnmatchedBudget`]'s own
+    /// rustdoc gives for splitting the arming rule out of
+    /// [`Client::dispatch_request`].
+    ///
+    /// The debug log is BOUNDED through [`echoed_request_id`] for the reason that
+    /// function records: the id is remote input of unbounded length, and a
+    /// hostile peer must not be able to push an unbounded string into a
+    /// consumer's logs. Debug rather than the no-owner branch's `warn!` because
+    /// this is not misbehaviour at all — it is the ordinary tail of a call that
+    /// gave up.
+    async fn absorb_abandoned(&self, id: &RequestId) -> bool {
+        if !self.abandoned_requests.write().await.take(id) {
+            return false;
+        }
+        let echoed = echoed_request_id(id);
+        tracing::debug!(
+            id = %echoed,
+            "absorbing the late answer to a request this client already stopped waiting for"
+        );
+        true
     }
 
     /// Answer an inbound server -> client request from the host registry.
@@ -5589,6 +5749,7 @@ impl<T: Transport> Clone for Client<T> {
             info: self.info.clone(),
             notification_tx: self.notification_tx.clone(),
             active_requests: self.active_requests.clone(),
+            abandoned_requests: self.abandoned_requests.clone(),
             options: self.options.clone(),
             host_registry: self.host_registry.clone(),
             negotiated_protocol_version: self.negotiated_protocol_version.clone(),
@@ -5831,6 +5992,143 @@ mod tests {
         assert!(
             rendered.contains("String(\"1\")"),
             "the offending id must be named — it is the whole diagnosis; got {rendered}"
+        );
+    }
+
+    /// A recorded id is absorbed as our own debris.
+    #[test]
+    fn an_abandoned_id_is_absorbed() {
+        let mut ledger = AbandonedRequestIds::default();
+        ledger.record(RequestId::Number(7));
+        assert!(
+            ledger.take(&RequestId::Number(7)),
+            "the late answer to a request this client abandoned is OUR debris and must be \
+             absorbed, not charged to whichever unrelated call happens to be pumping"
+        );
+    }
+
+    /// And absorbed ONCE: the entry is consumed on first use.
+    ///
+    /// The spoofing bound (T-118.2-22-03). Without it a peer could replay one
+    /// abandoned id indefinitely and have every replay absorbed silently; with
+    /// it the first replay is absorbed and every later one is booked against the
+    /// budget as the misbehaviour it is.
+    #[test]
+    fn an_abandoned_id_is_absorbed_only_once() {
+        let mut ledger = AbandonedRequestIds::default();
+        ledger.record(RequestId::Number(7));
+        assert!(ledger.take(&RequestId::Number(7)), "the first use absorbs");
+        assert!(
+            !ledger.take(&RequestId::Number(7)),
+            "the entry is CONSUMED on first use, so a peer that replays one abandoned id N times \
+             is absorbed once and the remaining N-1 replays still spend budget"
+        );
+    }
+
+    /// An id that was never recorded is still the peer's misbehaviour.
+    ///
+    /// The half of the classification that must NOT move: the re-typed id and
+    /// the id-spraying peer still spend budget at the same two bounds. This fix
+    /// removes one classification, not the ceiling.
+    #[test]
+    fn an_id_this_client_never_minted_is_not_absorbed() {
+        let mut ledger = AbandonedRequestIds::default();
+        ledger.record(RequestId::Number(7));
+        assert!(
+            !ledger.take(&RequestId::from("an-id-no-request-here-ever-minted")),
+            "an id nobody here asked for must stay unmatched, or the ceiling stops firing for \
+             the peer misbehaviour it was written for"
+        );
+        assert!(
+            !ledger.take(&RequestId::String("7".to_string())),
+            "and ids are TYPED: String(\"7\") is not Number(7), so a re-typed answer is not \
+             absorbed by the entry its correctly-typed twin left"
+        );
+    }
+
+    /// The container is bounded BY CONSTRUCTION: oldest-evicted at a fixed cap.
+    ///
+    /// This is what makes the memory bound a property of the type rather than a
+    /// hope about peer behaviour — and it holds even though no peer can reach
+    /// this path at all, because only locally-minted ids are ever recorded.
+    #[test]
+    fn the_abandoned_ledger_evicts_the_oldest_at_its_cap() {
+        let mut ledger = AbandonedRequestIds::default();
+        let overflow = 16;
+        for id in 0..(MAX_ABANDONED_REQUEST_IDS + overflow) {
+            ledger.record(RequestId::Number(id as i64));
+        }
+        assert_eq!(
+            ledger.ids.len(),
+            MAX_ABANDONED_REQUEST_IDS,
+            "the deque must never exceed its cap; an unbounded holding pen would be memory growth"
+        );
+        assert!(
+            !ledger.take(&RequestId::Number(0)),
+            "the OLDEST entries are the ones evicted — id 0 was recorded first and is gone"
+        );
+        assert!(
+            ledger.take(&RequestId::Number(
+                (MAX_ABANDONED_REQUEST_IDS + overflow - 1) as i64
+            )),
+            "and the newest is retained, which is the entry a live abandonment actually needs"
+        );
+    }
+
+    /// Registering a request CLEARS any stale entry for its id.
+    ///
+    /// Drives the real registration path — `dispatch_request` — rather than the
+    /// struct alone, because the property is about a live registration never
+    /// being SHADOWED by debris from a previous life of the same id: without the
+    /// take, that request's own answer would be absorbed as somebody else's
+    /// leftovers instead of delivered.
+    ///
+    /// The observation is a COUNT, so it needs no racing and no clock. The mock
+    /// answers nothing, so each dispatch fails and its exit cleanup records one
+    /// abandonment. Two dispatches of the SAME id therefore leave exactly ONE
+    /// entry if the second registration took the first one, and TWO if it did
+    /// not.
+    #[tokio::test]
+    async fn registering_a_request_clears_stale_debris_for_its_id() {
+        let transport = MockTransport::with_responses(vec![]);
+        let client = Client::new(transport);
+        let reused = RequestId::from("reused-across-two-lives");
+
+        for _ in 0..2 {
+            let failed = client
+                .dispatch_request(
+                    reused.clone(),
+                    Some(Request::Client(Box::new(ClientRequest::ListTools(
+                        ListToolsRequest { cursor: None },
+                    )))),
+                    crate::types::JSONRPCRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: reused.clone(),
+                        method: "tools/list".to_string(),
+                        params: Some(serde_json::json!({})),
+                    },
+                )
+                .await;
+            assert!(
+                failed.is_err(),
+                "the mock answers nothing, so each dispatch must fail and leave an abandonment — \
+                 a success here means this fence is counting something else entirely"
+            );
+        }
+
+        let entries = client
+            .abandoned_requests
+            .read()
+            .await
+            .ids
+            .iter()
+            .filter(|id| *id == &reused)
+            .count();
+        assert_eq!(
+            entries, 1,
+            "the second registration must TAKE the entry the first abandonment left. Two entries \
+             mean a live registration can be shadowed by debris from a previous life of the same \
+             id, and that request's real answer would be absorbed rather than delivered"
         );
     }
 
