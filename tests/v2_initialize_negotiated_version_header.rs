@@ -234,15 +234,43 @@ async fn the_initialize_header_agrees_with_the_initialize_body() {
     teardown(handle, ()).await;
 }
 
-/// A NON-init POST is unaffected: it echoes the default, as it always has.
+/// A NON-init POST echoes the version the CLIENT asserted.
 ///
-/// The complement of the test above, and the reason this file asserts agreement
-/// rather than "the header is never `2025-03-26`". `DEFAULT_PROTOCOL_VERSION` on
-/// a session-less non-init request is CORRECT behaviour that predates this phase;
-/// pinning it here means a future "fix" that blanket-raises the header would have
-/// to face a test rather than look like an improvement.
+/// # History — KEEP. This test asserted the OPPOSITE, deliberately
+///
+/// Until `tests/stateless_negotiated_version_header.rs` landed, this test was
+/// named `a_non_init_post_still_echoes_the_default` and pinned
+/// `DEFAULT_PROTOCOL_VERSION` here as CORRECT — "pre-existing behaviour", with
+/// the explicit purpose of making a future blanket-raise of the header "face a
+/// test rather than look like an improvement". That guard did its job: this is
+/// the test being faced, so the reasoning is recorded rather than deleted.
+///
+/// What changed is evidence, not taste. The behaviour was measured on a live
+/// deployment: a STATELESS server has no session to recover the negotiated
+/// version from, so it answered `2025-03-26` to every request after the
+/// handshake, and `StreamableHttpTransport` latched that header and replayed it
+/// — the identical downgrade this file's own sibling test calls a FAILURE MODE
+/// forty lines above, arriving by a different route. Two things settle it:
+///
+/// 1. The consequence is the one this file already names. A header that
+///    disagrees with the negotiated version silently downgrades the client. The
+///    init branch was fixed for exactly that reason; the mechanism does not
+///    become benign because a different request triggered it. On a stateless
+///    server it is strictly worse — every request, not one.
+/// 2. It was never "no information available". The client asserted
+///    `MCP-Protocol-Version: 2025-11-25` on THIS request. Answering `2025-03-26`
+///    contradicts information the server was handed, and the asserted header
+///    exists precisely so a session-less server can read it.
+///
+/// The old rationale's load-bearing claim was that the value predates the phase.
+/// That is true and is a fact about history, not about correctness.
+///
+/// The echo remains bounded: `validate_protocol_version_supported` answers `400`
+/// to anything outside `SUPPORTED_PROTOCOL_VERSIONS`, and
+/// `known_protocol_version` re-maps the survivor onto the SDK's own `&'static
+/// str`, so no client-chosen bytes can reach a response header.
 #[tokio::test]
-async fn a_non_init_post_still_echoes_the_default() {
+async fn a_non_init_post_echoes_the_version_the_client_asserted() {
     let (addr, handle) = spawn().await;
 
     let body = json!({
@@ -266,13 +294,21 @@ async fn a_non_init_post_still_echoes_the_default() {
     );
     assert_eq!(
         response.mcp_version.as_deref(),
-        Some(pmcp::DEFAULT_PROTOCOL_VERSION),
-        "FAILURE MODE: a session-less non-init POST echoed {:?} rather than \
-         `DEFAULT_PROTOCOL_VERSION`.\n\
-         CONSEQUENCE: this is pre-existing behaviour, unchanged by Phase 117. A change here is a \
-         wire change nobody asked for.\n\
+        Some(V1),
+        "FAILURE MODE: a session-less non-init POST echoed {:?} rather than the \
+         `{V1}` the client asserted on the request.\n\
+         CONSEQUENCE: a `{}` here is `compute_outbound_protocol_version` \
+         reaching its DEFAULT fallback again. The client latches this header and \
+         replays it, so the server has silently downgraded the connection to a \
+         version it never negotiated — on every request after the handshake, for \
+         every stateless deployment.\n\
+         WHAT TO DO: restore the `asserted_version` arm of \
+         `compute_outbound_protocol_version`, not this assertion. \
+         `tests/stateless_negotiated_version_header.rs` is the live-HTTP fence \
+         for the same rule on a v1-compat build.\n\
          BODY: {}",
         response.mcp_version,
+        pmcp::DEFAULT_PROTOCOL_VERSION,
         response.raw
     );
 

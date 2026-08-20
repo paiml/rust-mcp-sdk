@@ -3330,15 +3330,17 @@ fn extract_negotiated_version(response: &TransportMessage) -> Option<String> {
 
 /// Compute the outbound `MCP-Protocol-Version` header value.
 ///
-/// Used by both POST handlers to echo either the negotiated version from an
-/// initialize response or the session's recorded version for subsequent
-/// requests, falling back to `DEFAULT_PROTOCOL_VERSION` when no session is
-/// associated with the response.
+/// Used by both POST handlers to echo the negotiated version from an initialize
+/// response, the session's recorded version for subsequent requests, or — when
+/// there is no session to recover it from, as on every STATELESS deployment —
+/// the version the client itself asserted on the request. Only a request that
+/// names no version at all reaches `DEFAULT_PROTOCOL_VERSION`.
 fn compute_outbound_protocol_version(
     state: &ServerState,
     response_session_id: Option<&String>,
     is_init_request: bool,
     negotiated_version: Option<&str>,
+    asserted_version: Option<&str>,
 ) -> String {
     if is_init_request {
         return negotiated_version.map_or_else(
@@ -3354,7 +3356,42 @@ fn compute_outbound_protocol_version(
             return negotiated_version;
         }
     }
+    // A STATELESS server has no session to recover the negotiated version from,
+    // so without this it advertised `DEFAULT_PROTOCOL_VERSION` on every request
+    // after the handshake — a version LOWER than the one it had just negotiated,
+    // which `StreamableHttpTransport` then latches and replays. The client is
+    // dragged down with it, and nothing decided the downgrade except whether the
+    // deployment was serverless. `tests/stateless_negotiated_version_header.rs`
+    // is the live-HTTP fence; the sibling defect on the init branch is
+    // `tests/v2_initialize_negotiated_version_header.rs`.
+    //
+    // The client asserted the version on THIS request, which is the only place
+    // a session-less server can still read it.
+    if let Some(known) = asserted_version.and_then(known_protocol_version) {
+        return known.to_string();
+    }
     crate::DEFAULT_PROTOCOL_VERSION.to_string()
+}
+
+/// The SDK's own spelling of a version a client asserted, or `None` if it named
+/// one this SDK does not know.
+///
+/// Returning a `&'static str` from the SDK's table rather than the caller's
+/// bytes is what makes the asserted header safe to echo into a RESPONSE header:
+/// the value can carry nothing attacker-chosen, and it cannot fail the
+/// `HeaderValue` parse that every `MCP_PROTOCOL_VERSION` insertion site
+/// `unwrap()`s. `validate_protocol_version_supported` already refuses an
+/// unknown version at ingress with a `400`, so this is the second of two
+/// gates rather than the only one — deliberately, because the ingress guard is
+/// skipped for an accepted v2 request.
+fn known_protocol_version(asserted: &str) -> Option<&'static str> {
+    crate::SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .chain(std::iter::once(
+            &crate::types::protocol::PROTOCOL_VERSION_2026_07_28,
+        ))
+        .find(|known| **known == asserted)
+        .copied()
 }
 
 /// Best-effort error-hook dispatch for the middleware path.
@@ -3573,6 +3610,9 @@ fn parse_transport_message_fast(body: &[u8]) -> std::result::Result<HttpIngress,
 struct FastPathDispatch {
     is_init_request: bool,
     response_session_id: Option<String>,
+    /// The `MCP-Protocol-Version` the client asserted — see the field of the
+    /// same name on [`InternalResponseShape`].
+    asserted_protocol_version: Option<String>,
     /// Plan-04-resolved `ProtocolContext`, CONSUMED at dispatch (D-11).
     protocol_context: Option<crate::types::protocol::ProtocolContext>,
     /// When `Some((method, name))`, this is an accepted v2 request whose
@@ -3600,6 +3640,7 @@ async fn handle_fast_path_request(
     let FastPathDispatch {
         is_init_request,
         response_session_id,
+        asserted_protocol_version,
         protocol_context,
         v2_outbound,
         sessions_on,
@@ -3664,6 +3705,7 @@ async fn handle_fast_path_request(
         response_session_id.as_ref(),
         is_init_request,
         negotiated_version.as_deref(),
+        asserted_protocol_version.as_deref(),
     );
     response
         .headers_mut()
@@ -3707,6 +3749,12 @@ async fn handle_fast_path_request(
 struct InternalResponseShape<'a> {
     /// The session id to echo, if any — already `None` on v2.
     response_session_id: Option<&'a String>,
+    /// The `MCP-Protocol-Version` the CLIENT asserted on this request.
+    ///
+    /// The only source a STATELESS server has for the negotiated version, since
+    /// it keeps no session to look one up in — see
+    /// [`compute_outbound_protocol_version`].
+    asserted_protocol_version: Option<&'a str>,
     /// `Some((method, name))` for an accepted v2 discover (VERS-05 echo).
     v2_outbound: Option<(String, String)>,
     /// [`v1::sessions_active`] for THIS request (HTTP-01).
@@ -3729,6 +3777,7 @@ async fn assemble_discover_response_fast(
 ) -> Response {
     let InternalResponseShape {
         response_session_id,
+        asserted_protocol_version,
         v2_outbound,
         sessions_on,
     } = shape;
@@ -3750,8 +3799,13 @@ async fn assemble_discover_response_fast(
     v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
 
     // Discover is never an init request → compute the outbound version normally.
-    let version_to_send =
-        compute_outbound_protocol_version(state, response_session_id, false, None);
+    let version_to_send = compute_outbound_protocol_version(
+        state,
+        response_session_id,
+        false,
+        None,
+        asserted_protocol_version,
+    );
     response
         .headers_mut()
         .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
@@ -3846,6 +3900,7 @@ async fn assemble_tasks_update_fast(
 ) -> Response {
     let InternalResponseShape {
         response_session_id,
+        asserted_protocol_version,
         v2_outbound,
         sessions_on,
     } = shape;
@@ -3866,8 +3921,13 @@ async fn assemble_tasks_update_fast(
 
     // `tasks/update` is never an init request → compute the outbound version
     // normally.
-    let version_to_send =
-        compute_outbound_protocol_version(state, response_session_id, false, None);
+    let version_to_send = compute_outbound_protocol_version(
+        state,
+        response_session_id,
+        false,
+        None,
+        asserted_protocol_version,
+    );
     response
         .headers_mut()
         .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
@@ -3900,6 +3960,7 @@ async fn assemble_tasks_update_with_middleware(
 ) -> Response {
     let InternalResponseShape {
         response_session_id,
+        asserted_protocol_version,
         v2_outbound,
         sessions_on,
     } = shape;
@@ -3913,8 +3974,13 @@ async fn assemble_tasks_update_with_middleware(
 
     v1::store_response_event(state, era, response_session_id, &response_msg).await;
 
-    let version_to_send =
-        compute_outbound_protocol_version(state, response_session_id, false, None);
+    let version_to_send = compute_outbound_protocol_version(
+        state,
+        response_session_id,
+        false,
+        None,
+        asserted_protocol_version,
+    );
 
     let mut response = build_success_response_with_middleware(
         &response_msg,
@@ -4716,6 +4782,7 @@ async fn handle_post_fast_path_inner(
         FastPathDispatch {
             is_init_request,
             response_session_id,
+            asserted_protocol_version: protocol_version,
             protocol_context,
             v2_outbound,
             sessions_on,
@@ -4848,6 +4915,9 @@ async fn resolve_v2_gate_with_error_hook(
 struct MiddlewareDispatch {
     is_init_request: bool,
     response_session_id: Option<String>,
+    /// The `MCP-Protocol-Version` the client asserted — see the field of the
+    /// same name on [`InternalResponseShape`].
+    asserted_protocol_version: Option<String>,
     protocol_context: Option<crate::types::protocol::ProtocolContext>,
     v2_outbound: Option<(String, String)>,
     /// [`v1::sessions_active`] for THIS request — gates the `Mcp-Session-Id`
@@ -4877,6 +4947,7 @@ async fn assemble_discover_response_with_middleware(
 ) -> Response {
     let InternalResponseShape {
         response_session_id,
+        asserted_protocol_version,
         v2_outbound,
         sessions_on,
     } = shape;
@@ -4894,8 +4965,13 @@ async fn assemble_discover_response_with_middleware(
     v1::store_response_event(state, era, response_session_id, &response_msg).await;
 
     // Discover is never an init request → compute the outbound version normally.
-    let version_to_send =
-        compute_outbound_protocol_version(state, response_session_id, false, None);
+    let version_to_send = compute_outbound_protocol_version(
+        state,
+        response_session_id,
+        false,
+        None,
+        asserted_protocol_version,
+    );
 
     let mut response = build_success_response_with_middleware(
         &response_msg,
@@ -4968,6 +5044,7 @@ async fn dispatch_message_fast(
         HttpIngress::Discover { id, .. } => {
             let FastPathDispatch {
                 response_session_id,
+                asserted_protocol_version,
                 protocol_context,
                 v2_outbound,
                 sessions_on,
@@ -4979,6 +5056,7 @@ async fn dispatch_message_fast(
                 protocol_context.as_ref(),
                 InternalResponseShape {
                     response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
                     v2_outbound,
                     sessions_on,
                 },
@@ -5012,6 +5090,7 @@ async fn dispatch_message_fast(
         HttpIngress::TasksUpdate { id, params } => {
             let FastPathDispatch {
                 response_session_id,
+                asserted_protocol_version,
                 protocol_context,
                 v2_outbound,
                 sessions_on,
@@ -5027,6 +5106,7 @@ async fn dispatch_message_fast(
                 },
                 InternalResponseShape {
                     response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
                     v2_outbound,
                     sessions_on,
                 },
@@ -5067,6 +5147,7 @@ async fn dispatch_message_with_middleware(
     let MiddlewareDispatch {
         is_init_request,
         response_session_id,
+        asserted_protocol_version,
         protocol_context,
         v2_outbound,
         sessions_on,
@@ -5080,6 +5161,7 @@ async fn dispatch_message_with_middleware(
                 protocol_context.as_ref(),
                 InternalResponseShape {
                     response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
                     v2_outbound,
                     sessions_on,
                 },
@@ -5112,6 +5194,7 @@ async fn dispatch_message_with_middleware(
                 },
                 InternalResponseShape {
                     response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
                     v2_outbound,
                     sessions_on,
                 },
@@ -5152,6 +5235,7 @@ async fn dispatch_message_with_middleware(
                 response_session_id.as_ref(),
                 is_init_request,
                 negotiated_version.as_deref(),
+                asserted_protocol_version.as_deref(),
             );
 
             // CONF-07 / D-16, the middleware twin. The multi-frame body is a
@@ -5516,6 +5600,7 @@ async fn handle_post_with_middleware_inner(
         MiddlewareDispatch {
             is_init_request,
             response_session_id,
+            asserted_protocol_version: protocol_version,
             protocol_context,
             v2_outbound,
             sessions_on,
