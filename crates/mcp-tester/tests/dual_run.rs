@@ -722,8 +722,56 @@ fn http_json(body: &str, extra_headers: &str) -> String {
     response
 }
 
-/// The JSON-RPC `-32601` refusal both stubs answer unknown methods with.
-const STUB_REFUSAL: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#;
+/// The JSON-RPC `id` the client actually sent, ready to be echoed back.
+///
+/// pmcp mints a UUID STRING id per request and, since phase 118.2 taught the
+/// transport to ROUTE responses by id (`d01b87e2`, `4e33210d`), DISCARDS any
+/// response bearing an id it did not ask for — leaving the caller to wait out
+/// its whole timeout. A stub that answers with a hardcoded `"id":1` is
+/// therefore not a server this client can complete a handshake with, however
+/// well-formed the rest of the envelope is. Echoing the id is what every real
+/// server does, and the stub only earns the right to stand in for one by doing
+/// it too.
+///
+/// Yields `null` when the message has no id to echo: a `DELETE`, which carries
+/// no body, or a NOTIFICATION, whose body deliberately omits `id`. Neither is
+/// answered with a result — see [`refusal_or_ack`].
+fn echo_id(request: &str) -> Value {
+    request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .and_then(|body| body.get("id").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// What a stub owes an unrecognised message: a `-32601` to a REQUEST, a bare
+/// `202 Accepted` to a NOTIFICATION.
+///
+/// The split is not politeness. A notification carries no `id`, so the only
+/// response envelope a stub could build for one carries `"id": null` — and
+/// `null` matches no variant of pmcp's untagged `RequestId`, so the client
+/// fails the frame with `Invalid message format`. Since 118.2 routes by id,
+/// that parse error surfaces on whatever call is in flight, which means a stub
+/// answering `notifications/initialized` breaks the `initialize` that
+/// PRECEDED it — a handshake failure whose cause is a message sent after the
+/// handshake succeeded. `202` with an empty body is what the MCP HTTP binding
+/// specifies and what a real server sends.
+fn refusal_or_ack(request: &str) -> String {
+    let id = echo_id(request);
+    if id.is_null() {
+        return "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+    }
+    http_json(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": "no" },
+        })
+        .to_string(),
+        "",
+    )
+}
 
 /// Spawn a raw TCP stub that answers each request with `respond(request)`.
 ///
@@ -772,7 +820,7 @@ async fn the_sdk_emits_the_reserved_meta_key_this_crate_spells() {
         if let Ok(mut seen) = sink.lock() {
             seen.push(request.to_owned());
         }
-        http_json(STUB_REFUSAL, "")
+        refusal_or_ack(request)
     });
 
     let mut v2 = v2_tester(&mcp_url(addr));
@@ -825,7 +873,7 @@ async fn era_detection_does_not_leak_a_session_per_invocation() {
             m.fetch_add(1, Ordering::SeqCst);
             let body = json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": echo_id(request),
                 "result": {
                     "protocolVersion": V1,
                     "capabilities": {},
@@ -835,7 +883,7 @@ async fn era_detection_does_not_leak_a_session_per_invocation() {
             .to_string();
             return http_json(&body, "mcp-session-id: stub-session\r\n");
         }
-        http_json(STUB_REFUSAL, "")
+        refusal_or_ack(request)
     });
 
     let url = mcp_url(addr);
