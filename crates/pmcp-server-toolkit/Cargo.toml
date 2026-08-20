@@ -189,7 +189,7 @@ trybuild = "1"
 # (initialize → tools/list → tools/call) via the mcp-tester library. Dev-only —
 # `tests/` is excluded from the published artifact (see `exclude` above), so this
 # does NOT enter the downstream dependency graph.
-mcp-tester = { version = "0.7.0", path = "../mcp-tester" }
+mcp-tester = { version = "0.8.0", path = "../mcp-tester" }
 # Why: Phase 90 Plans 01/03/04/05 drive the HttpConnector against a mock REST
 # backend (GET/POST + auth-header assertions) without a live server. Dev-only.
 wiremock = "0.6"

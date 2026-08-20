@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-team-servers"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Dev-grade reference team servers (team-fs, mem-mcp, approval-mcp, team-mcp) for the PMCP SDK (experimental)"
 license = "MIT"

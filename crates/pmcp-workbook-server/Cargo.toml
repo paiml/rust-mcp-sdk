@@ -55,7 +55,7 @@ thiserror = "2"
 # path via the mcp-tester library. Mirrors pmcp-sql-server's parity_chinook
 # harness. mcp-tester is a [dev-dependencies] test harness, never a runtime dep,
 # so it does NOT enter the published crate's dependency tree.
-mcp-tester = { version = "0.7.0", path = "../mcp-tester" }
+mcp-tester = { version = "0.8.0", path = "../mcp-tester" }
 tempfile = "3"
 # Why: the property test in bundle_id_props.rs uses proptest to generate
 # arbitrary --bundle-id strings and assert the fail-closed mismatch invariant.

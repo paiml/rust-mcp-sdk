@@ -65,8 +65,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # (Phase 116). `path` wins locally, but a published cargo-pmcp 0.19.0 claiming
 # compatibility with an older pmcp would not compile: `auth_cmd` resolves every
 # credential through that seam.
-pmcp = { version = "2.18.0", path = "..", features = ["streamable-http", "oauth"] }
-mcp-tester = { version = "0.7.0", path = "../crates/mcp-tester" }
+pmcp = { version = "2.19.0", path = "..", features = ["streamable-http", "oauth"] }
+mcp-tester = { version = "0.8.0", path = "../crates/mcp-tester" }
 # Collects the SDK's `pmcp::wire` tracing target for `--dump-wire`. The SDK emits
 # those events unconditionally-but-guarded; without a subscriber installed here
 # they would go nowhere, which is exactly the gap `--dump-wire` closes.

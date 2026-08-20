@@ -55,6 +55,17 @@ gains `blob` and nothing else.
   from any other SDK's server failed to parse at all with ``missing field `uri` ``.
   The tolerance is a compatibility affordance for mixed-version fleets, not a
   second supported wire format.
+- **`SharedSender`** — a new public trait, plus a defaulted
+  `Transport::shared_sender()` accessor that returns `None`. A transport that
+  implements it hands the client an OWNED send handle, so `Client` takes its
+  transport guard only long enough to ask for that handle, drops it, and only
+  then awaits the send. Additive: a transport that does not implement it keeps
+  the previous exclusive path. `StreamableHttpTransport` implements it;
+  `PooledTransport`, `HttpTransport` and `WasmHttpTransport` do not.
+- **`Era` / `protocol_era()` and the `V2_PROTOCOL_VERSIONS` table** — v2
+  membership now has ONE source of truth that both the era classifier and the
+  `MCP-Protocol-Version` echo read, so adding a future v2-generation version is
+  a single-table edit and cannot make the echo advertise the wrong spelling.
 
 ### Changed
 
@@ -70,6 +81,43 @@ gains `blob` and nothing else.
   key would match no arm at all.
 - A payload carrying BOTH `text` and `blob` inside `resource` is REJECTED on
   input, because the spec type is an XOR.
+- **A stalled peer can no longer wedge a whole `Client`.** Client sends route
+  through an owned handle taken under a momentary guard that is released BEFORE
+  the round trip is awaited, so a peer that accepts a POST and never writes its
+  response head now blocks only its own call — not every other operation on that
+  client, `close()` included. Two disclosed exceptions remain: a POOLED
+  `StreamableHttpTransport` keeps the exclusive path, and `Client::open_event_stream`
+  still holds a read guard across the `subscriptions/listen` response head.
+- **Concurrent token vends on one transport are single-flighted.** Two paths that
+  were serialised only by accident are now serialised in their own right: the
+  `401` refresh (purge through retry BUILD), and — new in this release — the
+  ORDINARY vend while the credential cache is cold. Several concurrent first
+  requests on one cloned transport previously reached `AuthProvider::get_access_token`
+  once each; against a ROTATING refresh token the identity provider accepts one and
+  rejects the rest, and each rejection invalidates the token the winner cached, so
+  the transport's auth failed permanently before any `401` had occurred. NOTE the
+  limit: this holds only if your `AuthProvider` CACHES what `get_access_token`
+  returns. The trait states no caching contract and pmcp cannot enforce one —
+  against a non-caching provider the vends are serialised but still plural.
+- **Session-stream restarts are atomic.** Two overlapping restarts can no longer
+  leave an orphaned reader holding a live connection.
+
+### Fixed
+
+- **Docs: the v2 server track said the opposite of the code.** The README and the
+  migration guide both stated that servers need do nothing for v2 — that a server
+  built with default features "already answers both eras". The default accept-list
+  is v1-only BY DESIGN (`default_accept_list()` excludes `2026-07-28`, so no server
+  reaches the v2 era by accident), and v2 is reached only through
+  `ServerBuilder::with_supported_protocol_versions(..)`. A team following the guide
+  shipped a v1-only server and believed it was done, with the failure silent until
+  a v2 client arrived. Both documents now teach the opt-in, with the v1 version
+  listed ALONGSIDE v2. No code change: the docs were wrong, not the default.
+- **`pmcp-code-mode` no longer declares `execute_code` as a safe read.**
+  `readOnlyHint`/`destructiveHint` were shared with `validate_code`, telling every
+  host it could auto-approve execution of caller-supplied code. `execute_code` now
+  declares nothing and the MCP defaults (`readOnlyHint = false`,
+  `destructiveHint = true`) stand.
 
 ### Deprecated
 
