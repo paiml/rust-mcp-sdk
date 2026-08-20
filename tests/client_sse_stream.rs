@@ -55,7 +55,7 @@
     not(target_arch = "wasm32")
 ))]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -235,6 +235,15 @@ const MISMATCH_BOUND: Duration = Duration::from_secs(2);
 /// `RequestId::String` holding a UUID), so a failure message naming it reads as
 /// "this frame was addressed to nobody" rather than as an off-by-one.
 const MISMATCHED_CALL_ID: &str = "an-id-no-pmcp-client-request-ever-produced";
+
+/// The `id` prefix every SPRAYED response frame carries (plan 22, CR-02).
+///
+/// The same self-describing rule [`MISMATCHED_CALL_ID`] states, plus a per-frame
+/// serial appended by [`sprayed_unowned_answer`]: a failure message naming
+/// `…-17` and one naming `…-31` are telling the reader about DIFFERENT frames,
+/// which is what makes "how far did this budget get" readable straight off the
+/// assertion text.
+const UNOWNED_SPRAY_ID_PREFIX: &str = "an-id-no-pmcp-client-request-ever-produced-spray-";
 
 /// How long fence 23 gives a SECOND operation on the same client to complete
 /// while a mis-addressed frame is being discarded (plan 20, BLOCKER 2 half A).
@@ -422,6 +431,23 @@ struct Shared {
     /// Distinct from [`Self::calls_answered`], which counts answers BUILT — the
     /// gate needs "the other answer is on the wire", not "it exists".
     answers_flushed: AtomicUsize,
+    /// How many response frames addressed to ids NO request awaits are written
+    /// immediately before each answered call's own answer frame (plan 22, CR-02).
+    ///
+    /// One entry per answered call, in order; the front is popped as each
+    /// SSE-answered call is served and an exhausted schedule sprays nothing. That
+    /// per-call shape is what lets ONE fence give call 1, call 2 and call 3
+    /// different spray counts, which is the whole arithmetic the chain fence
+    /// turns on.
+    ///
+    /// EMPTY by default, so every existing fence observes byte-identical bytes to
+    /// the ones it observes today — the same rule
+    /// [`answer_calls_with_sse`](Shared::answer_calls_with_sse) and
+    /// [`advertise_tools`](Shared::advertise_tools) state.
+    unowned_spray_schedule: Mutex<VecDeque<usize>>,
+    /// The serial appended to each sprayed frame's id, so no two sprayed frames
+    /// anywhere in a run share an id.
+    unowned_sprayed: AtomicUsize,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -471,6 +497,8 @@ impl RecordingServer {
             stagger_answers: AtomicBool::new(false),
             answerable_gated: AtomicUsize::new(0),
             answers_flushed: AtomicUsize::new(0),
+            unowned_spray_schedule: Mutex::new(VecDeque::new()),
+            unowned_sprayed: AtomicUsize::new(0),
         });
 
         let accept = tokio::spawn({
@@ -622,6 +650,24 @@ impl RecordingServer {
     /// roughly half the time while measuring nothing.
     fn answer_calls_newest_first(&self) {
         self.shared.stagger_answers.store(true, Ordering::SeqCst);
+    }
+
+    /// Write `schedule[n]` response frames addressed to ids NOBODY awaits
+    /// immediately BEFORE answered call *n*'s own answer frame (plan 22, CR-02).
+    ///
+    /// Call BEFORE the client connects, together with
+    /// [`answer_calls_with_an_echoing_result`](RecordingServer::answer_calls_with_an_echoing_result)
+    /// and
+    /// [`answer_calls_with_sse`](RecordingServer::answer_calls_with_sse) — the
+    /// spray rides the SSE-answered POST body, which is the only framing on which
+    /// a frame can precede an answer that is still on the wire.
+    ///
+    /// Per-CALL rather than a single count because the chain fence needs three
+    /// different counts on one client. An exhausted schedule sprays nothing, so a
+    /// fence naming fewer counts than it makes calls is stating "and then behave
+    /// normally" rather than falling off an edge.
+    fn spray_unowned_frames_before_each_answer(&self, schedule: &[usize]) {
+        *self.shared.unowned_spray_schedule.lock() = schedule.iter().copied().collect();
     }
 
     fn answer_the_next_call_with_a_mismatched_id(&self) {
@@ -930,6 +976,23 @@ fn call_marker(sequence: usize) -> String {
     format!("call-answer-{sequence}")
 }
 
+/// One well-formed JSON-RPC 2.0 success addressed to an id nobody awaits
+/// (plan 22, CR-02).
+///
+/// A SUCCESS rather than an error deliberately: the client's correlation
+/// decision is made on the frame's `id` alone, before anything looks at
+/// `result`/`error`, so an error frame would add a second variable to a fence
+/// whose subject is classification. The `id` is
+/// [`UNOWNED_SPRAY_ID_PREFIX`] plus `serial`, unique across a whole run.
+fn sprayed_unowned_answer(serial: usize) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("{UNOWNED_SPRAY_ID_PREFIX}{serial}"),
+        "result": { "content": [ { "type": "text", "text": "addressed to nobody" } ] },
+    })
+    .to_string()
+}
+
 /// Answer a GET with a `text/event-stream` whose body is already over (plan 04).
 ///
 /// A well-formed, successful response — the client's open SUCCEEDS — that then
@@ -1074,6 +1137,29 @@ async fn serve_post_sse_answer(write_half: &mut WriteHalf<TcpStream>, body: &str
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+        // The unowned spray (plan 22, CR-02), placed AFTER the stagger gate and
+        // BEFORE this call's own answer. Both facts matter: the sprayed frames
+        // must reach the client while the call is still waiting (so they are
+        // booked against ITS budget), and the call's real answer must still be
+        // behind them on the wire (so a call that dies at the count bound leaves
+        // its own answer as un-owned debris — the chain under test).
+        let spray = shared
+            .unowned_spray_schedule
+            .lock()
+            .pop_front()
+            .unwrap_or(0);
+        for _ in 0..spray {
+            let serial = shared.unowned_sprayed.fetch_add(1, Ordering::SeqCst) + 1;
+            let frame = format!(
+                "event: message\ndata: {}\n\n",
+                sprayed_unowned_answer(serial)
+            );
+            // The SAME `write_chunk` the answer uses, so the framing a sprayed
+            // frame arrives in is byte-identical to the framing a real answer
+            // arrives in and nothing can pass by telling the two apart.
+            let _ = write_chunk(write_half, &frame).await;
+        }
+
         let frame = format!("event: message\ndata: {body}\n\n");
         let _ = write_chunk(write_half, &frame).await;
         shared.answers_flushed.fetch_add(1, Ordering::SeqCst);
@@ -3283,4 +3369,164 @@ async fn an_outstanding_call_does_not_block_another_operation() {
         "the outstanding call completed before the probe could run, so this fence measured \
          nothing. The harness must hold that answer until the probe has finished."
     );
+}
+
+// ===========================================================================
+// Fence 27 — CR-02's SURVIVING half: a dead call's own answer must not be
+// charged to the NEXT call's unmatched budget.
+// ===========================================================================
+
+/// The unmatched-response COUNT bound the client ships, restated here
+/// (plan 22, CR-02).
+///
+/// `MAX_UNMATCHED_RESPONSES` is a PRIVATE constant in `src/client/mod.rs` — for
+/// the same never-a-semver-event reason [`SHIPPED_RECONNECT_BUDGET`] records
+/// about the transport's knobs — so an integration test cannot import it.
+/// Restating it is safe because a drift is caught by the very fence that uses
+/// it: call one's failure names the count it actually reached, and
+/// [`debris_from_a_dead_call_does_not_charge_the_next_calls_budget`] asserts on
+/// that number.
+const SHIPPED_UNMATCHED_RESPONSE_BUDGET: usize = 32;
+
+/// Upper bound on the WHOLE three-call chain (plan 22, CR-02).
+///
+/// Generous, and NOT the subject: nothing in this fence is timed. Its only job
+/// is to keep a regression from hanging CI, which is why the panic text says a
+/// timeout here means a call never returned at all rather than that a budget
+/// fired.
+const DEBRIS_CHAIN_BOUND: Duration = Duration::from_secs(60);
+
+/// Fence 27 (plan 22, CR-02 surviving half): the answer to a call that already
+/// stopped waiting must not spend the NEXT call's unmatched budget.
+///
+/// # The mechanism
+///
+/// A call that dies at its ceiling is removed from `active_requests` by
+/// `dispatch_request`'s exit cleanup, but its real answer is still on the wire
+/// behind the frames that killed it. That answer lands on the transport's
+/// SHARED receive queue with no owner. The next call pops it, finds no live
+/// owner, and — before the fix — booked it `PumpStep::Unmatched`, spending one
+/// unit of its OWN budget and arming its OWN `UNMATCHED_RESPONSE_TIMEOUT` on
+/// frame one. That is CR-02's shape one rename later: one stray frame plus a
+/// slow peer fails every LATER call on the client, permanently.
+///
+/// # The arithmetic that makes RED deterministic
+///
+/// Call one is sprayed exactly [`SHIPPED_UNMATCHED_RESPONSE_BUDGET`] frames
+/// addressed to nobody, so it dies ON THE LAST ONE — by COUNT — while its own
+/// answer is still behind them. Call two is sprayed exactly one FEWER. On a tree
+/// that books call one's leftover answer as unmatched, call two reaches
+/// `31 + 1 == 32` and fails; on a tree that absorbs it, call two stays at `31`,
+/// one under the bound, and is answered. Call three is sprayed nothing at all
+/// and must simply be answered, which is what makes this a fence on the CHAIN
+/// rather than on a single failure.
+///
+/// # No wall clock appears anywhere in it
+///
+/// `UnmatchedBudget` fires on `seen >= MAX_UNMATCHED_RESPONSES` **or** on an
+/// elapsed deadline, and only the COUNT is used here. The deadline is built from
+/// `web_time::Instant::now()`, which on native IS `std::time::Instant`:
+/// `tokio::time::pause()` does not move it, so a paused-clock fence could never
+/// expire it and a real-time fence would need eleven seconds of wall clock and
+/// would be load-sensitive. [`DEBRIS_CHAIN_BOUND`] is a hang guard, not a
+/// measurement.
+#[tokio::test]
+async fn debris_from_a_dead_call_does_not_charge_the_next_calls_budget() {
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+    server.answer_calls_with_sse();
+    server.spray_unowned_frames_before_each_answer(&[
+        SHIPPED_UNMATCHED_RESPONSE_BUDGET,
+        SHIPPED_UNMATCHED_RESPONSE_BUDGET - 1,
+        0,
+    ]);
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so nothing here can be blamed on a terminal \
+         reason. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    let chain = timeout(DEBRIS_CHAIN_BOUND, async {
+        let first = client
+            .call_tool("fence-27-dies".to_string(), json!({}))
+            .await;
+        let second = client
+            .call_tool("fence-27-next".to_string(), json!({}))
+            .await;
+        let third = client
+            .call_tool("fence-27-after".to_string(), json!({}))
+            .await;
+        (first, second, third)
+    })
+    .await;
+
+    let Ok((first, second, third)) = chain else {
+        panic!(
+            "the three-call chain did not complete in {DEBRIS_CHAIN_BOUND:?}. This bound is a \
+             HANG guard, not the subject: a timeout here means one of the three calls never \
+             RETURNED AT ALL, which is a different defect from a budget firing — a budget that \
+             fires returns a named error promptly. Observed POST bodies: {:?}",
+            server.post_bodies()
+        )
+    };
+
+    // Call one must die the way the construction intends. Without this a later
+    // refactor could make it die some other way and the fence would stop
+    // measuring the chain while still passing.
+    let died = first.expect_err(
+        "call one is sprayed exactly the shipped unmatched-response budget, so it MUST fail at \
+         the COUNT bound. A success here means the spray never reached the client and every \
+         later assertion in this fence is vacuous",
+    );
+    let died = died.to_string();
+    assert!(
+        died.contains(&format!(
+            "{SHIPPED_UNMATCHED_RESPONSE_BUDGET} response id(s) no request is awaiting"
+        )),
+        "call one must fail at the COUNT bound, naming {SHIPPED_UNMATCHED_RESPONSE_BUDGET}. A \
+         failure naming a different number means the restated \
+         SHIPPED_UNMATCHED_RESPONSE_BUDGET has drifted from `MAX_UNMATCHED_RESPONSES` in \
+         src/client/mod.rs; a failure naming none means it died of something other than the \
+         budget and this fence is no longer measuring the chain. Observed error: {died}"
+    );
+
+    let second = second.unwrap_or_else(|error| {
+        panic!(
+            "call two must be ANSWERED. It was sprayed {} frames — one UNDER the bound — so the \
+             only way it can reach {SHIPPED_UNMATCHED_RESPONSE_BUDGET} is by also being charged \
+             for call one's leftover answer, which is our OWN debris and belongs to nobody's \
+             budget. That is CR-02's surviving half: one stray frame plus a peer this client \
+             already stopped waiting for fails every LATER call on the same client. Observed \
+             error: {error}",
+            SHIPPED_UNMATCHED_RESPONSE_BUDGET - 1,
+        )
+    });
+    let third = third.expect(
+        "call three was sprayed NOTHING and must simply be answered. A failure here means the \
+         charge did not stop at call two — the budget damage is chaining forward, which is the \
+         permanence half of the defect",
+    );
+
+    let second = text_of(&second).expect("call two's result must carry its marker");
+    let third = text_of(&third).expect("call three's result must carry its marker");
+    assert_ne!(
+        second, third,
+        "each surviving call must receive its OWN answer; identical markers mean one answer was \
+         delivered twice"
+    );
+    assert_eq!(
+        (second.as_str(), third.as_str()),
+        (call_marker(2).as_str(), call_marker(3).as_str()),
+        "the three calls are SEQUENTIAL, so the harness answers them 1, 2, 3. Call two must hold \
+         answer 2 and call three answer 3. Either holding {} would mean the dead call's debris \
+         was DELIVERED to a live caller rather than absorbed, which is a routing defect and not \
+         a budget one",
+        call_marker(1),
+    );
+
+    server.shutdown().await;
 }
