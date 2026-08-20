@@ -182,7 +182,7 @@ pub use reconnect::{ReconnectConfig, ReconnectGuard, ReconnectManager};
 pub use session::{Session, SessionConfig, SessionManager};
 #[cfg(not(target_arch = "wasm32"))]
 pub use stdio::StdioTransport;
-pub use transport::{Transport, TransportMessage};
+pub use transport::{SharedSender, Transport, TransportMessage};
 pub use uri_template::UriTemplate;
 
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]

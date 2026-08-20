@@ -185,7 +185,8 @@ pub use server::tower_layers::{AllowedOrigins, DnsRebindingLayer, SecurityHeader
 pub use shared::{
     batch::{BatchRequest, BatchResponse},
     uri_template::UriTemplate,
-    AuthMiddleware, LoggingMiddleware, Middleware, MiddlewareChain, RetryMiddleware, Transport,
+    AuthMiddleware, LoggingMiddleware, Middleware, MiddlewareChain, RetryMiddleware, SharedSender,
+    Transport,
 };
 
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]

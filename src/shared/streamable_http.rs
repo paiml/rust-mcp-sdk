@@ -12,7 +12,7 @@ use crate::shared::http_constants::{
 #[cfg_attr(docsrs, doc(cfg(feature = "v1-compat")))]
 use crate::shared::http_constants::LAST_EVENT_ID;
 use crate::shared::sse_parser::SseParser;
-use crate::shared::{Transport, TransportMessage};
+use crate::shared::{SharedSender, Transport, TransportMessage};
 use crate::types::mrtr::encode_header_value;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -2515,8 +2515,27 @@ impl StreamableHttpTransport {
     }
 
     /// Send a message with options (hyper-based with middleware)
+    ///
+    /// A thin `&mut self` wrapper over [`Self::send_with_options_shared`], kept
+    /// at its original signature so no existing caller changes. The `&mut` was
+    /// always gratuitous — the body only ever needed `&self` — and separating
+    /// the two is what lets [`SharedSender`] reach the SAME send core rather
+    /// than a second, hand-rolled one (Phase 118.2, plan 23).
     pub async fn send_with_options(
         &mut self,
+        message: TransportMessage,
+        options: SendOptions,
+    ) -> Result<()> {
+        self.send_with_options_shared(message, options).await
+    }
+
+    /// The ONE send core, on `&self`.
+    ///
+    /// Byte-for-byte what [`Self::send_with_options`] did before the split:
+    /// same resumption branch, same outbound classification, same
+    /// serialization, same [`Self::post_body`].
+    async fn send_with_options_shared(
+        &self,
         message: TransportMessage,
         options: SendOptions,
     ) -> Result<()> {
@@ -3026,11 +3045,79 @@ impl StreamableHttpTransport {
     }
 }
 
+/// This transport's [`SharedSender`]: the SAME send core, reachable on `&self`
+/// (Phase 118.2, plan 23).
+///
+/// Both operations delegate to the very functions [`Transport::send`] and
+/// [`Transport::send_raw`] delegate to, so a frame sent through a handle reaches
+/// the wire with identical headers, identical 401 recovery, identical 202
+/// handling and identical non-2xx / structured-error handling. There is
+/// deliberately no second POST path.
+///
+/// # Concurrency: what is now reachable in parallel, and what makes each safe
+///
+/// With the consumer's guard released, two POSTs can be in flight on one
+/// transport at once. Three things a POST touches beyond its own call, each
+/// named rather than covered by a blanket claim:
+///
+/// 1. **The per-caller POST-reader accounting** — an atomic, which is exactly
+///    what it exists for.
+/// 2. **The transport-wide [`AuthProvider`](crate::shared::auth::AuthProvider)**
+///    — its 401 recovery is single-flighted by [`Self::refresh_lock`] from the
+///    purge THROUGH the retry request's `get_access_token`, i.e. through the
+///    VEND. Through the vend and not merely the purge, because
+///    `on_unauthorized` only EVICTS: without that span two concurrent 401s would
+///    each present a rotating refresh token to the identity provider, and the
+///    rejected one destroys the token the winner just cached. That guarantee is
+///    preconditioned on the provider caching what it vends — see
+///    [`Self::refresh_lock`].
+/// 3. **[`Self::start_sse`]**, reached from [`Self::post_body`]'s 202 branch,
+///    which mutates transport-wide state non-atomically across an await and is
+///    made indivisible by [`Self::restart_lock`]. Without it two overlapping
+///    restarts can each abort the other's predecessor and strand a reader
+///    [`Transport::close`] can never reach, since close aborts exactly ONE
+///    `JoinHandle`.
+///
+/// Nothing beyond those three is asserted here.
+///
+/// # Ordering
+///
+/// A consumer that sends through handles no longer imposes a total order on its
+/// outbound frames for this transport. HTTP never guaranteed one across separate
+/// POSTs in any case, and transports that answer `None` from
+/// [`Transport::shared_sender`] keep the exclusive, totally-ordered path.
+#[async_trait]
+impl SharedSender for StreamableHttpTransport {
+    async fn send_shared(&self, message: TransportMessage) -> Result<()> {
+        self.send_with_options_shared(message, SendOptions::default())
+            .await
+    }
+
+    async fn send_raw_shared(&self, body: Vec<u8>) -> Result<()> {
+        // The SAME classification `Transport::send_raw` uses: the v2 raw path
+        // never carries `notifications/initialized`, so its 202s never open a
+        // session stream.
+        self.post_body(body, OutboundFrame::Other).await
+    }
+}
+
 #[async_trait]
 impl Transport for StreamableHttpTransport {
     async fn send(&mut self, message: TransportMessage) -> Result<()> {
         self.send_with_options(message, SendOptions::default())
             .await
+    }
+
+    /// Hand back a clone of this transport as a [`SharedSender`].
+    ///
+    /// The clone is cheap BY CONSTRUCTION — every field of this
+    /// `#[derive(Clone)]` struct is an `Arc`, a `watch` sender, an atomic or a
+    /// cheap handle, and the type is designed to be cloned (the client's own
+    /// fences hold an observer clone). That is what makes removing the
+    /// consumer's guard from the round trip an OWNERSHIP change rather than a
+    /// lifetime change: no borrow escapes, so nothing has to outlive anything.
+    fn shared_sender(&self) -> Option<Arc<dyn SharedSender>> {
+        Some(Arc::new(self.clone()))
     }
 
     /// Take the next server-to-client message, or the reason the stream ended.
@@ -6673,6 +6760,124 @@ mod tests {
             }
         });
         Url::parse(&format!("http://127.0.0.1:{}", addr.port())).unwrap()
+    }
+
+    /// What one recorded request looks like: method, path, sorted headers, body.
+    type RecordedRequest = (String, String, Vec<(String, String)>, Vec<u8>);
+
+    /// A listener that RECORDS every request it is given and answers each with
+    /// the same JSON-RPC success (plan 23).
+    ///
+    /// Records the whole header block deliberately: the hazard the
+    /// [`SharedSender`] impl has to rule out is a SECOND, hand-rolled wire path
+    /// — different headers, a different auth branch — so a comparison that
+    /// looked only at the body would pass against exactly the tree it exists to
+    /// catch.
+    async fn spawn_recording_listener(seen: Arc<StdMutex<Vec<RecordedRequest>>>) -> Url {
+        use hyper::service::service_fn;
+        use hyper_util::server::conn::auto::Builder as ServerBuilder;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let io = hyper_util::rt::TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let _ = ServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(
+                            io,
+                            service_fn(move |req: Request<hyper::body::Incoming>| {
+                                let seen = Arc::clone(&seen);
+                                async move {
+                                    let method = req.method().to_string();
+                                    let path = req.uri().path().to_string();
+                                    let mut headers: Vec<(String, String)> = req
+                                        .headers()
+                                        .iter()
+                                        .map(|(name, value)| {
+                                            (
+                                                name.as_str().to_string(),
+                                                value.to_str().unwrap_or("<binary>").to_string(),
+                                            )
+                                        })
+                                        .collect();
+                                    headers.sort();
+                                    let body = req.collect().await.unwrap().to_bytes().to_vec();
+                                    seen.lock().unwrap().push((method, path, headers, body));
+                                    Ok::<_, hyper::Error>(
+                                        HyperResponse::builder()
+                                            .status(200u16)
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(
+                                                r#"{"jsonrpc":"2.0","id":42,"result":{}}"#,
+                                            )))
+                                            .unwrap(),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        Url::parse(&format!("http://127.0.0.1:{}", addr.port())).unwrap()
+    }
+
+    // Plan 23 fence: the SHARED handle and the exclusive `&mut` path put the
+    // SAME request on the wire. A handle with its own POST path would be a
+    // second emission surface — the hazard `post_once`'s own rustdoc names —
+    // and this is what rules it out.
+    #[tokio::test]
+    async fn the_shared_handle_writes_the_same_request_as_the_exclusive_path() {
+        let seen: Arc<StdMutex<Vec<RecordedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let url = spawn_recording_listener(Arc::clone(&seen)).await;
+        let mut transport = make_transport(url, None);
+
+        // The exclusive path, exactly as every caller reaches it today.
+        transport
+            .send(list_tools_message())
+            .await
+            .expect("the exclusive path reaches the listener");
+
+        // The shared path: the SAME frame, through the handle the accessor hands
+        // back, with no `&mut` borrow anywhere.
+        let handle = transport
+            .shared_sender()
+            .expect("this transport offers a shared-send path");
+        handle
+            .send_shared(list_tools_message())
+            .await
+            .expect("the shared path reaches the listener");
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "both sends must have reached the wire, or this fence compares nothing"
+        );
+        assert_eq!(
+            recorded[0], recorded[1],
+            "a frame sent through the shared handle must produce a BYTE-IDENTICAL request to one \
+             sent through the exclusive `&mut` path — same method, same path, same header block, \
+             same body. A difference here means the handle is a second, hand-rolled POST path \
+             rather than the same core reached differently (T-118.2-23-03)"
+        );
+    }
+
+    // Plan 23 fence: a transport with no shared-send path answers `None`, and
+    // the client therefore keeps using the exclusive path for it. Asserted on a
+    // SHIPPED transport rather than on a double, because the claim being made is
+    // about shipped transports.
+    #[test]
+    fn stdio_offers_no_shared_send_path() {
+        let transport = crate::shared::StdioTransport::new();
+        assert!(
+            transport.shared_sender().is_none(),
+            "StdioTransport owns its own I/O and must keep the default `None`, so a client over \
+             it sends through the exclusive `&mut` path byte-for-byte as it does today"
+        );
     }
 
     // Plan 25 fence A: a SOLO caller behaves exactly as it always did, and the
