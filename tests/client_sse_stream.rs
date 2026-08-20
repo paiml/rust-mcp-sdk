@@ -3253,6 +3253,15 @@ const CONCURRENT_CALLS_BOUND: Duration = Duration::from_secs(15);
 /// caller got which. Answer numbering follows arrival order at the server, which
 /// is not the property under test; "two distinct real answers, one per caller"
 /// is.
+///
+/// # It covers ONE half of CR-02
+///
+/// This fence covers the CONCURRENT half: two callers alive at once, and neither
+/// answer destroyed. The SEQUENTIAL half — a caller that already DIED, whose own
+/// answer then arrives with no owner and is charged to the next call's unmatched
+/// budget — is [`debris_from_a_dead_call_does_not_charge_the_next_calls_budget`].
+/// Neither implies the other, and concurrency coverage alone does not close the
+/// chain: nothing here has a dead call in it.
 #[tokio::test]
 async fn two_concurrent_calls_each_receive_their_own_answer() {
     let server = RecordingServer::start().await;
@@ -3394,7 +3403,7 @@ const SHIPPED_UNMATCHED_RESPONSE_BUDGET: usize = 32;
 /// is to keep a regression from hanging CI, which is why the panic text says a
 /// timeout here means a call never returned at all rather than that a budget
 /// fired.
-const DEBRIS_CHAIN_BOUND: Duration = Duration::from_secs(60);
+const DEBRIS_CHAIN_BOUND: Duration = Duration::from_secs(45);
 
 /// Fence 27 (plan 22, CR-02 surviving half): the answer to a call that already
 /// stopped waiting must not spend the NEXT call's unmatched budget.

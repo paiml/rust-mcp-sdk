@@ -241,12 +241,23 @@ const PUMP_RECEIVE_SLICE: std::time::Duration = std::time::Duration::from_millis
 /// indistinguishable from a slow tool call, and it holds an `active_requests`
 /// entry and a caller task for the life of the process.
 ///
-/// Phase 118.2 shipped exactly this ceiling, the per-id router replaced the
-/// discard loop it was written for, and the follow-up commit deleted it — but
-/// the router only removed the discarding of frames that DO match an id.
-/// A frame matching NO id is still dropped, so the failure mode came back
-/// wearing the router's clothes, and silently instead of loudly. This restores
-/// the bound at the one site that can still observe the discard.
+/// # What it bounds, and what it deliberately does not
+///
+/// It bounds frames addressed to ids THIS CLIENT NEVER MINTED: the re-typed id,
+/// and the peer that sprays ids nobody here ever asked for. Those are the shapes
+/// that answer nothing, forever, and they are counted by
+/// [`MAX_UNMATCHED_RESPONSES`] as well as timed here — either bound alone is
+/// sufficient.
+///
+/// It does NOT bound a frame that is the LATE ANSWER of a request this client
+/// already stopped waiting for. Such a frame is our own debris rather than the
+/// peer's misbehaviour, and charging it to whichever unrelated call happens to
+/// be pumping was self-sustaining: one abandoned call plus a slow peer failed
+/// every LATER call on the same `Client`, permanently. [`AbandonedRequestIds`]
+/// separates the two classifications and absorbs the debris ONCE;
+/// `debris_from_a_dead_call_does_not_charge_the_next_calls_budget` in
+/// `tests/client_sse_stream.rs` is the fence that proves the chain is broken at
+/// every link.
 ///
 /// It fires ONLY once a mis-addressed frame has actually been seen. A request
 /// whose peer has simply gone quiet is NOT bounded here, deliberately: that is
@@ -470,7 +481,11 @@ enum PumpStep<T> {
 ///
 /// Registering the answer channel by id moves that demultiplexing to one place.
 /// A frame is delivered to whoever awaits its id; a frame nobody awaits is
-/// dropped, which is harmless precisely because no caller is blocked on it.
+/// dropped. That is harmless in TWO distinct ways, and the split matters: no
+/// caller is blocked on it, AND — since [`AbandonedRequestIds`] — a frame that
+/// is the late answer of a request this client already stopped waiting for is
+/// not CHARGED to one either. Only a frame addressed to an id nobody here ever
+/// minted spends the awaiting call's [`UnmatchedBudget`].
 struct Pending {
     /// Signalled by [`Client::cancel_request`].
     cancel: oneshot::Sender<()>,
@@ -6054,9 +6069,10 @@ mod tests {
     #[test]
     fn the_abandoned_ledger_evicts_the_oldest_at_its_cap() {
         let mut ledger = AbandonedRequestIds::default();
-        let overflow = 16;
-        for id in 0..(MAX_ABANDONED_REQUEST_IDS + overflow) {
-            ledger.record(RequestId::Number(id as i64));
+        let overflow: i64 = 16;
+        let cap = i64::try_from(MAX_ABANDONED_REQUEST_IDS).expect("the cap fits in an i64");
+        for id in 0..(cap + overflow) {
+            ledger.record(RequestId::Number(id));
         }
         assert_eq!(
             ledger.ids.len(),
@@ -6068,9 +6084,7 @@ mod tests {
             "the OLDEST entries are the ones evicted — id 0 was recorded first and is gone"
         );
         assert!(
-            ledger.take(&RequestId::Number(
-                (MAX_ABANDONED_REQUEST_IDS + overflow - 1) as i64
-            )),
+            ledger.take(&RequestId::Number(cap + overflow - 1)),
             "and the newest is retained, which is the entry a live abandonment actually needs"
         );
     }
