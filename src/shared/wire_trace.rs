@@ -11,7 +11,7 @@
 //!
 //! # It is `tracing`, not a bespoke logger
 //!
-//! Everything here emits on the [`WIRE_TARGET`] tracing target, so it composes
+//! Everything here emits on the [`WIRE_TARGET`](crate::shared::wire_trace::WIRE_TARGET) tracing target, so it composes
 //! with the ecosystem instead of competing with it:
 //!
 //! - **debugging**: `RUST_LOG=pmcp::wire=debug cargo run --example …`
@@ -22,7 +22,7 @@
 //!
 //! # Zero cost when it is off
 //!
-//! Every entry point is guarded by [`enabled`] before it builds a single
+//! Every entry point is guarded by [`enabled`](crate::shared::wire_trace::enabled) before it builds a single
 //! `String`. Redaction, header formatting and body previewing are all
 //! allocation-heavy relative to sending a request, so doing them unconditionally
 //! and letting the subscriber discard the event would tax every production
@@ -31,7 +31,7 @@
 //!
 //! # Secrets are redacted BY DEFAULT
 //!
-//! [`REDACTED_HEADERS`] is deny-by-default for the headers that carry
+//! [`REDACTED_HEADERS`](crate::shared::wire_trace::REDACTED_HEADERS) is deny-by-default for the headers that carry
 //! credentials or session identity. A wire dump is exactly the artifact someone
 //! pastes into a bug report, so the safe default is the only responsible one —
 //! and an opt-out is deliberately NOT offered here: a caller that truly needs a

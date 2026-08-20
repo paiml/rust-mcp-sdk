@@ -886,6 +886,11 @@ quality-gate:
 	@$(MAKE) lint-plans
 	@$(MAKE) fmt-check
 	@$(MAKE) lint
+	# doc-check runs HERE because CI runs it and this gate did not: a branch
+	# carrying 24 rustdoc errors passed `make quality-gate` green and then failed
+	# CI at `Documenting pmcp`. Same shape as the test-cargo-pmcp leg -- the gate
+	# is green on what it reaches, and the failures live in what it does not.
+	@$(MAKE) doc-check
 	@$(MAKE) build
 	@$(MAKE) test-all
 	@$(MAKE) pmcp-package-gate

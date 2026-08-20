@@ -1,3 +1,20 @@
+// Why `rustdoc::private_intra_doc_links` is allowed for THIS module only:
+//
+// The concurrency documentation on `StreamableHttpTransport` and its methods
+// explains mechanism by NAMING the private machinery that implements it —
+// `refresh_lock`, `restart_lock`, `cold_vend_gate`, `open_post_readers`,
+// `PostReaderGuard`, `StreamKind`, `drain_or_latch` and friends. That is
+// deliberate: a reader of `send`, `receive` or `close` cannot reason about what
+// is serialised against what without those names, and 18 such links exist across
+// the work of plans 118.2-01, -04, -19, -23 and -25.
+//
+// Those links resolve for anyone reading the source or running
+// `cargo doc --document-private-items`, and render as plain code spans in the
+// published docs. Scoped to this module rather than set crate-wide so that
+// `rustdoc::broken_intra_doc_links` — links that resolve to NOTHING, a real
+// defect — stays enforced everywhere including here.
+#![allow(rustdoc::private_intra_doc_links)]
+
 use crate::error::{Error, Result, TransportError};
 use crate::shared::http_constants::{
     ACCEPT, ACCEPT_STREAMABLE, APPLICATION_JSON, CONTENT_TYPE, MCP_METHOD, MCP_NAME,

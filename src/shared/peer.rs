@@ -16,7 +16,7 @@
 //! peer handles) bound to its own transport. Cross-session confusion requires
 //! cross-process access, which is out of threat model.
 //!
-//! The claim covers EVERY method on the trait, [`PeerHandle::elicit`] included,
+//! The claim covers EVERY method on the trait, [`PeerHandle::elicit`](crate::shared::peer::PeerHandle::elicit) included,
 //! and for the same reason: one transport, one dispatcher, one correlation
 //! authority.
 //!
@@ -39,8 +39,8 @@
 //! authz runs BEFORE the dispatch site wires `peer` — an unauthorized caller
 //! never reaches the handler body and therefore never sees `extra.peer()`. That
 //! ordering is a property of the DISPATCH SITE rather than of any individual
-//! method, so it covers [`PeerHandle::elicit`] exactly as it covers
-//! [`PeerHandle::sample`]: a refused caller never reaches a handler body and so
+//! method, so it covers [`PeerHandle::elicit`](crate::shared::peer::PeerHandle::elicit) exactly as it covers
+//! [`PeerHandle::sample`](crate::shared::peer::PeerHandle::sample): a refused caller never reaches a handler body and so
 //! never obtains a handle to elicit with.
 
 #![cfg(not(target_arch = "wasm32"))]
@@ -85,10 +85,10 @@ pub trait PeerHandle: Send + Sync {
     ///
     /// Returns a [`CreateMessageResultWithTools`], whose `content` is an array
     /// that can carry `tool_use` / `tool_result` blocks — unlike the
-    /// single-`Content` [`CreateMessageResult`] from [`PeerHandle::sample`].
+    /// single-`Content` [`CreateMessageResult`] from [`PeerHandle::sample`](crate::shared::peer::PeerHandle::sample).
     ///
     /// This is an ADDITIVE trait method with a default body that delegates to
-    /// [`PeerHandle::sample`] and lifts the single result into the `WithTools`
+    /// [`PeerHandle::sample`](crate::shared::peer::PeerHandle::sample) and lifts the single result into the `WithTools`
     /// shape (via [`CreateMessageResultWithTools::from_single`]). Existing
     /// `PeerHandle` implementors therefore keep compiling unchanged; the
     /// dispatch-backed [`crate::server::peer_impl::DispatchPeerHandle`] overrides
