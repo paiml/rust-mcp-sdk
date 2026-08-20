@@ -1392,13 +1392,21 @@ pub struct StreamableHttpTransport {
     /// The vintage of the access token a request presented, bumped once per
     /// completed `401` refresh (Phase 118.2, plan 25).
     ///
-    /// Read immediately BEFORE a request is built — the build is where
-    /// `get_access_token` runs, so that is the moment the token's vintage is
-    /// fixed — and compared again inside [`Self::refresh_lock`]. A caller whose
-    /// captured vintage is still CURRENT received a genuinely new `401` and must
-    /// refresh. A caller whose vintage has already been superseded lost the race
-    /// to a refresh that happened while its request was in flight, so it skips
-    /// the purge and takes its retry token from the cache the winner warmed.
+    /// Read immediately AFTER a request is built — the build is where
+    /// `get_access_token` runs, so the vintage is only settled once it has
+    /// returned — and compared again inside [`Self::refresh_lock`]. A caller
+    /// whose captured vintage is still CURRENT received a genuinely new `401`
+    /// and must refresh. A caller whose vintage has already been superseded lost
+    /// the race to a refresh that happened while its request was in flight, so
+    /// it skips the purge and takes its retry token from the cache the winner
+    /// warmed.
+    ///
+    /// AFTER and not before, because the build is an `await`: a reading taken
+    /// before it can be superseded while this task is suspended INSIDE it, and
+    /// such a caller then reads its own fresh-but-rejected token as somebody
+    /// else's refresh and skips the one it needs. The residual of reading after
+    /// (a refresh landing between `get_access_token` and the load) costs one
+    /// redundant refresh, which is the harmless direction.
     ///
     /// Getting that comparison backwards would skip a refresh a caller genuinely
     /// needed and turn a token-rotation fix into a permanent auth failure, which
@@ -2656,15 +2664,25 @@ impl StreamableHttpTransport {
 
         let url = self.config.read().url.clone();
 
-        // The vintage of the token THIS attempt is about to present, captured
-        // immediately before the build because the build is where
-        // `get_access_token` runs. See `Self::token_generation`.
-        let presented_generation = self.token_generation.load(Ordering::SeqCst);
-
         // Build POST request with middleware integration
         let mut request = self
             .build_request_with_middleware(Method::POST, url.as_str(), body_bytes)
             .await?;
+
+        // The vintage of the token this attempt IS presenting, captured
+        // immediately AFTER the build rather than before it. The build is where
+        // `get_access_token` runs, and it is an `await`: a refresh that
+        // completed while this task was suspended inside the build would leave a
+        // pre-build reading STALE, and a stale reading is read as "somebody else
+        // already refreshed for me" — so a caller holding a freshly-vended token
+        // that is genuinely rejected would SKIP the refresh it needs and retry
+        // with the token that just failed. Reading after the build cannot make
+        // that mistake; its own residual window (a refresh landing between
+        // `get_access_token` and this load) errs the other way, costing one
+        // redundant refresh instead of a failed call. See
+        // `Self::token_generation`.
+        let presented_generation = self.token_generation.load(Ordering::SeqCst);
+
         Self::apply_post_headers(&mut request)?;
 
         // Send first attempt.
@@ -3062,7 +3080,7 @@ impl StreamableHttpTransport {
 ///
 /// 1. **The per-caller POST-reader accounting** — an atomic, which is exactly
 ///    what it exists for.
-/// 2. **The transport-wide [`AuthProvider`](crate::shared::auth::AuthProvider)**
+/// 2. **The transport-wide [`AuthProvider`]**
 ///    — its 401 recovery is single-flighted by [`Self::refresh_lock`] from the
 ///    purge THROUGH the retry request's `get_access_token`, i.e. through the
 ///    VEND. Through the vend and not merely the purge, because

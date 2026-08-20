@@ -61,7 +61,7 @@ const CHAPTER_REL: &str = "pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md"
 /// The number of `[CONSUMER-OBSERVABLE]` entries the ledger carried when this gate
 /// was written, used as a FLOOR rather than as an expected set.
 ///
-/// `!marked.is_empty()` alone is too weak: four of the five marked entries could
+/// `!marked.is_empty()` alone is too weak: all but one of the marked entries could
 /// lose their sentinel — a `gsd-tools windows` re-record, or a description rewritten
 /// in place, which entries in this ledger explicitly document happening ("SEVERITY
 /// CORRECTED IN PLACE", "RESTATED … rewritten in place") — and one survivor would

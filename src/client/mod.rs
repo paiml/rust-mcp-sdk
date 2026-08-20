@@ -5151,9 +5151,10 @@ impl<T: Transport> Client<T> {
     /// head, recorded as a KNOWN RESIDUAL at that call site. Stating this
     /// invariant unqualified would tell the next reader of `send_frame` that
     /// the whole file is covered, which it is not.) The guard is taken for
-    /// exactly as long as it takes to ASK the transport for
-    /// a [`SharedSender`], dropped explicitly, and only then is the send
-    /// awaited. Without that, a peer that accepts a POST and never writes its
+    /// exactly as long as it takes to ASK the transport for a
+    /// [`SharedSender`](crate::shared::SharedSender), dropped explicitly, and
+    /// only then is the send awaited. Without that, a peer that accepts a POST
+    /// and never writes its
     /// response HEAD holds the single transport lock forever and every other
     /// operation on this client — a second call, a notification, a
     /// cancellation, [`Transport::close`] — blocks at acquisition with nothing
@@ -5503,10 +5504,10 @@ impl<T: Transport> ClientBuilder<T> {
     /// constant is unioned in here rather than added to that table.
     fn is_selectable_protocol_version(version: &str) -> bool {
         // ONE membership authority, shared with the server's outbound-header
-        // echo — see `known_protocol_version`. It keeps the `protocol_era`
-        // union this comment used to spell out inline, so a second
-        // v2-generation version still becomes selectable automatically instead
-        // of silently failing opt-in.
+        // echo — see `known_protocol_version`. It reads the same two version
+        // tables `protocol_era` classifies against, so a second v2-generation
+        // version added to `V2_PROTOCOL_VERSIONS` becomes selectable
+        // automatically instead of silently failing opt-in.
         crate::types::protocol::known_protocol_version(version).is_some()
     }
 

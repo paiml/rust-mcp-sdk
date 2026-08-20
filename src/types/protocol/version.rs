@@ -32,6 +32,24 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 /// clients to v2 semantics.
 pub const PROTOCOL_VERSION_2026_07_28: &str = "2026-07-28";
 
+/// Every v2-generation protocol version this SDK knows, in the SDK's own
+/// spelling.
+///
+/// THE authority for v2 membership. [`protocol_era`] classifies against this
+/// table and [`known_protocol_version`] echoes the entry it matched, so the
+/// classifier and the header echo cannot disagree and a matched version is
+/// always echoed as ITSELF rather than as whichever constant happened to be
+/// hardcoded. Adding a second v2-generation version is therefore ONE edit here:
+/// it becomes era-`V2`, client-selectable and server-echoable in the same
+/// breath. A constant added WITHOUT being listed here reaches none of the
+/// three — the fail-closed direction — rather than being silently echoed under
+/// another version's spelling.
+///
+/// Deliberately NOT merged into [`SUPPORTED_PROTOCOL_VERSIONS`]: that table is
+/// what [`negotiate_protocol_version`] falls back through, and v2 is reachable
+/// only by explicit opt-in.
+pub(crate) const V2_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION_2026_07_28];
+
 /// Protocol era: the coarse behavioral generation a negotiated version belongs to.
 ///
 /// The whole v2.5 milestone era-gates off this classifier. `V1` covers every
@@ -74,7 +92,10 @@ pub enum Era {
 /// assert_eq!(protocol_era("who-knows"), Era::V1);
 /// ```
 pub fn protocol_era(version: &str) -> Era {
-    if version == PROTOCOL_VERSION_2026_07_28 {
+    // Against the TABLE, not against one constant: the table is what
+    // `known_protocol_version` echoes from, so classifying off anything else
+    // would let the two disagree by construction.
+    if V2_PROTOCOL_VERSIONS.contains(&version) {
         Era::V2
     } else {
         Era::V1
@@ -94,29 +115,29 @@ pub fn protocol_era(version: &str) -> Era {
 /// header: it can carry nothing attacker-chosen and cannot fail the
 /// `HeaderValue` parse that every emission site unwraps.
 ///
-/// The v2 arm goes through [`protocol_era`] — the classifier this crate treats
-/// as the single source of truth for era membership — rather than a second
-/// equality check against the constant, so this cannot drift from the
-/// classifier the rest of the transport gates on. `SUPPORTED_PROTOCOL_VERSIONS`
-/// deliberately excludes `2026-07-28` (v2 is reachable only by explicit opt-in,
-/// never by the v1 negotiation fallback), which is why the two arms are
-/// separate rather than one table lookup.
+/// Searches BOTH tables and returns the entry it matched, so the answer is
+/// always the queried version's own spelling. [`SUPPORTED_PROTOCOL_VERSIONS`]
+/// deliberately excludes the v2 generation (v2 is reachable only by explicit
+/// opt-in, never by the v1 negotiation fallback), which is why
+/// [`V2_PROTOCOL_VERSIONS`] is a second table rather than more rows in the
+/// first.
 ///
 /// # When a SECOND v2-generation constant is added
 ///
-/// Extend the v2 arm to return the matched constant. Today [`protocol_era`]
-/// classifies exactly one string as [`Era::V2`], so returning
-/// [`PROTOCOL_VERSION_2026_07_28`] is that string; with two, this would echo
-/// the wrong spelling. `known_protocol_version_agrees_with_the_era_classifier`
-/// fails the moment that becomes true.
+/// Add it to [`V2_PROTOCOL_VERSIONS`] and nothing here changes: it becomes
+/// era-`V2` (that table IS what [`protocol_era`] classifies against),
+/// client-selectable, and echoed under its OWN spelling. An earlier shape of
+/// this function returned a hardcoded [`PROTOCOL_VERSION_2026_07_28`] for
+/// anything the classifier called [`Era::V2`], which would have echoed the
+/// wrong spelling for a second version — and no test could have caught it,
+/// because the wrong spelling only appears once the second constant exists.
+/// Matching the table removes the failure mode instead of watching for it.
 pub(crate) fn known_protocol_version(version: &str) -> Option<&'static str> {
-    if let Some(known) = SUPPORTED_PROTOCOL_VERSIONS.iter().find(|k| **k == version) {
-        return Some(known);
-    }
-    if protocol_era(version) == Era::V2 {
-        return Some(PROTOCOL_VERSION_2026_07_28);
-    }
-    None
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .chain(V2_PROTOCOL_VERSIONS)
+        .find(|known| **known == version)
+        .copied()
 }
 
 /// Negotiate the protocol version for an MCP session.
@@ -221,39 +242,62 @@ mod tests {
         assert_eq!(protocol_era("2026-07-29"), Era::V1);
     }
 
-    /// The v2 arm returns the string it MATCHED, not a hardcoded one.
+    /// Membership, the era classifier and the echo all read the same two
+    /// tables — and the echo returns the row it MATCHED.
     ///
-    /// Named by `known_protocol_version`'s own rustdoc as the tripwire for
-    /// adding a second v2-generation constant. Today exactly one string
-    /// classifies as `Era::V2`, so "the matched one" and
-    /// `PROTOCOL_VERSION_2026_07_28` are the same string and this passes. Add a
-    /// second and it fails, which is the point: the echo would otherwise
-    /// advertise the wrong spelling to every client that asserted the new one.
+    /// DERIVED over the tables rather than over a hand-written id list, so a
+    /// version added to either one is in scope here with no edit. That is what
+    /// an earlier shape of this fence could not do: it named
+    /// `PROTOCOL_VERSION_2026_07_28` explicitly and asserted membership only
+    /// for four hardcoded non-versions, so a second v2-generation constant —
+    /// the exact drift `known_protocol_version`'s rustdoc said it guarded — was
+    /// invisible to it. Looping the table closes that, and matching from the
+    /// table (rather than returning a hardcoded constant) removes the failure
+    /// mode the loop would have had to watch for.
     #[test]
     fn known_protocol_version_agrees_with_the_era_classifier() {
-        // Every version this SDK admits must round-trip to ITSELF.
-        for version in SUPPORTED_PROTOCOL_VERSIONS {
+        // Every version either table admits must round-trip to ITSELF. An echo
+        // that answered with another version's spelling would advertise the
+        // wrong protocol to a client that asserted the new one.
+        for version in SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .chain(V2_PROTOCOL_VERSIONS)
+        {
             assert_eq!(
                 known_protocol_version(version),
                 Some(*version),
                 "{version} must map to its own spelling, not another"
             );
         }
-        assert_eq!(
-            known_protocol_version(PROTOCOL_VERSION_2026_07_28),
-            Some(PROTOCOL_VERSION_2026_07_28)
-        );
 
-        // The two predicates must admit exactly the same set: a version the
-        // classifier calls V2 must be known, and a known version must never be
-        // one the classifier has never heard of.
-        for candidate in ["", "2027-01-01", "2026-07-29", "not-a-version"] {
+        // The v1 table and the v2 table must not overlap, and each must land in
+        // the era its table names — `SUPPORTED_PROTOCOL_VERSIONS` is what the v1
+        // negotiation fallback walks, so a v2 entry appearing there would make
+        // v2 reachable without opt-in.
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
             assert_eq!(
-                known_protocol_version(candidate).is_some(),
-                SUPPORTED_PROTOCOL_VERSIONS.contains(&candidate)
-                    || protocol_era(candidate) == Era::V2,
-                "membership disagreed with the classifier for {candidate:?}"
+                protocol_era(version),
+                Era::V1,
+                "{version} is in the v1 negotiation table and must classify as V1"
             );
+        }
+        for version in V2_PROTOCOL_VERSIONS {
+            assert_eq!(
+                protocol_era(version),
+                Era::V2,
+                "{version} is in the v2 table and must classify as V2"
+            );
+            assert!(
+                !SUPPORTED_PROTOCOL_VERSIONS.contains(version),
+                "{version} must not also sit in the v1 negotiation table, or v2 becomes reachable \
+                 through the fallback instead of by explicit opt-in"
+            );
+        }
+
+        // And a version in neither table is known to nobody.
+        for candidate in ["", "2027-01-01", "2026-07-29", "not-a-version"] {
+            assert_eq!(known_protocol_version(candidate), None);
+            assert_eq!(protocol_era(candidate), Era::V1);
         }
     }
 }

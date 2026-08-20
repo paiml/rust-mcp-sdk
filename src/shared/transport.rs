@@ -328,7 +328,6 @@ pub trait SharedSender: Debug {
 ///     }
 /// }
 /// ```
-
 // On native targets, transports must be Send + Sync so they can be used from
 // multi-threaded runtimes. In WASM (single-threaded), we relax this to avoid
 // forcing Send/Sync on Web APIs (e.g., web_sys::WebSocket).

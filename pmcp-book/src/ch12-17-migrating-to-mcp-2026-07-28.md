@@ -477,9 +477,17 @@ tripwire passes.
   other, and the loser's purge destroys the token the winner had just cached, so
   the transport's auth fails permanently until you re-authenticate out of band.
   That sequence is now single-flighted from the purge through the retry's token
-  fetch. Separately, two overlapping session-stream restarts can no longer leave
-  an orphaned reader that `close()` cannot reach. **What you must check on your
-  side:** "exactly one vend" holds only if your `AuthProvider` **caches what
+  fetch. Two limits on that, both real: the single-flight covers the `401`
+  RECOVERY only — the ordinary token fetch that every request build performs is
+  not serialised, so a **cold-start fan-out** (N concurrent first requests
+  against an empty cache) still reaches `get_access_token()` N times — and a
+  second `401` on the retry is returned to you unchanged rather than triggering
+  another refresh. Separately, two overlapping session-stream **restarts** can
+  no longer leave an orphaned reader that `close()` cannot reach; a restart
+  overlapping a concurrent `close()` is a different pairing, and there the
+  reader is stopped by the transport's shutdown signal rather than by `close()`'s
+  abort. **What you must check on your side:** "exactly one vend" holds only if
+  your `AuthProvider` **caches what
   `get_access_token` returns**. The trait does not require that, and pmcp cannot
   enforce it. Against a non-caching provider the two vends are merely serialised
   rather than simultaneous, which a rotating refresh token still rejects — so if
