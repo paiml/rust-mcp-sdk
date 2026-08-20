@@ -81,6 +81,44 @@ pub fn protocol_era(version: &str) -> Era {
     }
 }
 
+/// The SDK's own spelling of a protocol version it knows, or `None`.
+///
+/// THE single membership authority for "is this a version this SDK speaks".
+/// Two copies of that predicate existed before this was extracted — one in the
+/// client's opt-in validation and one in the server's outbound-header echo —
+/// and they were free to disagree by construction, which is precisely the
+/// silent-downgrade class the header echo exists to close.
+///
+/// Returns a `&'static str` from this module's own tables rather than the
+/// caller's bytes. That is what makes the answer safe to write into a RESPONSE
+/// header: it can carry nothing attacker-chosen and cannot fail the
+/// `HeaderValue` parse that every emission site unwraps.
+///
+/// The v2 arm goes through [`protocol_era`] — the classifier this crate treats
+/// as the single source of truth for era membership — rather than a second
+/// equality check against the constant, so this cannot drift from the
+/// classifier the rest of the transport gates on. `SUPPORTED_PROTOCOL_VERSIONS`
+/// deliberately excludes `2026-07-28` (v2 is reachable only by explicit opt-in,
+/// never by the v1 negotiation fallback), which is why the two arms are
+/// separate rather than one table lookup.
+///
+/// # When a SECOND v2-generation constant is added
+///
+/// Extend the v2 arm to return the matched constant. Today [`protocol_era`]
+/// classifies exactly one string as [`Era::V2`], so returning
+/// [`PROTOCOL_VERSION_2026_07_28`] is that string; with two, this would echo
+/// the wrong spelling. `known_protocol_version_agrees_with_the_era_classifier`
+/// fails the moment that becomes true.
+pub(crate) fn known_protocol_version(version: &str) -> Option<&'static str> {
+    if let Some(known) = SUPPORTED_PROTOCOL_VERSIONS.iter().find(|k| **k == version) {
+        return Some(known);
+    }
+    if protocol_era(version) == Era::V2 {
+        return Some(PROTOCOL_VERSION_2026_07_28);
+    }
+    None
+}
+
 /// Negotiate the protocol version for an MCP session.
 ///
 /// If the client's requested version is in [`SUPPORTED_PROTOCOL_VERSIONS`],
@@ -181,5 +219,41 @@ mod tests {
         assert_eq!(protocol_era(""), Era::V1);
         assert_eq!(protocol_era("2027-01-01"), Era::V1);
         assert_eq!(protocol_era("2026-07-29"), Era::V1);
+    }
+
+    /// The v2 arm returns the string it MATCHED, not a hardcoded one.
+    ///
+    /// Named by `known_protocol_version`'s own rustdoc as the tripwire for
+    /// adding a second v2-generation constant. Today exactly one string
+    /// classifies as `Era::V2`, so "the matched one" and
+    /// `PROTOCOL_VERSION_2026_07_28` are the same string and this passes. Add a
+    /// second and it fails, which is the point: the echo would otherwise
+    /// advertise the wrong spelling to every client that asserted the new one.
+    #[test]
+    fn known_protocol_version_agrees_with_the_era_classifier() {
+        // Every version this SDK admits must round-trip to ITSELF.
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            assert_eq!(
+                known_protocol_version(version),
+                Some(*version),
+                "{version} must map to its own spelling, not another"
+            );
+        }
+        assert_eq!(
+            known_protocol_version(PROTOCOL_VERSION_2026_07_28),
+            Some(PROTOCOL_VERSION_2026_07_28)
+        );
+
+        // The two predicates must admit exactly the same set: a version the
+        // classifier calls V2 must be known, and a known version must never be
+        // one the classifier has never heard of.
+        for candidate in ["", "2027-01-01", "2026-07-29", "not-a-version"] {
+            assert_eq!(
+                known_protocol_version(candidate).is_some(),
+                SUPPORTED_PROTOCOL_VERSIONS.contains(&candidate)
+                    || protocol_era(candidate) == Era::V2,
+                "membership disagreed with the classifier for {candidate:?}"
+            );
+        }
     }
 }

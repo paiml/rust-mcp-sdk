@@ -3367,31 +3367,29 @@ fn compute_outbound_protocol_version(
     //
     // The client asserted the version on THIS request, which is the only place
     // a session-less server can still read it.
-    if let Some(known) = asserted_version.and_then(known_protocol_version) {
+    if let Some(known) = asserted_version.and_then(crate::types::protocol::known_protocol_version) {
         return known.to_string();
     }
     crate::DEFAULT_PROTOCOL_VERSION.to_string()
 }
 
-/// The SDK's own spelling of a version a client asserted, or `None` if it named
-/// one this SDK does not know.
+/// [`compute_outbound_protocol_version`] for a request that is NOT `initialize`.
 ///
-/// Returning a `&'static str` from the SDK's table rather than the caller's
-/// bytes is what makes the asserted header safe to echo into a RESPONSE header:
-/// the value can carry nothing attacker-chosen, and it cannot fail the
-/// `HeaderValue` parse that every `MCP_PROTOCOL_VERSION` insertion site
-/// `unwrap()`s. `validate_protocol_version_supported` already refuses an
-/// unknown version at ingress with a `400`, so this is the second of two
-/// gates rather than the only one — deliberately, because the ingress guard is
-/// skipped for an accepted v2 request.
-fn known_protocol_version(asserted: &str) -> Option<&'static str> {
-    crate::SUPPORTED_PROTOCOL_VERSIONS
-        .iter()
-        .chain(std::iter::once(
-            &crate::types::protocol::PROTOCOL_VERSION_2026_07_28,
-        ))
-        .find(|known| **known == asserted)
-        .copied()
+/// Four of the six emission sites pass the same constant pair — `false, None` —
+/// because they answer a method that can never be the handshake. Naming that
+/// pair once removes it from four call sites and, more usefully, means the next
+/// input threaded through this path costs ONE edit rather than four. Threading
+/// `asserted_version` through cost five, which is what prompted this.
+///
+/// The two sites that pass a real runtime `is_init_request`
+/// (`handle_fast_path_request` and `dispatch_message_with_middleware`) keep the
+/// general form.
+fn outbound_protocol_version_after_init(
+    state: &ServerState,
+    response_session_id: Option<&String>,
+    asserted_version: Option<&str>,
+) -> String {
+    compute_outbound_protocol_version(state, response_session_id, false, None, asserted_version)
 }
 
 /// Best-effort error-hook dispatch for the middleware path.
@@ -3799,13 +3797,8 @@ async fn assemble_discover_response_fast(
     v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
 
     // Discover is never an init request → compute the outbound version normally.
-    let version_to_send = compute_outbound_protocol_version(
-        state,
-        response_session_id,
-        false,
-        None,
-        asserted_protocol_version,
-    );
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
     response
         .headers_mut()
         .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
@@ -3921,13 +3914,8 @@ async fn assemble_tasks_update_fast(
 
     // `tasks/update` is never an init request → compute the outbound version
     // normally.
-    let version_to_send = compute_outbound_protocol_version(
-        state,
-        response_session_id,
-        false,
-        None,
-        asserted_protocol_version,
-    );
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
     response
         .headers_mut()
         .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
@@ -3974,13 +3962,8 @@ async fn assemble_tasks_update_with_middleware(
 
     v1::store_response_event(state, era, response_session_id, &response_msg).await;
 
-    let version_to_send = compute_outbound_protocol_version(
-        state,
-        response_session_id,
-        false,
-        None,
-        asserted_protocol_version,
-    );
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
 
     let mut response = build_success_response_with_middleware(
         &response_msg,
@@ -4965,13 +4948,8 @@ async fn assemble_discover_response_with_middleware(
     v1::store_response_event(state, era, response_session_id, &response_msg).await;
 
     // Discover is never an init request → compute the outbound version normally.
-    let version_to_send = compute_outbound_protocol_version(
-        state,
-        response_session_id,
-        false,
-        None,
-        asserted_protocol_version,
-    );
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
 
     let mut response = build_success_response_with_middleware(
         &response_msg,

@@ -433,7 +433,11 @@ impl AbandonedRequestIds {
     /// The caller MUST have obtained `id` from a live `active_requests`
     /// registration — see property 2 on the type.
     fn record(&mut self, id: RequestId) {
-        while self.ids.len() >= MAX_ABANDONED_REQUEST_IDS {
+        // `if`, not `while`: this is the ONLY insertion path and it pushes
+        // exactly one id, so the length can never exceed the cap by more than
+        // one and a second eviction is unreachable. A loop here would suggest
+        // the invariant is weaker than it is.
+        if self.ids.len() >= MAX_ABANDONED_REQUEST_IDS {
             self.ids.pop_front();
         }
         self.ids.push_back(id);
@@ -604,6 +608,21 @@ pub struct Client<T: Transport> {
     /// caller on one clone could abandon an id that a pump on another clone then
     /// booked as the peer's misbehaviour.
     abandoned_requests: Arc<RwLock<AbandonedRequestIds>>,
+    /// The transport's owned send handle, resolved ONCE at construction.
+    ///
+    /// [`Transport::shared_sender`] answers a question that is constant for the
+    /// transport's lifetime — no API swaps a `Client`'s transport — so asking
+    /// it per frame bought nothing and cost real latency. The read guard it
+    /// needed queues behind [`Client::pump_once`]'s writer, which holds the
+    /// transport for up to `PUMP_RECEIVE_SLICE`; whenever any task on a cloned
+    /// client was pumping, a send waited out a slice just to ask. Worse, a
+    /// `None`-answering transport — stdio, WebSocket, every external one — paid
+    /// that twice per send: once to ask, once to send. That was a REGRESSION
+    /// against the pre-plan-23 path for the default transport.
+    ///
+    /// Resolved here, the opt-in path takes NO transport lock and the fallback
+    /// takes exactly one, which is what the code did before plan 23.
+    shared_sender: Option<Arc<dyn crate::shared::SharedSender>>,
     options: ClientOptions,
     /// Registered host handlers answering inbound server -> client requests
     /// (sampling / elicitation / roots). Immutable after construction.
@@ -687,6 +706,7 @@ impl<T: Transport> Client<T> {
     /// ```
     pub fn with_info(transport: T, client_info: Implementation) -> Self {
         Self {
+            shared_sender: transport.shared_sender(),
             transport: Arc::new(RwLock::new(transport)),
             protocol: Arc::new(RwLock::new(Protocol::new(ProtocolOptions::default()))),
             middleware_chain: Arc::new(RwLock::new(EnhancedMiddlewareChain::new())),
@@ -735,6 +755,7 @@ impl<T: Transport> Client<T> {
         options: ProtocolOptions,
     ) -> Self {
         Self {
+            shared_sender: transport.shared_sender(),
             transport: Arc::new(RwLock::new(transport)),
             protocol: Arc::new(RwLock::new(Protocol::new(options))),
             middleware_chain: Arc::new(RwLock::new(EnhancedMiddlewareChain::new())),
@@ -779,6 +800,7 @@ impl<T: Transport> Client<T> {
     /// ```
     pub fn with_client_options(transport: T, options: ClientOptions) -> Self {
         Self {
+            shared_sender: transport.shared_sender(),
             transport: Arc::new(RwLock::new(transport)),
             protocol: Arc::new(RwLock::new(Protocol::new(ProtocolOptions::default()))),
             middleware_chain: Arc::new(RwLock::new(EnhancedMiddlewareChain::new())),
@@ -4302,9 +4324,15 @@ impl<T: Transport> Client<T> {
         if !self.abandoned_requests.write().await.take(id) {
             return false;
         }
-        let echoed = echoed_request_id(id);
+        // Built INSIDE the macro: `echoed_request_id` is a `format!`, and
+        // `tracing` evaluates a field expression only when the callsite is
+        // enabled. Hoisting it into a local would allocate on every absorbed
+        // frame in every shipping configuration, where `debug` is off. The
+        // no-owner branch's `warn!` is deliberately NOT written this way — there
+        // the string is also the `PumpStep::Unmatched` return value, so it is
+        // eager because it is USED, not merely logged.
         tracing::debug!(
-            id = %echoed,
+            id = %echoed_request_id(id),
             "absorbing the late answer to a request this client already stopped waiting for"
         );
         true
@@ -5117,8 +5145,13 @@ impl<T: Transport> Client<T> {
     ///
     /// # The invariant this whole plan rests on
     ///
-    /// No transport guard in this file is held across an HTTP round trip. The
-    /// guard is taken for exactly as long as it takes to ASK the transport for
+    /// No transport guard on the SEND path in this file is held across an HTTP
+    /// round trip. (The qualifier is load-bearing: [`Self::open_event_stream`]
+    /// still holds a READ guard across the `subscriptions/listen` response
+    /// head, recorded as a KNOWN RESIDUAL at that call site. Stating this
+    /// invariant unqualified would tell the next reader of `send_frame` that
+    /// the whole file is covered, which it is not.) The guard is taken for
+    /// exactly as long as it takes to ASK the transport for
     /// a [`SharedSender`], dropped explicitly, and only then is the send
     /// awaited. Without that, a peer that accepts a POST and never writes its
     /// response HEAD holds the single transport lock forever and every other
@@ -5140,15 +5173,10 @@ impl<T: Transport> Client<T> {
     /// including every external one — is sent through the exclusive `&mut`
     /// path exactly as before, byte for byte.
     async fn send_frame(&self, frame: ClientFrame) -> Result<()> {
-        // Scoped so the guard's drop point is VISIBLE rather than inferred from
-        // where the temporary happens to end. `shared_sender` is not async and
-        // performs no I/O, so nothing is awaited while it is held.
-        let handle = {
-            let transport = self.transport.read().await;
-            transport.shared_sender()
-        };
-
-        if let Some(handle) = handle {
+        // Resolved at construction, so the opt-in path takes NO transport lock
+        // here at all — see the field's docs for why asking per frame was both
+        // pointless and a regression for `None`-answering transports.
+        if let Some(handle) = self.shared_sender.as_ref() {
             return match frame {
                 ClientFrame::Typed(message) => handle.send_shared(message).await,
                 ClientFrame::Raw(body) => handle.send_raw_shared(body).await,
@@ -5474,11 +5502,12 @@ impl<T: Transport> ClientBuilder<T> {
     /// never be picked by the v1 negotiation fallback), which is why the v2
     /// constant is unioned in here rather than added to that table.
     fn is_selectable_protocol_version(version: &str) -> bool {
-        // Union via the `protocol_era` classifier rather than an equality check
-        // against the v2 constant, so a second v2-generation version becomes
-        // selectable automatically instead of silently failing opt-in.
-        crate::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
-            || crate::types::protocol::protocol_era(version) == crate::types::protocol::Era::V2
+        // ONE membership authority, shared with the server's outbound-header
+        // echo — see `known_protocol_version`. It keeps the `protocol_era`
+        // union this comment used to spell out inline, so a second
+        // v2-generation version still becomes selectable automatically instead
+        // of silently failing opt-in.
+        crate::types::protocol::known_protocol_version(version).is_some()
     }
 
     /// Bound the MRTR gather→resend loop (Phase 113, CLNT-02 / D-09).
@@ -5846,6 +5875,7 @@ impl<T: Transport> Clone for Client<T> {
     fn clone(&self) -> Self {
         Self {
             transport: self.transport.clone(),
+            shared_sender: self.shared_sender.clone(),
             protocol: self.protocol.clone(),
             middleware_chain: self.middleware_chain.clone(),
             capabilities: self.capabilities.clone(),

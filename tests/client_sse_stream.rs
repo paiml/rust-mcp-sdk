@@ -1137,13 +1137,14 @@ async fn await_get_head_rendezvous(shared: &Shared) {
     let Some(grace) = *shared.get_head_rendezvous.lock() else {
         return;
     };
-    let deadline = tokio::time::Instant::now() + grace;
-    while shared.get_instants.lock().len() < GET_RENDEZVOUS_PARTY {
-        if tokio::time::Instant::now() >= deadline {
-            return;
-        }
-        tokio::time::sleep(POLL).await;
-    }
+    // `wait_for_within` IS this loop, and it already backs fence 28's
+    // identically OR-shaped wait. Hand-rolling it here re-implemented the
+    // deadline arithmetic on `tokio::time::Instant`, putting a second timing
+    // primitive in a file whose fences are sensitive to exactly that.
+    let _ = wait_for_within(grace, || {
+        shared.get_instants.lock().len() >= GET_RENDEZVOUS_PARTY
+    })
+    .await;
 }
 
 /// The `capabilities` member of this harness's `initialize` result.
