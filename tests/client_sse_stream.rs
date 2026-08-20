@@ -478,6 +478,43 @@ struct Shared {
     /// `None` by default, so every existing GET fence sees the listener it
     /// always did.
     get_head_rendezvous: Mutex<Option<Duration>>,
+    /// When set, the NEXT answerable JSON POST parks BEFORE its response HEAD is
+    /// written, instead of answering at once (plan 23).
+    ///
+    /// # Before the head, not after it — and that is the whole distinction
+    ///
+    /// Parking AFTER the head is what
+    /// [`stagger_answers`](Shared::stagger_answers) already does, and
+    /// [`serve_post_sse_answer`]'s own comment states what that shape measures:
+    /// holding the FRAME lets `send()` RETURN and the answer arrive
+    /// asynchronously, which exercises the RECEIVE path. The same comment names
+    /// the shape this flag produces — "holding a JSON-answered POST blocks the
+    /// client INSIDE `send()`, still holding the transport lock and never
+    /// reaching the receive path at all". That is the SEND-path wedge, and this
+    /// is the only gate that reaches it.
+    ///
+    /// CONSUMED on use — see [`await_stalled_post_head`] — so exactly one POST
+    /// is stalled and every later POST, the probe's included, is served the way
+    /// it always was. Default OFF, so every existing fence observes
+    /// byte-identical bytes, the same rule
+    /// [`answer_calls_with_sse`](Shared::answer_calls_with_sse) states.
+    stall_next_answerable_post: AtomicBool,
+    /// How many POSTs have ENTERED that park, counted at the gate.
+    ///
+    /// The observable a send-path fence has to wait on before it probes: "the
+    /// stalled POST has arrived and is being held" is what makes the transport
+    /// guard genuinely contended, and a probe that ran before it would measure
+    /// an uncontended lock and pass vacuously — the failure mode fence 26
+    /// guards against by name.
+    stalled_post_arrivals: AtomicUsize,
+    /// Bumped to release a parked POST early.
+    ///
+    /// A `watch` rather than a `Notify` for exactly the reason
+    /// [`close_live`](Shared::close_live) records: `notify_waiters` wakes only
+    /// the tasks ALREADY parked, so a release raised between the arming and the
+    /// park would be lost and the fence would hang on the park bound instead of
+    /// finishing cleanly.
+    release_stalled_post: watch::Sender<u64>,
 }
 
 /// A recording HTTP/1.1 listener on an ephemeral port.
@@ -505,6 +542,7 @@ impl RecordingServer {
         let (frames, frames_rx) = mpsc::channel::<String>(1);
         let (post_frames, post_frames_rx) = mpsc::channel::<String>(1);
         let (close_live, _) = watch::channel(0u64);
+        let (release_stalled_post, _) = watch::channel(0u64);
         let shared = Arc::new(Shared {
             request_lines: Mutex::new(Vec::new()),
             post_bodies: Mutex::new(Vec::new()),
@@ -532,6 +570,9 @@ impl RecordingServer {
             unauthorized_posts_remaining: AtomicUsize::new(0),
             unauthorized_answers: AtomicUsize::new(0),
             get_head_rendezvous: Mutex::new(None),
+            stall_next_answerable_post: AtomicBool::new(false),
+            stalled_post_arrivals: AtomicUsize::new(0),
+            release_stalled_post,
         });
 
         let accept = tokio::spawn({
@@ -728,6 +769,36 @@ impl RecordingServer {
     /// part of the construction and not a settle time.
     fn hold_each_get_head_until_two_arrive(&self, grace: Duration) {
         *self.shared.get_head_rendezvous.lock() = Some(grace);
+    }
+
+    /// Park the NEXT answerable JSON POST BEFORE its response head is written
+    /// (plan 23).
+    ///
+    /// Call together with
+    /// [`answer_calls_with_an_echoing_result`](RecordingServer::answer_calls_with_an_echoing_result)
+    /// — this decides WHEN an answer's head is written, not whether there is
+    /// one. Consumed by the first POST that reaches the gate, so exactly one is
+    /// stalled; release it with
+    /// [`release_the_stalled_post`](RecordingServer::release_the_stalled_post).
+    /// See [`Shared::stall_next_answerable_post`] for why parking before the
+    /// head is the only shape that reaches the SEND path.
+    fn stall_the_next_answerable_post_before_its_head(&self) {
+        self.shared
+            .stall_next_answerable_post
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// How many POSTs have entered that park.
+    fn stalled_posts(&self) -> usize {
+        self.shared.stalled_post_arrivals.load(Ordering::SeqCst)
+    }
+
+    /// Release a parked POST so the run finishes without waiting out the park
+    /// bound.
+    fn release_the_stalled_post(&self) {
+        self.shared
+            .release_stalled_post
+            .send_modify(|generation| *generation += 1);
     }
 
     fn answer_the_next_call_with_a_mismatched_id(&self) {
@@ -965,12 +1036,54 @@ async fn serve_post(write_half: &mut WriteHalf<TcpStream>, value: &Value, shared
         "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
     };
 
+    // The stalled-head gate (plan 23), placed AFTER the answer is BUILT and
+    // strictly BEFORE its head is written, and only for an ANSWERABLE call.
+    // Both facts matter: building first keeps `call_answer`'s per-answer
+    // numbering identical for every existing fence, and gating only an
+    // answerable call leaves the `202`-acknowledged notifications — which is
+    // what a probe sends — served the way they always were.
+    if is_call_answer {
+        await_stalled_post_head(shared).await;
+    }
+
     let _ = write_half.write_all(response.as_bytes()).await;
     let _ = write_half.flush().await;
     if is_call_answer {
         shared.answers_flushed.fetch_add(1, Ordering::SeqCst);
     }
     let _ = write_half.shutdown().await;
+}
+
+/// How long a parked POST holds its response head before giving up (plan 23).
+///
+/// Deliberately far ABOVE [`LOCK_PROBE_BOUND`] — two orders of magnitude of the
+/// probe's own bound — for the reason the stagger gate records: "the probe never
+/// completed" must surface as a FENCE failure rather than be papered over by the
+/// harness answering first. Bounded rather than infinite only so a regression
+/// cannot hang CI.
+const STALLED_POST_PARK: Duration = Duration::from_secs(30);
+
+/// Withhold this answer's response HEAD until a fence releases it, or until
+/// [`STALLED_POST_PARK`] elapses (plan 23).
+///
+/// A no-op unless
+/// [`RecordingServer::stall_the_next_answerable_post_before_its_head`] armed it.
+/// The arming is CONSUMED with a `swap`, so the decision and the consumption are
+/// one atomic step and two concurrent POSTs cannot both be stalled by one
+/// arming — the same rule the bare-401 gate's `fetch_update` states.
+///
+/// Subscribed BEFORE the arrival is counted, so a release raised the instant a
+/// fence sees `stalled_posts() >= 1` is observed rather than missed.
+async fn await_stalled_post_head(shared: &Shared) {
+    if !shared
+        .stall_next_answerable_post
+        .swap(false, Ordering::SeqCst)
+    {
+        return;
+    }
+    let mut release = shared.release_stalled_post.subscribe();
+    shared.stalled_post_arrivals.fetch_add(1, Ordering::SeqCst);
+    let _ = timeout(STALLED_POST_PARK, release.changed()).await;
 }
 
 /// Answer a POST with a bare `401 Unauthorized` (plan 25).
@@ -4053,5 +4166,158 @@ async fn two_concurrent_session_stream_restarts_leave_one_reader() {
         server.open_get_connections(),
     );
 
+    server.shutdown().await;
+}
+
+// ===========================================================================
+// Fence 30 — plan 23: a peer that accepts a POST and never writes its response
+// HEAD must block only ITS OWN call, not every operation on the client.
+//
+// The defect is the SEND path's twin of the one fence 23 owns on the receive
+// path, and no existing fence can see it. `Client::dispatch_request` takes the
+// single transport write guard and awaits the send INSIDE it; the send reaches
+// `StreamableHttpTransport::post_once`, which awaits the peer's response
+// HEADERS; and `grep -n "timeout" src/shared/streamable_http.rs` shows only a
+// pool idle timeout — there is no request timeout on any path. So the guard is
+// held across a round trip whose duration the PEER chooses, and `send`,
+// `cancel_request`, `call_tool` and `Transport::close` all queue behind it.
+//
+// Fence 26 answers POST heads promptly and holds the answer FRAME, which lets
+// `send()` return and measures the RECEIVE path. Neither fence subsumes the
+// other: a tree that released the guard around the receive but not around the
+// send passes fence 26 and fails this one.
+// ===========================================================================
+
+/// Fence 30 (plan 23): a stalled POST HEAD serialises only its own call.
+///
+/// # Why the RED is deterministic rather than load-sensitive
+///
+/// For the whole park the harness writes NOTHING — no head, no body, no byte.
+/// The two outcomes being distinguished are therefore "the probe completed in
+/// milliseconds" and "the probe did not complete within
+/// [`LOCK_PROBE_BOUND`]", separated by three orders of magnitude rather than by
+/// a race, and [`STALLED_POST_PARK`] is six times the probe bound so a slow
+/// machine cannot turn a wedged client into a pass. CI load can only make an
+/// already-passing probe slower.
+///
+/// # Two probe operations, of two different kinds, in order
+///
+/// A notification send (`cancel_request`, which is
+/// `Client::send_notification`'s path) and then a full request/response round
+/// trip (`call_tool`, which is `dispatch_request`'s). One alone would leave the
+/// pass attributable to that one path happening to be lock-free; both together
+/// say the transport is genuinely available while a peer is silent.
+#[tokio::test]
+async fn a_peer_that_never_writes_response_headers_does_not_serialise_the_client() {
+    /// Which `select!` arm finished first. Named rather than a bool so the
+    /// failure message can say what actually happened.
+    enum Arm {
+        /// The stalled `tools/call` returned — this fence is then measuring
+        /// nothing, because there is no held POST to contend with.
+        Call,
+        /// Both probe operations completed while the POST was still parked.
+        Probe(pmcp::Result<()>, pmcp::Result<pmcp::types::CallToolResult>),
+    }
+
+    let server = RecordingServer::start().await;
+    server.advertise_tools();
+    server.answer_calls_with_an_echoing_result();
+
+    let (client, _observer) = handshake(&server).await;
+    assert!(
+        wait_for(|| server.get_lines() >= 1).await,
+        "the ordinary session stream must be open, so nothing here can be blamed on a terminal \
+         reason. Observed request lines: {:?}",
+        server.request_lines()
+    );
+
+    // Armed AFTER the handshake, so the `initialize` POST and the `initialized`
+    // notification are served exactly as they always are and the stall lands on
+    // the call this fence makes.
+    server.stall_the_next_answerable_post_before_its_head();
+
+    let started = std::time::Instant::now();
+    let outcome = timeout(LOCK_PROBE_BOUND, async {
+        tokio::select! {
+            _call = client.call_tool("fence-30-stalled".to_string(), json!({})) => Arm::Call,
+            probe = async {
+                // Wait until the stalled POST has genuinely ARRIVED at the gate.
+                // A probe that ran before it would contend for a lock nobody had
+                // taken and pass against any tree at all.
+                assert!(
+                    wait_for(|| server.stalled_posts() >= 1).await,
+                    "the stalled call's POST must have reached the harness gate, or this fence \
+                     probes an uncontended lock. Observed POST bodies: {:?}",
+                    server.post_bodies()
+                );
+                let notified = client
+                    .cancel_request(&RequestId::from("fence-30-probe"))
+                    .await;
+                let called = client.call_tool("fence-30-probe".to_string(), json!({})).await;
+                Arm::Probe(notified, called)
+            } => probe,
+        }
+    })
+    .await;
+
+    let Ok(finished) = outcome else {
+        server.release_the_stalled_post();
+        panic!(
+            "a SECOND operation on the same client never completed in {LOCK_PROBE_BOUND:?} while \
+             a POST was parked BEFORE its response head. `dispatch_request` takes the transport \
+             write guard and awaits the send INSIDE it; that send reaches `post_once`, which \
+             awaits the peer's response HEADERS, and no request timeout exists on any path in \
+             `src/shared/streamable_http.rs`. So a peer that accepts a POST and never answers \
+             holds the one transport guard for as long as it likes, and every other operation on \
+             this client — a second call, a notification, a cancellation, `Transport::close` — is \
+             serialised behind it with nothing to bound it (T-118.2-23-01). Observed POST bodies \
+             at the elapse: {:?}",
+            server.post_bodies()
+        )
+    };
+
+    match finished {
+        Arm::Call => {
+            server.release_the_stalled_post();
+            panic!(
+                "the stalled `tools/call` returned after {:?}, before the probe ran. This fence's \
+                 subject is the guard being free WHILE a POST is unanswered, so a run in which \
+                 that POST was already answered measures nothing. Observed POST bodies: {:?}",
+                started.elapsed(),
+                server.post_bodies()
+            )
+        },
+        Arm::Probe(notified, called) => {
+            notified.expect("the probe's notification must reach the wire and be answered 202");
+            called.expect("the probe's own call must be answered while the other POST is stalled");
+        },
+    }
+
+    // Vacuity guards. Both are needed: the stalled call must have been SENT (or
+    // there is nothing held), and both probe operations must have reached the
+    // WIRE (or "a second operation completed" is a statement about a no-op).
+    assert_eq!(
+        calls_observed(&server),
+        2,
+        "both the stalled call and the probe's call must be observable on the wire. Observed \
+         POST bodies: {:?}",
+        server.post_bodies()
+    );
+    let cancelled_frames = server
+        .post_bodies()
+        .iter()
+        .filter(|body| {
+            body.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        })
+        .count();
+    assert_eq!(
+        cancelled_frames,
+        1,
+        "the probe's notification must be observable on the wire. Observed POST bodies: {:?}",
+        server.post_bodies()
+    );
+
+    // Release the park so the run finishes without waiting out STALLED_POST_PARK.
+    server.release_the_stalled_post();
     server.shutdown().await;
 }
