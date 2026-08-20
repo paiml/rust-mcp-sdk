@@ -50,6 +50,11 @@
 
 use super::traits::{AuthContext, ClaimMappings};
 use crate::error::{Error, ErrorCode, Result};
+// Gated to match its ONLY use site, not the module. `mod jwt`/`mod jwt_validator`
+// compile under `http-client`, but the reqwest body-cap read lives inside a
+// `jwt-auth` + non-wasm arm, so an `http-client`-without-`jwt-auth` build (and
+// every wasm32 build) left this import unused and `-D warnings` made it fatal.
+#[cfg(all(not(target_arch = "wasm32"), feature = "jwt-auth"))]
 use crate::shared::http_body_cap::{collect_reqwest_body_within_cap, DEFAULT_AUTH_RESPONSE_BYTES};
 #[cfg(feature = "jwt-auth")]
 use std::collections::HashMap;
