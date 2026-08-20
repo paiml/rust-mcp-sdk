@@ -2841,7 +2841,7 @@ Plans:
 **Goal:** Close the two residuals Phase 118.1 measured and could not close within its own scope, so that the server-to-client channel 118.1 built is usable end to end by pmcp's OWN client, and a tool handler can emit MCP log notifications. Both were signed off as **OPEN** sub-items of G-3 at plan 118.1-13's D-10 gate (2026-08-11); neither is a re-litigation of a closed gap.
 **Requirements**: CONF-09, CONF-10 (minted 2026-08-11 at planning time per D-17; rows added to `REQUIREMENTS.md`'s checklist AND traceability table so the existing 10-orphan-ID warning is not widened)
 **Depends on:** Phase 118.1
-**Plans:** 17/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed, plus 3 SECOND-ROUND gap-closure plans (19-21) in waves 12-14 closing the two Critical defects that closure's own code introduced — 20 plans total, 17 executed and 3 planned
+**Plans:** 17/17 plans executed in 7 waves (plan 02 was merged into plan 01 during the cross-AI review round; the numbering gap at 02 is deliberate), plus 5 GAP-CLOSURE plans (14-18) in waves 8-11 addressing the safety truth `118.2-VERIFICATION.md` failed, plus 3 SECOND-ROUND gap-closure plans (19-21) in waves 12-14 closing the two Critical defects that closure's own code introduced, plus an unplanned THIRD round (commits `e104dea6`, `d01b87e2`, `2d385d60`, `26447f94`) that shipped the per-id response router with NO plan and NO summary, plus 3 FOURTH-ROUND gap-closure plans (22-24) in waves 15-17 closing the two defects the third round left behind and giving that round a record — 23 plans total, 20 executed and 3 planned
 
 - [x] 118.2-13-PLAN.md
 
@@ -2922,6 +2922,18 @@ Plans:
 **Wave 14** *(blocked on Waves 12-13)*
 
 - [ ] 118.2-21-PLAN.md — Wave 14. The record: the false ceiling premise REMOVED in place from `deferred-items.md`, CONF-09's limitation (vi) corrected and BLOCKER 1 disclosed as (vii), `WINDOWS.md` entries 12/13 restated at the severity found and entry 16 cross-referenced, every declined finding named with an owner, and the round's closing semver, gate and D-16 verdict (CONF-09, CONF-10)
+
+**Wave 15** *(FOURTH gap-closure round, against `118.2-VERIFICATION.md` re-verified 2026-08-20 at HEAD `5caeed05`)*
+
+- [ ] 118.2-22-PLAN.md — Wave 15. **CR-02's surviving half**: the ceiling that re-arms itself across calls from the debris of the call it just killed. A bounded, locally-minted-ids-only ledger lets the pump tell OUR OWN abandoned request's late answer from the peer's mis-addressed frame, so a dead call no longer charges the next one's budget. Fenced deterministically by COUNT, not by clock (CONF-09)
+
+**Wave 16** *(blocked on Wave 15 — same two files)*
+
+- [ ] 118.2-23-PLAN.md — Wave 16. **The wedge that moved to the SEND path** (new finding, seen by neither review nor prior verification): `dispatch_request` holds the transport write guard across the whole POST, and there is no request timeout anywhere, so a peer that accepts the POST and never writes response headers freezes every operation on the `Client`. Closed by an owned shared-send handle — an additive, defaulted `Transport` accessor — NOT by a deadline, which would fail legitimate long calls against JSON-answering and Lambda-hosted servers (CONF-09)
+
+**Wave 17** *(blocked on Waves 15-16)*
+
+- [ ] 118.2-24-PLAN.md — Wave 17. The record, fourth time: `WINDOWS.md` entry 20's false "per-id routing removes this too" claim REMOVED in both representations, entry 13 re-pointed at symbols that resolve, entries of record minted for the unplanned THIRD round and for plans 22/23 including plan 23's two accepted residuals, the CONF-09 row's five deleted identifiers replaced, the migration chapter brought into agreement with the shipped client, the five stale fence-calibration comments corrected, and semver plus both era legs re-measured at the tree they describe (CONF-09, CONF-10)
 
 **Not in scope:** the `json_schema_2020_12_tool` and `x-mcp-header` fixture gaps on the dual-conformance example, and the Tasks-extension surface — all three are missing FIXTURES rather than SDK defects, and all are classified as such in `118-CONFORMANCE-GAPS.md`'s amendment. Also not in scope: the `ServerAcceptsWhitespaceHeaderValue` flake, which was REFUTED as an SDK defect (the server trims OWS correctly in 14/14 fresh processes) and is a suite-side check-design issue.
 
