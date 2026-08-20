@@ -273,6 +273,27 @@ test-tester:
 	fi; \
 	echo "$(GREEN)✓ mcp-tester tests passed ($$ran tests)$(NC)"
 
+# Why this exists, mirroring test-tester: `test-unit` runs `cargo test --lib
+# --features full` with no `-p`, so it reaches the ROOT crate only. cargo-pmcp's
+# tests were therefore covered by nothing in this gate — and cargo-pmcp is where
+# the SCAFFOLD-PIN TRIPWIRES live (templates/workbook_server.rs PMCP_VERSION,
+# templates/agent.rs PMCP_AGENT_VERSION), the tests whose whole job is to fire on
+# a version bump. A `chore: bump` commit passed this gate green and then failed
+# CI on exactly that tripwire; this target closes that hole.
+.PHONY: test-cargo-pmcp
+test-cargo-pmcp:
+	@echo "$(BLUE)Running cargo-pmcp's own tests...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ cargo-pmcp reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ cargo-pmcp tests passed ($$ran tests)$(NC)"
+
 .PHONY: test-doc
 test-doc:
 	@echo "$(BLUE)Running doctests...$(NC)"
@@ -544,7 +565,7 @@ test-playwright-ui:
 	@cd tests/playwright && npm run test:ui
 
 .PHONY: test-all
-test-all: test-unit test-doc test-property test-examples test-integration test-tester
+test-all: test-unit test-doc test-property test-examples test-integration test-tester test-cargo-pmcp
 	@echo "$(GREEN)✓ All test suites passed (ALWAYS requirements met)$(NC)"
 
 # ALWAYS Requirements Validation (for new features)
