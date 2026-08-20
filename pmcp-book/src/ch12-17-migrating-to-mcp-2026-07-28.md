@@ -14,8 +14,8 @@ made **per request** rather than per binary.
 
 That design has a consequence which shapes this entire chapter: *"how do I opt
 into v2" has three genuinely different answers*, depending on whether you own a
-server, a client, or an agent. A server owner has almost nothing to do. A client
-owner has exactly one line to write. An agent owner already has it, because
+server, a client, or an agent. A server owner has one builder call to add. A
+client owner has exactly one line to write. An agent owner already has it, because
 `pmcp-agent` opted in on their behalf. Reading the wrong track will leave you
 looking for a switch that does not exist in your role.
 
@@ -49,12 +49,46 @@ and no dual deployment.
 
 ## For servers
 
-**There is nothing to opt into.** A pmcp server built normally — the default
-feature set, or `full` — already answers both eras. If your goal is "support v2",
-you are done; upgrade the crate and deploy.
+**v2 is opt-in, and upgrading the crate is not the opt-in.** A pmcp server built
+normally — the default feature set, or `full` — answers **v1 only**. The default
+accept-list is v1-only by design: `default_accept_list()`
+(`src/types/protocol/context.rs`) is exactly `SUPPORTED_PROTOCOL_VERSIONS`, which
+deliberately excludes `2026-07-28`, so no server reaches the v2 era by accident.
+That guard is intentional and is not going to be relaxed; the cost is that you
+must ask for v2 explicitly.
 
-The only lever that exists on the server side is the *opposite* one: opting
-**out** of v1.
+The call is `with_supported_protocol_versions`, and the important part is that
+you list your v1 version **alongside** v2 rather than replacing it — the era is
+negotiated per request, so one accept-list carrying both makes one binary serve
+both:
+
+```rust,ignore
+use pmcp::types::protocol::{LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28};
+use pmcp::types::ProtocolVersion;
+
+let server = Server::builder()
+    .name("my-server")
+    .version("1.0.0")
+    .capabilities(ServerCapabilities::tools_only())
+    .with_supported_protocol_versions([
+        ProtocolVersion(LATEST_PROTOCOL_VERSION.to_string()),
+        ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
+    ])
+    .tool("my_tool", MyTool)
+    .build()?;
+```
+
+`examples/s47_v2_stateless_mrtr.rs` is the compiled version of exactly this, and
+`s48_v2_mrtr_client.rs` is the client that exercises it.
+
+⚠ **Do not pass v2 alone.** `.with_supported_protocol_versions([v2])` is accepted
+and looks like it works: v1 `initialize` still succeeds, because v1 negotiation
+falls back through the global `SUPPORTED_PROTOCOL_VERSIONS` table rather than
+through your accept-list. But `server/discover` will then advertise
+`supportedVersions: ["2026-07-28"]`, so what you advertise and what you serve
+disagree, and nothing warns you.
+
+There is also a lever in the *opposite* direction: opting **out** of v1.
 
 ### Opting out of v1 (the severance build)
 

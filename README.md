@@ -497,11 +497,11 @@ written with its name attached — "pmcp 2.18". A bare version number never mean
 
 **Opting in, by role:**
 
-- **Servers** — nothing to do. A server built with the default features (or with `full`) already answers both eras.
+- **Servers** — one explicit call, `ServerBuilder::with_supported_protocol_versions(...)`, listing your v1 version *alongside* `PROTOCOL_VERSION_2026_07_28`. The default accept-list is v1-only by design, so upgrading the crate alone leaves a server answering v1 only. See `examples/s47_v2_stateless_mrtr.rs`.
 - **Clients** — one explicit call, `ClientBuilder::with_protocol_version(...)`. Without it a client stays on v1, exactly as before.
 - **Agents** — already done for you. `pmcp-agent`'s invoker prefers v2 and falls back to v1, so an agent scaffolded with `cargo pmcp agent new` speaks v2 wherever the server supports it.
 
-The only server-side lever is the *opposite* one — opting **out** of v1:
+There is also a server-side lever in the *opposite* direction — opting **out** of v1:
 
 ```bash
 cargo build -p pmcp --no-default-features --features full-v2
