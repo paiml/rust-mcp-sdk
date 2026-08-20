@@ -3776,9 +3776,14 @@ impl CachingAuthProvider {
 #[async_trait]
 impl AuthProvider for CachingAuthProvider {
     async fn get_access_token(&self) -> pmcp::Result<String> {
-        // A cache HIT is the loser's path on a fixed tree: no IdP is touched, so
-        // nothing is recorded and no gate is entered.
-        if let Some(token) = self.cached.lock().clone() {
+        // A cache HIT is the loser's path on a fixed tree: no identity provider
+        // is touched, so nothing is recorded and no gate is entered.
+        //
+        // Read into a local FIRST so the guard is dropped before the branch —
+        // a lock guard living in an `if let` scrutinee outlives the whole
+        // arm, and this one is held across the vend's await if it does.
+        let cached = self.cached.lock().clone();
+        if let Some(token) = cached {
             return Ok(token);
         }
 
@@ -3830,7 +3835,7 @@ impl AuthProvider for CachingAuthProvider {
 /// # THE TWO PURGE ASSERTIONS ALONE ARE INSUFFICIENT
 ///
 /// Do not simplify this fence back to counting `on_unauthorized`. That call only
-/// EVICTS the cached token. The rotating refresh token is presented to the IdP
+/// EVICTS the cached token. The rotating refresh token is presented to the identity provider
 /// by the SUBSEQUENT `get_access_token`, which the transport reaches while
 /// rebuilding the retry request. A serialisation that ended at the purge would
 /// let both callers reach `get_access_token` concurrently one step later —
@@ -3842,7 +3847,7 @@ impl AuthProvider for CachingAuthProvider {
 /// # What a failure MEANS
 ///
 /// Two callers presented a refresh token at the same time. Against a rotating
-/// refresh token the IdP accepts the first and REJECTS the second, and the
+/// refresh token the identity provider accepts the first and REJECTS the second, and the
 /// second's rejection also destroys the token the first just cached — so the
 /// transport's auth fails permanently until an out-of-band re-auth.
 ///

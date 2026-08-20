@@ -1156,6 +1156,33 @@ fn drain_or_latch(
 ///
 /// HTTPS is supported via rustls with the ring crypto provider, which is compatible
 /// with AWS Lambda and other serverless environments.
+///
+/// # Concurrent POSTs on ONE transport (Phase 118.2, plan 25)
+///
+/// This struct is `#[derive(Clone)]` with every field an `Arc`, a `watch` sender
+/// or an atomic, so two clones are ONE transport: they share the config — and
+/// therefore the [`AuthProvider`] — the session-stream abort handle and the
+/// terminal latch. A durable agent holding one transport across concurrent tasks
+/// has exactly that shape.
+///
+/// Three transport-wide things a concurrent POST path touches, and what makes
+/// each safe:
+///
+/// 1. **The POST-reader accounting** ([`Self::open_post_readers`]). An
+///    `AtomicUsize` maintained only through [`PostReaderGuard`], whose `Drop`
+///    covers every reader exit path, so overlapping streaming POSTs cannot leave
+///    it wrong.
+/// 2. **The `401` refresh** ([`Self::refresh_lock`], [`Self::token_generation`]).
+///    Single-flighted from the purge through the retry request's BUILD, so
+///    exactly one caller purges and — for a caching provider — exactly one vends.
+///    The retry SEND is outside the lock.
+/// 3. **The session-stream restart** ([`Self::restart_lock`]). The
+///    take-and-abort / open / reset / respawn sequence is indivisible, so two
+///    overlapping restarts leave exactly one reader and `close()` reaches it.
+///
+/// That list is the whole of the claim and is not broader than it: it says
+/// nothing about a peer's ORDERING of answers across concurrent calls, which is
+/// the client's correlation problem and is fenced in `src/client/mod.rs`.
 #[derive(Clone)]
 pub struct StreamableHttpTransport {
     config: Arc<RwLock<StreamableHttpTransportConfig>>,
@@ -1319,7 +1346,7 @@ pub struct StreamableHttpTransport {
     ///    cached.
     /// 2. **Build — INSIDE.** This is the step that makes the lock worth
     ///    anything. `on_unauthorized` only EVICTS; the rotating refresh token is
-    ///    presented to the IdP by the retry rebuild's `get_access_token`
+    ///    presented to the identity provider by the retry rebuild's `get_access_token`
     ///    ([`Self::build_request_from_parts`]). A lock that ended at the purge
     ///    would release two callers into `get_access_token` concurrently,
     ///    against the cache the winner had just emptied — the original defect,
@@ -1379,6 +1406,36 @@ pub struct StreamableHttpTransport {
     ///
     /// `Arc`-shared for the reason [`Self::refresh_lock`] gives.
     token_generation: Arc<AtomicU64>,
+    /// Makes the session-stream restart indivisible: take-and-abort, open, reset
+    /// seam, respawn-and-store (Phase 118.2, plan 25).
+    ///
+    /// [`Self::start_sse`] is a transport-wide read-modify-write over
+    /// [`Self::abort_handle`] and [`Self::terminal`] with an `await` in the
+    /// middle — the GET open. Two overlapping calls each take a `None` handle,
+    /// each open, and the second's store orphans the first's reader.
+    /// [`Transport::close`] aborts exactly ONE `JoinHandle`, which is what makes
+    /// that orphan unreachable rather than merely redundant.
+    ///
+    /// # Who takes it, and the one caller that must NOT
+    ///
+    /// Taken by [`Self::start_sse`] and therefore by both of its call sites —
+    /// [`Self::send_with_options`]'s resumption-cursor branch and
+    /// [`Self::post_body`]'s `202` `notifications/initialized` branch.
+    ///
+    /// NOT taken by the reconnect loop. That loop re-opens through
+    /// [`SseReaderContext::open_sse_once`] rather than through `start_sse`,
+    /// because `start_sse` aborts [`Self::abort_handle`] as its first act and a
+    /// recursive call would abort the very task making it. Adding this lock does
+    /// not change that: a reconnect that took it would park on a lock held by its
+    /// own restart. Guarding the ENTRY POINT only is what keeps the reconnect
+    /// live.
+    ///
+    /// A [`tokio::sync::Mutex`] rather than the [`parking_lot::RwLock`] this file
+    /// uses for short non-await state, for the same reason
+    /// [`Self::refresh_lock`] is one: it is held across an await. `Arc`-shared,
+    /// so clones of this transport — which already share the handle and the
+    /// latch — share the lock that protects them.
+    restart_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Debug for StreamableHttpTransport {
@@ -1475,6 +1532,7 @@ impl StreamableHttpTransport {
             // it has MOVED since a request captured it — so any starting point
             // does.
             token_generation: Arc::new(AtomicU64::new(0)),
+            restart_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1905,7 +1963,24 @@ impl StreamableHttpTransport {
     /// carrying the resumption cursor. See
     /// [`SseReaderContext::run_session_stream`] for the loop and for what is
     /// deliberately NOT retried.
+    ///
+    /// # The restart is ATOMIC across the transport (plan 25)
+    ///
+    /// Everything below — the take-and-abort, the open, the reset seam and the
+    /// respawn-and-store — is one transport-wide read-modify-write with an
+    /// `await` in the middle. Two overlapping calls could each take a `None`
+    /// handle, each open a GET, and the second's store could orphan the first's
+    /// reader; `close()` aborts exactly ONE `JoinHandle`, so that orphan would
+    /// outlive the transport holding a live socket nothing can reach.
+    /// [`Self::restart_lock`] makes the sequence indivisible.
     pub async fn start_sse(&self, cursor: Option<String>) -> Result<()> {
+        // Held across the WHOLE sequence below, including the `await` in the
+        // middle — that await IS the defect, so a lock that did not span it
+        // would protect nothing. Every exit path, the 405 early return included,
+        // releases it by drop. See `Self::restart_lock` for which call sites
+        // take it and which deliberately does not.
+        let _restart = self.restart_lock.lock().await;
+
         // Abort any existing SSE stream
         let handle = self.abort_handle.write().take();
         if let Some(handle) = handle {
@@ -6510,7 +6585,11 @@ mod tests {
     #[async_trait]
     impl AuthProvider for CachingProbe {
         async fn get_access_token(&self) -> Result<String> {
-            if let Some(token) = self.cached.lock().unwrap().clone() {
+            // Read into a local FIRST: a guard living in an `if let` scrutinee
+            // outlives the whole arm, and this one would then be held across the
+            // vend's await.
+            let cached = self.cached.lock().unwrap().clone();
+            if let Some(token) = cached {
                 return Ok(token);
             }
             self.vends.fetch_add(1, Ordering::SeqCst);
