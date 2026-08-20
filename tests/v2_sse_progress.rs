@@ -536,6 +536,7 @@ const V1_COLLECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5)
 /// rather than parsing them, so a chunk boundary landing mid-line cannot turn a
 /// real frame into a false negative for the COUNT — and the raw bytes are written
 /// to disk either way.
+#[cfg(feature = "v1-compat")]
 async fn read_v1_session_stream(
     addr: std::net::SocketAddr,
     session: &str,
@@ -596,6 +597,13 @@ fn scenario_call_body(era_body: fn(&str, Value, Value) -> String, id: Value) -> 
     value.to_string()
 }
 
+/// `v1-compat`-gated: this is the file's ONE dual-era test and its v1 leg opens a
+/// real session. A `--no-default-features --features full-v2` build mints none,
+/// so on that build it panics with "the example minted no session id" — a v1
+/// complaint against a configuration that deliberately has no v1. The nine
+/// v2-only tests above are deliberately NOT gated; they are exactly the coverage
+/// the severed build should still be running.
+#[cfg(feature = "v1-compat")]
 #[tokio::test]
 async fn the_dual_conformance_example_emits_progress_on_both_eras() {
     use common::example_process::{

@@ -157,6 +157,15 @@ fmt-check:
 .PHONY: lint
 lint:
 	@echo "$(BLUE)Running clippy...$(NC)"
+	# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
+	# 1.98 split part of `unused_async` — already allowed here, deliberately —
+	# into a sibling lint the old allow does not cover, and it fires on 9
+	# pre-existing sites. THREE of them are `pub async fn` on the public API
+	# (`CognitoProvider::new`, `NotificationDebouncer::start`,
+	# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
+	# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
+	# design — its body says "this would make an HTTP request". Allowing it
+	# restores the policy this list already encodes rather than weakening it.
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- \
 		-D clippy::all \
 		-W clippy::pedantic \
@@ -189,7 +198,8 @@ lint:
 		-A clippy::default_trait_access \
 		-A clippy::format_push_string \
 		-A clippy::too_many_lines \
-		-A clippy::cargo_common_metadata
+		-A clippy::cargo_common_metadata \
+		-A clippy::unused_async_trait_impl
 	@echo "$(BLUE)Checking examples...$(NC)"
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) check --features "full" --examples
 	@echo "$(GREEN)✓ No lint issues$(NC)"

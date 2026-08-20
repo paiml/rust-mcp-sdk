@@ -42,9 +42,19 @@
 //! be split into two tests; instead both round trips complete and the artifact is
 //! written BEFORE the first assertion, so a failure on either era is diagnosed
 //! against a recording of both.
+// `v1-compat` is load-bearing, not decoration: this file's single test is a
+// DUAL-era assertion, and its v1 leg opens a real session. A
+// `--no-default-features --features full-v2` build mints no session at all, so
+// `v1_open_session` panics and the leg reports a v1 failure about a build that
+// deliberately has no v1. CI's v1 Severance Gate runs the AGGREGATE
+// `cargo test -p pmcp --no-default-features --features full-v2`, which compiles
+// and RUNS every test target, so a dual-era file must be gated out of it rather
+// than left to fail in it. Same gate, same reason, as
+// `tests/log_records_example_run.rs`.
 #![cfg(all(
     feature = "streamable-http",
     feature = "http-client",
+    feature = "v1-compat",
     not(target_arch = "wasm32")
 ))]
 

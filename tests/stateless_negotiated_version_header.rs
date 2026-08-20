@@ -165,6 +165,13 @@ async fn a_stateless_server_advertises_the_version_it_negotiated() {
 /// The stateful twin, which recovers the version from its session and was never
 /// broken. Present so a future change cannot fix one configuration by breaking
 /// the other.
+///
+/// `v1-compat`-gated because the whole point of this test is that a session IS
+/// minted: a `--no-default-features --features full-v2` build mints none, so on
+/// that build its first assertion fires and reports a v1 defect against a
+/// configuration that deliberately has no v1. Its stateless sibling above needs
+/// no gate — it asserts what the header says, not that a session exists.
+#[cfg(feature = "v1-compat")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stateful_server_advertises_the_version_it_negotiated() {
     let (init, list, handle) = handshake_then_list(StreamableHttpServerConfig::default()).await;

@@ -62,30 +62,40 @@
 mod common;
 
 use std::collections::HashMap;
+#[cfg(feature = "v1-compat")]
 use std::net::SocketAddr;
+#[cfg(feature = "v1-compat")]
 use std::time::Duration;
 
+#[cfg(feature = "v1-compat")]
 use common::example_process::{
     spawn_example, target_dir, wait_until_listening, wait_until_released,
 };
+#[cfg(feature = "v1-compat")]
 use common::v2::{header, post, spawn_default_config, teardown, v1_body, v2_body, v2_headers_for};
 use pmcp::server::builder::ServerCoreBuilder;
 use pmcp::server::core::ProtocolHandler;
+#[cfg(feature = "v1-compat")]
 use pmcp::shared::http_constants::MCP_SESSION_ID;
 use pmcp::types::completable::{
     CompletionItem, CompletionProviderTrait, CompletionRequest, CompletionResponse,
     StaticCompletionProvider,
 };
 use pmcp::types::jsonrpc::ResponsePayload;
+#[cfg(feature = "v1-compat")]
+use pmcp::types::protocol::LATEST_PROTOCOL_VERSION;
 use pmcp::types::protocol::{
     CompleteRequest, CompletionArgument, CompletionReference, InitializeRequest,
-    LATEST_PROTOCOL_VERSION,
 };
 use pmcp::types::{ClientCapabilities, ClientRequest, JSONRPCResponse, Request, RequestId};
-use pmcp::{Implementation, Server};
+use pmcp::Implementation;
+#[cfg(feature = "v1-compat")]
+use pmcp::Server;
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
-use serde_json::{json, Value};
+#[cfg(feature = "v1-compat")]
+use serde_json::json;
+use serde_json::Value;
 
 // ===========================================================================
 // The suite's exact request.
@@ -109,11 +119,13 @@ const SUITE_ARG_VALUE: &str = "test";
 const METHOD: &str = "completion/complete";
 
 /// The suite's `completion/complete` params, as JSON.
+#[cfg(feature = "v1-compat")]
 fn suite_params() -> Value {
     params_with_partial(SUITE_ARG_VALUE)
 }
 
 /// The suite's params with a caller-chosen partial value.
+#[cfg(feature = "v1-compat")]
 fn params_with_partial(partial: &str) -> Value {
     json!({
         "ref": { "type": "ref/prompt", "name": SUITE_PROMPT },
@@ -171,6 +183,7 @@ const EMPTY_PARTIAL: &str = "";
 /// The no-handler case is the one the suite actually meets on a typical server,
 /// and it is the case that must answer a SUCCESS with an empty array rather than
 /// an error or a bare `{}`.
+#[cfg(feature = "v1-compat")]
 fn server_without_completions() -> Server {
     Server::builder()
         .name("completion-complete-http")
@@ -181,6 +194,7 @@ fn server_without_completions() -> Server {
 
 /// The same server WITH a provider registered through `ServerBuilder`
 /// (`src/server/mod.rs`), the high-level builder family.
+#[cfg(feature = "v1-compat")]
 fn server_with_completions() -> Server {
     Server::builder()
         .name("completion-complete-http-provider")
@@ -197,6 +211,14 @@ fn server_with_completions() -> Server {
 /// POST answers `HTTP 400 "Session ID required"` and the resulting red says
 /// nothing whatsoever about `completion/complete`. v2 has no session at all
 /// (Phase 117 severed it), which is why only the v1 framing needs this.
+// The v1 leg needs a MINTED SESSION, and a `--no-default-features
+// --features full-v2` build mints none: v1 is severed, so `initialize`
+// answers without an `Mcp-Session-Id` and this helper panics. CI's v1
+// Severance Gate runs the AGGREGATE `cargo test -p pmcp
+// --no-default-features --features full-v2`, which compiles and RUNS every
+// test target in this file, so the v1-only items must be gated out of that
+// build rather than left to fail in it.
+#[cfg(feature = "v1-compat")]
 async fn v1_open_session(addr: SocketAddr) -> String {
     let params = json!({
         "protocolVersion": LATEST_PROTOCOL_VERSION,
@@ -219,11 +241,13 @@ async fn v1_open_session(addr: SocketAddr) -> String {
 }
 
 /// POST the suite's `completion/complete` over a live v1 session.
+#[cfg(feature = "v1-compat")]
 async fn http_complete(addr: SocketAddr) -> common::v2::Resp {
     http_complete_with(addr, suite_params()).await
 }
 
 /// [`http_complete`] with caller-chosen params.
+#[cfg(feature = "v1-compat")]
 async fn http_complete_with(addr: SocketAddr, params: Value) -> common::v2::Resp {
     let session = v1_open_session(addr).await;
     post(
@@ -252,6 +276,7 @@ fn values_of(result: &Value, context: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "v1-compat")]
 #[tokio::test]
 async fn http_server_answers_the_spec_completion_shape_with_no_handler_registered() {
     let (addr, handle) = spawn_default_config(server_without_completions()).await;
@@ -377,6 +402,7 @@ async fn server_core_answers_the_spec_completion_shape_with_no_handler_registere
 // so every case above would pass while the provider was silently ignored.
 // ===========================================================================
 
+#[cfg(feature = "v1-compat")]
 #[tokio::test]
 async fn http_server_returns_the_values_of_a_provider_registered_through_server_builder() {
     let (addr, handle) = spawn_default_config(server_with_completions()).await;
@@ -552,6 +578,7 @@ proptest! {
 // ===========================================================================
 
 /// The example's compiled path, relative to the target directory.
+#[cfg(feature = "v1-compat")]
 const EXAMPLE_REL_PATH: &str = "debug/examples/s54_v2_dual_conformance";
 
 /// Port 8153, deliberately.
@@ -562,20 +589,25 @@ const EXAMPLE_REL_PATH: &str = "debug/examples/s54_v2_dual_conformance";
 /// `tests/embedded_resource_example_run.rs` (plan 03), which runs CONCURRENTLY
 /// with this file under nextest. 8080/8081 belong to
 /// `scripts/test_examples_with_tester.sh`.
+#[cfg(feature = "v1-compat")]
 const BIND_ADDR: &str = "127.0.0.1:8153";
 
 /// Where the recorded answers land, for the SUMMARY to quote verbatim.
+#[cfg(feature = "v1-compat")]
 const ARTIFACT_REL_PATH: &str = "118.1-04-example-response.json";
 
 /// How long the child gets to bind its socket before the leg gives up.
+#[cfg(feature = "v1-compat")]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the port gets to become free again after the child is killed.
+#[cfg(feature = "v1-compat")]
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Assert one era's answer carries the spec `CompleteResult` shape with at least
 /// one candidate — the example registers a real provider, so an empty array here
 /// would mean the seam was never reached.
+#[cfg(feature = "v1-compat")]
 fn assert_example_answer(era: &str, response: &common::v2::Resp) {
     assert_eq!(
         response.status, 200,
@@ -601,6 +633,7 @@ fn assert_example_answer(era: &str, response: &common::v2::Resp) {
     }
 }
 
+#[cfg(feature = "v1-compat")]
 #[tokio::test]
 async fn the_dual_conformance_example_serves_completion_complete_on_both_eras() {
     let (addr, mut guard) = spawn_example(EXAMPLE_REL_PATH, BIND_ADDR);

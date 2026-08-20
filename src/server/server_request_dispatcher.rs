@@ -140,6 +140,19 @@ impl ServerRequestDispatcher {
     /// the stock loop behaves byte-for-byte as before. Both entry points share
     /// [`dispatch_with_owner`](Self::dispatch_with_owner) precisely so the two
     /// can never drift in their pending-map bookkeeping.
+    // Why: the only non-test caller is the streamable-HTTP peer channel
+    // (`streamable_http_server/peer_channel.rs`), which is itself
+    // `#[cfg(feature = "streamable-http")]`. A build of this crate WITHOUT that
+    // feature — `pmcp-tasks --no-default-features` in CI's Feature Flag
+    // Verification, and the Era Matrix job — therefore has no caller at all, and
+    // `-D warnings` turns the dead_code lint into a hard error.
+    //
+    // An `allow` rather than a `#[cfg(feature = "streamable-http")]` on the
+    // method: the unit tests below exercise `dispatch_owned` under DEFAULT
+    // features, and `default = ["logging", "v1-compat"]` does not include
+    // `streamable-http`, so cfg-gating the method would delete it out from under
+    // its own tests.
+    #[cfg_attr(not(feature = "streamable-http"), allow(dead_code))]
     pub(crate) async fn dispatch_owned(
         &self,
         owner: &str,

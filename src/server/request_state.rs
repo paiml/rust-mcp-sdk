@@ -919,7 +919,14 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in s.as_bytes().chunks_exact(2) {
+    // `as_chunks::<2>()` rather than `chunks_exact(2)`: the const-generic form
+    // gives the compiler a fixed-size array per step instead of a slice whose
+    // length it must re-prove, which is what `clippy::chunks_exact_to_as_chunks`
+    // (new in Rust 1.98) asks for. The trailing remainder is discarded here
+    // exactly as `chunks_exact` discarded it, and cannot be non-empty anyway:
+    // the length was already checked to be a multiple of 2 above.
+    let (pairs, _remainder) = s.as_bytes().as_chunks::<2>();
+    for pair in pairs {
         let hi = char::from(pair[0]).to_digit(16)?;
         let lo = char::from(pair[1]).to_digit(16)?;
         out.push(u8::try_from(hi * 16 + lo).ok()?);
