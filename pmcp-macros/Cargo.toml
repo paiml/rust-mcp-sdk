@@ -20,7 +20,7 @@ proc-macro = true
 syn = { version = "2.0", features = ["full", "extra-traits", "visit-mut"] }
 quote = "1.0"
 proc-macro2 = "1.0"
-darling = "0.23"
+darling = "0.24"
 pmcp-macros-support = { version = "0.1.0", path = "../crates/pmcp-macros-support" }
 heck = "0.5"
 
