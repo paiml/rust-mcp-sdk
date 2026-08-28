@@ -11,3 +11,14 @@ query_timeout_ms = 5000
 [[database.tables]]
 name = "users"
 description = "user accounts"
+
+# --- Config slots (PKG-03) -----------------------------------------------
+# Declared so this seed also packs: pmcp-package 0.3.1's CONFIG -> SLOT gate
+# refuses an addressable `${VAR}` / `env:VAR` reference no slot names. The
+# parser under fuzz stores these verbatim; `kind = "secret"` is identity-bearing
+# and structurally carries no `tested_value`.
+
+[[config_slots]]
+key = "database.url"
+kind = "secret"
+name = "DATABASE_URL"

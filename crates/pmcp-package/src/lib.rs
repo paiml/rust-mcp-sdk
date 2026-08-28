@@ -68,9 +68,9 @@ pub use error::{PackageError, Result};
 pub use oci::{
     pack_agent, pack_server, pack_team, pack_workflow, parse_declared_config_slots, unpack_agent,
     unpack_server, unpack_team, unpack_workflow, validate_config_slot_agreement,
-    validate_config_slot_placeholders, AttestationFile, BinaryMode, ConfigFile, DeclaredConfigSlot,
-    OciLayout, OpenApiSpecFile, RestoredFile, SubjectVerdict, UnpackedAttestation, UnpackedBinary,
-    UnpackedServer, UnpackedTeam,
+    validate_config_slot_placeholders, validate_no_undeclared_env_refs, AttestationFile,
+    BinaryMode, ConfigFile, DeclaredConfigSlot, OciLayout, OpenApiSpecFile, RestoredFile,
+    SubjectVerdict, UnpackedAttestation, UnpackedBinary, UnpackedServer, UnpackedTeam,
 };
 pub use package::{
     AgentPackage, CedarPolicySet, DeployDescriptor, ServerPackage, TeamPackage, WorkflowManifest,

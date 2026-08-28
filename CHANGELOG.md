@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.2] - 2026-08-28
+
+**A carrier release, following the v2.19.1 precedent.** No `pmcp` source changed
+since 2.19.1 — `pmcp` moves 2.19.1 → 2.19.2 solely to mint the tag that carries
+`pmcp-package` 0.3.1 to crates.io, because this repo tags on the `pmcp` version
+and a `v*` tag is the only path `pmcp-package` has to the registry.
+
+The heading is the version, NOT `[Unreleased]`, and that is load-bearing:
+`.github/workflows/release.yml`'s `create-release` job extracts notes with
+`awk 'index($0, "## [" ver "]") == 1'` and **exits 1** when no section matches
+the tag — "refusing to create a release with empty notes" — *before* any publish
+step runs. A tag pushed against an `[Unreleased]` heading aborts the whole
+release.
+
+`pmcp`'s patch bump needs no downstream pin changes: `crates/mcp-tester` and
+`cargo-pmcp` both pin `pmcp = "2.19.0"`, and `^2.19.0` admits 2.19.2 (the caret
+exception in CLAUDE.md's *Version Bump Rules*, same as at 2.19.1).
+
+### Fixed
+
+- **`pmcp-package` 0.3.0 → 0.3.1** — `pack_server`'s config-slot validation ran
+  only in the DECLARED-SLOT -> CONFIG direction. A server config referencing
+  environment variables that no `[[config_slots]]` entry declared therefore
+  packed at exit 0 and reported "no config slots — nothing to fill", producing a
+  package that installs cleanly into a new environment and then cannot
+  authenticate. A third gate, `validate_no_undeclared_env_refs`, closes the
+  CONFIG -> SLOT direction fail-closed. See
+  `crates/pmcp-package/CHANGELOG.md` for the gate's deliberate scope
+  boundaries, the gaps it does not close, and the migration.
+
+  **Version axis — read this before trusting the patch level.**
+  `cargo semver-checks` vs the published 0.3.0 reports 196/196 and "no semver
+  update required", and none of the four crates pinning `pmcp-package = "0.3"`
+  (`cargo-pmcp`, `pmcp-agent`, `pmcp-team-servers`, `pmcp-cfn-renderer`) needs a
+  pin change under the caret exception. But that tool measures the API surface
+  for BREAKING changes only — it never reports "you added a public item, so bump
+  minor" — and two facts sit outside what it can see. This release **adds**
+  public API (`validate_no_undeclared_env_refs`, re-exported from the crate
+  root), which this repo's own Version Bump Rules call a minor bump; and
+  `pack_server` now **refuses input it previously accepted**, which CLAUDE.md
+  item 15a treats as a contract change warranting minor. 0.3.0 *is* published, so
+  `^0.3` auto-resolves 0.3.1 and that refusal reaches users of an unchanged
+  `cargo-pmcp` 0.23.0 with no version signal. Choosing 0.3.1 over 0.4.0 avoids
+  moving four pins as one set; it is a deliberate trade, not a semver-checks
+  verdict.
+
+### Changed
+
+- **Config corpus migrated to declare its slots.** The new gate refuses a config
+  that defers a value nothing declares, and a repo sweep through the real
+  `cargo pmcp package save` path found **11 in-repo configs** in exactly that
+  shape. All now carry a `[[config_slots]]` block: the five reference fixtures
+  (`pmcp-server-toolkit/tests/fixtures/{reference,imdb,msr-vtt,open-images}-config.toml`
+  and `pmcp-sql-server/tests/fixtures/reference-config.toml`, each deferring
+  `code_mode.token_secret`) and the six `pmcp_server_toolkit_config_parser` fuzz
+  seeds. The fuzz-seed half is cosmetic — the gate never runs on a parser
+  corpus — and was migrated so a repo-wide sweep reads clean.
+- **Docs no longer teach a shape the SDK refuses.** `pmcp-sql-server/README.md`
+  and `pmcp-openapi-server/README.md` both showed
+  `token_secret = "${CODE_MODE_SECRET}"` with no declaration anywhere, and both
+  scaffold templates (`cargo-pmcp/src/templates/{sql,openapi}_server.rs`) told
+  the reader to replace the dev literal with `env:CODE_MODE_SECRET` — advice that
+  now leads straight into the refusal. All four show the declaration.
+
+  Note the out-of-box scaffold was never broken: it emits a dev-only *literal*
+  `token_secret`, which the gate does not touch. The break was one step later,
+  at the documented "productionize your config" move.
+
+- **`cargo-pmcp` 0.23.0 → 0.23.1** — carries the corrected scaffold templates and
+  the `PMCP_VERSION` move to 2.19.2. Without this bump the published 0.23.0 keeps
+  emitting the advice that leads into the refusal, so the fix would not reach
+  anyone.
+- **`pmcp-sql-server` 0.1.0 → 0.1.1 and `pmcp-openapi-server` 0.1.1 → 0.1.2** —
+  README-only, and bumped for exactly that reason: a README ships inside the
+  `.crate` and is what crates.io and docs.rs render. Left unbumped, the most
+  visible copy of the instructions would go on teaching a config shape the SDK
+  now refuses. Nothing pins either crate with a version requirement, so the bumps
+  are self-contained.
+
 ## [2.19.1] - 2026-08-27
 
 **A release-hygiene release.** No `pmcp` source changed since 2.19.0 — this tag exists to

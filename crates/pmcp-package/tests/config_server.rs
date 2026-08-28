@@ -255,6 +255,174 @@ fn a_keyed_slot_without_a_config_file_is_refused_naming_the_dangling_key() {
     );
 }
 
+/// The CONFIG -> SLOT direction, at the `pack_server` boundary an author
+/// actually meets.
+///
+/// Both older document gates start from the DECLARED slot list, so a config
+/// that defers a value to the environment without declaring a slot for it
+/// satisfied them trivially — and packed at exit 0 into a package that then
+/// told its target environment "no config slots — nothing to fill" about a
+/// server that could not start without one.
+///
+/// The config below is the reported shape reduced: one declared slot that is
+/// correct in every way the old gates check, plus a SECOND reference nothing
+/// declares. A gate that only ran one way passes this document.
+#[test]
+fn a_config_reference_no_slot_declares_is_refused_before_anything_is_written() {
+    const UNDER_DECLARED: &[u8] = br#"
+name    = "london-tube"
+version = "1.0.0"
+
+[[config_slots]]
+key = "backend.api_key"
+kind = "secret"
+name = "TFL_API_KEY"
+
+[backend]
+kind = "openapi"
+api_key = "${TFL_API_KEY}"
+# Deferred to the environment, and declared by nothing.
+base_url = "${TFL_BASE_URL}"
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let layout = OciLayout::create(dir.path()).unwrap();
+    let before = blob_file_names(dir.path());
+
+    let err = pack_server(
+        &london_tube_package(UNDER_DECLARED),
+        referenced_binary(),
+        Some(ConfigFile {
+            file_name: CONFIG_FILE_NAME,
+            bytes: UNDER_DECLARED,
+        }),
+        None,
+        None,
+        &layout,
+    )
+    .expect_err("a config deferring a value nothing declares must not pack");
+
+    let (key, reason) = config_slot_violation(err);
+    assert_eq!(key, "backend.base_url");
+    assert!(reason.contains("TFL_BASE_URL"), "was: {reason}");
+    assert!(
+        reason.contains("[[config_slots]]"),
+        "the message must say where the declaration goes: {reason}"
+    );
+    assert!(
+        !reason.contains("backend.api_key"),
+        "the correctly declared key must not be reported: {reason}"
+    );
+    // "Before anything is written" is asserted against the BLOBS, not only the
+    // index. An empty index is the weaker half: move the precondition check
+    // after the layer-write loop and the config layer lands in
+    // `blobs/sha256/` while the index stays empty, so an index-only assertion
+    // stays green with its own name false (measured: 7 leaked blobs). Leaked
+    // config bytes are exactly what this validation exists to prevent, which
+    // is why `a_rejected_pack_adds_neither_a_blob_nor_an_index_entry` asserts
+    // both — the reference-bearing path needs the pair just as much.
+    assert_eq!(
+        blob_file_names(dir.path()),
+        before,
+        "the refusal must land before a single blob is written"
+    );
+    assert!(
+        layout.read_index().unwrap().manifests().is_empty(),
+        "the refusal must land before anything is recorded in the index"
+    );
+}
+
+/// The same config packs once the missing slot is declared — the gate demands
+/// a DECLARATION, never a particular value, and never a second copy of the
+/// config.
+#[test]
+fn declaring_the_missing_slot_is_what_makes_the_same_config_pack() {
+    const FULLY_DECLARED: &[u8] = br#"
+name    = "london-tube"
+version = "1.0.0"
+
+[[config_slots]]
+key = "backend.api_key"
+kind = "secret"
+name = "TFL_API_KEY"
+
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+
+[backend]
+kind = "openapi"
+api_key = "${TFL_API_KEY}"
+base_url = "${TFL_BASE_URL}"
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let layout = OciLayout::create(dir.path()).unwrap();
+
+    pack_server(
+        &london_tube_package(FULLY_DECLARED),
+        referenced_binary(),
+        Some(ConfigFile {
+            file_name: CONFIG_FILE_NAME,
+            bytes: FULLY_DECLARED,
+        }),
+        None,
+        None,
+        &layout,
+    )
+    .expect("every deferred value now has a slot");
+
+    let unpacked = unpack_server(&layout).unwrap();
+    assert_eq!(
+        unpacked.package.config_slots.len(),
+        2,
+        "the target environment must be told about BOTH values it has to supply"
+    );
+
+    // THE NEGATIVE CONTROL, without which this test proves nothing about the
+    // gate. `london_tube_package` DERIVES its `config_slots` from the config's
+    // own `[[config_slots]]` block, so the assertion above only re-measures
+    // that derivation plus a `Vec` round trip — it is green whether or not
+    // `validate_no_undeclared_env_refs_in` runs at all. Removing exactly one
+    // declaration from the SAME bytes must flip the pack to a refusal naming
+    // exactly that key.
+    const MISSING_THE_ENDPOINT_SLOT: &[u8] = br#"
+name    = "london-tube"
+version = "1.0.0"
+
+[[config_slots]]
+key = "backend.api_key"
+kind = "secret"
+name = "TFL_API_KEY"
+
+[backend]
+kind = "openapi"
+api_key = "${TFL_API_KEY}"
+base_url = "${TFL_BASE_URL}"
+"#;
+    let control_dir = tempfile::tempdir().unwrap();
+    let control_layout = OciLayout::create(control_dir.path()).unwrap();
+    let err = pack_server(
+        &london_tube_package(MISSING_THE_ENDPOINT_SLOT),
+        referenced_binary(),
+        Some(ConfigFile {
+            file_name: CONFIG_FILE_NAME,
+            bytes: MISSING_THE_ENDPOINT_SLOT,
+        }),
+        None,
+        None,
+        &control_layout,
+    )
+    .expect_err("dropping the endpoint declaration must un-do what made it pack");
+    let (key, _) = config_slot_violation(err);
+    assert_eq!(
+        key, "backend.base_url",
+        "the declaration is what made the difference, so removing it must name that key"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Determinism: pack is environment-independent
 // ---------------------------------------------------------------------

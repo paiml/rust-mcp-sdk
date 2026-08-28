@@ -207,7 +207,12 @@ read_only_hint = true
 # code-mode (validate_code / execute_code) is visible on first run; it runs JS
 # against the backend through the SAME HTTP engine the script tool uses.
 enabled = true
-# DEV ONLY — replace with a secrets ref (token_secret = "env:CODE_MODE_SECRET")
+# DEV ONLY — replace with a secrets ref (token_secret = "env:CODE_MODE_SECRET").
+# When you do, ALSO declare it, or `cargo pmcp package save` refuses the config:
+#   [[config_slots]]
+#   key = "code_mode.token_secret"
+#   kind = "secret"
+#   name = "CODE_MODE_SECRET"
 # for production. The deploy path (cargo pmcp deploy) substitutes a secrets ref
 # automatically. The inline literal below is rejected unless the dev flag is set.
 token_secret = "dev-only-insecure-secret-min-16-bytes"

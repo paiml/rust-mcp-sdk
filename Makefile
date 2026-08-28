@@ -1637,6 +1637,7 @@ pmcp-package-gate:
 # scripts/run-example-builds.sh over the ROOT workspace, which never reaches
 # this workspace-EXCLUDED crate.
 	$(CARGO) run --manifest-path crates/pmcp-package/Cargo.toml --example attestation_carriage
+	$(CARGO) run --manifest-path crates/pmcp-package/Cargo.toml --example config_slot_gates
 	@echo "$(GREEN)✓ pmcp-package fmt/clippy/test/example OK$(NC)"
 
 .PHONY: quality-gate

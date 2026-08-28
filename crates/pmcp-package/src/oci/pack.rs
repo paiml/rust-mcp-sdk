@@ -23,7 +23,7 @@ use crate::digest::{canonicalize, ManifestDigest};
 use crate::error::{PackageError, Result};
 use crate::oci::config_validation::{
     parse_declared_config_slots_in, parse_document, validate_config_slot_agreement,
-    validate_config_slot_placeholders_in,
+    validate_config_slot_placeholders_in, validate_no_undeclared_env_refs_in,
 };
 use crate::oci::layout::OciLayout;
 use crate::oci::media_types::{
@@ -444,8 +444,10 @@ fn plan_server_layers(
 /// Returns [`PackageError::ConfigSlotViolation`] when the config document's
 /// `[[config_slots]]` block disagrees with `package.config_slots`, when a
 /// slot-declared value key holds a resolved literal rather than an environment
-/// reference, or when a package that ships NO config file nonetheless declares
-/// a slot naming a `config_key`. Returns [`PackageError::Serialize`] when the
+/// reference, when the config defers a slot-addressable key to the environment
+/// that NO slot declares, or when a package that ships NO config file
+/// nonetheless declares a slot naming a `config_key`. Returns
+/// [`PackageError::Serialize`] when the
 /// config document is not parseable TOML. Returns
 /// [`PackageError::MalformedDigest`] or
 /// [`PackageError::AttestationSubjectMismatch`] per
@@ -477,11 +479,16 @@ fn validate_pack_preconditions(
         // must name the config key it fills" rule on the with-config path.
         return reject_config_keys_without_a_config(package);
     };
-    // One parse feeds both gates — the `_in` variants take the document.
+    // One parse feeds all three gates — the `_in` variants take the document.
     let document = parse_document(config.bytes)?;
     let declared = parse_declared_config_slots_in(&document)?;
     validate_config_slot_agreement(&declared, &package.config_slots)?;
-    validate_config_slot_placeholders_in(&document, &package.config_slots)
+    validate_config_slot_placeholders_in(&document, &package.config_slots)?;
+    // The CONFIG -> SLOT direction. The two gates above both start from the
+    // declared slot list, so a config declaring NO slots satisfies both
+    // trivially; this one starts from the document and is what makes the pair
+    // of questions symmetric.
+    validate_no_undeclared_env_refs_in(&document, &package.config_slots)
 }
 
 /// The no-config half of [`validate_pack_preconditions`]: refuse a package that
@@ -805,8 +812,11 @@ fn would_be_unattested_manifest_digest(
 /// When `config` is `Some`, returns [`PackageError::ConfigSlotViolation`]
 /// BEFORE writing anything if the config's `[[config_slots]]` declaration block
 /// disagrees with `package.config_slots` in either direction (D-01: the shipped
-/// config is the source of truth), or if a slot-declared value key holds a
-/// resolved literal rather than a `${VAR}` / `env:VAR` reference (D-04). See
+/// config is the source of truth), if a slot-declared value key holds a
+/// resolved literal rather than a `${VAR}` / `env:VAR` reference (D-04), or if
+/// the config holds a `${VAR}` / `env:VAR` reference at a slot-addressable key
+/// that no slot declares — the CONFIG -> SLOT direction, without which a
+/// package under-reports what a target environment must supply. See
 /// [`crate::oci::config_validation`].
 ///
 /// When `config` is `None`, returns [`PackageError::ConfigSlotViolation`] if

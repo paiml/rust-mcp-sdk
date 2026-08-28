@@ -1,5 +1,14 @@
 //! Pack-time validation of a config server's `[[config_slots]]` declaration
-//! block against the package's own slot list (D-01, D-04, D-17).
+//! block against the package's own slot list, and of the shipped config
+//! against BOTH (D-01, D-04, D-17).
+//!
+//! Three gates, in two directions. Two run SLOT -> CONFIG
+//! ([`validate_config_slot_agreement`], [`validate_config_slot_placeholders`]):
+//! is every declared slot well-formed, and does it point at a placeholder? One
+//! runs CONFIG -> SLOT ([`validate_no_undeclared_env_refs`]): does every
+//! slot-addressable key that defers a value have a slot? The summary line above
+//! described only the first direction for three releases, which is the mental
+//! model that let the second go ungated.
 //!
 //! # Why this module exists
 //!
@@ -35,7 +44,7 @@
 
 use crate::error::{PackageError, Result};
 use crate::slot::{ConfigSlot, SlotType};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The closed `kind` vocabulary a `[[config_slots]]` entry may declare. These
 /// are byte-identical to `pmcp-server-toolkit`'s `ConfigSlotKind` snake_case
@@ -718,12 +727,28 @@ fn is_bare_key(component: &str) -> bool {
 /// resolve to nothing at runtime) is why the `env:` arm is identical on both
 /// sides.
 fn is_env_reference(raw: &str) -> bool {
+    env_ref_name(raw).is_some()
+}
+
+/// The name-returning half of [`is_env_reference`], so the reverse gate
+/// ([`validate_no_undeclared_env_refs`]) can NAME the variable a config defers
+/// to without restating the grammar. `is_env_reference` is defined in terms of
+/// this function precisely so the two can never disagree: the parity table
+/// `tests/golden_fixtures/env_ref_grammar_v1.tsv` asserts the predicate, and a
+/// second independent implementation here would be a second thing to keep in
+/// step with the toolkit.
+///
+/// Returns the variable name for the two accepted forms and `None` for
+/// everything else — plain literals, the empty forms (`${}`, `env:`) and
+/// multi-placeholder compositions alike. Verdict-identical to the predicate it
+/// replaced, row for row.
+fn env_ref_name(raw: &str) -> Option<&str> {
     if let Some(rest) = raw.strip_prefix("env:") {
-        return !rest.is_empty();
+        return (!rest.is_empty()).then_some(rest);
     }
     raw.strip_prefix("${")
         .and_then(|inner| inner.strip_suffix('}'))
-        .is_some_and(is_valid_env_var_name)
+        .filter(|name| is_valid_env_var_name(name))
 }
 
 /// Whether `name` is a variable name a TARGET environment can actually be
@@ -734,6 +759,44 @@ fn is_env_reference(raw: &str) -> bool {
 /// contract forbids a value one side resolves and the other refuses.
 fn is_valid_env_var_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What [`undeclared_reason`] may print in place of a deferred variable's name
+/// when the name is not one a target environment could be told to set.
+const UNREPORTABLE_NAME: &str = "<name withheld: not a settable variable name>";
+
+/// The deferred variable's name, rendered so it is safe to put in an error.
+///
+/// # Why this is not just `name.to_string()`
+///
+/// [`validate_no_undeclared_env_refs`]'s rationale for naming the variable at
+/// all is that a value already proven to be a reference is a variable NAME and
+/// therefore not a secret. That argument holds for the `${NAME}` form, whose
+/// interior [`env_ref_name`] has already constrained to
+/// [`is_valid_env_var_name`]'s `[A-Za-z0-9_]+`. It does NOT hold for the
+/// `env:` form: its grammar accepts ANY non-empty remainder — the pinned
+/// parity table (`tests/golden_fixtures/env_ref_grammar_v1.tsv`) has
+/// `env:FOO}BAR` as an ACCEPT row precisely to record that — so the
+/// "name" there is arbitrary document text.
+///
+/// Two things ride on that difference, and the module's error-hygiene rule
+/// ("No error raised here ever echoes a config VALUE", T-120-21) forbids
+/// both. An author who writes `api_key = "env:sk-live-…"` believing `env:` is
+/// an encoding prefix has the credential printed by `cargo pmcp package save`
+/// and captured in CI logs. And because [`undeclared_reason`] renders the
+/// violations as one comma-separated list, a remainder containing `, ` or a
+/// newline forges extra entries in it — a value that reads as a second,
+/// non-existent offending key.
+///
+/// Withholding the name costs nothing the author needs: the KEY is what says
+/// where the `[[config_slots]]` entry goes, and the config line it points at
+/// is what says which variable to declare.
+fn reportable_name(name: &str) -> &str {
+    if is_valid_env_var_name(name) {
+        name
+    } else {
+        UNREPORTABLE_NAME
+    }
 }
 
 /// Reference-SHAPED but not a valid single reference: the empty forms (`${}`,
@@ -749,6 +812,270 @@ fn is_malformed_env_reference(raw: &str) -> bool {
         .and_then(|inner| inner.strip_suffix('}'))
         .is_some_and(|name| !is_valid_env_var_name(name))
 }
+
+/// Gate C — the CONFIG -> SLOT direction: refuse a config document that defers
+/// a value to the environment without a `[[config_slots]]` entry naming that
+/// key.
+///
+/// # Why this gate exists — the other two only run one way
+///
+/// [`validate_config_slot_agreement`] and [`validate_config_slot_placeholders`]
+/// both START from the declared slot list. Both answer *"is every declared slot
+/// well-formed, and does it point at a placeholder?"* — a good question,
+/// correctly gated. Neither answers the converse, *"does every placeholder have
+/// a slot?"*, and a config declaring NO slots at all satisfies both trivially:
+/// iterating an empty list finds no violations.
+///
+/// Since the slot list is the whole mechanism for telling a target environment
+/// what it must supply, the un-gated direction produced a package that installs
+/// cleanly into a new environment and then cannot authenticate — reported
+/// against `pmcp-package` 0.3.0 / `cargo-pmcp` 0.23.0, where a real OpenAPI
+/// server carrying four `${...}` references packed at exit 0 and unpacked
+/// saying "This package declares no config slots — nothing to fill."
+///
+/// The gap survived because the fixture the feature was built against,
+/// `london-tube.toml`, declares all three of its slots and is fully
+/// self-consistent, so the corpus never contained a config whose references
+/// OUTNUMBERED its declarations.
+///
+/// # Scope — exactly the locations a slot can address, and no others
+///
+/// This walks the document's TABLES, building the same dotted paths
+/// [`resolve_dotted_key`] resolves, and reports a string value that is a
+/// whole-value environment reference whose path no slot's `config_key` names.
+/// Two boundaries fall out of that, and BOTH are deliberate:
+///
+/// - **Arrays are not descended.** `resolve_dotted_key` addresses TOML tables
+///   only — array indexing is out of its grammar — so a reference inside an
+///   `[[tools]]` or `[[resources]]` entry is unnameable by ANY `config_key`.
+///   Demanding a slot for it would be a demand no config author could satisfy.
+///   This is also what keeps the gate off `london-tube.toml`'s two JS template
+///   placeholders (`${line.id}` in a `[[tools]].script`, `${'victoria'}` in a
+///   `[[resources]].content`): they are a different `${}` namespace entirely,
+///   and a naive document-wide text scan would have flagged this crate's own
+///   golden fixture.
+/// - **Whole-value references only**, per the pinned grammar
+///   (`tests/golden_fixtures/env_ref_grammar_v1.tsv`). `${A}-${B}` and
+///   `${VAR}-suffix` are reject rows there, so an EMBEDDED reference is not
+///   something any environment can fill through a slot, and this gate does not
+///   pretend otherwise. A config wanting one filled must compose the whole
+///   value in one variable — which is what the forward gate already says.
+///
+/// Malformed whole-value references (`${}`, `env:`, `${A}://${B}`) are OUT of
+/// scope here: they are a different defect with a different fix — repair the
+/// reference, not declare a slot — and the forward gate already names them
+/// where a slot points at one.
+///
+/// # Naming the variable is safe HERE, unlike in the forward gate
+///
+/// [`validate_config_slot_placeholders`] names the key and never the value,
+/// because the value it rejects may be a RESOLVED credential. This gate fires
+/// only on values already proven to be references, so the "value" it reports is
+/// a variable NAME — never a secret, and the single most useful thing to put in
+/// the message.
+///
+/// # Errors
+///
+/// Returns [`PackageError::ConfigSlotViolation`] naming the first undeclared
+/// key in lexicographic order, with the undeclared keys listed in the reason
+/// (up to [`MAX_LISTED_UNDECLARED`], then a count of the rest) so a config with
+/// several is fixed in one pass rather than one per pack.
+///
+/// Also returns [`PackageError::Serialize`] when `config_bytes` are not
+/// parseable TOML — this entry point parses before it validates, so a caller
+/// matching only on `ConfigSlotViolation` falls through on the commonest input
+/// error of all.
+///
+/// [`PackageError::ConfigSlotViolation`]: crate::error::PackageError::ConfigSlotViolation
+///
+/// # Examples
+///
+/// ```
+/// use pmcp_package::{validate_no_undeclared_env_refs, ConfigSlot, SlotType};
+///
+/// let config = br#"
+/// [backend]
+/// base_url = "${TFL_BASE_URL}"
+/// "#;
+///
+/// // Refused: the config defers `backend.base_url` to the environment, but no
+/// // slot tells a target environment to supply `TFL_BASE_URL`.
+/// let err = validate_no_undeclared_env_refs(config, &[]).unwrap_err();
+/// assert!(err.to_string().contains("backend.base_url"));
+/// assert!(err.to_string().contains("TFL_BASE_URL"));
+///
+/// // Accepted once the slot is declared.
+/// let slots = vec![ConfigSlot::new(SlotType::Endpoint {
+///     name: "TFL_BASE_URL".to_string(),
+///     tested_value: "https://api.tfl.gov.uk".to_string(),
+/// })
+/// .with_config_key("backend.base_url")];
+/// assert!(validate_no_undeclared_env_refs(config, &slots).is_ok());
+/// ```
+pub fn validate_no_undeclared_env_refs(config_bytes: &[u8], slots: &[ConfigSlot]) -> Result<()> {
+    validate_no_undeclared_env_refs_in(&parse_document(config_bytes)?, slots)
+}
+
+/// Document-taking half of [`validate_no_undeclared_env_refs`], so a caller
+/// that runs several gates over the same config (`pack_server`) parses once.
+///
+/// # Errors
+///
+/// Per [`validate_no_undeclared_env_refs`].
+pub(crate) fn validate_no_undeclared_env_refs_in(
+    document: &toml::Value,
+    slots: &[ConfigSlot],
+) -> Result<()> {
+    // Fail CLOSED, not open. Every in-tree caller sources `document` from
+    // `parse_document`, and a TOML document always roots in a table, so this
+    // arm is unreachable today. Returning `Ok(())` from it anyway would make
+    // the one impossible input the one input this gate waves through — it
+    // would report "no undeclared references" without having looked at
+    // anything, which is the exact fail-open shape the gate exists to close.
+    // `resolve_dotted_key` meets the same situation and raises a violation;
+    // this matches it.
+    let Some(root) = document.as_table() else {
+        return Err(violation(
+            DOCUMENT_LABEL,
+            "the config document does not root in a TOML table, so no `config_key` can address \
+             anything in it and no deferred value could be checked",
+        ));
+    };
+    let declared: BTreeSet<&str> = slots
+        .iter()
+        .filter_map(|slot| slot.config_key.as_deref())
+        .collect();
+    let mut undeclared = BTreeMap::new();
+    collect_undeclared_env_refs(root, "", &declared, &mut undeclared);
+    let Some((first, _)) = undeclared.first_key_value() else {
+        return Ok(());
+    };
+    Err(violation(first, undeclared_reason(&undeclared)))
+}
+
+/// Walk `table`, recording every SLOT-ADDRESSABLE key that holds a whole-value
+/// environment reference `declared` does not name, as
+/// `dotted key -> variable name`.
+///
+/// Addressable means what [`resolve_dotted_key`] can reach: a chain of
+/// non-empty TOML bare keys through tables. Non-bare and empty keys are
+/// skipped (a key whose literal name contains a dot is unaddressable by the
+/// dotted grammar — note `is_bare_key("")` is `true`, so the emptiness check is
+/// load-bearing rather than redundant) and arrays are not descended — see the
+/// reasoning on [`validate_no_undeclared_env_refs`].
+///
+/// `declared` is applied HERE rather than to a fully-collected map afterwards,
+/// so `out` holds only violations for its whole lifetime and its name is never
+/// briefly a lie. `undeclared_agrees_with_what_resolve_dotted_key_can_address`
+/// is what keeps this walk's notion of addressable in step with
+/// [`resolve_dotted_key`]'s; the two are duals of one grammar with no shared
+/// code, and a silent divergence would be fail-OPEN — the same shape as the bug
+/// this gate exists to close.
+///
+/// Recursion is bounded by the document's own nesting depth, and that depth is
+/// bounded by the `toml` dependency, which refuses to build a `Value` past its
+/// own recursion limit — measured at 80 levels for `toml` 1.1.x, on both the
+/// inline-table and the dotted/header forms, with `parse_document` returning
+/// `Err` before this walk is ever entered.
+///
+/// State the bound as the DEPENDENCY PROPERTY it is. "The parser already
+/// recursed through it" would not establish anything on its own: a parser
+/// recursing does not bound a different walker with different frames, and
+/// `toml`'s parser is event-based rather than a mirror of this walk. If a
+/// future `toml` raises or removes that limit, this becomes the only recursive
+/// consumer of untrusted config in the crate, and the failure mode is a stack
+/// overflow — an abort, not a catchable panic — so re-measure it rather than
+/// assume it.
+fn collect_undeclared_env_refs(
+    table: &toml::value::Table,
+    prefix: &str,
+    declared: &BTreeSet<&str>,
+    out: &mut BTreeMap<String, String>,
+) {
+    for (key, value) in table {
+        if key.is_empty() || !is_bare_key(key) {
+            continue;
+        }
+        // The path is built INSIDE the arms that need it. Built before the
+        // match, it is a heap allocation per visited key at every depth,
+        // two thirds of which the match immediately drops (integers,
+        // booleans, arrays, datetimes, and plain-literal strings — measured
+        // at 15 of 23 on this crate's own golden fixture).
+        match value {
+            toml::Value::String(raw) => {
+                let Some(name) = env_ref_name(raw) else {
+                    continue;
+                };
+                let path = join_dotted(prefix, key);
+                if !declared.contains(path.as_str()) {
+                    out.insert(path, reportable_name(name).to_string());
+                }
+            },
+            toml::Value::Table(nested) => {
+                collect_undeclared_env_refs(nested, &join_dotted(prefix, key), declared, out);
+            },
+            _ => {},
+        }
+    }
+}
+
+/// The dotted path of `key` under `prefix` — the spelling
+/// [`resolve_dotted_key`] parses back. One definition so the walker and the
+/// test-module referee it is checked against cannot disagree on SPELLING while
+/// the property test is busy checking they agree on REACH.
+fn join_dotted(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// The reason half of [`validate_no_undeclared_env_refs_in`]'s error: says what
+/// breaks and lists the offending keys so one pack fixes them all.
+///
+/// Split out to keep the message string and its length bound out of the gate's
+/// control flow. NOT a cognitive-complexity necessity: inlined, the gate sits
+/// well inside CLAUDE.md's cap of 25.
+///
+/// The wording deliberately says the key "is not among the config keys the slot
+/// list names" rather than "no `[[config_slots]]` entry declares it". This
+/// function is reached from the exported
+/// [`validate_no_undeclared_env_refs`], which is handed a `&[ConfigSlot]` and
+/// never reads the document's own `[[config_slots]]` table — inside
+/// `pack_server` the two are already proven equal by
+/// [`validate_config_slot_agreement`], but a standalone caller passing `&[]`
+/// against a fully-declared config would otherwise be told something false
+/// about the file in front of it.
+fn undeclared_reason(undeclared: &BTreeMap<String, String>) -> String {
+    let listed = undeclared
+        .iter()
+        .take(MAX_LISTED_UNDECLARED)
+        .map(|(key, name)| format!("{key} -> {name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let elided = match undeclared.len().saturating_sub(MAX_LISTED_UNDECLARED) {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    format!(
+        "the config defers this key to the environment, but it is not among the config keys the \
+         slot list names — so the packed package under-reports what a target environment must \
+         supply and the server cannot start where the variable is unset. Declare one slot per \
+         deferred key ({listed}{elided}). Note only [[config_slots]] entries are read as \
+         declarations; a slot must carry a `key` for this gate to see it"
+    )
+}
+
+/// How many offending keys [`undeclared_reason`] spells out before eliding the
+/// rest.
+///
+/// The list exists so one pack fixes them all, which a bounded prefix still
+/// achieves — an author with twenty undeclared keys has a systemic problem the
+/// first twenty already describe. Unbounded, the message grows with the
+/// document: a config with 2000 references produced a measured 74 KB
+/// `PackageError`, and every entry of it is text the config controls.
+const MAX_LISTED_UNDECLARED: usize = 20;
 
 #[cfg(test)]
 mod tests {
@@ -793,6 +1120,91 @@ mod tests {
             PackageError::ConfigSlotViolation { key, reason } => (key, reason),
             other => panic!("expected ConfigSlotViolation, got: {other}"),
         }
+    }
+
+    /// Enumerate EVERY leaf string in `value` with a dotted path, descending
+    /// arrays and non-bare keys alike — deliberately more permissive than
+    /// either production walker, so it can act as the neutral referee in
+    /// `undeclared_agrees_with_what_resolve_dotted_key_can_address`.
+    fn naive_leaf_paths(value: &toml::Value, prefix: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            toml::Value::String(raw) if !prefix.is_empty() => {
+                out.push((prefix.to_string(), raw.clone()));
+            },
+            toml::Value::Table(table) => {
+                for (key, nested) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    naive_leaf_paths(nested, &path, out);
+                }
+            },
+            toml::Value::Array(items) => {
+                for (index, nested) in items.iter().enumerate() {
+                    let path = if prefix.is_empty() {
+                        index.to_string()
+                    } else {
+                        format!("{prefix}.{index}")
+                    };
+                    naive_leaf_paths(nested, &path, out);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Arbitrary TOML documents mixing the shapes this gate has to get right:
+    /// accepted references, a malformed composition, plain literals, non-string
+    /// values, nested tables, ARRAYS of tables (the `[[tools]]` shape), a
+    /// non-bare key and the empty key.
+    fn arbitrary_toml_document() -> impl Strategy<Value = toml::Value> {
+        let leaf = prop_oneof![
+            Just(toml::Value::String("${TFL_BASE_URL}".to_string())),
+            Just(toml::Value::String("env:TFL_APP_KEY".to_string())),
+            Just(toml::Value::String("${A}-${B}".to_string())),
+            Just(toml::Value::String("https://api.tfl.gov.uk".to_string())),
+            Just(toml::Value::Integer(7)),
+            Just(toml::Value::Boolean(true)),
+        ];
+        // `my` is here for ONE reason: with `my.key` alone, the alias the
+        // bi-implication's `raw == leaf` guard exists to handle — a quoted
+        // `"my.key"` beside a table `my` holding `key`, two locations sharing
+        // one dotted spelling — is unconstructible, and the guard is dead
+        // code. Proven by mutation before it was added: rewriting the guard to
+        // `|| true` left the property green at 50_000 cases.
+        let key = prop_oneof![
+            Just("a".to_string()),
+            Just("backend".to_string()),
+            Just("auth".to_string()),
+            Just("my".to_string()),
+            Just("key".to_string()),
+            Just("my.key".to_string()),
+            Just(String::new()),
+        ];
+        let table_of = |inner: BoxedStrategy<toml::Value>, key: BoxedStrategy<String>| {
+            proptest::collection::btree_map(key, inner, 0..4)
+                .prop_map(|entries| toml::Value::Table(entries.into_iter().collect()))
+        };
+        let tree = leaf.boxed().prop_recursive(4, 32, 4, move |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..3).prop_map(toml::Value::Array),
+                table_of(inner, key.clone().boxed()),
+            ]
+        });
+        // The root of a TOML document is always a table.
+        proptest::collection::btree_map(
+            prop_oneof![
+                Just("a".to_string()),
+                Just("backend".to_string()),
+                Just("my".to_string()),
+                Just("my.key".to_string()),
+            ],
+            tree,
+            0..4,
+        )
+        .prop_map(|entries| toml::Value::Table(entries.into_iter().collect()))
     }
 
     // --- Test 1: the real fixture parses to exactly its three declarations ---
@@ -1500,6 +1912,485 @@ name = "TFL_BASE_URL"
                 toml::from_str("[backend]\nbase_url = \"${X}\"\n[backend.auth]\ntype = \"t\"\n")
                     .unwrap();
             let _ = resolve_dotted_key(&document, &config_key);
+        }
+
+        /// THE COUPLING THAT NOTHING ELSE ENFORCES.
+        ///
+        /// `resolve_dotted_key` and `collect_undeclared_env_refs` are duals of
+        /// ONE grammar with no shared code: the first parses a single
+        /// user-supplied path ("is this addressable, and if not, precisely
+        /// why"), the second enumerates every addressable location. They agree
+        /// today on three separate facts — bare-key components (shared through
+        /// `is_bare_key`), non-empty components, and tables-only-never-arrays,
+        /// which is duplicated as a structural coincidence (`as_table()` on one
+        /// side, a `match` arm on the other).
+        ///
+        /// A divergence would be silently fail-OPEN, which is the exact shape
+        /// of the bug this gate exists to close: widen `resolve_dotted_key` to
+        /// address array elements and a `config_key` gains reach the collector
+        /// does not follow, so a `${VAR}` inside a `[[tools]]` entry becomes
+        /// both slot-addressable and un-demanded. Every other test here stays
+        /// green through that change.
+        ///
+        /// So the agreement is asserted as an executable bi-implication against
+        /// a neutral referee (`naive_leaf_paths`, which descends everything):
+        /// the collector reports a path IF AND ONLY IF `resolve_dotted_key` can
+        /// address it AND it holds a whole-value reference.
+        ///
+        /// The `raw == leaf` guard on the second direction is not decoration:
+        /// two distinct locations can share one dotted spelling (a quoted
+        /// `"a.b"` key beside a table `a` holding `b`), and without it an alias
+        /// resolving elsewhere would be read as a missed report.
+        #[test]
+        fn undeclared_agrees_with_what_resolve_dotted_key_can_address(
+            document in arbitrary_toml_document()
+        ) {
+            let table = document
+                .as_table()
+                .expect("arbitrary_toml_document always roots in a table");
+            let declared = BTreeSet::new();
+            let mut found = BTreeMap::new();
+            collect_undeclared_env_refs(table, "", &declared, &mut found);
+
+            // Direction 1 — nothing over-reported: every path the collector
+            // emits is one `resolve_dotted_key` resolves to that same
+            // reference.
+            for (path, name) in &found {
+                let addressable = matches!(
+                    resolve_dotted_key(&document, path),
+                    Ok(toml::Value::String(raw))
+                        if env_ref_name(raw).map(reportable_name) == Some(name.as_str())
+                );
+                prop_assert!(
+                    addressable,
+                    "collector emitted `{path}` -> `{name}`, which resolve_dotted_key does not \
+                     address as that reference"
+                );
+            }
+
+            // Direction 2 — nothing under-reported: every addressable location
+            // holding a reference was emitted.
+            let mut naive = Vec::new();
+            naive_leaf_paths(&document, "", &mut naive);
+            for (path, leaf) in naive {
+                if env_ref_name(&leaf).is_none() {
+                    continue;
+                }
+                let addresses_this_leaf = matches!(
+                    resolve_dotted_key(&document, &path),
+                    Ok(toml::Value::String(raw)) if *raw == leaf
+                );
+                if !addresses_this_leaf {
+                    continue;
+                }
+                prop_assert!(
+                    found.contains_key(&path),
+                    "resolve_dotted_key addresses `{path}`, which holds the reference `{leaf}`, \
+                     but the collector did not report it — the two walkers have diverged and the \
+                     gate is now fail-open at that shape"
+                );
+            }
+        }
+
+        /// THE SUPPRESSION HALF, which the bi-implication above cannot see.
+        ///
+        /// `undeclared_agrees_with_what_resolve_dotted_key_can_address` runs
+        /// the collector with `declared` EMPTY, so it pins which references
+        /// exist and says nothing about which are forgiven. Widen the
+        /// `!declared.contains(path)` test at the collector's `String` arm to
+        /// match on the leaf key rather than the full dotted path — forgiving
+        /// far too much — and it stays green, as do both `pack_server`-level
+        /// integration tests. This is the property that fails.
+        ///
+        /// Declaring EXACTLY the paths the collector found must empty it, and
+        /// declaring any strict subset must leave exactly the rest.
+        #[test]
+        fn declaring_a_path_suppresses_exactly_that_path_and_no_other(
+            document in arbitrary_toml_document()
+        ) {
+            let table = document
+                .as_table()
+                .expect("arbitrary_toml_document always roots in a table");
+            let mut all = BTreeMap::new();
+            collect_undeclared_env_refs(table, "", &BTreeSet::new(), &mut all);
+
+            let every: BTreeSet<&str> = all.keys().map(String::as_str).collect();
+            let mut none_left = BTreeMap::new();
+            collect_undeclared_env_refs(table, "", &every, &mut none_left);
+            prop_assert!(
+                none_left.is_empty(),
+                "declaring every reported path must leave nothing, but {none_left:?} survived"
+            );
+
+            // Drop ONE declaration; exactly the dropped path must come back.
+            if let Some(dropped) = all.keys().next().cloned() {
+                let partial: BTreeSet<&str> = every
+                    .iter()
+                    .copied()
+                    .filter(|path| *path != dropped)
+                    .collect();
+                let mut remaining = BTreeMap::new();
+                collect_undeclared_env_refs(table, "", &partial, &mut remaining);
+                let expected: BTreeMap<String, String> = all
+                    .iter()
+                    .filter(|(path, _)| **path == dropped)
+                    .map(|(path, name)| (path.clone(), name.clone()))
+                    .collect();
+                prop_assert_eq!(
+                    remaining,
+                    expected,
+                    "un-declaring `{}` must bring back exactly that one path",
+                    dropped
+                );
+            }
+        }
+
+        /// FUZZ (CLAUDE.md ALWAYS), the axis that actually reaches the walk.
+        ///
+        /// `validate_no_undeclared_env_refs_never_panics` below drives the
+        /// BYTE axis, which is totality on the parse leg and nothing more:
+        /// random bytes essentially never form a content-bearing TOML
+        /// document (measured over 200_000 samples of that exact strategy —
+        /// ~0.4% valid UTF-8, ~0.2% parse, and every one of those the EMPTY
+        /// document), so `collect_undeclared_env_refs`'s loop body runs zero
+        /// times there. The empty keys, non-bare keys, arrays and nesting the
+        /// walk has to survive live in `arbitrary_toml_document`, so this
+        /// property feeds it that instead.
+        #[test]
+        fn validate_no_undeclared_env_refs_never_panics_on_arbitrary_documents(
+            document in arbitrary_toml_document(),
+            config_key in "\\PC{0,40}"
+        ) {
+            let slot = ConfigSlot::new(SlotType::Secret { name: "N".to_string() })
+                .with_config_key(config_key);
+            let _ = validate_no_undeclared_env_refs_in(&document, &[slot]);
+            // And through the public byte entry point where the document
+            // re-serializes (TOML forbids a value after a table, so some
+            // generated shapes legitimately cannot round-trip).
+            if let Ok(text) = toml::to_string(&document) {
+                let _ = validate_no_undeclared_env_refs(text.as_bytes(), &[]);
+            }
+        }
+
+        /// FUZZ, the BYTE axis: the public entry point parses before it
+        /// validates, so it must be total on input that is not TOML at all.
+        /// Deliberately NOT credited with covering the walk — see
+        /// `validate_no_undeclared_env_refs_never_panics_on_arbitrary_documents`.
+        #[test]
+        fn validate_no_undeclared_env_refs_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+            config_key in "\\PC{0,40}"
+        ) {
+            let slot = ConfigSlot::new(SlotType::Secret { name: "N".to_string() })
+                .with_config_key(config_key);
+            let _ = validate_no_undeclared_env_refs(&bytes, &[slot]);
+        }
+
+        /// The gate is EXACTLY the inverse of the forward one, so a document
+        /// whose only reference sits at a declared key must always pass — for
+        /// any variable name the grammar accepts and any bare-key path.
+        #[test]
+        fn a_declared_key_holding_any_valid_reference_always_passes(
+            name in "[A-Za-z0-9_]{1,24}",
+            key in "[a-z][a-z0-9_]{0,12}"
+        ) {
+            let document: toml::Value =
+                toml::from_str(&format!("[backend]\n{key} = \"${{{name}}}\"\n")).unwrap();
+            let config_key = format!("backend.{key}");
+            let slot = ConfigSlot::new(SlotType::Secret { name })
+                .with_config_key(&config_key);
+            prop_assert!(validate_no_undeclared_env_refs_in(&document, &[slot]).is_ok());
+        }
+
+        /// The converse, and the property the reported bug violated: the SAME
+        /// document with NO slot must always be refused, naming the key.
+        #[test]
+        fn an_undeclared_reference_is_always_refused_naming_its_key(
+            name in "[A-Za-z0-9_]{1,24}",
+            key in "[a-z][a-z0-9_]{0,12}"
+        ) {
+            let document: toml::Value =
+                toml::from_str(&format!("[backend]\n{key} = \"${{{name}}}\"\n")).unwrap();
+            let err = validate_no_undeclared_env_refs_in(&document, &[])
+                .expect_err("an undeclared reference must never pack");
+            let rendered = err.to_string();
+            let expected_key = format!("backend.{key}");
+            prop_assert!(rendered.contains(&expected_key));
+            prop_assert!(rendered.contains(&name));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Gate C — the CONFIG -> SLOT direction (undeclared environment refs)
+    // -----------------------------------------------------------------
+
+    /// The reported bug, reduced to its six-line form: a config that defers a
+    /// value to the environment while declaring no slot at all. Both older
+    /// gates accept it (iterating an empty slot list finds no violations),
+    /// which is why the package it produced said "declares no config slots —
+    /// nothing to fill" about a server that could not start without one.
+    #[test]
+    fn a_reference_with_no_slot_is_refused_naming_the_key_and_the_variable() {
+        let config = b"[server]\nname = \"repro\"\n\n[backend]\nbase_url = \"${SOME_ENDPOINT}\"\n";
+        // The gates that existed before this one both accept it.
+        assert!(validate_config_slot_placeholders(config, &[]).is_ok());
+
+        let err = validate_no_undeclared_env_refs(config, &[])
+            .expect_err("a deferred value with no slot must not pack");
+        let rendered = err.to_string();
+        assert!(rendered.contains("backend.base_url"), "was: {rendered}");
+        assert!(rendered.contains("SOME_ENDPOINT"), "was: {rendered}");
+    }
+
+    /// Declaring the slot is what makes it pack — the gate demands a
+    /// declaration, never a particular value.
+    #[test]
+    fn a_reference_whose_slot_is_declared_is_accepted() {
+        let config = b"[backend]\nbase_url = \"${TFL_BASE_URL}\"\n";
+        assert!(validate_no_undeclared_env_refs(config, &[endpoint_slot()]).is_ok());
+    }
+
+    /// The `env:` form is the same grammar, so it is the same rule.
+    #[test]
+    fn the_env_prefixed_form_is_gated_identically_to_the_brace_form() {
+        let config = b"[backend]\nbase_url = \"env:SOME_ENDPOINT\"\n";
+        let err = validate_no_undeclared_env_refs(config, &[])
+            .expect_err("`env:VAR` defers a value exactly as `${VAR}` does");
+        assert!(err.to_string().contains("SOME_ENDPOINT"));
+    }
+
+    /// The fixture the feature was built against must stay green: all three of
+    /// its slots are declared, so it has nothing undeclared. This is the
+    /// regression guard for the gap's own cause — a fully self-consistent
+    /// corpus that exercised only the direction that was gated.
+    #[test]
+    fn the_real_fixture_has_no_undeclared_references() {
+        assert!(
+            validate_no_undeclared_env_refs(LONDON_TUBE_TOML, &london_tube_package_slots()).is_ok()
+        );
+    }
+
+    /// THE BOUNDARY THAT KEEPS THE GATE OFF ITS OWN FIXTURE. `london-tube.toml`
+    /// carries two `${...}` occurrences that are JS TEMPLATE placeholders in a
+    /// `[[tools]].script` and a `[[resources]].content` — a different `${}`
+    /// namespace entirely. They live inside arrays of tables, which the dotted
+    /// `config_key` grammar cannot address, so no slot could ever be written
+    /// for them. A naive document-wide text scan would have flagged this
+    /// crate's own golden fixture; this asserts the structural reason it does
+    /// not.
+    #[test]
+    fn a_reference_inside_an_array_of_tables_is_not_demanded() {
+        let config = br#"
+[[tools]]
+name = "t"
+script = "await api.get(`/Line/${line.id}/Disruption`)"
+
+[[tools]]
+name = "whole-value"
+script = "${NOT_ADDRESSABLE}"
+"#;
+        assert!(
+            validate_no_undeclared_env_refs(config, &[]).is_ok(),
+            "array elements are unaddressable by the dotted key grammar, so demanding a slot \
+             for one would be a demand no config author could satisfy"
+        );
+    }
+
+    /// The pinned grammar accepts a reference only as the WHOLE value
+    /// (`env_ref_grammar_v1.tsv` rejects `${A}-${B}` and `${VAR}-suffix`), so
+    /// an EMBEDDED reference is not something a slot can fill and this gate
+    /// does not pretend otherwise. Documented rather than silently true: it is
+    /// the one shape from the original report this gate cannot catch.
+    #[test]
+    fn an_embedded_reference_is_not_demanded_because_no_slot_could_fill_it() {
+        let config = b"[backend]\nbase_url = \"${SCHEME}://${HOST}\"\nother = \"${VAR}-suffix\"\n";
+        assert!(validate_no_undeclared_env_refs(config, &[]).is_ok());
+    }
+
+    /// ERROR HYGIENE (T-120-21). The `env:` form's grammar accepts ANY
+    /// non-empty remainder, so the "variable name" this gate would otherwise
+    /// echo is arbitrary document text. An author who writes
+    /// `api_key = "env:sk-live-…"` believing `env:` is an encoding prefix must
+    /// NOT have the credential printed by `cargo pmcp package save` and
+    /// captured in CI logs. The key still says where the fix goes.
+    #[test]
+    fn an_env_prefixed_name_that_is_not_a_settable_variable_is_not_echoed() {
+        let config = b"[backend]\napi_key = \"env:sk-live-DEADBEEF secret text\"\n";
+        let (key, reason) =
+            expect_violation(validate_no_undeclared_env_refs(config, &[]).unwrap_err());
+        assert_eq!(key, "backend.api_key");
+        assert!(
+            !reason.contains("sk-live-DEADBEEF"),
+            "the credential must never reach the message: {reason}"
+        );
+        assert!(reason.contains(UNREPORTABLE_NAME), "was: {reason}");
+    }
+
+    /// The same rule blocks message SPOOFING. `undeclared_reason` renders the
+    /// violations as one comma-separated list, so an `env:` remainder holding
+    /// `, ` would otherwise forge an extra entry — a second offending key that
+    /// does not exist.
+    #[test]
+    fn an_env_prefixed_name_cannot_forge_extra_entries_in_the_list() {
+        let config = b"[backend]\napi_key = \"env:A, backend.forged -> B\"\n";
+        let (_, reason) =
+            expect_violation(validate_no_undeclared_env_refs(config, &[]).unwrap_err());
+        assert!(
+            !reason.contains("backend.forged"),
+            "a config value must not be able to fabricate a listed key: {reason}"
+        );
+    }
+
+    /// A well-formed `env:NAME` still names its variable — the withholding is
+    /// scoped to names an environment could not be told to set, not to the
+    /// `env:` form as a whole.
+    #[test]
+    fn a_well_formed_env_prefixed_name_is_still_reported() {
+        let config = b"[backend]\napi_key = \"env:TFL_APP_KEY\"\n";
+        let (_, reason) =
+            expect_violation(validate_no_undeclared_env_refs(config, &[]).unwrap_err());
+        assert!(reason.contains("TFL_APP_KEY"), "was: {reason}");
+    }
+
+    /// The listed-keys prefix is BOUNDED: unbounded, a hostile or generated
+    /// config controls both the length and the content of an error the CLI
+    /// prints and callers log (measured: 2000 references produced a 74 KB
+    /// message).
+    #[test]
+    fn the_listed_keys_are_capped_and_the_remainder_is_counted() {
+        let mut config = String::from("[backend]\n");
+        let total = MAX_LISTED_UNDECLARED + 5;
+        for i in 0..total {
+            config.push_str(&format!("k{i:03} = \"${{VAR{i:03}}}\"\n"));
+        }
+        let (_, reason) =
+            expect_violation(validate_no_undeclared_env_refs(config.as_bytes(), &[]).unwrap_err());
+        assert!(reason.contains("and 5 more"), "was: {reason}");
+        assert!(
+            !reason.contains(&format!("VAR{:03}", total - 1)),
+            "the tail must be elided, not spelled out: {reason}"
+        );
+    }
+
+    /// Malformed whole-value references are a different defect with a
+    /// different fix — repair the reference, not declare a slot — so they are
+    /// out of this gate's scope and stay the forward gate's business.
+    #[test]
+    fn a_malformed_whole_value_reference_is_out_of_scope() {
+        let config = b"[backend]\nbase_url = \"${}\"\napi_key = \"env:\"\n";
+        assert!(validate_no_undeclared_env_refs(config, &[]).is_ok());
+    }
+
+    /// A resolved literal is not a reference, so the gate is silent about it —
+    /// baked credentials are the forward gate's job, and firing here would
+    /// risk putting a value in a message.
+    #[test]
+    fn a_resolved_literal_never_triggers_the_gate() {
+        let config = b"[backend]\nbase_url = \"https://api.tfl.gov.uk\"\n";
+        assert!(validate_no_undeclared_env_refs(config, &[]).is_ok());
+    }
+
+    /// A config with several undeclared references is fixed in ONE pass: the
+    /// error names the lexicographically first key and lists every one of
+    /// them. Deterministic regardless of the TOML map's iteration order,
+    /// because the walk collects into a `BTreeMap`.
+    #[test]
+    fn every_undeclared_reference_is_listed_in_one_error() {
+        let config = br#"
+[backend]
+base_url = "${BT_ENDPOINT}"
+
+[backend.auth]
+client_id = "${BT_CLIENT_ID}"
+client_secret = "${BT_CLIENT_SECRET}"
+
+[code_mode]
+token_secret = "${CODE_MODE_SECRET}"
+"#;
+        let err = validate_no_undeclared_env_refs(config, &[]).unwrap_err();
+        let (key, reason) = expect_violation(err);
+        assert_eq!(
+            key, "backend.auth.client_id",
+            "first in lexicographic order"
+        );
+        for expected in [
+            "backend.auth.client_id -> BT_CLIENT_ID",
+            "backend.auth.client_secret -> BT_CLIENT_SECRET",
+            "backend.base_url -> BT_ENDPOINT",
+            "code_mode.token_secret -> CODE_MODE_SECRET",
+        ] {
+            assert!(reason.contains(expected), "missing {expected} in: {reason}");
+        }
+    }
+
+    /// Declaring SOME of them is not enough — the ones left over are still
+    /// reported, and the satisfied one is not.
+    #[test]
+    fn a_partially_declared_config_reports_only_what_is_still_missing() {
+        let config = b"[backend]\nbase_url = \"${TFL_BASE_URL}\"\napi_key = \"${TFL_APP_KEY}\"\n";
+        let err = validate_no_undeclared_env_refs(config, &[endpoint_slot()]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("backend.api_key"), "was: {rendered}");
+        assert!(
+            !rendered.contains("backend.base_url"),
+            "the declared key must not be reported: {rendered}"
+        );
+    }
+
+    /// An inline table is a table, so the gate reaches through it — this is
+    /// the shape the real fixture's `query_params = { app_key = "${...}" }`
+    /// uses, and missing it would leave the secret path ungated.
+    #[test]
+    fn the_gate_reaches_through_an_inline_table() {
+        let config = b"[backend.auth]\nquery_params = { app_key = \"${TFL_APP_KEY}\" }\n";
+        let err = validate_no_undeclared_env_refs(config, &[]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("backend.auth.query_params.app_key"));
+        assert!(validate_no_undeclared_env_refs(config, &[secret_slot()]).is_ok());
+    }
+
+    /// A key whose literal name contains a dot is unaddressable by the dotted
+    /// grammar (`resolve_dotted_key` says so explicitly), so it is skipped for
+    /// the same reason array elements are.
+    #[test]
+    fn a_non_bare_key_is_skipped_as_unaddressable() {
+        let config = b"[backend]\n\"my.key\" = \"${SOME_VAR}\"\n";
+        assert!(validate_no_undeclared_env_refs(config, &[]).is_ok());
+    }
+
+    /// Every accept row of the pinned grammar must yield its variable NAME, and
+    /// every reject row `None`.
+    ///
+    /// Deliberately asserts `env_ref_name` ONLY. `is_env_reference` is now
+    /// `env_ref_name(raw).is_some()`, so an `assert_eq!(is_env_reference(raw),
+    /// expected.is_some())` beside the assertion below would expand to
+    /// `env_ref_name(raw).is_some() == expected.is_some()` — strictly implied by
+    /// it, and unable to fail on its own. The predicate is covered
+    /// INDEPENDENTLY by `tests/config_server.rs`'s
+    /// `is_env_reference_agrees_with_the_shared_grammar_table_on_every_row`,
+    /// which reads the `.tsv` rather than this inlined copy.
+    #[test]
+    fn env_ref_name_yields_the_variable_for_every_accept_row() {
+        for (raw, expected) in [
+            ("${TFL_BASE_URL}", Some("TFL_BASE_URL")),
+            ("env:TFL_APP_KEY", Some("TFL_APP_KEY")),
+            ("${A}", Some("A")),
+            ("env:A", Some("A")),
+            ("env:FOO}BAR", Some("FOO}BAR")),
+            ("https://api.tfl.gov.uk", None),
+            ("the price is $5 per call", None),
+            ("${}", None),
+            ("env:", None),
+            ("${TFL_BASE_URL", None),
+            ("${TFL_BASE_URL}-suffix", None),
+            ("  ${TFL_BASE_URL}  ", None),
+            ("${TFL_SCHEME}://${TFL_HOST}", None),
+            ("${A}-${B}", None),
+            ("${TFL-HOST}", None),
+            ("", None),
+        ] {
+            assert_eq!(env_ref_name(raw), expected, "env_ref_name({raw:?})");
         }
     }
 }

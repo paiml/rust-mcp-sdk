@@ -177,7 +177,7 @@ pub mod unpack;
 
 pub use config_validation::{
     parse_declared_config_slots, validate_config_slot_agreement, validate_config_slot_placeholders,
-    DeclaredConfigSlot,
+    validate_no_undeclared_env_refs, DeclaredConfigSlot,
 };
 pub use layout::OciLayout;
 pub use pack::{

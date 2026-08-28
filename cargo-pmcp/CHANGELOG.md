@@ -5,6 +5,28 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.1] - 2026-08-28
+
+Ships with `pmcp` 2.19.2 / `pmcp-package` 0.3.1 (tag `v2.19.2`). Scaffold-output
+change only — no CLI surface moved, so no consumer pin changes.
+
+### Changed
+
+- **`cargo pmcp new --kind sql-server|openapi-server` now teaches the declared
+  config shape.** `pmcp-package` 0.3.1 refuses to pack a config that defers a
+  value to the environment without a `[[config_slots]]` entry naming its key, and
+  both templates' own advice ("replace with a secrets ref
+  `token_secret = \"env:CODE_MODE_SECRET\"`") walked the reader straight into that
+  refusal. Both now show the matching `[[config_slots]]` declaration beside it.
+
+  The out-of-box scaffold was never broken: it emits a dev-only *literal*
+  `token_secret`, which the gate does not touch. The break was one step later, at
+  the documented "productionize your config" move.
+- **`PMCP_VERSION` 2.19.1 -> 2.19.2** (`src/templates/workbook_server.rs`), so a
+  workbook scaffold pins the `pmcp` shipping at this tag. Caught by its own
+  `emitted_pmcp_version_matches_workspace_pin` drift guard rather than by review
+  — the guard is the reason a `pmcp` bump cannot silently ship a stale scaffold.
+
 ## [0.22.0] - Unreleased
 
 Phase 120 (config-server packaging). Re-pins onto the crates whose versions
