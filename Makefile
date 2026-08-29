@@ -280,10 +280,31 @@ test-tester:
 # templates/agent.rs PMCP_AGENT_VERSION), the tests whose whole job is to fire on
 # a version bump. A `chore: bump` commit passed this gate green and then failed
 # CI on exactly that tripwire; this target closes that hole.
+#
+# `--lib` AND `--bins`, because this leg once closed the hole one level short.
+# `cargo-pmcp/src/lib.rs` declares NO `mod commands`, so ALL of
+# `src/commands/**` (save, load, deploy, doctor, secret, package/*) compiles into
+# the BIN target. Measured 2026-08-29: `--lib` alone runs 524 tests and the bin
+# adds a further 927 that were reached by NOTHING. The vacuity guard below could
+# not catch it -- it fires only at ZERO, so this leg was green at 524 while
+# missing 927, the partial-blind-spot shape `test-server-toolkit`'s comment
+# describes in general terms.
+#
+# Two details, both measured rather than assumed:
+#   * `--test-threads=1` is REQUIRED. The doctor and aws-artifact tests race on
+#     shared fixture paths: `--bins` in parallel fails 5 tests
+#     nondeterministically, serialized passes 927/927.
+#   * `RUSTFLAGS=` is deliberate and matches `test-cargo-pmcp-integration`, which
+#     already empties it for the same crate. The bin has never been compiled
+#     under the `-D warnings` this Makefile sets, and it carries 13 pre-existing
+#     dead-code violations across pentest/, deployment/, secrets/, configure/ and
+#     commands/package/. Emptying RUSTFLAGS keeps this leg's posture identical to
+#     its sibling instead of making 927 tests hostage to a cleanup that needs a
+#     per-item judgement (scaffolding for pending work vs. genuinely dead).
 .PHONY: test-cargo-pmcp
 test-cargo-pmcp:
 	@echo "$(BLUE)Running cargo-pmcp's own tests...$(NC)"
-	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib 2>&1); \
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib --bins -- --test-threads=1 2>&1); \
 	status=$$?; \
 	echo "$$out"; \
 	if [ $$status -ne 0 ]; then exit $$status; fi; \
