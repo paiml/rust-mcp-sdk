@@ -23,6 +23,28 @@ pub struct BuildResult {
     pub deployment_package: Option<PathBuf>,
 }
 
+/// Where `deploy` writes the Lambda bootstrap it uploads, under `project_root`.
+///
+/// THE one definition of that path. `cargo pmcp package save` defaults to it
+/// (its `--binary-from`/`--binary` inputs), so producer and consumer must agree
+/// — and the failure when they do not is silent, not loud: a STALE bootstrap
+/// left behind by a path change is still found, still hashed, and still packed,
+/// yielding a package that pins bytes the deployed server does not run. That is
+/// an integrity failure in a format whose whole purpose is byte-accurate
+/// identity, and no error is raised anywhere along the way.
+///
+/// A shared function rather than a drift test on purpose: the authority here is
+/// Rust in the same binary, so the compiler can enforce it. This repo's
+/// drift-guard idiom (`templates/workbook_server.rs`'s `PMCP_VERSION`) is for
+/// authorities Rust cannot import — an external `Cargo.toml` — and is a
+/// fallback for uncrossable boundaries, not the default.
+pub fn bootstrap_path(project_root: &Path) -> PathBuf {
+    project_root.join(BOOTSTRAP_RELATIVE)
+}
+
+/// [`bootstrap_path`]'s project-relative form, for messages that name it.
+pub const BOOTSTRAP_RELATIVE: &str = "deploy/.build/bootstrap";
+
 impl BinaryBuilder {
     pub fn new(project_root: PathBuf) -> Self {
         // Check if OAuth is enabled in config and if we should build local OAuth lambdas
@@ -182,11 +204,10 @@ impl BinaryBuilder {
         }
 
         // Destination path for CDK
-        let deploy_build_dir = self.project_root.join("deploy/.build");
-        std::fs::create_dir_all(&deploy_build_dir)
+        let dst = bootstrap_path(&self.project_root);
+        let deploy_build_dir = dst.parent().expect("bootstrap_path always has a parent");
+        std::fs::create_dir_all(deploy_build_dir)
             .context("Failed to create deploy/.build directory")?;
-
-        let dst = deploy_build_dir.join("bootstrap");
 
         // Copy binary
         std::fs::copy(&src, &dst).context("Failed to copy binary to deploy/.build/bootstrap")?;

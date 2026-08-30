@@ -123,8 +123,17 @@ fn referenced_binary_digest() -> String {
         .to_string()
 }
 
-/// Run `package save` on the london-tube project at `root`, writing `output`.
-fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::assert::Assert {
+/// Run `package save` on the london-tube project at `root`, writing `output`,
+/// with `extra` appended verbatim.
+///
+/// One argv for every save in this file, so a test reads as exactly the rule it
+/// names — the trailing slice — instead of restating the leading arguments.
+fn save_with(
+    root: &Path,
+    config: &Path,
+    output: &Path,
+    extra: &[&str],
+) -> assert_cmd::assert::Assert {
     Command::cargo_bin("cargo-pmcp")
         .expect("cargo-pmcp binary must be available")
         .args([
@@ -132,16 +141,29 @@ fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::as
             "save",
             "--config",
             config.to_str().unwrap(),
-            "--spec",
-            root.join("london-tube-api.yaml").to_str().unwrap(),
             "--project-root",
             root.to_str().unwrap(),
             "--output",
             output.to_str().unwrap(),
+        ])
+        .args(extra)
+        .assert()
+}
+
+/// Run `package save` on the london-tube project at `root`, writing `output`.
+fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::assert::Assert {
+    let spec = root.join("london-tube-api.yaml");
+    save_with(
+        root,
+        config,
+        output,
+        &[
+            "--spec",
+            spec.to_str().unwrap(),
             "--binary-digest",
             &referenced_binary_digest(),
-        ])
-        .assert()
+        ],
+    )
 }
 
 /// Run `package load`, returning the assertion for the caller to judge.
@@ -1737,31 +1759,13 @@ fn unpacked_binary(layout_dir: &Path) -> UnpackedBinary {
         .binary
 }
 
-/// Run `package save` with an explicit binary flag pair.
-fn save_with_binary_flag(
-    root: &Path,
-    config: &Path,
-    output: &Path,
-    flag: &str,
-    value: &str,
-) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("cargo-pmcp")
-        .expect("cargo-pmcp binary must be available")
-        .args([
-            "package",
-            "save",
-            "--config",
-            config.to_str().unwrap(),
-            "--spec",
-            root.join("london-tube-api.yaml").to_str().unwrap(),
-            "--project-root",
-            root.to_str().unwrap(),
-            "--output",
-            output.to_str().unwrap(),
-            flag,
-            value,
-        ])
-        .assert()
+/// Write the stand-in bootstrap at `path`, creating its directory, and return it.
+fn write_fake_bootstrap(path: PathBuf) -> PathBuf {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the bootstrap's directory");
+    }
+    std::fs::write(&path, FAKE_BOOTSTRAP).expect("write the fake bootstrap");
+    path
 }
 
 /// R4.1/R4.4: `--binary` embeds, and the package becomes self-contained — the
@@ -1771,11 +1775,16 @@ fn binary_flag_embeds_bytes_that_survive_the_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     let config = london_tube_project(root);
-    let bootstrap = root.join("bootstrap");
-    std::fs::write(&bootstrap, FAKE_BOOTSTRAP).expect("write the fake bootstrap");
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
     let tar = root.join("out.tar");
 
-    save_with_binary_flag(root, &config, &tar, "--binary", bootstrap.to_str().unwrap()).success();
+    save_with(
+        root,
+        &config,
+        &tar,
+        &["--binary", bootstrap.to_str().unwrap()],
+    )
+    .success();
 
     let unpacked = root.join("unpacked");
     load_artifact(&tar, &unpacked, false).success();
@@ -1799,16 +1808,14 @@ fn binary_from_derives_a_digest_matching_an_independent_computation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     let config = london_tube_project(root);
-    let bootstrap = root.join("bootstrap");
-    std::fs::write(&bootstrap, FAKE_BOOTSTRAP).expect("write the fake bootstrap");
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
     let tar = root.join("out.tar");
 
-    save_with_binary_flag(
+    save_with(
         root,
         &config,
         &tar,
-        "--binary-from",
-        bootstrap.to_str().unwrap(),
+        &["--binary-from", bootstrap.to_str().unwrap()],
     )
     .success();
 
@@ -1834,27 +1841,10 @@ fn the_default_path_is_found_and_referenced_not_embedded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     let config = london_tube_project(root);
-    let build_dir = root.join("deploy/.build");
-    std::fs::create_dir_all(&build_dir).expect("create deploy/.build");
-    std::fs::write(build_dir.join("bootstrap"), FAKE_BOOTSTRAP).expect("write the bootstrap");
+    write_fake_bootstrap(root.join("deploy/.build/bootstrap"));
     let tar = root.join("out.tar");
 
-    Command::cargo_bin("cargo-pmcp")
-        .expect("cargo-pmcp binary must be available")
-        .args([
-            "package",
-            "save",
-            "--config",
-            config.to_str().unwrap(),
-            "--spec",
-            root.join("london-tube-api.yaml").to_str().unwrap(),
-            "--project-root",
-            root.to_str().unwrap(),
-            "--output",
-            tar.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    save_with(root, &config, &tar, &[]).success();
 
     let unpacked = root.join("unpacked");
     load_artifact(&tar, &unpacked, false).success();
@@ -1882,19 +1872,7 @@ fn a_bare_save_with_no_binary_anywhere_names_every_option() {
     let root = dir.path();
     let config = london_tube_project(root);
 
-    Command::cargo_bin("cargo-pmcp")
-        .expect("cargo-pmcp binary must be available")
-        .args([
-            "package",
-            "save",
-            "--config",
-            config.to_str().unwrap(),
-            "--project-root",
-            root.to_str().unwrap(),
-            "--output",
-            root.join("out.tar").to_str().unwrap(),
-        ])
-        .assert()
+    save_with(root, &config, &root.join("out.tar"), &[])
         .failure()
         .stderr(
             contains("--binary ")
@@ -1912,25 +1890,18 @@ fn the_three_binary_forms_are_mutually_exclusive() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     let config = london_tube_project(root);
-    let bootstrap = root.join("bootstrap");
-    std::fs::write(&bootstrap, FAKE_BOOTSTRAP).expect("write the fake bootstrap");
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
 
-    Command::cargo_bin("cargo-pmcp")
-        .expect("cargo-pmcp binary must be available")
-        .args([
-            "package",
-            "save",
-            "--config",
-            config.to_str().unwrap(),
-            "--project-root",
-            root.to_str().unwrap(),
-            "--output",
-            root.join("out.tar").to_str().unwrap(),
+    save_with(
+        root,
+        &config,
+        &root.join("out.tar"),
+        &[
             "--binary",
             bootstrap.to_str().unwrap(),
             "--binary-digest",
             &referenced_binary_digest(),
-        ])
-        .assert()
-        .failure();
+        ],
+    )
+    .failure();
 }

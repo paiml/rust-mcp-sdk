@@ -291,9 +291,21 @@ test-tester:
 # describes in general terms.
 #
 # Two details, both measured rather than assumed:
-#   * `--test-threads=1` is REQUIRED. The doctor and aws-artifact tests race on
-#     shared fixture paths: `--bins` in parallel fails 5 tests
-#     nondeterministically, serialized passes 927/927.
+#   * TWO invocations, not one: `-- --test-threads=1` reaches every binary in an
+#     invocation, and only the BIN target has racers. Measured: lib 524 tests,
+#     5.06s parallel vs 7.58s serial; bin 927 tests, 4-9 failures every parallel
+#     run vs 4.66s clean serialized. Splitting keeps the lib leg parallel.
+#     The racers are wider than doctor alone -- configure/{list,show,workspace,
+#     resolver,use_cmd}.rs, deploy/mod.rs and doctor.rs make 20 process-global
+#     `set_current_dir` calls. Isolating them is a real refactor; serializing the
+#     bin leg is the right trade.
+#   * The PER-TARGET guard is the load-bearing half. A summed count answers "was
+#     the selection non-empty", NEVER "was it complete" -- which is why the
+#     `ran -eq 0` check stayed green at 524 while 927 tests were dark. It reuses
+#     `scripts/named-test-binary-count.awk` from `test-cargo-pmcp-integration`,
+#     whose own comment states the principle: a nonzero SUM proves the SELECTION
+#     ran, not that any particular binary ran. Drop `--bins` above and this now
+#     FAILS instead of passing.
 #   * `RUSTFLAGS=` is deliberate and matches `test-cargo-pmcp-integration`, which
 #     already empties it for the same crate. The bin has never been compiled
 #     under the `-D warnings` this Makefile sets, and it carries 13 pre-existing
@@ -301,10 +313,16 @@ test-tester:
 #     commands/package/. Emptying RUSTFLAGS keeps this leg's posture identical to
 #     its sibling instead of making 927 tests hostage to a cleanup that needs a
 #     per-item judgement (scaffolding for pending work vs. genuinely dead).
+#     NOT this target's debt to pay: `make lint` carries no `-p`, so it resolves
+#     to the root `pmcp` and never lints cargo-pmcp's bin at all. The root cause
+#     is the dual-target layout (`main.rs` re-declares every module instead of
+#     consuming the lib), already recorded as a follow-up elsewhere in this file.
+#     Fix it there, not by turning a test target into a linter.
 .PHONY: test-cargo-pmcp
 test-cargo-pmcp:
 	@echo "$(BLUE)Running cargo-pmcp's own tests...$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib --bins -- --test-threads=1 2>&1); \
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib 2>&1; \
+	        RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --bins -- --test-threads=1 2>&1); \
 	status=$$?; \
 	echo "$$out"; \
 	if [ $$status -ne 0 ]; then exit $$status; fi; \
@@ -313,6 +331,24 @@ test-cargo-pmcp:
 		echo "$(RED)✗ cargo-pmcp reported 0 tests — the gate is not reaching this crate$(NC)"; \
 		exit 1; \
 	fi; \
+	for t in src/lib.rs src/main.rs; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="$$t" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ unittest target '$$t' never RAN. If a --lib/--bins selector was dropped from this recipe that is the cause — it is exactly how 927 bin-target tests went dark while this leg reported green.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ unittest target '$$t' printed a target line but NO 'test result:' followed — truncated output. This gate refuses to pass on output it cannot read.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ unittest target '$$t' RAN but passed ZERO tests. The summed total ($$ran) stays nonzero from the other target, so the count guard above CANNOT catch this.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ unittest target '$$t' — extractor gave no usable reading ('$$n'). EMPTY means awk did not run: check scripts/named-test-binary-count.awk.$(NC)"; \
+			exit 1;; \
+		esac; \
+		echo "$(GREEN)  ✓ $$t ran ($$n passed)$(NC)"; \
+	done; \
 	echo "$(GREEN)✓ cargo-pmcp tests passed ($$ran tests)$(NC)"
 
 # The GATE's reach into `cargo-pmcp/tests/`, mirroring test-openapi-server.

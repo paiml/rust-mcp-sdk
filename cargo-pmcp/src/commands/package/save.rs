@@ -66,8 +66,8 @@ use crate::deployment::stack_routing::load_deploy_descriptor;
 /// A configuration server NAMES its runtime rather than carrying it, exactly as
 /// `crates/pmcp-openapi-server/tests/roundtrip_e2e.rs` does. The value is a
 /// hint recorded in the binary-ref layer for the target environment; the digest
-/// is the load-bearing half and has no default, which is why `--binary-digest`
-/// is required and this is not.
+/// is the load-bearing half, which is why the three `--binary*` inputs derive or
+/// demand one while this stays a hint with a default.
 const DEFAULT_BINARY_MEDIA_TYPE: &str = "application/x-lambda-bootstrap; arch=arm64";
 
 /// Long help for `--spec`, written out because omitting the flag silently
@@ -151,7 +151,16 @@ fn refuse_a_kind_save_cannot_pack(kind: SaveKind) -> Result<()> {
 }
 
 /// Arguments for `cargo pmcp package save`.
+///
+/// The three `--binary*` inputs form one at-most-one group. Stated once here
+/// rather than as three cross-referencing `conflicts_with_all` attributes,
+/// which cost six name mentions for a three-way rule and grow quadratically.
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("binary_input").args([
+    "binary",
+    "binary_from",
+    "binary_digest",
+])))]
 pub struct SaveArgs {
     /// Path to the server's `config.toml`.
     #[arg(long)]
@@ -182,11 +191,11 @@ pub struct SaveArgs {
     /// The digest is derived from the bytes, so it cannot disagree with them.
     /// Note an embedded package's digest moves whenever the binary is rebuilt —
     /// see [`BINARY_LONG_HELP`].
-    #[arg(long, conflicts_with_all = ["binary_from", "binary_digest"], long_help = BINARY_LONG_HELP)]
+    #[arg(long, long_help = BINARY_LONG_HELP)]
     pub binary: Option<PathBuf>,
 
     /// Reference the binary at this path; its digest is derived from the file.
-    #[arg(long, conflicts_with_all = ["binary", "binary_digest"])]
+    #[arg(long)]
     pub binary_from: Option<PathBuf>,
 
     /// `sha256:<hex>` digest of the runtime binary the target must resolve.
@@ -195,7 +204,7 @@ pub struct SaveArgs {
     /// hand. Prefer `--binary-from` locally: deriving the digest from the bytes
     /// removes the class of error where the two disagree because a human typed
     /// one of them.
-    #[arg(long, conflicts_with_all = ["binary", "binary_from"])]
+    #[arg(long)]
     pub binary_digest: Option<String>,
 
     /// Descriptive media-type hint for that runtime binary.
@@ -203,14 +212,19 @@ pub struct SaveArgs {
     pub binary_media_type: String,
 }
 
-/// Where `cargo pmcp deploy` leaves the artifact it uploads.
+/// Where `cargo pmcp deploy` leaves the artifact it uploads, project-relative.
 ///
-/// `deploy` runs `cargo lambda build --release --arm64` with Zig wrappers and
-/// copies the result here (`deployment/builder.rs`), so this is a genuine
-/// `aarch64-unknown-linux` bootstrap and the exact bytes that reach Lambda —
-/// arm64 being the target on both Lambda and pmcp.run. Defaulting to it makes
-/// the common case a bare `cargo pmcp package save`.
-pub(crate) const DEFAULT_BINARY_PATH: &str = "deploy/.build/bootstrap";
+/// Re-exported from `deployment::builder`, which OWNS it: `deploy` runs
+/// `cargo lambda build --release --arm64` with Zig wrappers and writes the
+/// result there, so this is a genuine `aarch64-unknown-linux` bootstrap and the
+/// exact bytes that reach Lambda — arm64 being the target on both Lambda and
+/// pmcp.run. Defaulting to it makes the common case a bare
+/// `cargo pmcp package save`.
+///
+/// Taken from the producer rather than restated here because a disagreement is
+/// SILENT: a stale bootstrap left by a path change is still found, hashed and
+/// packed, pinning bytes the deployed server does not run.
+use crate::deployment::builder::{bootstrap_path, BOOTSTRAP_RELATIVE};
 
 /// Long help for `--binary`, which states the one trade embedding makes.
 const BINARY_LONG_HELP: &str = "\
@@ -228,11 +242,17 @@ digest does not, which is what lets one tested package move between environments
 unchanged. For a hand-rolled server whose identity IS its code, a digest that
 tracks the code is arguably correct; for a configuration server it is not.";
 
+/// Read the runtime binary, naming the path in the error rather than surfacing
+/// a bare ENOENT.
+fn read_runtime_binary(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("read the runtime binary {}", path.display()))
+}
+
 /// Which binary input `save` will use, after resolving the flags against the
 /// default path. Split from the I/O so the precedence rules are testable
 /// without a filesystem.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum BinarySource {
+enum BinarySource {
     /// Embed the bytes at this path — the package becomes self-contained.
     Embed(PathBuf),
     /// Reference the binary at this path; derive the digest from its bytes.
@@ -251,7 +271,7 @@ pub(crate) enum BinarySource {
 ///
 /// Returns an error naming all three flags and the default path when no input
 /// is available.
-pub(crate) fn resolve_binary_source(
+fn resolve_binary_source(
     binary: Option<&Path>,
     binary_from: Option<&Path>,
     binary_digest: Option<&str>,
@@ -275,8 +295,8 @@ pub(crate) fn resolve_binary_source(
         return Ok(BinarySource::ReferencePath(path.to_path_buf()));
     }
     bail!(
-        "no runtime binary given, and none found at {DEFAULT_BINARY_PATH}.\n  \
-         Build it first with `cargo pmcp deploy` (which writes {DEFAULT_BINARY_PATH}), or name \
+        "no runtime binary given, and none found at {BOOTSTRAP_RELATIVE}.\n  \
+         Build it first with `cargo pmcp deploy` (which writes {BOOTSTRAP_RELATIVE}), or name \
          one:\n    \
          --binary <path>         embed the bytes (self-contained package)\n    \
          --binary-from <path>    reference it; the digest is derived from the file\n    \
@@ -468,7 +488,7 @@ pub fn execute(args: SaveArgs, global_flags: &GlobalFlags) -> Result<()> {
 
     // The default path is offered only when it exists, so the "nothing to pack"
     // error can name what it looked for rather than failing on a read.
-    let default_binary = project_root.join(DEFAULT_BINARY_PATH);
+    let default_binary = bootstrap_path(&project_root);
     let source = resolve_binary_source(
         args.binary.as_deref(),
         args.binary_from.as_deref(),
@@ -476,31 +496,27 @@ pub fn execute(args: SaveArgs, global_flags: &GlobalFlags) -> Result<()> {
         default_binary.exists().then_some(default_binary.as_path()),
     )?;
 
-    // Bytes are bound here, outside the `pack_server` call, because
-    // `BinaryMode::Embedded` BORROWS them.
-    let binary_bytes = match &source {
-        BinarySource::Embed(path) | BinarySource::ReferencePath(path) => Some(
-            std::fs::read(path)
-                .with_context(|| format!("read the runtime binary {}", path.display()))?,
-        ),
-        BinarySource::ReferenceDigest(_) => None,
-    };
-    let binary_mode = match (&source, &binary_bytes) {
-        (BinarySource::Embed(_), Some(bytes)) => BinaryMode::Embedded(bytes),
-        (BinarySource::ReferencePath(_), Some(bytes)) => BinaryMode::Referenced {
+    // Declared here rather than inside the arm because `BinaryMode::Embedded`
+    // BORROWS, so the bytes must outlive `pack_server`. Only the embed arm needs
+    // that: the reference arm's read is a statement temporary that drops as soon
+    // as the digest is taken, so a 15 MB bootstrap is not held for the rest of
+    // the pack.
+    let embedded_bytes: Vec<u8>;
+    let binary_mode = match &source {
+        BinarySource::Embed(path) => {
+            embedded_bytes = read_runtime_binary(path)?;
+            BinaryMode::Embedded(&embedded_bytes)
+        },
+        BinarySource::ReferencePath(path) => BinaryMode::Referenced {
             // R4.4: derived from the bytes, so digest and binary cannot disagree.
-            digest: ManifestDigest::from_bytes(bytes),
+            digest: ManifestDigest::from_bytes(&read_runtime_binary(path)?),
             media_type: args.binary_media_type.clone(),
         },
-        (BinarySource::ReferenceDigest(digest), _) => BinaryMode::Referenced {
+        BinarySource::ReferenceDigest(digest) => BinaryMode::Referenced {
             digest: ManifestDigest::parse(digest).with_context(|| {
                 format!("--binary-digest '{digest}' is not a sha256:<hex> digest")
             })?,
             media_type: args.binary_media_type.clone(),
-        },
-        // Unreachable: the two path arms always bind bytes above.
-        (BinarySource::Embed(path) | BinarySource::ReferencePath(path), None) => {
-            bail!("failed to read the runtime binary {}", path.display())
         },
     };
 
@@ -606,11 +622,10 @@ mod tests {
     /// silently carry that binary N times because a default changed shape.
     #[test]
     fn the_default_path_is_used_and_it_references_rather_than_embeds() {
-        let got =
-            resolve_binary_source(None, None, None, Some(&p("deploy/.build/bootstrap"))).unwrap();
+        let got = resolve_binary_source(None, None, None, Some(&p(BOOTSTRAP_RELATIVE))).unwrap();
         assert_eq!(
             got,
-            BinarySource::ReferencePath(p("deploy/.build/bootstrap")),
+            BinarySource::ReferencePath(p(BOOTSTRAP_RELATIVE)),
             "embedding must stay opt-in — the default may never grow the package"
         );
     }
@@ -626,7 +641,7 @@ mod tests {
             "--binary",
             "--binary-from",
             "--binary-digest",
-            DEFAULT_BINARY_PATH,
+            BOOTSTRAP_RELATIVE,
             "cargo pmcp deploy",
         ] {
             assert!(
@@ -643,13 +658,9 @@ mod tests {
     /// wrong kind of total.
     #[test]
     fn explicit_input_always_beats_the_default_path() {
-        let got = resolve_binary_source(
-            None,
-            None,
-            Some("sha256:abc"),
-            Some(&p("deploy/.build/bootstrap")),
-        )
-        .unwrap();
+        let got =
+            resolve_binary_source(None, None, Some("sha256:abc"), Some(&p(BOOTSTRAP_RELATIVE)))
+                .unwrap();
         assert_eq!(got, BinarySource::ReferenceDigest("sha256:abc".to_string()));
     }
 }
