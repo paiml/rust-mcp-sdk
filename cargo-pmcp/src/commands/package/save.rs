@@ -242,6 +242,56 @@ digest does not, which is what lets one tested package move between environments
 unchanged. For a hand-rolled server whose identity IS its code, a digest that
 tracks the code is arguably correct; for a configuration server it is not.";
 
+/// A binary input after the flags are resolved AND the I/O is done.
+///
+/// Distinct from [`BinarySource`], which is the pure pre-I/O intent: this owns
+/// the bytes for the embed case, because [`BinaryMode::Embedded`] borrows and
+/// the borrow must outlive `pack_server`.
+enum ResolvedBinary {
+    /// Bytes to embed, read from disk.
+    Embed(Vec<u8>),
+    /// A digest to reference — derived from a file or supplied on the command line.
+    Reference(ManifestDigest),
+}
+
+/// Resolve `--binary` / `--binary-from` / `--binary-digest` (or the default
+/// path) into the binary this pack is about, doing the reads.
+///
+/// Extracted from `execute` rather than inlined so that function stays under
+/// the repo's cognitive-complexity ceiling — CLAUDE.md caps it at 25 per
+/// function and CI enforces it with `pmat quality-gate --checks complexity`.
+/// Inlined, this block put `execute` at 27.
+///
+/// # Errors
+///
+/// Per [`resolve_binary_source`] when no input is available; otherwise when a
+/// named binary cannot be read, or a supplied digest is not `sha256:<hex>`.
+fn resolve_binary(args: &SaveArgs, project_root: &Path) -> Result<ResolvedBinary> {
+    // The default path is offered only when it EXISTS, so the "nothing to pack"
+    // error can name what it looked for rather than failing on a read.
+    let default_binary = bootstrap_path(project_root);
+    let source = resolve_binary_source(
+        args.binary.as_deref(),
+        args.binary_from.as_deref(),
+        args.binary_digest.as_deref(),
+        default_binary.exists().then_some(default_binary.as_path()),
+    )?;
+    Ok(match &source {
+        BinarySource::Embed(path) => ResolvedBinary::Embed(read_runtime_binary(path)?),
+        // R4.4: derived from the bytes, so digest and binary cannot disagree.
+        // The Vec is a statement temporary and drops here, so a 15 MB bootstrap
+        // is not held for the rest of the pack.
+        BinarySource::ReferencePath(path) => {
+            ResolvedBinary::Reference(ManifestDigest::from_bytes(&read_runtime_binary(path)?))
+        },
+        BinarySource::ReferenceDigest(digest) => {
+            ResolvedBinary::Reference(ManifestDigest::parse(digest).with_context(|| {
+                format!("--binary-digest '{digest}' is not a sha256:<hex> digest")
+            })?)
+        },
+    })
+}
+
 /// Read the runtime binary, naming the path in the error rather than surfacing
 /// a bare ENOENT.
 fn read_runtime_binary(path: &Path) -> Result<Vec<u8>> {
@@ -486,36 +536,13 @@ pub fn execute(args: SaveArgs, global_flags: &GlobalFlags) -> Result<()> {
         );
     }
 
-    // The default path is offered only when it exists, so the "nothing to pack"
-    // error can name what it looked for rather than failing on a read.
-    let default_binary = bootstrap_path(&project_root);
-    let source = resolve_binary_source(
-        args.binary.as_deref(),
-        args.binary_from.as_deref(),
-        args.binary_digest.as_deref(),
-        default_binary.exists().then_some(default_binary.as_path()),
-    )?;
-
-    // Declared here rather than inside the arm because `BinaryMode::Embedded`
-    // BORROWS, so the bytes must outlive `pack_server`. Only the embed arm needs
-    // that: the reference arm's read is a statement temporary that drops as soon
-    // as the digest is taken, so a 15 MB bootstrap is not held for the rest of
-    // the pack.
-    let embedded_bytes: Vec<u8>;
-    let binary_mode = match &source {
-        BinarySource::Embed(path) => {
-            embedded_bytes = read_runtime_binary(path)?;
-            BinaryMode::Embedded(&embedded_bytes)
-        },
-        BinarySource::ReferencePath(path) => BinaryMode::Referenced {
-            // R4.4: derived from the bytes, so digest and binary cannot disagree.
-            digest: ManifestDigest::from_bytes(&read_runtime_binary(path)?),
-            media_type: args.binary_media_type.clone(),
-        },
-        BinarySource::ReferenceDigest(digest) => BinaryMode::Referenced {
-            digest: ManifestDigest::parse(digest).with_context(|| {
-                format!("--binary-digest '{digest}' is not a sha256:<hex> digest")
-            })?,
+    // `resolved` OWNS the embedded bytes, so it must outlive `binary_mode`,
+    // which borrows them — hence two bindings here rather than one expression.
+    let resolved = resolve_binary(&args, &project_root)?;
+    let binary_mode = match &resolved {
+        ResolvedBinary::Embed(bytes) => BinaryMode::Embedded(bytes),
+        ResolvedBinary::Reference(digest) => BinaryMode::Referenced {
+            digest: digest.clone(),
             media_type: args.binary_media_type.clone(),
         },
     };
