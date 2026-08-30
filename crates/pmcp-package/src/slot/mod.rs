@@ -21,4 +21,4 @@ pub use aggregate::aggregate;
 pub use classification::{classify, SlotClass};
 pub use deviation::{detect_deviation, Deviation};
 pub use required::{required_slots, RequiredSlot};
-pub use types::{ConfigSlot, SlotType};
+pub use types::{ConfigSlot, SlotType, SuppliedBy};

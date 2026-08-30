@@ -80,6 +80,16 @@ pub fn aggregate<'a>(slots: impl IntoIterator<Item = &'a ConfigSlot>) -> Result<
 /// [`PackageError::ConfigSlotViolation`] for cases 1 and 3,
 /// [`PackageError::SlotConflict`] for a differing `tested_value`.
 fn reconcile_collision(name: &str, existing: &ConfigSlot, incoming: &ConfigSlot) -> Result<()> {
+    if existing.supplied_by != incoming.supplied_by {
+        return Err(PackageError::ConfigSlotViolation {
+            key: name.to_string(),
+            reason: "declared with two different `supplied_by` values by different components; \
+                     since `required_slots` enumerates only environment-supplied slots, \
+                     resolving this by input order would either ask an operator for a value the \
+                     host injects or fail to ask for one nobody supplies — both silent"
+                .to_string(),
+        });
+    }
     if existing.config_key != incoming.config_key {
         return Err(PackageError::ConfigSlotViolation {
             key: name.to_string(),

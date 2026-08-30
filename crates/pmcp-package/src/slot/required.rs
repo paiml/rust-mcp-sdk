@@ -100,6 +100,13 @@ pub struct RequiredSlot {
 pub fn required_slots(slots: &[ConfigSlot]) -> Vec<RequiredSlot> {
     let mut required: Vec<RequiredSlot> = slots
         .iter()
+        // R1.1: this is the enumerator of what a TARGET ENVIRONMENT must supply,
+        // so a value the host or the runtime injects does not belong in it. The
+        // excluded slots are NOT hidden — `package inspect`/`load` render them
+        // in their own labelled section, because a slot no operator must fill is
+        // near-invisible and near-invisibility is the failure mode this whole
+        // vocabulary exists to prevent.
+        .filter(|entry| entry.supplied_by.is_operator_supplied())
         .map(|entry| RequiredSlot {
             slot: entry.slot.clone(),
             class: classify(&entry.slot),
