@@ -5,6 +5,35 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-08-29
+
+### Added
+
+- **`package save` learns where the binary is.** Three mutually-exclusive inputs
+  — `--binary <path>` (embeds the bytes), `--binary-from <path>` (references,
+  digest derived from the file) and the existing `--binary-digest sha256:<hex>`
+  (references, digest supplied) — defaulting to `deploy/.build/bootstrap`, which
+  is where `cargo pmcp deploy` leaves the artifact it uploads. The common case is
+  now a bare `cargo pmcp package save`.
+
+  Deriving the digest from bytes removes the class of error where the digest and
+  the binary disagree because a human typed one of them. Before this, packing
+  meant hand-computing a `shasum` even though `deploy` had just produced the
+  exact bytes.
+
+  **Referencing remains the default.** A configuration server should name its
+  runtime rather than carry it, and a team package sharing one MCP server across
+  N agents would otherwise carry that binary N times. Embedding is opt-in.
+
+  The trade is documented in `--binary`'s long help: an embedded package's digest
+  moves on every rebuild, including a byte-identical-source rebuild on a
+  different toolchain, while a referenced one's does not.
+
+### Changed
+
+- **`--binary-digest` is no longer required.** Existing invocations are
+  unaffected; it is now one of three ways to answer the same question.
+
 ## [0.23.1] - 2026-08-28
 
 Ships with `pmcp` 2.19.2 / `pmcp-package` 0.3.1 (tag `v2.19.2`). Scaffold-output

@@ -292,7 +292,39 @@ cargo pmcp team dev --serve --port 8080     # or serve team-mcp over HTTP
 
 # 4. Inspect a portable AI-Package bundle locally, fully offline:
 cargo pmcp package inspect ./some-agent.pmcp
+
+# 5. Pack a server into a portable AI-Package. After `cargo pmcp deploy` has
+#    built the bootstrap, this needs no binary flag at all:
+cargo pmcp package save --config ./config.toml -o my-server.tar
 ```
+
+### Packing a server: the binary
+
+`package save` needs to know which runtime binary the package is about. It
+defaults to `deploy/.build/bootstrap` — where `cargo pmcp deploy` leaves the
+artifact it uploads — so the common case is the bare command above.
+
+| Flag | What it does |
+|---|---|
+| *(none)* | references `deploy/.build/bootstrap`, deriving the digest from it |
+| `--binary-from <path>` | references that file, deriving the digest from it |
+| `--binary <path>` | **embeds** the bytes; the package is self-contained |
+| `--binary-digest sha256:<hex>` | references a digest you supply (CI, artifact built elsewhere) |
+
+Deriving the digest from the bytes is the point of the first three: a digest you
+type by hand can disagree with the binary it names, and nothing downstream can
+tell.
+
+**Referencing is the default on purpose.** A configuration server should NAME its
+runtime rather than carry it, and a team package holding several agents that
+share one MCP server would otherwise carry that binary once per agent.
+
+**If you do embed**, know the trade: an embedded package's digest moves whenever
+the binary is rebuilt — including a byte-identical-source rebuild on a different
+toolchain — while a referenced package's digest does not. That stability is what
+lets one tested package move between environments unchanged. For a hand-rolled
+server whose identity *is* its code, a digest that tracks the code is arguably
+what you want; for a configuration server it is not.
 
 > `package inspect` reads an OCI image-layout `.pmcp` bundle. The remote
 > `capture`/`show` verbs (upload / fetch against the pmcp.run platform) are a

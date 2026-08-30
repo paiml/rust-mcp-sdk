@@ -98,6 +98,15 @@ BEGIN { ansi = sprintf("%c", 27) "\\[[0-9;]*[a-zA-Z]" }
 
 $1 == "Running" && $2 == want { seen = 1; next }
 
+# The UNITTEST form, for `--lib` / `--bins` targets. Cargo prints
+# `Running unittests src/lib.rs (...)`, so the path lands in $3 and $2 is the
+# literal `unittests` -- the rule above can never match it. Documented in the
+# field-splitting table at the top of this file since it was written; without
+# this rule a caller passing want="src/lib.rs" gets -1 ("never RAN") for a
+# target that ran perfectly, which is a false ALARM rather than a false pass,
+# but still sends the reader hunting for a renamed file.
+$1 == "Running" && $2 == "unittests" && $3 == want { seen = 1; next }
+
 seen && $1 == "test" && $2 == "result:" {
     print $4 + 0
     printed = 1

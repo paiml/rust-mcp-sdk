@@ -39,7 +39,7 @@ use oci_spec::image::{
     Descriptor, ImageIndexBuilder, ImageManifestBuilder, MediaType, SCHEMA_VERSION,
 };
 use pmcp_package::oci::media_types::{ARTIFACT_TYPE_SERVER, EMPTY_CONFIG_BLOB, MT_EMPTY_CONFIG};
-use pmcp_package::oci::OciLayout;
+use pmcp_package::oci::{unpack_server, OciLayout, UnpackedBinary};
 use pmcp_package::ManifestDigest;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -123,8 +123,17 @@ fn referenced_binary_digest() -> String {
         .to_string()
 }
 
-/// Run `package save` on the london-tube project at `root`, writing `output`.
-fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::assert::Assert {
+/// Run `package save` on the london-tube project at `root`, writing `output`,
+/// with `extra` appended verbatim.
+///
+/// One argv for every save in this file, so a test reads as exactly the rule it
+/// names — the trailing slice — instead of restating the leading arguments.
+fn save_with(
+    root: &Path,
+    config: &Path,
+    output: &Path,
+    extra: &[&str],
+) -> assert_cmd::assert::Assert {
     Command::cargo_bin("cargo-pmcp")
         .expect("cargo-pmcp binary must be available")
         .args([
@@ -132,16 +141,29 @@ fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::as
             "save",
             "--config",
             config.to_str().unwrap(),
-            "--spec",
-            root.join("london-tube-api.yaml").to_str().unwrap(),
             "--project-root",
             root.to_str().unwrap(),
             "--output",
             output.to_str().unwrap(),
+        ])
+        .args(extra)
+        .assert()
+}
+
+/// Run `package save` on the london-tube project at `root`, writing `output`.
+fn save_london_tube(root: &Path, config: &Path, output: &Path) -> assert_cmd::assert::Assert {
+    let spec = root.join("london-tube-api.yaml");
+    save_with(
+        root,
+        config,
+        output,
+        &[
+            "--spec",
+            spec.to_str().unwrap(),
             "--binary-digest",
             &referenced_binary_digest(),
-        ])
-        .assert()
+        ],
+    )
 }
 
 /// Run `package load`, returning the assertion for the caller to judge.
@@ -1719,4 +1741,167 @@ fn save_help_documents_the_kind_asymmetry() {
         .success()
         .stdout(contains("Only `server` is supported today"))
         .stdout(contains("per-kind"));
+}
+
+// ---------------------------------------------------------------------
+// R4: --binary / --binary-from / the default path
+// ---------------------------------------------------------------------
+
+/// Stand-in runtime binary bytes. Not a real ELF: `save` treats the file as
+/// opaque content to hash and carry, and pinning that opacity is the point.
+const FAKE_BOOTSTRAP: &[u8] = b"\x7fELF fake aarch64 bootstrap \x00\x01\x02";
+
+/// Read the binary carriage out of a layout `package load` wrote.
+fn unpacked_binary(layout_dir: &Path) -> UnpackedBinary {
+    let layout = OciLayout::open(layout_dir);
+    unpack_server(&layout)
+        .expect("unpack the loaded layout")
+        .binary
+}
+
+/// Write the stand-in bootstrap at `path`, creating its directory, and return it.
+fn write_fake_bootstrap(path: PathBuf) -> PathBuf {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the bootstrap's directory");
+    }
+    std::fs::write(&path, FAKE_BOOTSTRAP).expect("write the fake bootstrap");
+    path
+}
+
+/// R4.1/R4.4: `--binary` embeds, and the package becomes self-contained — the
+/// restored bytes must be byte-identical to what the author handed in.
+#[test]
+fn binary_flag_embeds_bytes_that_survive_the_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let config = london_tube_project(root);
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
+    let tar = root.join("out.tar");
+
+    save_with(
+        root,
+        &config,
+        &tar,
+        &["--binary", bootstrap.to_str().unwrap()],
+    )
+    .success();
+
+    let unpacked = root.join("unpacked");
+    load_artifact(&tar, &unpacked, false).success();
+
+    // Byte-identical, not merely "a layer exists" — the weaker assertion would
+    // pass on a truncated or re-encoded binary.
+    match unpacked_binary(&unpacked) {
+        UnpackedBinary::Embedded(bytes) => assert_eq!(
+            bytes, FAKE_BOOTSTRAP,
+            "an embedded binary must round-trip byte-for-byte"
+        ),
+        other => panic!("--binary must embed, got {other:?}"),
+    }
+}
+
+/// R4.4: `--binary-from` references, and the digest is DERIVED — so it equals an
+/// independently computed one. This is the property that removes the class of
+/// error where a hand-typed digest and the binary disagree.
+#[test]
+fn binary_from_derives_a_digest_matching_an_independent_computation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let config = london_tube_project(root);
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
+    let tar = root.join("out.tar");
+
+    save_with(
+        root,
+        &config,
+        &tar,
+        &["--binary-from", bootstrap.to_str().unwrap()],
+    )
+    .success();
+
+    let unpacked = root.join("unpacked");
+    load_artifact(&tar, &unpacked, false).success();
+
+    match unpacked_binary(&unpacked) {
+        UnpackedBinary::Referenced { digest, .. } => assert_eq!(
+            digest,
+            ManifestDigest::from_bytes(FAKE_BOOTSTRAP),
+            "the referenced digest must be derived from the file's bytes"
+        ),
+        other => panic!("--binary-from must reference, got {other:?}"),
+    }
+}
+
+/// R4.2 + R4.3: a bare `save` finds `deploy/.build/bootstrap` — and REFERENCES
+/// it. The negative half is the load-bearing one: a default that embedded would
+/// silently grow every package and multiply a shared binary across a team's
+/// agents, so this asserts no bootstrap layer was written.
+#[test]
+fn the_default_path_is_found_and_referenced_not_embedded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let config = london_tube_project(root);
+    write_fake_bootstrap(root.join("deploy/.build/bootstrap"));
+    let tar = root.join("out.tar");
+
+    save_with(root, &config, &tar, &[]).success();
+
+    let unpacked = root.join("unpacked");
+    load_artifact(&tar, &unpacked, false).success();
+
+    match unpacked_binary(&unpacked) {
+        UnpackedBinary::Referenced { digest, .. } => assert_eq!(
+            digest,
+            ManifestDigest::from_bytes(FAKE_BOOTSTRAP),
+            "the default path must be read and its digest derived from it"
+        ),
+        // The negative half, and the load-bearing one: a default that embedded
+        // would silently grow every package and multiply a shared binary across
+        // a team's agents.
+        UnpackedBinary::Embedded(_) => {
+            panic!("the DEFAULT must reference, never embed — embedding is opt-in via --binary")
+        },
+    }
+}
+
+/// With no flag and no artifact on disk, the error teaches every way out rather
+/// than failing on a missing file.
+#[test]
+fn a_bare_save_with_no_binary_anywhere_names_every_option() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let config = london_tube_project(root);
+
+    save_with(root, &config, &root.join("out.tar"), &[])
+        .failure()
+        .stderr(
+            contains("--binary ")
+                .and(contains("--binary-from"))
+                .and(contains("--binary-digest"))
+                .and(contains("deploy/.build/bootstrap"))
+                .and(contains("cargo pmcp deploy")),
+        );
+}
+
+/// The three forms are mutually exclusive, and clap must say so rather than
+/// letting a precedence rule decide silently.
+#[test]
+fn the_three_binary_forms_are_mutually_exclusive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let config = london_tube_project(root);
+    let bootstrap = write_fake_bootstrap(root.join("bootstrap"));
+
+    save_with(
+        root,
+        &config,
+        &root.join("out.tar"),
+        &[
+            "--binary",
+            bootstrap.to_str().unwrap(),
+            "--binary-digest",
+            &referenced_binary_digest(),
+        ],
+    )
+    .failure();
 }
