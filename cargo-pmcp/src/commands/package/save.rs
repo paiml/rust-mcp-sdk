@@ -421,7 +421,13 @@ fn slot_from_declaration(declaration: &DeclaredConfigSlot) -> Result<ConfigSlot>
             declaration.key
         ),
     };
-    Ok(ConfigSlot::new(slot).with_config_key(declaration.key.as_str()))
+    // `supplied_by` is carried straight through from the declaration: the config
+    // document is the source of truth for who fills a slot ("A generates, B
+    // verifies"), and `parse_declared_config_slots` has already refused anything
+    // outside the closed vocabulary.
+    Ok(ConfigSlot::new(slot)
+        .with_config_key(declaration.key.as_str())
+        .with_supplied_by(declaration.supplied_by))
 }
 
 /// Build the `ServerPackage` from the two files the user maintains (D-10).

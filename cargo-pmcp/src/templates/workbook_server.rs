@@ -56,7 +56,7 @@ const PMCP_VERSION: &str = "2.19.2";
 /// test asserts this equals the workspace `pmcp-server-toolkit` package version so
 /// the hardcoded pin cannot silently drift from the released crate (ME-01) —
 /// mirroring the `PMCP_VERSION` drift guard.
-const TOOLKIT_VERSION: &str = "0.1.2";
+const TOOLKIT_VERSION: &str = "0.1.3";
 
 /// Emit the files of a single runnable `workbook-server` crate into `dir`.
 pub fn generate(dir: &Path, name: &str) -> Result<()> {

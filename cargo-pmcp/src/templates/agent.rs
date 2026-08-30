@@ -46,7 +46,7 @@ use pmcp_package::{AgentPackage, ConfigSlot, SlotType};
 /// asserts this equals the workspace `crates/pmcp-agent` package version so the
 /// hardcoded pin cannot silently drift from the released crate (D-05) —
 /// mirroring the `workbook_server::PMCP_VERSION` drift guard.
-const PMCP_AGENT_VERSION: &str = "0.3.0";
+const PMCP_AGENT_VERSION: &str = "0.4.0";
 
 /// The `pmcp-package` version REQUIREMENT the emitted `Cargo.toml` declares —
 /// a caret major.minor line, not a full version.
@@ -64,7 +64,7 @@ const PMCP_AGENT_VERSION: &str = "0.3.0";
 /// reverting ONLY this line leaves `cargo build --workspace` green while
 /// `emitted_package_requirement_matches_workspace_major_minor_line` goes red.
 /// The compiler is not this emitter's tripwire; that test is.
-const PMCP_PACKAGE_VERSION_REQ: &str = "0.3";
+const PMCP_PACKAGE_VERSION_REQ: &str = "0.4";
 
 /// Emit the files of a single runnable agent crate into `dir`.
 pub fn generate(dir: &Path, name: &str) -> Result<()> {

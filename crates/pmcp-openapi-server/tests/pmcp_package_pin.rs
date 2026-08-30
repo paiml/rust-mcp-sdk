@@ -86,7 +86,7 @@ const OPENAPI_SERVER_CARGO_TOML: &str = include_str!("../Cargo.toml");
 const PMCP_PACKAGE_CARGO_TOML: &str = include_str!("../../pmcp-package/Cargo.toml");
 
 /// The major.minor line the round-trip E2E was written against.
-const EXPECTED_VERSION_LINE: &str = "0.3.";
+const EXPECTED_VERSION_LINE: &str = "0.4.";
 
 /// The path this crate's `pmcp-package` dev-dep must point at.
 const EXPECTED_DEP_PATH: &str = "../pmcp-package";

@@ -5,6 +5,61 @@ All notable changes to `pmcp-package` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-30
+
+Declares WHO fills a config slot. **Source-breaking on the Rust API** —
+`cargo semver-checks check-release --baseline-version 0.3.1` reports 1 major
+failure — so `^0.3` consumers must move their pin to `^0.4`. The wire format is
+additive: a config with no `supplied_by` parses exactly as before.
+
+### Added
+
+- **`SuppliedBy` (`environment` | `platform` | `runtime`) on `ConfigSlot`,
+  declarable in the config document.** A `[[config_slots]]` entry may now carry
+  `supplied_by = "platform"`, and `parse_declared_config_slots` reads it.
+  Absent means `environment` — the operator supplies it — so every existing
+  config keeps its exact meaning. An unrecognized VALUE is refused rather than
+  defaulted: silently reading it as `environment` would demand an operator fill
+  a value the host injects, which is the confusion the field exists to remove.
+  The rejected value is not echoed, matching the `kind` rule.
+
+- **`classify_slots` -> `Vec<ClassifiedSlot>`**: every declared slot, classified,
+  carrying `supplied_by`. `required_slots` is now DEFINED as its
+  operator-supplied projection rather than filtering independently, so the
+  "required" and "host-supplied" groups are complements by construction — there
+  is no second filter that can drift.
+
+- `SuppliedBy` is re-exported at the crate root, alongside the vocabulary types
+  it belongs with (`ConfigSlot`, `SlotType`, `SlotClass`, `RequiredSlot`).
+
+### Changed
+
+- **`required_slots` no longer enumerates host- or runtime-supplied slots.**
+  Asking an operator to fill a value the platform injects is wrong, and a
+  package that demanded them would be unfillable. Those slots are NOT hidden:
+  `cargo pmcp package load`/`pull` render them under a labelled *"Supplied by the
+  host at deploy time"* section, built by splitting the same `classify_slots`
+  list. (`package inspect` reports a count over the raw `config_slots` and is
+  unaffected; `package show` renders the raw list flat.)
+
+- **`validate_config_slot_agreement` compares `supplied_by`.** A config saying
+  `platform` against a package slot saying `environment` is a refusal, not a
+  silent preference for one side — the package would otherwise demand a value
+  the config says the host injects. Same posture as the `kind` disagreement.
+
+- **`aggregate`'s `reconcile_collision` compares `supplied_by`** and refuses a
+  disagreement, so two team components declaring the same secret with different
+  suppliers can no longer dedupe to whichever was inserted first.
+
+### Breaking
+
+- **`DeclaredConfigSlot` gained a `supplied_by` field and is now
+  `#[non_exhaustive]`.** The field addition alone was source-breaking because
+  the struct was externally constructible — the same break `ConfigSlot` took
+  when `config_key` was added, and this is the same fix it received in response.
+  Taking it once here is what stops the next field from costing another major.
+  Build these by parsing a config document; read them by field.
+
 ## [0.3.1] - 2026-08-27
 
 A correctness patch closing a one-directional gate. **Additive on the Rust API**
