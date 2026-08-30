@@ -43,7 +43,7 @@
 //! that was violated.
 
 use crate::error::{PackageError, Result};
-use crate::slot::{ConfigSlot, SlotType};
+use crate::slot::{ConfigSlot, SlotType, SuppliedBy};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The closed `kind` vocabulary a `[[config_slots]]` entry may declare. These
@@ -64,7 +64,16 @@ const ACCEPTED_KINDS: [&str; 3] = ["endpoint", "secret", "auth_mode"];
 /// with `unknown field`. That is the "packs cleanly and then fails to resolve
 /// at boot" class this module exists to close, so the vocabulary is enforced
 /// here too — see [`parse_declaration_entry`].
-const ACCEPTED_FIELDS: [&str; 4] = ["key", "kind", "name", "tested_value"];
+const ACCEPTED_FIELDS: [&str; 5] = ["key", "kind", "name", "tested_value", "supplied_by"];
+
+/// The closed `supplied_by` vocabulary, mirroring [`SuppliedBy`]'s serde names.
+///
+/// Re-validated here rather than deferring to serde because these bytes are
+/// untrusted input to this crate, and because an unknown value must be REFUSED
+/// rather than defaulted — silently reading an unrecognized `supplied_by` as
+/// `environment` would demand an operator fill a value the host injects, which
+/// is the exact confusion the field exists to remove.
+const ACCEPTED_SUPPLIED_BY: [&str; 3] = ["environment", "platform", "runtime"];
 
 /// Error label used when a failure is a property of the DOCUMENT rather than
 /// of any single declared key.
@@ -122,6 +131,13 @@ pub(crate) fn parse_document(config_bytes: &[u8]) -> Result<toml::Value> {
 /// that parses the real `london-tube.toml` the reference server boots from — if
 /// a field is renamed on either side, that test stops finding three slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Added with `supplied_by`, which was itself a source-break precisely because
+// this attribute was missing — the same break `ConfigSlot` took when
+// `config_key` was added, and got this same fix in response. Taking the break
+// once, here, is what stops the NEXT field from costing another major. Build
+// these by parsing a config document (`parse_declared_config_slots`); read them
+// by field.
+#[non_exhaustive]
 pub struct DeclaredConfigSlot {
     /// The dotted TOML path this slot fills, e.g. `backend.base_url`.
     pub key: String,
@@ -132,6 +148,10 @@ pub struct DeclaredConfigSlot {
     /// The value exercised when the server was tested. `None` for an
     /// identity-bearing slot, which structurally carries no value.
     pub tested_value: Option<String>,
+    /// Who fills this slot. Absent in the document means
+    /// [`SuppliedBy::Environment`] — the operator supplies it — so every config
+    /// written before this field existed keeps its meaning.
+    pub supplied_by: SuppliedBy,
 }
 
 /// Read the `[[config_slots]]` declaration table out of a server config
@@ -235,6 +255,8 @@ fn parse_declaration_entry(index: usize, entry: &toml::Value) -> Result<Declared
         Some(_) => return Err(violation(&label, "`tested_value` must be a string")),
     };
 
+    let supplied_by = parse_supplied_by(table, &label)?;
+
     // Match the runtime parser's `deny_unknown_fields` (see [`ACCEPTED_FIELDS`]).
     // The stray field name IS echoed: it is a KEY, not a value, and naming it is
     // the whole point — the same information `serde`'s own `unknown field` error
@@ -259,7 +281,39 @@ fn parse_declaration_entry(index: usize, entry: &toml::Value) -> Result<Declared
         kind,
         name,
         tested_value,
+        supplied_by,
     })
+}
+
+/// Read the optional `supplied_by` field, defaulting to
+/// [`SuppliedBy::Environment`] and refusing anything outside the vocabulary.
+///
+/// Absent is NOT an error: the field is additive, and a config that predates it
+/// means "the operator supplies it", which is the default. An unrecognized
+/// value IS an error — see [`ACCEPTED_SUPPLIED_BY`] for why defaulting would be
+/// the dangerous choice.
+fn parse_supplied_by(table: &toml::Table, label: &str) -> Result<SuppliedBy> {
+    let Some(raw) = table.get("supplied_by") else {
+        return Ok(SuppliedBy::Environment);
+    };
+    let Some(text) = raw.as_str() else {
+        return Err(violation(label, "`supplied_by` must be a string"));
+    };
+    match text {
+        "environment" => Ok(SuppliedBy::Environment),
+        "platform" => Ok(SuppliedBy::Platform),
+        "runtime" => Ok(SuppliedBy::Runtime),
+        // The rejected value is NOT echoed, matching the `kind` rule three
+        // functions up: it is attacker-controlled document CONTENT, and errors
+        // name the key and the rule rather than what the document said.
+        _ => Err(violation(
+            label,
+            format!(
+                "unknown `supplied_by`; the accepted values are {}",
+                ACCEPTED_SUPPLIED_BY.join(", ")
+            ),
+        )),
+    }
 }
 
 /// Read a required string field off a declaration entry.
@@ -275,7 +329,7 @@ fn required_string(table: &toml::Table, field: &str, label: &str) -> Result<Stri
 }
 
 /// The comparable projection of a slot: `(kind, name, tested_value)`.
-type SlotFacts<'a> = (&'a str, &'a str, Option<&'a str>);
+type SlotFacts<'a> = (&'a str, &'a str, Option<&'a str>, SuppliedBy);
 
 /// Require the config's `[[config_slots]]` declarations and the package's
 /// `config_slots` list to describe the SAME slots.
@@ -396,7 +450,40 @@ fn compare_facts(key: &str, declaration: SlotFacts<'_>, package: SlotFacts<'_>) 
             "the declared `tested_value` disagrees with the package slot's tested value",
         ));
     }
+    if declaration.3 != package.3 {
+        // A closed vocabulary, like `kind`, so naming both is safe and is what
+        // makes this actionable. Refused rather than reconciled: one side says
+        // an operator must fill this and the other says the host injects it, so
+        // the package would either demand a value nobody should supply or omit
+        // one nobody supplies. Both are wrong and neither is visible at deploy
+        // time — the same reasoning as `reconcile_collision`'s refusal.
+        return Err(violation(
+            key,
+            format!(
+                "the config declares supplied_by '{}' but the package slot is '{}'",
+                supplied_by_label(declaration.3),
+                supplied_by_label(package.3)
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// The TOML spelling of a [`SuppliedBy`], for error text.
+///
+/// A closed vocabulary — never config content — so echoing it is safe.
+fn supplied_by_label(supplied_by: SuppliedBy) -> &'static str {
+    match supplied_by {
+        SuppliedBy::Environment => "environment",
+        SuppliedBy::Platform => "platform",
+        SuppliedBy::Runtime => "runtime",
+        // NO catch-all arm. `#[non_exhaustive]` constrains only OTHER crates;
+        // inside the defining crate this match is exhaustive, so a `_` arm is
+        // unreachable (clippy rejects it) AND would defeat the point — the
+        // compiler error a new variant produces HERE is what forces its
+        // spelling to be added. Consumers in other crates do need a catch-all;
+        // `cargo-pmcp`'s renderer has one.
+    }
 }
 
 /// Index the declarations by config key, rejecting a duplicated key.
@@ -407,6 +494,7 @@ fn declared_fact_map(declared: &[DeclaredConfigSlot]) -> Result<BTreeMap<&str, S
             declaration.kind.as_str(),
             declaration.name.as_str(),
             declaration.tested_value.as_deref(),
+            declaration.supplied_by,
         );
         if map.insert(declaration.key.as_str(), facts).is_some() {
             return Err(violation(
@@ -427,7 +515,7 @@ fn package_fact_map(package_slots: &[ConfigSlot]) -> Result<BTreeMap<&str, SlotF
             continue;
         };
         let (kind, name) = slot.slot.key();
-        let facts = (kind, name, slot.slot.tested_value());
+        let facts = (kind, name, slot.slot.tested_value(), slot.supplied_by);
         if map.insert(config_key, facts).is_some() {
             return Err(violation(
                 config_key,
@@ -1237,6 +1325,181 @@ mod tests {
         assert_eq!(declared[2].tested_value.as_deref(), Some("api_key"));
     }
 
+    // --- supplied_by parsing ----------------------------------------------
+
+    /// Absent means `environment`, so every config written before this field
+    /// existed keeps its exact meaning rather than becoming unparseable.
+    #[test]
+    fn a_declaration_without_supplied_by_defaults_to_environment() {
+        let declared = parse_declared_config_slots(LONDON_TUBE_TOML).unwrap();
+        assert_eq!(declared.len(), 3);
+        for entry in &declared {
+            assert_eq!(entry.supplied_by, SuppliedBy::Environment);
+        }
+    }
+
+    /// The whole point of the field: a config can now SAY the host injects a
+    /// value, and that reaches the package.
+    #[test]
+    fn a_declaration_can_name_platform_or_runtime() {
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+supplied_by = "platform"
+
+[[config_slots]]
+key = "backend.function_name"
+kind = "secret"
+name = "AWS_LAMBDA_FUNCTION_NAME"
+supplied_by = "runtime"
+"#;
+        let declared = parse_declared_config_slots(config).unwrap();
+        assert_eq!(declared[0].supplied_by, SuppliedBy::Platform);
+        assert_eq!(declared[1].supplied_by, SuppliedBy::Runtime);
+    }
+
+    /// An unrecognized value is REFUSED, never defaulted. Defaulting would make
+    /// a typo'd `suplied_by = "platform"`... well, that trips the unknown-FIELD
+    /// gate. This is the other half: a correct field name with a wrong value,
+    /// which would silently become "the operator must supply it" and demand a
+    /// value the host actually injects.
+    #[test]
+    fn an_unknown_supplied_by_value_is_refused_and_never_echoed() {
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "x"
+supplied_by = "sekrit-injector"
+"#;
+        let (key, reason) = expect_violation(parse_declared_config_slots(config).unwrap_err());
+        assert_eq!(key, "backend.base_url");
+        assert!(reason.contains("unknown `supplied_by`"), "was: {reason}");
+        // Document CONTENT is never echoed — same rule as the `kind` error.
+        assert!(
+            !reason.contains("sekrit-injector"),
+            "the rejected value leaked into the error: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_supplied_by_is_refused() {
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "x"
+supplied_by = 3
+"#;
+        let (_, reason) = expect_violation(parse_declared_config_slots(config).unwrap_err());
+        assert!(reason.contains("must be a string"), "was: {reason}");
+    }
+
+    /// `supplied_by` must be in ACCEPTED_FIELDS, or the unknown-field gate
+    /// rejects the very configs this feature exists to allow. Guards the
+    /// two-sided failure: the packer refusing what the server can now boot.
+    #[test]
+    fn supplied_by_is_an_accepted_field_not_an_unknown_one() {
+        assert!(ACCEPTED_FIELDS.contains(&"supplied_by"));
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "x"
+supplied_by = "platform"
+"#;
+        parse_declared_config_slots(config)
+            .expect("a declaration carrying supplied_by must not trip the unknown-field gate");
+    }
+
+    /// The vocabulary const is a hand-written mirror of `SuppliedBy`'s serde
+    /// names. Nothing derives one from the other, so this pin is what turns a
+    /// fourth variant added on only ONE side into a red test rather than a
+    /// parse-time refusal of a value the type system already supports.
+    #[test]
+    fn accepted_supplied_by_matches_the_supplied_by_variants() {
+        let round_tripped: Vec<SuppliedBy> = ACCEPTED_SUPPLIED_BY
+            .iter()
+            .map(|name| {
+                serde_json::from_value::<SuppliedBy>(serde_json::Value::String((*name).to_string()))
+                    .unwrap_or_else(|_| panic!("`{name}` is not a SuppliedBy serde name"))
+            })
+            .collect();
+        assert_eq!(
+            round_tripped,
+            vec![
+                SuppliedBy::Environment,
+                SuppliedBy::Platform,
+                SuppliedBy::Runtime
+            ],
+            "ACCEPTED_SUPPLIED_BY must stay in step with SuppliedBy's serde names"
+        );
+        // And the labels used in error text round-trip to the same values.
+        for (name, value) in ACCEPTED_SUPPLIED_BY.iter().zip(round_tripped.iter()) {
+            assert_eq!(supplied_by_label(*value), *name);
+        }
+    }
+
+    /// A disagreement between the config and the package is a REFUSAL, not a
+    /// silent preference for one side — the same posture as the `kind`
+    /// disagreement, and for the same reason: the package would otherwise demand
+    /// a value the config says the host injects.
+    #[test]
+    fn a_supplied_by_disagreement_between_config_and_package_is_refused() {
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+supplied_by = "platform"
+"#;
+        let declared = parse_declared_config_slots(config).unwrap();
+        // The package slot says the OPERATOR supplies it.
+        let package = vec![ConfigSlot::new(SlotType::Endpoint {
+            name: "TFL_BASE_URL".to_string(),
+            tested_value: "https://api.tfl.gov.uk".to_string(),
+        })
+        .with_config_key("backend.base_url")];
+
+        let (key, reason) =
+            expect_violation(validate_config_slot_agreement(&declared, &package).unwrap_err());
+        assert_eq!(key, "backend.base_url");
+        assert!(reason.contains("supplied_by"), "was: {reason}");
+        assert!(reason.contains("platform"), "was: {reason}");
+        assert!(reason.contains("environment"), "was: {reason}");
+    }
+
+    /// The matching case still passes, so the new comparison did not make every
+    /// agreement fail — the non-vacuity check for the test above.
+    #[test]
+    fn agreement_holds_when_both_sides_name_the_same_supplied_by() {
+        let config = br#"
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+supplied_by = "platform"
+"#;
+        let declared = parse_declared_config_slots(config).unwrap();
+        let package = vec![ConfigSlot::new(SlotType::Endpoint {
+            name: "TFL_BASE_URL".to_string(),
+            tested_value: "https://api.tfl.gov.uk".to_string(),
+        })
+        .with_config_key("backend.base_url")
+        .with_supplied_by(SuppliedBy::Platform)];
+
+        validate_config_slot_agreement(&declared, &package)
+            .expect("both sides name platform — this must agree");
+    }
+
     // --- The ACCEPTED_KINDS const cannot drift from SlotType ---------------
 
     #[test]
@@ -1417,12 +1680,14 @@ mod tests {
                 kind: "endpoint".to_string(),
                 name: "A".to_string(),
                 tested_value: None,
+                supplied_by: SuppliedBy::Environment,
             },
             DeclaredConfigSlot {
                 key: "backend.base_url".to_string(),
                 kind: "endpoint".to_string(),
                 name: "B".to_string(),
                 tested_value: None,
+                supplied_by: SuppliedBy::Environment,
             },
         ];
         let (key, reason) = expect_violation(

@@ -188,6 +188,46 @@ impl SlotType {
 /// `#[non_exhaustive]`: construct with [`ConfigSlot::new`] and [`ConfigSlot::with_config_key`]
 /// rather than a struct literal. Adding `config_key` broke every struct literal in this
 /// repository; the attribute is what stops the NEXT field from doing it again.
+/// WHO fills a slot's value — orthogonal to WHAT kind of value it is.
+///
+/// Who supplies a value and whether its value is behaviour-relevant are
+/// independent axes, so this never touches [`crate::slot::classify`] or
+/// [`crate::slot::detect_deviation`]: a platform-supplied ENDPOINT stays
+/// deviation-visible. Collapsing the two would re-hide exactly what deviation
+/// detection exists to see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SuppliedBy {
+    /// The operator supplies it in the target environment. The default, and the
+    /// only class [`crate::slot::required_slots`] enumerates.
+    #[default]
+    Environment,
+    /// The hosting platform injects it at deploy time — never operator-supplied.
+    Platform,
+    /// The runtime injects it (e.g. `AWS_LAMBDA_FUNCTION_NAME`): neither the
+    /// operator nor the platform supplies it, and nothing needs to.
+    Runtime,
+}
+
+impl SuppliedBy {
+    /// Whether a target environment's operator must supply this value.
+    ///
+    /// The one predicate `required_slots` and every renderer key on, so "who is
+    /// asked for this" has a single definition rather than a `!= Environment`
+    /// test repeated at each call site.
+    #[must_use]
+    pub fn is_operator_supplied(self) -> bool {
+        matches!(self, Self::Environment)
+    }
+}
+
+/// `skip_serializing_if` hands the field by reference, so the public
+/// `Copy`-taking predicate cannot be named there directly.
+fn is_environment_supplied(supplied_by: &SuppliedBy) -> bool {
+    supplied_by.is_operator_supplied()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigSlot {
@@ -219,6 +259,21 @@ pub struct ConfigSlot {
     ///   originally under-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_key: Option<String>,
+    /// Who fills this slot's value. Defaults to [`SuppliedBy::Environment`].
+    ///
+    /// # Compatibility — ADDITIVE on both axes, unlike `config_key`
+    ///
+    /// - **Serde/wire:** `#[serde(default)]` deserializes pre-`supplied_by` slot
+    ///   JSON to `Environment`, and `skip_serializing_if` emits nothing for it,
+    ///   so no checked-in fixture byte and no pinned digest moves.
+    /// - **Rust source:** ALSO additive, which is the difference from
+    ///   `config_key`'s addition. `ConfigSlot` is `#[non_exhaustive]` — added in
+    ///   response to that break — so no crate outside this one can write a
+    ///   struct literal, and a repo-wide sweep finds ZERO literals even inside
+    ///   it: every construction goes through [`ConfigSlot::new`] and the
+    ///   `with_*` builders. The attribute did the job it was added for.
+    #[serde(default, skip_serializing_if = "is_environment_supplied")]
+    pub supplied_by: SuppliedBy,
 }
 
 impl ConfigSlot {
@@ -239,6 +294,7 @@ impl ConfigSlot {
         Self {
             slot,
             config_key: None,
+            supplied_by: SuppliedBy::Environment,
         }
     }
 
@@ -265,6 +321,13 @@ impl ConfigSlot {
     #[must_use]
     pub fn with_config_key(mut self, key: impl Into<String>) -> Self {
         self.config_key = Some(key.into());
+        self
+    }
+
+    /// Declare who fills this slot. See [`SuppliedBy`].
+    #[must_use]
+    pub fn with_supplied_by(mut self, supplied_by: SuppliedBy) -> Self {
+        self.supplied_by = supplied_by;
         self
     }
 }

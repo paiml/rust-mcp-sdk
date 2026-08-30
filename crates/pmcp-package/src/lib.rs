@@ -77,7 +77,7 @@ pub use package::{
 };
 pub use reference::{ComponentRef, PinnedRef};
 pub use slot::{
-    aggregate, classify, detect_deviation, required_slots, ConfigSlot, Deviation, RequiredSlot,
-    SlotClass, SlotType,
+    aggregate, classify, classify_slots, detect_deviation, required_slots, ClassifiedSlot,
+    ConfigSlot, Deviation, RequiredSlot, SlotClass, SlotType, SuppliedBy,
 };
 pub use validation::validate as validate_deploy_descriptor;

@@ -62,7 +62,9 @@ use std::fmt::Write as _;
 
 use pmcp_package::oci::UnpackedAttestation;
 use pmcp_package::reference::ComponentType;
-use pmcp_package::{required_slots, ComponentRef, ConfigSlot, SlotClass, SlotType};
+use pmcp_package::{
+    classify_slots, required_slots, ComponentRef, ConfigSlot, SlotClass, SlotType, SuppliedBy,
+};
 
 /// Width of the `label:` column, matching `inspect.rs`'s `field` helper so the
 /// two commands line up visually.
@@ -120,6 +122,7 @@ pub fn render_report(report: &PackageReport<'_>) -> String {
     let mut out = String::new();
     out.push_str(&render_identity(report));
     out.push_str(&render_required_slots(report.slots));
+    out.push_str(&render_host_supplied_slots(report.slots));
     out.push_str(&render_component_pins(report.components));
     out.push_str(&render_carriage(report.attestation));
     out
@@ -209,6 +212,89 @@ pub fn render_required_slots(slots: &[ConfigSlot]) -> String {
         // slot has no value field in the type at all, so there is nothing here
         // to leak — the absence is structural, not a filter that could be
         // forgotten.
+        if let Some(tested) = entry.slot.tested_value() {
+            field(&mut out, "      ", "Tested value", &untrusted(tested));
+        }
+    }
+    out
+}
+
+/// Render the slots the HOST or RUNTIME injects — the ones no operator fills.
+///
+/// # Why this section exists
+///
+/// [`required_slots`] deliberately excludes these: asking an operator to supply
+/// a value the platform injects is wrong, and a package that demanded them
+/// would be unfillable. But excluding them from the DEMAND must not exclude
+/// them from the RECORD. A slot nobody is asked for and nothing displays is
+/// invisible, and a reader cannot tell "this package needs nothing here" from
+/// "this package never said" — which is precisely the ambiguity
+/// [`SuppliedBy`] was introduced to remove.
+///
+/// So this section is not decoration; it is the other half of the filter. It is
+/// omitted entirely when there is nothing to report, so an ordinary
+/// all-operator-supplied package renders exactly as it did before.
+///
+/// # Complement by construction
+///
+/// Both sections are built from one [`classify_slots`] list split on one
+/// predicate, so every declared slot appears in exactly one of them. This is
+/// deliberately NOT a second independent filter over `slots` — two predicates
+/// could drift apart, and a slot that fell out of both would be invisible in
+/// the exact way this section exists to prevent.
+///
+/// # Ordering
+///
+/// Exactly [`classify_slots`]' order, which is `required_slots`' order. Nothing
+/// is re-sorted here.
+#[must_use]
+pub fn render_host_supplied_slots(slots: &[ConfigSlot]) -> String {
+    let mut out = String::new();
+
+    let host_supplied: Vec<_> = classify_slots(slots)
+        .into_iter()
+        .filter(|entry| !entry.supplied_by.is_operator_supplied())
+        .collect();
+
+    // Nothing to say: omit the heading rather than print an empty section, so a
+    // package with no host-supplied slots renders byte-identically to before.
+    if host_supplied.is_empty() {
+        return out;
+    }
+
+    section(&mut out, "Supplied by the host at deploy time");
+    let _ = writeln!(
+        out,
+        "  Listed for the record — no operator action is required for these."
+    );
+    for (position, entry) in host_supplied.iter().enumerate() {
+        let (kind, name) = entry.slot.key();
+        let source = match entry.supplied_by {
+            SuppliedBy::Platform => "platform (injected by the host at deploy time)",
+            SuppliedBy::Runtime => "runtime (injected by the execution environment)",
+            // `SuppliedBy` is `#[non_exhaustive]`, so this arm is required.
+            // `Environment` cannot reach it (filtered out above), which leaves
+            // only a variant added after this code was written. Say exactly
+            // that rather than guessing it resembles one of the two above — a
+            // wrong label here would misreport who fills a slot.
+            _ => "an unrecognized source — this package may need a newer CLI",
+        };
+        let _ = writeln!(out, "\n  [{}] {kind}", position + 1);
+        let name_label = match entry.slot {
+            SlotType::HumanRole { .. } => "Role",
+            _ => "Env var",
+        };
+        field(&mut out, "      ", name_label, &untrusted(name));
+        field(&mut out, "      ", "Supplied by", source);
+        match entry.config_key.as_deref() {
+            Some(key) => field(&mut out, "      ", "Config path", &untrusted(key)),
+            None => field(&mut out, "      ", "Config path", "fills no config key"),
+        }
+        // Shown because `supplied_by` is ORTHOGONAL to `kind`: a
+        // platform-supplied endpoint stays deviation-visible, and
+        // `detect_deviation` compares against exactly this value. Omitting it
+        // would hide the baseline of a comparison the package still makes.
+        // Identity-bearing slots structurally have none, so nothing prints.
         if let Some(tested) = entry.slot.tested_value() {
             field(&mut out, "      ", "Tested value", &untrusted(tested));
         }
@@ -485,6 +571,73 @@ mod tests {
             },
             issuer: "https://issuer.test.invalid/pmcp-run".to_string(),
             payload_type: "application/vnd.test.attestation-payload".to_string(),
+        }
+    }
+
+    /// R1.2: a host-supplied slot is EXCLUDED from "Required slots" but still
+    /// appears, under its own heading, naming who supplies it.
+    ///
+    /// This is the pair of assertions that matters: absent from the demand,
+    /// present in the record. Asserting only the first would pass on the
+    /// invisibility bug.
+    #[test]
+    fn a_host_supplied_slot_leaves_the_required_list_but_is_still_rendered() {
+        let platform_endpoint = endpoint_slot().with_supplied_by(SuppliedBy::Platform);
+        let slots = vec![secret_slot(), platform_endpoint];
+
+        let required = render_required_slots(&slots);
+        let host = render_host_supplied_slots(&slots);
+
+        // Absent from the demand: the operator is not asked for it.
+        assert!(
+            !required.contains("TFL_BASE_URL"),
+            "a platform-injected slot must not be demanded of the operator: {required}"
+        );
+        assert!(required.contains("TFL_APP_KEY"), "{required}");
+
+        // Present in the record, and attributed.
+        assert!(
+            host.contains("Supplied by the host at deploy time"),
+            "the section heading is missing: {host}"
+        );
+        assert!(
+            host.contains("TFL_BASE_URL"),
+            "the excluded slot vanished entirely — this is the invisibility bug: {host}"
+        );
+        assert!(host.contains("Supplied by:"), "{host}");
+        assert!(host.contains("platform"), "{host}");
+    }
+
+    /// The section is omitted entirely when nothing is host-supplied, so an
+    /// ordinary package's report is unchanged by this feature.
+    #[test]
+    fn an_all_operator_supplied_package_renders_no_host_section() {
+        let rendered = render_host_supplied_slots(&[secret_slot(), endpoint_slot()]);
+        assert!(
+            rendered.is_empty(),
+            "an all-operator-supplied package must render no extra section: {rendered}"
+        );
+    }
+
+    /// Every declared slot reaches exactly one of the two sections. A slot in
+    /// neither is invisible; a slot in both would be double-counted.
+    #[test]
+    fn the_two_sections_together_account_for_every_slot() {
+        let slots = vec![
+            secret_slot(),
+            endpoint_slot().with_supplied_by(SuppliedBy::Platform),
+        ];
+        let required = render_required_slots(&slots);
+        let host = render_host_supplied_slots(&slots);
+
+        for name in ["TFL_APP_KEY", "TFL_BASE_URL"] {
+            let in_required = required.contains(name);
+            let in_host = host.contains(name);
+            assert!(
+                in_required ^ in_host,
+                "{name} must appear in exactly one section \
+                 (required={in_required}, host={in_host})"
+            );
         }
     }
 

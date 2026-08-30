@@ -1338,6 +1338,62 @@ fn sample_team_package() -> pmcp_package::TeamPackage {
     }
 }
 
+/// R1 end-to-end: a `supplied_by` declared in the CONFIG reaches the PACKAGE
+/// and is rendered as host-supplied by `load`.
+///
+/// This is the whole "A generates, B verifies" path in one test. The config
+/// document is the source of truth for who fills a slot; `save` carries the
+/// declaration into the package; `load` re-derives the split from the artifact
+/// alone. Asserting only that it packs would miss the half that matters — a
+/// holder has to be able to SEE it.
+#[test]
+fn a_config_declared_supplied_by_survives_save_and_renders_as_host_supplied() {
+    let project = tempfile::tempdir().unwrap();
+    let config = london_tube_project(project.path());
+
+    // Mark the ENDPOINT as platform-injected, leaving the secret operator-supplied.
+    let original = std::fs::read_to_string(&config).unwrap();
+    let patched = original.replace(
+        "tested_value = \"https://api.tfl.gov.uk\"",
+        "tested_value = \"https://api.tfl.gov.uk\"\nsupplied_by = \"platform\"",
+    );
+    assert_ne!(original, patched, "the fixture must have been patched");
+    std::fs::write(&config, patched).unwrap();
+
+    let tar = project.path().join("london-tube.tar");
+    save_london_tube(project.path(), &config, &tar).success();
+    let tar_bytes = std::fs::read(&tar).unwrap();
+
+    let (_holder, _destination, assertion) = load_bytes(&tar_bytes, false);
+    assertion
+        .success()
+        // The operator-supplied secret is still DEMANDED.
+        .stdout(contains("Required slots"))
+        .stdout(contains("TFL_APP_KEY"))
+        // The platform-injected endpoint is NOT demanded, but IS recorded.
+        .stdout(contains("Supplied by the host at deploy time"))
+        .stdout(contains("TFL_BASE_URL"))
+        .stdout(contains("platform"));
+}
+
+/// The complement: without the declaration the same fixture renders no host
+/// section at all, so the assertions above are about the declaration rather
+/// than about the fixture.
+#[test]
+fn the_unmodified_fixture_renders_no_host_supplied_section() {
+    let project = tempfile::tempdir().unwrap();
+    let config = london_tube_project(project.path());
+    let tar = project.path().join("london-tube.tar");
+    save_london_tube(project.path(), &config, &tar).success();
+    let tar_bytes = std::fs::read(&tar).unwrap();
+
+    let (_holder, _destination, assertion) = load_bytes(&tar_bytes, false);
+    assertion
+        .success()
+        .stdout(contains("TFL_BASE_URL"))
+        .stdout(contains("Supplied by the host at deploy time").not());
+}
+
 /// Behavior 1: a SERVER package's report carries the identity, the required
 /// slots and the carriage state — and NO pin section, because a
 /// `ServerPackage` has no `ComponentRef` field at all (D-14's scope note).

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [0.24.0] - 2026-08-29
 
+### Added (R1, folded into this unreleased version)
+
+- **`package load`/`pull` render a *"Supplied by the host at deploy time"*
+  section.** Slots a config declares as `supplied_by = "platform"` or
+  `"runtime"` are excluded from *"Required slots"* — no operator fills them —
+  but are still shown, attributed, with their tested value. A slot nobody is
+  asked for and nothing displays is invisible, and a reader could not otherwise
+  tell "this package needs nothing here" from "this package never said".
+
+- **`package save` carries a declaration's `supplied_by` into the package.** The
+  config document is the source of truth for who fills a slot; the CLI does not
+  infer it.
+
+### Changed
+
+- `pmcp-package` pin moves `0.3` -> `0.4`, `pmcp-agent` `0.3` -> `0.4`,
+  `pmcp-team-servers` `0.2` -> `0.3`, `pmcp-cfn-renderer` `0.2` -> `0.3`. The
+  scaffold emitters `PMCP_PACKAGE_VERSION_REQ`, `PMCP_AGENT_VERSION` and
+  `TOOLKIT_VERSION` move with them; each has a drift test, and
+  `PMCP_AGENT_VERSION`/`TOOLKIT_VERSION` are invisible to the compiler because
+  they are emitted into scaffolded projects.
+
 ### Added
 
 - **`package save` learns where the binary is.** Three mutually-exclusive inputs

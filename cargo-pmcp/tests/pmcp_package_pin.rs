@@ -36,7 +36,7 @@
 const CARGO_PMCP_CARGO_TOML: &str = include_str!("../Cargo.toml");
 
 /// The exact version-requirement string cargo-pmcp must declare.
-const EXPECTED_PIN: &str = "0.3";
+const EXPECTED_PIN: &str = "0.4";
 
 /// Extract the version-requirement string for a `[dependencies]` entry, handling
 /// BOTH the `name = "x.y"` shorthand and the `name = { version = "x.y", .. }`

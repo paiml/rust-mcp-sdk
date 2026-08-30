@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-agent"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Deploy-anywhere agent decision loop for the PMCP SDK (experimental)"
 license = "MIT"
@@ -15,7 +15,7 @@ rust-version = "1.91.0"
 # gives us everything while staying wasm-clean (no reqwest). Do NOT add pmcp
 # transport features here — see the `url-connector` opt-in below.
 pmcp = { version = "2.17.0", path = "../..", default-features = false }
-pmcp-package = { version = "0.3", path = "../pmcp-package" }
+pmcp-package = { version = "0.4", path = "../pmcp-package" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"

@@ -758,6 +758,31 @@ pub enum ConfigSlotKind {
 /// name = "TFL_BASE_URL"
 /// tested_value = "https://api.tfl.gov.uk"
 /// ```
+/// Who fills a config slot's value.
+///
+/// Mirrors `pmcp-package`'s `SuppliedBy` **by TOML value name, never by shared
+/// type** — the same arrangement as [`ConfigSlotKind`], and for the same
+/// reason: the toolkit must NOT depend on `pmcp-package` (the
+/// workspace-excluded leaf), and a dependency the other way inverts the
+/// layering. The agreement is enforced by the package side re-parsing these
+/// same config bytes, not by a shared definition.
+///
+/// Defaults to [`Environment`](Self::Environment), so every config written
+/// before this field existed keeps its exact meaning: the operator supplies it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSlotSuppliedBy {
+    /// The operator supplies it in the target environment. The default, and the
+    /// only class a package enumerates as REQUIRED of an operator.
+    #[default]
+    Environment,
+    /// The hosting platform injects it at deploy time.
+    Platform,
+    /// The execution environment injects it (e.g. `AWS_LAMBDA_FUNCTION_NAME`);
+    /// neither the operator nor the platform supplies it.
+    Runtime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigSlotDecl {
@@ -781,6 +806,17 @@ pub struct ConfigSlotDecl {
     /// never packed.
     #[serde(default)]
     pub tested_value: Option<String>,
+    /// Who fills this slot — see [`ConfigSlotSuppliedBy`]. Defaults to
+    /// `environment` (the operator supplies it), so a config written before this
+    /// field existed is unchanged in meaning.
+    ///
+    /// This field is why the toolkit had to move in the same change as the
+    /// packer: `deny_unknown_fields` above means a config carrying
+    /// `supplied_by` would FAIL TO BOOT if only the package side learned it,
+    /// and `pmcp-package` refuses to pack a config it knows the server cannot
+    /// parse. Both sides accept it, or neither does.
+    #[serde(default)]
+    pub supplied_by: ConfigSlotSuppliedBy,
 }
 
 // -----------------------------------------------------------------------------
@@ -1693,6 +1729,80 @@ mod tests {
         assert_eq!(cfg.config_slots[1].kind, ConfigSlotKind::Secret);
         assert_eq!(cfg.config_slots[1].name, "TFL_APP_KEY");
         assert_eq!(cfg.config_slots[2].kind, ConfigSlotKind::AuthMode);
+    }
+
+    /// A `[[config_slots]]` entry carrying `supplied_by` must BOOT.
+    ///
+    /// This is the load-bearing half of a two-crate change. `pmcp-package`
+    /// refuses to pack a config whose fields this struct's
+    /// `deny_unknown_fields` would reject, on the grounds that packing it would
+    /// ship a server that cannot start. So if the packer learns `supplied_by`
+    /// and this struct does not, every config using the field becomes
+    /// unpackable; if this struct learns it and the packer does not, the packer
+    /// rejects configs the server boots from happily. Both sides move together
+    /// or neither does, and this test is the runtime half of that pin.
+    #[test]
+    fn a_config_slot_declaring_supplied_by_parses_through_the_strict_entry_point() {
+        let toml = r#"
+            [server]
+            name = "tube"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            name = "TFL_BASE_URL"
+            tested_value = "https://api.tfl.gov.uk"
+            supplied_by = "platform"
+
+            [[config_slots]]
+            key = "backend.function_name"
+            kind = "secret"
+            name = "AWS_LAMBDA_FUNCTION_NAME"
+            supplied_by = "runtime"
+        "#;
+        let cfg = ServerConfig::from_toml_strict_validated(toml)
+            .expect("`supplied_by` must parse under deny_unknown_fields");
+        assert_eq!(
+            cfg.config_slots[0].supplied_by,
+            ConfigSlotSuppliedBy::Platform
+        );
+        assert_eq!(
+            cfg.config_slots[1].supplied_by,
+            ConfigSlotSuppliedBy::Runtime
+        );
+    }
+
+    /// Omitting it means `environment`, so every config written before the
+    /// field existed keeps its meaning rather than failing to parse.
+    #[test]
+    fn a_config_slot_without_supplied_by_defaults_to_environment() {
+        let cfg = ServerConfig::from_toml_strict_validated(CONFIG_SLOTS_TOML)
+            .expect("the pre-existing fixture must still parse");
+        for slot in &cfg.config_slots {
+            assert_eq!(slot.supplied_by, ConfigSlotSuppliedBy::Environment);
+        }
+    }
+
+    /// An unrecognized value is a parse ERROR, not a silent default — strict
+    /// parse discipline (D-13). A defaulted typo here would tell an operator to
+    /// supply a value the platform actually injects.
+    #[test]
+    fn an_unknown_supplied_by_value_is_a_parse_error() {
+        let toml = r#"
+            [server]
+            name = "tube"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            name = "TFL_BASE_URL"
+            tested_value = "x"
+            supplied_by = "platfrom"
+        "#;
+        ServerConfig::from_toml_strict_validated(toml)
+            .expect_err("a misspelled supplied_by must not silently default");
     }
 
     /// Test 2: the field is ADDITIVE — a config with no `[[config_slots]]` block
