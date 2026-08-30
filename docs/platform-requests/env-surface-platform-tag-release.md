@@ -93,3 +93,81 @@ No other pin exists in our tree.
 
 Nothing outstanding from you. Tag when it suits you; we will read the published versions off
 crates.io rather than asking.
+
+---
+
+# Addendum — tagged and published (SDK side, 2026-08-30)
+
+*Appended by the SDK side below the platform team's letter above, which is unedited.*
+
+**`v2.19.3` is tagged and all seven crates are live on crates.io.** You said you would read
+the versions off the registry rather than asking, so this is confirmation rather than a
+request — nothing here needs a reply.
+
+| Crate | Published |
+|---|---|
+| `pmcp` | **2.19.3** (carrier only; no `pmcp` source changed) |
+| `pmcp-package` | **0.4.0** |
+| `pmcp-agent` | **0.4.0** |
+| `pmcp-team-servers` | **0.3.0** |
+| `pmcp-cfn-renderer` | **0.3.0** |
+| `pmcp-server-toolkit` | **0.1.3** |
+| `cargo-pmcp` | **0.24.0** |
+
+Your §4 Flow A is unblocked: `pmcp-package` 0.4.0 and `cargo-pmcp` 0.24.0 are both
+installable now, so the 13 `CODE_MODE_SECRET` configs can take
+`supplied_by = "platform"` and you can test the emit contract for real.
+
+Your §5 holds as you predicted — `tax-calc-lambda`'s `pmcp-server-toolkit = "0.1.1"` is a
+caret range, 0.1.3 is published, and no edit is needed.
+
+## The publish did not go cleanly, and it is worth your knowing why
+
+The crates.io job **failed mid-order**, at `pmcp-team-servers`. Cause is ownership, not
+code: that crate is owned by one maintainer account while CI publishes as another, so the
+step 403s. Its error handler tolerates only `"already exists"`, so a 403 exits 1 — and
+`cargo-pmcp` is the *very next* step and never ran.
+
+Both were then published by hand, in dependency order. The end state is correct and
+complete; only the path there was manual.
+
+Flagging it because it is a **property of this release pipeline, not a one-off**: any future
+release that bumps `pmcp-team-servers` or `pmcp-tasks` will stop at the same place, and the
+crate immediately downstream will silently not ship. If you are ever waiting on a version
+that the release notes say went out, check the registry before assuming it did — that is
+now the second release where this has happened.
+
+## One thing in `cargo-pmcp` 0.24.0 you did not ask about
+
+0.24.0 also carries an unrelated fix that may matter to anyone on your side using the CLI to
+scaffold. Through **0.23.1**, `cargo pmcp new <name>` wrote a hardcoded **absolute path to
+the SDK maintainer's own checkout** into the generated workspace's
+`[workspace.dependencies]`:
+
+```toml
+pmcp = { path = "/Users/<maintainer>/.../rust-mcp-sdk", features = [...] }
+```
+
+The generated `crates/server-common` inherits it via `pmcp = { workspace = true }`, so every
+`cargo metadata` — and therefore `cargo build`, `cargo test`, and `cargo pmcp deploy init` —
+fails on any machine but that one. Reported by an external user; it survived to release
+because the generated project works fine where the path happens to exist.
+
+0.24.0 emits a crates.io version requirement instead, with a regression test asserting the
+contract that **no absolute path of any shape** can appear in generated output.
+
+**Projects already scaffolded by ≤ 0.23.1 are not repaired by upgrading** — the fix cannot
+reach files that already exist. If anyone on your side has one, the repair is a single line
+in the workspace **root** `Cargo.toml` (not the member):
+
+```toml
+pmcp = { version = "2.19", features = ["streamable-http", "schema-generation"] }
+```
+
+`crates/server-common` needs no edit; it inherits.
+
+## On §2
+
+Noted, and taken in the spirit meant. The framing that a same-day correction landing before
+you act is the process working — and that the expensive failure is being told after the tag —
+is the useful one, and it is the standard we will keep holding to.
