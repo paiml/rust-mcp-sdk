@@ -5,6 +5,33 @@ use colored::Colorize;
 use std::fs;
 use std::path::Path;
 
+/// The `pmcp` version REQUIREMENT the emitted workspace `Cargo.toml` declares —
+/// a caret major.minor line, not a full version.
+///
+/// This MUST be a requirement that the PUBLISHED crates.io `pmcp` satisfies, and
+/// must never be a filesystem path. Users of `cargo pmcp new` do not have — and
+/// must never need — a local SDK checkout.
+///
+/// This shipped once as `pmcp = { path = "/Users/<maintainer>/..." }` in
+/// cargo-pmcp 0.23.1 and broke every scaffolded workspace on every machine
+/// except the maintainer's own: `crates/server-common` inherits this pin via
+/// `pmcp = { workspace = true }`, so `cargo metadata` — and therefore
+/// `cargo pmcp deploy init` — failed with "No such file or directory". It was
+/// invisible in-house precisely because the hardcoded path resolves there, so a
+/// green local run is not evidence for this class of defect.
+///
+/// MAJOR.MINOR, not the exact root version, deliberately — mirroring
+/// `templates/agent.rs`'s `PMCP_PACKAGE_VERSION_REQ`. The workspace root is
+/// routinely a patch ahead of crates.io during a release cycle, and an exact pin
+/// on an unpublished patch makes every scaffolded project fail to resolve
+/// (measured: `failed to select a version for the requirement pmcp = "^2.19.3"`,
+/// exit 101). A caret major.minor line resolves against the currently published
+/// crate AND admits the newer patch once it ships.
+///
+/// `emitted_pmcp_requirement_matches_workspace_major_minor_line` asserts this
+/// tracks the workspace-root `pmcp` version so it cannot silently drift.
+const PMCP_VERSION_REQ: &str = "2.19";
+
 /// Generate workspace files (Cargo.toml, Makefile, README.md)
 pub fn generate(workspace_dir: &Path, name: &str) -> Result<()> {
     generate_cargo_toml(workspace_dir, name)?;
@@ -17,7 +44,8 @@ pub fn generate(workspace_dir: &Path, name: &str) -> Result<()> {
 }
 
 fn generate_cargo_toml(workspace_dir: &Path, _name: &str) -> Result<()> {
-    let content = r#"[workspace]
+    let content = format!(
+        r#"[workspace]
 resolver = "2"
 members = [
     "crates/server-common",
@@ -31,22 +59,22 @@ license = "MIT OR Apache-2.0"
 authors = ["Your Name <you@example.com>"]
 
 [workspace.dependencies]
-# MCP SDK (using local path for development - change to git for production)
-pmcp = { path = "/Users/guy/Development/mcp/sdk/rust-mcp-sdk", features = ["streamable-http", "schema-generation"] }
+# MCP SDK
+pmcp = {{ version = "{PMCP_VERSION_REQ}", features = ["streamable-http", "schema-generation"] }}
 
 # HTTP transport
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tokio = {{ version = "1", features = ["full"] }}
+tower-http = {{ version = "0.6", features = ["trace", "cors"] }}
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
-schemars = { version = "1.0", features = ["preserve_order"] }
+schemars = {{ version = "1.0", features = ["preserve_order"] }}
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = {{ version = "0.3", features = ["env-filter", "json"] }}
 async-trait = "0.1"
 
 # Error handling
@@ -54,16 +82,17 @@ anyhow = "1"
 thiserror = "1"
 
 # Validation
-validator = { version = "0.18", features = ["derive"] }
+validator = {{ version = "0.18", features = ["derive"] }}
 
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Enable link-time optimization
 codegen-units = 1   # Better optimization
 strip = true        # Strip symbols for smaller binaries
-"#;
+"#
+    );
 
-    fs::write(workspace_dir.join("Cargo.toml"), content).context("Failed to create Cargo.toml")?;
+    fs::write(workspace_dir.join("Cargo.toml"), &content).context("Failed to create Cargo.toml")?;
 
     Ok(())
 }
@@ -299,4 +328,137 @@ lambda/node_modules/
     fs::write(workspace_dir.join(".gitignore"), content).context("Failed to create .gitignore")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The workspace-root `Cargo.toml`, embedded so the drift guard can compare
+    /// the scaffold's pin against the real `pmcp` version.
+    const ROOT_CARGO_TOML: &str = include_str!("../../../Cargo.toml");
+
+    /// Render the emitted workspace `Cargo.toml` into a tempdir and read it back,
+    /// exercising the real `generate_cargo_toml` rather than a copy of its string.
+    fn render_workspace_cargo_toml() -> String {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        generate_cargo_toml(tmp.path(), "testws").expect("generate workspace Cargo.toml");
+        fs::read_to_string(tmp.path().join("Cargo.toml")).expect("read emitted Cargo.toml")
+    }
+
+    /// DIRECT REGRESSION GUARD for the `deploy-init-abs-path-dep` defect.
+    ///
+    /// `cargo pmcp new` once emitted a `pmcp = { path = "..." }` dependency
+    /// carrying an ABSOLUTE path to the maintainer's own SDK checkout into every
+    /// scaffolded workspace. `crates/server-common` inherits that pin via
+    /// `pmcp = { workspace = true }`, so `cargo metadata` — and therefore
+    /// `cargo pmcp deploy init` — failed on every machine except the
+    /// maintainer's. The bug was invisible in-house precisely because the
+    /// hardcoded path resolves fine there.
+    ///
+    /// Oracle: `derived` (contract) — asserts the structural property "no
+    /// absolute filesystem path may appear in generated output", not one
+    /// literal. Boundary neighbors cover the macOS, Linux and Windows shapes so
+    /// re-introducing the defect under a different home directory still fails.
+    #[test]
+    fn emitted_cargo_toml_contains_no_absolute_path() {
+        let content = render_workspace_cargo_toml();
+
+        for needle in [
+            "/Users/",
+            "/home/",
+            "/root/",
+            "C:\\",
+            "/private/var",
+            "/tmp/",
+        ] {
+            assert!(
+                !content.contains(needle),
+                "emitted workspace Cargo.toml leaked an absolute filesystem path \
+                 containing `{needle}` — scaffolded projects must never reference a \
+                 local SDK checkout. Emitted:\n{content}"
+            );
+        }
+    }
+
+    /// The `pmcp` dependency must be pinned BY VERSION and must carry no `path`
+    /// key at all — the shape that caused the original defect.
+    ///
+    /// Oracle: `derived` — parses the emitted TOML and asserts on the dependency
+    /// table's structure rather than string-matching, so a reformatting of the
+    /// template cannot make this pass vacuously.
+    #[test]
+    fn emitted_pmcp_dep_is_pinned_by_version_not_path() {
+        let content = render_workspace_cargo_toml();
+        let parsed: toml::Value = toml::from_str(&content).expect("emitted Cargo.toml must parse");
+
+        let pmcp = parsed
+            .get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.get("pmcp"))
+            .expect("emitted [workspace.dependencies] must declare pmcp");
+
+        assert!(
+            pmcp.get("path").is_none(),
+            "emitted pmcp dependency carries a `path` key — scaffolded workspaces \
+             must resolve pmcp from crates.io, never from a local checkout. Got: {pmcp:?}"
+        );
+        assert_eq!(
+            pmcp.get("version").and_then(toml::Value::as_str),
+            Some(PMCP_VERSION_REQ),
+            "emitted pmcp dependency must declare PMCP_VERSION_REQ. Got: {pmcp:?}"
+        );
+    }
+
+    /// `PMCP_VERSION_REQ` must track the workspace-root `pmcp` MAJOR.MINOR line.
+    ///
+    /// This is a version emitter `cargo build` cannot see: the workspace resolves
+    /// green while every project scaffolded by `cargo pmcp new` requests whatever
+    /// this constant says. Without this guard a stale requirement ships silently.
+    ///
+    /// Compared at major.minor (not the full version) ON PURPOSE — see
+    /// `PMCP_VERSION_REQ`'s docs. An exact-version guard here would force the
+    /// scaffold to pin an unpublished patch during every release cycle.
+    #[test]
+    fn emitted_pmcp_requirement_matches_workspace_major_minor_line() {
+        let parsed: toml::Value =
+            toml::from_str(ROOT_CARGO_TOML).expect("parse workspace root Cargo.toml");
+        let root_version = parsed
+            .get("package")
+            .and_then(|p| p.get("version"))
+            .and_then(|v| v.as_str())
+            .expect("root Cargo.toml has [package] version");
+        let mut parts = root_version.split('.');
+        let major = parts.next().unwrap_or("0");
+        let minor = parts.next().unwrap_or("0");
+        let expected = format!("{major}.{minor}");
+        assert_eq!(
+            PMCP_VERSION_REQ, expected,
+            "the scaffold's pmcp requirement `{PMCP_VERSION_REQ}` drifted from the \
+             workspace-root version `{root_version}` — bump PMCP_VERSION_REQ in \
+             templates/workspace.rs"
+        );
+    }
+
+    /// The generated `server-common` member inherits the root pin via
+    /// `workspace = true`. This is the hop that turned one bad literal into a
+    /// broken workspace, so assert the member list and the emitted workspace
+    /// table stay consistent.
+    #[test]
+    fn emitted_workspace_declares_the_server_common_member() {
+        let content = render_workspace_cargo_toml();
+        let parsed: toml::Value = toml::from_str(&content).expect("emitted Cargo.toml must parse");
+        let members = parsed
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(toml::Value::as_array)
+            .expect("emitted [workspace] must declare members");
+        assert!(
+            members
+                .iter()
+                .any(|m| m.as_str() == Some("crates/server-common")),
+            "emitted workspace must list crates/server-common — it is the member that \
+             inherits the pmcp pin. Got: {members:?}"
+        );
+    }
 }
