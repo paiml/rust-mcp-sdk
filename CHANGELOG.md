@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.3] - 2026-08-30
+
+**A carrier release, following the v2.19.2 and v2.19.1 precedent.** No `pmcp`
+source changed since 2.19.2 — `pmcp` moves 2.19.2 → 2.19.3 solely to mint the
+tag that carries `pmcp-package` 0.4.0 and four sibling crates to crates.io,
+because this repo tags on the `pmcp` version and a `v*` tag is the only path
+those crates have to the registry.
+
+The heading is the version, NOT `[Unreleased]`:
+`.github/workflows/release.yml`'s `create-release` job extracts notes with
+`awk 'index($0, "## [" ver "]") == 1'` and **exits 1** when no section matches
+the tag, *before* any publish step runs.
+
+`pmcp`'s patch bump needs no downstream pin changes — the caret exception.
+Every in-tree `pmcp` requirement is `^2.x` with x ≤ 19, and `^2.19.0` already
+admits 2.19.3, so no pin moves and no crate is bumped on `pmcp`'s account.
+
+### What this tag carries
+
+| Crate | From | To | Why |
+|---|---|---|---|
+| `pmcp-package` | 0.3.1 | **0.4.0** | `supplied_by` on config slots; source-breaking |
+| `pmcp-agent` | 0.3.0 | 0.4.0 | pins `pmcp-package` `^0.3` → `^0.4` |
+| `pmcp-team-servers` | 0.2.0 | 0.3.0 | pins `pmcp-package` and `pmcp-agent` |
+| `pmcp-cfn-renderer` | 0.2.0 | 0.3.0 | pins `pmcp-package` |
+| `pmcp-server-toolkit` | 0.1.2 | 0.1.3 | `supplied_by` on `ConfigSlotDecl` |
+| `cargo-pmcp` | 0.24.0 | 0.24.0 | unpublished; R1 folds into it |
+
+### Added — a config slot can declare WHO fills it
+
+A `[[config_slots]]` entry may now carry `supplied_by = "environment"` (the
+default), `"platform"` or `"runtime"`:
+
+```toml
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+supplied_by = "platform"
+```
+
+`cargo pmcp package save` carries the declaration into the package;
+`package load`/`pull` render such slots under a labelled **"Supplied by the host
+at deploy time"** section rather than demanding them of an operator. Absent
+means `environment`, so every config written before this release keeps its exact
+meaning.
+
+This is the "A generates, B verifies" severance in practice: the config document
+is the source of truth for who fills a slot, it travels inside the artifact, and
+a holder re-derives the split from the artifact alone.
+
+**Three crates had to move together.** `pmcp-package` refuses to pack a config
+carrying a field the SERVER would reject at boot, and the toolkit's
+`ConfigSlotDecl` is `#[serde(deny_unknown_fields)]`. Teaching only the packer
+would make every config using the field unpackable; teaching only the runtime
+would have the packer reject configs the server boots from happily. Each side
+now carries a test pinning the other.
+
+An unrecognized `supplied_by` VALUE is **refused**, never defaulted — silently
+reading it as `environment` would tell an operator to supply a value the
+platform actually injects, which is the confusion the field exists to remove.
+
+### Breaking — `pmcp-package` 0.4.0
+
+Measured with `cargo semver-checks check-release --baseline-version 0.3.1`:
+one major failure. `DeclaredConfigSlot` was externally constructible, so its new
+`supplied_by` field breaks struct literals. It is now `#[non_exhaustive]` — the
+same remedy `ConfigSlot` received after the `config_key` break — so the next
+field addition costs nothing. Consumers move `^0.3` → `^0.4`; all four in-tree
+consumers already have.
+
+`required_slots` no longer enumerates host- or runtime-supplied slots, and
+`validate_config_slot_agreement` now refuses a `supplied_by` disagreement
+between the config and the package.
+
+### Note on `pmcp-server-toolkit` 0.1.3
+
+Its `ConfigSlotDecl` field addition is the same class of source break, taken as
+a PATCH by deliberate decision rather than oversight. `^0.1.x` admits 0.1.3, so
+its seven consumer pins do not move and this release is five crates rather than
+about twelve. Justified by zero in-tree `ConfigSlotDecl` struct literals (it is
+a deserialization target) and no CI semver gate. Recorded here so a future
+releaser sees the reasoning.
+
 ## [2.19.2] - 2026-08-28
 
 **A carrier release, following the v2.19.1 precedent.** No `pmcp` source changed
