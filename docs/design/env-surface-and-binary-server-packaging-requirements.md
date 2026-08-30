@@ -37,10 +37,13 @@ safe handoff.
 ## Versioning posture
 
 `cargo pmcp package` and `pmcp-package` are new with very few users. **Break freely.** Prefer a
-correct vocabulary over a compatible one; do not carry workarounds to avoid a bump. R1 is
-already known to force `pmcp-package` 0.4.0 and, per CLAUDE.md's authoritative ordering
-constraint, moves `pmcp-cfn-renderer`, `pmcp-agent`, `pmcp-team-servers` and `cargo-pmcp` as one
-set. Price that in; do not design around it.
+correct vocabulary over a compatible one; do not carry workarounds to avoid a bump.
+
+But do not ASSUME a break either: R1 was written believing it forced 0.4.0 and a five-crate set
+move, and measurement showed it is fully additive (R1.5). Check with `cargo semver-checks`
+against the published baseline before pricing in a coordinated release — this repo's
+`#[non_exhaustive]` and builder discipline mean field additions are usually cheaper than they
+look.
 
 ---
 
@@ -63,9 +66,14 @@ Optional attribute `supplied_by = "environment" | "platform" | "runtime"`, defau
   dedupe to whichever was inserted first — and since R1.1 makes `required_slots` depend on the
   field, the aggregated team either asks for a value the host injects or fails to ask for one
   nobody supplies. Silent, and wrong either way.
-- **R1.5** Source-breaking by construction: a new public field breaks every `ConfigSlot { … }`
-  literal (21 in-tree). Add a `with_supplied_by()` builder for future callers, and accept the
-  break for existing ones.
+- **R1.5** **ADDITIVE, not breaking** — corrected 2026-08-29 after measuring. `ConfigSlot` is
+  already `#[non_exhaustive]` (added in response to the `config_key` break), so no external
+  crate can write a struct literal; and a repo-wide sweep finds **zero** genuine literals even
+  internally — every construction already uses `ConfigSlot::new(…)` plus builders. Verified by
+  `cargo semver-checks` against published 0.3.1: 196/196, "no semver update required". Add a
+  `with_supplied_by()` builder to match. **No 0.4.0 and no five-crate set move**; an earlier
+  revision of this requirement claimed otherwise on the strength of a grep that counted
+  `-> ConfigSlot {` signatures and the unrelated `DeclaredConfigSlot` type.
 
 **Verification:** a property test that `required_slots` never emits a non-`environment` slot; a
 test that `inspect` output contains the labelled section whenever one exists (assert on rendered

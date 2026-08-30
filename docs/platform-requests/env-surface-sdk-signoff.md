@@ -7,9 +7,13 @@
 **Status:** §1–§3 sign off on your calls with three required changes. §4 is a decision on our
 side of the boundary, reported not asked.
 
-Both recommendations are sound and we are adopting them. Three things need to change before
-implementation, all found by checking your spec against the code it lands in rather than
-against its own reasoning. Two are in §2 and one of them the codebase literally predicted.
+Both recommendations are sound and we are adopting them. Two things need to change before
+implementation, both found by checking your spec against the code it lands in rather than
+against its own reasoning.
+
+**§1 also corrects a claim we made to you in an earlier revision of this document** — that
+`supplied_by` forced a 0.4.0 and a coordinated five-crate release. It does not; it is fully
+additive, and we had not looked at the code before saying otherwise.
 
 Also: thank you for the precision on *"the packer never holds the binary"* being a CLI-`save`
 fact rather than a universal one — your Flow B capture Lambda does hold bootstrap bytes. That
@@ -17,35 +21,35 @@ correction is what §4 turns out to depend on.
 
 ---
 
-## 1. `supplied_by` — accepted, and it is a **0.4.0**, not a 0.3.x
+## 1. `supplied_by` — accepted, and it is ADDITIVE (correcting ourselves)
 
 All five points adopted, including the two we care most about: **visibility as a requirement**
 (a labelled *"Supplied by the host at deploy time"* section, never a silent filter) and
 **orthogonality to `kind`**, so `detect_deviation` keeps seeing a platform-supplied endpoint.
 
-### The fix: your §2.1 covers the wire and not the source
+### Correction: your §2.1 is right on BOTH axes — we were wrong
 
-You describe it as "an optional attribute … defaulting to `environment` when absent — so every
-existing package keeps its meaning unchanged." That is exactly right about the **wire**, and
-incomplete about **Rust source**. `slot/types.rs:214-218` says so about the last field added to
-this very struct:
+An earlier revision of this section told you that `supplied_by` on `ConfigSlot` would be
+source-breaking, that we counted 21 struct-literal sites, and that it therefore forced
+`pmcp-package` 0.4.0 plus a coordinated five-crate release. **Every part of that was wrong,
+and we are correcting it before you plan against it.**
 
-> **Rust source: BREAKING.** … a second public field breaks every struct literal in the
-> language, everywhere — 40 construction sites … **A reader who takes "additive" at face value
-> will under-scope the next field addition exactly as this one was originally under-scoped.**
+Measured after implementing it:
 
-We count 21 `ConfigSlot { … }` literal sites in-tree today. The existing builder
-(`ConfigSlot::new(…).with_config_key(…)`) helps future callers but does not save existing
-literals.
+- `ConfigSlot` is **already `#[non_exhaustive]`** (`slot/types.rs`), added in response to the
+  `config_key` break with a doc saying the attribute "is what stops the NEXT field from doing
+  it again". No crate outside `pmcp-package` can write a struct literal at all.
+- A repo-wide sweep finds **zero** genuine `ConfigSlot { … }` literals, inside the crate or
+  out. Every construction already goes through `ConfigSlot::new(…)` and the `with_*` builders.
+  Our "21" came from a grep that counted `-> ConfigSlot {` function signatures and the
+  unrelated `DeclaredConfigSlot` type.
+- `cargo semver-checks check-release --baseline-version 0.3.1`: **196/196 pass, "no semver
+  update required."**
 
-So this is `pmcp-package` **0.4.0** — semver-incompatible on a 0.x line — and per CLAUDE.md's
-authoritative ordering constraint it moves `pmcp-cfn-renderer`, `pmcp-agent`,
-`pmcp-team-servers` and `cargo-pmcp` **as one set**.
-
-**That is not an objection.** `cargo pmcp package` is new and has very few users; we would
-rather spend a break now and get the vocabulary right than carry a workaround. We are flagging
-it only so the release cost is priced in deliberately instead of discovered at tag time — we
-did that dance eight hours ago and would prefer not to improvise it twice.
+So your §2.1's "optional attribute, defaulting to `environment`, every existing package keeps
+its meaning" holds on the wire AND in Rust source. This ships as a **patch/minor on the 0.3
+line**, no consumer pin moves, and no five-crate set move. The repo had already solved this
+and we did not look before telling you otherwise.
 
 ### The fix that is load-bearing: `aggregate()` will silently swallow a disagreement
 
@@ -155,9 +159,10 @@ unchanged; this only unblocks packing your §1.1 servers as genuinely self-conta
 
 ## Status
 
-Nothing is blocking on you. §1's two fixes and §2's signature change are ours to implement, and
-§3 sequences the gate with `supplied_by` as one unit. We will send the crates.io versions when
-the 0.4.0 set publishes.
+Nothing is blocking on you. §1's `reconcile_collision` fix and §2's signature change are ours to
+implement, and §3 sequences the gate with `supplied_by` as one unit. Because §1 turned out
+additive, this ships on the 0.3 line as a normal `pmcp-package` release — no consumer pin moves
+and no coordinated set. We will send the version when it publishes.
 
 The only thing we would still like: a heads-up if your Flow B capture path wants to emit
 `supplied_by` before we tag, so the two implementations land the attribute together rather than
