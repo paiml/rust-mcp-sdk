@@ -52,3 +52,20 @@ examples/spin
 
 # PMAT/pv lint cache (machine-generated tooling scratch — never commit)
 .pv/
+
+# cargo-pmcp per-workspace local state and credentials (`.pmcp/`).
+# NOT a blanket `.pmcp/` ignore: that directory legitimately carries COMMITTED
+# config — `crates/pmcp-server/.pmcp/{deploy,deployment}.toml` are tracked — so
+# ignoring the whole directory would silently swallow future config additions.
+# These entries name only the machine-generated and secret-bearing files that
+# `cargo pmcp` writes at runtime.
+# The `**/` prefix is REQUIRED: a pattern containing a slash is anchored to this
+# file's directory, so a bare `.pmcp/active-target` would match only the repo
+# root and miss `cargo-pmcp/.pmcp/active-target` entirely (measured).
+**/.pmcp/active-target
+**/.pmcp/credentials.toml
+**/.pmcp/oauth-cache.json
+**/.pmcp/oauth-tokens.json
+**/.pmcp/secrets/
+**/.pmcp/binaries/
+**/.pmcp/reports/
