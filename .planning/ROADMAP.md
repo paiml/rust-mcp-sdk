@@ -2583,10 +2583,21 @@ reports 11/11).
 **Plans:** 5 plans across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
 
 Plans:
+**Wave 1**
+
 - [ ] 125-01-PLAN.md — TRACER: `skills/list` end-to-end over streamable HTTP + the SC#1 routing guarantees
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics + `ServerCore` twin-site parity
 - [ ] 125-03-PLAN.md — Complete `resources` manifests, verbatim frontmatter, D-02 warn+exclude, name-identity reject, SEP limits warning
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 125-04-PLAN.md — Retire `skill://index.json` (12 tracked sites) + examples and the four documentation surfaces
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 125-05-PLAN.md — `make test-skills` gate leg with a zero-test-count guard, fuzz target, and the rustdoc deferral record
 
 **Success Criteria** (what must be TRUE):

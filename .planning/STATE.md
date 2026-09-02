@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.6
 milestone_name: AI-Package Portability
-current_phase: 124
-current_phase_name: Release & Publish Order
+current_phase: 125
+current_phase_name: SEP-2640 Conformance — skills/list + skills/get
 status: executing
 stopped_at: Phase 124 context gathered
-last_updated: "2026-08-27T16:32:28.237Z"
+last_updated: "2026-09-02T04:23:43.583Z"
 last_activity: 2026-08-27
 last_activity_desc: Phase 124 execution started
-state_head: e094f01104471682610b296520d0233e8bca6b5f
+state_head: 184b0228741cfc50dcd6e55d2212766ddc1a0d68
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 32
   completed_plans: 25
-  percent: 78
+  percent: 80
 ---
 
 # Project State
@@ -31,9 +31,9 @@ See: .planning/PROJECT.md (updated 2026-08-22, milestone v2.6 open) · .planning
 
 ## Current Position
 
-Phase: 124 (Release & Publish Order) — EXECUTING
+Phase: 125 (SEP-2640 Conformance — skills/list + skills/get) — READY TO EXECUTE
 Plan: 1 of 7
-Status: Executing Phase 124
+Status: Ready to execute
 Last activity: 2026-08-27 — Phase 124 execution started
 Next: Execute Phase 123 — `/gsd-execute-phase 123`. 7 plans across 6 waves
 (1:{01} 2:{02,03} 3:{04} 4:{05} 5:{06} 6:{07}), all carrying PKGX-02.
