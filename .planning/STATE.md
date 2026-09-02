@@ -1,121 +1,56 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.6
-milestone_name: AI-Package Portability
+milestone: v2.7
+milestone_name: SEP-2640 Skills Conformance & Positioning
+status: In progress — phase 125 complete, next phase not yet added
+stopped_at: Phase 125 COMPLETE — 5/5 plans, UAT 3/3 passed, verification passed, threats_open 0
+last_updated: "2026-09-02T23:33:33.702Z"
+last_activity: 2026-09-02
+last_activity_desc: Milestone v2.6 archived; milestone pointer moved to v2.7 (phase 125 already complete)
+state_head: 7147ca43c19673987d54b33d52062d9b7208bb6d
+progress:
+  total_phases: 1
+  completed_phases: 1
+  total_plans: 5
+  completed_plans: 5
+  percent: 100
+  scope_note: "v2.7 counters. Phase 125 only — the milestone's later phases are not yet added (see ROADMAP scoping note), so 100% means 'everything added so far is done', NOT 'the milestone is finished'. The previous values (5/5 phases, 32/32 plans) were v2.6's and were left behind by milestone.complete."
 current_phase: 125
 current_phase_name: SEP-2640 Conformance — skills/list + skills/get
-status: complete
-stopped_at: "Phase 125 COMPLETE — 5/5 plans, UAT 3/3 passed, verification passed, threats_open 0"
-last_updated: "2026-09-02T16:50:21.977Z"
-last_activity: 2026-09-02
-last_activity_desc: Phase 125 complete (verification passed, security verified). NO next phase set — see the transition defect note in Current Position.
-state_head: 263da4aa462f779d8e60b54feda0702652c3cfc9
-progress:
-  total_phases: 5
-  completed_phases: 4
-  total_plans: 32
-  completed_plans: 30
-  percent: 80
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-22, milestone v2.6 open) · .planning/ROADMAP.md (`## v2.6 AI-Package Portability (Phases 120-124)` + `## Phase Details — Current Milestone`) · .planning/REQUIREMENTS.md (7 v2.6 requirements, 7/7 mapped) · .planning/MILESTONES.md (v2.5 record incl. the override_closeout rationale) · .planning/milestones/v2.5-{ROADMAP,REQUIREMENTS}.md (archived detail) · .planning/milestones/v2.5-phases/ (101 archived phase dirs)
+See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 close — `## v2.7 …` is the ACTIVE section; every earlier milestone is a row in the `## Milestones` index) · `.planning/MILESTONES.md` (v2.6 record incl. the `override_closeout` rationale) · `.planning/milestones/v2.6-{ROADMAP,REQUIREMENTS}.md` · `.planning/milestones/v2.6-phases/` (phases 120–124) · `.planning/milestones/pre-v2.7-ROADMAP-history.md` (v2.1–v2.4 detail, which has no per-milestone archive of its own)
 
-> `.planning/v2.6-REQUIREMENTS-STAGED.md` was consumed and removed when v2.6 opened — its content is now `.planning/REQUIREMENTS.md`. Do not look for it.
+> **There is no `.planning/REQUIREMENTS.md` right now.** It was archived to
+> `milestones/v2.6-REQUIREMENTS.md` and removed at the v2.6 close, as the workflow prescribes.
+> v2.7 gets a fresh one — `/gsd-new-milestone` writes it. Do not go looking for the old file.
 
 **Core value:** An AI-Package built from configuration alone moves between pmcp.run environments with its tool surface intact, and the target environment is told exactly what it must supply.
-**Current focus:** Phase 125 — SEP-2640 Conformance — skills/list + skills/get
+**Current focus:** v2.7 — SEP-2640 skills conformance and tri-surface positioning. Phase 125 is COMPLETE; no further v2.7 phase has been added yet.
 
 ## Current Position
 
-Phase: 125 — SEP-2640 Conformance — skills/list + skills/get — **COMPLETE**
+Phase: 125 — SEP-2640 Conformance (skills/list + skills/get) — **COMPLETE**
 Plan: 5 of 5 complete
-Status: Complete — UAT 3/3 passed, verification `passed`, `threats_open: 0`
-Last activity: 2026-09-02 — Phase 125 complete
-Next: **NOT SET — requires a human decision.** See the transition defect immediately below.
+Status: v2.6 archived. v2.7 is active with phase 125 done and no next phase added yet.
+Last activity: 2026-09-02 — v2.6 completed and archived; milestone pointer moved v2.6 → v2.7
 
-> ### ⚠ `phase.complete 125` regressed this file backwards — corrected 2026-09-02
->
-> Running `gsd_run query phase.complete 125` at the end of `/gsd-verify-work 125` returned
-> `next_phase: "124"`, `is_last_phase: false`, `roadmap_updated: false`, and wrote
-> `current_phase: 124` / `status: planning` into this file. Phase 124 belongs to the
-> **previous** milestone and already carries 5 SUMMARY files; in `mode: yolo` the transition
-> would have auto-invoked planning on it. That auto-advance was stopped by hand and the seven
-> frontmatter fields plus this block were restored to the truth.
->
-> **Root cause — a milestone-pointer mismatch, not a one-off.** This file's frontmatter and
-> `.planning/state.json` both say `milestone: v2.6` (phases 120-124), while Phase 125 lives
-> under the separate `## v2.7 SEP-2640 Skills Conformance & Positioning (Phase 125+)` heading
-> in ROADMAP.md. Every milestone-scoped tool therefore cannot see Phase 125:
-> `query init.progress` enumerates only 120-124 and reports `next_phase: null`;
-> `phase.complete` could not find 125's checkbox in the "Current Milestone" section
-> (hence `roadmap_updated: false`) and picked the next incomplete phase it COULD see,
-> which is 124. The `progress:` counters in the frontmatter above are v2.6-scoped for the
-> same reason and do not count Phase 125's five plans.
->
-> **Why v2.6 was never closed.** Phase 124's own record is unfinished — `124-06-PLAN.md`
-> and `124-07-PLAN.md` have no SUMMARY, and the ROADMAP Progress table still reads
-> `124. Release & Publish Order | 0/7 | Planned` — even though that release SHIPPED
-> (tags `v2.19.2` and `v2.19.3` exist). Plans 06 and 07 were the "open the release PR /
-> drive CI green" and "tag push + registry verification + closeout PR" plans: the work
-> happened, the paperwork did not. So `/gsd-complete-milestone v2.6` was never run, v2.7
-> was opened as a ROADMAP heading only, and the pointer stayed on v2.6.
->
-> **This is a known-recurring class**, recorded in project memory as "GSD phase.complete
-> picks a wrong next_phase" — it previously returned an already-complete phase and wrote it
-> into STATE.md. Check `next_phase` against the ROADMAP table on every transition.
->
-> **Do not "fix" this by editing `next_phase` alone.** The milestone pointer is the defect;
-> moving it means closing v2.6, which is a milestone-level decision. See Session Continuity.
+**Phase 125 close-out:** UAT 3/3 passed, verification `passed`, `threats_open: 0`. Three human
+decisions recorded — CR-01 accepted as a D-01-scoped residual risk (an advertised skills
+capability tears down a **stdio** session *silently*: no JSON-RPC error to the client, and
+`crate::log` is a no-op stub at `src/lib.rs:373-386`), WR-06 shipped as-is with the capability
+guard retained, and three code-review findings (WR-03, WR-04-partial, WR-05) carried forward in
+that phase's `deferred-items.md`.
 
-> **The two lines above were STALE and are corrected 2026-08-26.** They said Phase 123 was
-> "not yet discussed" and had "no phase directory yet". Both were false by then: the phase dir
-> exists with CONTEXT (D-01..D-16), RESEARCH, PATTERNS, VALIDATION, seven PLANs, REVIEWS and
-> COVERAGE. Left uncorrected, a reader following STATE.md would have re-run discuss-phase over
-> settled decisions.
-
-**Phase 123 planning currency (2026-08-26):** plans were cross-AI reviewed (`123-REVIEWS.md`,
-commit `8f2bc451`) and then replanned against that review (commit `2b7d59b4`). Codex returned
-HIGH/non-executable with four architectural findings — all four independently re-verified against
-source — while Gemini returned "APPROVED"; Gemini's verdict is marked
-`[reviewed-without-source-citations]` and is NOT counted at full consensus weight, because the six
-files it cited as read do not exist (they are this phase's planned outputs). Do not re-read that
-approval as evidence the original plans were ready.
-
-The replan also caught two defects neither reviewer found: `bytes_stream()` is
-`#[cfg(feature = "stream")]` and `cargo-pmcp/Cargo.toml:111` sets `default-features = false`
-without it (so the originally planned call would not have compiled), and two self-invalidating
-greps in plan 05. Wave count went 5 → 6 because four plans now edit the `Makefile` under the
-same-commit registration rule (`Makefile:337-339`, the Phase 122 precedent) and same-wave plans
-must not share `files_modified` — recorded in ROADMAP.md so it is not "optimized" back.
-
-> **Corrected again 2026-08-25 (Phase 122 close) — my first correction was WRONG.**
-> `phase.complete 122` returned `next_phase: 120`, and I initially wrote here that this was
-> correct "because 120 is genuinely `[ ]`". That was a mistake: I checked the CHECKBOX at
-> ROADMAP line 2301 instead of the **Progress table**, which is what the Phase 121 note below
-> tells you to check. The Progress table has read
-> `| 120. Config-Server Packaging | ... | 5/5 | Complete | 2026-08-23 |` since 2026-08-23, and
-> `120-VERIFICATION.md` carries `status: passed`. Phase 120 has 5 plans, 5 summaries and a passing
-> verification — it finished two days before Phase 122 ran.
->
-> The stale `[ ]` checkbox is the ROOT CAUSE of this verb misrouting twice (once at the 121 close,
-> once at the 122 close). It has now been ticked, so the next `phase.complete` should route
-> correctly. **Check the Progress table, not the checkbox** — they can disagree, and the table wins.
->
-> Retracted: an earlier version of this note speculated that Phase 122's declared
-> "Depends on: Phase 120" edge might be inaccurate, because 122 appeared to complete while 120 was
-> open. That premise was false. Phase 120 completed 2026-08-23, BEFORE 122 executed, so the
-> dependency was properly satisfied in the normal order. There is nothing to re-measure.
-
-> **Corrected by hand 2026-08-25.** `gsd-tools query phase.complete 121` returned
-> `next_phase: 120` and wrote `current_phase: 120` here — a phase that was already
-> complete with verification passed — alongside a self-contradictory
-> `Next: Phase 121`. The roadmap execution order is 120 → 121 → 122 ∥ 123 → 124,
-> so the real next phase is 122. Do not trust that verb's `next_phase` on this
-> project without checking it against the ROADMAP progress table.
+> **The v2.6 → v2.7 pointer move was made BY HAND, 2026-09-02.** `milestone.complete` left
+> `milestone: v2.6` in this frontmatter even after archiving that milestone, which is the same
+> stale-pointer condition that made `phase.complete 125` return `next_phase: "124"` and
+> `roadmap_updated: false` earlier the same day. Recorded so the next reader knows the value was
+> corrected deliberately rather than written by the tool.
 
 ## v2.6 Phase Plan (5 phases, 7 requirements)
 
@@ -659,6 +594,9 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 | Memory | Scaled team-memory backends (embeddings/vector stores) in the open SDK | Deferred (DEFER-03) | v2.4 scope |
 | Platform | pmcp.run adopting the loop/traits (companion §8 note) | Deferred (DEFER-04) | not SDK work |
 | Audit | **461 open audit items carried forward UNACKNOWLEDGED at the v2.5 close** — 3 debug sessions, 7 phases with incomplete UAT, 3 verification gaps (Phase 78 `gaps_found`; Phases 107/77 `human_needed`), 5 incomplete quick tasks, 443 deferred items | Open — 0 acknowledged, 0 suppressed | v2.5 close (2026-08-22) |
+| Audit | **486 open audit items carried forward UNACKNOWLEDGED at the v2.6 close** — 453 from already-archived milestones, 11 from phase 125 (v2.7, not this milestone), 9 unscoped (5 quick tasks, 4 debug sessions), and **13 genuinely v2.6-scoped** (phases 120/121) | Open — 0 acknowledged, 0 suppressed | v2.6 close (2026-09-02) |
+| Release | **4 crates carry an `mcp-tester` dev-dep pin and publish BEFORE `mcp-tester` itself** (toolkit `:192`, sql-server `:57`, openapi-server `:63`, workbook-server `:58`) — green only while the pinned `0.8.0` stays published | Open — standing release risk | v2.6 close (2026-09-02) |
+| Release | **crates.io OWNERSHIP is an unchecked publish precondition** — `check-release-coverage.sh` verifies a publish STEP exists, not that the CI token may use it. This is what failed v2.19.1 (403 on `pmcp-team-servers`, 11/14 published) | Open — no in-repo check | v2.6 close (2026-09-02) |
 
 > **Why nothing was acknowledged at the v2.5 close.** Acknowledgment could not be performed safely:
 > (1) `gsd-tools query audit-open --json` emits invalid JSON (unescaped `\(`/`\.`/`\s`/`\|` and
@@ -669,6 +607,19 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 > acknowledgment would have corrupted `deferred-items.md` files. The real debt is smaller than 461
 > but is genuinely unresolved and stays visible to the next audit. Both gsd-tools defects should be
 > reported upstream. See `.planning/MILESTONES.md` § *Known verification overrides*.
+
+> **The same two defects RECURRED at the v2.6 close (2026-09-02), one of them confirmed exactly.**
+> Acknowledgment was attempted on only the 13 genuinely v2.6-scoped items — deliberately not on
+> the 453 archived ones or the 11 belonging to phase 125 — and **11 of the 13 were refused** with
+> `Error: no deferred item matched --text`. The v2.5 diagnosis above is precisely right about the
+> cause: the scanner emits one item per markdown **table row** and per **sub-bullet**, while
+> `acknowledge --text` only matches a top-level `##` heading. The 2 calls that DID apply were the
+> only two `##` headings in `120/deferred-items.md`, and both were reverted so no half-applied
+> suppression survived. One correction to the v2.5 note: the writer does not corrupt the file on a
+> miss — it refuses cleanly. It does, however, **exit 0 while refusing**, so a naive
+> `if ! cmd; then` guard reports success; check the OUTPUT for `Error:`, not the exit status. The
+> v2.6 close therefore proceeded as `override_closeout` with these items disclosed rather than
+> suppressed.
 
 ## Shipped Milestones
 
