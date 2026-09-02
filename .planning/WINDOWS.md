@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 49
+open_count: 52
 waived_count: 0
 fixed_count: 9
-total_count: 58
-last_updated: 2026-08-27T19:57:06.610Z
+total_count: 61
+last_updated: 2026-09-02T05:53:26.065Z
 ---
 
 # Broken Windows Ledger
@@ -73,6 +73,9 @@ last_updated: 2026-08-27T19:57:06.610Z
 | 56 | 124 | deviation | .github/workflows/release.yml | 34 | RESIDUAL AFTER FIX: release.yml's changelog extractor was measured returning ZERO bytes for v2.19.1, v2.19.0 AND v2.18.0 -- every past release -- because 'awk -v ver="## \\[VER\\]"' undergoes string-literal escape processing, '\\[' is an UNDEFINED escape, and BSD awk 20200816 drops the backslash so '[2.19.1]' became a CHARACTER CLASS that '## [' cannot match. Threat T-124-08 realised: an empty-notes GitHub Release at exit 0, silently. Fixed here by passing the bare version and matching with index(), plus a fail-closed guard that exits 1 on an empty extraction. THE RESIDUAL: only ONE awk implementation was measured. CI runs ubuntu-latest (mawk) and neither mawk nor gawk is installed on this machine, so whether CI has actually been shipping empty release notes is NOT established -- gawk and mawk may differ from BSD awk on undefined escapes. Someone with a Linux runner should confirm the historical blast radius; the fix itself is implementation-independent. | open |  | 2026-08-27T19:57:06.470Z |  |
 | 57 | 124 | deviation | .planning/phases/124-release-publish-order/124-05-PLAN.md |  | Task 3's <verify> could not have detected the awk bug it exists to detect, and my first run of it produced a false green. The plan's verify is: awk ... > /tmp/124-notes.txt; test -s /tmp/124-notes.txt. It uses the SAME broken '-v ver="## \\\\[2.19.1\\\\]"' construction as release.yml, so it returns empty against a perfectly good CHANGELOG. Worse, wrapping the extraction as CHANGELOG=$(awk ...) then 'printf "%s\\n" "$CHANGELOG"' writes a 1-byte newline when the extraction is EMPTY, so 'test -s' PASSES on zero content -- which is exactly what happened on the first attempt here (reported '1 byte, non-empty: YES'). Any extraction check must write raw output (awk ... > file) and assert a realistic byte count, not merely non-emptiness. | open |  | 2026-08-27T19:57:06.540Z |  |
 | 58 | 124 | unrun-verify | Makefile |  | make quality-gate's FUZZ leg is vacuous on a stable toolchain, so its green tells you nothing about fuzzing. Measured during plan 05's gate run (13,214-line log, overall EXIT 0, banner present): the 'Validating ALWAYS requirements / 1. FUZZ Testing validation' section emits repeated 'error: failed to run rustc to learn about target-specific information ... error: the option Z is only accepted on the nightly compiler' -- cargo-fuzz needs -Zsanitizer=address. The gate prints these errors and still reports ALL TOYOTA WAY QUALITY CHECKS PASSED. Pre-existing and out of scope for this phase (it corroborates the project-memory note that make validate-always fuzzes NOTHING on stable), recorded so a reader does not read the banner as fuzz coverage. | open |  | 2026-08-27T19:57:06.610Z |  |
+| 59 | 125 | stub | src/server/skills.rs |  | Skills::entries() manifest holds only SKILL.md; reference-file rows deferred to 125-03 | open |  | 2026-09-02T05:53:25.893Z |  |
+| 60 | 125 | stub | src/server/skills.rs |  | Skills::entries() returns Result with no Err path; validation arrives in 125-03 | open |  | 2026-09-02T05:53:25.978Z |  |
+| 61 | 125 | stub | src/server/skills.rs |  | Frontmatter-less/malformed skills excluded with only a debug! breadcrumb; D-02 build-time warning is 125-03's | open |  | 2026-09-02T05:53:26.065Z |  |
 
 ````json
 [
@@ -770,6 +773,42 @@ last_updated: 2026-08-27T19:57:06.610Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-08-27T19:57:06.610Z",
+    "resolved_at": null
+  },
+  {
+    "id": 59,
+    "kind": "stub",
+    "phase": "125",
+    "file": "src/server/skills.rs",
+    "line": null,
+    "description": "Skills::entries() manifest holds only SKILL.md; reference-file rows deferred to 125-03",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T05:53:25.893Z",
+    "resolved_at": null
+  },
+  {
+    "id": 60,
+    "kind": "stub",
+    "phase": "125",
+    "file": "src/server/skills.rs",
+    "line": null,
+    "description": "Skills::entries() returns Result with no Err path; validation arrives in 125-03",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T05:53:25.978Z",
+    "resolved_at": null
+  },
+  {
+    "id": 61,
+    "kind": "stub",
+    "phase": "125",
+    "file": "src/server/skills.rs",
+    "line": null,
+    "description": "Frontmatter-less/malformed skills excluded with only a debug! breadcrumb; D-02 build-time warning is 125-03's",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T05:53:26.065Z",
     "resolved_at": null
   }
 ]

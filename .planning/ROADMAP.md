@@ -2591,12 +2591,12 @@ D-NN citations: D-01 (01,05), D-02 (01,03,04), D-03 (04), D-04 (01), D-05 (01,03
 > the plan-phase gate false positives already recorded in project memory, not a signal about
 > these plans. Do not read a future `covered: 0` from that verb as evidence of a planning
 > gap here; use the manual extraction above, which is what the enumeration reflects.
-**Plans:** 5 plans across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
+**Plans:** 1/5 plans executed across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
 
 Plans:
 **Wave 1**
 
-- [ ] 125-01-PLAN.md — TRACER: `skills/list` end-to-end over streamable HTTP + the SC#1 routing guarantees
+- [x] 125-01-PLAN.md — TRACER: `skills/list` end-to-end over streamable HTTP + the SC#1 routing guarantees
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
