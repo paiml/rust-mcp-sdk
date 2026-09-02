@@ -1733,7 +1733,7 @@ impl Server {
         #[cfg(not(feature = "skills"))]
         let skills: Vec<Value> = Vec::new();
 
-        crate::server::core::build_skills_list_response(id, skills, &self.info, protocol_context)
+        crate::server::core::build_skills_list_response(id, &skills, &self.info, protocol_context)
     }
 
     /// Handle the SEP-2640 `skills/get` request (Phase 125 plan 02, D-06/D-07).

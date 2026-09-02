@@ -2492,7 +2492,15 @@ pub(crate) fn build_discover_response(
 /// if the dead delegates are re-added.
 pub(crate) fn build_skills_list_response(
     id: RequestId,
-    skills: Vec<Value>,
+    // A BORROWED slice, matching the `build_skills_get_response` sibling below.
+    // It took an owned `Vec` until Phase 125 plan 05: the projection only
+    // serializes the entries, so ownership bought nothing, and
+    // `clippy::needless_pass_by_value` (pedantic, enabled by `make lint`) is a
+    // hard error under this repo's lint policy. It went unnoticed because
+    // `make lint` is reached only through `make quality-gate`, which no earlier
+    // plan of this phase ran — the same class of blind spot `make test-skills`
+    // exists to close, one gate leg over.
+    skills: &[Value],
     info: &Implementation,
     protocol_context: Option<&crate::types::protocol::ProtocolContext>,
 ) -> JSONRPCResponse {
@@ -5688,7 +5696,7 @@ mod tests {
         let entries: Vec<serde_json::Value> = skills_entry_map().into_values().collect();
         let ctx = v2_ctx();
         let response =
-            build_skills_list_response(RequestId::from(1i64), entries, &skills_info(), Some(&ctx));
+            build_skills_list_response(RequestId::from(1i64), &entries, &skills_info(), Some(&ctx));
 
         let ResponsePayload::Result(value) = response.payload else {
             panic!("skills/list must return a result");

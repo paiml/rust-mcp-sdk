@@ -15,6 +15,83 @@
 //! the wire round-trip — reference files like `schema.graphql` keep their
 //! `application/graphql` MIME type.
 //!
+//! # Transport reach: the two SEP-2640 methods are answered over streamable HTTP
+//!
+//! `skills/list` and `skills/get` are routed through the crate-private
+//! `InternalClientRequest` classifier, which adds NO variant to the public
+//! `ClientRequest` enum (a 2.x semver promise). The consequence a server author
+//! must plan around is that the classifier's only production consumer is
+//! `classify_http_ingress` in `src/server/streamable_http_server.rs`. Every other
+//! transport reaches requests through the PUBLIC parse path, which maps an
+//! internally-routed method to a method-not-found error — so these two methods
+//! are served over streamable HTTP and are unavailable everywhere else. The
+//! `resources/list` / `resources/read` surface below is transport-independent and
+//! is unaffected; only the two RPC methods are narrowed.
+//!
+//! **Over stdio the failure is harsher than a method-not-found reply, and it was
+//! measured rather than assumed.** The frame fails inside the transport's own
+//! `parse_method_message`, which turns the parse error into a
+//! `TransportError::InvalidMessage`; the server actor's receive arm logs that and
+//! BREAKS its loop. The connection therefore tears down instead of answering.
+//! `tests/skills_routing.rs::stdio_ingress_rejects_a_skills_list_frame` pins this,
+//! with a `resources/list` control that must parse so the assertion cannot pass
+//! against a transport that rejects everything.
+//!
+//! Widening the reach is a NON-semver-breaking follow-on owned by the next skills
+//! phase of the v2.7 milestone (the classifier seam lives in `shared/` and is
+//! transport-agnostic by design). It is nonetheless a bigger change than the
+//! skills work itself: the server actor's request channel is typed
+//! `(RequestId, Request)` over the PUBLIC request enum, so widening means changing
+//! that channel's type or adding a second one.
+//!
+//! # Reach boundary: a `ServerCore` serves skill RESOURCES, not the skill METHODS
+//!
+//! The same limit in a second place, and a reader who knows only the stdio half
+//! has an incomplete picture. A `ServerCore` built through `ServerCoreBuilder`
+//! serves its registered skills through `resources/list` and `resources/read`, and
+//! answers NEITHER skills method. The cause is the same typed ingress: a
+//! `ServerCore`'s only request entry point is `ProtocolHandler::handle_request`,
+//! which accepts the public `Request` enum, and this phase adds no variant to it.
+//! The streamable-HTTP transport dispatches through the high-level `Server`, which
+//! is where the two methods land.
+//!
+//! Widening this reach has a stated precondition: `ProtocolHandler` needs an
+//! ingress that accepts an internally-routed request — the same change the stdio
+//! deferral above needs. Adding delegates first produces code nothing can call,
+//! which is exactly what Phase 112 deleted when it consolidated `server/discover`.
+//! The boundary is enforced, not merely described:
+//! `tests/skills_routing.rs::server_core_declares_no_skills_field_or_skills_method`
+//! fails if a `ServerCore` skills delegate appears without that ingress.
+//!
+//! # What this phase deliberately did not implement, and who owns each
+//!
+//! Recorded here as prose, never as a code marker: `make check-todos` fails the
+//! build on a self-admitted-debt comment anywhere in `src/`, and a deferral with
+//! an owner is documentation rather than debt.
+//!
+//! | Deferred | Why it is legal to defer | Owner |
+//! |---|---|---|
+//! | Stdio (and every non-HTTP transport) reach for the two methods | The extension's methods are answered on the transport this SDK's remote deployments use; see the section above for the measured stdio behaviour | next skills phase, v2.7 |
+//! | The `ServerCore` method reach | Same typed-ingress cause; a delegate added first would be unreachable code | same follow-on, gated on the `ProtocolHandler` ingress change |
+//! | `resources/directory/read` | The capability declaration is an EMPTY object, which is exactly how SEP-2640 spells `directoryRead: false`. Declaring nothing and implementing nothing is conformant; the optional feature is simply off | a later v2.7 phase, if a host asks for it |
+//! | A strict frontmatter mode (a `try_`-style constructor that ERRORS instead of excluding) | D-02 chose warn-and-exclude because 40+ existing `Skill::new(..)` call sites, both proptest strategies and this module's own doctests build frontmatter-less skills. A hard error is a behaviour break that belongs after the canonical surfaces are all conforming | a later v2.7 phase, after D-03's cleanup has settled |
+//! | Cursor pagination for `skills/list` | D-11: a single page with no `nextCursor` is conformant — an absent cursor means the listing is complete — and the shipped handler already ignores its cursor argument | revisit when a registry with hundreds of skills exists |
+//!
+//! # Neither skills method is name-bearing under the v2 routing-header cross-check
+//!
+//! `Mcp-Name` carries the primary subject of a request for the methods that have
+//! one (`tools/call` and `prompts/get` carry `name`, `resources/read` carries
+//! `uri`, the `tasks/*` trio carries `taskId`). `skills/get` does take a `uri`, so
+//! its absence from that table is a decision and not an oversight — and it is a
+//! decision with a stated cost. Adding either method would require editing BOTH
+//! `contracts/mcp-protocol-sdk-v1.yaml`'s method table AND the literal-contract
+//! test beside `is_name_bearing_method` in
+//! `src/server/streamable_http_server.rs`, so it belongs to a phase that owns the
+//! header contract rather than to one that adds a method.
+//! `tests/skills_routing.rs::neither_skills_method_is_routing_name_bearing`
+//! resolves the property through the production seam rather than restating a
+//! method list, so it stays true if the table moves.
+//!
 //! Byte-equal mirror of the doctest at the end of `pmcp-book/src/ch12-8-skills.md`.
 //!
 //! ```rust,no_run
@@ -81,6 +158,51 @@ const SKILL_MD_MIME: &str = "text/markdown";
 /// Flip `ServerCapabilities` to advertise skills support. Called from
 /// every builder method that accepts a skill or skill registry — keeping
 /// the four call sites in sync via one function instead of inline copies.
+///
+/// # What the EMPTY declaration object means
+///
+/// `json!({})` is not a placeholder and is not an omission. SEP-2640's extension
+/// object carries optional feature flags, of which `directoryRead` is the one
+/// this SDK does not implement, and an absent flag is exactly how the draft
+/// spells "off". So the empty object legitimately declares
+/// `directoryRead: false`, and it is the honest declaration for a server that
+/// serves `resources/read` per file and has no `resources/directory/read`.
+///
+/// # What declaring the extension COMMITS the server to
+///
+/// Declaring `io.modelcontextprotocol/skills` makes both `skills/list` and
+/// `skills/get` MANDATORY for a conforming server. Phase 125 implements both, so
+/// the declaration is honest in a way it was not before — but only over
+/// streamable HTTP. See this module's transport-reach section for why, and for
+/// the measured stdio behaviour.
+///
+/// # The uncomfortable half, said at the site where it matters
+///
+/// This function runs at BUILD time, before a transport has been chosen. A server
+/// built here and then run over stdio therefore declares an extension whose two
+/// mandatory methods it cannot answer, and a host that trusts the declaration and
+/// calls `skills/list` gets a torn-down connection rather than a listing. That is
+/// the largest accepted product risk of the phase that implemented these methods,
+/// and it is recorded here because the declaration site is where an operator will
+/// be standing when it bites.
+///
+/// **A stdio operator should expect:** the skills' SKILL.md and reference files to
+/// be fully served through `resources/list` and `resources/read` (that surface is
+/// transport-independent), and the two RPC methods to be unavailable.
+///
+/// Closing the gap needs one of two changes, named here so the next phase
+/// inherits options rather than a complaint:
+///
+/// 1. **Widen the transport reach** so every transport can answer an
+///    internally-routed method. Non-semver-breaking, and the same change the
+///    stdio and `ServerCore` deferrals both need.
+/// 2. **Defer capability resolution until a transport is known**, so the
+///    declaration can be conditional. Larger: it changes WHEN capabilities are
+///    computed, which every builder path depends on.
+///
+/// Narrowing the declaration silently was considered and rejected: a server that
+/// implements the methods but hides the extension is unusable by a conforming
+/// host on the transport where it does work.
 pub(crate) fn set_skills_capabilities(caps: &mut crate::types::ServerCapabilities) {
     if caps.resources.is_none() {
         caps.resources = Some(crate::types::ResourceCapabilities {
