@@ -21,9 +21,18 @@
 //! use pmcp::server::skills::Skill;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let greeting = Skill::new("hello-world", "# Hello\nThis is a minimal skill.\n");
+//!     // SEP-2640 frontmatter. `name` MUST equal the final segment of the
+//!     // resolved URI (`skill://hello-world/SKILL.md`) or the build is
+//!     // rejected; a body with no frontmatter at all is excluded from
+//!     // `skills/list` while remaining readable via `resources/read`.
+//!     let greeting = Skill::new(
+//!         "hello-world",
+//!         "---\nname: hello-world\ndescription: A minimal skill\n---\n\n# Hello\nThis is a minimal skill.\n",
+//!     );
+//!     // The prompt surface serves the SKILL.md verbatim, frontmatter included.
 //!     let prompt_text = greeting.as_prompt_text();
-//!     assert!(prompt_text.starts_with("# Hello"));
+//!     assert!(prompt_text.starts_with("---\nname: hello-world\n"));
+//!     assert!(prompt_text.contains("# Hello"));
 //!
 //!     let _server = pmcp::Server::builder()
 //!         .name("doctest-skills-demo")
@@ -1822,6 +1831,54 @@ mod tests {
             Content::Text { text } => assert_eq!(text, &skill.as_prompt_text()),
             other => panic!("expected Content::Text, got {other:?}"),
         }
+    }
+
+    // ── The module doctest's assertions, actually EXECUTED ────────────
+    /// The module doctest at the top of this file (byte-mirrored into
+    /// `pmcp-book/src/ch12-8-skills.md`, per the rule at line 18) is
+    /// `rust,no_run`: `cargo test --doc` and `mdbook test` COMPILE it but
+    /// never RUN it, so its two `assert!`s are unexecuted claims. A reader
+    /// who copies the snippet does run them.
+    ///
+    /// This test executes exactly those assertions against exactly that
+    /// body, so the canonical snippet cannot silently become false. It is
+    /// the reason Phase 125 plan 04 could change the assertion from
+    /// `starts_with("# Hello")` — which the frontmatter block D-03 requires
+    /// makes false — with evidence rather than with reasoning.
+    #[test]
+    fn the_module_doctest_assertions_actually_hold() {
+        let greeting = Skill::new(
+            "hello-world",
+            "---\nname: hello-world\ndescription: A minimal skill\n---\n\n# Hello\nThis is a minimal skill.\n",
+        );
+        let prompt_text = greeting.as_prompt_text();
+        assert!(prompt_text.starts_with("---\nname: hello-world\n"));
+        assert!(prompt_text.contains("# Hello"));
+
+        // The assertion the doctest USED to make, now false — recorded so
+        // a future reverter sees why it changed rather than "fixing" it back.
+        assert!(!prompt_text.starts_with("# Hello"));
+
+        // D-03: the snippet must produce a CONFORMING entry, not one the
+        // D-02 exclusion path drops. That is the whole point of giving it
+        // frontmatter, and it is checkable here.
+        let entries = Skills::new()
+            .add(greeting)
+            .entries()
+            .expect("frontmatter name equals the URI's final segment");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the canonical snippet must be discoverable"
+        );
+        assert_eq!(entries[0].uri(), "skill://hello-world/SKILL.md");
+        assert_eq!(
+            entries[0]
+                .frontmatter()
+                .get("name")
+                .and_then(|v| v.as_str()),
+            Some("hello-world")
+        );
     }
 
     // ── Test 1.15 ─────────────────────────────────────────────────────

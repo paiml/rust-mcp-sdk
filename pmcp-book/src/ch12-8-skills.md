@@ -61,7 +61,7 @@ The test `tests/skills_integration.rs` asserts byte-equality at runtime: it walk
 
 The Skills surface is just three public types in `src/server/skills.rs`:
 
-- **`Skill`** — a single skill carrying `name`, the full SKILL.md `body`, an optional URI `path` override, a parsed `description`, and zero or more `references`. Constructed with `Skill::new(name, body)`; mutated with `.with_path(...)`, `.with_description(...)`, `.with_reference(...)` (panicking) and `.try_with_reference(...)` (fallible). The `description:` line is parsed eagerly out of the YAML frontmatter so per-skill metadata reads (e.g. `resources/list`, the discovery index) don't re-scan the body on every request.
+- **`Skill`** — a single skill carrying `name`, the full SKILL.md `body`, an optional URI `path` override, a parsed `description`, and zero or more `references`. Constructed with `Skill::new(name, body)`; mutated with `.with_path(...)`, `.with_description(...)`, `.with_reference(...)` (panicking) and `.try_with_reference(...)` (fallible). The `description:` line is parsed eagerly out of the YAML frontmatter so per-skill metadata reads (e.g. `resources/list`) don't re-scan the body on every request.
 - **`SkillReference`** — a supporting file within a skill's directory carrying a `relative_path` (e.g. `references/schema.graphql`), a `mime_type`, and a body. Path validation rejects empty values, null bytes, the literal `SKILL.md` (which would collide with the canonical URI), `..` segments, leading slashes, and embedded URI schemes; duplicates within a skill are also rejected at builder time.
 - **`Skills`** — a registry that collects multiple `Skill` values via `.add(skill)` or `.merge(other)` and flattens them into a `ResourceHandler` via `Skills::into_handler()`. Duplicate URIs (either at the SKILL.md level or at the reference level) are rejected with a `Validation` error rather than silently overwritten.
 
@@ -118,31 +118,61 @@ let _server = pmcp::Server::builder()
 
 `Skill::new(name, body)` is the minimum required. The default URI is `skill://<name>/SKILL.md` — so after this registration the resource is addressable at `skill://hello-world/SKILL.md`. The builder method `.skill(Skill)` is a convenience over `.skills(Skills::new().add(skill))` — when registering one skill, prefer `.skill`; when registering a batch, prefer `.skills`.
 
-After this single registration, a `resources/list` call returns two entries:
+After this single registration, a `resources/list` call returns exactly one entry — one per registered SKILL.md, and nothing else:
 
 - `skill://hello-world/SKILL.md` (mime: `text/markdown`)
-- `skill://index.json` (mime: `application/json`) — the auto-synthesized SEP-2640 §9 discovery index
 
-The discovery index is built once by `Skills::into_handler()` and reused on every list request; the registry is immutable post-construction, so list/read responses are precomputed rather than serialized per request.
+That list is built once by `Skills::into_handler()` and reused on every list request; the registry is immutable post-construction, so list/read responses are precomputed rather than serialized per request.
 
-The discovery index body looks like this (synthesized from the registered skills' frontmatter):
+### Discovery is `skills/list` and `skills/get`, not a resource
+
+`resources/list` tells a host which SKILL.md documents exist. **Discovery** — the metadata a host needs to decide *which* skill to load — is the SEP-2640 method pair `skills/list` and `skills/get`, which pmcp answers over streamable HTTP. There is no discovery-index resource: earlier versions synthesized a `skill://` index into `resources/list`, and it was retired, both because the methods supersede it and because its URI violated the draft's own structure rule (its name segment is not a skill name and it has no `/SKILL.md` sibling).
+
+A `skills/list` response looks like this on the wire:
 
 <!-- synthetic -->
 ```json
 {
-  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  "resultType": "complete",
   "skills": [
     {
-      "name": "hello-world",
-      "type": "skill-md",
-      "description": "Demonstrates the simplest possible MCP skill",
-      "url": "skill://hello-world/SKILL.md"
+      "uri": "skill://hello-world/SKILL.md",
+      "frontmatter": {
+        "name": "hello-world",
+        "description": "Demonstrates the simplest possible MCP skill"
+      },
+      "resources": [
+        {
+          "uri": "skill://hello-world/SKILL.md",
+          "digest": "sha256:a5777e88496e95687177aa658f37dab174074d1dbe0622219166a9494700d43d",
+          "size": 142
+        }
+      ]
     }
   ]
 }
 ```
 
-The `description` field is pulled from the SKILL.md frontmatter at construction time. A SEP-2640-capable host typically fetches the discovery index first, decides which skills are relevant for the user's task, and then issues per-skill `resources/read` calls only for the skills it actually wants to load.
+`skills/get` returns the same entry shape for a single `params.uri`, and answers `-32602` for any URI it does not serve.
+
+The `frontmatter` object is emitted **verbatim** from the SKILL.md YAML block — not reconstructed — so a non-required field such as `license:` survives to the host untouched. The `resources` array is the skill's complete manifest: its own SKILL.md first, then every registered reference, each with a `sha256:` digest and a byte-accurate `size` over exactly the bytes `resources/read` serves for that URI. A skill whose body carries no frontmatter is excluded from this projection with a build-time warning; it remains listable and readable as a resource.
+
+You can obtain the same values locally, without a transport, by calling `Skills::entries()` on the registry:
+
+```rust,ignore
+let registry = Skills::new().add(Skill::new("hello-world", HELLO_WORLD));
+// Read the projection BEFORE `into_handler()` consumes the registry —
+// `entries` borrows, `into_handler` takes ownership.
+let entries = registry.entries()?;
+assert_eq!(entries[0].uri(), "skill://hello-world/SKILL.md");
+assert_eq!(
+    entries[0].frontmatter().get("name").and_then(|v| v.as_str()),
+    Some("hello-world"),
+);
+let handler = registry.into_handler()?;
+```
+
+That is a local read of the projection, **not** an MCP request — the same distinction `examples/c10_client_skills.rs` makes, and for the same reason: neither the snippet above nor that example holds a client transport, so neither can issue `skills/list`. The end-to-end wire proof, real POSTs against a live `StreamableHttpServer` asserted on the response bodies, is `tests/skills_routing.rs`.
 
 Full example: [`examples/s44_server_skills.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s44_server_skills.rs)
 
@@ -178,9 +208,11 @@ The resulting resource lives at `skill://acme/billing/refunds/SKILL.md` rather t
 
 ### SEP-2640 §9 Visibility Filtering
 
-Refunds is the canonical place to teach SEP-2640 §9's "readable but not listable" behavior. Supporting files placed in a skill's `references/` subdirectory ARE addressable via `resources/read` — clients that already know the URI can fetch them lazily. But they MUST NOT appear in `resources/list` or `skill://index.json`. This is the spec-defined contract that keeps the discovery surface scoped to top-level skill entries; references are pulled in on demand, not enumerated upfront.
+Refunds is the canonical place to teach SEP-2640 §9's "readable but not listable" behavior. Supporting files placed in a skill's `references/` subdirectory ARE addressable via `resources/read` — clients that already know the URI can fetch them lazily. But they MUST NOT appear in `resources/list`. This is the spec-defined contract that keeps the resource surface scoped to top-level skill entries; references are pulled in on demand, not enumerated upfront.
 
-PMCP's `SkillsHandler::list()` filters explicitly: it emits the SKILL.md entries plus the synthesized discovery index, and nothing else. The example file calls this out in its module doc comment ("reference URIs ... MUST NOT appear in `resources/list` or the discovery index. They are intentionally absent from the printed URI list below — this is the spec-required 'readable but not listable' behavior"), and `tests/skills_integration.rs` locks the behavior in CI with a property test that walks all generated URIs and asserts none of them contain `/references/` in the listed output.
+They are not hidden from a host, though — they are simply not *listed*. A skill's complete file manifest, digests and all, is carried by its `skills/list` / `skills/get` entry (see the `resources` array above), which is where a host learns the reference URIs it may then read.
+
+PMCP's `SkillsHandler::list()` filters explicitly: it emits one entry per registered SKILL.md and nothing else. The example file calls this out in its module doc comment ("reference URIs ... MUST NOT appear in `resources/list`. They are intentionally absent from the printed URI list below — this is the spec-required 'readable but not listable' behavior"), and `tests/skills_integration.rs` locks the behavior in CI with a property test that walks all generated URIs and asserts none of them contain `/references/` in the listed output.
 
 ### Reference Path Validation
 
@@ -251,34 +283,52 @@ Cross-link: see [Chapter 12.9: Code Mode — LLM Code Validation and Execution](
 
 ### How the Two Hosts See the Same Data
 
-`examples/c10_client_skills.rs` walks both flows side-by-side. Flow A is what an SEP-2640-capable host does — `resources/list`, then `resources/read` for the discovery index, the SKILL.md, and each reference URI:
+`examples/c10_client_skills.rs` walks both flows side-by-side. Flow A is what an SEP-2640-capable host does — discovery first, then `resources/list` and a `resources/read` for the SKILL.md and each reference URI.
+
+The example opens with the discovery half. It reads the ENTRY PROJECTION — the same `SkillEntry` values a `skills/list` response carries — directly from the registry, because the example holds no client and no transport and therefore cannot issue the method itself:
+
+```rust,ignore
+// `entries` borrows and `into_handler` consumes, so read the projection
+// FIRST. This is a local read, NOT a skills/list RPC.
+let registry = Skills::new().add(skill.clone());
+let entries = registry.entries().unwrap();
+
+assert_eq!(entries.len(), 1);
+assert_eq!(entries[0].uri(), "skill://code-mode/SKILL.md");
+assert_eq!(
+    entries[0].frontmatter().get("name").and_then(|v| v.as_str()),
+    Some("code-mode"),
+);
+// SKILL.md + 3 references, each with a sha256: digest and a byte size.
+assert_eq!(entries[0].resources().len(), 4);
+
+let handler = registry.into_handler().unwrap();
+```
+
+Then the resource half, which does run against a real `ResourceHandler`:
 
 ```rust,ignore
 async fn sep_2640_flow(handler: &dyn ResourceHandler, skill: &Skill) -> String {
     let extra = RequestHandlerExtra::default();
 
-    // 1. resources/list — SKILL.md + index ONLY (references excluded per §9).
+    // 1. resources/list — one entry per registered SKILL.md, and nothing
+    //    else (references excluded per §9).
     let list = handler.list(None, extra.clone()).await.unwrap();
     // ...
 
-    // 2. resources/read index — assert wire shape per Fix 3.
-    let index_result = handler
-        .read("skill://index.json", extra.clone())
-        .await
-        .unwrap();
-    // ...
-
-    // 3. resources/read SKILL.md — assert wire shape.
+    // 2. resources/read SKILL.md — assert wire shape.
     let skill_uri = "skill://code-mode/SKILL.md";
     let md_result = handler.read(skill_uri, extra.clone()).await.unwrap();
     // ...
 
-    // 4. resources/read each reference URI — registration order — per-reference MIME.
+    // 3. resources/read each reference URI — registration order — per-reference MIME.
     let mut concatenated = String::new();
     // <concatenation with --- relative_path --- separators>
     concatenated
 }
 ```
+
+Neither snippet issues `skills/list` or `skills/get` over MCP; both drive a handler in process. `tests/skills_routing.rs` is the file that sends real POSTs to a live `StreamableHttpServer` and asserts on the JSON-RPC bodies that come back — read it if you want the wire behavior rather than the projection.
 
 Flow B is the legacy fallback — `prompts/get` invoked on a real `Server` built via the dual-surface bootstrap. The legacy host does not see references as separate resources; it gets the entire workflow context inlined in one prompt body:
 
@@ -337,7 +387,7 @@ The SEP itself: `https://github.com/modelcontextprotocol/modelcontextprotocol/pu
 
 ### Comparing the DX Surfaces
 
-A useful exercise when evaluating MCP SDKs is to count what server authors actually have to write for an equivalent skill registration. For a Tier 1 `hello-world` skill, PMCP's surface is two lines (the constant `include_str!` and the builder call), and the runtime artifact is one `resources/list` entry plus the auto-synthesized index. Tier 2 adds one builder method (`.with_path(...)`) to demonstrate URI namespacing. Tier 3 adds `.bootstrap_skill_and_prompt(...)` — the single line that doubles the surface a host can use to fetch the same workflow context. That builder-method count (3) is the relevant signal: it does not grow with the number of references, the number of skills, or the number of advanced features the skill composes with.
+A useful exercise when evaluating MCP SDKs is to count what server authors actually have to write for an equivalent skill registration. For a Tier 1 `hello-world` skill, PMCP's surface is two lines (the constant `include_str!` and the builder call), and the runtime artifact is one `resources/list` entry plus one conforming `skills/list` entry. Tier 2 adds one builder method (`.with_path(...)`) to demonstrate URI namespacing. Tier 3 adds `.bootstrap_skill_and_prompt(...)` — the single line that doubles the surface a host can use to fetch the same workflow context. That builder-method count (3) is the relevant signal: it does not grow with the number of references, the number of skills, or the number of advanced features the skill composes with.
 
 The aspect that distinguishes PMCP from other SDKs at the wire level is the per-resource MIME type round-trip. The `Content::Resource` variant carries `uri`, `text`, and `mime_type` on every read response — so a reference file like `schema.graphql` keeps its `application/graphql` MIME type all the way from registration through `resources/read`. Some SDKs collapse to a string body without per-resource metadata; PMCP does not.
 
@@ -355,15 +405,26 @@ Two items are explicit non-goals for Phase 80 and Phase 81 — surfacing them he
 
 ## Try It Yourself
 
-The doctest below registers a single skill plus a dual-surface prompt, then asserts on the prompt text length. It is compile-verified via `cargo test --doc -p pmcp --features skills,full`. The same doctest is embedded in `src/server/skills.rs` so it stays in sync with the production code.
+The doctest below registers a single skill plus a dual-surface prompt, then asserts on the prompt text. It is compile-verified via `cargo test --doc -p pmcp --features skills,full`. The same doctest is embedded in `src/server/skills.rs` so it stays in sync with the production code — the two are byte-equal mirrors and must be edited together.
+
+Note the frontmatter block. It is not decoration: a skill whose body carries none is excluded from `skills/list` (with a build-time warning), so a snippet without it would teach a construction that silently disappears from discovery.
 
 ```rust,no_run
 use pmcp::server::skills::Skill;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let greeting = Skill::new("hello-world", "# Hello\nThis is a minimal skill.\n");
+    // SEP-2640 frontmatter. `name` MUST equal the final segment of the
+    // resolved URI (`skill://hello-world/SKILL.md`) or the build is
+    // rejected; a body with no frontmatter at all is excluded from
+    // `skills/list` while remaining readable via `resources/read`.
+    let greeting = Skill::new(
+        "hello-world",
+        "---\nname: hello-world\ndescription: A minimal skill\n---\n\n# Hello\nThis is a minimal skill.\n",
+    );
+    // The prompt surface serves the SKILL.md verbatim, frontmatter included.
     let prompt_text = greeting.as_prompt_text();
-    assert!(prompt_text.starts_with("# Hello"));
+    assert!(prompt_text.starts_with("---\nname: hello-world\n"));
+    assert!(prompt_text.contains("# Hello"));
 
     let _server = pmcp::Server::builder()
         .name("doctest-skills-demo")
@@ -381,15 +442,17 @@ cargo run --example s44_server_skills --features skills,full
 cargo run --example c10_client_skills --features skills,full
 ```
 
-The server example prints the registered SKILL.md URIs, the auto-synthesized `skill://index.json` URI, the bootstrap result for the code-mode skill, and the byte length of the dual-surface text. The client example walks both host flows (`resources/list` + `resources/read` for the SEP-2640 path, `prompts/get` for the legacy path) and asserts byte-equality at the end.
+The server example prints the registered SKILL.md URIs, the entry projection a `skills/list` response carries (count, URI, frontmatter name, file count and digest per entry), the bootstrap result for the code-mode skill, and the byte length of the dual-surface text. The client example walks both host flows (the entry projection plus `resources/list` + `resources/read` for the SEP-2640 path, `prompts/get` for the legacy path) and asserts byte-equality at the end.
+
+Neither example exercises `skills/list` or `skills/get` over MCP — both hold a handler in process rather than a client transport, and both say so in their output. `tests/skills_routing.rs` is the end-to-end proof.
 
 ### Where to Go from Here
 
 Once you have the doctest above working, try the following extensions in order:
 
-1. **Add a second skill** with `.skill(Skill::new("second-skill", "..."))` and verify it appears in the `resources/list` output alongside the auto-synthesized discovery index. Confirm the index includes both entries.
-2. **Add a reference to your skill** with `.with_reference(SkillReference::new("references/notes.md", "text/markdown", "..."))` and verify the reference URI is NOT in `resources/list` but IS readable via `resources/read`. This is the SEP-2640 §9 visibility-filtering behavior the Tier 2 section describes.
-3. **Use `.with_path("team/topic")`** to override the default URI, and confirm the new URI shows up in the listed entries. This is how to namespace skills inside larger workspaces.
+1. **Add a second skill** with `.skill(Skill::new("second-skill", "---\nname: second-skill\ndescription: ...\n---\n..."))` and verify it appears in the `resources/list` output. Then call `Skills::entries()` on a registry holding both and confirm the projection — the value a `skills/list` response carries — has two entries. Give the body real frontmatter: a skill with none is excluded from the projection (with a build-time warning) even though it stays listable and readable as a resource.
+2. **Add a reference to your skill** with `.with_reference(SkillReference::new("references/notes.md", "text/markdown", "..."))` and verify the reference URI is NOT in `resources/list` but IS readable via `resources/read` — and that it DOES appear in the entry's `resources` manifest, with a digest matching the bytes the read returns. This is the SEP-2640 §9 visibility-filtering behavior the Tier 2 section describes.
+3. **Use `.with_path("team/topic")`** to override the default URI, and confirm the new URI shows up in the listed entries. This is how to namespace skills inside larger workspaces. Note that if the skill carries a frontmatter `name:`, it must equal the URI's final segment (`topic` here) or the build is rejected — the URI is the identity, and the frontmatter must agree with it.
 4. **Use `.bootstrap_skill_and_prompt(skill, "prompt_name")`** instead of `.skill(skill)` and verify that a `prompts/get prompt_name` call returns the same content the SEP-2640 resource reads return — byte-equal, per the chapter's central invariant.
 
 **Related chapters:**
