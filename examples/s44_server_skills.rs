@@ -15,22 +15,42 @@
 //! Run with: `cargo run --example s44_server_skills --features skills,full`
 //!
 //! What this example prints:
-//! 1. The registered SKILL.md URIs (discovery-listable resources).
-//! 2. The auto-synthesized `skill://index.json` discovery URI.
+//! 1. The registered SKILL.md URIs (the `resources/list` surface).
+//! 2. The SEP-2640 entry PROJECTION — the count of conforming entries the
+//!    registry produced, plus the first entry's URI and digest.
 //! 3. The fact that `bootstrap_skill_and_prompt(...)` registers BOTH a
 //!    skill AND a parallel prompt from one `Skill` value.
 //! 4. The byte length of the dual-surface text (skill body + references).
 //!
+//! ## Discovery is `skills/list` / `skills/get`, and this example does NOT call them
+//!
+//! A server built the way this example builds one answers the SEP-2640
+//! `skills/list` and `skills/get` methods over **streamable HTTP**. This
+//! example binds no socket and holds no client, so it does NOT exercise
+//! either method over MCP. What it prints instead is the entry PROJECTION —
+//! the very same [`pmcp::server::skills::SkillEntry`] values a `skills/list`
+//! response carries — obtained directly from the registry via
+//! `Skills::entries()`.
+//!
+//! The authoritative end-to-end wire proof lives in `tests/skills_routing.rs`,
+//! which drives real `skills/list` and `skills/get` POSTs against a live
+//! `StreamableHttpServer` and asserts on the response bodies. Read that file,
+//! not this one, if you want to see the RPC.
+//!
+//! There is no synthesized discovery-index resource. One used to be minted
+//! automatically and enumerated by `resources/list`; it was retired in favour
+//! of the method-based surface (125-CONTEXT D-08).
+//!
 //! Note on SEP-2640 §9: reference URIs (e.g.
 //! `skill://code-mode/references/schema.graphql`) are addressable via
-//! `resources/read` but MUST NOT appear in `resources/list` or the
-//! discovery index. They are intentionally absent from the printed URI
-//! list below — this is the spec-required "readable but not listable"
-//! behavior, locked by the integration test in `tests/skills_integration.rs`.
+//! `resources/read` but MUST NOT appear in `resources/list`. They are
+//! intentionally absent from the printed URI list below — this is the
+//! spec-required "readable but not listable" behavior, locked by the
+//! integration test in `tests/skills_integration.rs`.
 //!
 //! Pair with `c10_client_skills.rs` to see the full client-side flow.
 
-use pmcp::server::skills::{Skill, SkillReference};
+use pmcp::server::skills::{Skill, SkillReference, Skills};
 
 // Compiled-in skill bodies (matches spike 002 reference impl byte-for-byte
 // — see `.planning/spikes/002-skill-ergonomics-pragmatic/src/main.rs`
@@ -63,6 +83,33 @@ fn build_code_mode_skill() -> Skill {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let code_mode_skill = build_code_mode_skill();
+    let hello_world_skill = Skill::new("hello-world", HELLO_WORLD);
+    let refunds_skill = Skill::new("refunds", REFUNDS).with_path("acme/billing/refunds");
+
+    // A SEPARATE registry holding CLONES of the same three skills, built
+    // purely so `entries()` can be called on it. Two constraints force this
+    // apparent duplication — neither is avoidable from an example crate:
+    //
+    //   1. Passing this registry to `.skills(...)` and ALSO keeping
+    //      `.bootstrap_skill_and_prompt(code_mode_skill, ...)` would register
+    //      code-mode twice. `ServerBuilder::skill` / `::skills` /
+    //      `::bootstrap_skill_and_prompt` all merge into ONE pending registry
+    //      finalized at `.build()`, so the merged registry would present a
+    //      duplicate `skill://code-mode/SKILL.md` and `.build()` would fail.
+    //
+    //   2. Dropping `bootstrap_skill_and_prompt` in favour of a direct
+    //      `.prompt(...)` is not possible either: the dual-surface prompt
+    //      handler (`SkillPromptHandler`) is `pub(crate)`, and `examples/` is
+    //      a separate crate. `bootstrap_skill_and_prompt` is the ONLY route
+    //      from an example to that surface.
+    //
+    // So the registration chain below is left intact and this registry exists
+    // alongside it, for projection only. `Skill` is `Clone`, so this costs a
+    // copy of three already-embedded `&'static str` bodies.
+    let projection_registry = Skills::new()
+        .add(hello_world_skill.clone())
+        .add(refunds_skill.clone())
+        .add(code_mode_skill.clone());
 
     // pmcp::Server::builder() returns ServerBuilder (see src/server/mod.rs:637).
     // The skill API is wired on BOTH ServerBuilder AND ServerCoreBuilder per
@@ -80,8 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _server = pmcp::Server::builder()
         .name("skills-demo")
         .version("0.1.0")
-        .skill(Skill::new("hello-world", HELLO_WORLD))
-        .skill(Skill::new("refunds", REFUNDS).with_path("acme/billing/refunds"))
+        .skill(hello_world_skill)
+        .skill(refunds_skill)
         .bootstrap_skill_and_prompt(code_mode_skill.clone(), "start_code_mode")
         .build()?;
 
@@ -92,11 +139,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Skills demo server built successfully via pmcp::Server::builder().");
     println!();
-    println!("Registered SKILL.md URIs (discovery-listable):");
+    println!("Registered SKILL.md URIs (the resources/list surface):");
     println!("  skill://hello-world/SKILL.md");
     println!("  skill://acme/billing/refunds/SKILL.md");
     println!("  skill://code-mode/SKILL.md");
-    println!("Also auto-synthesized: skill://index.json");
+    println!();
+
+    // The SEP-2640 discovery surface: a server built like the one above
+    // answers `skills/list` and `skills/get` over streamable HTTP. What
+    // follows is the PROJECTION those responses carry, read straight from
+    // the registry — NOT an RPC round trip. This example holds no client
+    // and no transport, so it cannot issue either call.
+    let entries = projection_registry.entries()?;
+    println!("SEP-2640 discovery surface: skills/list + skills/get.");
+    println!(
+        "  {} conforming entr{} in the projection a skills/list response carries:",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" }
+    );
+    for e in &entries {
+        let name = e
+            .frontmatter()
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<no frontmatter name>");
+        let digest = e.resources().first().map_or(
+            "<no resources>",
+            pmcp::server::skills::SkillResourceRef::digest,
+        );
+        println!(
+            "    {} name={name} files={} digest={digest}",
+            e.uri(),
+            e.resources().len()
+        );
+    }
+    println!("  NOT an RPC: this is Skills::entries(), read in process.");
+    println!("  End-to-end wire proof lives in tests/skills_routing.rs.");
     println!();
     println!("Code-mode dual-surface registered as:");
     println!("  Skill at:  skill://code-mode/SKILL.md (+ 3 references)");
