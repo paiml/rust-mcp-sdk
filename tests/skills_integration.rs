@@ -317,6 +317,43 @@ async fn dual_surface_byte_equal_crlf_and_mixed_line_endings() {
 
 // ── SEP-2640 entry manifests (Phase 125, plan 03) ─────────────────────
 
+/// D-02: a frontmatter-less skill is excluded from the SKILLS listing ONLY.
+/// It stays enumerated by `resources/list` and stays readable byte-identically
+/// through `resources/read` — the exclusion never removes it from the resource
+/// surface, which is what makes a partial listing SEP-legal rather than lossy.
+#[tokio::test]
+async fn frontmatter_less_skill_is_excluded_from_entries_but_still_served() {
+    const BARE_BODY: &str = "# Bare\n\nThis skill has no YAML frontmatter at all.\n";
+
+    let registry = Skills::new()
+        .add(build_widget_skill_lf())
+        .add(Skill::new("bare", BARE_BODY));
+
+    let entries = registry.entries().expect("entries build");
+    assert_eq!(entries.len(), 1, "only the annotated skill is listed");
+    assert_eq!(entries[0].uri(), "skill://widget-builder/SKILL.md");
+
+    let handler = registry.into_handler().expect("fixture has no duplicates");
+    let list = handler
+        .list(None, RequestHandlerExtra::default())
+        .await
+        .unwrap();
+    let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(
+        uris.contains(&"skill://bare/SKILL.md"),
+        "the excluded skill is still enumerated by resources/list, got {uris:?}"
+    );
+
+    let read = handler
+        .read("skill://bare/SKILL.md", RequestHandlerExtra::default())
+        .await
+        .expect("the excluded skill is still readable");
+    let (uri, text, mime) = extract_resource(&read.contents);
+    assert_eq!(uri, "skill://bare/SKILL.md");
+    assert_eq!(mime, "text/markdown");
+    assert_eq!(text, BARE_BODY, "served byte-identically");
+}
+
 /// The entry manifest names EVERY file the skill is made of — its `SKILL.md`
 /// first, then each reference in registration order — and every row's `size` is
 /// the byte length of what `resources/read` actually returns for that URI.
@@ -393,7 +430,8 @@ fn lf_and_crlf_frontmatter_are_identical() {
         "line endings must not reach the emitted frontmatter"
     );
     assert_eq!(
-        lf_entries[0].frontmatter()["name"], "widget-builder",
+        lf_entries[0].frontmatter()["name"],
+        "widget-builder",
         "and the comparison above is not vacuous — the object has real keys"
     );
 

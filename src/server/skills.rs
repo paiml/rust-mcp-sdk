@@ -463,6 +463,81 @@ impl SkillEntry {
     }
 }
 
+/// A build-time finding about ONE registered skill, produced by
+/// [`Skills::entries_with_diagnostics`] and warned by [`Skills::entries`].
+///
+/// Crate-private on purpose: it adds no public API surface while making every
+/// warn path directly assertable from the in-module test block, which is what a
+/// test of "the exclusion produces a warning naming the skill" needs in order to
+/// be a measurement rather than a claim.
+///
+/// Which findings exist, and how they are partitioned, is explicitly NOT part of
+/// the stable surface — see [`Skills::entries`]'s stability boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// Why: every variant here is about the frontmatter block, so the shared prefix
+// is the accurate name rather than a stutter — and dropping it would leave
+// `Absent` / `Invalid` / `NotAMapping`, which say nothing about WHAT is absent.
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum SkillDiagnostic {
+    /// The SKILL.md carries no `---`-delimited frontmatter block at all. The
+    /// skill is EXCLUDED from `skills/list` (D-02) and stays readable via
+    /// `resources/read`.
+    FrontmatterAbsent {
+        /// The excluded skill's SKILL.md URI.
+        uri: String,
+    },
+    /// A frontmatter block IS present but is unterminated or is not valid YAML.
+    /// EXCLUDED, and deliberately a DIFFERENT finding from
+    /// [`Self::FrontmatterAbsent`]: reporting a typo as a missing block sends
+    /// the author to add one that is already there.
+    FrontmatterInvalid {
+        /// The excluded skill's SKILL.md URI.
+        uri: String,
+        /// The parser's own message.
+        reason: String,
+    },
+    /// A frontmatter block IS present and IS valid YAML, but is a sequence or a
+    /// scalar rather than a mapping. EXCLUDED.
+    FrontmatterNotAMapping {
+        /// The excluded skill's SKILL.md URI.
+        uri: String,
+        /// Which non-mapping shape was found.
+        reason: String,
+    },
+}
+
+impl SkillDiagnostic {
+    /// The SKILL.md URI of the skill this finding is about.
+    pub(crate) fn uri(&self) -> &str {
+        match self {
+            Self::FrontmatterAbsent { uri }
+            | Self::FrontmatterInvalid { uri, .. }
+            | Self::FrontmatterNotAMapping { uri, .. } => uri,
+        }
+    }
+
+    /// The operator-facing warning text. Each case says what it actually is:
+    /// an author reading these must be able to tell an absent block from a
+    /// broken one without opening the source.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::FrontmatterAbsent { uri } => format!(
+                "skill {uri} is excluded from skills/list: its SKILL.md carries NO frontmatter \
+                 block. Add a `---`-delimited YAML block at the top of the file; the skill stays \
+                 readable via resources/read either way."
+            ),
+            Self::FrontmatterInvalid { uri, reason } => format!(
+                "skill {uri} is excluded from skills/list: a frontmatter block IS present but is \
+                 unusable ({reason}). This is a broken block, not a missing one."
+            ),
+            Self::FrontmatterNotAMapping { uri, reason } => format!(
+                "skill {uri} is excluded from skills/list: its frontmatter block is valid YAML but \
+                 is not a mapping ({reason}). SEP-2640 entries need top-level `key: value` pairs."
+            ),
+        }
+    }
+}
+
 /// Collection of skills + auto-generated discovery index. Lifted into a
 /// [`crate::server::ResourceHandler`] impl via [`Skills::into_handler`].
 ///
@@ -534,6 +609,21 @@ impl Skills {
     /// entry whose `frontmatter` disagrees with the served `SKILL.md`, and a
     /// synthesized `{name, description}` for an unannotated skill is a guaranteed
     /// host-side rejection. Such skills stay readable via `resources/read`.
+    ///
+    /// Each exclusion emits exactly ONE `tracing::warn!` on the `mcp.skills`
+    /// target naming the excluded skill's URI and its case-specific reason, so
+    /// an operator sees a partial listing being formed rather than discovering
+    /// it from a host. The three failure shapes — no block, a broken block, and
+    /// a block that is valid YAML but not a mapping — each report themselves as
+    /// what they are.
+    ///
+    /// A future strict variant may REJECT frontmatter-less skills at build time
+    /// instead of excluding them. That is deliberately not the default today:
+    /// this crate's own doctests, both in-module proptest strategies and dozens
+    /// of shipped `Skill::new(...)` call sites construct frontmatter-less
+    /// skills, and hard-erroring on them would be a breaking change to shipped,
+    /// documented usage. Promotion belongs with the canonical-surface cleanup,
+    /// not here.
     ///
     /// # The manifest is COMPLETE, and its digests are the served bytes
     ///
@@ -633,8 +723,47 @@ impl Skills {
     /// # }
     /// ```
     pub fn entries(&self) -> Result<Vec<SkillEntry>> {
-        let mut out = Vec::with_capacity(self.skills.len());
+        let (entries, diagnostics) = self.entries_with_diagnostics()?;
+        for diagnostic in &diagnostics {
+            tracing::warn!(
+                target: "mcp.skills",
+                uri = %diagnostic.uri(),
+                "{}",
+                diagnostic.message()
+            );
+        }
+        Ok(entries)
+    }
+
+    /// [`Self::entries`] with the build-time findings returned instead of
+    /// logged — the crate-private form every test of the exclusion semantics
+    /// drives, so "a warning is emitted naming the skill" is assertable rather
+    /// than merely claimed.
+    ///
+    /// A skill whose frontmatter yields anything other than
+    /// [`FrontmatterParse::Parsed`] contributes NO entry and exactly ONE
+    /// diagnostic, and each of the three failure shapes maps to its OWN
+    /// [`SkillDiagnostic`] variant. None of them is an error: 40+ existing
+    /// `Skill::new(...)` call sites, the module doctests and both proptest
+    /// strategies construct frontmatter-less skills, and D-02 chose a partial
+    /// listing over breaking them.
+    ///
+    /// A `{name, description}` object is never synthesized for an excluded
+    /// skill. SEP-2640 makes a field-by-field mismatch between an entry's
+    /// `frontmatter` and the fetched SKILL.md a mandatory host-side refusal, so
+    /// a synthesized entry ships a server that looks conformant and is unusable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` if the registry cannot produce a
+    /// well-formed entry set. See [`Self::entries`]'s `# Errors` section.
+    pub(crate) fn entries_with_diagnostics(
+        &self,
+    ) -> Result<(Vec<SkillEntry>, Vec<SkillDiagnostic>)> {
+        let mut entries = Vec::with_capacity(self.skills.len());
+        let mut diagnostics = Vec::new();
         for skill in &self.skills {
+            let uri = skill.skill_md_uri();
             // The emitted object comes from `parse_frontmatter_value` and from
             // NOTHING else. It is deliberately never reconstructed from
             // `Skill::name()` or from the resolved description accessor:
@@ -644,29 +773,26 @@ impl Skills {
             // to the file's, field for field.
             let frontmatter = match parse_frontmatter_value(skill.body()) {
                 FrontmatterParse::Parsed(value) => value,
-                FrontmatterParse::Absent => continue,
+                FrontmatterParse::Absent => {
+                    diagnostics.push(SkillDiagnostic::FrontmatterAbsent { uri });
+                    continue;
+                },
                 FrontmatterParse::Invalid(reason) => {
-                    // Reading the diagnostic here keeps the three-way distinction
-                    // load-bearing rather than decorative: an operator can tell a
-                    // BROKEN canonical skill from an unannotated one. The
-                    // build-time WARNING that names the excluded skill is a later
-                    // plan's (D-02); this is the debug-level breadcrumb under it.
-                    tracing::debug!(
-                        target: "mcp.skills",
-                        uri = %skill.skill_md_uri(),
-                        reason = %reason,
-                        "skill excluded from skills/list: frontmatter present but unusable"
-                    );
+                    diagnostics.push(SkillDiagnostic::FrontmatterInvalid { uri, reason });
+                    continue;
+                },
+                FrontmatterParse::NotAMapping(reason) => {
+                    diagnostics.push(SkillDiagnostic::FrontmatterNotAMapping { uri, reason });
                     continue;
                 },
             };
-            out.push(SkillEntry {
-                uri: skill.skill_md_uri(),
+            entries.push(SkillEntry {
+                uri,
                 frontmatter,
                 resources: skill_resource_manifest(skill),
             });
         }
-        Ok(out)
+        Ok((entries, diagnostics))
     }
 
     /// Flatten the registry into a [`crate::server::ResourceHandler`].
@@ -959,21 +1085,29 @@ fn parse_frontmatter_description(body: &str) -> Option<String> {
     None
 }
 
-/// The THREE outcomes of reading a SKILL.md's YAML frontmatter block.
+/// The FOUR outcomes of reading a SKILL.md's YAML frontmatter block.
 ///
-/// Three, not two, on purpose: collapsing `Invalid` into `Absent` would make a
-/// BROKEN canonical skill indistinguishable from a deliberately unannotated one,
-/// and the build-time diagnostics a later plan layers on top are built entirely
-/// on that distinction.
+/// Four, not two, on purpose. Collapsing any of the failures into `Absent` would
+/// make a BROKEN canonical skill indistinguishable from a deliberately
+/// unannotated one, and every build-time diagnostic in [`SkillDiagnostic`] is
+/// built on the distinction: an author whose block has a YAML typo is told about
+/// the typo rather than told to add a block that is already there.
+///
+/// The split between [`Self::Invalid`] and [`Self::NotAMapping`] is the same
+/// argument one level down — "your YAML does not parse" and "your YAML parses
+/// but is a list" send an author to two different edits.
 #[derive(Debug)]
 enum FrontmatterParse {
     /// The body carries no `---`-delimited block at its start.
     Absent,
     /// The block parsed to a YAML mapping, rendered here as a JSON object.
     Parsed(serde_json::Value),
-    /// A block IS present but is unterminated, is not valid YAML, or parses to
-    /// something other than a mapping. Carries a human-readable diagnostic.
+    /// A block IS present but is unterminated or is not valid YAML. Carries a
+    /// human-readable diagnostic including the parser's own message.
     Invalid(String),
+    /// A block IS present and IS valid YAML, but is a sequence or a scalar
+    /// rather than the mapping SEP-2640 entries require.
+    NotAMapping(String),
 }
 
 /// The ONE crate-private function that touches `serde_yaml` (D-04).
@@ -1025,7 +1159,7 @@ fn parse_frontmatter_value(body: &str) -> FrontmatterParse {
         Ok(serde_json::Value::Object(map)) => {
             FrontmatterParse::Parsed(serde_json::Value::Object(map))
         },
-        Ok(other) => FrontmatterParse::Invalid(format!(
+        Ok(other) => FrontmatterParse::NotAMapping(format!(
             "frontmatter must be a YAML mapping, got {}",
             match other {
                 serde_json::Value::Array(_) => "a sequence",
@@ -1860,10 +1994,15 @@ mod tests {
         );
 
         // 3. Valid YAML that is a SEQUENCE, not a mapping.
-        let FrontmatterParse::Invalid(reason) =
+        //
+        // The bound VARIANT moved from `Invalid` to `NotAMapping` when plan
+        // 125-03 split the failure shapes (R-20); the ASSERTION below is
+        // unchanged, because the diagnostic text is the same and it is the text
+        // an author reads.
+        let FrontmatterParse::NotAMapping(reason) =
             parse_frontmatter_value("---\n- one\n- two\n---\nbody\n")
         else {
-            panic!("a YAML sequence must be Invalid");
+            panic!("a YAML sequence must be NotAMapping");
         };
         assert!(
             reason.contains("must be a YAML mapping"),
@@ -2081,7 +2220,8 @@ mod tests {
 
         let entries = Skills::new().add(skill).entries().expect("entries build");
         assert_eq!(
-            entries[0].frontmatter()["description"], "AUTHORED",
+            entries[0].frontmatter()["description"],
+            "AUTHORED",
             "the emitted object comes from the FILE, not from the override"
         );
     }
@@ -2090,7 +2230,8 @@ mod tests {
     /// JSON — the existing CRLF lock, now asserted at the entry level.
     #[test]
     fn entries_frontmatter_is_identical_for_lf_and_crlf() {
-        let lf = "---\nname: widget\ndescription: Build widgets\nmetadata:\n  tier: gold\n---\n# W\n";
+        let lf =
+            "---\nname: widget\ndescription: Build widgets\nmetadata:\n  tier: gold\n---\n# W\n";
         let crlf = lf.replace('\n', "\r\n");
 
         let lf_entries = Skills::new()
@@ -2130,7 +2271,10 @@ mod tests {
                 // The frontmatter `name` must equal the final URI segment, which
                 // `skills_strategy_with_refs` rewrote to `p{i}`.
                 let path = s.resolved_path().to_string();
-                let body = format!("---\nname: {path}\ndescription: generated\n---\n{}\n", s.body());
+                let body = format!(
+                    "---\nname: {path}\ndescription: generated\n---\n{}\n",
+                    s.body()
+                );
                 let mut rebuilt = Skill::new(s.name().to_string(), body).with_path(path);
                 for r in s.references() {
                     rebuilt = rebuilt.with_reference(SkillReference::new(
@@ -2194,6 +2338,303 @@ mod tests {
                     prop_assert_eq!(row.digest(), sha256_digest_hex(served.as_bytes()));
                 }
             }
+        }
+    }
+
+    // ── D-02 warn-and-exclude diagnostics (Phase 125, plan 03) ─────────
+
+    /// A mixed registry yields exactly ONE entry and exactly ONE diagnostic:
+    /// the frontmatter-bearing skill is listed, the bare one is named.
+    #[test]
+    fn entries_with_diagnostics_excludes_one_and_names_it() {
+        let (entries, diagnostics) = Skills::new()
+            .add(Skill::new(
+                "good",
+                "---\nname: good\ndescription: d\n---\nbody\n",
+            ))
+            .add(Skill::new("bare", "# Bare\n\nNo frontmatter.\n"))
+            .entries_with_diagnostics()
+            .expect("entries build");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uri(), "skill://good/SKILL.md");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].uri(), "skill://bare/SKILL.md");
+        assert!(
+            diagnostics[0].message().contains("skill://bare/SKILL.md"),
+            "the warning must NAME the excluded skill, got: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// A body with NO delimited block produces the frontmatter-ABSENT
+    /// diagnostic, and the warning says the block is missing.
+    #[test]
+    fn entries_diagnose_an_absent_frontmatter_block() {
+        let (entries, diagnostics) = Skills::new()
+            .add(Skill::new("bare", "# Bare\n\nNo frontmatter.\n"))
+            .entries_with_diagnostics()
+            .expect("entries build");
+        assert!(entries.is_empty());
+        assert!(
+            matches!(diagnostics[0], SkillDiagnostic::FrontmatterAbsent { .. }),
+            "got {:?}",
+            diagnostics[0]
+        );
+        assert!(diagnostics[0].message().contains("NO frontmatter"));
+    }
+
+    /// A block that is present but unterminated, or present but unparseable,
+    /// produces the frontmatter-INVALID diagnostic — never the absent one —
+    /// and the warning carries the parser's own message (R-20).
+    #[test]
+    fn entries_diagnose_an_invalid_frontmatter_block() {
+        for (body, expected_reason) in [
+            ("---\nname: x\ndescription: d\n", "never closed"),
+            ("---\nname: [unclosed\n---\nbody\n", "not valid YAML"),
+        ] {
+            let (entries, diagnostics) = Skills::new()
+                .add(Skill::new("x", body))
+                .entries_with_diagnostics()
+                .expect("entries build");
+            assert!(entries.is_empty());
+            let SkillDiagnostic::FrontmatterInvalid { uri, reason } = &diagnostics[0] else {
+                panic!("expected FrontmatterInvalid, got {:?}", diagnostics[0]);
+            };
+            assert_eq!(uri, "skill://x/SKILL.md");
+            assert!(
+                reason.contains(expected_reason),
+                "reason must carry the parser's message, got: {reason}"
+            );
+            assert!(
+                diagnostics[0].message().contains("not a missing one"),
+                "the warning must distinguish a BROKEN block from an absent one"
+            );
+        }
+    }
+
+    /// A block that parses to a YAML sequence or a scalar produces the
+    /// NOT-A-MAPPING diagnostic (R-20).
+    #[test]
+    fn entries_diagnose_a_non_mapping_frontmatter_block() {
+        for body in [
+            "---\n- one\n- two\n---\nbody\n",
+            "---\njust a scalar\n---\nbody\n",
+            "---\n\n---\nbody\n",
+        ] {
+            let (entries, diagnostics) = Skills::new()
+                .add(Skill::new("x", body))
+                .entries_with_diagnostics()
+                .expect("entries build");
+            assert!(entries.is_empty(), "body = {body:?}");
+            let SkillDiagnostic::FrontmatterNotAMapping { uri, reason } = &diagnostics[0] else {
+                panic!(
+                    "expected FrontmatterNotAMapping for {body:?}, got {:?}",
+                    diagnostics[0]
+                );
+            };
+            assert_eq!(uri, "skill://x/SKILL.md");
+            assert!(reason.contains("must be a YAML mapping"), "got: {reason}");
+        }
+    }
+
+    /// The three exclusion shapes are DISTINCT variants, not one collapsed
+    /// case. A test that only checked "a diagnostic was produced" would pass
+    /// against the collapsed design this replaces (R-20).
+    #[test]
+    fn the_three_frontmatter_diagnostics_are_distinct_variants() {
+        let of = |body: &str| {
+            Skills::new()
+                .add(Skill::new("x", body))
+                .entries_with_diagnostics()
+                .expect("entries build")
+                .1
+                .remove(0)
+        };
+        let absent = of("# Bare\n");
+        let invalid = of("---\nname: [unclosed\n---\nbody\n");
+        let not_mapping = of("---\n- one\n---\nbody\n");
+
+        assert!(matches!(absent, SkillDiagnostic::FrontmatterAbsent { .. }));
+        assert!(matches!(
+            invalid,
+            SkillDiagnostic::FrontmatterInvalid { .. }
+        ));
+        assert!(matches!(
+            not_mapping,
+            SkillDiagnostic::FrontmatterNotAMapping { .. }
+        ));
+
+        // Pairwise distinct — same URI, three different findings.
+        assert_ne!(absent, invalid);
+        assert_ne!(invalid, not_mapping);
+        assert_ne!(absent, not_mapping);
+        assert_ne!(absent.message(), invalid.message());
+        assert_ne!(invalid.message(), not_mapping.message());
+        assert_ne!(absent.message(), not_mapping.message());
+    }
+
+    /// YAML robustness (R-25): an anchor/alias block resolves to the aliased
+    /// value in the emitted JSON, and a twenty-level nested block either parses
+    /// or diagnoses. Neither may panic, loop, or exhaust the stack.
+    #[test]
+    fn entries_survive_yaml_anchors_and_deep_nesting() {
+        let aliased = "---\nname: x\ndescription: d\ndefaults: &shared\n  tier: gold\n\
+                       metadata: *shared\n---\nbody\n";
+        let (entries, diagnostics) = Skills::new()
+            .add(Skill::new("x", aliased))
+            .entries_with_diagnostics()
+            .expect("entries build");
+        assert!(diagnostics.is_empty(), "got {diagnostics:?}");
+        assert_eq!(
+            entries[0].frontmatter()["metadata"]["tier"],
+            "gold",
+            "the alias must RESOLVE in the emitted JSON"
+        );
+
+        // Twenty levels deep.
+        let mut deep = String::from("---\nname: x\ndescription: d\ndeep:\n");
+        for level in 1..=20u32 {
+            let indent = "  ".repeat(level as usize);
+            deep.push_str(&format!("{indent}l{level}:\n"));
+        }
+        deep.push_str(&format!("{}leaf: bottom\n", "  ".repeat(21)));
+        deep.push_str("---\nbody\n");
+
+        let (entries, diagnostics) = Skills::new()
+            .add(Skill::new("x", deep))
+            .entries_with_diagnostics()
+            .expect("entries build");
+        // EITHER outcome is acceptable — a panic or a hang is not.
+        assert_eq!(
+            entries.len() + diagnostics.len(),
+            1,
+            "a deep block must parse or diagnose, exactly once"
+        );
+    }
+
+    /// A registry of ONLY frontmatter-less skills yields an empty entry vector
+    /// and `Ok` — an empty listing is SEP-legal ("MAY return an empty or
+    /// partial listing"), never an error.
+    #[test]
+    fn entries_on_an_all_bare_registry_is_ok_and_empty() {
+        let result = Skills::new()
+            .add(Skill::new("a", "body-a"))
+            .add(Skill::new("b", "body-b"))
+            .add(Skill::new("c", ""))
+            .entries();
+        let entries = result.expect("an all-bare registry is Ok, not Err");
+        assert!(entries.is_empty());
+    }
+
+    /// A capturing `tracing` subscriber counts the WARN events `entries()`
+    /// actually emits (R-24).
+    ///
+    /// Without this, "emits a warning" is a contractual claim nothing checks:
+    /// the diagnostics are asserted elsewhere, but the loop that turns them
+    /// into warnings could be deleted and every other test would stay green.
+    /// Proven by construction — the assertion is on CAPTURED events, not on the
+    /// diagnostic count.
+    mod warn_capture {
+        use std::sync::{Arc, Mutex};
+
+        /// A minimal thread-local `tracing` subscriber, hand-written against
+        /// `tracing` itself rather than pulled from `tracing-subscriber`, so
+        /// this test carries no feature gate beyond the module's own. Mirrors
+        /// the shipped idiom in `crate::testing`'s `capture` module.
+        pub(super) struct WarnCollector {
+            pub(super) events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[derive(Default)]
+        struct Fields {
+            text: String,
+        }
+
+        impl Fields {
+            fn push(&mut self, name: &str, value: &str) {
+                use std::fmt::Write as _;
+                let _ = write!(self.text, "{name}={value} ");
+            }
+        }
+
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.push(field.name(), value);
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.push(field.name(), &format!("{value:?}"));
+            }
+        }
+
+        impl tracing::Subscriber for WarnCollector {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if let Ok(mut events) = self.events.lock() {
+                    events.push(fields.text);
+                }
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+    }
+
+    #[test]
+    fn entries_emits_exactly_one_warn_event_per_diagnostic() {
+        let registry = Skills::new()
+            .add(Skill::new(
+                "good",
+                "---\nname: good\ndescription: d\n---\nb\n",
+            ))
+            .add(Skill::new("bare", "no frontmatter"))
+            .add(Skill::new("broken", "---\nname: [unclosed\n---\nb\n"))
+            .add(Skill::new("seq", "---\n- one\n---\nb\n"));
+
+        let (entries, diagnostics) = registry.entries_with_diagnostics().expect("entries build");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(diagnostics.len(), 3);
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector = warn_capture::WarnCollector {
+            events: std::sync::Arc::clone(&events),
+        };
+        let logged = tracing::subscriber::with_default(collector, || {
+            registry.entries().expect("entries build")
+        });
+        assert_eq!(logged.len(), 1, "the wrapper returns only the entries");
+
+        let captured = events.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            diagnostics.len(),
+            "exactly one WARN per diagnostic, captured: {captured:?}"
+        );
+        for diagnostic in &diagnostics {
+            assert!(
+                captured.iter().any(|e| e.contains(diagnostic.uri())),
+                "no captured WARN names {}; captured: {captured:?}",
+                diagnostic.uri()
+            );
         }
     }
 
