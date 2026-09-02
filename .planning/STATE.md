@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v2.7
 milestone_name: SEP-2640 Skills Conformance & Positioning
-status: In progress — phase 125 complete, next phase not yet added
+status: In progress — phase 125 complete; phase 126 added, not yet planned
 stopped_at: Phase 125 COMPLETE — 5/5 plans, UAT 3/3 passed, verification passed, threats_open 0
 last_updated: "2026-09-02T23:33:33.702Z"
 last_activity: 2026-09-02
 last_activity_desc: Milestone v2.6 archived; milestone pointer moved to v2.7 (phase 125 already complete)
 state_head: 7147ca43c19673987d54b33d52062d9b7208bb6d
 progress:
-  total_phases: 1
+  total_phases: 2
   completed_phases: 1
   total_plans: 5
   completed_plans: 5
-  percent: 100
-  scope_note: "v2.7 counters. Phase 125 only — the milestone's later phases are not yet added (see ROADMAP scoping note), so 100% means 'everything added so far is done', NOT 'the milestone is finished'. The previous values (5/5 phases, 32/32 plans) were v2.6's and were left behind by milestone.complete."
+  percent: 50
+  scope_note: "v2.7 counters. Phases 125 (complete) and 126 (added 2026-09-02, unplanned — plan count unknown, so total_plans still reads 5). Items 24-25 of the spike-findings implementation order are NOT yet added, so this percentage measures what has been added, NOT the milestone's true remaining work. The earlier values (5/5 phases, 32/32 plans) were v2.6's, left behind by milestone.complete."
 current_phase: 125
 current_phase_name: SEP-2640 Conformance — skills/list + skills/get
 ---
@@ -30,13 +30,13 @@ See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 clo
 > v2.7 gets a fresh one — `/gsd-new-milestone` writes it. Do not go looking for the old file.
 
 **Core value:** An AI-Package built from configuration alone moves between pmcp.run environments with its tool surface intact, and the target environment is told exactly what it must supply.
-**Current focus:** v2.7 — SEP-2640 skills conformance and tri-surface positioning. Phase 125 is COMPLETE; no further v2.7 phase has been added yet.
+**Current focus:** v2.7 — SEP-2640 skills conformance and tri-surface positioning. Phase 125 COMPLETE; **Phase 126 (workflow→skill projection, `SequentialWorkflow::as_skill()`) is the next phase** — added 2026-09-02, not yet planned.
 
 ## Current Position
 
 Phase: 125 — SEP-2640 Conformance (skills/list + skills/get) — **COMPLETE**
 Plan: 5 of 5 complete
-Status: v2.6 archived. v2.7 is active with phase 125 done and no next phase added yet.
+Status: v2.6 archived. v2.7 active — phase 125 COMPLETE, phase 126 added and awaiting `/gsd-plan-phase 126`.
 Last activity: 2026-09-02 — v2.6 completed and archived; milestone pointer moved v2.6 → v2.7
 
 **Phase 125 close-out:** UAT 3/3 passed, verification `passed`, `threats_open: 0`. Three human

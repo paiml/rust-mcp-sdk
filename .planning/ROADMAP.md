@@ -13,7 +13,7 @@
 | v2.1 – v2.4 (Tasks DX, config-only servers, governed Excel, Agents & Teams) | 82–111 | ✅ superseded / shipped | [history](milestones/pre-v2.7-ROADMAP-history.md) |
 | v2.5 MCP Spec 2026-07-28 (v2) Support | 112–119 | ✅ shipped 2026-08-22 | [archive](milestones/v2.5-ROADMAP.md) |
 | v2.6 AI-Package Portability | 120–124 | ✅ shipped 2026-08-27 (tag `v2.19.1`) | [archive](milestones/v2.6-ROADMAP.md) |
-| **v2.7 SEP-2640 Skills Conformance & Positioning** | **125+** | 🚧 **active** | below |
+| **v2.7 SEP-2640 Skills Conformance & Positioning** | **125–126+** | 🚧 **active** | below |
 
 <sub>v2.1–v2.4 were never given their own per-milestone archive; their full phase detail lives in
 `milestones/pre-v2.7-ROADMAP-history.md`, carried over verbatim at the v2.6 close so the collapse
@@ -38,6 +38,7 @@ via `/gsd-phase add` as they are taken up — implementation-order items 23-25 i
 spike-findings skill.
 
 - [x] Phase 125: SEP-2640 Conformance — skills/list + skills/get — 5/5 plans, completed 2026-09-02
+- [ ] Phase 126: Workflow→skill projection — `SequentialWorkflow::as_skill()` (spike 009, implementation-order item 23)
 
 > **Ticked by hand, 2026-09-02.** `gsd_run query phase.complete 125` returned
 > `roadmap_updated: false` and did not tick this box: it looks for the phase inside the
@@ -103,6 +104,67 @@ Plans:
      implemented — never silently dropped; the current `{}` declaration legitimately means
      `directoryRead: false`.
 
+### Phase 126: Workflow to skill projection — `SequentialWorkflow::as_skill()`
+
+**Goal**: A `SequentialWorkflow` and its projected skill are the SAME content rendered twice, and
+cannot drift — because the SDK owns the renderer. `SequentialWorkflow::as_skill()` (or
+`Skills::from_workflow(&wf)`) derives a SEP-2640-conforming skill from the workflow's already-public
+introspection surface, targeting the CURRENT entry shape (digests included) from day one, so the
+Phase 125 conformance work is inherited rather than re-litigated.
+
+**Depends on**: Phase 125 (the conforming `Skills::entries()` / `skills/list` surface this projects
+INTO). Grounded in spike 009 (`.planning/spikes/`, VALIDATED) and
+`.claude/skills/spike-findings-rust-mcp-sdk/references/skills-positioning-tri-surface.md`
+(implementation-order item 23).
+
+**Requirements**: TBD — v2.7 has no REQUIREMENTS.md yet (`/gsd-new-milestone` writes one). Until
+then the tracked requirement set is the MANIFEST bullets quoted in the tri-surface reference.
+
+**Why this is a projection and not a rival feature.** Spike 011 measured the positioning as
+*alongside, composing — never instead*: same tools and same data, the ineligible order got refunded
+ONLY by the workflow surface. Context cost is NOT monotone. So the generated skill body must stay a
+COMPLETE manual procedure, and its closing "Server-accelerated alternative" section
+**cross-references the workflow prompt but never redirects to it**.
+
+**The mapping (spike 009, ~90 lines, needs zero new SDK introspection).** The surface is already
+public — `SequentialWorkflow::{name, description, arguments, steps, instructions}`,
+`WorkflowStep::{name, tool, arguments, binding, guidance}`, `DataSource::{PromptArg, StepOutput,
+Constant}`:
+
+- frontmatter ← workflow name (**slugified by the projection**) + description
+- Context ← workflow-level instructions — render `PromptContent::Text` properly
+  (Debug-formatting it was spike 009's only real bug)
+- Inputs ← argument specs
+- Procedure ← per step: tool + rendered `DataSource` argument mappings + "Save the result as {binding}"
+- "Judgment:" lines ← `with_guidance` text
+- Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
+
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 126 to break down)
+
+**Success Criteria** (what must be TRUE):
+
+  1. **Slugification is owned by the projection.** A workflow named `refund_flow` projects to skill
+     `refund-flow`, and the final URI segment equals the frontmatter `name` — so the projection
+     satisfies Phase 125's name-identity build check by construction rather than by luck.
+  2. **Determinism.** Re-deriving the same workflow yields a byte-equal body. Asserted, not assumed.
+  3. **Full coverage.** Every workflow fact — name, description, each argument, each step's tool and
+     argument bindings, each `with_guidance` line — appears in the derived text, asserted
+     string-by-string rather than by a length or substring heuristic.
+  4. **Registry pass-through.** The projected skill registers and `skill://{name}/SKILL.md` reads
+     back byte-identical through the real handler, carrying a conforming SEP-2640 entry (verbatim
+     frontmatter + complete `{uri, digest: sha256, size}` manifest) — i.e. it satisfies Phase 125's
+     contract on the wire, not just in-process.
+  5. **The dual-surface invariant holds for free:** `as_prompt_text() == body`, and both surfaces
+     name exactly the same tools (surface equivalence).
+  6. **Projection-time warning on the workflow surface's blind spot.** Server-side execution runs
+     every deterministic step regardless of guidance prose, so a **side-effecting step carrying
+     gate-like guidance** must produce a warning at projection time — the one thing the projection
+     can see that the executing surface cannot.
+
 ## Progress — v2.7 Milestone
 
 *Milestone **v2.7 SEP-2640 Skills Conformance & Positioning** — opened 2026-09-01 with Phase 125.*
@@ -110,6 +172,7 @@ Plans:
 | Phase | Requirements | Plans Complete | Status | Completed |
 |-------|--------------|----------------|--------|-----------|
 | 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
+| 126. Workflow→skill projection (`as_skill()`) | TBD (spike 009) | 0/? | Planned | - |
 
 **Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
 (`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
@@ -556,4 +619,3 @@ Plans:
 
 - SEP-2640 §4 archive distribution (`application/gzip` + base64 blob). Blocked by GAP #2 (`Content::Resource` has no `blob` field). The SEP marks archive mode as optional.
 - `#[pmcp::skill]` procedural macro for compile-time SKILL.md validation. Worth a separate spike if compile-time validation is wanted.
-
