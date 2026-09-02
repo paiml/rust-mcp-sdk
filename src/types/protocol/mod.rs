@@ -814,6 +814,44 @@ pub(crate) enum InternalClientRequest {
         /// frame carried none).
         params: serde_json::Value,
     },
+    /// The SEP-2640 `skills/list` request (Phase 125), carrying its **RAW**
+    /// `params` and NOTHING else.
+    ///
+    /// # Why it is here and NOT a [`ClientRequest`] variant
+    ///
+    /// The same measurement the [`TasksUpdate`](Self::TasksUpdate) rustdoc above
+    /// records: [`ClientRequest`] is a public exhaustive enum with **no
+    /// `#[non_exhaustive]`**, so `enum_variant_added` is a semver-**MAJOR** break
+    /// and `#[non_exhaustive]` is itself a source break for every downstream
+    /// exhaustive `match`. This enum is `pub(crate)`, invisible to
+    /// `cargo-semver-checks` / `cargo-public-api`, and may grow freely. The
+    /// in-repo guard is `client_request_has_no_skills_variants` in
+    /// `tests/skills_routing.rs`.
+    ///
+    /// # Why the params stay RAW, and why there is no id field
+    ///
+    /// RAW because [`classify_internal_method`] **must never reject a body** — a
+    /// malformed `params` has to become a structured error in the SERVED branch,
+    /// after the header/auth pipeline, not a parse error before it. `skills/list`
+    /// takes only an optional `cursor` today and pmcp answers a single complete
+    /// page (D-11), so the value is currently unread; carrying it verbatim keeps
+    /// this variant shaped like its siblings and keeps the classifier body-blind.
+    ///
+    /// No request id: the classifier is never given one.
+    /// `parse_request_or_internal` reads `request.id` itself and returns it as the
+    /// FIRST element of its `(RequestId, IngressRequest)` tuple.
+    ///
+    /// # There is no era gate on this variant
+    ///
+    /// Unlike `server/discover`, `skills/list` carries no protocol-version gate:
+    /// it rides the base Resources primitive and answers on 2025-11-25 as well as
+    /// 2026-07-28. Only the `ttlMs` / `cacheScope` caching attributes on its
+    /// result are 2026-07-28-conditional (D-07).
+    SkillsList {
+        /// The request's `params`, verbatim and undecoded (`Value::Null` when the
+        /// frame carried none).
+        params: serde_json::Value,
+    },
 }
 
 /// The wire method string of the v2 `server/discover` request (VERS-04).
@@ -845,12 +883,45 @@ pub(crate) const SERVER_DISCOVER_METHOD: &str = "server/discover";
 /// `#[cfg(test)]` fixture.
 pub(crate) use crate::types::mrtr::TASKS_UPDATE_METHOD;
 
+/// The wire method string of the SEP-2640 `skills/list` request (Phase 125).
+///
+/// Single-sourced here — beside [`SERVER_DISCOVER_METHOD`] and for exactly the
+/// reason its rustdoc gives — so [`classify_internal_method`] and the
+/// streamable-HTTP ingress fast-reject in
+/// `src/server/streamable_http_server.rs` can never disagree on the spelling.
+/// MEASURED before minting: `src/`, `tests/` and `examples/` carried ZERO
+/// `"skills/list"` / `"skills/get"` string literals, so neither constant
+/// duplicates an existing definition.
+///
+/// The integration suite `tests/skills_routing.rs` restates both literals as
+/// file-level consts because a Rust integration test is its own crate and cannot
+/// reach a `pub(crate)` item; that restatement carries the same justification
+/// comment `tests/v2_tasks_update_routing.rs` uses for `tasks/update`.
+pub(crate) const SKILLS_LIST_METHOD: &str = "skills/list";
+
+/// The wire method string of the SEP-2640 `skills/get` request (Phase 125).
+///
+/// Minted in the same block, and under the same single-sourcing rationale, as
+/// [`SKILLS_LIST_METHOD`] above — the two spellings share one rustdoc so a later
+/// edit cannot update one and leave the other stale.
+///
+/// The `skills/get` ROUTE lands in plan 125-02; this constant exists ahead of it
+/// deliberately, so that plan adds a classifier arm rather than re-opening this
+/// rustdoc-governed block to mint a second constant.
+// `dead_code` allow: the value has no in-crate reader until 125-02 adds
+// `InternalClientRequest::SkillsGet` and the matching ingress arm. Splitting the
+// mint across two waves would mean a second edit to the shared rustdoc above,
+// which is precisely the drift that single-sourcing exists to prevent.
+#[allow(dead_code)]
+pub(crate) const SKILLS_GET_METHOD: &str = "skills/get";
+
 /// Classify a raw JSON-RPC method string into a crate-private internal request,
 /// if it is one of the internally-routed (non-public-enum) methods.
 ///
 /// Returns `Some(InternalClientRequest::ServerDiscover(..))` for the exact
 /// method string [`SERVER_DISCOVER_METHOD`], `Some(InternalClientRequest::TasksUpdate { .. })`
-/// for [`TASKS_UPDATE_METHOD`], and `None` for every other method (which then
+/// for [`TASKS_UPDATE_METHOD`], `Some(InternalClientRequest::SkillsList { .. })`
+/// for [`SKILLS_LIST_METHOD`], and `None` for every other method (which then
 /// flows through the normal public-enum dispatch path). Plan 05 calls this from
 /// the server request path BEFORE the public-enum conversion. Consumed in
 /// production by [`parse_request_or_internal`](crate::shared::protocol_helpers)
@@ -879,6 +950,9 @@ pub(crate) fn classify_internal_method(
             ServerDiscoverRequest::new(),
         )),
         TASKS_UPDATE_METHOD => Some(InternalClientRequest::TasksUpdate {
+            params: params.clone(),
+        }),
+        SKILLS_LIST_METHOD => Some(InternalClientRequest::SkillsList {
             params: params.clone(),
         }),
         _ => None,
@@ -1109,6 +1183,55 @@ mod tests {
         assert!(classify_internal_method("tasks/updates", &serde_json::json!({})).is_none());
         assert!(classify_internal_method("tasks/get", &serde_json::json!({})).is_none());
         assert!(classify_internal_method("tasks/cancel", &serde_json::json!({})).is_none());
+    }
+
+    /// `skills/list` classifies as its own internal variant and carries its
+    /// params VERBATIM (Phase 125, D-01).
+    ///
+    /// Same property as the `tasks/update` twin above, and it matters for the same
+    /// reason: the classifier judges the METHOD and never the body, so a malformed
+    /// `params` becomes a structured error in the SERVED branch — after the
+    /// header/auth pipeline — rather than a parse error ahead of it.
+    ///
+    /// The near-miss controls are what keep this from passing against a prefix
+    /// match: `skills/lists`, `skills/` and `skills` must all fall through to the
+    /// public-enum path.
+    #[test]
+    fn classify_internal_method_routes_skills_list_with_raw_params() {
+        let garbage = serde_json::json!({ "cursor": 17, "wat": [1, 2, 3] });
+        match classify_internal_method(SKILLS_LIST_METHOD, &garbage) {
+            Some(InternalClientRequest::SkillsList { params }) => {
+                assert_eq!(params, garbage, "params must pass through undecoded");
+            },
+            other => panic!("skills/list must classify as SkillsList, got {other:?}"),
+        }
+
+        // `Value::Null` (a frame with no params at all) is still classified.
+        assert!(matches!(
+            classify_internal_method(SKILLS_LIST_METHOD, &serde_json::Value::Null),
+            Some(InternalClientRequest::SkillsList { .. })
+        ));
+
+        // Near-miss method names are NOT matched.
+        assert!(classify_internal_method("skills/lists", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills/", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills", &serde_json::json!({})).is_none());
+
+        // `skills/get` has no classifier arm YET — plan 125-02 adds it. Asserting
+        // the CURRENT state here means that plan's own test flips a documented
+        // fact rather than silently discovering one.
+        assert!(classify_internal_method(SKILLS_GET_METHOD, &serde_json::json!({})).is_none());
+    }
+
+    /// The two SEP-2640 method spellings, pinned to their wire values.
+    ///
+    /// A constant whose value drifts from the wire is the one failure the
+    /// single-sourcing rustdoc on [`SKILLS_LIST_METHOD`] cannot prevent by
+    /// structure, so it is asserted.
+    #[test]
+    fn the_skills_method_spellings_are_the_wire_values() {
+        assert_eq!(SKILLS_LIST_METHOD, "skills/list");
+        assert_eq!(SKILLS_GET_METHOD, "skills/get");
     }
 
     /// The one spelling: [`TASKS_UPDATE_METHOD`] is the re-exported

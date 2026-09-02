@@ -2427,6 +2427,67 @@ pub(crate) fn build_discover_response(
     response
 }
 
+/// Build the SEP-2640 `skills/list` response (Phase 125, D-07/D-11).
+///
+/// The SINGLE shared projection consumed by the production HTTP caller
+/// (`Server::handle_skills_list` → the streamable-HTTP `HttpIngress::SkillsList`
+/// classifier). Modelled on [`build_discover_response`] above, with four
+/// deliberate deltas — each one is a decision, not an omission:
+///
+/// 1. **No era gate.** `server/discover` is a 2026-07-28-only method and answers
+///    `-32601` on v1. `skills/list` has no version gate in the SEP-2640 draft: it
+///    rides the base Resources primitive, and only the caching ATTRIBUTES on its
+///    result are era-conditional. Deleting the gate here is the point; do not
+///    translate `build_discover_response`'s copy of it.
+/// 2. **[`ResponseDisposition::Complete`]**, which is what emits
+///    `resultType: "complete"` — the value the draft's own `skills/list` example
+///    carries.
+/// 3. **[`Cacheable::Yes`] is named HERE, at the projection call site**, exactly
+///    as `build_discover_response` names its own. This is also why
+///    [`request_is_cacheable`] gains no `skills/list` row: that table is keyed on
+///    public `ClientRequest` variants, `skills/list` deliberately has none, its
+///    `match` carries no wildcard arm, and its rustdoc calls a row for a variant
+///    that cannot occur "a lie about where the claim is made".
+/// 4. **Single page, no cursor.** Every entry is returned in one response and no
+///    `nextCursor` key is emitted (D-11). An absent cursor means the listing is
+///    complete, which is conformant. Cursor pagination is a recorded deferral —
+///    revisit if a registry with hundreds of skills materializes — and is recorded
+///    here rather than as an in-code marker.
+///
+/// `skills` arrives ALREADY SERIALIZED. `SkillEntry` exists only under
+/// `feature = "skills"` while the classifier that routes the method is ungated, so
+/// taking a `Value` array keeps this projection feature-agnostic and lets a
+/// featureless build answer with an honest empty catalog rather than a second
+/// envelope implementation behind a `cfg`.
+///
+/// # An EMPTY catalog answers the method; it does not deny it
+///
+/// A server with no registered skills returns `{"skills": []}`, never `-32601`.
+/// The capability is declared at build time regardless of catalog size, so an
+/// empty catalog that refused the method would make that declaration a lie.
+pub(crate) fn build_skills_list_response(
+    id: RequestId,
+    skills: Vec<Value>,
+    info: &Implementation,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+) -> JSONRPCResponse {
+    let mut response = ServerCore::success_response(id, serde_json::json!({ "skills": skills }));
+    inject_v2_result_envelope(
+        &mut response,
+        protocol_context,
+        info,
+        ResponseDisposition::Complete,
+        // `skills/list` mints no reserved MRTR/tasks result field, so it owns none.
+        ReservedFieldOwner::None,
+        // SEP-2640 §Dependencies: "In protocol versions 2026-07-28 and later,
+        // `skills/list` results additionally carry the base protocol's
+        // list-caching attributes." The claim is made HERE — see delta 3 above for
+        // why it is not a `request_is_cacheable` row.
+        Cacheable::Yes,
+    );
+    response
+}
+
 // ===========================================================================
 // MRTR ingress + egress (Plan 113-06, HTTP-02 / HTTP-03).
 //

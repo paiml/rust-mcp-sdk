@@ -475,6 +475,22 @@ pub struct Server {
     uri_to_tool_meta: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// The SEP-2640 `skills/list` entry set, keyed by SKILL.md URI in
+    /// REGISTRATION order (Phase 125, D-01/D-11).
+    ///
+    /// Carried as its OWN field, never reached by downcasting
+    /// [`resources`](Self::resources): the builder wraps the skills handler in
+    /// `ComposedResources` whenever the author also called `.resources(...)`, so
+    /// a downcast would silently report "no skills" for exactly the servers that
+    /// registered the most. Populated at build time from the single
+    /// `finalize_skills_resources` call, which is also where `ServerCoreBuilder`
+    /// gets its handler — one source, two build paths.
+    ///
+    /// An `IndexMap` rather than a `Vec` because plan 125-02's `skills/get`
+    /// resolves a URI to one entry, and the map keeps registration order for the
+    /// list projection at the same time.
+    #[cfg(feature = "skills")]
+    skill_entries: Arc<indexmap::IndexMap<String, skills::SkillEntry>>,
     /// Completion provider backing `completion/complete` (Phase 118.1-04,
     /// CONF-05). Mirrors `ServerCore`'s field of the same name so BOTH native
     /// dispatchers consult the same registered seam through the same shared
@@ -1673,6 +1689,51 @@ impl Server {
             &self.info,
             protocol_context,
         )
+    }
+
+    /// Handle the SEP-2640 `skills/list` request (Phase 125, D-01/D-07/D-11).
+    ///
+    /// The production `skills/list` caller, and a THIN delegate exactly like
+    /// [`handle_discover`](Self::handle_discover) beside it: the streamable-HTTP
+    /// transport classifies a `skills/list` POST as `HttpIngress::SkillsList` and,
+    /// at the per-path response-assembly step, calls this. It projects the entry
+    /// set computed once at BUILD time through the ONE shared
+    /// [`build_skills_list_response`](crate::server::core::build_skills_list_response)
+    /// free fn.
+    ///
+    /// **It defines no gate of its own.** In particular there is no era gate:
+    /// unlike `server/discover`, `skills/list` rides the base Resources primitive
+    /// and answers on 2025-11-25 as well as 2026-07-28. Only the `ttlMs` /
+    /// `cacheScope` attributes on the result are era-conditional, and that
+    /// condition lives in the shared v2 envelope, not here.
+    ///
+    /// # Why the entries are serialized here rather than passed as typed values
+    ///
+    /// `SkillEntry` exists only under `feature = "skills"`, while the classifier
+    /// that routes `skills/list` is ungated — a server built WITHOUT the feature
+    /// can still receive the method and must answer it. Handing `core.rs` an
+    /// already-serialized array keeps the shared projection feature-agnostic and
+    /// gives the featureless build the honest answer (an empty catalog) instead of
+    /// a second envelope implementation behind a `cfg`.
+    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
+    pub(crate) fn handle_skills_list(
+        &self,
+        id: RequestId,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> JSONRPCResponse {
+        #[cfg(feature = "skills")]
+        let skills: Vec<Value> = self
+            .skill_entries
+            .values()
+            .map(|entry| {
+                serde_json::to_value(entry)
+                    .expect("SkillEntry is String/Value/Vec only — serialization cannot fail")
+            })
+            .collect();
+        #[cfg(not(feature = "skills"))]
+        let skills: Vec<Value> = Vec::new();
+
+        crate::server::core::build_skills_list_response(id, skills, &self.info, protocol_context)
     }
 
     /// Handle the v2 `tasks/update` request (Phase 114 plan 13, TASK-02).
@@ -5367,9 +5428,15 @@ impl ServerBuilder {
         // itself stays "last write wins" — composition lives here so the
         // setter's semantics are unchanged for callers that don't use
         // skills.
+        //
+        // The SEP-2640 entry set comes back from the SAME call (Phase 125): it is
+        // the one place that sees the registry, so it is the only place both build
+        // paths can take entries from without drifting.
         #[cfg(feature = "skills")]
-        let final_resources: Option<Arc<dyn ResourceHandler>> =
-            builder::finalize_skills_resources(self.pending_skills, self.resources);
+        let (final_resources, skill_entries): (
+            Option<Arc<dyn ResourceHandler>>,
+            Vec<skills::SkillEntry>,
+        ) = builder::finalize_skills_resources(self.pending_skills, self.resources);
         #[cfg(not(feature = "skills"))]
         let final_resources = self.resources;
 
@@ -5436,6 +5503,13 @@ impl ServerBuilder {
             uri_to_tool_meta,
             prompts: self.prompts,
             resources: final_resources,
+            #[cfg(feature = "skills")]
+            skill_entries: Arc::new(
+                skill_entries
+                    .into_iter()
+                    .map(|entry| (entry.uri().to_string(), entry))
+                    .collect(),
+            ),
             completions: self.completions,
             sampling: self.sampling,
             client_capabilities: Arc::new(RwLock::new(None)),

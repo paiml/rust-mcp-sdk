@@ -2233,15 +2233,52 @@ enum HttpIngress {
         id: crate::types::RequestId,
         params: serde_json::Value,
     },
+    /// A SEP-2640 `skills/list` request (Phase 125), carrying the ORIGINAL request
+    /// id and the RAW `params`.
+    ///
+    /// Classified through the SHARED
+    /// [`parse_request_or_internal`](crate::shared::protocol_helpers::parse_request_or_internal)
+    /// seam — the `server/discover` / `tasks/update` route, not this file's
+    /// HTTP-local `SubscriptionsListen` route. `skills/list` is an ordinary
+    /// request/response with meaning off this transport, so its classification
+    /// belongs in `shared/` where a later plan can widen its reach without a
+    /// semver break. That widening is a RECORDED DEFERRAL (D-01), not an
+    /// oversight: today an internally-routed method reaches only streamable HTTP.
+    ///
+    /// Not a public `ClientRequest` variant, for the reason Phase 112 recorded on
+    /// [`Discover`](Self::Discover): `enum_variant_added` on a public exhaustive
+    /// enum is a MAJOR break. The params stay RAW because the classifier must
+    /// never reject a body.
+    ///
+    /// Unlike [`Discover`](Self::Discover) this variant carries NO era gate — see
+    /// [`build_skills_list_response`](crate::server::core::build_skills_list_response).
+    SkillsList {
+        id: crate::types::RequestId,
+        /// The request's `params`, RAW and undecoded.
+        ///
+        /// `dead_code` allow: SEP-2640's only `skills/list` parameter is an
+        /// optional `cursor`, and pmcp answers a SINGLE COMPLETE PAGE (D-11), so
+        /// nothing downstream reads it yet. The value is carried this far anyway
+        /// so the raw-params discipline holds end to end — the classifier stays
+        /// body-blind, and a later plan that honors a cursor changes a response
+        /// assembler rather than re-plumbing the ingress. Dropping the field
+        /// instead would make that later change a classification change.
+        #[allow(dead_code)]
+        params: serde_json::Value,
+    },
 }
 
 impl HttpIngress {
     /// Whether this ingress is an `initialize` request — the flag that decides
     /// session minting.
     ///
-    /// `server/discover`, `subscriptions/listen` and `tasks/update` are non-init
-    /// by construction (a stateless capability projection, a v2 stream opener and
-    /// a v2 task-input delivery respectively).
+    /// `server/discover`, `subscriptions/listen`, `tasks/update` and
+    /// `skills/list` are non-init by construction (a stateless capability
+    /// projection, a v2 stream opener, a v2 task-input delivery and a read-only
+    /// catalog projection respectively).
+    ///
+    /// For `skills/list` this is also a security property, not just a
+    /// classification: a skills method must never MINT a session (ASVS V3).
     ///
     /// Both POST preambles derived this with the same inline `match` before plan
     /// 113.1; it lives here so the two paths cannot drift, and so a new
@@ -2249,19 +2286,21 @@ impl HttpIngress {
     fn is_initialize(&self) -> bool {
         match self {
             Self::Public(msg) => is_initialize_request(msg),
-            Self::Discover { .. } | Self::SubscriptionsListen { .. } | Self::TasksUpdate { .. } => {
-                false
-            },
+            Self::Discover { .. }
+            | Self::SubscriptionsListen { .. }
+            | Self::TasksUpdate { .. }
+            | Self::SkillsList { .. } => false,
         }
     }
 }
 
 /// Classify a raw POST body as an internally-routed request, if it is one.
 ///
-/// Three methods are internally routed, none of which has a public
+/// Four methods are internally routed, none of which has a public
 /// `ClientRequest` variant: `server/discover` (Phase 112, VERS-04),
-/// `subscriptions/listen` (Phase 113 plan 10, HTTP-04) and `tasks/update`
-/// (Phase 114 plan 13, TASK-02). Never panics (T-112-13).
+/// `subscriptions/listen` (Phase 113 plan 10, HTTP-04), `tasks/update`
+/// (Phase 114 plan 13, TASK-02) and `skills/list` (Phase 125, SEP-2640).
+/// Never panics (T-112-13).
 ///
 /// Every other input (malformed JSON, a batch/notification with no `id`, a
 /// non-object, or any other method) returns `None`, so the caller falls through
@@ -2278,18 +2317,23 @@ fn classify_http_ingress(body: &[u8]) -> Option<HttpIngress> {
             params: req.params,
         });
     }
-    // Fast reject: `server/discover` and `tasks/update` are the only remaining
-    // internally-routed methods, so for ~100% of traffic we skip the typed
-    // `parse_client_request` conversion and the `_meta` clone below.
-    // `parse_request_or_internal` remains the authority for both (its
+    // Fast reject: `server/discover`, `tasks/update` and `skills/list` are the
+    // only remaining internally-routed methods, so for ~100% of traffic we skip
+    // the typed `parse_client_request` conversion and the `_meta` clone below.
+    // `parse_request_or_internal` remains the authority for all three (its
     // `IngressRequest::Internal(..)` arms are the only paths that yield `Discover`
-    // / `TasksUpdate`), so this peek changes no classification — any other method
-    // returned `None` before too, via `Public(_) => None`.
+    // / `TasksUpdate` / `SkillsList`), so this peek changes no classification —
+    // any other method returned `None` before too, via `Public(_) => None`.
     //
-    // Both spellings are read from the SINGLE-SOURCED constants; neither is
+    // FAILING TO EXTEND THIS CONDITION IS A SILENT NO-ROUTE BUG: the method would
+    // return `None` here and fall through to the public parse path, which answers
+    // `-32601`. Omitting the inner `match` arm below is merely a compile error.
+    //
+    // All three spellings are read from the SINGLE-SOURCED constants; none is
     // re-typed here.
     if req.method != crate::types::protocol::SERVER_DISCOVER_METHOD
         && req.method != crate::types::protocol::TASKS_UPDATE_METHOD
+        && req.method != crate::types::protocol::SKILLS_LIST_METHOD
     {
         return None;
     }
@@ -2303,6 +2347,9 @@ fn classify_http_ingress(body: &[u8]) -> Option<HttpIngress> {
             },
             crate::types::protocol::InternalClientRequest::TasksUpdate { params } => {
                 Some(HttpIngress::TasksUpdate { id, params })
+            },
+            crate::types::protocol::InternalClientRequest::SkillsList { params } => {
+                Some(HttpIngress::SkillsList { id, params })
             },
         },
         // A public request re-parsed here is DISCARDED; the caller re-parses it via
@@ -3239,11 +3286,14 @@ async fn resolve_v2_gate(
         // Only a REQUEST carries a header contract. `server/discover` pins its
         // method (it is routed by classification, not by the body's `method`
         // field); every other request — including `subscriptions/listen`, whose
-        // body DOES carry its method — reads the method from the body.
+        // body DOES carry its method, and `skills/list`, whose body does too —
+        // reads the method from the body. `skills/list` therefore sets NO
+        // `method_override`.
         HttpIngress::Public(TransportMessage::Request { .. })
         | HttpIngress::Discover { .. }
         | HttpIngress::SubscriptionsListen { .. }
-        | HttpIngress::TasksUpdate { .. } => {
+        | HttpIngress::TasksUpdate { .. }
+        | HttpIngress::SkillsList { .. } => {
             let method_override = matches!(ingress, HttpIngress::Discover { .. })
                 .then_some(crate::types::protocol::SERVER_DISCOVER_METHOD);
             let (ctx, gate) = run_v2_header_gate(state, headers, body, method_override).await;
@@ -3955,6 +4005,134 @@ async fn assemble_tasks_update_with_middleware(
     let live_id = call.id.clone();
     let protocol_context = call.protocol_context;
     let json_response = tasks_update_json_response(state, &call).await;
+    let era = protocol_context.map(|pc| pc.era);
+    let v2_status = v2_dispatch_response_status(era, &json_response);
+    let response_msg =
+        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
+
+    v1::store_response_event(state, era, response_session_id, &response_msg).await;
+
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
+
+    let mut response = build_success_response_with_middleware(
+        &response_msg,
+        response_session_id,
+        &version_to_send,
+        sessions_on,
+        http_middleware,
+        http_context,
+    )
+    .await;
+
+    if let Some((method, name)) = &v2_outbound {
+        apply_v2_outbound_headers(response.headers_mut(), method, name);
+    }
+    if let Some(status) = v2_status {
+        *response.status_mut() = status;
+    }
+    response
+}
+
+// ===========================================================================
+// `skills/list` (Phase 125, SEP-2640).
+// ===========================================================================
+
+/// Assemble the `skills/list` response on the fast path (Phase 125).
+///
+/// Structurally the twin of [`assemble_discover_response_fast`] and it shares that
+/// function's [`InternalResponseShape`] and response tail verbatim in shape.
+/// Reached only AFTER session resolution, the v2 header matrix, legacy-version
+/// validation and auth — classify-then-continue, no pipeline bypass.
+///
+/// # The v1 answer, and why it is NOT `-32601`
+///
+/// This is where `skills/list` parts company with its two siblings.
+/// `server/discover` and `tasks/update` are 2026-07-28-only methods and answer
+/// `-32601` on a v1 connection. `skills/list` has no version gate at all in
+/// SEP-2640: it rides the base Resources primitive and is served identically on
+/// 2025-11-25. Only the `ttlMs` / `cacheScope` attributes differ by era, and that
+/// difference is applied by the shared v2 result envelope, not here.
+///
+/// `params` are accepted and currently unread: pmcp answers a single complete page
+/// (D-11), so the draft's optional `cursor` has no effect. They are carried this
+/// far rather than dropped at classification so that the classifier stays
+/// body-blind and a later plan that honors a cursor needs no new plumbing.
+async fn assemble_skills_list_fast(
+    state: &ServerState,
+    id: crate::types::RequestId,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    shape: InternalResponseShape<'_>,
+    session_id: Option<&String>,
+) -> Response {
+    let InternalResponseShape {
+        response_session_id,
+        asserted_protocol_version,
+        v2_outbound,
+        sessions_on,
+    } = shape;
+    let live_id = id.clone();
+    let json_response = {
+        let server = state.server.lock().await;
+        server.handle_skills_list(id, protocol_context)
+    };
+    let era = protocol_context.map(|pc| pc.era);
+    let v2_status = v2_dispatch_response_status(era, &json_response);
+    // Same structural guarantee as every other direct response (HTTP-05).
+    let response_msg =
+        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
+
+    v1::store_response_event(state, era, response_session_id, &response_msg).await;
+
+    let mut response = build_response(state, response_msg, session_id, sessions_on);
+
+    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
+
+    // `skills/list` is never an init request → compute the outbound version
+    // normally.
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
+    response
+        .headers_mut()
+        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
+
+    if let Some((method, name)) = &v2_outbound {
+        apply_v2_outbound_headers(response.headers_mut(), method, name);
+    }
+
+    if let Some(status) = v2_status {
+        *response.status_mut() = status;
+    }
+
+    response
+}
+
+/// Assemble the `skills/list` response on the middleware path (Phase 125).
+///
+/// The middleware-path twin of [`assemble_skills_list_fast`], differing ONLY in
+/// the response-BUILDING step ([`build_success_response_with_middleware`] instead
+/// of [`build_response`] + [`v1::apply_session_header`]) — this file's established
+/// fast/middleware split. Both MUST exist or the two POST paths diverge on which
+/// servers can answer the method at all.
+async fn assemble_skills_list_with_middleware(
+    state: &ServerState,
+    id: crate::types::RequestId,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    shape: InternalResponseShape<'_>,
+    http_middleware: &ServerHttpMiddlewareChain,
+    http_context: &ServerHttpContext,
+) -> Response {
+    let InternalResponseShape {
+        response_session_id,
+        asserted_protocol_version,
+        v2_outbound,
+        sessions_on,
+    } = shape;
+    let live_id = id.clone();
+    let json_response = {
+        let server = state.server.lock().await;
+        server.handle_skills_list(id, protocol_context)
+    };
     let era = protocol_context.map(|pc| pc.era);
     let v2_status = v2_dispatch_response_status(era, &json_response);
     let response_msg =
@@ -5092,6 +5270,32 @@ async fn dispatch_message_fast(
             ))
             .await
         },
+        // Phase 125: the SEP-2640 catalog projection. Reached AFTER the same
+        // session / v2-matrix / legacy-version / auth pipeline as every other
+        // ingress — a catalog listing must not be a way around auth.
+        HttpIngress::SkillsList { id, params: _ } => {
+            let FastPathDispatch {
+                response_session_id,
+                asserted_protocol_version,
+                protocol_context,
+                v2_outbound,
+                sessions_on,
+                ..
+            } = dispatch;
+            Box::pin(assemble_skills_list_fast(
+                state,
+                id,
+                protocol_context.as_ref(),
+                InternalResponseShape {
+                    response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
+                    v2_outbound,
+                    sessions_on,
+                },
+                session_id,
+            ))
+            .await
+        },
         HttpIngress::Public(TransportMessage::Notification { .. }) => {
             StatusCode::ACCEPTED.into_response()
         },
@@ -5170,6 +5374,23 @@ async fn dispatch_message_with_middleware(
                     protocol_context: protocol_context.as_ref(),
                     auth_context: auth_context.as_ref(),
                 },
+                InternalResponseShape {
+                    response_session_id: response_session_id.as_ref(),
+                    asserted_protocol_version: asserted_protocol_version.as_deref(),
+                    v2_outbound,
+                    sessions_on,
+                },
+                http_middleware,
+                http_context,
+            )
+            .await
+        },
+        // Phase 125: the SEP-2640 catalog projection (see the fast-path twin).
+        HttpIngress::SkillsList { id, params: _ } => {
+            assemble_skills_list_with_middleware(
+                state,
+                id,
+                protocol_context.as_ref(),
                 InternalResponseShape {
                     response_session_id: response_session_id.as_ref(),
                     asserted_protocol_version: asserted_protocol_version.as_deref(),
@@ -6899,7 +7120,8 @@ mod tests {
             },
             HttpIngress::Public(_)
             | HttpIngress::SubscriptionsListen { .. }
-            | HttpIngress::TasksUpdate { .. } => {
+            | HttpIngress::TasksUpdate { .. }
+            | HttpIngress::SkillsList { .. } => {
                 panic!("server/discover must classify as Discover")
             },
         }
@@ -6938,7 +7160,8 @@ mod tests {
             },
             HttpIngress::Public(_)
             | HttpIngress::Discover { .. }
-            | HttpIngress::SubscriptionsListen { .. } => {
+            | HttpIngress::SubscriptionsListen { .. }
+            | HttpIngress::SkillsList { .. } => {
                 panic!("tasks/update must classify as TasksUpdate")
             },
         }
@@ -6946,6 +7169,80 @@ mod tests {
         // A notification (no id) is NOT an ingress — it has nothing to answer to.
         let notif = br#"{"jsonrpc":"2.0","method":"tasks/update","params":{}}"#;
         assert!(classify_http_ingress(notif).is_none());
+    }
+
+    /// A `skills/list` body classifies as `HttpIngress::SkillsList` carrying the
+    /// ORIGINAL id and its params VERBATIM (Phase 125, SEP-2640).
+    ///
+    /// The near-miss controls are the load-bearing half. Extending the enum and
+    /// the inner `match` without extending the FAST-REJECT condition above is a
+    /// silent no-route: the method would fall through to the public parse path and
+    /// answer `-32601` while every compile-time tripwire stayed green. These
+    /// assertions are what catch that.
+    #[test]
+    fn classify_http_ingress_routes_skills_list_with_raw_params() {
+        let body =
+            br#"{"jsonrpc":"2.0","id":"s-1","method":"skills/list","params":{"cursor":9,"junk":[1]}}"#;
+        let ingress = classify_http_ingress(body).expect("skills/list classifies");
+        match ingress {
+            HttpIngress::SkillsList { id, params } => {
+                assert_eq!(id, crate::types::RequestId::from("s-1".to_string()));
+                assert_eq!(
+                    params,
+                    serde_json::json!({ "cursor": 9, "junk": [1] }),
+                    "the params must reach the served branch UNDECODED"
+                );
+            },
+            HttpIngress::Public(_)
+            | HttpIngress::Discover { .. }
+            | HttpIngress::SubscriptionsListen { .. }
+            | HttpIngress::TasksUpdate { .. } => {
+                panic!("skills/list must classify as SkillsList")
+            },
+        }
+
+        // A frame with NO params at all still classifies — the classifier judges
+        // the METHOD, never the body.
+        let bare = br#"{"jsonrpc":"2.0","id":2,"method":"skills/list"}"#;
+        assert!(matches!(
+            classify_http_ingress(bare),
+            Some(HttpIngress::SkillsList { .. })
+        ));
+
+        // Near-miss method names fall through to the public path.
+        let near = br#"{"jsonrpc":"2.0","id":3,"method":"skills/lists","params":{}}"#;
+        assert!(classify_http_ingress(near).is_none());
+        // A notification (no id) is NOT an ingress — it has nothing to answer to.
+        let notif = br#"{"jsonrpc":"2.0","method":"skills/list","params":{}}"#;
+        assert!(classify_http_ingress(notif).is_none());
+    }
+
+    /// A `skills/list` ingress never mints a session (ASVS V3, T-125-02).
+    #[test]
+    fn skills_list_ingress_is_never_an_initialize() {
+        let ingress = classify_http_ingress(
+            br#"{"jsonrpc":"2.0","id":1,"method":"skills/list","params":{}}"#,
+        )
+        .expect("skills/list classifies");
+        assert!(!ingress.is_initialize());
+    }
+
+    /// Neither SEP-2640 method is name-bearing (Phase 125).
+    ///
+    /// `skills/get` carries a `uri` param, structurally identical to
+    /// `resources/read`, which IS in the table — so the omission looks like an
+    /// oversight and is pinned here as a decision. Adding either method to
+    /// `crate::types::mrtr`'s table would additionally require editing
+    /// `contracts/mcp-protocol-sdk-v1.yaml`'s method table and this file's
+    /// literal-contract test; that is a deliberate deferral.
+    #[test]
+    fn skills_methods_are_not_name_bearing() {
+        assert!(!is_name_bearing_method(
+            crate::types::protocol::SKILLS_LIST_METHOD
+        ));
+        assert!(!is_name_bearing_method(
+            crate::types::protocol::SKILLS_GET_METHOD
+        ));
     }
 
     /// A JSON-RPC body for `method` carrying a v2 `params._meta` under `key`.

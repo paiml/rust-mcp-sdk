@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::error::{Error, ErrorCode, Result};
@@ -365,6 +366,102 @@ fn validate_reference_path(path: &str, existing: &[SkillReference]) -> Result<()
     Ok(())
 }
 
+// ── SEP-2640 entry manifests (`skills/list` / `skills/get`) ───────────
+
+/// One file in a skill's `resources` manifest: the URI a host fetches, the
+/// SHA-256 digest of the bytes it will receive, and their length.
+///
+/// Produced only by [`Skills::entries`]; see that method's rustdoc for the
+/// STABLE-vs-unstable boundary on this type's serialized shape.
+///
+/// # Security
+///
+/// The digest is **not** an integrity boundary. SEP-2640 is explicit that
+/// digests are unsigned and are supplied by the same server that supplies the
+/// content, so a host MUST NOT treat a digest match as authentication of the
+/// bytes. It detects drift between a listing and a later read; it proves nothing
+/// about origin.
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "skills")] {
+/// use pmcp::server::skills::{Skill, Skills};
+///
+/// let entries = Skills::new()
+///     .add(Skill::new("x", "---\nname: x\ndescription: d\n---\nbody\n"))
+///     .entries()
+///     .expect("entries build");
+/// let manifest = entries[0].resources();
+/// assert_eq!(manifest[0].uri(), "skill://x/SKILL.md");
+/// assert!(manifest[0].digest().starts_with("sha256:"));
+/// # }
+/// ```
+#[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
+pub struct SkillResourceRef {
+    uri: String,
+    digest: String,
+    size: usize,
+}
+
+impl SkillResourceRef {
+    /// The `skill://` URI a host fetches this file from via `resources/read`.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// `sha256:` followed by 64 lowercase hexadecimal characters.
+    ///
+    /// See this type's `# Security` section: this is a drift detector, not an
+    /// integrity guarantee.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Length of the served bytes, in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+/// One entry of a SEP-2640 `skills/list` / `skills/get` result: the skill's
+/// `SKILL.md` URI, its frontmatter rendered VERBATIM as JSON, and the complete
+/// manifest of the files the skill is made of.
+///
+/// Produced only by [`Skills::entries`]; see that method's rustdoc for the
+/// STABLE-vs-unstable boundary on this type's serialized shape and for the
+/// disclosure warning on `frontmatter`.
+#[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
+pub struct SkillEntry {
+    uri: String,
+    frontmatter: serde_json::Value,
+    resources: Vec<SkillResourceRef>,
+}
+
+impl SkillEntry {
+    /// The skill's canonical `skill://<path>/SKILL.md` URI.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The skill's YAML frontmatter, rendered verbatim as a JSON object —
+    /// every field the author wrote, never a curated subset.
+    ///
+    /// SEP-2640 requires a host to compare this object field-by-field against
+    /// the frontmatter of the `SKILL.md` it fetches and to REFUSE the skill on
+    /// any discrepancy, which is why nothing here is synthesized or normalized.
+    pub fn frontmatter(&self) -> &serde_json::Value {
+        &self.frontmatter
+    }
+
+    /// The skill's file manifest, `SKILL.md` first.
+    pub fn resources(&self) -> &[SkillResourceRef] {
+        &self.resources
+    }
+}
+
 /// Collection of skills + auto-generated discovery index. Lifted into a
 /// [`crate::server::ResourceHandler`] impl via [`Skills::into_handler`].
 ///
@@ -419,6 +516,126 @@ impl Skills {
     /// `resources/read` but never enumerated (SEP-2640 §9).
     pub fn skill_md_uris(&self) -> Vec<String> {
         self.skills.iter().map(Skill::skill_md_uri).collect()
+    }
+
+    /// Synthesize the SEP-2640 `skills/list` entry for every registered skill
+    /// that carries parseable YAML frontmatter.
+    ///
+    /// Takes `&self` deliberately: [`Self::into_handler`] is public API returning
+    /// `Result<Arc<dyn ResourceHandler>>` and CONSUMES `self`, so widening it to
+    /// a tuple would be a semver-MAJOR break on a shipped method. Call this
+    /// first, `into_handler()` second — which is exactly what the crate-private
+    /// builder finalization does, so both build paths get entries from one place.
+    ///
+    /// A skill whose body carries NO frontmatter block, or whose block is present
+    /// but malformed, is EXCLUDED from the returned vector rather than
+    /// synthesized. SEP-2640 permits a partial listing; it does not permit an
+    /// entry whose `frontmatter` disagrees with the served `SKILL.md`, and a
+    /// synthesized `{name, description}` for an unannotated skill is a guaranteed
+    /// host-side rejection. Such skills stay readable via `resources/read`.
+    ///
+    /// # What is STABLE about the returned values, and what is not
+    ///
+    /// These types are designed backwards from a wire format, so the boundary is
+    /// written down rather than left to be guessed.
+    ///
+    /// **STABLE — a conforming host reads every one of these, so changing any is
+    /// a wire break whatever Rust semver says about it:**
+    ///
+    /// - the serialized key sets, exactly `uri` / `frontmatter` / `resources` on
+    ///   [`SkillEntry`] and `uri` / `digest` / `size` on [`SkillResourceRef`];
+    /// - the digest format — `sha256:` followed by 64 LOWERCASE hex characters;
+    /// - `size` measured in BYTES of the served content;
+    /// - entry order equal to REGISTRATION order;
+    /// - the `SKILL.md`-first position in each `resources` manifest.
+    ///
+    /// **NOT stable:** which non-conforming skills are excluded rather than
+    /// rejected, and the crate-private diagnostic set behind the exclusion, which
+    /// may be re-partitioned freely.
+    ///
+    /// # Security — `frontmatter` is disclosed verbatim to every caller
+    ///
+    /// SEP-2640 REQUIRES verbatim emission, so pmcp performs no redaction. A
+    /// secret placed in a `SKILL.md` frontmatter block is therefore returned to
+    /// every `skills/list` caller — where before this method existed it required
+    /// a deliberate `resources/read` of that skill's body. Treat frontmatter as
+    /// public data (ASVS V8).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` if the registry cannot produce a
+    /// well-formed entry set. No condition currently reaches that arm; the
+    /// build-time name-identity and limits validation that will is added by a
+    /// later plan, and the signature is fixed now so adding it is not a
+    /// source-breaking change for callers.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::{Skill, Skills};
+    ///
+    /// let body = "---\nname: refunds\ndescription: Issue refunds\nlicense: Apache-2.0\n---\n\
+    ///             # Refunds\n";
+    /// let entries = Skills::new()
+    ///     .add(Skill::new("refunds", body))
+    ///     .entries()
+    ///     .expect("entries build");
+    ///
+    /// assert_eq!(entries.len(), 1);
+    /// assert_eq!(entries[0].uri(), "skill://refunds/SKILL.md");
+    /// // Verbatim: the non-required `license` field survives untouched.
+    /// assert_eq!(entries[0].frontmatter()["license"], "Apache-2.0");
+    ///
+    /// let manifest = entries[0].resources();
+    /// assert_eq!(manifest[0].uri(), "skill://refunds/SKILL.md");
+    /// assert_eq!(manifest[0].size(), body.len());
+    /// assert!(manifest[0].digest().starts_with("sha256:"));
+    /// assert_eq!(manifest[0].digest().len(), "sha256:".len() + 64);
+    ///
+    /// // A skill with NO frontmatter is excluded, not synthesized.
+    /// assert!(Skills::new()
+    ///     .add(Skill::new("bare", "just a body"))
+    ///     .entries()
+    ///     .expect("entries build")
+    ///     .is_empty());
+    /// # }
+    /// ```
+    pub fn entries(&self) -> Result<Vec<SkillEntry>> {
+        let mut out = Vec::with_capacity(self.skills.len());
+        for skill in &self.skills {
+            let frontmatter = match parse_frontmatter_value(skill.body()) {
+                FrontmatterParse::Parsed(value) => value,
+                FrontmatterParse::Absent => continue,
+                FrontmatterParse::Invalid(reason) => {
+                    // Reading the diagnostic here keeps the three-way distinction
+                    // load-bearing rather than decorative: an operator can tell a
+                    // BROKEN canonical skill from an unannotated one. The
+                    // build-time WARNING that names the excluded skill is a later
+                    // plan's (D-02); this is the debug-level breadcrumb under it.
+                    tracing::debug!(
+                        target: "mcp.skills",
+                        uri = %skill.skill_md_uri(),
+                        reason = %reason,
+                        "skill excluded from skills/list: frontmatter present but unusable"
+                    );
+                    continue;
+                },
+            };
+            let body = skill.body();
+            out.push(SkillEntry {
+                uri: skill.skill_md_uri(),
+                frontmatter,
+                // SKILL.md first, and for this plan it is the only manifest
+                // entry; reference-file rows arrive with the limits guard.
+                resources: vec![SkillResourceRef {
+                    uri: skill.skill_md_uri(),
+                    digest: sha256_digest_hex(body.as_bytes()),
+                    size: body.len(),
+                }],
+            });
+        }
+        Ok(out)
     }
 
     /// Flatten the registry into a [`crate::server::ResourceHandler`].
@@ -673,6 +890,111 @@ fn parse_frontmatter_description(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The THREE outcomes of reading a SKILL.md's YAML frontmatter block.
+///
+/// Three, not two, on purpose: collapsing `Invalid` into `Absent` would make a
+/// BROKEN canonical skill indistinguishable from a deliberately unannotated one,
+/// and the build-time diagnostics a later plan layers on top are built entirely
+/// on that distinction.
+#[derive(Debug)]
+enum FrontmatterParse {
+    /// The body carries no `---`-delimited block at its start.
+    Absent,
+    /// The block parsed to a YAML mapping, rendered here as a JSON object.
+    Parsed(serde_json::Value),
+    /// A block IS present but is unterminated, is not valid YAML, or parses to
+    /// something other than a mapping. Carries a human-readable diagnostic.
+    Invalid(String),
+}
+
+/// The ONE crate-private function that touches `serde_yaml` (D-04).
+///
+/// Every other line of this module is YAML-library-agnostic, so swapping to a
+/// maintained fork later is a change to this function body and nothing else.
+///
+/// # Where the block must be
+///
+/// The opening `---` must be the FIRST line of the body (after an optional UTF-8
+/// BOM), which is what agentskills.io requires. This is deliberately STRICTER
+/// than the shipped [`parse_frontmatter_description`] scanner beside it, which
+/// accepts the first `---` anywhere in the leading 40 lines: under that looser
+/// rule an ordinary markdown horizontal rule in an UNANNOTATED skill would open
+/// a phantom block and turn `Absent` into `Invalid` — exactly the confusion the
+/// three-way return exists to avoid.
+///
+/// A trailing `\r` is stripped from each candidate delimiter line BEFORE the
+/// `---` comparison, so a CRLF-authored SKILL.md behaves identically to an LF one
+/// (`str::lines` already does this; the explicit trim is belt-and-braces and
+/// documents the intent).
+fn parse_frontmatter_value(body: &str) -> FrontmatterParse {
+    // Strip the UTF-8 BOM, exactly as the description scanner does.
+    let body = body.strip_prefix('\u{FEFF}').unwrap_or(body);
+    let mut lines = body.lines();
+    match lines.next() {
+        Some(first) if first.trim_end_matches('\r') == "---" => {},
+        _ => return FrontmatterParse::Absent,
+    }
+
+    let mut block = String::new();
+    let mut terminated = false;
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line == "---" {
+            terminated = true;
+            break;
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    if !terminated {
+        return FrontmatterParse::Invalid(
+            "frontmatter block opens with `---` but is never closed by a `---` line".to_string(),
+        );
+    }
+
+    match serde_yaml::from_str::<serde_json::Value>(&block) {
+        Ok(serde_json::Value::Object(map)) => {
+            FrontmatterParse::Parsed(serde_json::Value::Object(map))
+        },
+        Ok(other) => FrontmatterParse::Invalid(format!(
+            "frontmatter must be a YAML mapping, got {}",
+            match other {
+                serde_json::Value::Array(_) => "a sequence",
+                serde_json::Value::Null => "an empty document",
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => "a scalar",
+                serde_json::Value::String(_) => "a string scalar",
+                serde_json::Value::Object(_) => unreachable!("matched by the arm above"),
+            }
+        )),
+        Err(e) => FrontmatterParse::Invalid(format!("frontmatter is not valid YAML: {e}")),
+    }
+}
+
+/// `sha256:` + 64 LOWERCASE hex characters over `bytes`, the SEP-2640 digest
+/// format.
+///
+/// The whole-value `{:x}` formatter does NOT compile on this workspace's stack:
+/// MEASURED at plan time, there is no `LowerHex` impl anywhere in `sha2-0.11.0`,
+/// `digest-0.11.2` or `crypto-common-0.2.2`. The finalized bytes are therefore
+/// folded with the per-byte width-2 formatter, which is also what pins the
+/// lowercase-and-zero-padded guarantee the format string requires.
+fn sha256_digest_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+
+    let mut out = String::with_capacity("sha256:".len() + 64);
+    out.push_str("sha256:");
+    for byte in digest.iter() {
+        // Infallible: writing to a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1390,5 +1712,206 @@ mod tests {
         assert_eq!(list.resources[0].uri, "skill://a/SKILL.md");
         assert_eq!(list.resources[1].uri, "skill://b/SKILL.md");
         assert_eq!(list.resources[2].uri, "skill://index.json");
+    }
+
+    // ── SEP-2640 entry synthesis (Phase 125, plan 01) ─────────────────
+
+    /// `parse_frontmatter_value` distinguishes ABSENT from PARSED — the happy
+    /// pair, on both LF and CRLF bodies (RESEARCH A2/A4).
+    #[test]
+    fn parse_frontmatter_value_absent_and_parsed() {
+        // No delimiter block at all → Absent.
+        assert!(matches!(
+            parse_frontmatter_value("just a body\nwith no frontmatter\n"),
+            FrontmatterParse::Absent
+        ));
+        // An empty body is Absent, not Invalid.
+        assert!(matches!(
+            parse_frontmatter_value(""),
+            FrontmatterParse::Absent
+        ));
+        // A markdown horizontal rule that is NOT at the start does not open a
+        // phantom block — this is why the opening delimiter must be line 1.
+        assert!(matches!(
+            parse_frontmatter_value("# Title\n\n---\n\nmore prose\n\n---\n"),
+            FrontmatterParse::Absent
+        ));
+
+        // LF frontmatter, including a NESTED field the shipped line scanner
+        // cannot represent.
+        let lf =
+            "---\nname: refunds\ndescription: Issue refunds\nmetadata:\n  tier: gold\n---\n# R\n";
+        let FrontmatterParse::Parsed(value) = parse_frontmatter_value(lf) else {
+            panic!("LF frontmatter must parse");
+        };
+        assert_eq!(value["name"], "refunds");
+        assert_eq!(value["description"], "Issue refunds");
+        assert_eq!(value["metadata"]["tier"], "gold");
+
+        // CRLF must behave IDENTICALLY.
+        let crlf = lf.replace('\n', "\r\n");
+        let FrontmatterParse::Parsed(crlf_value) = parse_frontmatter_value(&crlf) else {
+            panic!("CRLF frontmatter must parse");
+        };
+        assert_eq!(
+            crlf_value, value,
+            "CRLF and LF must produce the same object"
+        );
+
+        // A leading UTF-8 BOM is stripped, as it is for the description scanner.
+        let bommed = format!("\u{FEFF}{lf}");
+        assert!(matches!(
+            parse_frontmatter_value(&bommed),
+            FrontmatterParse::Parsed(_)
+        ));
+    }
+
+    /// `parse_frontmatter_value` reports INVALID — never `Absent` — for a block
+    /// that is present but unusable (R-04). Three distinct causes.
+    #[test]
+    fn parse_frontmatter_value_invalid_is_not_absent() {
+        // 1. Unterminated block.
+        let FrontmatterParse::Invalid(reason) =
+            parse_frontmatter_value("---\nname: x\ndescription: d\n")
+        else {
+            panic!("an unterminated block must be Invalid, never Absent");
+        };
+        assert!(
+            reason.contains("never closed"),
+            "diagnostic must name the cause, got: {reason}"
+        );
+
+        // 2. Present, terminated, but not valid YAML.
+        let FrontmatterParse::Invalid(reason) =
+            parse_frontmatter_value("---\nname: [unclosed\n---\nbody\n")
+        else {
+            panic!("a malformed YAML block must be Invalid");
+        };
+        assert!(
+            reason.contains("not valid YAML"),
+            "diagnostic must name the cause, got: {reason}"
+        );
+
+        // 3. Valid YAML that is a SEQUENCE, not a mapping.
+        let FrontmatterParse::Invalid(reason) =
+            parse_frontmatter_value("---\n- one\n- two\n---\nbody\n")
+        else {
+            panic!("a YAML sequence must be Invalid");
+        };
+        assert!(
+            reason.contains("must be a YAML mapping"),
+            "diagnostic must name the cause, got: {reason}"
+        );
+    }
+
+    /// The digest format, and the reason it is not `format!("{:x}", ..)`.
+    #[test]
+    fn sha256_digest_hex_is_prefixed_lowercase_64_hex() {
+        // The published SHA-256 of the empty input.
+        assert_eq!(
+            sha256_digest_hex(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let d = sha256_digest_hex(b"abc");
+        assert_eq!(d.len(), "sha256:".len() + 64);
+        let hex = d
+            .strip_prefix("sha256:")
+            .expect("carries the sha256: prefix");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "digest must be 64 LOWERCASE hex characters, got {hex}"
+        );
+    }
+
+    /// One frontmatter-bearing skill yields exactly one conforming entry.
+    #[test]
+    fn entries_synthesizes_one_conforming_entry() {
+        let body =
+            "---\nname: refunds\ndescription: Issue refunds\nlicense: Apache-2.0\n---\n# Refunds\n";
+        let entries = Skills::new()
+            .add(Skill::new("refunds", body))
+            .entries()
+            .expect("entries build");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uri(), "skill://refunds/SKILL.md");
+        // Verbatim: all three authored fields, including the non-required one.
+        assert_eq!(entries[0].frontmatter()["name"], "refunds");
+        assert_eq!(entries[0].frontmatter()["description"], "Issue refunds");
+        assert_eq!(entries[0].frontmatter()["license"], "Apache-2.0");
+
+        let manifest = entries[0].resources();
+        assert_eq!(manifest.len(), 1, "SKILL.md is the only manifest row here");
+        assert_eq!(manifest[0].uri(), "skill://refunds/SKILL.md");
+        assert_eq!(manifest[0].size(), body.len());
+        assert_eq!(manifest[0].digest(), sha256_digest_hex(body.as_bytes()));
+    }
+
+    /// Skills with no frontmatter, or a broken block, are EXCLUDED rather than
+    /// synthesized — and the exclusion does not disturb registration order for
+    /// the skills that do conform.
+    #[test]
+    fn entries_excludes_frontmatter_less_and_malformed_skills() {
+        let good_a = "---\nname: a\ndescription: da\n---\nbody-a\n";
+        let good_b = "---\nname: b\ndescription: db\n---\nbody-b\n";
+        let entries = Skills::new()
+            .add(Skill::new("a", good_a))
+            .add(Skill::new("bare", "no frontmatter here"))
+            .add(Skill::new("broken", "---\nname: [unclosed\n---\nbody\n"))
+            .add(Skill::new("b", good_b))
+            .entries()
+            .expect("entries build");
+
+        let uris: Vec<&str> = entries.iter().map(SkillEntry::uri).collect();
+        assert_eq!(
+            uris,
+            vec!["skill://a/SKILL.md", "skill://b/SKILL.md"],
+            "entry order equals REGISTRATION order, with non-conformers dropped"
+        );
+
+        // An EMPTY registry is an empty entry set, not an error.
+        assert!(Skills::new().entries().expect("entries build").is_empty());
+    }
+
+    /// The serialized shape is the wire shape: exactly the declared key sets.
+    #[test]
+    fn entry_serialization_emits_exactly_the_wire_keys() {
+        let entries = Skills::new()
+            .add(Skill::new("x", "---\nname: x\ndescription: d\n---\nbody\n"))
+            .entries()
+            .expect("entries build");
+        let value = serde_json::to_value(&entries[0]).expect("entry serializes");
+
+        let obj = value.as_object().expect("an entry is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["frontmatter", "resources", "uri"]);
+
+        let row = value["resources"][0].as_object().expect("a manifest row");
+        let mut row_keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        row_keys.sort_unstable();
+        assert_eq!(row_keys, vec!["digest", "size", "uri"]);
+        assert!(
+            value["resources"][0]["size"].is_u64(),
+            "size is a byte count"
+        );
+    }
+
+    /// `with_path` moves the URI, and the manifest follows it.
+    #[test]
+    fn entries_honor_with_path() {
+        let entries = Skills::new()
+            .add(
+                Skill::new("refunds", "---\nname: refunds\ndescription: d\n---\nb\n")
+                    .with_path("acme/billing/refunds"),
+            )
+            .entries()
+            .expect("entries build");
+        assert_eq!(entries[0].uri(), "skill://acme/billing/refunds/SKILL.md");
+        assert_eq!(
+            entries[0].resources()[0].uri(),
+            "skill://acme/billing/refunds/SKILL.md"
+        );
     }
 }

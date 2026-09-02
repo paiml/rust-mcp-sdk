@@ -1353,9 +1353,16 @@ impl ServerCoreBuilder {
         // itself stays "last write wins" — composition lives here so the
         // setter's semantics are unchanged for callers that don't use
         // skills.
+        //
+        // `ServerCore` deliberately does NOT carry the entry set: its dispatch
+        // accepts only the typed public `Request` enum, which `skills/list` will
+        // never appear in (2.x exhaustive-enum promise), so a `skill_entries`
+        // field here would be unreachable dead code. The entries are consumed by
+        // the high-level `Server` build path in `src/server/mod.rs`, which is what
+        // the streamable-HTTP transport holds.
         #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
         let final_resources: Option<Arc<dyn ResourceHandler>> =
-            finalize_skills_resources(self.pending_skills.take(), self.resources.take());
+            finalize_skills_resources(self.pending_skills.take(), self.resources.take()).0;
         #[cfg(not(all(feature = "skills", not(target_arch = "wasm32"))))]
         let final_resources = self.resources.take();
 
@@ -1423,31 +1430,53 @@ impl ServerCoreBuilder {
     }
 }
 
-/// Finalize accumulated `Skills` into a single `ResourceHandler`, optionally
-/// composed with the user's `.resources(...)` slot.
+/// Finalize accumulated `Skills` into a single `ResourceHandler` PLUS the
+/// SEP-2640 `skills/list` entry set, optionally composing the handler with the
+/// user's `.resources(...)` slot.
 ///
 /// Called from both [`ServerCoreBuilder::build`] and the `ServerBuilder::build`
 /// path in `src/server/mod.rs` so the composition logic exists in exactly
 /// one place. Panics on duplicate URIs — surface the failure via
 /// [`ServerCoreBuilder::try_skills`] for fallible registration.
+///
+/// # Why the entries come back in the tuple rather than off the handler
+///
+/// This is the ONE place both build paths see the registry, so it is the only
+/// place both can get entries from without drifting. Reaching them later by
+/// downcasting the returned `ResourceHandler` would silently return "no skills"
+/// the moment [`ComposedResources`] wraps it — which it already does whenever the
+/// author also called `.resources(...)` — so entries travel as their own value
+/// and are stored in their own field.
+///
+/// [`Skills::entries`] is called BEFORE [`Skills::into_handler`] because the
+/// latter consumes `self`. `into_handler`'s public signature is deliberately
+/// unchanged: widening it to a tuple would be a semver-MAJOR break on a shipped
+/// public method.
 #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
 pub(crate) fn finalize_skills_resources(
     pending: Option<Skills>,
     user: Option<Arc<dyn ResourceHandler>>,
-) -> Option<Arc<dyn ResourceHandler>> {
+) -> (
+    Option<Arc<dyn ResourceHandler>>,
+    Vec<crate::server::skills::SkillEntry>,
+) {
     match (pending, user) {
-        (None, other) => other,
-        (Some(skills), None) => Some(skills.into_handler().unwrap_or_else(|e| {
-            panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
-        })),
-        (Some(skills), Some(user_handler)) => {
+        (None, other) => (other, Vec::new()),
+        (Some(skills), user_handler) => {
+            let entries = skills.entries().unwrap_or_else(|e| {
+                panic!("Skills::entries: {e}; use try_skills(...) for fallible registration")
+            });
             let skills_handler = skills.into_handler().unwrap_or_else(|e| {
                 panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
             });
-            Some(Arc::new(ComposedResources {
-                skills: skills_handler,
-                other: user_handler,
-            }))
+            let resources = match user_handler {
+                None => skills_handler,
+                Some(other) => Arc::new(ComposedResources {
+                    skills: skills_handler,
+                    other,
+                }),
+            };
+            (Some(resources), entries)
         },
     }
 }
@@ -2294,7 +2323,9 @@ mod skills_builder_tests {
         // calling `.build()` (which moves the handler into ServerCore).
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let list = composed.list(None, extra()).await.unwrap();
         let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
@@ -2323,7 +2354,9 @@ mod skills_builder_tests {
         // the builder method call order. Verifies the same outcome.
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let res = composed.read("skill://a/SKILL.md", extra()).await.unwrap();
         match &res.contents[0] {
@@ -2386,6 +2419,7 @@ mod skills_builder_tests {
         // No skill calls — finalize should pass through user only.
         let final_handler =
             finalize_skills_resources(None, Some(Arc::new(B) as Arc<dyn ResourceHandler>))
+                .0
                 .expect("user handler preserved");
         let res = final_handler.read("test://uri", extra()).await.unwrap();
         match &res.contents[0] {
