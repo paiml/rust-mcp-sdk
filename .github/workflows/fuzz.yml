@@ -25,7 +25,15 @@ jobs:
           - jsonrpc_handling
           - transport_layer
           - auth_flows
-    
+          # Phase 125-05: SEP-2640 skill entry synthesis. Registering a target
+          # in fuzz/Cargo.toml does NOT enrol it here — this matrix is an
+          # explicit list, and several registered targets are deliberately
+          # absent from it. The CLAUDE.md ALWAYS/FUZZ requirement's substance is
+          # RECURRING execution against hostile input; a registered-but-unrun
+          # target satisfies only its letter. Arbitrary author-supplied bytes
+          # reaching serde_yaml is exactly what a scheduled campaign is for.
+          - fuzz_skill_entry
+
     steps:
       - uses: actions/checkout@v7
 

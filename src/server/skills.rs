@@ -2656,6 +2656,229 @@ mod tests {
         }
     }
 
+    // ── Entry synthesis is total over arbitrary bodies (Phase 125, plan 05) ──
+
+    /// The stable-toolchain half of the CLAUDE.md ALWAYS/FUZZ requirement:
+    /// `fuzz/fuzz_targets/fuzz_skill_entry.rs` drives the same path under
+    /// libFuzzer, but the fuzz crate is workspace-EXCLUDED, needs a nightly
+    /// toolchain, and runs only on `fuzz.yml`'s schedule. This function is the
+    /// same invariant asserted where `make test-skills` — and therefore
+    /// `make quality-gate` — can see it on every run.
+    ///
+    /// Drives ONE arbitrary body through the whole build path and asserts the
+    /// outcome is always one of the two documented shapes: an entry with a
+    /// well-formed digest and a byte-accurate size, or an exclusion diagnostic.
+    /// A panic, an uppercase digest, or a size that disagrees with the body all
+    /// fail here.
+    ///
+    /// Returns `true` when the body produced an ENTRY (as opposed to a
+    /// legitimate exclusion or name-identity reject), so callers can assert
+    /// anti-vacuity: the digest and size branches below are only evidence if
+    /// something actually reaches them.
+    fn assert_entry_synthesis_is_total(body: &str) -> bool {
+        let registry = Skills::new().add(Skill::new("fuzzed", body));
+
+        // `into_handler` runs the SAME `validate_names`; for a ONE-skill registry
+        // the duplicate-URI rule cannot fire, so the two MUST agree on
+        // acceptance. A disagreement is a registry that lists what it refuses to
+        // serve, or the reverse.
+        let handler_ok = Skills::new()
+            .add(Skill::new("fuzzed", body))
+            .into_handler()
+            .is_ok();
+
+        let Ok((entries, diagnostics)) = registry.entries_with_diagnostics() else {
+            assert!(
+                !handler_ok,
+                "entries() rejected but into_handler() accepted; both run the same \
+                 validate_names over artifacts of the same shape"
+            );
+            return false;
+        };
+        assert!(
+            handler_ok,
+            "entries() accepted but into_handler() rejected the same one-skill registry"
+        );
+
+        // Exactly one outcome per skill: an entry, or a diagnostic saying why not.
+        assert_eq!(
+            entries.len()
+                + diagnostics
+                    .iter()
+                    .filter(|d| matches!(
+                        d,
+                        SkillDiagnostic::FrontmatterAbsent { .. }
+                            | SkillDiagnostic::FrontmatterInvalid { .. }
+                            | SkillDiagnostic::FrontmatterNotAMapping { .. }
+                    ))
+                    .count(),
+            1,
+            "a one-skill registry yields either ONE entry or ONE exclusion \
+             diagnostic, never both and never neither (body: {body:?})"
+        );
+
+        for entry in &entries {
+            assert!(
+                entry.frontmatter().is_object(),
+                "an emitted frontmatter is always a JSON object; a scalar or a \
+                 sequence takes the exclusion path (body: {body:?})"
+            );
+            let manifest = entry.resources();
+            assert_eq!(manifest.len(), 1, "no references were registered");
+            assert_eq!(manifest[0].uri(), entry.uri());
+            assert_eq!(
+                manifest[0].size(),
+                body.len(),
+                "the SKILL.md row's size must be the body's byte length (body: {body:?})"
+            );
+            let hex = manifest[0]
+                .digest()
+                .strip_prefix("sha256:")
+                .unwrap_or_else(|| panic!("digest must carry the sha256: prefix (body: {body:?})"));
+            assert_eq!(
+                hex.len(),
+                64,
+                "digest hex is 64 characters (body: {body:?})"
+            );
+            assert!(
+                hex.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "digest hex must be LOWERCASE — an uppercase rendering is a silent \
+                 host-side comparison failure (body: {body:?})"
+            );
+        }
+        !entries.is_empty()
+    }
+
+    /// The four malformed shapes a generator essentially never produces, and
+    /// which are precisely what a real hand-authored SKILL.md hits.
+    ///
+    /// These are named explicitly rather than left to the proptest above them
+    /// because `"\\PC*"` will not stumble onto a leading BOM followed by a `---`
+    /// delimiter, nor onto an unterminated block, in any realistic number of
+    /// cases — and each one exercises a DIFFERENT arm of
+    /// [`parse_frontmatter_value`].
+    #[test]
+    fn entry_synthesis_survives_the_named_malformed_frontmatter_shapes() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "leading BOM then a real block",
+                "\u{FEFF}---\nname: fuzzed\ndescription: d\n---\n\n# Body\n",
+            ),
+            ("a lone --- line", "---\n"),
+            ("unterminated block", "---\nname: fuzzed\ndescription: d\n"),
+            (
+                "frontmatter parses to a sequence",
+                "---\n- a\n- b\n---\n\nbody\n",
+            ),
+            (
+                "frontmatter parses to a scalar",
+                "---\njust a scalar\n---\n\nbody\n",
+            ),
+            ("empty body", ""),
+            (
+                "a markdown horizontal rule, not frontmatter",
+                "# Title\n\n---\n\nbody\n",
+            ),
+            (
+                "CRLF block",
+                "---\r\nname: fuzzed\r\ndescription: d\r\n---\r\n\r\nbody\r\n",
+            ),
+            (
+                "a YAML alias reference",
+                "---\nname: fuzzed\na: &x [1]\nb: *x\n---\n\nbody\n",
+            ),
+            (
+                "a duplicate YAML key",
+                "---\nname: fuzzed\nname: fuzzed\n---\n\nbody\n",
+            ),
+            ("a tab-indented block", "---\n\tname: fuzzed\n---\n\nbody\n"),
+            (
+                "a NUL byte inside the block",
+                "---\nname: fuzz\u{0}ed\n---\n\nbody\n",
+            ),
+        ];
+
+        // Anti-vacuity: assert the case set is non-empty before quantifying over
+        // it, so a future edit that empties the array cannot pass silently.
+        assert!(
+            cases.len() >= 4,
+            "the named-shape set must not shrink below the four the plan requires"
+        );
+
+        let mut produced_entries = 0usize;
+        for (label, body) in cases {
+            if assert_entry_synthesis_is_total(body) {
+                produced_entries += 1;
+            }
+            // Exclusion is not deletion (D-02): whatever the frontmatter did,
+            // the skill still resolves to a servable handler unless the
+            // name-identity rule — which both entry points share — rejected it.
+            let handler = Skills::new()
+                .add(Skill::new("fuzzed", *body))
+                .into_handler();
+            assert!(
+                handler.is_ok()
+                    || Skills::new()
+                        .add(Skill::new("fuzzed", *body))
+                        .entries()
+                        .is_err(),
+                "case `{label}`: into_handler failed for a reason entries() did not share"
+            );
+        }
+
+        // Anti-vacuity: the digest, size and object-shape assertions inside the
+        // helper only run for a case that yields an ENTRY. If every named shape
+        // took the exclusion path, this test would pass having checked only that
+        // nothing panicked.
+        assert!(
+            produced_entries >= 3,
+            "only {produced_entries} of the named shapes produced an entry; the \
+             digest and size assertions are barely exercised"
+        );
+    }
+
+    proptest! {
+        /// Arbitrary UTF-8 as a SKILL.md body never panics entry synthesis.
+        ///
+        /// THREE generated shapes per case, and each reaches a different arm:
+        ///
+        /// - `raw` almost never opens with `---`, so it exercises the delimiter
+        ///   scan and the `Absent` path.
+        /// - `framed` puts the arbitrary text where the YAML DOCUMENT goes, so
+        ///   `serde_yaml` itself — the only third-party parser this module
+        ///   reaches from author-supplied bytes — is driven on every case
+        ///   instead of only when the generator happens to emit a delimiter.
+        ///   Arbitrary text is usually a YAML scalar, so this mostly lands on
+        ///   the `NotAMapping` exclusion.
+        /// - `valued` puts the arbitrary text where a FIELD VALUE goes, as a
+        ///   JSON-quoted string, so the frontmatter is always a mapping and the
+        ///   digest / size / verbatim-object assertions are reached on EVERY
+        ///   case. Without this third shape those assertions would run on
+        ///   almost no generated input and the property would be near-vacuous
+        ///   for the half of the invariant that is about emitted entries.
+        #[test]
+        fn prop_entry_synthesis_never_panics_on_arbitrary_bodies(raw in "\\PC*") {
+            assert_entry_synthesis_is_total(&raw);
+            assert_entry_synthesis_is_total(&format!("---\n{raw}\n---\n\n# Body\n"));
+
+            // JSON string encoding, NOT Rust's `{:?}`. YAML 1.2 is a superset of
+            // JSON, so a `serde_json` string literal is always a valid YAML
+            // double-quoted scalar. Rust's Debug escape is NOT: it renders a
+            // non-ASCII char as `\u{1e000}`, which YAML rejects (it wants
+            // `\U0001E000`). Measured — that exact input was the first failure
+            // this property produced, and it was the framing that was wrong, not
+            // the parser.
+            let encoded = serde_json::to_string(&raw).expect("a String always encodes as JSON");
+            let valued = format!("---\nname: fuzzed\nfree: {encoded}\n---\n\n# Body\n");
+            prop_assert!(
+                assert_entry_synthesis_is_total(&valued),
+                "the `valued` shape must always yield an entry — it is what keeps \
+                 the digest and size assertions non-vacuous"
+            );
+        }
+    }
+
     // ── D-02 warn-and-exclude diagnostics (Phase 125, plan 03) ─────────
 
     /// A mixed registry yields exactly ONE entry and exactly ONE diagnostic:
