@@ -2352,7 +2352,14 @@ mod skills_builder_tests {
         let list = composed.list(None, extra()).await.unwrap();
         let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
         assert!(uris.contains(&"skill://a/SKILL.md"));
-        assert!(uris.contains(&"skill://index.json"));
+        // The synthesized discovery index was retired in Phase 125 plan 04.
+        // Asserting its ABSENCE — rather than deleting the line — keeps a
+        // reintroduction detectable from the composed-handler side, which is
+        // the surface a server author actually observes.
+        assert!(
+            !uris.contains(&"skill://index.json"),
+            "retired discovery index reappeared: {uris:?}"
+        );
         assert!(uris.contains(&"docs://handbook"));
 
         let res = composed.read("docs://handbook", extra()).await.unwrap();

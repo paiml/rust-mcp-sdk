@@ -54,11 +54,20 @@ use crate::types::{
 /// SEP-2640 skill support. Set automatically when any skill is registered.
 pub(crate) const SKILLS_EXTENSION_KEY: &str = "io.modelcontextprotocol/skills";
 
-/// Synthesized discovery-index URI; emitted in `resources/list` and
-/// served from `resources/read`.
-const SKILL_INDEX_URI: &str = "skill://index.json";
+// Retirement note (Phase 125, plan 04): a synthesized `skill://` discovery
+// index used to be minted here, enumerated by `resources/list` and served by
+// `resources/read` against the agentskills.io discovery schema 0.2.0.
+// It is GONE, deliberately and as a published behavior break (125-CONTEXT
+// D-08, ROADMAP success criterion 2). Two reasons, either sufficient:
+//   1. `skills/list` and `skills/get` are the discovery surface the SEP-2640
+//      working group chose, and serving both meant advertising two surfaces,
+//      one of which the draft does not define.
+//   2. The synthesized URI violated the draft's own URI structure rule — its
+//      name segment is not a skill name and it has no `/SKILL.md` sibling.
+// Reading the retired URI now falls through to the ordinary unknown-URI error
+// path in `SkillsHandler::read`; there is no special case for it, and adding
+// one back would reintroduce exactly what was removed.
 const SKILL_MD_MIME: &str = "text/markdown";
-const INDEX_JSON_MIME: &str = "application/json";
 
 /// Flip `ServerCapabilities` to advertise skills support. Called from
 /// every builder method that accepts a skill or skill registry — keeping
@@ -1142,7 +1151,6 @@ pub(crate) struct SkillsHandler {
     list_resources: Vec<ResourceInfo>,
     skill_md: IndexMap<String, Skill>,
     references: IndexMap<String, (String, String)>, // uri -> (mime, body)
-    index_json: String,
 }
 
 impl SkillsHandler {
@@ -1150,7 +1158,10 @@ impl SkillsHandler {
         skill_md: IndexMap<String, Skill>,
         references: IndexMap<String, (String, String)>,
     ) -> Self {
-        let mut list_resources: Vec<ResourceInfo> = skill_md
+        // Exactly one entry per registered SKILL.md, in registration order,
+        // and nothing else. No synthesized discovery entry is appended —
+        // see the retirement note at the top of this file.
+        let list_resources: Vec<ResourceInfo> = skill_md
             .values()
             .map(|s| {
                 ResourceInfo::new(s.skill_md_uri(), s.name().to_string())
@@ -1158,38 +1169,12 @@ impl SkillsHandler {
                     .with_mime_type(SKILL_MD_MIME)
             })
             .collect();
-        list_resources.push(
-            ResourceInfo::new(SKILL_INDEX_URI, "index")
-                .with_description("Skill discovery index (SEP-2640 §9)")
-                .with_mime_type(INDEX_JSON_MIME),
-        );
-        let index_json = build_discovery_index_json(&skill_md);
         Self {
             list_resources,
             skill_md,
             references,
-            index_json,
         }
     }
-}
-
-fn build_discovery_index_json(skill_md: &IndexMap<String, Skill>) -> String {
-    let entries: Vec<_> = skill_md
-        .values()
-        .map(|s| {
-            json!({
-                "name": s.name(),
-                "type": "skill-md",
-                "description": s.resolved_description(),
-                "url": s.skill_md_uri(),
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&json!({
-        "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
-        "skills": entries,
-    }))
-    .expect("static JSON object — to_string_pretty cannot fail")
 }
 
 #[async_trait]
@@ -1199,8 +1184,9 @@ impl ResourceHandler for SkillsHandler {
         _cursor: Option<String>,
         _extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
-        // Per SEP-2640 §9: list emits SKILL.md entries + the discovery
-        // index ONLY. Reference URIs are never enumerated.
+        // Per SEP-2640 §9: list emits SKILL.md entries ONLY. Reference URIs
+        // are never enumerated, and no discovery entry is synthesized —
+        // discovery is `skills/list` / `skills/get`.
         Ok(ListResourcesResult::new(self.list_resources.clone()))
     }
 
@@ -1208,13 +1194,6 @@ impl ResourceHandler for SkillsHandler {
         // resource_with_text (not Content::text) preserves the per-resource
         // URI + MIME on the wire — required so a reference like
         // schema.graphql round-trips with `application/graphql`.
-        if uri == SKILL_INDEX_URI {
-            return Ok(ReadResourceResult::new(vec![Content::resource_with_text(
-                uri,
-                self.index_json.clone(),
-                INDEX_JSON_MIME,
-            )]));
-        }
         if let Some(skill) = self.skill_md.get(uri) {
             return Ok(ReadResourceResult::new(vec![Content::resource_with_text(
                 uri,
@@ -1573,10 +1552,11 @@ mod tests {
             .into_handler()
             .unwrap();
         let list = handler.list(None, extra()).await.unwrap();
-        assert_eq!(list.resources.len(), 3);
+        // Exactly one entry per registered SKILL.md and nothing else —
+        // the synthesized discovery entry was retired in Phase 125 plan 04.
+        assert_eq!(list.resources.len(), 2);
         assert_eq!(list.resources[0].uri, "skill://a/SKILL.md");
         assert_eq!(list.resources[1].uri, "skill://b/SKILL.md");
-        assert_eq!(list.resources[2].uri, "skill://index.json");
         // No references in the list.
         for r in &list.resources {
             assert!(!r.uri.contains("/references/"));
@@ -1594,11 +1574,10 @@ mod tests {
                 .into_handler()
                 .unwrap();
             let list = handler.list(None, extra()).await.unwrap();
-            assert_eq!(list.resources.len(), 4);
+            assert_eq!(list.resources.len(), 3);
             assert_eq!(list.resources[0].uri, "skill://zeta/SKILL.md");
             assert_eq!(list.resources[1].uri, "skill://alpha/SKILL.md");
             assert_eq!(list.resources[2].uri, "skill://mu/SKILL.md");
-            assert_eq!(list.resources[3].uri, "skill://index.json");
         }
     }
 
@@ -1682,12 +1661,15 @@ mod tests {
         for r in &list.resources {
             assert!(!r.uri.contains("/references/"), "leaked: {}", r.uri);
         }
-        let index_count = list
+        // The retired discovery entry must not reappear: asserting ABSENCE
+        // rather than deleting the check keeps a regression detectable.
+        let retired_count = list
             .resources
             .iter()
             .filter(|r| r.uri == "skill://index.json")
             .count();
-        assert_eq!(index_count, 1);
+        assert_eq!(retired_count, 0, "retired discovery entry reappeared");
+        assert_eq!(list.resources.len(), 1, "SKILL.md only");
     }
 
     // ── Test 1.10 (wire shape SKILL.md) ───────────────────────────────
@@ -1742,37 +1724,60 @@ mod tests {
         }
     }
 
-    // ── Test 1.12 (wire shape index) ──────────────────────────────────
+    // ── Test 1.12 (the retired discovery URI is no longer served) ─────
+    /// This test REPLACES `test_1_12_skills_handler_read_index_returns_resource_with_text`,
+    /// which asserted the synthesized discovery index came back as an
+    /// `application/json` resource. Deleting that test would have been a
+    /// silent coverage loss; replacing it pins the decision instead.
+    ///
+    /// The retired URI takes the ORDINARY unknown-URI path — the same error
+    /// any unregistered URI gets. There is deliberately no special case for
+    /// it, so a reintroduced short-circuit fails here. Note the handler-level
+    /// code is `METHOD_NOT_FOUND` (-32601); the streamable-HTTP dispatch tail
+    /// re-wraps it, so a caller on the WIRE sees -32603 carrying -32601 inside
+    /// the message (measured in 125-02, correcting D-06's single-level phrasing).
     #[tokio::test]
-    async fn test_1_12_skills_handler_read_index_returns_resource_with_text() {
+    async fn test_1_12_skills_handler_read_retired_index_uri_is_unknown() {
         let s = Skill::new("a", "").with_reference(SkillReference::new(
             "references/r.md",
             "text/markdown",
             "x",
         ));
         let handler = Skills::new().add(s).into_handler().unwrap();
-        let res = handler.read("skill://index.json", extra()).await.unwrap();
-        match &res.contents[0] {
-            Content::Resource {
-                uri,
-                text,
-                mime_type,
-                ..
-            } => {
-                assert_eq!(uri, "skill://index.json");
-                assert_eq!(mime_type.as_deref(), Some("application/json"));
-                let parsed: serde_json::Value =
-                    serde_json::from_str(text.as_deref().unwrap()).unwrap();
-                assert!(parsed.get("$schema").is_some());
-                assert!(parsed.get("skills").is_some());
-                let arr = parsed["skills"].as_array().unwrap();
-                assert_eq!(arr.len(), 1);
-                // Reference entries MUST NOT appear in the discovery index.
-                let serialized = serde_json::to_string(&parsed).unwrap();
-                assert!(!serialized.contains("references/r.md"));
+        let err = handler
+            .read("skill://index.json", extra())
+            .await
+            .expect_err("the retired discovery URI must no longer be served");
+        // Byte-identical to the unknown-URI error any other stranger gets.
+        let control = handler
+            .read("skill://totally-unregistered/SKILL.md", extra())
+            .await
+            .expect_err("control: an unregistered URI must error");
+        match (&err, &control) {
+            (
+                Error::Protocol {
+                    code, message: m1, ..
+                },
+                Error::Protocol {
+                    code: cc,
+                    message: m2,
+                    ..
+                },
+            ) => {
+                assert_eq!(*code, ErrorCode::METHOD_NOT_FOUND);
+                assert_eq!(code, cc, "retired URI must take the ordinary path");
+                assert!(m1.contains("skill://index.json"), "m1 = {m1}");
+                assert!(m2.contains("skill://totally-unregistered"), "m2 = {m2}");
+                // Same error SHAPE, differing only in the echoed URI.
+                assert_eq!(
+                    m1.replace("skill://index.json", "URI"),
+                    m2.replace("skill://totally-unregistered/SKILL.md", "URI")
+                );
             },
-            other => panic!("expected Content::Resource, got {other:?}"),
+            other => panic!("expected two Error::Protocol values, got {other:?}"),
         }
+        // Control that the handler is not simply refusing everything.
+        assert!(handler.read("skill://a/SKILL.md", extra()).await.is_ok());
     }
 
     // ── Test 1.13 ─────────────────────────────────────────────────────
@@ -1880,11 +1885,10 @@ mod tests {
         let other: Arc<dyn ResourceHandler> = Arc::new(DocsHandler);
         let composed = ComposedResources { skills, other };
         let list = composed.list(None, extra()).await.unwrap();
-        // Skills first (SKILL.md + index = 2), then other (1).
-        assert_eq!(list.resources.len(), 3);
+        // Skills first (SKILL.md only = 1), then other (1).
+        assert_eq!(list.resources.len(), 2);
         assert_eq!(list.resources[0].uri, "skill://a/SKILL.md");
-        assert_eq!(list.resources[1].uri, "skill://index.json");
-        assert_eq!(list.resources[2].uri, "docs://handbook");
+        assert_eq!(list.resources[1].uri, "docs://handbook");
     }
 
     // ── Test 1.17 (property: no reference ever listed) ────────────────
@@ -2012,7 +2016,10 @@ mod tests {
 
     // ── Test 1.19a (property: read responses always have URI + MIME) ──
     fn collect_all_uris(skills: &[Skill]) -> Vec<String> {
-        let mut uris: Vec<String> = vec!["skill://index.json".to_string()];
+        // The retired discovery URI is deliberately NOT seeded here — it is
+        // no longer readable, so including it would make the property assert
+        // that an error is a well-formed resource.
+        let mut uris: Vec<String> = Vec::new();
         for s in skills {
             uris.push(s.skill_md_uri());
             for r in s.references() {
@@ -2161,10 +2168,9 @@ mod tests {
             .merge(Skills::new().add(Skill::new("b", "")));
         let handler = combined.into_handler().unwrap();
         let list = handler.list(None, extra()).await.unwrap();
-        assert_eq!(list.resources.len(), 3);
+        assert_eq!(list.resources.len(), 2);
         assert_eq!(list.resources[0].uri, "skill://a/SKILL.md");
         assert_eq!(list.resources[1].uri, "skill://b/SKILL.md");
-        assert_eq!(list.resources[2].uri, "skill://index.json");
     }
 
     // ── SEP-2640 entry synthesis (Phase 125, plan 01) ─────────────────

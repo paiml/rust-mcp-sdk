@@ -1,9 +1,13 @@
 //! SEP-2640 Skills integration test.
 //!
-//! Exercises all four SEP-2640 endpoints (resources/list, resources/read
-//! for SKILL.md, resources/read for a reference, resources/read for the
-//! discovery index) via direct trait-impl calls on the `ResourceHandler`
-//! returned by `Skills::into_handler()`.
+//! Exercises the SEP-2640 resource surface (resources/list, resources/read
+//! for SKILL.md, resources/read for a reference) via direct trait-impl calls
+//! on the `ResourceHandler` returned by `Skills::into_handler()`.
+//!
+//! Discovery itself is NOT a resource: it is the `skills/list` / `skills/get`
+//! method pair, proven end to end over the wire in `tests/skills_routing.rs`.
+//! The synthesized `skill://` discovery index this file used to read was
+//! retired in Phase 125 plan 04; a replacement test asserts it now errors.
 //!
 //! The load-bearing tests are:
 //!
@@ -164,8 +168,12 @@ async fn wire_level_prompt_text(skill: Skill, prompt_name: &str) -> String {
 }
 
 // Test 3.1
+//
+// Renamed from `resources_list_returns_skill_md_and_index_only` in Phase 125
+// plan 04: the old NAME encoded the retired shape as strongly as its length
+// assertion did.
 #[tokio::test]
-async fn resources_list_returns_skill_md_and_index_only() {
+async fn resources_list_returns_skill_md_only() {
     let handler = build_handler().await;
     let result = handler
         .list(None, RequestHandlerExtra::default())
@@ -174,12 +182,15 @@ async fn resources_list_returns_skill_md_and_index_only() {
     let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
     assert_eq!(
         result.resources.len(),
-        3,
-        "2 SKILL.md + 1 index = 3, got {uris:?}"
+        2,
+        "2 SKILL.md and nothing else = 2, got {uris:?}"
     );
     assert!(uris.contains(&"skill://hello/SKILL.md"));
     assert!(uris.contains(&"skill://widget-builder/SKILL.md"));
-    assert!(uris.contains(&"skill://index.json"));
+    assert!(
+        !uris.contains(&"skill://index.json"),
+        "the synthesized discovery index was retired (125-CONTEXT D-08): {uris:?}"
+    );
     assert!(
         !uris.iter().any(|u| u.contains("/references/")),
         "SEP-2640 section 9: references MUST NOT be enumerated"
@@ -220,32 +231,42 @@ async fn resources_read_reference_carries_per_resource_mime() {
     assert!(text.contains("Widget Spec"));
 }
 
-// wire shape: the discovery index is served as Content::Resource (application/json)
+// The retired discovery index is no longer readable.
+//
+// REPLACES `resources_read_index_returns_resource_with_text_application_json`,
+// which asserted the synthesized index came back as an `application/json`
+// resource. A deleted test is a silent coverage loss; a replaced one pins the
+// decision, so a reintroduced short-circuit fails here (125-CONTEXT D-08).
+//
+// The retired URI takes the ORDINARY unknown-URI path — the same
+// `METHOD_NOT_FOUND` `resources_read_unknown_uri_method_not_found` pins for a
+// URI that was never registered. Note that is the HANDLER-level code: over
+// streamable HTTP the dispatch tail re-wraps it, so a caller on the wire sees
+// -32603 carrying -32601 inside the message (measured in 125-02).
 #[tokio::test]
-async fn resources_read_index_returns_resource_with_text_application_json() {
+async fn resources_read_retired_index_uri_is_unknown() {
     let handler = build_handler().await;
-    let result = handler
+    let err = handler
         .read("skill://index.json", RequestHandlerExtra::default())
         .await
-        .unwrap();
-    let (uri, text, mime) = extract_resource(&result.contents);
-    assert_eq!(uri, "skill://index.json");
-    assert_eq!(mime, "application/json");
-    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        parsed["$schema"],
-        "https://schemas.agentskills.io/discovery/0.2.0/schema.json"
-    );
-    let arr = parsed["skills"].as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    for entry in arr {
-        assert_eq!(entry["type"], "skill-md");
-        let url = entry["url"].as_str().unwrap();
-        assert!(
-            !url.contains("/references/"),
-            "index MUST NOT enumerate references"
-        );
+        .expect_err("the retired discovery URI must no longer be served");
+    match err {
+        pmcp::Error::Protocol { code, message, .. } => {
+            assert_eq!(code, ErrorCode::METHOD_NOT_FOUND);
+            assert!(
+                message.contains("skill://index.json"),
+                "message = {message}"
+            );
+        },
+        other => panic!("expected Protocol error with METHOD_NOT_FOUND, got {other:?}"),
     }
+    // Control: the handler is not simply refusing every read.
+    let ok = handler
+        .read("skill://hello/SKILL.md", RequestHandlerExtra::default())
+        .await
+        .expect("a registered SKILL.md must still read");
+    let (uri, _, _) = extract_resource(&ok.contents);
+    assert_eq!(uri, "skill://hello/SKILL.md");
 }
 
 // Test 3.5 — METHOD_NOT_FOUND on unknown URI
@@ -497,10 +518,12 @@ proptest! {
             );
             let handler = Skills::new().add(skill).into_handler().unwrap();
             let extra = RequestHandlerExtra::default();
+            // The retired discovery URI is deliberately absent from this
+            // list: it no longer reads, so asserting a wire shape for it
+            // would assert that an error is a well-formed resource.
             for uri in [
                 "skill://propmime/SKILL.md",
                 "skill://propmime/references/a.md",
-                "skill://index.json",
             ] {
                 let r = handler.read(uri, extra.clone()).await.unwrap();
                 match &r.contents[0] {
