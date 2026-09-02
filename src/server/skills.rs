@@ -456,7 +456,8 @@ impl SkillEntry {
         &self.frontmatter
     }
 
-    /// The skill's file manifest, `SKILL.md` first.
+    /// The skill's COMPLETE file manifest: `SKILL.md` first, then every
+    /// registered reference in registration order.
     pub fn resources(&self) -> &[SkillResourceRef] {
         &self.resources
     }
@@ -534,6 +535,27 @@ impl Skills {
     /// synthesized `{name, description}` for an unannotated skill is a guaranteed
     /// host-side rejection. Such skills stay readable via `resources/read`.
     ///
+    /// # The manifest is COMPLETE, and its digests are the served bytes
+    ///
+    /// Each entry's `resources` names the skill's own `SKILL.md` first and then
+    /// EVERY registered reference, in registration order. A conforming host
+    /// fetches every file named there and compares it against the row, so a
+    /// manifest that listed only `SKILL.md` would be rejected rather than
+    /// treated as a partial answer. See [`skill_resource_manifest`] for the
+    /// invariant that keeps a row and its `resources/read` in agreement by
+    /// construction.
+    ///
+    /// # `frontmatter` comes from the FILE, never from the overridable accessor
+    ///
+    /// The emitted object is produced by the single crate-private YAML parse and
+    /// by nothing else. [`Skill::with_description`] is an explicit override, so
+    /// [`Skill::resolved_description`] can legitimately differ from the
+    /// `description:` line the SKILL.md actually carries — and SEP-2640 makes a
+    /// field-by-field mismatch between this object and the fetched file a
+    /// mandatory host-side refusal. Reconstructing any part of it from `Skill`'s
+    /// own fields would therefore ship a server that looks conformant and is
+    /// unusable.
+    ///
     /// # What is STABLE about the returned values, and what is not
     ///
     /// These types are designed backwards from a wire format, so the boundary is
@@ -573,12 +595,17 @@ impl Skills {
     ///
     /// ```rust
     /// # #[cfg(feature = "skills")] {
-    /// use pmcp::server::skills::{Skill, Skills};
+    /// use pmcp::server::skills::{Skill, SkillReference, Skills};
     ///
     /// let body = "---\nname: refunds\ndescription: Issue refunds\nlicense: Apache-2.0\n---\n\
     ///             # Refunds\n";
+    /// let policy = "# Policy\n";
     /// let entries = Skills::new()
-    ///     .add(Skill::new("refunds", body))
+    ///     .add(Skill::new("refunds", body).with_reference(SkillReference::new(
+    ///         "references/policy.md",
+    ///         "text/markdown",
+    ///         policy,
+    ///     )))
     ///     .entries()
     ///     .expect("entries build");
     ///
@@ -587,11 +614,15 @@ impl Skills {
     /// // Verbatim: the non-required `license` field survives untouched.
     /// assert_eq!(entries[0].frontmatter()["license"], "Apache-2.0");
     ///
+    /// // The manifest is COMPLETE: SKILL.md first, then every reference.
     /// let manifest = entries[0].resources();
+    /// assert_eq!(manifest.len(), 2);
     /// assert_eq!(manifest[0].uri(), "skill://refunds/SKILL.md");
     /// assert_eq!(manifest[0].size(), body.len());
     /// assert!(manifest[0].digest().starts_with("sha256:"));
     /// assert_eq!(manifest[0].digest().len(), "sha256:".len() + 64);
+    /// assert_eq!(manifest[1].uri(), "skill://refunds/references/policy.md");
+    /// assert_eq!(manifest[1].size(), policy.len());
     ///
     /// // A skill with NO frontmatter is excluded, not synthesized.
     /// assert!(Skills::new()
@@ -604,6 +635,13 @@ impl Skills {
     pub fn entries(&self) -> Result<Vec<SkillEntry>> {
         let mut out = Vec::with_capacity(self.skills.len());
         for skill in &self.skills {
+            // The emitted object comes from `parse_frontmatter_value` and from
+            // NOTHING else. It is deliberately never reconstructed from
+            // `Skill::name()` or from the resolved description accessor:
+            // `with_description` is an explicit OVERRIDE, so that accessor can
+            // legitimately differ from the SKILL.md's authored `description:`
+            // line, while SEP-2640 requires the emitted object to be identical
+            // to the file's, field for field.
             let frontmatter = match parse_frontmatter_value(skill.body()) {
                 FrontmatterParse::Parsed(value) => value,
                 FrontmatterParse::Absent => continue,
@@ -622,17 +660,10 @@ impl Skills {
                     continue;
                 },
             };
-            let body = skill.body();
             out.push(SkillEntry {
                 uri: skill.skill_md_uri(),
                 frontmatter,
-                // SKILL.md first, and for this plan it is the only manifest
-                // entry; reference-file rows arrive with the limits guard.
-                resources: vec![SkillResourceRef {
-                    uri: skill.skill_md_uri(),
-                    digest: sha256_digest_hex(body.as_bytes()),
-                    size: body.len(),
-                }],
+                resources: skill_resource_manifest(skill),
             });
         }
         Ok(out)
@@ -686,6 +717,42 @@ impl Skills {
         }
         Ok(Arc::new(SkillsHandler::new(skill_md, references)))
     }
+}
+
+/// The complete SEP-2640 `resources` manifest for ONE skill: its own
+/// `SKILL.md` first, then every registered reference in REGISTRATION order.
+///
+/// # The manifest cannot disagree with the served bytes
+///
+/// Every `digest` and `size` below is computed from the exact same `&str` that
+/// [`SkillsHandler::read`] returns for the exact same URI —
+/// [`Skill::body`] for the `SKILL.md` row and [`SkillReference::body`] for each
+/// reference row, keyed by [`Skill::skill_md_uri`] and
+/// [`Skill::reference_uri`] respectively. There is no second source of bytes to
+/// drift from, so a manifest that disagrees with a later `resources/read` is
+/// unconstructible rather than merely untested.
+///
+/// A conforming host fetches EVERY file named here and compares what it reads
+/// against this row, which is why the manifest is complete rather than
+/// `SKILL.md`-only: an incomplete manifest is a host-side rejection, not a
+/// graceful degradation.
+fn skill_resource_manifest(skill: &Skill) -> Vec<SkillResourceRef> {
+    let mut rows = Vec::with_capacity(1 + skill.references.len());
+    let body = skill.body();
+    rows.push(SkillResourceRef {
+        uri: skill.skill_md_uri(),
+        digest: sha256_digest_hex(body.as_bytes()),
+        size: body.len(),
+    });
+    for r in &skill.references {
+        let ref_body = r.body();
+        rows.push(SkillResourceRef {
+            uri: skill.reference_uri(r.relative_path()),
+            digest: sha256_digest_hex(ref_body.as_bytes()),
+            size: ref_body.len(),
+        });
+    }
+    rows
 }
 
 // ── Internal handler types ────────────────────────────────────────────
@@ -1896,6 +1963,238 @@ mod tests {
             value["resources"][0]["size"].is_u64(),
             "size is a byte count"
         );
+    }
+
+    // ── Complete manifests + verbatim frontmatter (Phase 125, plan 03) ──
+
+    /// A two-reference skill yields a THREE-row manifest: SKILL.md at index 0,
+    /// then the references in REGISTRATION order.
+    #[test]
+    fn entries_manifest_lists_skill_md_first_then_every_reference() {
+        let body = "---\nname: refunds\ndescription: Issue refunds\n---\n# Refunds\n";
+        let policy = "# Policy\n\nRefund within 30 days.\n";
+        let email = "Dear customer,\n";
+        let entries = Skills::new()
+            .add(
+                Skill::new("refunds", body)
+                    .with_reference(SkillReference::new(
+                        "references/policy.md",
+                        "text/markdown",
+                        policy,
+                    ))
+                    .with_reference(SkillReference::new(
+                        "examples/email.md",
+                        "text/markdown",
+                        email,
+                    )),
+            )
+            .entries()
+            .expect("entries build");
+
+        let manifest = entries[0].resources();
+        assert_eq!(manifest.len(), 3, "1 SKILL.md + 2 references");
+        assert_eq!(manifest[0].uri(), "skill://refunds/SKILL.md");
+        assert_eq!(manifest[1].uri(), "skill://refunds/references/policy.md");
+        assert_eq!(manifest[2].uri(), "skill://refunds/examples/email.md");
+
+        assert_eq!(manifest[0].size(), body.len());
+        assert_eq!(manifest[1].size(), policy.len());
+        assert_eq!(manifest[2].size(), email.len());
+        assert_eq!(manifest[0].digest(), sha256_digest_hex(body.as_bytes()));
+        assert_eq!(manifest[1].digest(), sha256_digest_hex(policy.as_bytes()));
+        assert_eq!(manifest[2].digest(), sha256_digest_hex(email.as_bytes()));
+    }
+
+    /// Entry order across a multi-skill registry equals REGISTRATION order —
+    /// the `IndexMap` contract, with no response-time sort.
+    #[test]
+    fn entries_preserve_registration_order_across_skills() {
+        let fm = |n: &str| format!("---\nname: {n}\ndescription: d\n---\nbody\n");
+        let entries = Skills::new()
+            .add(Skill::new("zeta", fm("zeta")))
+            .add(Skill::new("alpha", fm("alpha")))
+            .add(Skill::new("mu", fm("mu")))
+            .entries()
+            .expect("entries build");
+        let uris: Vec<&str> = entries.iter().map(SkillEntry::uri).collect();
+        assert_eq!(
+            uris,
+            vec![
+                "skill://zeta/SKILL.md",
+                "skill://alpha/SKILL.md",
+                "skill://mu/SKILL.md"
+            ]
+        );
+    }
+
+    /// Frontmatter is emitted VERBATIM: a nested mapping stays a JSON object, a
+    /// list stays a JSON array, and a non-required scalar survives untouched.
+    #[test]
+    fn entries_frontmatter_is_verbatim_including_nested_and_list_fields() {
+        let body = "---\n\
+                    name: refunds\n\
+                    description: Issue refunds\n\
+                    license: Apache-2.0\n\
+                    keywords:\n  - billing\n  - support\n\
+                    metadata:\n  tier: gold\n  owner:\n    team: payments\n\
+                    ---\n# Refunds\n";
+        let entries = Skills::new()
+            .add(Skill::new("refunds", body))
+            .entries()
+            .expect("entries build");
+        let fm = entries[0].frontmatter();
+
+        let obj = fm.as_object().expect("frontmatter is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["description", "keywords", "license", "metadata", "name"],
+            "all five authored keys survive"
+        );
+
+        assert_eq!(fm["license"], "Apache-2.0");
+        assert_eq!(
+            fm["keywords"],
+            serde_json::json!(["billing", "support"]),
+            "a list-valued field is a JSON array"
+        );
+        assert_eq!(
+            fm["metadata"],
+            serde_json::json!({"tier": "gold", "owner": {"team": "payments"}}),
+            "a nested mapping is a JSON object, arbitrarily deep"
+        );
+    }
+
+    /// `with_description` is an OVERRIDE of the resolved description; it must
+    /// never leak into the emitted frontmatter, which SEP-2640 requires to be
+    /// byte-faithful to the SKILL.md the host will fetch.
+    #[test]
+    fn entries_frontmatter_ignores_the_with_description_override() {
+        let body = "---\nname: x\ndescription: AUTHORED\n---\nbody\n";
+        let skill = Skill::new("x", body).with_description("OVERRIDE");
+        assert_eq!(
+            skill.resolved_description(),
+            "OVERRIDE",
+            "the override is live on the accessor"
+        );
+
+        let entries = Skills::new().add(skill).entries().expect("entries build");
+        assert_eq!(
+            entries[0].frontmatter()["description"], "AUTHORED",
+            "the emitted object comes from the FILE, not from the override"
+        );
+    }
+
+    /// An LF-authored SKILL.md and its CRLF twin produce identical frontmatter
+    /// JSON — the existing CRLF lock, now asserted at the entry level.
+    #[test]
+    fn entries_frontmatter_is_identical_for_lf_and_crlf() {
+        let lf = "---\nname: widget\ndescription: Build widgets\nmetadata:\n  tier: gold\n---\n# W\n";
+        let crlf = lf.replace('\n', "\r\n");
+
+        let lf_entries = Skills::new()
+            .add(Skill::new("widget", lf))
+            .entries()
+            .expect("entries build");
+        let crlf_entries = Skills::new()
+            .add(Skill::new("widget", crlf))
+            .entries()
+            .expect("entries build");
+
+        assert_eq!(
+            lf_entries[0].frontmatter(),
+            crlf_entries[0].frontmatter(),
+            "line endings must not reach the emitted frontmatter"
+        );
+    }
+
+    /// Property: for EVERY generated registry, every manifest row's digest is
+    /// `sha256:` + 64 lowercase hex, its `size` is the length of the bytes the
+    /// `ResourceHandler` actually serves for that URI, and the manifest holds
+    /// exactly `1 + references().count()` rows.
+    ///
+    /// The served bytes are read back THROUGH the handler rather than
+    /// re-derived from the `Skill`, so the property cannot pass by both sides
+    /// making the same mistake (T-125-14).
+    ///
+    /// The generator is the existing [`skills_strategy_with_refs`] with a
+    /// conforming frontmatter block prepended to each body — without one every
+    /// generated skill takes the D-02 exclusion path and the property would hold
+    /// vacuously over an empty entry set, which the anti-vacuity assertion below
+    /// refuses.
+    fn annotate_with_frontmatter(skills: &[Skill]) -> Vec<Skill> {
+        skills
+            .iter()
+            .map(|s| {
+                // The frontmatter `name` must equal the final URI segment, which
+                // `skills_strategy_with_refs` rewrote to `p{i}`.
+                let path = s.resolved_path().to_string();
+                let body = format!("---\nname: {path}\ndescription: generated\n---\n{}\n", s.body());
+                let mut rebuilt = Skill::new(s.name().to_string(), body).with_path(path);
+                for r in s.references() {
+                    rebuilt = rebuilt.with_reference(SkillReference::new(
+                        r.relative_path(),
+                        r.mime_type(),
+                        r.body(),
+                    ));
+                }
+                rebuilt
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn prop_manifest_rows_are_the_bytes_the_handler_serves(
+            skills in skills_strategy_with_refs(),
+        ) {
+            let annotated = annotate_with_frontmatter(&skills);
+            let mut registry = Skills::new();
+            for s in &annotated {
+                registry = registry.add(s.clone());
+            }
+
+            let entries = registry.entries().expect("entries build");
+            prop_assert_eq!(
+                entries.len(),
+                annotated.len(),
+                "anti-vacuity: every annotated skill must yield an entry"
+            );
+
+            let handler = registry.into_handler().expect("unique p{i} paths cannot collide");
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            for (entry, skill) in entries.iter().zip(annotated.iter()) {
+                prop_assert_eq!(
+                    entry.resources().len(),
+                    1 + skill.references().count(),
+                    "manifest is SKILL.md plus every reference"
+                );
+                for row in entry.resources() {
+                    let hex = row.digest().strip_prefix("sha256:");
+                    prop_assert!(hex.is_some(), "digest must carry the sha256: prefix");
+                    let hex = hex.unwrap();
+                    prop_assert_eq!(hex.len(), 64);
+                    prop_assert!(
+                        hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                        "digest hex must be 64 LOWERCASE hex characters"
+                    );
+
+                    let read = rt
+                        .block_on(handler.read(row.uri(), RequestHandlerExtra::default()))
+                        .expect("every manifest URI must be readable");
+                    let served = match &read.contents[0] {
+                        Content::Resource { text, .. } => {
+                            text.clone().expect("skills handler always emits text")
+                        },
+                        other => panic!("expected Content::Resource, got {other:?}"),
+                    };
+                    prop_assert_eq!(row.size(), served.len());
+                    prop_assert_eq!(row.digest(), sha256_digest_hex(served.as_bytes()));
+                }
+            }
+        }
     }
 
     /// `with_path` moves the URI, and the manifest follows it.

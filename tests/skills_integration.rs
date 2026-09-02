@@ -315,6 +315,105 @@ async fn dual_surface_byte_equal_crlf_and_mixed_line_endings() {
     }
 }
 
+// ── SEP-2640 entry manifests (Phase 125, plan 03) ─────────────────────
+
+/// The entry manifest names EVERY file the skill is made of — its `SKILL.md`
+/// first, then each reference in registration order — and every row's `size` is
+/// the byte length of what `resources/read` actually returns for that URI.
+///
+/// Reading the bytes back THROUGH the handler is the point: a test that
+/// re-derived them from the `Skill` would pass against an implementation where
+/// the manifest and the served content agreed only because both were wrong.
+#[tokio::test]
+async fn entry_manifest_names_every_file_and_sizes_match_the_served_bytes() {
+    let registry = Skills::new().add(build_widget_skill_lf());
+    let entries = registry.entries().expect("entries build");
+    assert_eq!(entries.len(), 1, "the LF fixture carries frontmatter");
+
+    let manifest = entries[0].resources();
+    let uris: Vec<&str> = manifest.iter().map(|r| r.uri()).collect();
+    assert_eq!(
+        uris,
+        vec![
+            "skill://widget-builder/SKILL.md",
+            "skill://widget-builder/references/spec.md",
+            "skill://widget-builder/references/checklist.md",
+        ],
+        "SKILL.md first, then references in registration order"
+    );
+
+    let handler = registry.into_handler().expect("fixture has no duplicates");
+    for row in manifest {
+        let read = handler
+            .read(row.uri(), RequestHandlerExtra::default())
+            .await
+            .expect("every manifest URI must be readable");
+        let (uri, text, _mime) = extract_resource(&read.contents);
+        assert_eq!(uri, row.uri());
+        assert_eq!(
+            text.len(),
+            row.size(),
+            "manifest size must equal the served byte length for {}",
+            row.uri()
+        );
+        assert!(
+            row.digest().starts_with("sha256:") && row.digest().len() == "sha256:".len() + 64,
+            "digest shape for {}: {}",
+            row.uri(),
+            row.digest()
+        );
+    }
+}
+
+/// An LF-authored SKILL.md and a CRLF twin of the SAME content produce
+/// byte-identical `frontmatter` JSON.
+///
+/// The CRLF twin is derived from the LF fixture's own body here rather than
+/// taken from [`build_widget_skill_crlf`]: that shipped fixture deliberately
+/// differs in BOTH of its frontmatter fields (`name` and `description`), so
+/// "equal except for the differing keys" would compare an empty key set and
+/// prove nothing. The shipped fixture is still exercised below for its key set.
+#[test]
+fn lf_and_crlf_frontmatter_are_identical() {
+    let lf_skill = build_widget_skill_lf();
+    let crlf_body = lf_skill.body().replace('\n', "\r\n");
+
+    let lf_entries = Skills::new()
+        .add(lf_skill.clone())
+        .entries()
+        .expect("entries build");
+    let crlf_entries = Skills::new()
+        .add(Skill::new("widget-builder", crlf_body))
+        .entries()
+        .expect("entries build");
+
+    assert_eq!(
+        lf_entries[0].frontmatter(),
+        crlf_entries[0].frontmatter(),
+        "line endings must not reach the emitted frontmatter"
+    );
+    assert_eq!(
+        lf_entries[0].frontmatter()["name"], "widget-builder",
+        "and the comparison above is not vacuous — the object has real keys"
+    );
+
+    // The shipped CRLF fixture parses to the same KEY SET (its values differ by
+    // design), which is what locks the CRLF path for a separately-authored file.
+    let shipped = Skills::new()
+        .add(build_widget_skill_crlf())
+        .entries()
+        .expect("entries build");
+    let key_set = |v: &serde_json::Value| {
+        let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        key_set(lf_entries[0].frontmatter()),
+        key_set(shipped[0].frontmatter())
+    );
+}
+
 // Test 3.8 — proptest construction-level byte equality under arbitrary content
 proptest! {
     #[test]
