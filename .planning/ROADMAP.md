@@ -2569,7 +2569,13 @@ module declares a capability it cannot answer). Later phases (workflow→skill p
 via `/gsd-phase add` as they are taken up — implementation-order items 23-25 in the
 spike-findings skill.
 
-- [ ] Phase 125: SEP-2640 Conformance — skills/list + skills/get
+- [x] Phase 125: SEP-2640 Conformance — skills/list + skills/get — 5/5 plans, completed 2026-09-02
+
+> **Ticked by hand, 2026-09-02.** `gsd_run query phase.complete 125` returned
+> `roadmap_updated: false` and did not tick this box: it looks for the phase inside the
+> "Current Milestone" section, which is v2.6 (phases 120-124), while this phase lives under
+> the v2.7 heading. The same scoping mismatch made it return `next_phase: "124"`. Full
+> account in `.planning/STATE.md` § Current Position.
 
 ### Phase 125: SEP-2640 Conformance — skills/list + skills/get
 
@@ -2628,3 +2634,39 @@ Plans:
   5. `resources/directory/read` (gap #6) and client wrappers (gap #7) are explicitly deferred or
      implemented — never silently dropped; the current `{}` declaration legitimately means
      `directoryRead: false`.
+
+## Progress — v2.7 Milestone
+
+*Milestone **v2.7 SEP-2640 Skills Conformance & Positioning** — opened 2026-09-01 with Phase 125.*
+
+| Phase | Requirements | Plans Complete | Status | Completed |
+|-------|--------------|----------------|--------|-----------|
+| 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
+
+**Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
+(`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
+CR-01 accepted as a D-01-scoped residual risk, WR-06 shipped as-is with the capability guard
+retained, and the remaining code-review findings carried forward. Security verified
+(`125-SECURITY.md`, `threats_open: 0`; 23 threats, all closed, ASVS L1). Two items leave the phase
+open by decision rather than by oversight, both in `deferred-items.md`:
+
+- **CR-01 / T-125-21** — a server that declares `io.modelcontextprotocol/skills` and runs on
+  **stdio** tears down the session on `skills/list`, silently (no JSON-RPC error to the client;
+  `crate::log` is a no-op stub). Accepted: the SDK targets remote streamable-HTTP servers, and
+  `skills` is opt-in — absent from both `default` and `full`.
+- **Three code-review findings** — WR-03 (a build-time `panic!` inside a `Result`-returning
+  `build()`, `src/server/builder.rs:1501`), WR-04 partial (the log-injection mitigation landed
+  but has no test), WR-05 (the two middleware-path skills assemblers have no test coverage).
+
+**⚠ This milestone is not the one the tooling tracks.** `.planning/STATE.md` and
+`.planning/state.json` both still read `milestone: v2.6`, so every milestone-scoped verb —
+`init.progress`, `phase.complete`, the progress counters — cannot see Phase 125. That is why
+`phase.complete 125` returned `next_phase: "124"` and `roadmap_updated: false`, and why this
+table and the checkbox above were written by hand. Resolving it means closing v2.6, which first
+needs Phase 124's record finished (plans 06/07 have no SUMMARY though the release shipped as
+`v2.19.2`/`v2.19.3`). Full account in `.planning/STATE.md` § Current Position.
+
+**Next phases** are unplanned by design: the milestone's scoping note says the positioning work
+(workflow→skill projection `as_skill()`, `[[skills]]` digest pins on AgentPackage, the
+tri-surface decision-matrix docs — implementation-order items 23-25 in the spike-findings skill)
+is added via `/gsd-phase add` as it is taken up.
