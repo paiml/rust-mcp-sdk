@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 52
+open_count: 53
 waived_count: 0
 fixed_count: 9
-total_count: 61
-last_updated: 2026-09-02T05:53:26.065Z
+total_count: 62
+last_updated: 2026-09-02T07:59:41.332Z
 ---
 
 # Broken Windows Ledger
@@ -76,6 +76,7 @@ last_updated: 2026-09-02T05:53:26.065Z
 | 59 | 125 | stub | src/server/skills.rs |  | Skills::entries() manifest holds only SKILL.md; reference-file rows deferred to 125-03 | open |  | 2026-09-02T05:53:25.893Z |  |
 | 60 | 125 | stub | src/server/skills.rs |  | Skills::entries() returns Result with no Err path; validation arrives in 125-03 | open |  | 2026-09-02T05:53:25.978Z |  |
 | 61 | 125 | stub | src/server/skills.rs |  | Frontmatter-less/malformed skills excluded with only a debug! breadcrumb; D-02 build-time warning is 125-03's | open |  | 2026-09-02T05:53:26.065Z |  |
+| 62 | 125 | unrun-verify | pmcp-book/src/ch12-8-skills.md |  | make book-test exits 2 (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical at HEAD baseline; pre-existing, out of scope for 125-04 | open |  | 2026-09-02T07:59:41.332Z |  |
 
 ````json
 [
@@ -809,6 +810,18 @@ last_updated: 2026-09-02T05:53:26.065Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-02T05:53:26.065Z",
+    "resolved_at": null
+  },
+  {
+    "id": 62,
+    "kind": "unrun-verify",
+    "phase": "125",
+    "file": "pmcp-book/src/ch12-8-skills.md",
+    "line": null,
+    "description": "make book-test exits 2 (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical at HEAD baseline; pre-existing, out of scope for 125-04",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T07:59:41.332Z",
     "resolved_at": null
   }
 ]

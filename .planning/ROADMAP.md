@@ -2591,7 +2591,7 @@ D-NN citations: D-01 (01,05), D-02 (01,03,04), D-03 (04), D-04 (01), D-05 (01,03
 > the plan-phase gate false positives already recorded in project memory, not a signal about
 > these plans. Do not read a future `covered: 0` from that verb as evidence of a planning
 > gap here; use the manual extraction above, which is what the enumeration reflects.
-**Plans:** 3/5 plans executed across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
+**Plans:** 4/5 plans executed across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
 
 Plans:
 **Wave 1**
@@ -2605,7 +2605,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 125-04-PLAN.md — Retire `skill://index.json` (12 tracked sites) + examples and the four documentation surfaces
+- [x] 125-04-PLAN.md — Retire `skill://index.json` (12 tracked sites) + examples and the four documentation surfaces
 
 **Wave 4** *(blocked on Wave 3 completion)*
 

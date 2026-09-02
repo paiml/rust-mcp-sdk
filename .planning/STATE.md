@@ -5,11 +5,11 @@ milestone_name: AI-Package Portability
 current_phase: 125
 current_phase_name: SEP-2640 Conformance — skills/list + skills/get
 status: executing
-stopped_at: Completed 125-03-PLAN.md
-last_updated: "2026-09-02T07:02:27.305Z"
+stopped_at: Completed 125-04-PLAN.md
+last_updated: "2026-09-02T07:59:29.146Z"
 last_activity: 2026-09-01
 last_activity_desc: Phase 125 execution started
-state_head: f6962639cfbf1a30ead1088470654f8fdc5812d9
+state_head: 7db052864eadb4799382c186c0afbb06672fb898
 progress:
   total_phases: 5
   completed_phases: 4
@@ -32,7 +32,7 @@ See: .planning/PROJECT.md (updated 2026-08-22, milestone v2.6 open) · .planning
 ## Current Position
 
 Phase: 125 (SEP-2640 Conformance — skills/list + skills/get) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-09-01 — Phase 125 execution started
 Next: Execute Phase 123 — `/gsd-execute-phase 123`. 7 plans across 6 waves
@@ -574,6 +574,10 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase 125]: 125-03: gap 4c (frontmatter name vs URI final segment) ships as a hard Err from BOTH entries() and into_handler(); gap 4a (constructor-name mismatch) ships as a WARNING because three in-repo constructions and a taught pmcp-book exercise deliberately violate it
 - [Phase 125]: 125-03: exceeds_skill_limits is a pure zero-alloc predicate whose rustdoc WITHDRAWS the DoS-mitigation claim (R-22) — it fires after the bodies are retained; the transport collected-body cap is the real allocation bound
 - [Phase 125]: 125-03: SkillBuildArtifact + build_artifacts give ONE parse pass per build consumed by validate_names, entries_with_diagnostics and into_handler; parse_frontmatter_value now has exactly one non-test call site (R-21)
+- [Phase 125]: The synthesized skill://index.json discovery index is RETIRED (D-08) — one discovery surface, the skills/list + skills/get method pair. An intentional, authorized published behavior break, not a proven-safe one: a repo grep cannot establish absence of external consumers.
+- [Phase 125]: Both index-asserting tests were REPLACED with error/absence assertions rather than deleted, and two further sites inverted their assertions, so a reintroduced index fails in four places.
+- [Phase 125]: examples/c10_client_skills.rs demonstrates the Skills::entries() PROJECTION and states plainly it is not an RPC — no skills/get is reachable from a file holding no transport; tests/skills_routing.rs is named as the wire proof.
+- [Phase 125]: The book/source doctest mirror is rust,no_run and never EXECUTES its assertions in either harness, so a unit test now runs them — the D-03 frontmatter change is evidence rather than reasoning.
 
 ### Pending Todos
 
@@ -607,6 +611,7 @@ yet. (Research flags per phase to be surfaced during `/gsd:plan-phase`.)
 - A pmcp Client cannot answer a server-to-client request issued during its own call: Client::dispatch_request awaits transport.send(..) to complete before entering its receive loop, and the server holds the tools/call POST for the whole handler. Blocks v1 sampling/roots round trips over StreamableHttpServer (era_matrix reports no-live-stream with a 30s dispatch timeout).
 - ~~118.2-11 CHECKPOINT: official suite re-measured at held pin 0.2.0-alpha.11 — v1 leg 72/2 -> 71/3, exit 1. tools-call-with-logging 1/1 -> 0/2. Root cause: LogMessageParams emits 'message'; spec requires 'data'. Gate hardening (D-16) and CONF-09 booking BLOCKED on a src/ wire-format decision.~~ **RESOLVED 2026-08-17.** The developer chose the src/ fix; 118.2-13 shipped it (emit_log_record defaults `data` to the message string; semver-checks clean). 118.2-11 re-measured at the SAME held pin over 9 fresh runs: tools-call-with-logging **0/2 -> 2/0** (logCount 3, WireSchemaValid 10 messages / 0 violations), v1 leg **73 passed / 1 failed, exit 0**, GAP_ATTRIBUTABLE_FAILURES **-> 0**, G-3 CLOSED in full. Gate hardened (D-16): 2025-11-25 joined FULLY_SCORED_GREEN_REVISIONS with a per-revision scored floor, BLOCKING_GREEN_SCENARIOS widened 29 -> 30. CONF-09 booked. See 118-CONFORMANCE-GAPS.md '## Dispositions — Phase 118.2 (amendment 2)'.
 - 118.2-11 MEASURED FLAKE (new, open): 2025-11-25:tools-call-elicitation failed 1 of 9 fresh suite runs with 'Dispatch oneshot channel closed' — the same client request-lifecycle race as the blocker above. It is a pre-existing BLOCKING_GREEN_SCENARIOS entry and was ALREADY gate-fatal before the leg was hardened, so the hardening added no new exposure. Stated in the script's own output, NOT exempted. WINDOWS.md entry 9.
+- make book-test is red repo-wide (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical before and after phase 125; pre-existing build-tooling breakage, see 125 deferred-items.md
 
 ## Deferred Items
 
@@ -647,8 +652,8 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-09-02T07:02:13.107Z
-Stopped at: Completed 125-03-PLAN.md
+Last session: 2026-09-02T07:59:17.763Z
+Stopped at: Completed 125-04-PLAN.md
 Resume file: None
 Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
@@ -808,6 +813,7 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 125 P01 | 36 min | 2 tasks | 10 files |
 | Phase 125 P02 | 33 min | 2 tasks | 8 files |
 | Phase 125 P03 | 35 min | 3 tasks | 2 files |
+| Phase 125 P04 | 42 min | 3 tasks | 9 files |
 
 ## Operator Next Steps
 
