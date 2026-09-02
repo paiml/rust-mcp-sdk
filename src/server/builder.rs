@@ -1485,12 +1485,20 @@ pub(crate) fn finalize_skills_resources(
     match (pending, user) {
         (None, other) => (other, Vec::new()),
         (Some(skills), user_handler) => {
-            let entries = skills.entries().unwrap_or_else(|e| {
-                panic!("Skills::entries: {e}; use try_skills(...) for fallible registration")
+            // ONE artifact pass for both products. Calling `entries()` and then
+            // `into_handler()` here parsed every skill's YAML twice and
+            // SHA-256'd every SKILL.md and reference body twice per build.
+            let (skills_handler, entries, diagnostics) = skills.finalize().unwrap_or_else(|e| {
+                panic!("Skills: {e}; use try_skills(...) for fallible registration")
             });
-            let skills_handler = skills.into_handler().unwrap_or_else(|e| {
-                panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
-            });
+            for diagnostic in &diagnostics {
+                tracing::warn!(
+                    target: "mcp.skills",
+                    uri = %diagnostic.uri(),
+                    "{}",
+                    diagnostic.message()
+                );
+            }
             let resources = match user_handler {
                 None => skills_handler,
                 Some(other) => Arc::new(ComposedResources {

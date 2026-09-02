@@ -1721,19 +1721,44 @@ impl Server {
         id: RequestId,
         protocol_context: Option<&crate::types::protocol::ProtocolContext>,
     ) -> JSONRPCResponse {
-        #[cfg(feature = "skills")]
-        let skills: Vec<Value> = self
-            .skill_entries
-            .values()
-            .map(|entry| {
-                serde_json::to_value(entry)
-                    .expect("SkillEntry is String/Value/Vec only — serialization cannot fail")
-            })
-            .collect();
-        #[cfg(not(feature = "skills"))]
-        let skills: Vec<Value> = Vec::new();
+        crate::server::core::build_skills_list_response(
+            id,
+            &self.serialized_skill_catalog(),
+            &self.info,
+            protocol_context,
+        )
+    }
 
-        crate::server::core::build_skills_list_response(id, &skills, &self.info, protocol_context)
+    /// The registered skills as one serialized, registration-ordered catalog.
+    ///
+    /// The SINGLE place `skill_entries` is projected to JSON. Both `skills/*`
+    /// delegates read this, so the two methods cannot disagree about the
+    /// catalog's shape or its order, and the `feature = "skills"` boundary is
+    /// spelled once instead of once per method.
+    ///
+    /// A featureless build returns an empty map here, which is what gives it
+    /// the honest answer on both methods — an empty listing, and every URI a
+    /// `-32602` miss — rather than a second implementation behind a `cfg`.
+    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
+    fn serialized_skill_catalog(&self) -> indexmap::IndexMap<String, Value> {
+        #[cfg(feature = "skills")]
+        {
+            self.skill_entries
+                .iter()
+                .map(|(uri, entry)| {
+                    (
+                        uri.clone(),
+                        serde_json::to_value(entry).expect(
+                            "SkillEntry is String/Value/Vec only — serialization cannot fail",
+                        ),
+                    )
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "skills"))]
+        {
+            indexmap::IndexMap::new()
+        }
     }
 
     /// Handle the SEP-2640 `skills/get` request (Phase 125 plan 02, D-06/D-07).
@@ -1767,24 +1792,9 @@ impl Server {
         params: &Value,
         protocol_context: Option<&crate::types::protocol::ProtocolContext>,
     ) -> JSONRPCResponse {
-        #[cfg(feature = "skills")]
-        let entries: indexmap::IndexMap<String, Value> = self
-            .skill_entries
-            .iter()
-            .map(|(uri, entry)| {
-                (
-                    uri.clone(),
-                    serde_json::to_value(entry)
-                        .expect("SkillEntry is String/Value/Vec only — serialization cannot fail"),
-                )
-            })
-            .collect();
-        #[cfg(not(feature = "skills"))]
-        let entries: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-
         crate::server::core::build_skills_get_response(
             id,
-            &entries,
+            &self.serialized_skill_catalog(),
             params,
             &self.info,
             protocol_context,

@@ -496,6 +496,31 @@ fn client_request_has_no_skills_variants() {
              there.\n\nBlock was:\n{block}"
         );
     }
+
+    // The message above names `#[non_exhaustive]` as an equally breaking route
+    // to the same harm, so the test has to actually check for it — the sibling
+    // guard `v2_tasks_update_routing::client_request_has_no_tasks_update_variant`
+    // does, and this scan was modelled on that one without carrying the leg over.
+    //
+    // Checked in TWO places because they catch different spellings: inside the
+    // block finds a per-variant attribute, while the real enum-level attribute
+    // sits ABOVE the `pub enum` line and is therefore outside the slice
+    // entirely. The preceding window starts after the previous item's closing
+    // brace so a doc comment that merely discusses the attribute cannot trip it.
+    assert!(
+        !block.contains("non_exhaustive"),
+        "ClientRequest must stay exhaustive: adding #[non_exhaustive] breaks every downstream \
+         exhaustive match, which is the same harm by another route.\n\nBlock was:\n{block}"
+    );
+    let attrs = source[..start]
+        .rfind("\n}\n")
+        .map_or(&source[..start], |prev| &source[prev..start]);
+    assert!(
+        !attrs.contains("#[non_exhaustive]"),
+        "`pub enum ClientRequest` gained an enum-level #[non_exhaustive]. That breaks every \
+         downstream exhaustive match — the same semver harm as adding a variant.\n\n\
+         Attributes were:\n{attrs}"
+    );
 }
 
 // ===========================================================================

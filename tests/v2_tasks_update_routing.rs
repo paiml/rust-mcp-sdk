@@ -634,15 +634,17 @@ const TASKS_UPDATE_SITES: &[SiteEntry] = &[
               the two refusal messages that name the method. The named anchor is the entry \
               point every one of those gates lives inside.",
     },
-    SiteEntry {
-        path: "src/server/streamable_http_server.rs",
-        kind: SiteKind::Route {
-            must_contain: "HttpIngress::TasksUpdate",
-        },
-        why: "The TRANSPORT ingress fast-reject, which skips the typed parse for every method \
-              that is not internally routed. The named anchor is the ingress variant this \
-              method is classified into on the only transport that serves it.",
-    },
+    // `src/server/streamable_http_server.rs` was a fifth entry until the ingress
+    // fast-reject stopped naming the four method constants one by one and began
+    // asking `types::protocol::is_internally_routed` instead — which delegates to
+    // `classify_internal_method`, the `src/types/protocol/mod.rs` site above.
+    //
+    // The transport still routes `tasks/update` (via `HttpIngress::TasksUpdate`);
+    // it simply no longer *names* the method, which is what this population
+    // tracks. The site was removed rather than relocated: one fewer place where a
+    // hand-maintained list of methods could fall out of step with the classifier.
+    // That drift was not hypothetical — it shipped `skills/get` answering -32601
+    // in Phase 125 plan 02 with every classifier unit test green.
     SiteEntry {
         path: "src/client/mod.rs",
         kind: SiteKind::Route {

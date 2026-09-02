@@ -306,8 +306,8 @@ impl Skill {
     /// Create a skill from its frontmatter `name` and full SKILL.md body.
     ///
     /// The `description:` frontmatter line is parsed eagerly so per-skill
-    /// metadata reads (e.g. `resources/list`, the discovery index) avoid
-    /// re-scanning the body on every request.
+    /// metadata reads (e.g. `resources/list`, the prompt-surface projection)
+    /// avoid re-scanning the body on every request.
     pub fn new(name: impl Into<String>, body: impl Into<String>) -> Self {
         let body = body.into();
         let description = parse_frontmatter_description(&body).unwrap_or_default();
@@ -784,8 +784,11 @@ fn exceeds_skill_limits(count: usize, total_bytes: u64) -> Option<SkillLimitBrea
     None
 }
 
-/// Collection of skills + auto-generated discovery index. Lifted into a
-/// [`crate::server::ResourceHandler`] impl via [`Skills::into_handler`].
+/// Collection of skills. Lifted into a [`crate::server::ResourceHandler`] impl
+/// via [`Skills::into_handler`], and projected to SEP-2640 `skills/list`
+/// entries via [`Skills::entries`]. It synthesizes no discovery index — that
+/// surface (`skill://index.json`) was retired in Phase 125 plan 04 in favour of
+/// the `skills/list` and `skills/get` methods.
 ///
 /// `Clone` is required so the builder's `try_skills` can probe duplicates
 /// by cloning the registry before storing it (consume-by-value
@@ -1013,32 +1016,40 @@ impl Skills {
         // the same shape, so a registry can never produce entries it would
         // then refuse to serve.
         validate_names(&artifacts)?;
-
-        let mut entries = Vec::with_capacity(artifacts.len());
-        let mut diagnostics = Vec::new();
-        for artifact in artifacts {
-            diagnostics.extend(artifact.diagnostics);
-            // The emitted object comes from the ONE build-pass parse and from
-            // NOTHING else. It is deliberately never reconstructed from
-            // `Skill::name()` or from the resolved description accessor:
-            // `with_description` is an explicit OVERRIDE, so that accessor can
-            // legitimately differ from the SKILL.md's authored `description:`
-            // line, while SEP-2640 requires the emitted object to be identical
-            // to the file's, field for field.
-            if let Some(frontmatter) = artifact.frontmatter {
-                entries.push(SkillEntry {
-                    uri: artifact.uri,
-                    frontmatter,
-                    resources: artifact.resources,
-                });
-            }
-        }
-        Ok((entries, diagnostics))
+        Ok(entries_from_artifacts(artifacts))
     }
 
     /// The single per-build parse pass; see [`SkillBuildArtifact`].
     fn build_artifacts(&self) -> Vec<SkillBuildArtifact> {
         self.skills.iter().map(build_artifact).collect()
+    }
+
+    /// Both build products from ONE artifact pass.
+    ///
+    /// [`Self::entries`] and [`Self::into_handler`] each run `build_artifacts`,
+    /// so calling them in sequence — which is exactly what a server build does
+    /// — parses every skill's YAML twice and SHA-256s every SKILL.md and every
+    /// reference body twice. Nothing needs the second pass: `validate_names`
+    /// reads only `frontmatter["name"]` and `uri_segment`, and the handler is
+    /// built from `self.skills` alone.
+    ///
+    /// This is what [`SkillBuildArtifact`]'s "every consumer reads this
+    /// instead" claim means at the build seam — the artifacts are computed
+    /// here and both consumers read the SAME vector, rather than each
+    /// recomputing its own copy. The public `entries` / `into_handler` remain
+    /// as they were for callers holding only one of the two.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` on a name-identity offender or a
+    /// duplicate URI — the same two conditions, checked by the same functions,
+    /// that the separate entry points return.
+    pub(crate) fn finalize(self) -> Result<FinalizedSkills> {
+        let artifacts = self.build_artifacts();
+        validate_names(&artifacts)?;
+        let (entries, diagnostics) = entries_from_artifacts(artifacts);
+        let handler = self.build_handler()?;
+        Ok((handler, entries, diagnostics))
     }
 
     /// Flatten the registry into a [`crate::server::ResourceHandler`].
@@ -1062,6 +1073,18 @@ impl Skills {
     /// offender, or every duplicate URI detected. No silent overwrites.
     pub fn into_handler(self) -> Result<Arc<dyn ResourceHandler>> {
         validate_names(&self.build_artifacts())?;
+        self.build_handler()
+    }
+
+    /// The duplicate-URI half of [`Self::into_handler`], without the name
+    /// validation — split out so [`Self::finalize`] can run `validate_names`
+    /// once over artifacts it already holds instead of rebuilding them.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` listing every duplicate
+    /// `SKILL.md` or reference URI. No silent overwrites.
+    fn build_handler(self) -> Result<Arc<dyn ResourceHandler>> {
         let mut skill_md: IndexMap<String, Skill> = IndexMap::with_capacity(self.skills.len());
         let mut references: IndexMap<String, (String, String)> = IndexMap::new();
         let mut dup_skill: Vec<String> = Vec::new();
@@ -1210,6 +1233,49 @@ fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
 ///
 /// Returns `Err(pmcp::Error::Validation)` naming every offending URI with its
 /// frontmatter name and the URI segment that disagrees with it.
+/// Everything one artifact pass yields: the resource handler, the SEP-2640
+/// entries, and the build-time diagnostics for skills that were excluded.
+///
+/// Named because [`Skills::finalize`] returns all three and the bare tuple
+/// trips `clippy::type_complexity` — which `make lint` does NOT see, since it
+/// pins `--features "full"` and `skills` is in neither `full` nor `full-v2`.
+pub(crate) type FinalizedSkills = (
+    Arc<dyn ResourceHandler>,
+    Vec<SkillEntry>,
+    Vec<SkillDiagnostic>,
+);
+
+/// Drain a completed artifact pass into its entries and its diagnostics.
+///
+/// Shared by [`Skills::entries_with_diagnostics`] and [`Skills::finalize`] so
+/// the exclusion semantics have exactly ONE implementation: a skill whose
+/// frontmatter did not parse contributes no entry and carries its diagnostic
+/// out, whichever build path drained it.
+fn entries_from_artifacts(
+    artifacts: Vec<SkillBuildArtifact>,
+) -> (Vec<SkillEntry>, Vec<SkillDiagnostic>) {
+    let mut entries = Vec::with_capacity(artifacts.len());
+    let mut diagnostics = Vec::new();
+    for artifact in artifacts {
+        diagnostics.extend(artifact.diagnostics);
+        // The emitted object comes from the ONE build-pass parse and from
+        // NOTHING else. It is deliberately never reconstructed from
+        // `Skill::name()` or from the resolved description accessor:
+        // `with_description` is an explicit OVERRIDE, so that accessor can
+        // legitimately differ from the SKILL.md's authored `description:`
+        // line, while SEP-2640 requires the emitted object to be identical
+        // to the file's, field for field.
+        if let Some(frontmatter) = artifact.frontmatter {
+            entries.push(SkillEntry {
+                uri: artifact.uri,
+                frontmatter,
+                resources: artifact.resources,
+            });
+        }
+    }
+    (entries, diagnostics)
+}
+
 fn validate_names(artifacts: &[SkillBuildArtifact]) -> Result<()> {
     let mut offenders: Vec<String> = Vec::new();
     for artifact in artifacts {
@@ -1541,11 +1607,18 @@ fn parse_frontmatter_value(body: &str) -> FrontmatterParse {
 /// The whole-value `{:x}` formatter does NOT compile on this workspace's stack:
 /// MEASURED at plan time, there is no `LowerHex` impl anywhere in `sha2-0.11.0`,
 /// `digest-0.11.2` or `crypto-common-0.2.2`. The finalized bytes are therefore
-/// folded with the per-byte width-2 formatter, which is also what pins the
-/// lowercase-and-zero-padded guarantee the format string requires.
+/// encoded here directly.
+///
+/// A nibble table rather than `write!(out, "{byte:02x}")`: the formatter path
+/// runs the full `core::fmt` machinery (width, fill, padding) 32 times per
+/// digest, and this runs once per SKILL.md and once per reference body on every
+/// server build. Indexing a 16-byte table pins the same lowercase, zero-padded
+/// guarantee the format string did — every byte yields exactly two characters
+/// from `[0-9a-f]` — without the `fmt::Write` import or the discarded `Result`.
 fn sha256_digest_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1554,8 +1627,8 @@ fn sha256_digest_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity("sha256:".len() + 64);
     out.push_str("sha256:");
     for byte in digest.iter() {
-        // Infallible: writing to a String cannot fail.
-        let _ = write!(out, "{byte:02x}");
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }

@@ -2350,20 +2350,19 @@ fn classify_http_ingress(body: &[u8]) -> Option<HttpIngress> {
     // changes no classification — any other method returned `None` before too, via
     // `Public(_) => None`.
     //
-    // FAILING TO EXTEND THIS CONDITION IS A SILENT NO-ROUTE BUG: the method would
-    // return `None` here and fall through to the public parse path, which answers
-    // `-32601`. Omitting the inner `match` arm below is merely a compile error.
-    // MEASURED in 125-02: before this condition gained its `SKILLS_GET_METHOD`
-    // arm, every `skills/get` wire test failed with exactly that `-32601` while
-    // the classifier unit tests were green — which is the whole shape of the bug.
+    // This peek used to be a hand-maintained chain of `req.method != CONST`
+    // conjuncts, and it was the ONE silent site in the internal-method pattern:
+    // a method missing from it returns `None` here, falls through to the public
+    // parse path and answers `-32601`, while the exhaustive `match` below —
+    // which WOULD have been a compile error — is never reached. MEASURED in
+    // 125-02: before the chain gained its `skills/get` arm, every `skills/get`
+    // wire test failed with exactly that `-32601` while the classifier unit
+    // tests were green.
     //
-    // All four spellings are read from the SINGLE-SOURCED constants; none is
-    // re-typed here.
-    if req.method != crate::types::protocol::SERVER_DISCOVER_METHOD
-        && req.method != crate::types::protocol::TASKS_UPDATE_METHOD
-        && req.method != crate::types::protocol::SKILLS_LIST_METHOD
-        && req.method != crate::types::protocol::SKILLS_GET_METHOD
-    {
+    // `is_internally_routed` delegates to `classify_internal_method` itself, so
+    // the two can no longer disagree and a fifth internal method needs no edit
+    // here at all.
+    if !crate::types::protocol::is_internally_routed(&req.method) {
         return None;
     }
     let (id, ingress) = crate::shared::protocol_helpers::parse_request_or_internal(req).ok()?;

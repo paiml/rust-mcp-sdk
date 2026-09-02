@@ -2492,18 +2492,25 @@ pub(crate) fn build_discover_response(
 /// if the dead delegates are re-added.
 pub(crate) fn build_skills_list_response(
     id: RequestId,
-    // A BORROWED slice, matching the `build_skills_get_response` sibling below.
-    // It took an owned `Vec` until Phase 125 plan 05: the projection only
-    // serializes the entries, so ownership bought nothing, and
-    // `clippy::needless_pass_by_value` (pedantic, enabled by `make lint`) is a
-    // hard error under this repo's lint policy. It went unnoticed because
-    // `make lint` is reached only through `make quality-gate`, which no earlier
-    // plan of this phase ran — the same class of blind spot `make test-skills`
-    // exists to close, one gate leg over.
-    skills: &[Value],
+    // The SAME borrowed map the `build_skills_get_response` sibling takes, so
+    // one serialized catalog feeds both projections instead of each caller
+    // building its own container shape (a `Vec` here, an `IndexMap` there) from
+    // the same `skill_entries` field. `IndexMap` preserves registration order,
+    // so iterating `.values()` keeps the STABLE entry order `Skills::entries`
+    // promises — the guarantee was previously enforced by the `Vec` on this
+    // path and by insertion order on the other.
+    //
+    // It is BORROWED, not owned: the projection only serializes the entries, so
+    // ownership bought nothing, and `clippy::needless_pass_by_value` (pedantic,
+    // enabled by `make lint`) is a hard error under this repo's lint policy.
+    // That went unnoticed because `make lint` is reached only through
+    // `make quality-gate`, which no earlier plan of this phase ran — the same
+    // class of blind spot `make test-skills` exists to close, one gate leg over.
+    skills: &indexmap::IndexMap<String, Value>,
     info: &Implementation,
     protocol_context: Option<&crate::types::protocol::ProtocolContext>,
 ) -> JSONRPCResponse {
+    let skills: Vec<&Value> = skills.values().collect();
     let mut response = ServerCore::success_response(id, serde_json::json!({ "skills": skills }));
     inject_v2_result_envelope(
         &mut response,
@@ -5693,7 +5700,10 @@ mod tests {
     /// and an absent cursor is what tells a conforming host the listing is done.
     #[test]
     fn build_skills_list_response_projects_one_complete_page() {
-        let entries: Vec<serde_json::Value> = skills_entry_map().into_values().collect();
+        // The SAME map the `skills/get` sibling projection takes — both now read
+        // one serialized catalog, so this also pins that iterating `.values()`
+        // preserves registration order (asserted on element 0 below).
+        let entries = skills_entry_map();
         let ctx = v2_ctx();
         let response =
             build_skills_list_response(RequestId::from(1i64), &entries, &skills_info(), Some(&ctx));

@@ -1008,6 +1008,26 @@ pub(crate) fn classify_internal_method(
     }
 }
 
+/// Is `method` one this crate routes internally rather than through the public
+/// [`ClientRequest`] enum?
+///
+/// Defined BY DELEGATION to [`classify_internal_method`] rather than by a
+/// second list of constants, because the transport-level fast-reject that
+/// consumes this was the one site in the internal-method pattern that failed
+/// SILENTLY when it fell out of step: a method missing from it returns `None`
+/// before reaching the exhaustive `match` that would have been a compile error,
+/// falls through to the public parse path, and answers `-32601` while every
+/// classifier unit test stays green (measured in 125-02 for `skills/get`).
+///
+/// Delegation makes that drift unconstructible — the predicate cannot disagree
+/// with the classifier because it *is* the classifier. `Value::Null` is passed
+/// for params since only the arm's existence is being asked about; a
+/// non-matching method still exits at the same `_ => None` it always did, so
+/// the per-request cost is unchanged.
+pub(crate) fn is_internally_routed(method: &str) -> bool {
+    classify_internal_method(method, &serde_json::Value::Null).is_some()
+}
+
 #[cfg(test)]
 #[allow(clippy::used_underscore_binding)]
 mod tests {
