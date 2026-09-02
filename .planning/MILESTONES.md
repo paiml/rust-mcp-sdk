@@ -11,6 +11,20 @@
 > is when the planning record was closed out. The six-day gap is itself the story — see
 > *Closeout* below.
 
+### No `v2.6` git tag — deliberate
+
+`git.create_tag` is `true`, but no milestone tag was created and this is not an oversight.
+
+This repo's tag namespace is **crate versions**, not GSD milestone labels, and the two
+sequences collide by shape: `v2.6.0` **already exists** as a pmcp crate release from
+2026-04-22 (`daa091c5`, "rmcp-parity client helpers + cargo pmcp auth"), entirely unrelated
+to this milestone. A `v2.6` tag would sort directly beside it and read as a crate release to
+anyone scanning `git tag -l`.
+
+The v2.6 milestone's actual release is already tagged, correctly, in that namespace:
+**`v2.19.1`** on `370ac869` (PR #348, 2026-08-27). Tagging it twice under two numbering
+schemes would create exactly the ambiguity the release ledger exists to prevent.
+
 ### Closeout: `override_closeout`
 
 **Phase verification is clean.** All five phases report `phase_complete: true` and
