@@ -474,10 +474,6 @@ impl SkillEntry {
 /// Which findings exist, and how they are partitioned, is explicitly NOT part of
 /// the stable surface — see [`Skills::entries`]'s stability boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Why: every variant here is about the frontmatter block, so the shared prefix
-// is the accurate name rather than a stutter — and dropping it would leave
-// `Absent` / `Invalid` / `NotAMapping`, which say nothing about WHAT is absent.
-#[allow(clippy::enum_variant_names)]
 pub(crate) enum SkillDiagnostic {
     /// The SKILL.md carries no `---`-delimited frontmatter block at all. The
     /// skill is EXCLUDED from `skills/list` (D-02) and stays readable via
@@ -504,6 +500,34 @@ pub(crate) enum SkillDiagnostic {
         /// Which non-mapping shape was found.
         reason: String,
     },
+    /// The final segment of the skill's URI path differs from
+    /// [`Skill::name`] — spike gap 4a.
+    ///
+    /// A WARNING, never a rejection. ROADMAP success criterion 3 scopes the
+    /// hard reject to the FRONTMATTER name (gap 4c, see [`validate_names`]),
+    /// and three in-repo constructions plus `pmcp-book`'s taught
+    /// `.with_path("team/topic")` exercise deliberately use a path whose final
+    /// segment differs from the constructor name for reasons unrelated to
+    /// naming. The skill is still listed.
+    NameMismatch {
+        /// The skill's SKILL.md URI.
+        uri: String,
+        /// The final `/` segment of the resolved path.
+        uri_segment: String,
+        /// The name the skill was constructed with.
+        skill_name: String,
+    },
+    /// The skill crosses one of the SEP-2640 Limits bounds — see
+    /// [`exceeds_skill_limits`] for what this guard is and is not.
+    ///
+    /// A WARNING, never a rejection: ROADMAP success criterion 3 says "warns".
+    /// The skill is still emitted as an entry.
+    LimitExceeded {
+        /// The over-limit skill's SKILL.md URI.
+        uri: String,
+        /// Which bound was crossed, and by what measurement.
+        breach: SkillLimitBreach,
+    },
 }
 
 impl SkillDiagnostic {
@@ -512,7 +536,9 @@ impl SkillDiagnostic {
         match self {
             Self::FrontmatterAbsent { uri }
             | Self::FrontmatterInvalid { uri, .. }
-            | Self::FrontmatterNotAMapping { uri, .. } => uri,
+            | Self::FrontmatterNotAMapping { uri, .. }
+            | Self::NameMismatch { uri, .. }
+            | Self::LimitExceeded { uri, .. } => uri,
         }
     }
 
@@ -534,8 +560,88 @@ impl SkillDiagnostic {
                 "skill {uri} is excluded from skills/list: its frontmatter block is valid YAML but \
                  is not a mapping ({reason}). SEP-2640 entries need top-level `key: value` pairs."
             ),
+            Self::NameMismatch {
+                uri,
+                uri_segment,
+                skill_name,
+            } => format!(
+                "skill {uri} is still listed, but its URI's final segment '{uri_segment}' differs \
+                 from its constructed name '{skill_name}'. SEP-2640 hosts key a skill by its URI; \
+                 this is a warning because a deliberate `with_path` override is legitimate."
+            ),
+            Self::LimitExceeded { uri, breach } => format!(
+                "skill {uri} is still listed, but it exceeds a SEP-2640 Limits bound: {}",
+                breach.describe()
+            ),
         }
     }
+}
+
+/// Which SEP-2640 Limits bound a skill crossed, and by what measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillLimitBreach {
+    /// More than [`MAX_SKILL_RESOURCES`] entries in the skill's manifest,
+    /// counting its own `SKILL.md`. Carries the actual count.
+    TooManyResources(usize),
+    /// The manifest's `size` values sum above [`MAX_SKILL_TOTAL_BYTES`].
+    /// Carries the actual total.
+    TooManyBytes(u64),
+}
+
+impl SkillLimitBreach {
+    fn describe(&self) -> String {
+        match self {
+            Self::TooManyResources(count) => format!(
+                "{count} resource entries against a limit of {MAX_SKILL_RESOURCES} (SKILL.md \
+                 included in the count)"
+            ),
+            Self::TooManyBytes(total) => format!(
+                "{total} total bytes against a limit of {MAX_SKILL_TOTAL_BYTES} (16 MiB), summed \
+                 over the manifest's `size` values"
+            ),
+        }
+    }
+}
+
+/// SEP-2640 Limits: at most 512 resource entries per skill, counting the
+/// skill's own `SKILL.md`.
+const MAX_SKILL_RESOURCES: usize = 512;
+
+/// SEP-2640 Limits: at most 16 MiB of total file size per skill, summed over
+/// the manifest's `size` values.
+const MAX_SKILL_TOTAL_BYTES: u64 = 16_777_216;
+
+/// The SEP-2640 Limits bounds check, as a PURE predicate over two
+/// already-computed totals. Both bounds are INCLUSIVE: exactly 512 entries and
+/// exactly 16,777,216 bytes are within limits.
+///
+/// # What this guard IS, and what it is NOT
+///
+/// It is an OPERATOR DIAGNOSTIC. Entry synthesis must retain and parse a
+/// skill's bodies before it can compute their byte total, so this check fires
+/// strictly AFTER the allocation it would have to prevent in order to be a
+/// denial-of-service mitigation. It is not one, and pmcp does not claim it as
+/// one. What it genuinely provides is growth named at build time, in the
+/// operator's own log, before a host meets it.
+///
+/// The control that actually bounds allocation from an untrusted peer is the
+/// streamable-HTTP transport's collected-body cap
+/// (`DEFAULT_MAX_COLLECTED_BODY_BYTES`), which this module does not change. A
+/// skill registry is assembled by the SERVER AUTHOR from compiled-in or
+/// locally-read files, never supplied by a caller, so the residual risk here is
+/// bounded by who controls the input rather than by this predicate.
+///
+/// Writing that down matters: a threat register that overstates a mitigation is
+/// worse than one that records an accepted gap, because it stops anyone looking
+/// again.
+fn exceeds_skill_limits(count: usize, total_bytes: u64) -> Option<SkillLimitBreach> {
+    if count > MAX_SKILL_RESOURCES {
+        return Some(SkillLimitBreach::TooManyResources(count));
+    }
+    if total_bytes > MAX_SKILL_TOTAL_BYTES {
+        return Some(SkillLimitBreach::TooManyBytes(total_bytes));
+    }
+    None
 }
 
 /// Collection of skills + auto-generated discovery index. Lifted into a
@@ -675,11 +781,13 @@ impl Skills {
     ///
     /// # Errors
     ///
-    /// Returns `Err(pmcp::Error::Validation)` if the registry cannot produce a
-    /// well-formed entry set. No condition currently reaches that arm; the
-    /// build-time name-identity and limits validation that will is added by a
-    /// later plan, and the signature is fixed now so adding it is not a
-    /// source-breaking change for callers.
+    /// Returns `Err(pmcp::Error::Validation)` when a skill's frontmatter
+    /// `name` disagrees with the final segment of its URI path — the SEP-2640
+    /// name-identity rule, checked through the same [`validate_names`] function
+    /// [`Self::into_handler`] runs. Every offender is named in one message.
+    ///
+    /// Crossing a SEP-2640 Limits bound is deliberately NOT an error: it warns
+    /// (see [`exceeds_skill_limits`]), and the skill is still emitted.
     ///
     /// # Examples
     ///
@@ -760,55 +868,60 @@ impl Skills {
     pub(crate) fn entries_with_diagnostics(
         &self,
     ) -> Result<(Vec<SkillEntry>, Vec<SkillDiagnostic>)> {
-        let mut entries = Vec::with_capacity(self.skills.len());
+        let artifacts = self.build_artifacts();
+        // The SAME validation function `into_handler` runs, over artifacts of
+        // the same shape, so a registry can never produce entries it would
+        // then refuse to serve.
+        validate_names(&artifacts)?;
+
+        let mut entries = Vec::with_capacity(artifacts.len());
         let mut diagnostics = Vec::new();
-        for skill in &self.skills {
-            let uri = skill.skill_md_uri();
-            // The emitted object comes from `parse_frontmatter_value` and from
+        for artifact in artifacts {
+            diagnostics.extend(artifact.diagnostics);
+            // The emitted object comes from the ONE build-pass parse and from
             // NOTHING else. It is deliberately never reconstructed from
             // `Skill::name()` or from the resolved description accessor:
             // `with_description` is an explicit OVERRIDE, so that accessor can
             // legitimately differ from the SKILL.md's authored `description:`
             // line, while SEP-2640 requires the emitted object to be identical
             // to the file's, field for field.
-            let frontmatter = match parse_frontmatter_value(skill.body()) {
-                FrontmatterParse::Parsed(value) => value,
-                FrontmatterParse::Absent => {
-                    diagnostics.push(SkillDiagnostic::FrontmatterAbsent { uri });
-                    continue;
-                },
-                FrontmatterParse::Invalid(reason) => {
-                    diagnostics.push(SkillDiagnostic::FrontmatterInvalid { uri, reason });
-                    continue;
-                },
-                FrontmatterParse::NotAMapping(reason) => {
-                    diagnostics.push(SkillDiagnostic::FrontmatterNotAMapping { uri, reason });
-                    continue;
-                },
-            };
-            entries.push(SkillEntry {
-                uri,
-                frontmatter,
-                resources: skill_resource_manifest(skill),
-            });
+            if let Some(frontmatter) = artifact.frontmatter {
+                entries.push(SkillEntry {
+                    uri: artifact.uri,
+                    frontmatter,
+                    resources: artifact.resources,
+                });
+            }
         }
         Ok((entries, diagnostics))
+    }
+
+    /// The single per-build parse pass; see [`SkillBuildArtifact`].
+    fn build_artifacts(&self) -> Vec<SkillBuildArtifact> {
+        self.skills.iter().map(build_artifact).collect()
     }
 
     /// Flatten the registry into a [`crate::server::ResourceHandler`].
     ///
     /// Returns `Err` on:
+    /// - A skill whose frontmatter `name` disagrees with the final segment of
+    ///   its URI path (see [`validate_names`]).
     /// - Two skills resolving to the same `skill_md_uri()`.
     /// - Two skills' reference URIs colliding.
+    ///
+    /// Name identity is checked through the SAME [`validate_names`] function
+    /// [`Self::entries`] runs, so a registry can never produce entries it would
+    /// then refuse to serve, nor the reverse.
     ///
     /// Insertion order is preserved via [`indexmap::IndexMap`] so
     /// `resources/list` output is deterministic across runs.
     ///
     /// # Errors
     ///
-    /// Returns `Err(pmcp::Error::Validation)` listing every duplicate URI
-    /// detected. No silent overwrites.
+    /// Returns `Err(pmcp::Error::Validation)` listing every name-identity
+    /// offender, or every duplicate URI detected. No silent overwrites.
     pub fn into_handler(self) -> Result<Arc<dyn ResourceHandler>> {
+        validate_names(&self.build_artifacts())?;
         let mut skill_md: IndexMap<String, Skill> = IndexMap::with_capacity(self.skills.len());
         let mut references: IndexMap<String, (String, String)> = IndexMap::new();
         let mut dup_skill: Vec<String> = Vec::new();
@@ -843,6 +956,145 @@ impl Skills {
         }
         Ok(Arc::new(SkillsHandler::new(skill_md, references)))
     }
+}
+
+/// Everything one build pass learns about ONE skill, computed exactly once.
+///
+/// Before this existed, a skill's YAML could be parsed three or more times per
+/// server build: name validation ran from both entry synthesis and handler
+/// construction, and the builder's finalization calls `entries()` before
+/// `into_handler()`. That is invisible on a three-skill fixture and linear in
+/// registry size on a real one. Every consumer now reads this instead.
+struct SkillBuildArtifact {
+    /// The skill's canonical `skill://<path>/SKILL.md` URI.
+    uri: String,
+    /// The final `/` segment of the resolved path — what SEP-2640 name
+    /// identity is checked against.
+    uri_segment: String,
+    /// `Some` only when the frontmatter parsed to a mapping; `None` means the
+    /// skill is excluded and `diagnostics` says why.
+    frontmatter: Option<serde_json::Value>,
+    /// The complete `resources` manifest.
+    resources: Vec<SkillResourceRef>,
+    /// Every non-fatal finding about this skill.
+    diagnostics: Vec<SkillDiagnostic>,
+}
+
+/// The final `/`-separated segment of a resolved skill path.
+fn final_path_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The ONE build pass. Every YAML parse in this module's production path
+/// happens here; [`Skills::entries_with_diagnostics`], [`validate_names`] and
+/// [`Skills::into_handler`] all consume the result rather than re-deriving from
+/// `Skill` bodies.
+fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
+    let uri = skill.skill_md_uri();
+    let uri_segment = final_path_segment(skill.resolved_path()).to_string();
+    let mut diagnostics = Vec::new();
+
+    let frontmatter = match parse_frontmatter_value(skill.body()) {
+        FrontmatterParse::Parsed(value) => Some(value),
+        FrontmatterParse::Absent => {
+            diagnostics.push(SkillDiagnostic::FrontmatterAbsent { uri: uri.clone() });
+            None
+        },
+        FrontmatterParse::Invalid(reason) => {
+            diagnostics.push(SkillDiagnostic::FrontmatterInvalid {
+                uri: uri.clone(),
+                reason,
+            });
+            None
+        },
+        FrontmatterParse::NotAMapping(reason) => {
+            diagnostics.push(SkillDiagnostic::FrontmatterNotAMapping {
+                uri: uri.clone(),
+                reason,
+            });
+            None
+        },
+    };
+
+    // Gap 4a: a constructor-name mismatch WARNS. See `SkillDiagnostic::NameMismatch`
+    // for why it is not the reject — the reject is scoped to the frontmatter name.
+    if uri_segment != skill.name() {
+        diagnostics.push(SkillDiagnostic::NameMismatch {
+            uri: uri.clone(),
+            uri_segment: uri_segment.clone(),
+            skill_name: skill.name().to_string(),
+        });
+    }
+
+    let resources = skill_resource_manifest(skill);
+    let total_bytes = resources.iter().fold(0u64, |acc, row| {
+        acc.saturating_add(u64::try_from(row.size).unwrap_or(u64::MAX))
+    });
+    if let Some(breach) = exceeds_skill_limits(resources.len(), total_bytes) {
+        diagnostics.push(SkillDiagnostic::LimitExceeded {
+            uri: uri.clone(),
+            breach,
+        });
+    }
+
+    SkillBuildArtifact {
+        uri,
+        uri_segment,
+        frontmatter,
+        resources,
+        diagnostics,
+    }
+}
+
+/// SEP-2640 name identity (spike gap 4c, ROADMAP success criterion 3): a
+/// skill whose frontmatter carries a string `name` MUST have that name equal
+/// the final segment of its URI path.
+///
+/// # Deliberately conditional on frontmatter being present
+///
+/// A skill with no frontmatter, or with frontmatter carrying no `name` key, is
+/// never rejected by this rule regardless of its path. That scoping is the
+/// criterion's own — it names the FRONTMATTER name — and it is what keeps the
+/// duplicate-URI tests, the `skills_strategy_with_refs` proptest and
+/// `pmcp-book`'s taught `.with_path("team/topic")` exercise working: none of
+/// them carries frontmatter, and all three deliberately use a path whose final
+/// segment differs from the constructor name. The unconditional form (gap 4a)
+/// ships as [`SkillDiagnostic::NameMismatch`]; promoting IT to a reject belongs
+/// with the strict-frontmatter-mode work, once canonical surfaces are cleaned.
+///
+/// Every offender is collected before erroring, matching
+/// [`Skills::into_handler`]'s duplicate-URI style: an author with two bad
+/// skills should learn about both in one build.
+///
+/// # Errors
+///
+/// Returns `Err(pmcp::Error::Validation)` naming every offending URI with its
+/// frontmatter name and the URI segment that disagrees with it.
+fn validate_names(artifacts: &[SkillBuildArtifact]) -> Result<()> {
+    let mut offenders: Vec<String> = Vec::new();
+    for artifact in artifacts {
+        let Some(name) = artifact
+            .frontmatter
+            .as_ref()
+            .and_then(|fm| fm.get("name"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if name != artifact.uri_segment {
+            offenders.push(format!(
+                "{} (frontmatter name '{}', URI segment '{}')",
+                artifact.uri, name, artifact.uri_segment
+            ));
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    Err(Error::validation(format!(
+        "Skills: frontmatter `name` must equal the final segment of the skill's URI path: [{}]",
+        offenders.join(", ")
+    )))
 }
 
 /// The complete SEP-2640 `resources` manifest for ONE skill: its own
@@ -2636,6 +2888,185 @@ mod tests {
                 diagnostic.uri()
             );
         }
+    }
+
+    // ── Name identity + SEP Limits (Phase 125, plan 03, task 3) ────────
+
+    /// Gap 4c: a frontmatter `name` that disagrees with the URI's final segment
+    /// is REJECTED, by BOTH build-time entry points, with a message naming the
+    /// URI and both names.
+    #[test]
+    fn frontmatter_name_identity_is_rejected_by_entries_and_into_handler() {
+        let body = "---\nname: refunds\ndescription: d\n---\nbody\n";
+        let build = || Skills::new().add(Skill::new("refunds", body).with_path("acme/billing"));
+
+        match build().entries() {
+            Err(Error::Validation(msg)) => {
+                assert!(msg.contains("skill://acme/billing/SKILL.md"), "msg = {msg}");
+                assert!(msg.contains("refunds"), "the frontmatter name: {msg}");
+                assert!(msg.contains("billing"), "the URI segment: {msg}");
+            },
+            other => panic!("expected Err(Validation) from entries(), got {other:?}"),
+        }
+
+        match build().into_handler() {
+            Err(Error::Validation(msg)) => {
+                assert!(msg.contains("skill://acme/billing/SKILL.md"), "msg = {msg}");
+            },
+            Err(other) => panic!("expected Validation, got {other:?}"),
+            Ok(_) => panic!("expected Err from into_handler() — the two must agree"),
+        }
+    }
+
+    /// The name rule is conditional on a frontmatter `name` being present. No
+    /// frontmatter, no `name` key, or a non-string `name` are all exempt
+    /// regardless of the path — that scoping is what keeps the duplicate-URI
+    /// tests and the proptest strategies working.
+    #[test]
+    fn the_name_rule_never_touches_a_skill_without_a_frontmatter_name() {
+        let cases = [
+            ("", "no frontmatter at all"),
+            ("---\ndescription: d\n---\nbody\n", "no `name` key"),
+            (
+                "---\nname: 42\ndescription: d\n---\nbody\n",
+                "non-string name",
+            ),
+        ];
+        for (body, why) in cases {
+            let registry =
+                || Skills::new().add(Skill::new("a", body).with_path("totally/other/place"));
+            assert!(registry().entries().is_ok(), "entries() rejected {why}");
+            assert!(
+                registry().into_handler().is_ok(),
+                "into_handler() rejected {why}"
+            );
+        }
+    }
+
+    /// Every offender is collected before erroring — an author with two bad
+    /// skills learns about both in one build.
+    #[test]
+    fn two_name_mismatches_produce_one_error_naming_both() {
+        let err = Skills::new()
+            .add(Skill::new(
+                "a",
+                "---\nname: alpha\ndescription: d\n---\nb\n",
+            ))
+            .add(Skill::new("b", "---\nname: beta\ndescription: d\n---\nb\n"))
+            .entries()
+            .expect_err("both skills violate name identity");
+        let Error::Validation(msg) = err else {
+            panic!("expected Validation");
+        };
+        assert!(msg.contains("skill://a/SKILL.md"), "msg = {msg}");
+        assert!(msg.contains("skill://b/SKILL.md"), "msg = {msg}");
+        assert!(msg.contains("alpha"), "msg = {msg}");
+        assert!(msg.contains("beta"), "msg = {msg}");
+    }
+
+    /// Gap 4a: a CONSTRUCTOR-name mismatch whose frontmatter name still matches
+    /// the URI segment WARNS and is still listed. Promoting this to a reject
+    /// would break three in-repo constructions and a taught book exercise.
+    #[test]
+    fn constructor_name_mismatch_warns_rather_than_rejects() {
+        let body = "---\nname: billing\ndescription: d\n---\nbody\n";
+        let (entries, diagnostics) = Skills::new()
+            .add(Skill::new("refunds", body).with_path("billing"))
+            .entries_with_diagnostics()
+            .expect("gap 4a warns, it does not reject");
+
+        assert_eq!(entries.len(), 1, "the skill is still listed");
+        let SkillDiagnostic::NameMismatch {
+            uri,
+            uri_segment,
+            skill_name,
+        } = &diagnostics[0]
+        else {
+            panic!("expected NameMismatch, got {:?}", diagnostics[0]);
+        };
+        assert_eq!(uri, "skill://billing/SKILL.md");
+        assert_eq!(uri_segment, "billing");
+        assert_eq!(skill_name, "refunds");
+
+        assert!(
+            Skills::new()
+                .add(Skill::new("refunds", body).with_path("billing"))
+                .into_handler()
+                .is_ok(),
+            "and into_handler agrees — a warning is not a refusal"
+        );
+    }
+
+    /// The PURE bounds predicate, exercised at exactly the bounds and one past
+    /// each. Allocates no skill bodies at all — building a 16 MiB registry to
+    /// prove an inclusive comparison would add real time to every future run of
+    /// the suite for no additional signal (R-23).
+    #[test]
+    fn exceeds_skill_limits_bounds_are_inclusive() {
+        assert_eq!(exceeds_skill_limits(0, 0), None);
+        assert_eq!(
+            exceeds_skill_limits(MAX_SKILL_RESOURCES, MAX_SKILL_TOTAL_BYTES),
+            None,
+            "512 entries and 16,777,216 bytes exactly are WITHIN limits"
+        );
+        assert_eq!(
+            exceeds_skill_limits(MAX_SKILL_RESOURCES + 1, 0),
+            Some(SkillLimitBreach::TooManyResources(513))
+        );
+        assert_eq!(
+            exceeds_skill_limits(0, MAX_SKILL_TOTAL_BYTES + 1),
+            Some(SkillLimitBreach::TooManyBytes(16_777_217))
+        );
+        // The literals and the constants agree — a silent retune of either
+        // would break here rather than at a host.
+        assert_eq!(MAX_SKILL_RESOURCES, 512);
+        assert_eq!(MAX_SKILL_TOTAL_BYTES, 16_777_216);
+    }
+
+    /// The predicate is WIRED into the real synthesis path, not merely correct
+    /// in isolation: an over-COUNT registry produces the diagnostic naming its
+    /// URI and its count, and is STILL emitted as an entry.
+    #[test]
+    fn an_over_count_registry_produces_a_wired_limit_diagnostic() {
+        let make = |refs: usize| {
+            let mut skill = Skill::new("big", "---\nname: big\ndescription: d\n---\nb\n");
+            for i in 0..refs {
+                skill = skill.with_reference(SkillReference::new(
+                    format!("references/r{i}.md"),
+                    "text/markdown",
+                    "x",
+                ));
+            }
+            Skills::new().add(skill)
+        };
+
+        // 512 references + the skill's own SKILL.md = 513 rows, one past the bound.
+        let (entries, diagnostics) = make(MAX_SKILL_RESOURCES)
+            .entries_with_diagnostics()
+            .expect("an over-limit skill is a WARNING, never a rejection");
+        assert_eq!(entries.len(), 1, "still listed");
+        assert_eq!(entries[0].resources().len(), MAX_SKILL_RESOURCES + 1);
+        let found = diagnostics
+            .iter()
+            .find_map(|d| match d {
+                SkillDiagnostic::LimitExceeded { uri, breach } => Some((uri.as_str(), *breach)),
+                _ => None,
+            })
+            .expect("the over-count skill must produce a limit diagnostic");
+        assert_eq!(found.0, "skill://big/SKILL.md");
+        assert_eq!(found.1, SkillLimitBreach::TooManyResources(513));
+
+        // Control at exactly the bound: 511 references + SKILL.md = 512 rows.
+        let (entries, diagnostics) = make(MAX_SKILL_RESOURCES - 1)
+            .entries_with_diagnostics()
+            .expect("entries build");
+        assert_eq!(entries[0].resources().len(), MAX_SKILL_RESOURCES);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| matches!(d, SkillDiagnostic::LimitExceeded { .. })),
+            "512 rows exactly is WITHIN limits, got {diagnostics:?}"
+        );
     }
 
     /// `with_path` moves the URI, and the manifest follows it.
