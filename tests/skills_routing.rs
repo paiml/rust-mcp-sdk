@@ -442,6 +442,52 @@ async fn empty_registry_answers_skills_list_with_an_empty_array() {
     teardown(handle, ()).await;
 }
 
+/// A server that never DECLARED the extension answers `-32601`, on BOTH methods.
+///
+/// The negative half of the test above, and the half that was missing: the two
+/// methods ride the ungated `InternalClientRequest` classifier, so without a
+/// capability gate EVERY streamable-HTTP pmcp server — one that never called
+/// `.skills(..)`, and one compiled without `feature = "skills"` at all —
+/// answered `skills/list` with `200 {"skills": []}` where it previously answered
+/// method-not-found. A host that probes for SEP-2640 support by CALLING the
+/// method then read a false positive contradicting the same server's own
+/// `initialize` result.
+///
+/// The distinction the pair pins is DECLARED-vs-EMPTY, not empty-vs-populated:
+/// `.skills(Skills::new())` above declares the extension and must answer, while
+/// this fixture declares nothing and must refuse.
+#[tokio::test]
+async fn a_server_that_declares_no_skills_extension_refuses_both_methods() {
+    let undeclared = Server::builder()
+        .name("no-skills-fixture")
+        .version("1.0.0")
+        .with_supported_protocol_versions([
+            ProtocolVersion(V1.to_string()),
+            ProtocolVersion(V2.to_string()),
+        ])
+        .build()
+        .expect("fixture server builds");
+    let (addr, handle) = spawn_default_config(undeclared).await;
+
+    let listed = post_v2_skills_list(addr, 6).await;
+    assert_eq!(
+        error_code_of(&listed),
+        i64::from(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "an undeclared extension must answer -32601, not an empty listing: {}",
+        listed.raw
+    );
+
+    let got = post_v2_skills_get(addr, 7, REFUNDS_SKILL_MD).await;
+    assert_eq!(
+        error_code_of(&got),
+        i64::from(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "skills/get must refuse too — a -32602 there asserts the method EXISTS: {}",
+        got.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
 // ===========================================================================
 // 4 — the SEMVER mistake, as a source scan.
 // ===========================================================================
@@ -505,16 +551,28 @@ fn client_request_has_no_skills_variants() {
     // Checked in TWO places because they catch different spellings: inside the
     // block finds a per-variant attribute, while the real enum-level attribute
     // sits ABOVE the `pub enum` line and is therefore outside the slice
-    // entirely. The preceding window starts after the previous item's closing
-    // brace so a doc comment that merely discusses the attribute cannot trip it.
+    // entirely.
     assert!(
         !block.contains("non_exhaustive"),
         "ClientRequest must stay exhaustive: adding #[non_exhaustive] breaks every downstream \
          exhaustive match, which is the same harm by another route.\n\nBlock was:\n{block}"
     );
-    let attrs = source[..start]
+    // The preceding window starts after the previous item's closing brace, which
+    // means it also contains `ClientRequest`'s own rustdoc — so DOC LINES ARE
+    // DROPPED before the scan. Without that, the obvious explanatory comment
+    // this guard's failure message argues for ("Deliberately NOT
+    // `#[non_exhaustive]`: downstream exhaustive matches depend on it.") would
+    // fail the test, blocking CI on a change that made the invariant MORE
+    // visible. An earlier revision claimed the window excluded doc comments; it
+    // did not, and the claim was checkably false.
+    let window = source[..start]
         .rfind("\n}\n")
         .map_or(&source[..start], |prev| &source[prev..start]);
+    let attrs: String = window
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !attrs.contains("#[non_exhaustive]"),
         "`pub enum ClientRequest` gained an enum-level #[non_exhaustive]. That breaks every \
@@ -1442,14 +1500,30 @@ fn fuzz_skill_entry_is_registered_and_scheduled() {
     let workflow_path = repo_root.join(".github/workflows/fuzz.yml");
     let workflow = std::fs::read_to_string(&workflow_path).expect("fuzz.yml is readable");
 
-    // WHOLE-LINE equality, deliberately not `contains`. MEASURED during this
+    // SCOPED to the `target:` block, then WHOLE-LINE equality.
+    //
+    // Scope first: reading every `- item` in the whole file also matched
+    // `schedule.cron`, both `restore-keys` lists and the artifact `path` list,
+    // so a `- fuzz_skill_entry` line sitting in ANY of them — or surviving a
+    // commented-out matrix — satisfied the assertion while nothing scheduled the
+    // target. The rustdoc claims this check makes "registered but never run"
+    // impossible; unscoped it was weaker than that claim.
+    //
+    // Then whole-line equality, deliberately not `contains`. MEASURED during this
     // plan: a `workflow.contains("- fuzz_skill_entry")` check passed against a
     // matrix whose only row read `- fuzz_skill_entryX` — a prefix substring
     // satisfies it, so a typo'd or renamed row reports green while nothing runs.
     // Collecting the trimmed rows and comparing for equality removes the class.
-    let matrix_rows: Vec<&str> = workflow
+    let (_, after_target) = workflow
+        .split_once("target:")
+        .expect("fuzz.yml declares a strategy matrix `target:` key");
+    // The block ends at the first line that is neither blank, a comment, nor a
+    // `- ` row — `steps:` in the current file.
+    let matrix_rows: Vec<&str> = after_target
         .lines()
+        .skip(1)
         .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#') || line.starts_with("- "))
         .filter_map(|line| line.strip_prefix("- "))
         .collect();
 

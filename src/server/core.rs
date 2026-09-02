@@ -2543,9 +2543,31 @@ const SKILLS_GET_URI_ECHO_LIMIT: usize = 96;
 /// a `String` at a byte offset that is not a UTF-8 boundary panics, and the URI is
 /// attacker-controlled, so a byte-offset truncation would be a remotely reachable
 /// panic rather than a safety measure.
+///
+/// # Control characters are replaced, not merely bounded
+///
+/// A length bound alone addresses only the amplification half of the ASVS V7
+/// threat. The injection half needs the CR/LF (and ANSI escape) to go: a URI of
+/// `skill://x\n2026-01-01 ERROR audit: auth bypassed` is well under the limit,
+/// so it reached the `-32602` message intact and appeared as its own record in
+/// any line-oriented log that rendered it. Every `char::is_control` character is
+/// replaced by U+FFFD, which keeps the message useful to the caller who mistyped
+/// a URI while making one forged line impossible.
+///
+/// # The scan is bounded by the LIMIT, not by the input
+///
+/// The truncation test reads one character past the budget rather than counting
+/// the whole string, so a body-cap-sized `uri` costs O(limit) work here instead
+/// of O(len) — the function that exists to bound hostile input does not itself
+/// walk all of it.
 fn truncated_uri_for_error(uri: &str) -> String {
-    let mut out: String = uri.chars().take(SKILLS_GET_URI_ECHO_LIMIT).collect();
-    if out.chars().count() < uri.chars().count() {
+    let mut chars = uri.chars();
+    let mut out: String = chars
+        .by_ref()
+        .take(SKILLS_GET_URI_ECHO_LIMIT)
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out

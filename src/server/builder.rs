@@ -439,7 +439,10 @@ impl ServerCoreBuilder {
     /// # Panics
     ///
     /// Panics at `.build()` time if multiple registered skills resolve to
-    /// the same `skill://` URI. Use [`Self::try_skills`] with a pre-built
+    /// the same `skill://` URI, if a registered reference URI collides with
+    /// another skill's `SKILL.md` URI, or if a skill's frontmatter `name`
+    /// disagrees with the final segment of its URI path (the SEP-2640
+    /// name-identity rule). Use [`Self::try_skills`] with a pre-built
     /// [`Skills`] registry to surface duplicates as a `Result`.
     ///
     /// # Examples
@@ -472,8 +475,12 @@ impl ServerCoreBuilder {
     ///
     /// # Panics
     ///
-    /// Panics at `.build()` if two registered skills resolve to the same
-    /// `skill://` URI. Use [`Self::try_skills`] for fallible registration.
+    /// Panics at `.build()` on any condition the registry refuses: two skills
+    /// resolving to the same `skill://` URI, a reference URI colliding with
+    /// another skill's `SKILL.md` URI, or a frontmatter `name` that disagrees
+    /// with the final segment of its URI path (the SEP-2640 name-identity
+    /// rule, added in Phase 125). Use [`Self::try_skills`] for fallible
+    /// registration.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn skills(mut self, skills: Skills) -> Self {
@@ -488,14 +495,16 @@ impl ServerCoreBuilder {
         self
     }
 
-    /// Fallible variant of [`Self::skills`] — returns `Err` immediately if
-    /// the merged registry would contain duplicate URIs. Useful for
+    /// Fallible variant of [`Self::skills`] — returns `Err` immediately on any
+    /// condition that would otherwise panic at `.build()`. Useful for
     /// runtime-dynamic registration where panicking is unacceptable.
     ///
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` if the merged registry would
-    /// produce duplicate `skill://` URIs.
+    /// produce duplicate `skill://` URIs (including a reference URI that
+    /// collides with another skill's `SKILL.md`), or if a skill's frontmatter
+    /// `name` disagrees with the final segment of its URI path.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pub fn try_skills(mut self, skills: Skills) -> Result<Self> {
         let merged = match self.pending_skills.take() {
@@ -518,7 +527,7 @@ impl ServerCoreBuilder {
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn bootstrap_skill_and_prompt(self, skill: Skill, prompt_name: impl Into<String>) -> Self {
-        let prompt_handler = SkillPromptHandler::new(skill.clone());
+        let prompt_handler = SkillPromptHandler::new(&skill);
         self.skill(skill).prompt(prompt_name, prompt_handler)
     }
 

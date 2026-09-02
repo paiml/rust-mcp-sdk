@@ -145,7 +145,7 @@ A `skills/list` response looks like this on the wire:
         {
           "uri": "skill://hello-world/SKILL.md",
           "digest": "sha256:a5777e88496e95687177aa658f37dab174074d1dbe0622219166a9494700d43d",
-          "size": 142
+          "size": 172
         }
       ]
     }

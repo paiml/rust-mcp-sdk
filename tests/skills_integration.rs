@@ -78,8 +78,8 @@ fn build_trivial_skill() -> Skill {
     Skill::new("hello", "---\nname: hello\n---\nHi.")
 }
 
-/// Extract URI + body + MIME from a Resource-variant Content. Reads MUST
-/// be the Resource variant — Content::Text would drop the per-URI MIME.
+/// Extract URI + body + MIME from a Resource-variant `Content`. Reads MUST
+/// be the Resource variant — `Content::Text` would drop the per-URI MIME.
 fn extract_resource(contents: &[Content]) -> (String, String, String) {
     match contents.first() {
         Some(Content::Resource {
@@ -487,13 +487,15 @@ proptest! {
             let mut skill = Skill::new("propskill", body);
             for i in 0..n {
                 // try_with_reference returns Err on invalid paths (e.g. duplicates); skip those.
-                match skill.clone().try_with_reference(SkillReference::new(
+                // A rejected path leaves `skill` as it was and the loop moves
+                // on — proptest generates paths `validate_reference_path` is
+                // entitled to refuse.
+                if let Ok(s) = skill.clone().try_with_reference(SkillReference::new(
                     &ref_paths[i],
                     "text/markdown",
                     &ref_bodies[i],
                 )) {
-                    Ok(s) => skill = s,
-                    Err(_) => continue,
+                    skill = s;
                 }
             }
             let prompt = skill.as_prompt_text();

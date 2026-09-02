@@ -953,6 +953,71 @@ test-integration:
 # still exit 0.
 SKILLS_FEATURES := skills,streamable-http,http-client,testing
 
+# The GATE's LINT reach into `src/server/skills.rs` — the other half of D-09.
+#
+# `make lint` pins `--features "full"` and `skills` is in neither `full` nor
+# `full-v2`, so the pedantic+nursery policy CLAUDE.md calls zero-tolerance never
+# compiled this module: ~2,300 new lines shipped unlinted. The module itself
+# records two consequences of that blind spot in its own comments (a
+# `clippy::needless_pass_by_value` that survived four plans, and a
+# `clippy::type_complexity` the alias exists to dodge). CI's
+# `clippy --all-targets --all-features -D warnings` does reach the file but
+# carries NO pedantic/nursery groups, which CLAUDE.md states outright is the
+# weaker form.
+#
+# The allow-list below is `make lint`'s, verbatim: this leg exists to widen the
+# policy's REACH, not to give one module a softer policy.
+#
+# The feature set is `full` PLUS `skills`, deliberately NOT `$(SKILLS_FEATURES)`.
+# `test-skills` uses the narrow set because the test files' own `#![cfg]` headers
+# name exactly those features; a LINT leg has the opposite requirement. Measured:
+# the narrow set drops `jwt-auth`, which compiles `CachedJwks`'s
+# `HashMap<String, ()>` fallback branch and trips `clippy::zero_sized_map_values`
+# in `src/server/auth/jwt.rs` — a finding about a feature combination nobody
+# ships, in a module this phase never touched. `full,skills` is the one-feature
+# delta from what `make lint` already lints, so every finding it reports is a
+# finding about the reach this leg exists to add.
+LINT_SKILLS_FEATURES := full,skills
+
+.PHONY: lint-skills
+lint-skills:
+	@echo "$(BLUE)Linting the skills module (features: $(LINT_SKILLS_FEATURES))...$(NC)"
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- \
+		-D clippy::all \
+		-W clippy::pedantic \
+		-W clippy::nursery \
+		-W clippy::cargo \
+		-A clippy::module_name_repetitions \
+		-A clippy::must_use_candidate \
+		-A clippy::missing_errors_doc \
+		-A clippy::missing_const_for_fn \
+		-A clippy::return_self_not_must_use \
+		-A clippy::missing_fields_in_debug \
+		-A clippy::uninlined_format_args \
+		-A clippy::if_not_else \
+		-A clippy::result_large_err \
+		-A clippy::multiple_crate_versions \
+		-A clippy::implicit_hasher \
+		-A clippy::unused_async \
+		-A clippy::cast_lossless \
+		-A clippy::redundant_clone \
+		-A clippy::redundant_closure_for_method_calls \
+		-A clippy::significant_drop_tightening \
+		-A clippy::missing_panics_doc \
+		-A clippy::cast_possible_truncation \
+		-A clippy::cast_precision_loss \
+		-A clippy::option_if_let_else \
+		-A clippy::derive_partial_eq_without_eq \
+		-A clippy::redundant_else \
+		-A clippy::match_same_arms \
+		-A clippy::manual_string_new \
+		-A clippy::default_trait_access \
+		-A clippy::format_push_string \
+		-A clippy::too_many_lines \
+		-A clippy::cargo_common_metadata \
+		-A clippy::unused_async_trait_impl
+	@echo "$(GREEN)✓ No lint issues in the skills module$(NC)"
+
 .PHONY: test-skills
 test-skills:
 	@echo "$(BLUE)Running the skills module's tests (features: $(SKILLS_FEATURES))...$(NC)"
@@ -1843,6 +1908,10 @@ quality-gate:
 	# and until this leg existed the failures lived in what it did not. See the
 	# target's own header for why it uses four separately-guarded selectors.
 	@$(MAKE) test-skills
+	# lint-skills, for the identical reason one gate leg over: `make lint` also
+	# pins `--features "full"`, so the pedantic+nursery policy never compiled
+	# `src/server/skills.rs` at all.
+	@$(MAKE) lint-skills
 	@$(MAKE) pmcp-package-gate
 	@$(MAKE) audit
 	@$(MAKE) unused-deps
@@ -2256,6 +2325,7 @@ help:
 	@echo "  test-property   - Run property tests"
 	@echo "  test-all        - Run all tests"
 	@echo "  test-skills     - Run the skills module's tests (feature 'skills' is in neither full nor full-v2)"
+	@echo "  lint-skills     - Clippy the skills module under make lint's exact policy (same reach gap)"
 	@echo "  test-feature-flags - Verify pmcp-tasks feature flag combinations"
 	@echo "  coverage        - Generate coverage report"
 	@echo "  mutants         - Run mutation testing"

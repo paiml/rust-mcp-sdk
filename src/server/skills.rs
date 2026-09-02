@@ -657,6 +657,25 @@ pub(crate) enum SkillDiagnostic {
         /// The name the skill was constructed with.
         skill_name: String,
     },
+    /// The frontmatter carries a `name` key whose value is not a string
+    /// (`name: 42`, `name: true`, `name: [a]`).
+    ///
+    /// A WARNING, never a rejection — [`validate_names`] exempts a non-string
+    /// `name` deliberately, and a test pins that. But the exemption was SILENT,
+    /// and silence is what made it a hole: it is the one shape in which an
+    /// emitted entry carries a `frontmatter.name` that cannot equal its URI
+    /// segment while NEITHER the name-identity reject NOR
+    /// [`Self::NameMismatch`] fires (the latter compares the CONSTRUCTOR name,
+    /// which in this shape matches). SEP-2640 makes that mismatch a mandatory
+    /// host-side refusal, so the operator is told at build time.
+    FrontmatterNameNotAString {
+        /// The skill's SKILL.md URI.
+        uri: String,
+        /// The JSON spelling of what the author actually wrote.
+        found: String,
+        /// The final `/` segment of the resolved path the name is compared to.
+        uri_segment: String,
+    },
     /// The skill crosses one of the SEP-2640 Limits bounds — see
     /// [`exceeds_skill_limits`] for what this guard is and is not.
     ///
@@ -678,6 +697,7 @@ impl SkillDiagnostic {
             | Self::FrontmatterInvalid { uri, .. }
             | Self::FrontmatterNotAMapping { uri, .. }
             | Self::NameMismatch { uri, .. }
+            | Self::FrontmatterNameNotAString { uri, .. }
             | Self::LimitExceeded { uri, .. } => uri,
         }
     }
@@ -708,6 +728,16 @@ impl SkillDiagnostic {
                 "skill {uri} is still listed, but its URI's final segment '{uri_segment}' differs \
                  from its constructed name '{skill_name}'. SEP-2640 hosts key a skill by its URI; \
                  this is a warning because a deliberate `with_path` override is legitimate."
+            ),
+            Self::FrontmatterNameNotAString {
+                uri,
+                found,
+                uri_segment,
+            } => format!(
+                "skill {uri} is still listed, but its frontmatter `name` is {found}, not a \
+                 string. The SEP-2640 name-identity rule compares that value against the URI \
+                 segment '{uri_segment}' and a non-string can never equal it, so a conforming \
+                 host will REFUSE this skill. Quote the name or write it as a plain scalar."
             ),
             Self::LimitExceeded { uri, breach } => format!(
                 "skill {uri} is still listed, but it exceeds a SEP-2640 Limits bound: {}",
@@ -784,11 +814,13 @@ fn exceeds_skill_limits(count: usize, total_bytes: u64) -> Option<SkillLimitBrea
     None
 }
 
-/// Collection of skills. Lifted into a [`crate::server::ResourceHandler`] impl
-/// via [`Skills::into_handler`], and projected to SEP-2640 `skills/list`
-/// entries via [`Skills::entries`]. It synthesizes no discovery index — that
-/// surface (`skill://index.json`) was retired in Phase 125 plan 04 in favour of
-/// the `skills/list` and `skills/get` methods.
+/// Collection of skills, with two projections.
+///
+/// Lifted into a [`crate::server::ResourceHandler`] impl via
+/// [`Skills::into_handler`], and projected to SEP-2640 `skills/list` entries via
+/// [`Skills::entries`]. It synthesizes no discovery index — that surface
+/// (`skill://index.json`) was retired in Phase 125 plan 04 in favour of the
+/// `skills/list` and `skills/get` methods.
 ///
 /// `Clone` is required so the builder's `try_skills` can probe duplicates
 /// by cloning the registry before storing it (consume-by-value
@@ -1016,12 +1048,24 @@ impl Skills {
         // the same shape, so a registry can never produce entries it would
         // then refuse to serve.
         validate_names(&artifacts)?;
+        // ...and the SAME duplicate-URI rule. Without this the claim above was
+        // false in one direction: `into_handler` rejected a registry with two
+        // skills at one URI while `entries()` happily returned two entries
+        // carrying that URI, so the public projection could emit a `skills/list`
+        // payload the server that produced it refuses to build.
+        validate_unique_uris(&artifacts)?;
         Ok(entries_from_artifacts(artifacts))
     }
 
     /// The single per-build parse pass; see [`SkillBuildArtifact`].
     fn build_artifacts(&self) -> Vec<SkillBuildArtifact> {
         self.skills.iter().map(build_artifact).collect()
+    }
+
+    /// The same pass WITHOUT the manifest, for callers that only validate names.
+    /// See `build_artifact_inner` for why the split exists.
+    fn build_name_artifacts(&self) -> Vec<SkillBuildArtifact> {
+        self.skills.iter().map(build_name_artifact).collect()
     }
 
     /// Both build products from ONE artifact pass.
@@ -1072,7 +1116,13 @@ impl Skills {
     /// Returns `Err(pmcp::Error::Validation)` listing every name-identity
     /// offender, or every duplicate URI detected. No silent overwrites.
     pub fn into_handler(self) -> Result<Arc<dyn ResourceHandler>> {
-        validate_names(&self.build_artifacts())?;
+        // The NAME-ONLY pass: `validate_names` reads `frontmatter["name"]` and
+        // `uri_segment` and nothing else, while the full pass SHA-256s every
+        // SKILL.md and every reference body. `try_skills` probes through this
+        // method on every registration call, so hashing here made a registry
+        // assembled in K calls cost K passes over its accumulated bodies.
+        // Duplicate URIs are still caught, by `build_handler` below.
+        validate_names(&self.build_name_artifacts())?;
         self.build_handler()
     }
 
@@ -1107,13 +1157,34 @@ impl Skills {
                 },
             }
         }
-        if !dup_skill.is_empty() || !dup_ref.is_empty() {
+        // The two maps are populated independently, so a collision BETWEEN them
+        // is invisible to both loops above. It is reachable: `SkillsHandler::read`
+        // consults `skill_md` first, so a reference registered at, say,
+        // `sub/SKILL.md` on skill `a` is permanently shadowed by a second skill
+        // at `.with_path("a/sub")` — and, worse, `skill_resource_manifest`
+        // publishes skill `a`'s digest for a URI that serves the OTHER skill's
+        // bytes, which a conforming SEP-2640 host must refuse. `validate_reference_path`
+        // anticipated the class but rejects only the bare `"SKILL.md"`, so any
+        // nested `<dir>/SKILL.md` slipped through.
+        let mut dup_cross: Vec<String> = references
+            .keys()
+            .filter(|uri| skill_md.contains_key(*uri))
+            .cloned()
+            .collect();
+        dup_cross.sort();
+        if !dup_skill.is_empty() || !dup_ref.is_empty() || !dup_cross.is_empty() {
             let mut msg = String::from("Skills::into_handler: duplicate URI(s):");
             if !dup_skill.is_empty() {
                 msg.push_str(&format!(" SKILL.md=[{}]", dup_skill.join(", ")));
             }
             if !dup_ref.is_empty() {
                 msg.push_str(&format!(" references=[{}]", dup_ref.join(", ")));
+            }
+            if !dup_cross.is_empty() {
+                msg.push_str(&format!(
+                    " a reference collides with another skill's SKILL.md=[{}]",
+                    dup_cross.join(", ")
+                ));
             }
             return Err(Error::validation(msg));
         }
@@ -1152,7 +1223,18 @@ fn final_path_segment(path: &str) -> &str {
 /// happens here; [`Skills::entries_with_diagnostics`], [`validate_names`] and
 /// [`Skills::into_handler`] all consume the result rather than re-deriving from
 /// `Skill` bodies.
-fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
+///
+/// `with_manifest` selects how much of the pass runs. The manifest is the
+/// EXPENSIVE half — one SHA-256 over the SKILL.md and over every reference body
+/// — and [`validate_names`] reads neither it nor the byte totals derived from
+/// it, so the name-only callers skip it. That matters because
+/// [`crate::server::ServerBuilder::try_skills`] probes with
+/// `into_handler()` on EVERY registration call: hashing there made a registry
+/// assembled in K calls cost K full passes over its accumulated bodies. When
+/// `with_manifest` is false the artifact's `resources` is empty and no
+/// [`SkillDiagnostic::LimitExceeded`] can be produced, so such artifacts must
+/// never reach [`entries_from_artifacts`].
+fn build_artifact_inner(skill: &Skill, with_manifest: bool) -> SkillBuildArtifact {
     let uri = skill.skill_md_uri();
     let uri_segment = final_path_segment(skill.resolved_path()).to_string();
     let mut diagnostics = Vec::new();
@@ -1179,6 +1261,22 @@ fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
         },
     };
 
+    // A frontmatter `name` that is present but not a string is EXEMPT from the
+    // reject in `validate_names` (a test pins that), so it warns here instead.
+    // Without this it was the one shape where an entry shipped a name that
+    // cannot match its URI segment and nothing said so.
+    if let Some(found) = frontmatter
+        .as_ref()
+        .and_then(|fm| fm.get("name"))
+        .filter(|name| !name.is_string())
+    {
+        diagnostics.push(SkillDiagnostic::FrontmatterNameNotAString {
+            uri: uri.clone(),
+            found: found.to_string(),
+            uri_segment: uri_segment.clone(),
+        });
+    }
+
     // Gap 4a: a constructor-name mismatch WARNS. See `SkillDiagnostic::NameMismatch`
     // for why it is not the reject — the reject is scoped to the frontmatter name.
     if uri_segment != skill.name() {
@@ -1189,16 +1287,21 @@ fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
         });
     }
 
-    let resources = skill_resource_manifest(skill);
-    let total_bytes = resources.iter().fold(0u64, |acc, row| {
-        acc.saturating_add(u64::try_from(row.size).unwrap_or(u64::MAX))
-    });
-    if let Some(breach) = exceeds_skill_limits(resources.len(), total_bytes) {
-        diagnostics.push(SkillDiagnostic::LimitExceeded {
-            uri: uri.clone(),
-            breach,
+    let resources = if with_manifest {
+        let rows = skill_resource_manifest(skill);
+        let total_bytes = rows.iter().fold(0u64, |acc, row| {
+            acc.saturating_add(u64::try_from(row.size).unwrap_or(u64::MAX))
         });
-    }
+        if let Some(breach) = exceeds_skill_limits(rows.len(), total_bytes) {
+            diagnostics.push(SkillDiagnostic::LimitExceeded {
+                uri: uri.clone(),
+                breach,
+            });
+        }
+        rows
+    } else {
+        Vec::new()
+    };
 
     SkillBuildArtifact {
         uri,
@@ -1209,36 +1312,23 @@ fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
     }
 }
 
-/// SEP-2640 name identity (spike gap 4c, ROADMAP success criterion 3): a
-/// skill whose frontmatter carries a string `name` MUST have that name equal
-/// the final segment of its URI path.
-///
-/// # Deliberately conditional on frontmatter being present
-///
-/// A skill with no frontmatter, or with frontmatter carrying no `name` key, is
-/// never rejected by this rule regardless of its path. That scoping is the
-/// criterion's own — it names the FRONTMATTER name — and it is what keeps the
-/// duplicate-URI tests, the `skills_strategy_with_refs` proptest and
-/// `pmcp-book`'s taught `.with_path("team/topic")` exercise working: none of
-/// them carries frontmatter, and all three deliberately use a path whose final
-/// segment differs from the constructor name. The unconditional form (gap 4a)
-/// ships as [`SkillDiagnostic::NameMismatch`]; promoting IT to a reject belongs
-/// with the strict-frontmatter-mode work, once canonical surfaces are cleaned.
-///
-/// Every offender is collected before erroring, matching
-/// [`Skills::into_handler`]'s duplicate-URI style: an author with two bad
-/// skills should learn about both in one build.
-///
-/// # Errors
-///
-/// Returns `Err(pmcp::Error::Validation)` naming every offending URI with its
-/// frontmatter name and the URI segment that disagrees with it.
+/// The full pass, manifest included — what entry synthesis needs.
+fn build_artifact(skill: &Skill) -> SkillBuildArtifact {
+    build_artifact_inner(skill, true)
+}
+
+/// The name-identity half of the pass, with no SHA-256 over any body.
+fn build_name_artifact(skill: &Skill) -> SkillBuildArtifact {
+    build_artifact_inner(skill, false)
+}
+
 /// Everything one artifact pass yields: the resource handler, the SEP-2640
 /// entries, and the build-time diagnostics for skills that were excluded.
 ///
 /// Named because [`Skills::finalize`] returns all three and the bare tuple
-/// trips `clippy::type_complexity` — which `make lint` does NOT see, since it
-/// pins `--features "full"` and `skills` is in neither `full` nor `full-v2`.
+/// trips `clippy::type_complexity` — which `make lint` did NOT see until the
+/// gate grew a `skills`-featured lint leg, since it pins `--features "full"`
+/// and `skills` is in neither `full` nor `full-v2`.
 pub(crate) type FinalizedSkills = (
     Arc<dyn ResourceHandler>,
     Vec<SkillEntry>,
@@ -1276,6 +1366,81 @@ fn entries_from_artifacts(
     (entries, diagnostics)
 }
 
+/// Every URI an artifact pass would serve appears exactly once.
+///
+/// The projection twin of [`Skills::build_handler`]'s duplicate check, over the
+/// same URI population: each artifact's manifest names its own `SKILL.md` first
+/// and then every reference, which is precisely the key set the handler builds.
+/// Running it from [`Skills::entries_with_diagnostics`] is what makes that
+/// method's "a registry can never produce entries it would then refuse to
+/// serve" comment true in BOTH directions — before it, `into_handler` rejected
+/// a two-skills-one-URI registry while `entries()` happily returned two entries
+/// carrying that URI.
+///
+/// Reads `artifact.resources`, so it is meaningful only over a FULL artifact
+/// pass; the name-only pass leaves that vector empty by design.
+///
+/// # Errors
+///
+/// Returns `Err(pmcp::Error::Validation)` naming every repeated URI, sorted so
+/// the message is stable across runs.
+fn validate_unique_uris(artifacts: &[SkillBuildArtifact]) -> Result<()> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dups: Vec<&str> = Vec::new();
+    for row in artifacts.iter().flat_map(|a| a.resources.iter()) {
+        if !seen.insert(row.uri()) {
+            dups.push(row.uri());
+        }
+    }
+    if dups.is_empty() {
+        return Ok(());
+    }
+    dups.sort_unstable();
+    dups.dedup();
+    Err(Error::validation(format!(
+        "Skills::entries: duplicate URI(s): [{}]",
+        dups.join(", ")
+    )))
+}
+
+/// SEP-2640 name identity (spike gap 4c, ROADMAP success criterion 3): a
+/// skill whose frontmatter carries a string `name` MUST have that name equal
+/// the final segment of its URI path.
+///
+/// # Deliberately conditional on frontmatter being present
+///
+/// A skill with no frontmatter, or with frontmatter carrying no `name` key, is
+/// never rejected by this rule regardless of its path. That scoping is the
+/// criterion's own — it names the FRONTMATTER name — and it is what keeps the
+/// duplicate-URI tests, the `skills_strategy_with_refs` proptest and
+/// `pmcp-book`'s taught `.with_path("team/topic")` exercise working: none of
+/// them carries frontmatter, and all three deliberately use a path whose final
+/// segment differs from the constructor name. The unconditional form (gap 4a)
+/// ships as [`SkillDiagnostic::NameMismatch`]; promoting IT to a reject belongs
+/// with the strict-frontmatter-mode work, once canonical surfaces are cleaned.
+///
+/// # A `name` that is PRESENT but not a string is exempt — and now WARNED
+///
+/// `name: 42` and `name: true` are valid YAML producing a `Value` that is not a
+/// string, so `as_str()` yields `None` and this rule skips them — which
+/// `the_name_rule_never_touches_a_skill_without_a_frontmatter_name` pins as
+/// intended behaviour. The exemption stays; its SILENCE does not. Unannounced,
+/// it let criterion 3's reject be defeated by writing the name as a scalar of
+/// the wrong type: the entry shipped with a `frontmatter.name` that cannot
+/// possibly equal its URI segment, which SEP-2640 makes a mandatory host-side
+/// refusal, and no diagnostic fired either — [`SkillDiagnostic::NameMismatch`]
+/// compares the CONSTRUCTOR name, which in that shape matches. The exemption
+/// therefore carries [`SkillDiagnostic::FrontmatterNameNotAString`] so an
+/// operator learns at build time instead of from a host.
+///
+/// Every offender is collected before erroring, matching
+/// [`Skills::into_handler`]'s duplicate-URI style: an author with two bad
+/// skills should learn about both in one build.
+///
+/// # Errors
+///
+/// Returns `Err(pmcp::Error::Validation)` naming every offending URI with its
+/// frontmatter name and the URI segment that disagrees with it.
 fn validate_names(artifacts: &[SkillBuildArtifact]) -> Result<()> {
     let mut offenders: Vec<String> = Vec::new();
     for artifact in artifacts {
@@ -1425,7 +1590,10 @@ pub(crate) struct SkillPromptHandler {
 }
 
 impl SkillPromptHandler {
-    pub(crate) fn new(skill: Skill) -> Self {
+    // Borrows: it reads two projections off the skill and stores Strings, so
+    // taking ownership only forced every call site to `.clone()` a whole
+    // registry entry it still needed afterwards.
+    pub(crate) fn new(skill: &Skill) -> Self {
         let prompt_text = skill.as_prompt_text();
         let description = skill.resolved_description().to_string();
         Self {
@@ -1469,14 +1637,29 @@ impl ResourceHandler for ComposedResources {
         cursor: Option<String>,
         extra: RequestHandlerExtra,
     ) -> Result<ListResourcesResult> {
-        // SkillsHandler::list ignores cursor + extra — pass owned defaults
-        // so the user handler can take the real ones by move.
-        let mut combined = self
-            .skills
-            .list(None, RequestHandlerExtra::default())
-            .await?;
-        let extra_other = self.other.list(cursor, extra).await?;
-        combined.resources.extend(extra_other.resources);
+        // The USER handler's result is the base, because it is the only one of
+        // the two that can carry pagination or caching state. Building on the
+        // skills result instead discarded `next_cursor`, `ttl_ms` and
+        // `cache_scope` — `SkillsHandler::list` returns a bare
+        // `ListResourcesResult::new(..)`, which sets all three to `None` — so a
+        // paginating `.resources(...)` handler had its cursor silently dropped
+        // and the client concluded the listing was complete after page one.
+        let mut combined = self.other.list(cursor.clone(), extra).await?;
+        // Skills are ONE complete page with no cursor of their own, so they
+        // belong only on the caller's first page. Emitting them unconditionally
+        // (as `self.skills.list(None, ..)` did) repeated every skill URI on
+        // every page of the user handler's pagination.
+        if cursor.is_none() {
+            // SkillsHandler::list ignores cursor + extra — pass owned defaults
+            // so the user handler above could take the real ones by move.
+            let skills = self
+                .skills
+                .list(None, RequestHandlerExtra::default())
+                .await?;
+            let mut resources = skills.resources;
+            resources.append(&mut combined.resources);
+            combined.resources = resources;
+        }
         Ok(combined)
     }
 
@@ -1626,7 +1809,7 @@ fn sha256_digest_hex(bytes: &[u8]) -> String {
 
     let mut out = String::with_capacity("sha256:".len() + 64);
     out.push_str("sha256:");
-    for byte in digest.iter() {
+    for byte in &digest {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
@@ -2018,7 +2201,7 @@ mod tests {
             "text/markdown",
             "refbody",
         ));
-        let handler = SkillPromptHandler::new(skill.clone());
+        let handler = SkillPromptHandler::new(&skill);
         let result = handler.handle(HashMap::new(), extra()).await.unwrap();
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].role, Role::User);
