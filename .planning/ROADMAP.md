@@ -2591,7 +2591,7 @@ D-NN citations: D-01 (01,05), D-02 (01,03,04), D-03 (04), D-04 (01), D-05 (01,03
 > the plan-phase gate false positives already recorded in project memory, not a signal about
 > these plans. Do not read a future `covered: 0` from that verb as evidence of a planning
 > gap here; use the manual extraction above, which is what the enumeration reflects.
-**Plans:** 1/5 plans executed across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
+**Plans:** 2/5 plans executed across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
 
 Plans:
 **Wave 1**
@@ -2600,7 +2600,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics, proven auth-before-params gate ordering, and the measured `ServerCore` method boundary *(rescoped 2026-09-02 by the cross-AI replan: the original "twin-site parity" claim was unbuildable — `ProtocolHandler::handle_request` accepts only the typed public `Request`, so `ServerCore` skills delegates would be dead code. Follows the Phase-112 `server/discover` precedent; see the 125-02 R-13 disposition.)*
+- [x] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics, proven auth-before-params gate ordering, and the measured `ServerCore` method boundary *(rescoped 2026-09-02 by the cross-AI replan: the original "twin-site parity" claim was unbuildable — `ProtocolHandler::handle_request` accepts only the typed public `Request`, so `ServerCore` skills delegates would be dead code. Follows the Phase-112 `server/discover` precedent; see the 125-02 R-13 disposition.)*
 - [ ] 125-03-PLAN.md — Complete `resources` manifests, verbatim frontmatter, D-02 warn+exclude, name-identity reject, SEP limits warning
 
 **Wave 3** *(blocked on Wave 2 completion)*
