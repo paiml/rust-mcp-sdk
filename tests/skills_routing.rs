@@ -68,6 +68,15 @@
 
 mod common;
 
+// The in-process duplex seam, included per-crate exactly as its own module docs
+// prescribe. It is the ONE harness that accepts a `ServerCore`, which is what
+// test 17 needs — and the fact that it takes a typed `Request` too is the same
+// fact that makes test 18's boundary real. Declared at the top level (not inside
+// a nested module) because `#[path]` on a nested module resolves relative to the
+// ENCLOSING module's directory.
+#[path = "common/duplex.rs"]
+mod duplex;
+
 use common::v2::{
     header, post, post_raw, spawn_default_config, teardown, v1_body, v2_body, v2_headers_for,
     BearerSubjects, Resp, V1, V2,
@@ -1135,4 +1144,171 @@ async fn skills_get_auth_refusal_precedes_the_params_error() {
     );
 
     teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 17 — the ServerCoreBuilder RESOURCE surface: the reachable half.
+// ===========================================================================
+
+/// A `ServerCoreBuilder`-built `ServerCore` carrying a skills registry still
+/// answers typed `resources/list` and `resources/read` for its skills.
+///
+/// # What this test does NOT prove, stated so nobody reads more into it
+///
+/// **A `ServerCore` answers NO skills METHOD.** Its only request ingress is
+/// `ProtocolHandler::handle_request(&self, id, request: Request, auth)`, which
+/// accepts the typed PUBLIC `Request` enum — and neither `skills/list` nor
+/// `skills/get` has a variant in it, deliberately, because a variant on a public
+/// exhaustive enum is a semver-MAJOR break. `duplex::raw_via_core` is the
+/// one harness that accepts a `ServerCore`, and it takes a typed `Request` too,
+/// which is precisely why it can drive `resources/list` here and could never drive
+/// `skills/list`. That limit is a recorded phase deferral (125-05), and test 18
+/// below guards against "fixing" it with dead code.
+///
+/// # What it DOES prove, and why it earns its place
+///
+/// 125-01 changed `finalize_skills_resources` to return a tuple, and the
+/// `ServerCoreBuilder::build` call site discards the entries half. This is the
+/// surface that regresses if that change was made wrong: a mis-destructure that
+/// dropped the HANDLER instead of the entries would compile, and every
+/// `skills/list` test would still pass — because those run against a `Server`
+/// built by the OTHER path.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn server_core_builder_still_serves_skills_as_resources() {
+    use pmcp::server::core::ProtocolHandler;
+    use std::sync::Arc;
+
+    let core = pmcp::server::builder::ServerCoreBuilder::new()
+        .name("skills-core-fixture")
+        .version("1.0.0")
+        .skills(one_skill_registry())
+        .build()
+        .expect("ServerCoreBuilder with skills builds");
+    let core: Arc<dyn ProtocolHandler> = Arc::new(core);
+
+    // A v1 core gates every non-`initialize` request behind the init handshake,
+    // so the handshake runs first or both legs below get -32002 and the test would
+    // indict skills for a gate that has nothing to do with them.
+    let init = duplex::initialize_via_core(&core).await;
+    assert!(
+        matches!(
+            init.payload,
+            pmcp::types::jsonrpc::ResponsePayload::Result(_)
+        ),
+        "the handshake must succeed before the two legs below mean anything"
+    );
+
+    let list_request: pmcp::types::ClientRequest =
+        serde_json::from_value(json!({ "method": "resources/list", "params": {} }))
+            .expect("resources/list deserializes into ClientRequest");
+    let listed = duplex::raw_via_core(
+        Arc::clone(&core),
+        pmcp::types::Request::Client(Box::new(list_request)),
+    )
+    .await;
+    let pmcp::types::jsonrpc::ResponsePayload::Result(listed) = listed.payload else {
+        panic!("a ServerCoreBuilder core answers resources/list");
+    };
+    let uris: Vec<&str> = listed["resources"]
+        .as_array()
+        .expect("resources is an array")
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    assert!(
+        uris.contains(&REFUNDS_SKILL_MD),
+        "the registry's SKILL.md URI must be enumerated; got {uris:?}"
+    );
+
+    let read = duplex::raw_via_core(
+        Arc::clone(&core),
+        duplex::read_resource_request(REFUNDS_SKILL_MD, pmcp::types::protocol::Era::V1),
+    )
+    .await;
+    let pmcp::types::jsonrpc::ResponsePayload::Result(read) = read.payload else {
+        panic!("a ServerCoreBuilder core answers resources/read for a skill");
+    };
+    let body = serde_json::to_string(&read["contents"]).expect("contents serializes");
+    assert!(
+        body.contains("Follow company policy"),
+        "the skill BODY comes back, not merely a successful envelope: {body}"
+    );
+}
+
+// ===========================================================================
+// 18 — the dead-code guard: ServerCore must gain neither the field nor a method.
+// ===========================================================================
+
+/// `src/server/core.rs` must declare neither a `skill_entries` field on
+/// `ServerCore` nor a `ServerCore` method named for either skills method.
+///
+/// # This test is a RECORD, not merely a block
+///
+/// A future contributor reading the phase summary could reasonably conclude the
+/// `ServerCore` delegates were forgotten. They were omitted ON PURPOSE, and this
+/// is where that is written down in a form that fails loudly.
+///
+/// # What a future widener must change FIRST
+///
+/// The blocking fact is the signature of `ProtocolHandler::handle_request`: it
+/// takes the typed PUBLIC `pmcp::types::Request` enum, so a `ServerCore` can only
+/// ever receive a request that has a variant there. Adding a `skills/*` variant to
+/// that exhaustive public enum is a semver-MAJOR break, which is the whole reason
+/// both methods ride the crate-private `InternalClientRequest` classifier instead.
+///
+/// So widening the reach means changing the INGRESS — giving `ProtocolHandler` a
+/// seam that accepts an internally-routed request, the same change the D-01 stdio
+/// deferral needs — and only then adding delegates. Adding the delegates first
+/// produces code that nothing can call, which is exactly what Phase 112 DELETED
+/// when it consolidated `server/discover` into the free fn `build_discover_response`.
+///
+/// The scan filters comment lines because the plan's own instructions put
+/// explanatory prose at the discard site naming the very identifiers this test
+/// forbids; an unfiltered count would turn documentation into a gate failure.
+#[test]
+fn server_core_declares_no_skills_field_or_skills_method() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/server/core.rs");
+    let source = std::fs::read_to_string(&path).expect("server/core.rs is readable");
+
+    let code: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    // Anti-vacuity: if the comment filter (or the path) ever removed everything
+    // that matters, both assertions below would pass while measuring nothing.
+    assert!(
+        code.iter().any(|l| l.contains("pub struct ServerCore")),
+        "the extracted code lines are not `src/server/core.rs`; the scan is vacuous"
+    );
+    assert!(
+        code.iter()
+            .any(|l| l.contains("fn build_skills_get_response")),
+        "the shared projection is missing from the scanned code; the scan is vacuous"
+    );
+
+    for (needle, why) in [
+        (
+            "skill_entries",
+            "a `skill_entries` field on `ServerCore` would be a field NOTHING could \
+             read: a ServerCore receives only the typed public `Request` enum, which \
+             has no skills variant",
+        ),
+        (
+            "fn handle_skills",
+            "a `ServerCore::handle_skills_*` would be a function NOTHING could call, \
+             for the same reason — Phase 112 DELETED exactly these wrappers for \
+             `server/discover` rather than annotating them `#[allow(dead_code)]`",
+        ),
+    ] {
+        let hits: Vec<&&str> = code.iter().filter(|l| l.contains(needle)).collect();
+        assert!(
+            hits.is_empty(),
+            "`{needle}` reappeared in the CODE of src/server/core.rs.\n{why}.\n\
+             To widen the reach legitimately, change `ProtocolHandler::handle_request`'s \
+             typed-`Request` signature FIRST — see this test's rustdoc.\n\
+             Offending lines: {hits:?}"
+        );
+    }
 }

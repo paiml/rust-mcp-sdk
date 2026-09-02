@@ -1354,15 +1354,37 @@ impl ServerCoreBuilder {
         // setter's semantics are unchanged for callers that don't use
         // skills.
         //
-        // `ServerCore` deliberately does NOT carry the entry set: its dispatch
-        // accepts only the typed public `Request` enum, which `skills/list` will
-        // never appear in (2.x exhaustive-enum promise), so a `skill_entries`
-        // field here would be unreachable dead code. The entries are consumed by
-        // the high-level `Server` build path in `src/server/mod.rs`, which is what
-        // the streamable-HTTP transport holds.
+        // The SEP-2640 entry set is DISCARDED here, and that is a decision rather
+        // than an oversight.
+        //
+        // A `ServerCore`'s only request ingress is
+        // `ProtocolHandler::handle_request(&self, id, request: Request, auth)`
+        // (`src/server/core.rs`), which accepts the typed PUBLIC `Request` enum.
+        // Neither `skills/list` nor `skills/get` will ever appear in it — adding a
+        // variant to a public exhaustive enum is a semver-MAJOR break, which is
+        // the whole reason both methods ride the crate-private
+        // `InternalClientRequest` classifier instead. So a `skill_entries` field
+        // here would be a field nothing could ever read, and a
+        // `ServerCore::handle_skills_*` would be a function nothing could ever
+        // call.
+        //
+        // PRECEDENT, not preference: Phase 112 reached exactly this conclusion for
+        // `server/discover` and acted on it. The `ServerCore` discover wrappers
+        // were DELETED, the projection was consolidated into the single free fn
+        // `build_discover_response`, and no `#[allow(dead_code)]` was left behind;
+        // `handle_tasks_update` followed the same shape and exists only on the
+        // high-level `Server`. `tests/skills_routing.rs` carries a source-scan
+        // guard that fails if either dead item is re-added, and its rustdoc names
+        // the `handle_request` signature as the fact a future widener must change
+        // first.
+        //
+        // The skills RESOURCE surface a `ServerCoreBuilder` server exposes is
+        // real and unaffected: the handler bound below still serves every skill
+        // through `resources/list` and `resources/read`. Only the two skills
+        // METHODS are out of reach, and that limit is a recorded phase deferral.
         #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
-        let final_resources: Option<Arc<dyn ResourceHandler>> =
-            finalize_skills_resources(self.pending_skills.take(), self.resources.take()).0;
+        let (final_resources, _): (Option<Arc<dyn ResourceHandler>>, Vec<_>) =
+            finalize_skills_resources(self.pending_skills.take(), self.resources.take());
         #[cfg(not(all(feature = "skills", not(target_arch = "wasm32"))))]
         let final_resources = self.resources.take();
 
