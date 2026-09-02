@@ -2578,8 +2578,19 @@ spike-findings skill.
 (`.planning/spikes/008-sep-2640-drift-check/`) is the measured drift evidence; the fix contract
 lives in `.claude/skills/spike-findings-rust-mcp-sdk/references/sep-2640-conformance.md`.
 **Requirements**: TBD — no formal REQ-IDs; the tracked requirement set is `125-CONTEXT.md`
-decisions D-01..D-11 (all 11 covered by the plans below; gate `check.decision-coverage-plan`
-reports 11/11).
+decisions D-01..D-11. All 11 are covered by the plans below, verified by extracting the
+gate-scanned regions (`<objective>`, `<action>`, `<behavior>`, `<read_first>`, `<verify>`,
+`<acceptance_criteria>`, `<done>`, and frontmatter `must_haves`) from each PLAN and matching
+D-NN citations: D-01 (01,05), D-02 (01,03,04), D-03 (04), D-04 (01), D-05 (01,03), D-06
+(02,04,05), D-07 (01,02), D-08 (04), D-09 (01,05), D-10 (05), D-11 (01,05).
+
+> **Corrected 2026-09-02.** This line previously read "gate `check.decision-coverage-plan`
+> reports 11/11". That is **false as measured**: the gate returns `covered: 0` for this
+> phase — and also for the **shipped** Phase 123 (`total: 16, covered: 0`), whose plans cite
+> D-NN throughout. It is a pre-existing gate defect on this project, in the same family as
+> the plan-phase gate false positives already recorded in project memory, not a signal about
+> these plans. Do not read a future `covered: 0` from that verb as evidence of a planning
+> gap here; use the manual extraction above, which is what the enumeration reflects.
 **Plans:** 5 plans across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
 
 Plans:
@@ -2589,7 +2600,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics + `ServerCore` twin-site parity
+- [ ] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics, proven auth-before-params gate ordering, and the measured `ServerCore` method boundary *(rescoped 2026-09-02 by the cross-AI replan: the original "twin-site parity" claim was unbuildable — `ProtocolHandler::handle_request` accepts only the typed public `Request`, so `ServerCore` skills delegates would be dead code. Follows the Phase-112 `server/discover` precedent; see the 125-02 R-13 disposition.)*
 - [ ] 125-03-PLAN.md — Complete `resources` manifests, verbatim frontmatter, D-02 warn+exclude, name-identity reject, SEP limits warning
 
 **Wave 3** *(blocked on Wave 2 completion)*
