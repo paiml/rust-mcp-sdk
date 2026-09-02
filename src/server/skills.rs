@@ -755,7 +755,7 @@ impl Skills {
     /// EVERY registered reference, in registration order. A conforming host
     /// fetches every file named there and compares it against the row, so a
     /// manifest that listed only `SKILL.md` would be rejected rather than
-    /// treated as a partial answer. See [`skill_resource_manifest`] for the
+    /// treated as a partial answer. See `skill_resource_manifest` for the
     /// invariant that keeps a row and its `resources/read` in agreement by
     /// construction.
     ///
@@ -801,11 +801,11 @@ impl Skills {
     ///
     /// Returns `Err(pmcp::Error::Validation)` when a skill's frontmatter
     /// `name` disagrees with the final segment of its URI path — the SEP-2640
-    /// name-identity rule, checked through the same [`validate_names`] function
+    /// name-identity rule, checked through the same `validate_names` function
     /// [`Self::into_handler`] runs. Every offender is named in one message.
     ///
     /// Crossing a SEP-2640 Limits bound is deliberately NOT an error: it warns
-    /// (see [`exceeds_skill_limits`]), and the skill is still emitted.
+    /// (see `exceeds_skill_limits`), and the skill is still emitted.
     ///
     /// # Examples
     ///
@@ -923,11 +923,11 @@ impl Skills {
     ///
     /// Returns `Err` on:
     /// - A skill whose frontmatter `name` disagrees with the final segment of
-    ///   its URI path (see [`validate_names`]).
+    ///   its URI path (see `validate_names`).
     /// - Two skills resolving to the same `skill_md_uri()`.
     /// - Two skills' reference URIs colliding.
     ///
-    /// Name identity is checked through the SAME [`validate_names`] function
+    /// Name identity is checked through the SAME `validate_names` function
     /// [`Self::entries`] runs, so a registry can never produce entries it would
     /// then refuse to serve, nor the reverse.
     ///
