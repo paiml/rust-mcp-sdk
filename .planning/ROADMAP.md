@@ -2577,7 +2577,18 @@ spike-findings skill.
 **Depends on**: Nothing in-repo (first phase of the milestone). Spike 008
 (`.planning/spikes/008-sep-2640-drift-check/`) is the measured drift evidence; the fix contract
 lives in `.claude/skills/spike-findings-rust-mcp-sdk/references/sep-2640-conformance.md`.
-**Requirements**: TBD
+**Requirements**: TBD — no formal REQ-IDs; the tracked requirement set is `125-CONTEXT.md`
+decisions D-01..D-11 (all 11 covered by the plans below; gate `check.decision-coverage-plan`
+reports 11/11).
+**Plans:** 5 plans across 4 waves — 1:{01} 2:{02,03} 3:{04} 4:{05}
+
+Plans:
+- [ ] 125-01-PLAN.md — TRACER: `skills/list` end-to-end over streamable HTTP + the SC#1 routing guarantees
+- [ ] 125-02-PLAN.md — `skills/get` with draft-correct -32602 semantics + `ServerCore` twin-site parity
+- [ ] 125-03-PLAN.md — Complete `resources` manifests, verbatim frontmatter, D-02 warn+exclude, name-identity reject, SEP limits warning
+- [ ] 125-04-PLAN.md — Retire `skill://index.json` (12 tracked sites) + examples and the four documentation surfaces
+- [ ] 125-05-PLAN.md — `make test-skills` gate leg with a zero-test-count guard, fuzz target, and the rustdoc deferral record
+
 **Success Criteria** (what must be TRUE):
 
   1. `serde_json::from_value::<ClientRequest>` on `{"method":"skills/list"}` still returns Err
