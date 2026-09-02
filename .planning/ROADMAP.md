@@ -2501,31 +2501,31 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 124-01-PLAN.md — Coverage gate sees the workspace-excluded crate: D-01 two-source discovery plus a repo-wide scan-scope tripwire, D-10 cluster order assertion with a word-boundary matcher, eight-fixture red-direction self-test declared as the gate's prerequisite
+- [x] 124-01-PLAN.md — Coverage gate sees the workspace-excluded crate: D-01 two-source discovery plus a repo-wide scan-scope tripwire, D-10 cluster order assertion with a word-boundary matcher, eight-fixture red-direction self-test declared as the gate's prerequisite
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 124-02-PLAN.md — Sync `main` into the milestone branch (D-08), resolving the squash-merge conflict set BEFORE any version bump
+- [x] 124-02-PLAN.md — Sync `main` into the milestone branch (D-08), resolving the squash-merge conflict set BEFORE any version bump
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 124-03-PLAN.md — D-05 three-way version-drift sweep as a committed tool, D-03's public-API guard, and a blocking-human decision on every phantom delta
+- [x] 124-03-PLAN.md — D-05 three-way version-drift sweep as a committed tool, D-03's public-API guard, and a blocking-human decision on every phantom delta
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 124-04-PLAN.md — D-09 ledger reconciliation: release.yml's four stale comment regions and CLAUDE.md's scattered ordering constraint plus its Pre-Flight contradiction
+- [x] 124-04-PLAN.md — D-09 ledger reconciliation: release.yml's four stale comment regions and CLAUDE.md's scattered ordering constraint plus its Pre-Flight contradiction
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 124-05-PLAN.md — Version bumps for exactly the authorised set in one atomic commit, the D-04 pmcp-package audit with its nine-emitter one-set rule plus the separate row-C1 consequence set, the CHANGELOG section the release workflow can extract, and the committed `124-expected-release.json` release manifest that plans 06 and 07 verify against
+- [x] 124-05-PLAN.md — Version bumps for exactly the authorised set in one atomic commit, the D-04 pmcp-package audit with its nine-emitter one-set rule plus the separate row-C1 consequence set, the CHANGELOG section the release workflow can extract, and the committed `124-expected-release.json` release manifest that plans 06 and 07 verify against
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 124-06-PLAN.md — Open the release PR, drive CI green, human-action checkpoint for the merge
+- [x] 124-06-PLAN.md — Open the release PR, drive CI green, human-action checkpoint for the merge
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 124-07-PLAN.md — Pre-tag re-verification of two disjoint sets (expected-new vs expected-skips), one-way-door decision checkpoint, human-action tag push, per-crate registry verification with retry, and a closeout PR that delivers the planning record to `upstream/main`
+- [x] 124-07-PLAN.md — Pre-tag re-verification of two disjoint sets (expected-new vs expected-skips), one-way-door decision checkpoint, human-action tag push, per-crate registry verification with retry, and a closeout PR that delivers the planning record to `upstream/main`
 
 > **Waves are one plan wide by design.** This is a release pipeline: measure -> gate -> sync -> reconcile -> decide versions -> ship, and every step's output is the next step's input. Two ordering constraints are load-bearing and must not be "optimised" back into parallelism: the `main` sync (plan 02) precedes every version bump, because a conflict resolution that silently reverts a bumped manifest is the worst possible ordering; and the phantom-delta decision (plan 03) precedes the bumps it authorises, because published version numbers are consumed permanently.
 
@@ -2545,7 +2545,17 @@ duplicated. Authoritative table: `.planning/REQUIREMENTS.md`.
 | 121. Local Round-Trip E2E | PKG-04 | 5/5 | Complete    | 2026-08-25 |
 | 122. Attestation Carriage *(parked)* | PKGX-01 | 8/8 | Complete    | 2026-08-25 |
 | 123. Export/Import Verbs *(parked)* | PKGX-02 | 7/7 | Complete    | 2026-08-26 |
-| 124. Release & Publish Order | PKGR-01 | 0/7 | Planned | - |
+| 124. Release & Publish Order | PKGR-01 | 7/7 | Complete    | 2026-08-27 |
+
+> **Row corrected 2026-09-02.** It read `0/7 | Planned` from 2026-08-27 until then, while the
+> release it describes was live on crates.io the whole time. Plans 06 and 07 executed —
+> PR #348 merged as `370ac869`, tag `v2.19.1` pushed, all 14 `expected_new` crate versions
+> confirmed live — but neither wrote a SUMMARY, so the row never advanced. The two SUMMARYs
+> were reconstructed from git/gh/crates.io evidence on 2026-09-02 and are marked
+> `record_type: retroactive`. The completion date is the tag date (2026-08-27), not the
+> record date. **The release job itself FAILED** (run `#33122173433`, a crates.io ownership
+> 403 on `pmcp-team-servers`): 11 of 14 published, `cargo-pmcp` and `pmcp-tasks` skipped as
+> collateral, all three recovered by hand. See `124-07-SUMMARY.md`.
 
 > **⚠ Phases 122 and 123 cannot fully close inside this repo.** Both depend on pmcp.run backend
 > capabilities — package import and attestation issuance — that were not confirmed as scheduled at
