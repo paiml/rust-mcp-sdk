@@ -1,9 +1,9 @@
-//! SEP-2640 `skills/list` ROUTING and the guarantees the route must keep true
-//! (Phase 125, plan 01).
+//! SEP-2640 `skills/list` + `skills/get` ROUTING and the guarantees those routes
+//! must keep true (Phase 125, plans 01 and 02).
 //!
 //! # Two halves, and they are not the same kind of test
 //!
-//! **Half one — the LIVE WIRE.** `skills/list` is routed through the
+//! **Half one — the LIVE WIRE.** Both methods are routed through the
 //! crate-private `InternalClientRequest` classifier that Phase 112 built for
 //! `server/discover`, so nothing about the answer can be trusted from source
 //! alone. These tests drive REAL bytes over a loopback socket through the real
@@ -82,10 +82,11 @@ use std::net::SocketAddr;
 /// constant is `pub(crate)` and therefore unreachable from an integration crate.
 const SKILLS_LIST: &str = "skills/list";
 
-/// The sibling SEP-2640 method. It has no route until plan 125-02, but two of the
-/// properties below are about the method STRING and hold before any route exists:
-/// its absence from `ClientRequest` (tests 4 and 5) and its absence from the
-/// routing-name table (test 7).
+/// The sibling SEP-2640 method, routed by plan 125-02.
+///
+/// Two of the properties below are about the method STRING and held even before
+/// the route existed: its absence from `ClientRequest` (tests 4 and 5) and its
+/// absence from the routing-name table (test 7). Tests 9-16 are about the route.
 const SKILLS_GET: &str = "skills/get";
 
 /// The `Mcp-Session-Id` request header, for the v1 legs: a v1 caller against a
@@ -690,7 +691,11 @@ async fn skills_get_returns_the_single_conforming_entry_on_v2() {
         "a served method answers at HTTP 200: {}",
         response.raw
     );
-    assert_eq!(response.body["id"], json!(41), "the ORIGINAL id is preserved");
+    assert_eq!(
+        response.body["id"],
+        json!(41),
+        "the ORIGINAL id is preserved"
+    );
 
     let result = result_of(&response);
     assert_eq!(

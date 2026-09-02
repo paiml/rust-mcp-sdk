@@ -2488,6 +2488,137 @@ pub(crate) fn build_skills_list_response(
     response
 }
 
+/// The longest prefix of a caller-supplied URI that may appear in an error
+/// message.
+///
+/// ASVS V7: an error must not echo attacker-controlled input unbounded — that
+/// turns a `-32602` into a log-injection and response-amplification primitive.
+/// The value is a prefix rather than a hard reject because a truncated URI is
+/// genuinely useful to the legitimate caller who mistyped one.
+const SKILLS_GET_URI_ECHO_LIMIT: usize = 96;
+
+/// Render a caller-supplied `skills/get` URI for inclusion in an error message.
+///
+/// Truncated at [`SKILLS_GET_URI_ECHO_LIMIT`] **characters, not bytes** — slicing
+/// a `String` at a byte offset that is not a UTF-8 boundary panics, and the URI is
+/// attacker-controlled, so a byte-offset truncation would be a remotely reachable
+/// panic rather than a safety measure.
+fn truncated_uri_for_error(uri: &str) -> String {
+    let mut out: String = uri.chars().take(SKILLS_GET_URI_ECHO_LIMIT).collect();
+    if out.chars().count() < uri.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+/// Build the SEP-2640 `skills/get` response (Phase 125 plan 02, D-06/D-07).
+///
+/// The SINGLE shared projection consumed by the production HTTP caller
+/// (`Server::handle_skills_get` → the streamable-HTTP `HttpIngress::SkillsGet`
+/// classifier). There is no `ServerCore` route: `ProtocolHandler::handle_request`
+/// accepts the typed public `Request` enum, which this method deliberately has no
+/// variant in, so a `ServerCore` delegate would be unreachable dead code — the
+/// same conclusion Phase 112 reached for `server/discover` and acted on by
+/// deleting its `ServerCore` wrappers. `tests/skills_routing.rs` carries a
+/// source-scan guard that fails if one is re-added.
+///
+/// Four deliberate deltas from the [`build_skills_list_response`] sibling above:
+///
+/// 1. **The params are READ here, in the SERVED branch.** This is the first place
+///    in the phase where a caller-supplied value is decoded, and the location is
+///    the point: `classify_internal_method` stays body-blind so that a malformed
+///    body becomes a `-32602` AFTER the header and auth pipeline, never a parse
+///    error ahead of it. A classifier that deserialized would hand an
+///    unauthenticated caller a params error instead of the authentication refusal
+///    (T-125-07).
+/// 2. **A miss is [`error_codes::INVALID_PARAMS`] (`-32602`), NOT
+///    [`error_codes::METHOD_NOT_FOUND`]** — the code the current SEP-2640 draft
+///    specifies for an unresolvable `skills/get` URI (D-06). This diverges from
+///    two neighbours ON PURPOSE. [`build_discover_response`] uses `-32601` because
+///    a v1 `server/discover` genuinely is an unknown METHOD; and the shipped
+///    `SkillsHandler::read` raises `-32601` for an unknown `resources/read` URI,
+///    which reaches the wire re-wrapped as `-32603`. That `resources/read`
+///    divergence is a KNOWN, separately-tracked observation which this phase
+///    deliberately neither copies nor fixes — changing a shipped error code is
+///    observable behaviour with its own test
+///    (`resources_read_unknown_uri_method_not_found` in
+///    `tests/skills_integration.rs`, plus the measured wire control in
+///    `tests/skills_routing.rs`).
+/// 3. **The lookup is an EXACT map hit and nothing else** (T-125-06). The caller's
+///    string is never joined, normalized, percent-decoded or otherwise
+///    manipulated into a path. Registration-time `validate_reference_path`
+///    already rejects `..` segments, leading `/`, embedded `://` and null bytes;
+///    the lookup side must not re-open that surface by being clever. A
+///    consequence worth stating: only a SKILL.md URI resolves, so a registered
+///    skill's reference file — readable via `resources/read` — answers `-32602`
+///    here, which is what the draft's "the `uri` MUST be a skill's SKILL.md"
+///    requires.
+/// 4. **[`Cacheable::No`] is named at this call site**, where
+///    `build_skills_list_response` names `Cacheable::Yes`. SEP-2640 gives
+///    `skills/list` the base protocol's list-caching attributes explicitly and
+///    leaves the equivalent question OPEN for `skills/get`, so pmcp claims
+///    nothing and the result carries neither `ttlMs` nor `cacheScope` on either
+///    era. Naming it here rather than omitting it is what makes the claim
+///    reviewable: a later phase that decides the draft has settled changes ONE
+///    argument with a stated reason. As with its sibling this is also why
+///    [`request_is_cacheable`] gains no row — that table is keyed on public
+///    `ClientRequest` variants, `skills/get` deliberately has none, its `match`
+///    carries no wildcard arm, and its rustdoc calls a row for a variant that
+///    cannot occur "a lie about where the claim is made".
+///
+/// `entries` arrives ALREADY SERIALIZED, keyed by SKILL.md URI, for the reason
+/// [`build_skills_list_response`] records: `SkillEntry` exists only under
+/// `feature = "skills"` while the classifier that routes the method is ungated, so
+/// a featureless build must still answer — with an honest empty catalog, in which
+/// every URI is a `-32602` miss.
+pub(crate) fn build_skills_get_response(
+    id: RequestId,
+    entries: &indexmap::IndexMap<String, Value>,
+    params: &Value,
+    info: &Implementation,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+) -> JSONRPCResponse {
+    // Delta 1: the params are decoded HERE. `params` is `Value::Null` when the
+    // frame carried none, a non-object when the caller sent a scalar, and may
+    // carry a `uri` of any type — all four shapes land on the same `-32602`.
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return ServerCore::error_response(
+            id,
+            crate::types::protocol::error_codes::INVALID_PARAMS,
+            "Invalid params: skills/get requires a string `uri` naming a skill's SKILL.md"
+                .to_string(),
+        );
+    };
+
+    // Delta 3: an exact map hit. No join, no normalization, no decode.
+    let Some(entry) = entries.get(uri) else {
+        // Delta 2: -32602, not -32601. The URI is echoed TRUNCATED (ASVS V7).
+        return ServerCore::error_response(
+            id,
+            crate::types::protocol::error_codes::INVALID_PARAMS,
+            format!(
+                "Invalid params: no skill is served at `{}`",
+                truncated_uri_for_error(uri)
+            ),
+        );
+    };
+
+    let mut response =
+        ServerCore::success_response(id, serde_json::json!({ "skill": entry.clone() }));
+    inject_v2_result_envelope(
+        &mut response,
+        protocol_context,
+        info,
+        ResponseDisposition::Complete,
+        // `skills/get` mints no reserved MRTR/tasks result field, so it owns none.
+        ReservedFieldOwner::None,
+        // Delta 4 — see this function's rustdoc. The draft leaves get-caching open;
+        // pmcp claims nothing, on either era.
+        Cacheable::No,
+    );
+    response
+}
+
 // ===========================================================================
 // MRTR ingress + egress (Plan 113-06, HTTP-02 / HTTP-03).
 //

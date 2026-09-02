@@ -852,6 +852,52 @@ pub(crate) enum InternalClientRequest {
         /// frame carried none).
         params: serde_json::Value,
     },
+    /// The SEP-2640 `skills/get` request (Phase 125, plan 02), carrying its
+    /// **RAW** `params` and NOTHING else.
+    ///
+    /// # Why it is here and NOT a [`ClientRequest`] variant
+    ///
+    /// Identical to the [`SkillsList`](Self::SkillsList) sibling above, and for
+    /// the same measured reason: [`ClientRequest`] is a public exhaustive enum
+    /// with no `#[non_exhaustive]`, so `enum_variant_added` is a semver-**MAJOR**
+    /// break and `#[non_exhaustive]` is itself a source break for every downstream
+    /// exhaustive `match`. The in-repo guard is
+    /// `client_request_has_no_skills_variants` in `tests/skills_routing.rs`, which
+    /// scans for BOTH spellings.
+    ///
+    /// # Why the params stay RAW — and here it is load-bearing, not merely uniform
+    ///
+    /// `skills/get` is the FIRST method in this phase that actually READS its
+    /// params: the caller supplies a `uri` and the served branch looks it up. That
+    /// makes the raw-params discipline a security property rather than a
+    /// convention. A classifier that deserialized `{ uri: String }` here would
+    /// reject a malformed body BEFORE the header and auth pipeline had run, so an
+    /// UNAUTHENTICATED caller would receive `-32602` — a free parse of its own
+    /// chosen body — instead of the authentication refusal (T-125-07).
+    ///
+    /// The `uri` is therefore deserialized in `build_skills_get_response`, in the
+    /// served branch, and the ordering is asserted end to end by
+    /// `skills_get_auth_refusal_precedes_the_params_error` in
+    /// `tests/skills_routing.rs`. That test exists because this rustdoc is the
+    /// MECHANISM and not the proof: a future refactor that moved the parse up here
+    /// would leak the params error while every other test still passed.
+    ///
+    /// No request id: the classifier is never given one.
+    /// `parse_request_or_internal` reads `request.id` itself and returns it as the
+    /// FIRST element of its `(RequestId, IngressRequest)` tuple.
+    ///
+    /// # There is no era gate on this variant either
+    ///
+    /// Like `skills/list`, `skills/get` rides the base Resources primitive and
+    /// answers on 2025-11-25 as well as 2026-07-28. Unlike `skills/list`, its
+    /// result carries NEITHER caching attribute on either era — the draft leaves
+    /// the get-caching question open, so pmcp claims nothing (see
+    /// `build_skills_get_response`).
+    SkillsGet {
+        /// The request's `params`, verbatim and undecoded (`Value::Null` when the
+        /// frame carried none).
+        params: serde_json::Value,
+    },
 }
 
 /// The wire method string of the v2 `server/discover` request (VERS-04).
@@ -905,14 +951,13 @@ pub(crate) const SKILLS_LIST_METHOD: &str = "skills/list";
 /// [`SKILLS_LIST_METHOD`] above — the two spellings share one rustdoc so a later
 /// edit cannot update one and leave the other stale.
 ///
-/// The `skills/get` ROUTE lands in plan 125-02; this constant exists ahead of it
-/// deliberately, so that plan adds a classifier arm rather than re-opening this
-/// rustdoc-governed block to mint a second constant.
-// `dead_code` allow: the value has no in-crate reader until 125-02 adds
-// `InternalClientRequest::SkillsGet` and the matching ingress arm. Splitting the
-// mint across two waves would mean a second edit to the shared rustdoc above,
-// which is precisely the drift that single-sourcing exists to prevent.
-#[allow(dead_code)]
+/// The `skills/get` ROUTE landed in plan 125-02, which added the
+/// [`InternalClientRequest::SkillsGet`] arm below and the matching
+/// streamable-HTTP ingress. Minting the constant here a wave EARLY was deliberate:
+/// splitting the mint across two waves would have meant a second edit to the
+/// rustdoc this constant shares with [`SKILLS_LIST_METHOD`], which is exactly the
+/// drift single-sourcing exists to prevent. The `#[allow(dead_code)]` that carried
+/// it through that wave is gone now that it has a reader.
 pub(crate) const SKILLS_GET_METHOD: &str = "skills/get";
 
 /// Classify a raw JSON-RPC method string into a crate-private internal request,
@@ -921,7 +966,8 @@ pub(crate) const SKILLS_GET_METHOD: &str = "skills/get";
 /// Returns `Some(InternalClientRequest::ServerDiscover(..))` for the exact
 /// method string [`SERVER_DISCOVER_METHOD`], `Some(InternalClientRequest::TasksUpdate { .. })`
 /// for [`TASKS_UPDATE_METHOD`], `Some(InternalClientRequest::SkillsList { .. })`
-/// for [`SKILLS_LIST_METHOD`], and `None` for every other method (which then
+/// for [`SKILLS_LIST_METHOD`], `Some(InternalClientRequest::SkillsGet { .. })` for
+/// [`SKILLS_GET_METHOD`], and `None` for every other method (which then
 /// flows through the normal public-enum dispatch path). Plan 05 calls this from
 /// the server request path BEFORE the public-enum conversion. Consumed in
 /// production by [`parse_request_or_internal`](crate::shared::protocol_helpers)
@@ -953,6 +999,9 @@ pub(crate) fn classify_internal_method(
             params: params.clone(),
         }),
         SKILLS_LIST_METHOD => Some(InternalClientRequest::SkillsList {
+            params: params.clone(),
+        }),
+        SKILLS_GET_METHOD => Some(InternalClientRequest::SkillsGet {
             params: params.clone(),
         }),
         _ => None,
@@ -1217,10 +1266,60 @@ mod tests {
         assert!(classify_internal_method("skills/", &serde_json::json!({})).is_none());
         assert!(classify_internal_method("skills", &serde_json::json!({})).is_none());
 
-        // `skills/get` has no classifier arm YET — plan 125-02 adds it. Asserting
-        // the CURRENT state here means that plan's own test flips a documented
-        // fact rather than silently discovering one.
-        assert!(classify_internal_method(SKILLS_GET_METHOD, &serde_json::json!({})).is_none());
+        // `skills/get` is its OWN variant, never absorbed into this one. Plan
+        // 125-02 flipped the previous assertion here (which pinned the absent arm)
+        // into the sibling test below, so the change was to a documented fact
+        // rather than a silent discovery.
+        assert!(matches!(
+            classify_internal_method(SKILLS_GET_METHOD, &serde_json::json!({})),
+            Some(InternalClientRequest::SkillsGet { .. })
+        ));
+    }
+
+    /// `skills/get` classifies as its own internal variant and carries its params
+    /// VERBATIM (Phase 125, plan 02, D-06).
+    ///
+    /// **This is the one where the raw-params property has teeth.** `skills/get`
+    /// is the first method in this phase that READS its params, so a classifier
+    /// that deserialized `{ uri: String }` here would reject a malformed body
+    /// BEFORE the header and auth pipeline — handing an unauthenticated caller a
+    /// `-32602` instead of the authentication refusal (T-125-07). The garbage
+    /// fixture below is deliberately not a well-formed `skills/get` payload; it
+    /// must classify anyway.
+    ///
+    /// The wire-level half of the same property is
+    /// `skills_get_auth_refusal_precedes_the_params_error` in
+    /// `tests/skills_routing.rs`. This test proves the classifier is body-blind;
+    /// that one proves the ORDERING that body-blindness buys.
+    #[test]
+    fn classify_internal_method_routes_skills_get_with_raw_params() {
+        let garbage = serde_json::json!({ "uri": 17, "wat": [1, 2, 3] });
+        match classify_internal_method(SKILLS_GET_METHOD, &garbage) {
+            Some(InternalClientRequest::SkillsGet { params }) => {
+                assert_eq!(params, garbage, "params must pass through undecoded");
+            },
+            other => panic!("skills/get must classify as SkillsGet, got {other:?}"),
+        }
+
+        // A NON-OBJECT params value passes through untouched — the classifier does
+        // not even require an object, let alone the right keys.
+        let scalar = serde_json::json!("not-an-object");
+        match classify_internal_method(SKILLS_GET_METHOD, &scalar) {
+            Some(InternalClientRequest::SkillsGet { params }) => assert_eq!(params, scalar),
+            other => panic!("a non-object params body must still classify, got {other:?}"),
+        }
+
+        // `Value::Null` (a frame with no params at all) is still classified.
+        assert!(matches!(
+            classify_internal_method(SKILLS_GET_METHOD, &serde_json::Value::Null),
+            Some(InternalClientRequest::SkillsGet { .. })
+        ));
+
+        // Near-miss method names are NOT matched — the control that keeps this
+        // from passing against a prefix match.
+        assert!(classify_internal_method("skills/gets", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills/get/", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skill/get", &serde_json::json!({})).is_none());
     }
 
     /// The two SEP-2640 method spellings, pinned to their wire values.

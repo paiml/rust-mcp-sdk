@@ -1736,6 +1736,61 @@ impl Server {
         crate::server::core::build_skills_list_response(id, skills, &self.info, protocol_context)
     }
 
+    /// Handle the SEP-2640 `skills/get` request (Phase 125 plan 02, D-06/D-07).
+    ///
+    /// The production `skills/get` caller, and a THIN delegate exactly like
+    /// [`handle_skills_list`](Self::handle_skills_list) beside it: the
+    /// streamable-HTTP transport classifies a `skills/get` POST as
+    /// `HttpIngress::SkillsGet` and, at the per-path response-assembly step, calls
+    /// this. **It defines no gate of its own — every gate lives in the shared
+    /// projection.** In particular the `uri` is NOT read here: the params travel
+    /// raw all the way into
+    /// [`build_skills_get_response`](crate::server::core::build_skills_get_response),
+    /// which is what keeps the `-32602` behind the header and auth pipeline
+    /// (T-125-07).
+    ///
+    /// # Why the entries are serialized into a fresh map per request
+    ///
+    /// The same feature-gating reason [`handle_skills_list`](Self::handle_skills_list)
+    /// records: `SkillEntry` exists only under `feature = "skills"` while the
+    /// classifier that routes the method is ungated, so handing `core.rs` an
+    /// already-serialized map keeps the shared projection feature-agnostic and
+    /// gives a featureless build the honest answer — an empty catalog in which
+    /// every URI is a `-32602` miss — rather than a second lookup implementation
+    /// behind a `cfg`. The per-request cost is one serialization per registered
+    /// skill, identical in shape to the sibling listing path, and skills registries
+    /// are bounded by the SEP's own ≤512-file limit.
+    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
+    pub(crate) fn handle_skills_get(
+        &self,
+        id: RequestId,
+        params: &Value,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> JSONRPCResponse {
+        #[cfg(feature = "skills")]
+        let entries: indexmap::IndexMap<String, Value> = self
+            .skill_entries
+            .iter()
+            .map(|(uri, entry)| {
+                (
+                    uri.clone(),
+                    serde_json::to_value(entry)
+                        .expect("SkillEntry is String/Value/Vec only — serialization cannot fail"),
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "skills"))]
+        let entries: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+
+        crate::server::core::build_skills_get_response(
+            id,
+            &entries,
+            params,
+            &self.info,
+            protocol_context,
+        )
+    }
+
     /// Handle the v2 `tasks/update` request (Phase 114 plan 13, TASK-02).
     ///
     /// The production `tasks/update` caller, and a THIN delegate exactly like
