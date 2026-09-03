@@ -130,10 +130,16 @@ D-04a (01, 05, 07) · D-05 (all) · D-06 (all) · D-07 (04, 07) · D-08 (04) · 
 · D-11 (01, 02, 06, 07) · D-12 (02, 06) · D-13 (01, 02, 03, 06) · D-14 (01, 02, 06, 07) · D-15 (01,
 02, 04, 06, 07) · D-15a (01) · D-16 (07) · D-16a (07).
 
-> **Do not read `gsd-tools query check.decision-coverage-plan` as the authority here.** That verb
-> returns `covered: 0` for this project even on shipped phases whose plans cite D-NN throughout
-> (measured on Phase 123 and Phase 125) — a pre-existing gate defect recorded in project memory,
-> not a signal about these plans. The enumeration above is the manual extraction.
+> **CORRECTED 2026-09-03 (replan): the decision-coverage verb is NOT defective — the earlier
+> `covered: 0` readings were a CALLER error.** `check.decision-coverage-plan` takes TWO POSITIONAL
+> arguments, `PHASE_DIR` then `CONTEXT_PATH` (see `workflows/plan-phase.md:1361`). Invoked with only
+> a context path it reports `total: 17, covered: 0` because it scanned no plan directory — and its
+> own message says so. Invoked correctly it returns **`passed: true, total: 17, covered: 17`** for
+> this phase, measured this session:
+> `gsd_run query check.decision-coverage-plan "$PHASE_DIR" "$PHASE_DIR/126-CONTEXT.md"`.
+> The manual enumeration above stands as documentation, but the gate is a working oracle and should
+> be trusted over prose. Anyone re-testing the Phase 123 / 125 claim should re-run it with both
+> positional arguments before repeating "pre-existing gate defect".
 
 **Spec-less probe fallback: SKIPPED, recorded visibly.** There is no `126-SPEC.md`, so
 `## Edge Coverage` and `## Prohibitions` were both absent; the fallback derives predicates from
@@ -166,7 +172,7 @@ Plans:
 
 **Wave 1**
 
-- [ ] 126-01-PLAN.md — D-03 module split (alone, first) + TRACER: one trivial workflow projects, registers, and reads back byte-identical *(carries the D-02 one-way decision gate on `as_skill() -> Skill`)*
+- [ ] 126-01-PLAN.md — D-03 module split (alone, first) + TRACER: one trivial workflow projects, registers, and reads back byte-identical, with **safely encoded YAML frontmatter** and its round-trip proof *(carries the phase's two one-way decision gates: `build()`'s return shape, and builder-level reachability of the D-04a opt-in)*
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -175,8 +181,8 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 126-04-PLAN.md — `SkillProjection` builder, public `ProjectionWarning`, and the SC-6 gate warning with both D-10 delivery channels
-- [ ] 126-05-PLAN.md — D-04a opt-in prompt prepend on **both** handler kinds, with transcript tests placed where `make test-skills` can reach them
+- [ ] 126-04-PLAN.md — `SkillProjection` builder, public `ProjectionWarning`, and the SC-6 gate warning *(records the D-02 return-shape deviation and the D-10 narrowing: SC-6 warnings have ONE delivery channel, `build()`'s structured return)*
+- [ ] 126-05-PLAN.md — D-04a opt-in prompt prepend on **both** handler kinds (rendered once, validation preserved), builder-level reachability, and transcript tests placed where `make test-skills` can reach them
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -184,7 +190,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 126-07-PLAN.md — `s56_workflow_skill_projection` example (asserts, not prints) + the full gate and the three verifications it structurally cannot run
+- [ ] 126-07-PLAN.md — `s56_workflow_skill_projection` example (asserts, not prints) + `deferred-items.md` + the full gate and the three verifications it structurally cannot run
 
 **Success Criteria** (what must be TRUE):
 
