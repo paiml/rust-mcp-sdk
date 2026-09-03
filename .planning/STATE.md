@@ -2,20 +2,20 @@
 gsd_state_version: 1.0
 milestone: v2.7
 milestone_name: SEP-2640 Skills Conformance & Positioning (Phase 125+)
-current_phase: 125
-current_phase_name: SEP-2640 Conformance — skills/list + skills/get
+current_phase: 126
+current_phase_name: "Workflow to skill projection — `SequentialWorkflow::as_skill()`"
 status: In progress — phase 125 complete; phase 126 added, not yet planned
 stopped_at: Phase 126 context gathered
-last_updated: "2026-09-03T01:00:50.527Z"
+last_updated: "2026-09-03T05:09:25.923Z"
 last_activity: 2026-09-02
 last_activity_desc: Milestone v2.6 archived; milestone pointer moved to v2.7 (phase 125 already complete)
-state_head: da6f11e747085d0604d1fd679edf3ae7526bcaa7
+state_head: 291bb70e00e4c0e1bf1e9449402fd7c60639906a
 progress:
   total_phases: 2
   completed_phases: 1
-  total_plans: 5
+  total_plans: 12
   completed_plans: 5
-  percent: 50
+  percent: 42
 ---
 
 # Project State
@@ -33,7 +33,7 @@ See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 clo
 
 ## Current Position
 
-Phase: 125 — SEP-2640 Conformance (skills/list + skills/get) — **COMPLETE**
+Phase: 126 (Workflow to skill projection — `SequentialWorkflow::as_skill()`) — READY TO EXECUTE
 Plan: 5 of 5 complete
 Status: v2.6 archived. v2.7 active — phase 125 COMPLETE, phase 126 added and awaiting `/gsd-plan-phase 126`.
 Last activity: 2026-09-02 — v2.6 completed and archived; milestone pointer moved v2.6 → v2.7
