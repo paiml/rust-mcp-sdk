@@ -117,8 +117,29 @@ INTO). Grounded in spike 009 (`.planning/spikes/`, VALIDATED) and
 `.claude/skills/spike-findings-rust-mcp-sdk/references/skills-positioning-tri-surface.md`
 (implementation-order item 23).
 
-**Requirements**: TBD — v2.7 has no REQUIREMENTS.md yet (`/gsd-new-milestone` writes one). Until
-then the tracked requirement set is the MANIFEST bullets quoted in the tri-surface reference.
+**Requirements**: No formal REQ-IDs — v2.7 has no REQUIREMENTS.md (`/gsd-new-milestone` writes one),
+and the underlying requirement source is the MANIFEST bullets quoted in the tri-surface reference.
+**The tracked requirement set for planning and verification is the six Success Criteria below,
+carried as `SC-1`..`SC-6` in each plan's `requirements:` frontmatter**, plus the `126-CONTEXT.md`
+decisions `D-01`..`D-16` with the three amendments `D-04a` / `D-15a` / `D-16a`.
+
+Coverage as planned (verified by extracting the gate-scanned regions from each PLAN and matching
+citations): SC-1 (01, 04, 07) · SC-2 (02, 05, 06, 07) · SC-3 (02, 06, 07) · SC-4 (01, 03, 07) ·
+SC-5 (02, 05, 07) · SC-6 (04, 07). D-01 (01, 04) · D-02 (01, 04) · D-03 (01) · D-04 (01, 05, 07) ·
+D-04a (01, 05, 07) · D-05 (all) · D-06 (all) · D-07 (04, 07) · D-08 (04) · D-09 (04) · D-10 (04, 06)
+· D-11 (01, 02, 06, 07) · D-12 (02, 06) · D-13 (01, 02, 03, 06) · D-14 (01, 02, 06, 07) · D-15 (01,
+02, 04, 06, 07) · D-15a (01) · D-16 (07) · D-16a (07).
+
+> **Do not read `gsd-tools query check.decision-coverage-plan` as the authority here.** That verb
+> returns `covered: 0` for this project even on shipped phases whose plans cite D-NN throughout
+> (measured on Phase 123 and Phase 125) — a pre-existing gate defect recorded in project memory,
+> not a signal about these plans. The enumeration above is the manual extraction.
+
+**Spec-less probe fallback: SKIPPED, recorded visibly.** There is no `126-SPEC.md`, so
+`## Edge Coverage` and `## Prohibitions` were both absent; the fallback derives predicates from
+requirement TEXT, and this phase has no requirement IDs to derive from. **No probe-derived
+predicates were generated.** The SC set above and `126-VALIDATION.md`'s Per-Task Verification Map
+are the edge set instead.
 
 **Why this is a projection and not a rival feature.** Spike 011 measured the positioning as
 *alongside, composing — never instead*: same tools and same data, the ineligible order got refunded
@@ -139,11 +160,31 @@ Constant}`:
 - "Judgment:" lines ← `with_guidance` text
 - Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
 
-**Plans:** 0 plans
+**Plans:** 7 plans across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
 
 Plans:
 
-- [ ] TBD (run /gsd-plan-phase 126 to break down)
+**Wave 1**
+
+- [ ] 126-01-PLAN.md — D-03 module split (alone, first) + TRACER: one trivial workflow projects, registers, and reads back byte-identical *(carries the D-02 one-way decision gate on `as_skill() -> Skill`)*
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 126-02-PLAN.md — Full render breadth (Context / Inputs / per-step detail, sorted template bindings) + the SC-2 / SC-3 / SC-5 unit and property suite
+- [ ] 126-03-PLAN.md — SC-4 on the wire (conforming `skills/list` entry + byte-identical `resources/read`) + the ALWAYS/FUZZ target, its `[[bin]]` stanza, CI matrix row and registration tripwire
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 126-04-PLAN.md — `SkillProjection` builder, public `ProjectionWarning`, and the SC-6 gate warning with both D-10 delivery channels
+- [ ] 126-05-PLAN.md — D-04a opt-in prompt prepend on **both** handler kinds, with transcript tests placed where `make test-skills` can reach them
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 126-06-PLAN.md — The D-14 golden + its CHANGELOG-forcing failure message, the module documentation contract, and both doctest legs
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 126-07-PLAN.md — `s56_workflow_skill_projection` example (asserts, not prints) + the full gate and the three verifications it structurally cannot run
 
 **Success Criteria** (what must be TRUE):
 
@@ -172,7 +213,7 @@ Plans:
 | Phase | Requirements | Plans Complete | Status | Completed |
 |-------|--------------|----------------|--------|-----------|
 | 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
-| 126. Workflow→skill projection (`as_skill()`) | TBD (spike 009) | 0/? | Planned | - |
+| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 0/7 | Planned | - |
 
 **Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
 (`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
