@@ -255,15 +255,46 @@ fn fallback_slug(original_name: &str) -> String {
     format!("workflow-{hex}")
 }
 
+/// `true` for the two Unicode line separators that are NOT Unicode `Cc`.
+///
+/// `char::is_control()` is exactly the `Cc` category (`U+0000..=U+001F`,
+/// `U+007F..=U+009F`), so a bare `is_control()` test does NOT reach LINE
+/// SEPARATOR (`U+2028`, category `Zl`) or PARAGRAPH SEPARATOR (`U+2029`,
+/// category `Zp`). Both are nevertheless line terminators to the consumers
+/// this module hands text to — YAML 1.1's scanner and line-oriented log
+/// processors alike — so every site here that reasons about "characters that
+/// can end a line" must test this IN ADDITION to `is_control()`.
+///
+/// Extracted so the encoder ([`yaml_double_quoted`]) and the log sanitizer
+/// ([`sanitize_for_log`]) cannot drift apart on the classification again; they
+/// share the predicate and differ only in what they substitute (CR-01, WR-06).
+const fn is_unicode_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// Replace every control character with `U+FFFD` before the value reaches a
 /// `tracing` field (T-126-01).
 ///
 /// A workflow name is author-supplied and reaches a log sink; an embedded
 /// newline or terminal escape could forge a second log record. Follows Phase
 /// 125's WR-04 mitigation at `src/server/core.rs:2563`.
+///
+/// `U+2028`/`U+2029` are replaced alongside the `Cc` set even though the
+/// substitution differs from [`yaml_double_quoted`]'s: the risk is the same
+/// forged-record one, because several log processors and JS-based log viewers
+/// treat LS/PS as record terminators. A log field has no escape vocabulary to
+/// preserve the character with — it is display text, not a re-parsable scalar —
+/// so lossy replacement is the right disposition here where escaping is the
+/// right one there (WR-06).
 fn sanitize_for_log(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(|c| {
+            if c.is_control() || is_unicode_line_separator(c) {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -294,6 +325,33 @@ fn yaml_double_quoted(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // YAML 1.1 — which is what `serde_yaml 0.9` speaks, through
+            // `unsafe-libyaml`'s `IS_BREAK_AT!` — counts FIVE characters as
+            // line breaks: `\r`, `\n`, `U+0085`, `U+2028` and `U+2029`. Only
+            // the first three are Unicode `Cc`, so the `is_control()` arm below
+            // never reaches the last two (see `is_unicode_line_separator`).
+            // Emitted raw they either fold the blanks adjacent to them out of
+            // the value, or — when the text after them begins `---`/`...` —
+            // fail the parse outright, which the registry DOWNGRADES to a
+            // diagnostic and then silently drops the skill from `skills/list`
+            // while `into_handler()` still returns `Ok` (CR-01). That is the
+            // exact class the module header claims to have removed.
+            //
+            // `\uNNNN` rather than YAML 1.1's dedicated `\L`/`\P`: MEASURED
+            // against this workspace's resolved `serde_yaml 0.9.34+deprecated`
+            // / `unsafe-libyaml 0.2.11` pair, all four spellings round-trip, so
+            // the choice is about the OTHER readers of these bytes — a SKILL.md
+            // frontmatter block is a published artifact (D-14) that third-party
+            // hosts parse with their own YAML implementations, and `\uNNNN` is
+            // accepted by every mainstream one while `\L`/`\P` are rare.
+            //
+            // NOT `\xNN`, which is the trap this fix has to step around:
+            // libyaml's `\x` consumes EXACTLY two hex digits, so `\x2028`
+            // decodes as `U+0020` followed by the LITERAL text `28` (measured).
+            // The `\xNN` arm below is sound only because `Cc`'s maximum scalar
+            // is `U+009F` and two digits therefore always suffice there.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             // Every remaining C0/C1 control as `\xNN`. `char::is_control()` is
             // the Unicode `Cc` category, whose maximum scalar is `U+009F`, so
             // two lowercase hex digits always suffice.
@@ -1255,6 +1313,46 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::OnceLock;
 
+    /// The characters `yaml_double_quoted` treats specially, plus the blank
+    /// whose interaction with them is the corruption half of CR-01.
+    ///
+    /// `' '` earns its place here rather than being left to chance: a raw
+    /// `U+2028` only loses data when a blank is ADJACENT to it, so a generator
+    /// that samples the separator but never a neighbouring space cannot
+    /// observe failure mode 2.
+    const ENCODER_SIGNIFICANT_CHARS: &[char] = &[
+        '\\', '"', '\n', '\r', '\t', '\u{0}', '\u{7f}', '\u{85}', '\u{2028}', '\u{2029}', ' ', '-',
+        '.', ':', '#',
+    ];
+
+    /// Text that can actually REACH the escape classes `yaml_double_quoted`
+    /// exists for (WR-02).
+    ///
+    /// The three properties below previously drew from `".*"`. `.` in
+    /// `regex-syntax` — which proptest compiles with default flags, so no
+    /// `dot_matches_new_line` — is `[^\n]`, so that generator can NEVER produce
+    /// `\n`, the single character the newline-injection defence rests on. It
+    /// reaches `U+2028` only with probability ~1e-6 per character, i.e. never
+    /// within a default 256-case run. That blindness is why CR-01 survived
+    /// every guard the phase built.
+    ///
+    /// This strategy interleaves uniform draws from
+    /// [`ENCODER_SIGNIFICANT_CHARS`] with `proptest`'s arbitrary `char`, so
+    /// each escape class is sampled a constant fraction of the time and
+    /// adjacent pairs (`<LS>` next to a blank; `<LS>` before `---`) occur
+    /// within a normal run. The arbitrary half is kept so the property still
+    /// covers the pass-through path and arbitrary non-ASCII.
+    fn encoder_stressing_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                3 => proptest::sample::select(ENCODER_SIGNIFICANT_CHARS),
+                2 => proptest::char::any(),
+            ],
+            0..24usize,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
     /// A `crate::types::ToolInfo` carrying annotations.
     ///
     /// `ToolAnnotations` and `ToolInfo` are both `#[non_exhaustive]`, so they
@@ -1443,6 +1541,47 @@ mod tests {
         assert_eq!(sanitize_for_log("plain"), "plain");
     }
 
+    /// WR-06: the two non-`Cc` line separators are forged-record vectors too.
+    #[test]
+    fn sanitize_for_log_replaces_the_unicode_line_separators() {
+        assert_eq!(sanitize_for_log("a\u{2028}b"), "a\u{fffd}b");
+        assert_eq!(sanitize_for_log("a\u{2029}b"), "a\u{fffd}b");
+        // Neither is Unicode `Cc`, which is why `is_control()` alone missed
+        // them — assert the premise so this test cannot pass for a stale
+        // reason if `char::is_control` ever widens.
+        assert!(!'\u{2028}'.is_control());
+        assert!(!'\u{2029}'.is_control());
+    }
+
+    /// CR-01/WR-06: the encoder and the log sanitizer classify the same set.
+    ///
+    /// They substitute DIFFERENT things — an escape versus `U+FFFD` — but a
+    /// character either can terminate a line for a downstream consumer or it
+    /// cannot, and that judgement must be made in exactly one place.
+    #[test]
+    fn the_encoder_and_the_log_sanitizer_agree_on_the_line_separators() {
+        for c in ['\u{2028}', '\u{2029}'] {
+            assert!(
+                is_unicode_line_separator(c),
+                "{c:?} must be classified as a line separator"
+            );
+            assert_eq!(
+                sanitize_for_log(&c.to_string()),
+                "\u{fffd}",
+                "the log sanitizer must replace {c:?}"
+            );
+            assert!(
+                !yaml_double_quoted(&c.to_string()).contains(c),
+                "the encoder must not emit {c:?} verbatim"
+            );
+        }
+        // Anti-vacuity: an ordinary character is classified by NEITHER, so the
+        // three assertions above are not trivially true of every input.
+        assert!(!is_unicode_line_separator('a'));
+        assert_eq!(sanitize_for_log("a"), "a");
+        assert!(yaml_double_quoted("a").contains('a'));
+    }
+
     // ── SC-1: identity ────────────────────────────────────────────────
 
     #[test]
@@ -1560,6 +1699,31 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_survives_a_line_separator_before_a_document_indicator() {
+        // CR-01, failure mode 1: raw, libyaml scans the LS as a line break and
+        // then reads `--- ` at column 1 of the next line as a document
+        // indicator, failing the parse. `FrontmatterParse::Invalid` is
+        // DOWNGRADED to a diagnostic, so the skill vanishes from `skills/list`
+        // with a successful `into_handler()`.
+        assert_description_roundtrips("a\u{2028}--- b");
+        assert_description_roundtrips("a\u{2029}--- b");
+        // `...` is the other document indicator libyaml recognises.
+        assert_description_roundtrips("a\u{2028}... b");
+        assert_description_roundtrips("a\u{2029}... b");
+    }
+
+    #[test]
+    fn frontmatter_survives_a_line_separator_adjacent_to_blanks() {
+        // CR-01, failure mode 2: raw, the blanks on either side of the break
+        // fold away and the published `frontmatter.description` silently
+        // diverges from `Skill::resolved_description()`.
+        assert_description_roundtrips("a\u{2028}   b");
+        assert_description_roundtrips("a   \u{2028}b");
+        assert_description_roundtrips("a\u{2029}   b");
+        assert_description_roundtrips("a   \u{2029}b");
+    }
+
+    #[test]
     fn frontmatter_survives_a_yaml_boolean_alike_description() {
         assert_description_roundtrips("yes");
     }
@@ -1624,6 +1788,11 @@ mod tests {
         assert_eq!(yaml_double_quoted("a\tb"), "\"a\\tb\"");
         assert_eq!(yaml_double_quoted("a\u{0}b"), "\"a\\x00b\"");
         assert_eq!(yaml_double_quoted("a\u{7f}b"), "\"a\\x7fb\"");
+        // CR-01: the two YAML 1.1 line breaks that are not Unicode `Cc`. The
+        // spelling is `\uNNNN`, never `\xNN` — libyaml's `\x` takes exactly two
+        // hex digits, so `\x2028` would decode as a space plus the text `28`.
+        assert_eq!(yaml_double_quoted("a\u{2028}b"), "\"a\\u2028b\"");
+        assert_eq!(yaml_double_quoted("a\u{2029}b"), "\"a\\u2029b\"");
         // Non-ASCII is carried verbatim — a double-quoted YAML scalar is UTF-8.
         assert_eq!(yaml_double_quoted("héllo — 日本"), "\"héllo — 日本\"");
     }
@@ -2243,8 +2412,12 @@ mod tests {
         /// arbitrary workflow name, the result is an agentskills-legal skill
         /// name — 1..=64 characters drawn from `[a-z0-9-]`, with no leading or
         /// trailing hyphen and no `--`.
+        ///
+        /// Drawn from [`encoder_stressing_text`], not `".*"`: the latter
+        /// cannot produce `\n` at all and reaches `U+2028` only by accident
+        /// (WR-02).
         #[test]
-        fn prop_sc1_slug_is_agentskills_legal(name in ".*") {
+        fn prop_sc1_slug_is_agentskills_legal(name in encoder_stressing_text()) {
             let skill = SequentialWorkflow::new(name.as_str(), "Process a refund").as_skill();
             let slug = skill.name();
             prop_assert!(!slug.is_empty(), "slug was empty for name {:?}", name);
@@ -2283,11 +2456,16 @@ mod tests {
         /// D-15: nothing panics. Arbitrary text reaches the name, the
         /// description, an argument description, an instruction and a step's
         /// guidance — every author-supplied string the renderer touches.
+        ///
+        /// "Arbitrary" is honoured by [`encoder_stressing_text`], which mixes
+        /// `proptest::char::any()` with deliberate draws from the escape
+        /// classes. The previous `".*"` generator made the word false: it can
+        /// never emit `\n` (WR-02).
         #[test]
         fn prop_no_panic_on_arbitrary_text(
-            name in ".*",
-            description in ".*",
-            guidance in ".*",
+            name in encoder_stressing_text(),
+            description in encoder_stressing_text(),
+            guidance in encoder_stressing_text(),
         ) {
             let wf = SequentialWorkflow::new(name.as_str(), description.as_str())
                 .argument("arg", description.as_str(), true)
@@ -2406,11 +2584,67 @@ mod tests {
         assert_eq!(rendered, declared);
     }
 
+    /// WR-02, made checkable: the generator REACHES the characters it claims.
+    ///
+    /// A widened generator that quietly narrows again would leave the three
+    /// properties above passing while measuring nothing — the failure shape
+    /// this repository has recorded before. Drawing from the strategy directly
+    /// and asserting the escape classes appear turns "can sample" from a
+    /// comment into a test. `\n` is the character the old `".*"` could never
+    /// produce; `U+2028`/`U+2029` are the ones it reached at ~1e-6.
+    #[test]
+    fn the_stressing_generator_reaches_every_escape_class() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let strategy = encoder_stressing_text();
+        let mut runner = TestRunner::new(Config::default());
+        let mut corpus = String::new();
+        for _ in 0..512 {
+            corpus.push_str(
+                &strategy
+                    .new_tree(&mut runner)
+                    .expect("the strategy must produce a value")
+                    .current(),
+            );
+        }
+
+        for (label, needle) in [
+            ("a newline", '\n'),
+            ("LINE SEPARATOR", '\u{2028}'),
+            ("PARAGRAPH SEPARATOR", '\u{2029}'),
+            ("a backslash", '\\'),
+            ("a double quote", '"'),
+            ("a blank", ' '),
+        ] {
+            assert!(
+                corpus.contains(needle),
+                "the generator never produced {label} ({needle:?}) in 512 draws — \
+                 the properties drawing from it are measuring nothing"
+            );
+        }
+
+        // Anti-vacuity for the corpus itself: a strategy that returned one
+        // giant fixed string would satisfy every `contains` above.
+        assert!(
+            corpus.chars().filter(|c| !c.is_ascii()).count() > 0,
+            "the arbitrary half of the strategy produced no non-ASCII at all"
+        );
+    }
+
     // ── REVIEWS finding 1: the round-trip property ────────────────────
 
     proptest! {
+        /// The encoder is verified by the decoder the registry actually uses.
+        ///
+        /// Drawn from [`encoder_stressing_text`]. Under the previous `".*"`
+        /// generator this property was structurally incapable of finding
+        /// CR-01, and equally incapable of exercising the `'\n'` arm it was
+        /// written to protect (WR-02); `prop_frontmatter_roundtrips` was cited
+        /// in the module header as "a real check rather than a mirror of the
+        /// encoder's own assumptions", which it was not.
         #[test]
-        fn prop_frontmatter_roundtrips(description in ".*") {
+        fn prop_frontmatter_roundtrips(description in encoder_stressing_text()) {
             let wf = tracer_workflow("refund_flow", &description);
             let skill = wf.as_skill();
             let value = parsed_frontmatter(skill.body());

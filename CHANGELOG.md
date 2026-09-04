@@ -120,6 +120,38 @@ change at the call site:
   randomized per instance; the renderer sorts through a `BTreeMap` so the bytes
   are reproducible across processes and machines.
 
+### Fixed — `U+2028`/`U+2029` are now escaped in the projected frontmatter
+
+**This is a render change under the digest rule above.** The rendered bytes move
+for any workflow whose description or name contains LINE SEPARATOR (`U+2028`) or
+PARAGRAPH SEPARATOR (`U+2029`); a consumer that pinned such a skill's `sha256`
+must re-pin. `tests/golden/workflow_skill_projection.md` is unaffected — its
+fixture contains neither codepoint — so the golden did not move.
+
+The frontmatter encoder escaped `\\`, `"`, `\n`, `\r`, `\t` and then everything
+`char::is_control()` accepts. That predicate is exactly the Unicode `Cc`
+category, but the YAML the frontmatter is read back as is **YAML 1.1**, whose
+scanner counts *five* line breaks: `\r`, `\n`, `U+0085`, `U+2028` and `U+2029`.
+The last two are `Zl`/`Zp`, not `Cc`, so they were emitted raw, with two
+measured consequences:
+
+- **A skill could be silently dropped from `skills/list`.** When the text after
+  the separator began `--- ` or `... `, the parse failed on a document
+  indicator. That failure is *downgraded* to a diagnostic, so the frontmatter
+  became `None`, the name-identity check was skipped, and the server built and
+  served the `SKILL.md` over `resources/read` while the SEP-2640 discovery
+  surface silently omitted it.
+- **The published description could diverge from the served one.** Blanks
+  adjacent to the separator fold away, so `"a<LS>   b"` round-tripped as
+  `"a<LS>b"` — `frontmatter.description` no longer matched
+  `Skill::resolved_description()` or `SequentialWorkflow::description()`.
+
+Both are escaped as `\uNNNN`. Not `\xNN`: that escape consumes exactly two hex
+digits, so `\x2028` would decode as a space followed by the literal text `28`.
+`sanitize_for_log` shared the same `Cc`-only assumption and now replaces both
+with `U+FFFD` alongside the control characters, closing the same forged-log-record
+vector the function was added for.
+
 ## [2.19.3] - 2026-08-30
 
 **A carrier release, following the v2.19.2 and v2.19.1 precedent.** No `pmcp`
