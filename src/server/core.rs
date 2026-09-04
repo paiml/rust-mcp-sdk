@@ -2510,8 +2510,22 @@ pub(crate) fn build_skills_list_response(
     info: &Implementation,
     protocol_context: Option<&crate::types::protocol::ProtocolContext>,
 ) -> JSONRPCResponse {
-    let skills: Vec<&Value> = skills.values().collect();
-    let mut response = ServerCore::success_response(id, serde_json::json!({ "skills": skills }));
+    // Built as a `Map` rather than through `serde_json::json!`. The macro's
+    // object arm routes a non-literal value expression through
+    // `json_internal!($other:expr) => to_value(&$other).unwrap()`, so a
+    // `json!({ "skills": <expr> })` walks the whole catalog through the serde
+    // `Serializer` to rebuild a `Value` tree it is already holding — on top of a
+    // `Vec<&Value>` staging allocation that buys nothing. One clone per entry is
+    // unavoidable (`inject_v2_result_envelope` mutates the result in place); the
+    // serializer round-trip is not. Both `skills/*` call sites build their
+    // response while holding `state.server.lock()`, so the saved work is work
+    // that was serializing concurrent traffic.
+    let mut result = serde_json::Map::with_capacity(1);
+    result.insert(
+        "skills".to_string(),
+        Value::Array(skills.values().cloned().collect()),
+    );
+    let mut response = ServerCore::success_response(id, Value::Object(result));
     inject_v2_result_envelope(
         &mut response,
         protocol_context,
@@ -2671,8 +2685,14 @@ pub(crate) fn build_skills_get_response(
         );
     };
 
-    let mut response =
-        ServerCore::success_response(id, serde_json::json!({ "skill": entry.clone() }));
+    // Built as a `Map`, not via `serde_json::json!` — see the sibling
+    // `build_skills_list_response` for why. The saving is larger here: the macro
+    // would deep-COPY `entry` for the `&$other` borrow and then walk that copy
+    // through the `Serializer` to build a second fresh tree, discarding the
+    // first. The one clone below is the copy that is actually needed.
+    let mut result = serde_json::Map::with_capacity(1);
+    result.insert("skill".to_string(), entry.clone());
+    let mut response = ServerCore::success_response(id, Value::Object(result));
     inject_v2_result_envelope(
         &mut response,
         protocol_context,
