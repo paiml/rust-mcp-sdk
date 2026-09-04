@@ -42,7 +42,9 @@
 //! enforcing it. Encoding both values unconditionally removes the whole class.
 
 use crate::server::skills::Skill;
-use crate::server::workflow::{SequentialWorkflow, WorkflowStep};
+use crate::server::workflow::{DataSource, PromptContent, SequentialWorkflow, WorkflowStep};
+use crate::types::PromptArgumentType;
+use std::collections::BTreeMap;
 
 /// A condition the infallible projection path resolved on the author's behalf.
 ///
@@ -200,19 +202,205 @@ fn render_frontmatter(slug: &str, description: &str) -> String {
     )
 }
 
+/// Render one instruction's content as manual-runner prose.
+///
+/// Every arm emits either author text verbatim or a CONSTANT-shaped line —
+/// never `{:?}`. [`PromptContent`] is `#[non_exhaustive]`, so a future upstream
+/// variant lands on the catch-all; that arm emits one stable literal precisely
+/// so the addition cannot silently change the rendered bytes and invalidate
+/// every published `sha256` (D-14).
+///
+/// The `Image` arm names the MIME type and NOTHING else: the base64 `data` is
+/// unbounded, would blow the SEP-2640 16 MiB per-skill limit, and would put
+/// megabytes into a digest (T-126-03). The `ToolHandle` arm renders the tool
+/// NAME only — no schema, no description (D-12), because the client has
+/// `tools/list` one call away and a digested copy could only drift from it.
+fn render_prompt_content(content: &PromptContent) -> String {
+    match content {
+        PromptContent::Text(text) => text.clone(),
+        PromptContent::Image { mime_type, .. } => format!("(image content: {mime_type})"),
+        PromptContent::ResourceUri(uri) => format!("Read the resource `{uri}`."),
+        PromptContent::ResourceHandle(handle) => {
+            format!("Read the resource `{}`.", handle.uri())
+        },
+        PromptContent::ToolHandle(handle) => format!("Uses tool `{}`.", handle.name()),
+        // Joined with a blank line, matching what `PromptContent::to_protocol`
+        // already does at the wire edge (`conversion.rs:97-106`).
+        PromptContent::Multi(parts) => parts
+            .iter()
+            .map(|part| render_prompt_content(part))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        // Why: `PromptContent` is `#[non_exhaustive]`. Within this crate the
+        // match above is exhaustive today, so the arm reads as unreachable —
+        // but it is the D-14 tripwire that keeps a future variant from
+        // reaching a `{:?}` fallback and silently moving the digest.
+        #[allow(unreachable_patterns)]
+        _ => "(unsupported instruction content)".to_string(),
+    }
+}
+
+/// Render the `## Context` section from the workflow's instruction messages.
+///
+/// Emitted only when there are instructions — an empty heading is noise in a
+/// document whose bytes are a published digest. Each message is prefixed with
+/// its [`Role`](crate::types::Role) rendered through that type's `Display` impl
+/// (`src/types/content.rs:816-822`), never `Debug`.
+fn render_context(wf: &SequentialWorkflow) -> String {
+    if wf.instructions().is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Context\n\n");
+    for message in wf.instructions() {
+        out.push_str(&format!(
+            "{}: {}\n\n",
+            message.role,
+            render_prompt_content(&message.content)
+        ));
+    }
+    out
+}
+
+/// The lowercase wire spelling of a prompt-argument type hint.
+///
+/// [`PromptArgumentType`] derives `Debug` but has **no `Display` impl**, so the
+/// reflex formatter for it is `{:?}` — which would put the capitalised variant
+/// spelling into a digested body, the exact hazard D-14 forbids. This explicit
+/// match emits the type's own `#[serde(rename_all = "lowercase")]` wire
+/// spelling instead. The enum is not `#[non_exhaustive]`, so the match is
+/// exhaustive with no catch-all: if a variant is added, the compiler points
+/// here, which is the desired failure mode.
+fn prompt_argument_type_name(arg_type: PromptArgumentType) -> &'static str {
+    match arg_type {
+        PromptArgumentType::String => "string",
+        PromptArgumentType::Number => "number",
+        PromptArgumentType::Integer => "integer",
+        PromptArgumentType::Boolean => "boolean",
+    }
+}
+
+/// Render the `## Inputs` section from the workflow's argument specs.
+///
+/// Emitted only when there are arguments. One bullet per entry of the
+/// `IndexMap`, in insertion order — already deterministic, as
+/// `sequential.rs:27-28` states in-source.
+///
+/// Each bullet carries the argument name, the literal word `required` or
+/// `optional`, the type hint when `ArgumentSpec::arg_type` is `Some`, and the
+/// description. Rendering the type hint is a deliberate choice: CONTEXT.md left
+/// "`typed_argument` schema information" to discretion, and the field is public,
+/// so it costs nothing and tells a manual runner what shape of value to supply.
+fn render_inputs(wf: &SequentialWorkflow) -> String {
+    if wf.arguments().is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Inputs\n\n");
+    for (name, spec) in wf.arguments() {
+        let requiredness = if spec.required {
+            "required"
+        } else {
+            "optional"
+        };
+        let type_note = match spec.arg_type {
+            Some(arg_type) => format!(", type `{}`", prompt_argument_type_name(arg_type)),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "- `{name}` ({requiredness}{type_note}): {}\n",
+            spec.description
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Render where one step argument gets its value from.
+///
+/// [`DataSource`] is `#[non_exhaustive]`, so the catch-all arm emits one stable
+/// literal rather than `{:?}` — same D-14 reasoning as
+/// [`render_prompt_content`].
+///
+/// # Constant key order is digest-significant
+///
+/// `Constant` renders through `serde_json::to_string` — compact and
+/// single-line, because multi-line pretty JSON inside a markdown bullet is a
+/// readability and diff hazard. This crate builds `serde_json` with
+/// `preserve_order` (`Cargo.toml:119`), so object keys emit in **construction
+/// order**. That is deterministic for a given workflow, which is what SC-2
+/// requires, but it is NOT canonical: reordering the keys of a `json!` literal
+/// in a workflow definition changes the rendered body and therefore the
+/// published `sha256`, so it is a CHANGELOG-worthy change under D-14 exactly
+/// like a render change.
+///
+/// The keys are deliberately NOT sorted here. The rendered constant is
+/// documentation of what the workflow will actually SEND, and because
+/// `preserve_order` is on, the sent JSON is in construction order too — a
+/// sorted render would make the manual procedure disagree with the call it
+/// describes. `constant_key_order_is_digest_significant` pins the difference so
+/// this stays a decision rather than an accident.
+fn render_data_source(source: &DataSource) -> String {
+    match source {
+        DataSource::PromptArg(name) => format!("the `{name}` input"),
+        DataSource::StepOutput { step, field: None } => format!("the result of `{step}`"),
+        DataSource::StepOutput {
+            step,
+            field: Some(field),
+        } => format!("the `{field}` field of the result of `{step}`"),
+        DataSource::Constant(value) => serde_json::to_string(value).map_or_else(
+            |_| "an unrenderable constant value".to_string(),
+            |json| format!("the constant value `{json}`"),
+        ),
+        // Why: `DataSource` is `#[non_exhaustive]` — see `render_prompt_content`.
+        #[allow(unreachable_patterns)]
+        _ => "an unsupported data source".to_string(),
+    }
+}
+
 /// Render one step as a `### Step {n}: {name}` section.
 ///
-/// `index` is 1-based. A resource-only step carries no tool line; breadth
-/// beyond the tool and the binding (arguments, guidance, resources, template
-/// bindings) is deliberately absent here and is filled by a later plan — this
-/// is a functionality gap, not an architectural one.
+/// `index` is 1-based. A resource-only step carries no tool line (D-11 renders
+/// every fact a manual runner needs, and a step with no tool has none to name).
+///
+/// # The one determinism landmine in the whole input surface
+///
+/// [`WorkflowStep::template_bindings`] returns a `&HashMap`, and Rust's
+/// `HashMap` iteration order is randomized per instance. Every other accessor
+/// this renderer reads — `wf.arguments()`, `step.arguments()`, `wf.steps()`,
+/// `wf.instructions()`, `step.resources()` — is an `IndexMap` or a slice and is
+/// already ordered. The bindings are therefore collected into a [`BTreeMap`]
+/// before iterating. Byte order via `String`'s `Ord` is the right key precisely
+/// because it is locale-independent: a locale-aware collation would break
+/// byte-equality across machines, which is SC-2.
 fn render_step(index: usize, step: &WorkflowStep) -> String {
     let mut out = format!("### Step {index}: {}\n", step.name());
     if let Some(tool) = step.tool() {
         out.push_str(&format!("Call tool `{}`.\n", tool.name()));
     }
+    for (name, source) in step.arguments() {
+        out.push_str(&format!(
+            "- Argument `{name}`: {}\n",
+            render_data_source(source)
+        ));
+    }
+    let template_bindings: BTreeMap<&str, &DataSource> = step
+        .template_bindings()
+        .iter()
+        .map(|(name, source)| (name.as_str(), source))
+        .collect();
+    for (name, source) in template_bindings {
+        out.push_str(&format!(
+            "- Template variable `{name}`: {}\n",
+            render_data_source(source)
+        ));
+    }
+    for resource in step.resources() {
+        out.push_str(&format!("Read the resource `{}`.\n", resource.uri()));
+    }
     if let Some(binding) = step.binding() {
         out.push_str(&format!("Save the result as `{binding}`.\n"));
+    }
+    if let Some(guidance) = step.guidance() {
+        out.push_str(&format!("Judgment: {guidance}\n"));
     }
     out.push('\n');
     out
@@ -271,10 +459,11 @@ fn resolve_description(wf: &SequentialWorkflow, slug: &str) -> String {
 /// Compose the whole SKILL.md body.
 ///
 /// A straight sequence over leaf helpers and nothing else. The layout is
-/// locked: frontmatter, an `# ` heading, `## Procedure` with one section per
-/// step, then the closing instruction — later plans extend it but do not
-/// rearrange it. The body terminates in exactly one `'\n'`, which is half of
-/// what makes `Skill::as_prompt_text() == Skill::body()` hold (SC-5).
+/// locked: frontmatter, an `# ` heading, the optional `## Context` and
+/// `## Inputs` sections, `## Procedure` with one section per step, then the
+/// closing instruction — later plans extend it but do not rearrange it. The
+/// body terminates in exactly one `'\n'`, which is half of what makes
+/// `Skill::as_prompt_text() == Skill::body()` hold (SC-5).
 fn render_body(wf: &SequentialWorkflow, slug: &str) -> String {
     let description = resolve_description(wf, slug);
     let mut out = String::new();
@@ -283,6 +472,8 @@ fn render_body(wf: &SequentialWorkflow, slug: &str) -> String {
     out.push_str("# ");
     out.push_str(&description);
     out.push_str("\n\n");
+    out.push_str(&render_context(wf));
+    out.push_str(&render_inputs(wf));
     out.push_str(&render_procedure(wf));
     out.push_str(&render_closing(wf));
     out
