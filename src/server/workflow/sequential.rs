@@ -226,6 +226,55 @@ impl SequentialWorkflow {
         &self.instructions
     }
 
+    /// Project this workflow into a SEP-2640 [`Skill`] (D-01).
+    ///
+    /// The returned skill's `SKILL.md` body is rendered from this workflow's
+    /// own introspection surface, so the skill a host reads and the prompt a
+    /// host runs are one content rendered twice — they cannot drift, because
+    /// the SDK owns the renderer.
+    ///
+    /// The skill's name is this workflow's name normalized to the
+    /// agentskills alphabet (`refund_flow` becomes `refund-flow`), and no URI
+    /// path override is set, so the frontmatter `name` and the final segment of
+    /// `skill://{name}/SKILL.md` agree by construction.
+    ///
+    /// # Infallible by design
+    ///
+    /// This method never fails and never panics (D-02, D-15). When a workflow
+    /// name normalizes to nothing legal it emits a `tracing::warn!` on the
+    /// `mcp.skills` target and substitutes a deterministic `workflow-{8 hex}`
+    /// slug; when the description is empty it substitutes a deterministic legal
+    /// one. This deliberately DIVERGES from [`Skill::with_reference`]'s
+    /// `Err(e) => panic!` arm — restoring a panic here would reintroduce Phase
+    /// 125's WR-03 finding. A caller that wants those conditions to be hard
+    /// errors, and wants the warnings as data, uses the fallible builder path
+    /// instead.
+    ///
+    /// The rendered text is not semver-stable; see
+    /// [`crate::server::skills::projection`] for the re-pinning contract.
+    ///
+    /// [`Skill`]: crate::server::skills::Skill
+    /// [`Skill::with_reference`]: crate::server::skills::Skill::with_reference
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    /// let skill = workflow.as_skill();
+    ///
+    /// assert_eq!(skill.name(), "refund-flow");
+    /// assert!(skill.body().starts_with("---\nname: \"refund-flow\"\n"));
+    /// # }
+    /// ```
+    #[cfg(feature = "skills")]
+    #[must_use]
+    pub fn as_skill(&self) -> crate::server::skills::Skill {
+        crate::server::skills::projection::project(self)
+    }
+
     /// Validate the workflow
     ///
     /// Checks:

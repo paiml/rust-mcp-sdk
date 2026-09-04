@@ -541,3 +541,98 @@ proptest! {
         })?;
     }
 }
+
+// ── Phase 126 plan 01 (SC-4, in-process half) ─────────────────────────
+//
+// A `SequentialWorkflow` projects to a `Skill`, registers through the real
+// `Skills::into_handler()` choke point, and reads back byte-identical from the
+// real `ResourceHandler`. This is SC-4's in-process half; the wire half lives
+// in `tests/skills_routing.rs`.
+//
+// These tests live HERE rather than in a new `tests/skills_projection.rs`
+// because a new integration file is invisible to all four `make test-skills`
+// selectors and would need a fifth Makefile selector to run at all.
+
+use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+
+fn tracer_workflow(description: &str) -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", description)
+        .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+}
+
+#[tokio::test]
+async fn projected_workflow_skill_reads_back_byte_identical() {
+    let skill = tracer_workflow("Process a refund").as_skill();
+
+    // Anti-vacuity: a projection that rendered nothing would otherwise make
+    // the byte-identity assertion below trivially true.
+    assert!(
+        skill.body().len() > 120,
+        "projected body was only {} bytes",
+        skill.body().len()
+    );
+    assert!(
+        skill.body().starts_with("---\nname: \"refund-flow\"\n"),
+        "projected body began: {:?}",
+        &skill.body()[..skill.body().len().min(60)]
+    );
+
+    let handler = Skills::new()
+        .add(skill.clone())
+        .into_handler()
+        .expect("a projected skill must register cleanly");
+
+    let result = handler
+        .read(
+            "skill://refund-flow/SKILL.md",
+            RequestHandlerExtra::default(),
+        )
+        .await
+        .expect("the projected skill's SKILL.md must read");
+    let (uri, text, mime) = extract_resource(&result.contents);
+
+    assert_eq!(uri, "skill://refund-flow/SKILL.md");
+    assert_eq!(mime, "text/markdown");
+    assert_eq!(
+        text,
+        skill.body(),
+        "the served bytes must equal the projected body exactly"
+    );
+}
+
+/// The same proof for a description that would break a RAW frontmatter
+/// concatenation (REVIEWS finding 1): it carries a `: ` mapping indicator AND
+/// a `#` comment indicator. `into_handler()` returning `Ok` is the load-bearing
+/// half — it proves the skill did NOT take the diagnostic-downgrade path that
+/// silently skips the SC-1 name-identity check.
+#[tokio::test]
+async fn projected_skill_with_an_awkward_description_still_registers_and_reads() {
+    let workflow = tracer_workflow("Refund an order: fast path #urgent");
+    let skill = workflow.as_skill();
+
+    assert_eq!(skill.name(), "refund-flow");
+    assert_eq!(skill.resolved_description(), workflow.description());
+
+    let handler = Skills::new()
+        .add(skill.clone())
+        .into_handler()
+        .expect("an awkward description must not fail registration");
+
+    let result = handler
+        .read(
+            "skill://refund-flow/SKILL.md",
+            RequestHandlerExtra::default(),
+        )
+        .await
+        .expect("the projected skill's SKILL.md must read");
+    let (_uri, text, _mime) = extract_resource(&result.contents);
+    assert_eq!(text, skill.body());
+
+    // The registry's own name-identity validation runs inside `entries()`;
+    // reaching it at all requires the frontmatter to have PARSED.
+    let entries = Skills::new()
+        .add(skill)
+        .entries()
+        .expect("entries must build for a projected skill");
+    assert_eq!(entries.len(), 1);
+}
