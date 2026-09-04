@@ -38,7 +38,7 @@ via `/gsd-phase add` as they are taken up — implementation-order items 23-25 i
 spike-findings skill.
 
 - [x] Phase 125: SEP-2640 Conformance — skills/list + skills/get — 5/5 plans, completed 2026-09-02
-- [ ] Phase 126: Workflow→skill projection — `SequentialWorkflow::as_skill()` (spike 009, implementation-order item 23)
+- [x] Phase 126: Workflow→skill projection — `SequentialWorkflow::as_skill()` (spike 009, implementation-order item 23) (completed 2026-09-04)
 
 > **Ticked by hand, 2026-09-02.** `gsd_run query phase.complete 125` returned
 > `roadmap_updated: false` and did not tick this box: it looks for the phase inside the
@@ -166,7 +166,7 @@ Constant}`:
 - "Judgment:" lines ← `with_guidance` text
 - Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
 
-**Plans:** 7/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
+**Plans:** 7/7 plans complete
 
 Plans:
 
