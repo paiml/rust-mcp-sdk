@@ -1074,6 +1074,28 @@ impl<'w> SkillProjection<'w> {
 
         let warnings = gate_check(workflow, self.tools.as_ref());
 
+        // D-10, as narrowed: the BUILDER path delivers both channels — the
+        // structured return above AND a log record on the module's existing
+        // `mcp.skills` target. It is the only path that can, because it is the
+        // only path holding a tool map. `as_skill()` logs the two conditions it
+        // CAN observe (the slug fallback and the empty-description
+        // substitution) and never reaches this check at all.
+        //
+        // Every author-supplied string is neutralized first (T-126-01):
+        // workflow, step and tool names are author text that reaches a log
+        // sink, and the message embeds the step and tool names. The STRUCTURED
+        // return keeps the raw text; only the log record is neutralized.
+        for warning in &warnings {
+            tracing::warn!(
+                target: "mcp.skills",
+                workflow = %sanitize_for_log(name),
+                step = %sanitize_for_log(warning.step().unwrap_or_default()),
+                tool = %sanitize_for_log(warning.tool().unwrap_or_default()),
+                "{}",
+                sanitize_for_log(warning.message())
+            );
+        }
+
         Ok(ProjectionOutput { skill, warnings })
     }
 }
@@ -2619,5 +2641,82 @@ mod tests {
             .filter_map(ProjectionWarning::step)
             .collect();
         assert_eq!(steps, vec!["issue_refund", "close_order"]);
+    }
+
+    // ── Plan 126-04 Task 3: D-10's narrowed delivery contract ─────────
+
+    #[test]
+    fn an_author_supplied_name_is_neutralized_before_it_reaches_a_log_field() {
+        // T-126-01: a workflow name carrying a newline and an ESC could forge a
+        // second log record or move a terminal cursor.
+        let hostile = "refund\u{1b}[2Kflow\ninjected: line";
+        let sanitized = sanitize_for_log(hostile);
+        assert!(!sanitized.contains('\n'), "newline survived: {sanitized:?}");
+        assert!(!sanitized.contains('\u{1b}'), "ESC survived: {sanitized:?}");
+        assert!(sanitized.contains("refund"), "content was destroyed");
+        assert_eq!(
+            sanitized.matches('\u{fffd}').count(),
+            2,
+            "each control character maps to exactly one U+FFFD: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn build_returns_warning_kinds_and_counts_as_data() {
+        // D-10 exists so tests assert on DATA — no `tracing` subscriber is
+        // installed anywhere in this suite.
+        let wf = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(
+                WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                    .with_guidance("Confirm with the customer first."),
+            )
+            .step(
+                WorkflowStep::new("archive_order", ToolHandle::new("orders_archive"))
+                    .with_guidance("Only archive settled orders."),
+            );
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )],
+        );
+        assert_eq!(warnings.len(), 2, "got {warnings:?}");
+        let kinds: Vec<_> = warnings.iter().map(ProjectionWarning::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ProjectionWarningKind::GuidanceOnSideEffectingStep,
+                ProjectionWarningKind::GateCheckUnverifiable,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_warning_is_a_builder_capability_and_the_bytes_are_identical_either_way() {
+        // The observable form of the D-10 narrowing: for the SAME workflow the
+        // builder reports a gate finding and `as_skill()` reports nothing, yet
+        // neither entry point moves a single rendered byte.
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let output = SkillProjection::new(&wf)
+            .with_tools(vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )])
+            .build()
+            .expect("legal workflow");
+
+        assert!(
+            output
+                .warnings
+                .iter()
+                .any(|w| w.kind() == ProjectionWarningKind::GuidanceOnSideEffectingStep),
+            "anti-vacuity: the fixture must trip the gate"
+        );
+        assert_eq!(
+            output.skill.body(),
+            wf.as_skill().body(),
+            "the warning is a builder-path capability; the bytes are identical either way"
+        );
     }
 }
