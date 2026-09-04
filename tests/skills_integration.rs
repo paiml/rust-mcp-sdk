@@ -1265,3 +1265,164 @@ async fn server_builder_prompt_workflow_reaches_the_prepend() {
     assert_ne!(message_text(&plain_result.messages[0]), body);
     assert!(message_text(&plain_result.messages[0]).starts_with("I want to process a refund."));
 }
+
+// ── Phase 126 plan 06 (D-14, SC-2 golden half) ────────────────────────
+//
+// `tests/golden/workflow_skill_projection.md` holds the exact rendered bytes
+// of the fixture below. The SC-2 property tests in
+// `src/server/skills/projection.rs` prove the renderer is PURE — the same
+// workflow always renders the same bytes. The golden proves something the
+// property tests structurally cannot: that those bytes have not MOVED since
+// they were recorded.
+//
+// That distinction matters because the body is hashed into the `sha256` digest
+// published in the skill's `skills/list` entry. A consumer that pinned the
+// digest treats a mismatch as a fatal pre-loop revocation, not a warning
+// (spike 010), so a silent render change is a supply-chain event.
+//
+// The mechanism is `include_str!`, deliberately NOT `insta`: `insta` is a
+// dev-dependency used nowhere else in this tree and `cargo insta review` has no
+// story in this repo's quality gate. `include_str!` also registers a cargo
+// rebuild dependency on the golden, so editing the file re-runs this test —
+// which is exactly the D-14 tripwire behaviour.
+
+use pmcp::server::workflow::{DataSource, InternalPromptMessage};
+use pmcp::types::PromptArgumentType;
+use serde_json::json;
+
+/// The exact bytes `golden_workflow().as_skill().body()` must render.
+///
+/// `include_str!` rather than a runtime read: the path is resolved at compile
+/// time relative to THIS file, so the test cannot pass by silently reading a
+/// stale or absent file, and cargo rebuilds the test binary when the golden
+/// changes.
+const GOLDEN: &str = include_str!("golden/workflow_skill_projection.md");
+
+/// The D-14 golden fixture — a workflow exercising the whole D-11 render
+/// universe in one value.
+///
+/// Every element here is load-bearing for what the golden can catch:
+///
+/// - `refund_flow` requires slugification, so the frontmatter `name` pins
+///   `slugify`'s output rather than an already-legal passthrough.
+/// - The description carries a `: ` mapping indicator AND a `#` comment
+///   indicator, so the pinned `description:` line is a NON-TRIVIAL
+///   `yaml_double_quoted` output. A golden whose description were a plain word
+///   would stay green through a regression that dropped the escaping entirely.
+/// - One workflow-level instruction pins `## Context`, which is the only place
+///   `SequentialWorkflow::instruction()` becomes observable on any surface.
+/// - One typed required argument and one untyped optional argument pin both
+///   `## Inputs` bullet shapes and the lowercase wire spelling of the type hint.
+/// - Step 1 pins two argument bindings, a `Constant` source (whose key order is
+///   digest-significant under `serde_json`'s `preserve_order`) and a result
+///   binding.
+/// - Step 2 pins guidance, a `StepOutput` source, and two template bindings
+///   inserted in an order that SORTS DIFFERENTLY (`zeta_total` before
+///   `alpha_reason`) — without them the golden could not catch a regression
+///   from `render_step`'s `BTreeMap` back to raw `HashMap` iteration.
+/// - Step 3 pins the resource-only step shape and an attached resource.
+fn golden_workflow() -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", "Process a customer refund: policy #7")
+        .instruction(InternalPromptMessage::system(
+            "Refunds above the policy ceiling need a supervisor's approval.",
+        ))
+        .typed_argument(
+            "order_id",
+            "The order to refund",
+            true,
+            PromptArgumentType::String,
+        )
+        .argument("reason", "Why the customer asked for the refund", false)
+        .step(
+            WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                .arg("id", DataSource::prompt_arg("order_id"))
+                .arg(
+                    "options",
+                    DataSource::constant(json!({ "zeta": 1, "alpha": 2 })),
+                )
+                .bind("order"),
+        )
+        .step(
+            WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                .arg("order", DataSource::from_step_field("order", "id"))
+                .with_template_binding("zeta_total", DataSource::from_step_field("order", "total"))
+                .with_template_binding("alpha_reason", DataSource::prompt_arg("reason"))
+                .with_guidance("Confirm the customer accepted the policy before issuing."),
+        )
+        .step(
+            WorkflowStep::fetch_resources("read_policy")
+                .with_resource("file:///policies/refunds.md")
+                .expect("a literal resource URI carries no template variables"),
+        )
+}
+
+/// The text the golden byte-comparison fails with.
+///
+/// Factored out into a named `fn` rather than inlined for the same reason
+/// `wire_break_message` is in `tests/embedded_resource_golden.rs`: this is the
+/// string a reviewer greps for when asking "what is a maintainer told to do
+/// when this goes red?", and an inline literal buried in an `assert_eq!` is not
+/// greppable as a policy.
+///
+/// It states the ONE thing a maintainer must not do. A red golden has exactly
+/// two causes and they need opposite fixes, so re-recording the file from the
+/// current output resolves the symptom without deciding which cause it was.
+fn golden_break_message(rendered: &str) -> String {
+    format!(
+        "D-14: the projected SKILL.md bytes no longer match the golden at \
+         tests/golden/workflow_skill_projection.md. This has exactly two causes and \
+         they need OPPOSITE fixes. (1) The render changed on purpose: update \
+         tests/golden/workflow_skill_projection.md AND add a CHANGELOG entry, because \
+         these bytes are hashed into the sha256 digest published in the skill's \
+         skills/list entry and every consumer that pinned that digest must re-pin — \
+         a digest mismatch is a fatal pre-loop revocation for them, not a warning. \
+         (2) The render REGRESSED: fix the renderer, not the golden. Do NOT re-record \
+         the golden from the current output to turn this test green without first \
+         deciding which of the two it is. Rendered body was: {rendered:?}"
+    )
+}
+
+/// D-14 / SC-2 (golden half): the projected body is byte-equal to the recorded
+/// golden.
+#[test]
+fn golden_render_is_byte_equal() {
+    // Anti-vacuity FIRST: two empty strings are also byte-equal, so an empty or
+    // truncated golden would otherwise pass by matching an empty render.
+    assert!(
+        GOLDEN.len() > 400,
+        "the golden is only {} bytes — it cannot be the full render",
+        GOLDEN.len()
+    );
+    assert!(
+        GOLDEN.starts_with("---\nname: \"refund-flow\"\n"),
+        "the golden does not begin with the encoded frontmatter name; first 60 bytes: {:?}",
+        &GOLDEN[..GOLDEN.len().min(60)]
+    );
+    // Pins the ESCAPED form specifically. A regression to raw `key: ` + author
+    // text would still produce a plausible-looking `description:` line, so
+    // checking only that SOME description line exists would not catch it.
+    assert!(
+        GOLDEN.contains("description: \"Process a customer refund: policy #7\"\n"),
+        "the golden does not pin the yaml_double_quoted description line"
+    );
+    assert!(
+        GOLDEN.ends_with('\n') && !GOLDEN.ends_with("\n\n"),
+        "the golden must end in exactly one newline (SC-5 depends on it)"
+    );
+    // The two template bindings are inserted zeta-first and must render
+    // alpha-first: this is what makes the golden able to catch a regression
+    // from `render_step`'s BTreeMap back to raw HashMap iteration.
+    let alpha = GOLDEN
+        .find("Template variable `alpha_reason`")
+        .expect("the golden must pin both template bindings");
+    let zeta = GOLDEN
+        .find("Template variable `zeta_total`")
+        .expect("the golden must pin both template bindings");
+    assert!(
+        alpha < zeta,
+        "template bindings must render in sorted, not insertion, order"
+    );
+
+    let rendered = golden_workflow().as_skill().body().to_string();
+    assert_eq!(rendered, GOLDEN, "{}", golden_break_message(&rendered));
+}

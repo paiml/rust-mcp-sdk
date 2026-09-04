@@ -1,0 +1,5 @@
+# The D-14 projection golden is a byte-for-byte supply-chain pin: its bytes are
+# hashed into the sha256 digest published in a skill's skills/list entry. A CRLF
+# checkout would change those bytes and fail golden_render_is_byte_equal for a
+# reason that has nothing to do with the renderer.
+tests/golden/** text eol=lf
