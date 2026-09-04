@@ -5,16 +5,16 @@ milestone_name: SEP-2640 Skills Conformance & Positioning (Phase 125+)
 current_phase: 126
 current_phase_name: "Workflow to skill projection — `SequentialWorkflow::as_skill()`"
 status: executing
-stopped_at: Completed 126-04-PLAN.md
-last_updated: "2026-09-04T17:37:31.987Z"
+stopped_at: Completed 126-05-PLAN.md
+last_updated: "2026-09-04T18:38:16.137Z"
 last_activity: 2026-09-03
 last_activity_desc: Phase 126 execution started
-state_head: 16361dc62818f726d0d0ec4191ca93307370e051
+state_head: 81f3aa360bd472d3590217d1c02522b468df663c
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 12
-  completed_plans: 8
+  completed_plans: 10
   percent: 50
 ---
 
@@ -34,7 +34,7 @@ See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 clo
 ## Current Position
 
 Phase: 126 (Workflow to skill projection — `SequentialWorkflow::as_skill()`) — EXECUTING
-Plan: 5 of 7
+Plan: 6 of 7
 Status: Ready to execute
 Last activity: 2026-09-03 — Phase 126 execution started
 
@@ -559,6 +559,9 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase 126]: make test-fuzz is rejected as fuzz evidence for this phase; the registration tripwire plus a hand-run under +nightly is the evidence — cargo fuzz run passes -Z flags and fails on this repo pinned stable toolchain, and the Makefile swallows that with || echo, exiting 0 having run nothing. The tripwire was proven red on all three legs (source hidden, stanza renamed, matrix row suffixed).
 - [Phase 126]: GATE A implemented: SkillProjection::build() -> Result<ProjectionOutput> with #[non_exhaustive] pub struct ProjectionOutput { skill, warnings } plus into_parts() — D-02 and D-10 are literally incompatible (a Skill cannot carry a warning vector). #[non_exhaustive] supplies the additivity the plan text sought via accessors, while keeping the locked field-access ergonomics (build()?.skill). Deviation recorded in the build() and ProjectionOutput rustdocs and in 126-04-SUMMARY.md.
 - [Phase 126]: D-10 NARROWED: SC-6 gate warnings have exactly ONE delivery channel, the structured return from build() — ToolAnnotations are reachable only through crate::types::ToolInfo::annotations; no SequentialWorkflow/WorkflowStep accessor exposes them, so as_skill() cannot compute an SC-6 warning and cannot be a channel for one. build() emits BOTH channels for everything it can see; as_skill() logs only the slug fallback and the empty-description substitution.
+- [Phase 126]: GATE B implemented as answered (add-builder-path): ServerCoreBuilder::with_workflow_skill_prepend and ServerBuilder::with_workflow_skill_prepend make the D-04a prepend reachable from prompt_workflow, so the anti-drift claim holds per SERVER, not per workflow value. Two new public methods on published 2.x builder types — one-way.
+- [Phase 126]: create_assistant_plan() is CALLED unconditionally in both handlers and only its MESSAGE is suppressed. Guarding the call would silently delete the unregistered-tool validation whenever the D-04a flag was on (REVIEWS fable (a)).
+- [Phase 126]: The prepend field holds an already-rendered String, not a bool: a per-request render would re-fire the D-15 slug warning on every prompts/get and re-derive message [0] independently of the digested snapshot (REVIEWS fable (b)).
 
 ### Pending Todos
 
@@ -649,8 +652,8 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-09-04T17:37:23.132Z
-Stopped at: Completed 126-04-PLAN.md
+Last session: 2026-09-04T18:38:09.713Z
+Stopped at: Completed 126-05-PLAN.md
 Resume file: None
 Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
@@ -816,6 +819,7 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 126 P02 | 1h 27m | 3 tasks | 1 files |
 | Phase 126 P03 | 27 min | 2 tasks | 4 files |
 | Phase 126 P04 | 35 min | 3 tasks | 2 files |
+| Phase 126 P05 | 54 min | 4 tasks | 5 files |
 
 ## Operator Next Steps
 

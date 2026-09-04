@@ -166,7 +166,7 @@ Constant}`:
 - "Judgment:" lines ← `with_guidance` text
 - Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
 
-**Plans:** 4/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
+**Plans:** 5/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
 
 Plans:
 
@@ -182,7 +182,7 @@ Plans:
 **Wave 3** *(blocked on Wave 2 completion)*
 
 - [x] 126-04-PLAN.md — `SkillProjection` builder, public `ProjectionWarning`, and the SC-6 gate warning *(records the D-02 return-shape deviation and the D-10 narrowing: SC-6 warnings have ONE delivery channel, `build()`'s structured return)*
-- [ ] 126-05-PLAN.md — D-04a opt-in prompt prepend on **both** handler kinds (rendered once, validation preserved), builder-level reachability, and transcript tests placed where `make test-skills` can reach them
+- [x] 126-05-PLAN.md — D-04a opt-in prompt prepend on **both** handler kinds (rendered once, validation preserved), builder-level reachability, and transcript tests placed where `make test-skills` can reach them
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -219,7 +219,7 @@ Plans:
 | Phase | Requirements | Plans Complete | Status | Completed |
 |-------|--------------|----------------|--------|-----------|
 | 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
-| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 4/7 | In Progress|  |
+| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 5/7 | In Progress|  |
 
 **Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
 (`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
