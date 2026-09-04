@@ -710,6 +710,13 @@ name = "c10_client_skills"
 path = "examples/c10_client_skills.rs"
 required-features = ["skills", "full"]
 
+# Phase 126 (D-16): the workflow -> skill PROJECTION sibling of s44. `s45` is
+# taken by `s45_tool_as_task_lifecycle` below, hence `s56`.
+[[example]]
+name = "s56_workflow_skill_projection"
+path = "examples/s56_workflow_skill_projection.rs"
+required-features = ["skills", "full"]
+
 [[example]]
 name = "s45_tool_as_task_lifecycle"
 path = "examples/s45_tool_as_task_lifecycle.rs"
