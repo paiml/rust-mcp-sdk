@@ -166,7 +166,7 @@ Constant}`:
 - "Judgment:" lines ← `with_guidance` text
 - Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
 
-**Plans:** 2/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
+**Plans:** 3/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
 
 Plans:
 
@@ -177,7 +177,7 @@ Plans:
 **Wave 2** *(blocked on Wave 1 completion)*
 
 - [x] 126-02-PLAN.md — Full render breadth (Context / Inputs / per-step detail, sorted template bindings) + the SC-2 / SC-3 / SC-5 unit and property suite
-- [ ] 126-03-PLAN.md — SC-4 on the wire (conforming `skills/list` entry + byte-identical `resources/read`) + the ALWAYS/FUZZ target, its `[[bin]]` stanza, CI matrix row and registration tripwire
+- [x] 126-03-PLAN.md — SC-4 on the wire (conforming `skills/list` entry + byte-identical `resources/read`) + the ALWAYS/FUZZ target, its `[[bin]]` stanza, CI matrix row and registration tripwire
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -219,7 +219,7 @@ Plans:
 | Phase | Requirements | Plans Complete | Status | Completed |
 |-------|--------------|----------------|--------|-----------|
 | 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
-| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 2/7 | In Progress|  |
+| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 3/7 | In Progress|  |
 
 **Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
 (`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
