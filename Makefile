@@ -154,52 +154,68 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 	@echo "$(GREEN)✓ Code formatting OK$(NC)"
 
+# The ONE clippy policy, shared by `lint` and `lint-skills`.
+#
+# `lint-skills` used to carry a verbatim 33-line copy of this list, with a
+# comment saying it was `make lint`'s "verbatim: this leg exists to widen the
+# policy's REACH, not to give one module a softer policy" — and nothing enforced
+# the word "verbatim". The next `-A` added to `make lint` (this file already
+# records one such addition, the Rust-1.98 `unused_async_trait_impl` note below)
+# would silently have given the skills module a STRICTER policy than the rest of
+# the crate, the inverse of the stated intent, surfacing as a confusing CI-only
+# failure in a module nobody touched. One variable removes the class.
+#
+# The two targets now differ only in `--features` and `-p pmcp`, which is the
+# whole of the real difference between them.
+#
+# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
+# 1.98 split part of `unused_async` — already allowed here, deliberately —
+# into a sibling lint the old allow does not cover, and it fires on 9
+# pre-existing sites. THREE of them are `pub async fn` on the public API
+# (`CognitoProvider::new`, `NotificationDebouncer::start`,
+# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
+# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
+# design — its body says "this would make an HTTP request". Allowing it
+# restores the policy this list already encodes rather than weakening it.
+CLIPPY_POLICY := \
+	-D clippy::all \
+	-W clippy::pedantic \
+	-W clippy::nursery \
+	-W clippy::cargo \
+	-A clippy::module_name_repetitions \
+	-A clippy::must_use_candidate \
+	-A clippy::missing_errors_doc \
+	-A clippy::missing_const_for_fn \
+	-A clippy::return_self_not_must_use \
+	-A clippy::missing_fields_in_debug \
+	-A clippy::uninlined_format_args \
+	-A clippy::if_not_else \
+	-A clippy::result_large_err \
+	-A clippy::multiple_crate_versions \
+	-A clippy::implicit_hasher \
+	-A clippy::unused_async \
+	-A clippy::cast_lossless \
+	-A clippy::redundant_clone \
+	-A clippy::redundant_closure_for_method_calls \
+	-A clippy::significant_drop_tightening \
+	-A clippy::missing_panics_doc \
+	-A clippy::cast_possible_truncation \
+	-A clippy::cast_precision_loss \
+	-A clippy::option_if_let_else \
+	-A clippy::derive_partial_eq_without_eq \
+	-A clippy::redundant_else \
+	-A clippy::match_same_arms \
+	-A clippy::manual_string_new \
+	-A clippy::default_trait_access \
+	-A clippy::format_push_string \
+	-A clippy::too_many_lines \
+	-A clippy::cargo_common_metadata \
+	-A clippy::unused_async_trait_impl
+
 .PHONY: lint
 lint:
 	@echo "$(BLUE)Running clippy...$(NC)"
-	# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
-	# 1.98 split part of `unused_async` — already allowed here, deliberately —
-	# into a sibling lint the old allow does not cover, and it fires on 9
-	# pre-existing sites. THREE of them are `pub async fn` on the public API
-	# (`CognitoProvider::new`, `NotificationDebouncer::start`,
-	# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
-	# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
-	# design — its body says "this would make an HTTP request". Allowing it
-	# restores the policy this list already encodes rather than weakening it.
-	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- \
-		-D clippy::all \
-		-W clippy::pedantic \
-		-W clippy::nursery \
-		-W clippy::cargo \
-		-A clippy::module_name_repetitions \
-		-A clippy::must_use_candidate \
-		-A clippy::missing_errors_doc \
-		-A clippy::missing_const_for_fn \
-		-A clippy::return_self_not_must_use \
-		-A clippy::missing_fields_in_debug \
-		-A clippy::uninlined_format_args \
-		-A clippy::if_not_else \
-		-A clippy::result_large_err \
-		-A clippy::multiple_crate_versions \
-		-A clippy::implicit_hasher \
-		-A clippy::unused_async \
-		-A clippy::cast_lossless \
-		-A clippy::redundant_clone \
-		-A clippy::redundant_closure_for_method_calls \
-		-A clippy::significant_drop_tightening \
-		-A clippy::missing_panics_doc \
-		-A clippy::cast_possible_truncation \
-		-A clippy::cast_precision_loss \
-		-A clippy::option_if_let_else \
-		-A clippy::derive_partial_eq_without_eq \
-		-A clippy::redundant_else \
-		-A clippy::match_same_arms \
-		-A clippy::manual_string_new \
-		-A clippy::default_trait_access \
-		-A clippy::format_push_string \
-		-A clippy::too_many_lines \
-		-A clippy::cargo_common_metadata \
-		-A clippy::unused_async_trait_impl
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- $(CLIPPY_POLICY)
 	@echo "$(BLUE)Checking examples...$(NC)"
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) check --features "full" --examples
 	@echo "$(GREEN)✓ No lint issues$(NC)"
@@ -951,6 +967,13 @@ test-integration:
 # nothing from this module), and neither is a `cargo nextest -E 'test(...)'`
 # selector, which is a project-recorded false green: it can match zero tests and
 # still exit 0.
+#
+# The guards themselves live in `scripts/guarded-cargo-test.sh`, ONE copy driven
+# four times, because the four blocks that used to be expanded inline here
+# differed only in the label, the cargo arguments, the `want=` target and two
+# prose strings — and had already begun to drift. Read that script's header
+# before relaxing anything in it; `test-cargo-pmcp` above is the in-repo
+# precedent for the same collapse.
 SKILLS_FEATURES := skills,streamable-http,http-client,testing
 
 # The GATE's LINT reach into `src/server/skills/` — the other half of D-09.
@@ -965,8 +988,10 @@ SKILLS_FEATURES := skills,streamable-http,http-client,testing
 # carries NO pedantic/nursery groups, which CLAUDE.md states outright is the
 # weaker form.
 #
-# The allow-list below is `make lint`'s, verbatim: this leg exists to widen the
-# policy's REACH, not to give one module a softer policy.
+# The lint policy is `$(CLIPPY_POLICY)`, the SAME variable `make lint` uses, so
+# "verbatim" is now structural rather than a promise nobody checked: this leg
+# exists to widen the policy's REACH, not to give one module a softer (or, once
+# the copy drifted, a stricter) policy.
 #
 # The feature set is `full` PLUS `skills`, deliberately NOT `$(SKILLS_FEATURES)`.
 # `test-skills` uses the narrow set because the test files' own `#![cfg]` headers
@@ -982,107 +1007,36 @@ LINT_SKILLS_FEATURES := full,skills
 .PHONY: lint-skills
 lint-skills:
 	@echo "$(BLUE)Linting the skills module (features: $(LINT_SKILLS_FEATURES))...$(NC)"
-	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- \
-		-D clippy::all \
-		-W clippy::pedantic \
-		-W clippy::nursery \
-		-W clippy::cargo \
-		-A clippy::module_name_repetitions \
-		-A clippy::must_use_candidate \
-		-A clippy::missing_errors_doc \
-		-A clippy::missing_const_for_fn \
-		-A clippy::return_self_not_must_use \
-		-A clippy::missing_fields_in_debug \
-		-A clippy::uninlined_format_args \
-		-A clippy::if_not_else \
-		-A clippy::result_large_err \
-		-A clippy::multiple_crate_versions \
-		-A clippy::implicit_hasher \
-		-A clippy::unused_async \
-		-A clippy::cast_lossless \
-		-A clippy::redundant_clone \
-		-A clippy::redundant_closure_for_method_calls \
-		-A clippy::significant_drop_tightening \
-		-A clippy::missing_panics_doc \
-		-A clippy::cast_possible_truncation \
-		-A clippy::cast_precision_loss \
-		-A clippy::option_if_let_else \
-		-A clippy::derive_partial_eq_without_eq \
-		-A clippy::redundant_else \
-		-A clippy::match_same_arms \
-		-A clippy::manual_string_new \
-		-A clippy::default_trait_access \
-		-A clippy::format_push_string \
-		-A clippy::too_many_lines \
-		-A clippy::cargo_common_metadata \
-		-A clippy::unused_async_trait_impl
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- $(CLIPPY_POLICY)
 	@echo "$(GREEN)✓ No lint issues in the skills module$(NC)"
+
+# The environment every `test-skills` selector runs under. `RUSTFLAGS=` is
+# EMPTY on purpose — the file-level `-D warnings` must not reach these builds.
+SKILLS_TEST_ENV := RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE)
 
 .PHONY: test-skills
 test-skills:
 	@echo "$(BLUE)Running the skills module's tests (features: $(SKILLS_FEATURES))...$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --lib skills -- --test-threads=1 2>&1); \
-	status=$$?; \
-	echo "$$out"; \
-	if [ $$status -ne 0 ]; then exit $$status; fi; \
-	ran=$$(printf '%s\n' "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
-	if [ "$$ran" -eq 0 ]; then \
-		echo "$(RED)✗ selector 1 (--lib skills) reported 0 tests. The entire in-module unit + proptest body is dark; a missing feature gate on '$(SKILLS_FEATURES)' is the likely cause.$(NC)"; \
-		exit 1; \
-	fi; \
-	n=$$(printf '%s\n' "$$out" | awk -v want="src/lib.rs" -f scripts/named-test-binary-count.awk); \
-	case "$$n" in \
-	-1) echo "$(RED)✗ selector 1: the unittest target 'src/lib.rs' never RAN — a dropped --lib selector is exactly how a leg reports green over nothing.$(NC)"; exit 1;; \
-	-2) echo "$(RED)✗ selector 1: 'src/lib.rs' printed a target line but NO 'test result:' followed — truncated output. This gate refuses to pass on output it cannot read.$(NC)"; exit 1;; \
-	''|*[!0-9]*) echo "$(RED)✗ selector 1: extractor gave no usable reading ('$$n'). EMPTY means awk did not run: check scripts/named-test-binary-count.awk.$(NC)"; exit 1;; \
-	esac; \
-	echo "$(GREEN)  ✓ selector 1 (--lib skills) ran ($$ran passed)$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --doc skills -- --test-threads=1 2>&1); \
-	status=$$?; \
-	echo "$$out"; \
-	if [ $$status -ne 0 ]; then exit $$status; fi; \
-	ran=$$(printf '%s\n' "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
-	if [ "$$ran" -eq 0 ]; then \
-		echo "$(RED)✗ selector 2 (--doc skills) reported 0 tests. The entries() doctest and the module-header mirror that pmcp-book copies byte for byte are unchecked.$(NC)"; \
-		exit 1; \
-	fi; \
-	if ! printf '%s\n' "$$out" | grep -q '^ *Doc-tests pmcp$$'; then \
-		echo "$(RED)✗ selector 2: no 'Doc-tests pmcp' target line in the captured output — the doctest harness did not run for this package.$(NC)"; \
-		exit 1; \
-	fi; \
-	echo "$(GREEN)  ✓ selector 2 (--doc skills) ran ($$ran passed)$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_integration -- --test-threads=1 2>&1); \
-	status=$$?; \
-	echo "$$out"; \
-	if [ $$status -ne 0 ]; then exit $$status; fi; \
-	ran=$$(printf '%s\n' "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
-	if [ "$$ran" -eq 0 ]; then \
-		echo "$(RED)✗ selector 3 (--test skills_integration) reported 0 tests. The resource-surface and byte-identity suite is dark; an emptied #![cfg] header is the classic cause.$(NC)"; \
-		exit 1; \
-	fi; \
-	n=$$(printf '%s\n' "$$out" | awk -v want="tests/skills_integration.rs" -f scripts/named-test-binary-count.awk); \
-	case "$$n" in \
-	-1) echo "$(RED)✗ selector 3: 'tests/skills_integration.rs' never RAN.$(NC)"; exit 1;; \
-	-2) echo "$(RED)✗ selector 3: 'tests/skills_integration.rs' printed a target line but NO 'test result:' followed — truncated output.$(NC)"; exit 1;; \
-	''|*[!0-9]*) echo "$(RED)✗ selector 3: extractor gave no usable reading ('$$n').$(NC)"; exit 1;; \
-	esac; \
-	echo "$(GREEN)  ✓ selector 3 (--test skills_integration) ran ($$ran passed)$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_routing -- --test-threads=1 2>&1); \
-	status=$$?; \
-	echo "$$out"; \
-	if [ $$status -ne 0 ]; then exit $$status; fi; \
-	ran=$$(printf '%s\n' "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
-	if [ "$$ran" -eq 0 ]; then \
-		echo "$(RED)✗ selector 4 (--test skills_routing) reported 0 tests. Every wire proof, tripwire and routing guarantee is dark; an emptied #![cfg] header is the classic cause.$(NC)"; \
-		exit 1; \
-	fi; \
-	n=$$(printf '%s\n' "$$out" | awk -v want="tests/skills_routing.rs" -f scripts/named-test-binary-count.awk); \
-	case "$$n" in \
-	-1) echo "$(RED)✗ selector 4: 'tests/skills_routing.rs' never RAN.$(NC)"; exit 1;; \
-	-2) echo "$(RED)✗ selector 4: 'tests/skills_routing.rs' printed a target line but NO 'test result:' followed — truncated output.$(NC)"; exit 1;; \
-	''|*[!0-9]*) echo "$(RED)✗ selector 4: extractor gave no usable reading ('$$n').$(NC)"; exit 1;; \
-	esac; \
-	echo "$(GREEN)  ✓ selector 4 (--test skills_routing) ran ($$ran passed)$(NC)"
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 1 (--lib skills)" \
+		"src/lib.rs" \
+		"The entire in-module unit + proptest body is dark; a missing feature gate on '$(SKILLS_FEATURES)' is the likely cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --lib skills -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 2 (--doc skills)" \
+		"Doc-tests pmcp" \
+		"The entries() doctest and the module-header mirror that pmcp-book copies byte for byte are unchecked." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --doc skills -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 3 (--test skills_integration)" \
+		"tests/skills_integration.rs" \
+		"The resource-surface and byte-identity suite is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_integration -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 4 (--test skills_routing)" \
+		"tests/skills_routing.rs" \
+		"Every wire proof, tripwire and routing guarantee is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_routing -- --test-threads=1
 	@echo "$(GREEN)✓ skills module tests passed across all four selectors$(NC)"
 
 # Phase 117 (SMPL-01/02) — RUN the v1-severance proofs on the severed build.
