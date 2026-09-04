@@ -4719,7 +4719,7 @@ impl ServerBuilder {
     /// applies to workflows registered AFTER this call and leaves earlier ones
     /// alone. Call it before the workflows it should affect:
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// # #[cfg(feature = "skills")] {
     /// # fn main() -> Result<(), pmcp::Error> {
     /// use pmcp::server::workflow::SequentialWorkflow;
@@ -4733,7 +4733,11 @@ impl ServerBuilder {
     ///     .with_workflow_skill_prepend(true)
     ///     .prompt_workflow(workflow)?
     ///     .build()?;
-    /// # let _ = server;
+    ///
+    /// // The workflow is registered under its OWN name, not the skill slug:
+    /// // the prompt stays `refund_flow` while the projected skill is
+    /// // `refund-flow`.
+    /// assert!(server.get_prompt("refund_flow").is_some());
     /// # Ok(())
     /// # }
     /// # }

@@ -918,6 +918,30 @@ pub struct ProjectionOutput {
 
 impl ProjectionOutput {
     /// Consume this output and return both halves.
+    ///
+    /// This is the only way a DOWNSTREAM crate can move both fields out at
+    /// once: `#[non_exhaustive]` forbids struct-pattern destructuring outside
+    /// the defining crate, so `let ProjectionOutput { skill, warnings } = out;`
+    /// does not compile there. Reading the fields individually still works.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::SkillProjection;
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    /// let (skill, warnings) = SkillProjection::new(&workflow)
+    ///     .build()
+    ///     .expect("a legal name and a non-empty description")
+    ///     .into_parts();
+    ///
+    /// assert_eq!(skill.name(), "refund-flow");
+    /// // No tool map was supplied, so the SC-6 gate check did not run (D-07).
+    /// assert!(warnings.is_empty());
+    /// # }
+    /// ```
     #[must_use]
     pub fn into_parts(self) -> (Skill, Vec<ProjectionWarning>) {
         (self.skill, self.warnings)

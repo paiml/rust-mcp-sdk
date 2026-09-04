@@ -495,7 +495,7 @@ impl ServerCoreBuilder {
     /// applies to workflows registered AFTER this call and leaves earlier ones
     /// alone. Call it before the workflows it should affect:
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// # #[cfg(all(feature = "skills", not(target_arch = "wasm32")))] {
     /// # fn main() -> Result<(), pmcp::Error> {
     /// use pmcp::server::builder::ServerCoreBuilder;
@@ -503,17 +503,29 @@ impl ServerCoreBuilder {
     ///
     /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
     ///
+    /// // The exact bytes `prompts/get` will now open with, and the same bytes
+    /// // served at `skill://refund-flow/SKILL.md`.
+    /// let message_zero = workflow.as_skill().body().to_string();
+    ///
     /// let server = ServerCoreBuilder::new()
     ///     .name("my-server")
     ///     .version("1.0.0")
     ///     .with_workflow_skill_prepend(true)
     ///     .prompt_workflow(workflow)?
     ///     .build()?;
+    ///
+    /// assert!(message_zero.starts_with("---\nname: \"refund-flow\"\n"));
     /// # let _ = server;
     /// # Ok(())
     /// # }
     /// # }
     /// ```
+    ///
+    /// `ServerCore` exposes no synchronous prompt accessor, so the assertion
+    /// above is on the projected bytes rather than on the built server; the
+    /// end-to-end proof that this setter actually reaches message `[0]` is
+    /// `server_core_builder_prompt_workflow_reaches_the_prepend` in
+    /// `tests/skills_integration.rs`, with its flag-off negative case alongside.
     ///
     /// The default is `false`, so an existing server's transcripts do not move.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
