@@ -687,9 +687,29 @@ impl PromptHandler for TaskWorkflowPromptHandler {
         let mut step_statuses: Vec<StepStatus> = vec![StepStatus::Pending; step_count];
         let mut pause_reason: Option<PauseReason> = None;
 
-        // Add header messages
+        // Add header messages.
+        //
+        // This branch rebuilds the message list itself rather than delegating to
+        // `WorkflowPromptHandler::handle`, so it must reproduce that handler's
+        // header sequence exactly — otherwise a `has_task_support(true)` workflow
+        // would get a different transcript from a plain one. The D-04a prepend is
+        // read through the ONE crate-private producer on `inner`, never
+        // re-rendered here: `prepend.is_some()` IS the flag, so the two handlers
+        // cannot drift.
+        let prepend = self.inner.projected_prepend();
+        let suppress_plan = prepend.is_some();
+        messages.extend(prepend);
         messages.push(self.inner.create_user_intent(&args));
-        messages.push(self.inner.create_assistant_plan()?);
+        // Why: this call is the tool-registry validation — it is where
+        // `Error::Internal("Tool '{}' not found in registry")` is raised. It runs
+        // UNCONDITIONALLY and its `?` propagates in both flag states; only the
+        // push of its message is suppressed when the projected body already
+        // carries the step-and-tool list. Guarding the call instead of the push
+        // would silently delete a validation that flag-off callers have today.
+        let plan_message = self.inner.create_assistant_plan()?;
+        if !suppress_plan {
+            messages.push(plan_message);
+        }
 
         for (idx, step) in self.workflow.steps().iter().enumerate() {
             // Check cancellation
