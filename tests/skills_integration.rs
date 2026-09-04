@@ -560,6 +560,35 @@ fn tracer_workflow(description: &str) -> SequentialWorkflow {
         .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
 }
 
+/// Register `skill` through the real `Skills::into_handler()` choke point and
+/// read `uri` back, returning `extract_resource`'s `(uri, text, mime)` triple.
+///
+/// `uri` is passed in rather than derived from `skill.name()` on purpose: the
+/// literal stays at the call site, so the read still PINS the slug instead of
+/// echoing back whatever the projection happened to produce.
+///
+/// `register_expect` is a parameter because `into_handler()` returning `Ok` is
+/// the load-bearing half for one of the two callers — it proves the skill did
+/// not take the diagnostic-downgrade path that silently skips the SC-1
+/// name-identity check — and a generic message would lose that.
+async fn read_projected_skill_md(
+    skill: &Skill,
+    uri: &str,
+    register_expect: &str,
+) -> (String, String, String) {
+    let handler = Skills::new()
+        .add(skill.clone())
+        .into_handler()
+        .unwrap_or_else(|error| panic!("{register_expect}: {error}"));
+
+    let result = handler
+        .read(uri, RequestHandlerExtra::default())
+        .await
+        .expect("the projected skill's SKILL.md must read");
+
+    extract_resource(&result.contents)
+}
+
 #[tokio::test]
 async fn projected_workflow_skill_reads_back_byte_identical() {
     let skill = tracer_workflow("Process a refund").as_skill();
@@ -577,19 +606,12 @@ async fn projected_workflow_skill_reads_back_byte_identical() {
         &skill.body()[..skill.body().len().min(60)]
     );
 
-    let handler = Skills::new()
-        .add(skill.clone())
-        .into_handler()
-        .expect("a projected skill must register cleanly");
-
-    let result = handler
-        .read(
-            "skill://refund-flow/SKILL.md",
-            RequestHandlerExtra::default(),
-        )
-        .await
-        .expect("the projected skill's SKILL.md must read");
-    let (uri, text, mime) = extract_resource(&result.contents);
+    let (uri, text, mime) = read_projected_skill_md(
+        &skill,
+        "skill://refund-flow/SKILL.md",
+        "a projected skill must register cleanly",
+    )
+    .await;
 
     assert_eq!(uri, "skill://refund-flow/SKILL.md");
     assert_eq!(mime, "text/markdown");
@@ -613,19 +635,12 @@ async fn projected_skill_with_an_awkward_description_still_registers_and_reads()
     assert_eq!(skill.name(), "refund-flow");
     assert_eq!(skill.resolved_description(), workflow.description());
 
-    let handler = Skills::new()
-        .add(skill.clone())
-        .into_handler()
-        .expect("an awkward description must not fail registration");
-
-    let result = handler
-        .read(
-            "skill://refund-flow/SKILL.md",
-            RequestHandlerExtra::default(),
-        )
-        .await
-        .expect("the projected skill's SKILL.md must read");
-    let (_uri, text, _mime) = extract_resource(&result.contents);
+    let (_uri, text, _mime) = read_projected_skill_md(
+        &skill,
+        "skill://refund-flow/SKILL.md",
+        "an awkward description must not fail registration",
+    )
+    .await;
     assert_eq!(text, skill.body());
 
     // The registry's own name-identity validation runs inside `entries()`;
@@ -661,6 +676,44 @@ use pmcp::server::workflow::{TaskWorkflowPromptHandler, WorkflowPromptHandler};
 use pmcp::types::{PromptMessage, Role};
 use pmcp::{PromptHandler, SimpleTool, ToolHandler};
 use serde_json::Value;
+
+/// One definition of a fixture tool.
+///
+/// The two tools below were built THREE times — in [`prepend_registry`], in
+/// [`core_builder_first_prompt_message`] and in [`with_fixture_tools`] — with
+/// identical closures, descriptions and schemas. The descriptions in particular
+/// are asserted elsewhere in this file (the assistant plan renders
+/// `1. orders_get - Fetch an order`), so those literals used to live in three
+/// hand-synced places.
+///
+/// The closure clones `result` per call rather than moving it, because
+/// `SimpleTool` needs `Fn`, not `FnOnce`.
+fn fixture_tool(name: &str, description: &str, result: Value) -> impl ToolHandler + 'static {
+    SimpleTool::new(name.to_string(), move |_args, _extra| {
+        let result = result.clone();
+        Box::pin(async move { Ok(result) })
+    })
+    .with_description(description.to_string())
+    .with_schema(serde_json::json!({"type": "object"}))
+}
+
+/// Step 1's tool. Its description is rendered into the assistant plan.
+fn orders_get_tool() -> impl ToolHandler + 'static {
+    fixture_tool(
+        "orders_get",
+        "Fetch an order",
+        serde_json::json!({"order": {"id": "ord-42"}}),
+    )
+}
+
+/// Step 2's tool. Its description is rendered into the assistant plan.
+fn refunds_create_tool() -> impl ToolHandler + 'static {
+    fixture_tool(
+        "refunds_create",
+        "Create a refund",
+        serde_json::json!({"refund": {"id": "rf-1"}}),
+    )
+}
 
 /// Two tool steps, so the suppressed assistant-plan message has a step list
 /// worth suppressing and the projected `## Procedure` has something to
@@ -704,24 +757,8 @@ fn prepend_registry() -> (
     let mut tools = HashMap::new();
     let mut handlers: HashMap<Arc<str>, Arc<dyn ToolHandler>> = HashMap::new();
 
-    register_tool(
-        &mut tools,
-        &mut handlers,
-        SimpleTool::new("orders_get", |_args, _extra| {
-            Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
-        })
-        .with_description("Fetch an order")
-        .with_schema(serde_json::json!({"type": "object"})),
-    );
-    register_tool(
-        &mut tools,
-        &mut handlers,
-        SimpleTool::new("refunds_create", |_args, _extra| {
-            Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
-        })
-        .with_description("Create a refund")
-        .with_schema(serde_json::json!({"type": "object"})),
-    );
+    register_tool(&mut tools, &mut handlers, orders_get_tool());
+    register_tool(&mut tools, &mut handlers, refunds_create_tool());
 
     (tools, handlers)
 }
@@ -1108,22 +1145,8 @@ async fn core_builder_first_prompt_message(prepend: bool) -> String {
         // Tools must be registered BEFORE `prompt_workflow`, which snapshots the
         // tool registry at registration time; without them
         // `create_assistant_plan()?` fails and no transcript is produced at all.
-        .tool(
-            "orders_get",
-            SimpleTool::new("orders_get", |_args, _extra| {
-                Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
-            })
-            .with_description("Fetch an order")
-            .with_schema(serde_json::json!({"type": "object"})),
-        )
-        .tool(
-            "refunds_create",
-            SimpleTool::new("refunds_create", |_args, _extra| {
-                Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
-            })
-            .with_description("Create a refund")
-            .with_schema(serde_json::json!({"type": "object"})),
-        );
+        .tool("orders_get", orders_get_tool())
+        .tool("refunds_create", refunds_create_tool());
 
     if prepend {
         // Ordering is load-bearing and documented on the setter: it applies to
@@ -1201,69 +1224,69 @@ async fn server_core_builder_prompt_workflow_defaults_to_no_prepend() {
 /// or `create_assistant_plan()?` fails and no transcript is produced at all.
 fn with_fixture_tools(builder: pmcp::ServerBuilder) -> pmcp::ServerBuilder {
     builder
-        .tool(
-            "orders_get",
-            SimpleTool::new("orders_get", |_args, _extra| {
-                Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
-            })
-            .with_description("Fetch an order")
-            .with_schema(serde_json::json!({"type": "object"})),
-        )
-        .tool(
-            "refunds_create",
-            SimpleTool::new("refunds_create", |_args, _extra| {
-                Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
-            })
-            .with_description("Create a refund")
-            .with_schema(serde_json::json!({"type": "object"})),
-        )
+        .tool("orders_get", orders_get_tool())
+        .tool("refunds_create", refunds_create_tool())
 }
 
-/// GATE B, `ServerBuilder` half. This builder has no task wrap, and
-/// `Server::get_prompt` hands back the registered handler directly, so the
-/// transcript is reachable without the request/response round trip above.
-#[tokio::test]
-async fn server_builder_prompt_workflow_reaches_the_prepend() {
-    let body = prepend_workflow().as_skill().body().to_string();
-
-    let server = with_fixture_tools(
+/// Drive a `ServerBuilder`-built server to its workflow prompt and return the
+/// first message's text.
+///
+/// The `ServerCoreBuilder` twin above is [`core_builder_first_prompt_message`];
+/// this is the same shape, so the two halves of GATE B read as one pair of
+/// experiments rather than one factored test and one inlined one. This builder
+/// has no task wrap and `Server::get_prompt` hands back the registered handler
+/// directly, so no request/response round trip is needed here.
+///
+/// The OFF case omits the setter entirely, so what it measures is the DEFAULT
+/// rather than an explicit `false`.
+async fn server_builder_first_prompt_message(prepend: bool) -> String {
+    let builder = with_fixture_tools(
         pmcp::Server::builder()
             .name("prepend-server-fixture")
             .version("1.0.0"),
-    )
-    .with_workflow_skill_prepend(true)
-    .prompt_workflow(prepend_workflow())
-    .expect("the fixture workflow validates")
-    .build()
-    .expect("the server builds");
-    let prompt = server
-        .get_prompt("refund_flow")
-        .expect("prompt_workflow registered the handler");
-    let result = prompt
-        .handle(prepend_args(), RequestHandlerExtra::default())
-        .await
-        .expect("the workflow prompt resolves");
+    );
+    let builder = if prepend {
+        builder.with_workflow_skill_prepend(true)
+    } else {
+        builder
+    };
 
-    assert_eq!(message_text(&result.messages[0]), body);
-
-    // Negative case: the same construction WITHOUT the setter is flag-off.
-    let plain = with_fixture_tools(
-        pmcp::Server::builder()
-            .name("prepend-server-fixture")
-            .version("1.0.0"),
-    )
-    .prompt_workflow(prepend_workflow())
-    .expect("the fixture workflow validates")
-    .build()
-    .expect("the server builds");
-    let plain_result = plain
+    let server = builder
+        .prompt_workflow(prepend_workflow())
+        .expect("the fixture workflow validates")
+        .build()
+        .expect("the server builds");
+    let result = server
         .get_prompt("refund_flow")
         .expect("prompt_workflow registered the handler")
         .handle(prepend_args(), RequestHandlerExtra::default())
         .await
         .expect("the workflow prompt resolves");
-    assert_ne!(message_text(&plain_result.messages[0]), body);
-    assert!(message_text(&plain_result.messages[0]).starts_with("I want to process a refund."));
+
+    message_text(&result.messages[0]).to_string()
+}
+
+/// GATE B, `ServerBuilder` half: the prepend is reachable from
+/// `prompt_workflow`, so the anti-drift guarantee holds per SERVER.
+#[tokio::test]
+async fn server_builder_prompt_workflow_reaches_the_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    assert!(body.len() > 200, "projected body was {} bytes", body.len());
+
+    assert_eq!(server_builder_first_prompt_message(true).await, body);
+}
+
+/// ...and the default is OFF, so an existing server's transcript does not move.
+#[tokio::test]
+async fn server_builder_prompt_workflow_defaults_to_no_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    let first = server_builder_first_prompt_message(false).await;
+
+    assert_ne!(first, body, "the prepend must not be default-on");
+    assert!(
+        first.starts_with("I want to process a refund."),
+        "message [0] must still be the user intent, got: {first:?}"
+    );
 }
 
 // ── Phase 126 plan 06 (D-14, SC-2 golden half) ────────────────────────
