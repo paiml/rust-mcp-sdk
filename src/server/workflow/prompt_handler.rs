@@ -209,9 +209,9 @@ impl WorkflowPromptHandler {
     ///
     /// The assistant-plan MESSAGE is suppressed, because the projected body's
     /// `## Procedure` section already carries its step-and-tool list. Only the
-    /// message is dropped: `create_assistant_plan()` is still CALLED and its
-    /// error still propagates, so the "tool not found in registry" validation
-    /// behaves identically in both flag states.
+    /// message is dropped: [`Self::validate_tool_registry`] runs in its place, so
+    /// the "tool not found in registry" validation raises the same error on the
+    /// same step in both flag states — see [`Self::opening_messages`].
     ///
     /// With the flag OFF — the default — the transcript is byte-identical to
     /// what this handler has always produced, message for message and role for
@@ -582,6 +582,76 @@ impl WorkflowPromptHandler {
         Ok(PromptMessage::assistant(Content::text(plan)))
     }
 
+    /// The tool-registry validation half of [`Self::create_assistant_plan`],
+    /// without the rendering.
+    ///
+    /// `create_assistant_plan` does two things: it raises
+    /// `Error::Internal("Tool '{}' not found in registry")` for the first step
+    /// whose tool is absent, and it renders the plan text. When the projected
+    /// skill body already carries the step-and-tool list the rendered message is
+    /// dropped — but the validation must still run, because flag-off callers have
+    /// that error today. This is that validation on its own.
+    ///
+    /// The error value, its message and the step it fires on are identical to
+    /// [`Self::create_assistant_plan`]'s: same iteration order, same lookup, same
+    /// `Error::Internal` construction.
+    fn validate_tool_registry(&self) -> Result<()> {
+        for step in self.workflow.steps() {
+            if let Some(tool_handle) = step.tool() {
+                self.tools.get(tool_handle.name()).ok_or_else(|| {
+                    crate::Error::Internal(format!(
+                        "Tool '{}' not found in registry",
+                        tool_handle.name()
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The header messages every workflow transcript opens with.
+    ///
+    /// THE single source of the opening sequence — the D-04a projected prepend,
+    /// the user-intent message, and the assistant plan unless the prepend already
+    /// carries it. [`Self::handle`] and
+    /// [`TaskWorkflowPromptHandler`](super::TaskWorkflowPromptHandler)'s
+    /// independent message-building branch both push exactly this vector, which
+    /// is what makes it impossible for the two handlers to diverge anywhere in
+    /// the header, not just at message `[0]`.
+    ///
+    /// # Why the plan is suppressed rather than skipped
+    ///
+    /// When the prepend is present the plan MESSAGE is dropped, but the
+    /// tool-registry validation it carries is not: `validate_tool_registry()`
+    /// runs in its place and its `?` propagates identically. Guarding the whole
+    /// `create_assistant_plan()` call instead would silently delete a validation
+    /// that flag-off callers have today. Splitting it this way also stops the
+    /// plan text — one `format!` temporary per step into a growing `String`, plus
+    /// a `PromptMessage` — from being rendered and immediately dropped on a hot
+    /// path.
+    ///
+    /// The prepend is inserted FIRST because the five later early-return /
+    /// `break` exits in `handle` each build a `GetPromptResult` from whatever
+    /// `messages` holds; prepending here is what makes the projected body message
+    /// `[0]` on every one of those paths.
+    pub(crate) fn opening_messages(
+        &self,
+        args: &HashMap<String, String>,
+    ) -> Result<Vec<PromptMessage>> {
+        let prepend = self.projected_prepend();
+        let suppress_plan = prepend.is_some();
+
+        let mut messages = Vec::with_capacity(3);
+        messages.extend(prepend);
+        messages.push(self.create_user_intent(args));
+        if suppress_plan {
+            self.validate_tool_registry()?;
+        } else {
+            messages.push(self.create_assistant_plan()?);
+        }
+        Ok(messages)
+    }
+
     /// Create assistant message announcing the tool call with resolved parameters
     pub(crate) fn create_tool_call_announcement(
         &self,
@@ -885,33 +955,12 @@ impl PromptHandler for WorkflowPromptHandler {
                 .is_some()
         );
 
-        let mut messages = Vec::new();
+        // 0️⃣ 1️⃣ 2️⃣ The header sequence: D-04a projected prepend, user intent,
+        // assistant plan (suppressed when the prepend already carries it, but
+        // never at the cost of its tool-registry validation). Built by the ONE
+        // producer both this handler and `TaskWorkflowPromptHandler` share.
+        let mut messages = self.opening_messages(&args)?;
         let mut execution_context = ExecutionContext::new();
-
-        // 0️⃣ Projected skill body (D-04a opt-in; `None` unless
-        // `with_projected_skill_prepend(true)` was called). It is inserted HERE,
-        // before the user-intent push, because the five later early-return /
-        // `break` exits each build a `GetPromptResult` from whatever `messages`
-        // holds — prepending at this point is what makes the projected body
-        // message [0] on every one of those paths.
-        let prepend = self.projected_prepend();
-        let suppress_plan = prepend.is_some();
-        messages.extend(prepend);
-
-        // 1️⃣ User Intent Message
-        messages.push(self.create_user_intent(&args));
-
-        // 2️⃣ Assistant Plan Message (list all workflow steps)
-        // Why: this call is the tool-registry validation — it is where
-        // `Error::Internal("Tool '{}' not found in registry")` is raised. It runs
-        // UNCONDITIONALLY and its `?` propagates in both flag states; only the
-        // push of its message is suppressed when the projected body already
-        // carries the step-and-tool list. Guarding the call instead of the push
-        // would silently delete a validation that flag-off callers have today.
-        let plan_message = self.create_assistant_plan()?;
-        if !suppress_plan {
-            messages.push(plan_message);
-        }
 
         // 3️⃣ Execute workflow steps sequentially with progress reporting
         let total_steps = self.workflow.steps().len();

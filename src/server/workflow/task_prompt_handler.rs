@@ -681,7 +681,6 @@ impl PromptHandler for TaskWorkflowPromptHandler {
         // 4. Active execution loop
         let step_count = self.workflow.steps().len();
         let total_steps = step_count;
-        let mut messages: Vec<PromptMessage> = Vec::new();
         let mut execution_context = ExecutionContext::new();
         let mut step_results: Vec<(String, Value)> = Vec::new();
         let mut step_statuses: Vec<StepStatus> = vec![StepStatus::Pending; step_count];
@@ -692,24 +691,12 @@ impl PromptHandler for TaskWorkflowPromptHandler {
         // This branch rebuilds the message list itself rather than delegating to
         // `WorkflowPromptHandler::handle`, so it must reproduce that handler's
         // header sequence exactly — otherwise a `has_task_support(true)` workflow
-        // would get a different transcript from a plain one. The D-04a prepend is
-        // read through the ONE crate-private producer on `inner`, never
-        // re-rendered here: `prepend.is_some()` IS the flag, so the two handlers
-        // cannot drift.
-        let prepend = self.inner.projected_prepend();
-        let suppress_plan = prepend.is_some();
-        messages.extend(prepend);
-        messages.push(self.inner.create_user_intent(&args));
-        // Why: this call is the tool-registry validation — it is where
-        // `Error::Internal("Tool '{}' not found in registry")` is raised. It runs
-        // UNCONDITIONALLY and its `?` propagates in both flag states; only the
-        // push of its message is suppressed when the projected body already
-        // carries the step-and-tool list. Guarding the call instead of the push
-        // would silently delete a validation that flag-off callers have today.
-        let plan_message = self.inner.create_assistant_plan()?;
-        if !suppress_plan {
-            messages.push(plan_message);
-        }
+        // would get a different transcript from a plain one. It does not
+        // reproduce it, it USES it: the whole opening sequence (D-04a prepend,
+        // user intent, and the plan-or-its-validation) comes from the ONE
+        // producer on `inner`, so the two handlers cannot drift anywhere in the
+        // header rather than only at message [0].
+        let mut messages: Vec<PromptMessage> = self.inner.opening_messages(&args)?;
 
         for (idx, step) in self.workflow.steps().iter().enumerate() {
             // Check cancellation
