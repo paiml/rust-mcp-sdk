@@ -140,6 +140,15 @@ pub struct ServerCoreBuilder {
     /// `.skill(...)` / `.skills(...)` calls never produce nested wrappers.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pending_skills: Option<Skills>,
+    /// Whether workflows registered from here on get the D-04a projected-skill
+    /// prepend as prompt message `[0]`, set via
+    /// [`Self::with_workflow_skill_prepend`].
+    ///
+    /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
+    /// workflows registered after the setter and not to earlier ones. Default
+    /// `false`, so every existing server's transcript is byte-identical.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    prepend_projected_skill: bool,
 }
 
 impl Default for ServerCoreBuilder {
@@ -188,6 +197,8 @@ impl ServerCoreBuilder {
             payload_limits: PayloadLimits::default(),
             #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
             pending_skills: None,
+            #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+            prepend_projected_skill: false,
         }
     }
 
@@ -464,6 +475,52 @@ impl ServerCoreBuilder {
     #[must_use]
     pub fn skill(self, skill: Skill) -> Self {
         self.skills(Skills::new().add(skill))
+    }
+
+    /// Prepend the projected skill body to workflow prompts (default: **off**).
+    ///
+    /// Turns on
+    /// [`WorkflowPromptHandler::with_projected_skill_prepend`](crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend)
+    /// for every workflow this builder registers, so `prompts/get` opens with
+    /// the same bytes the server serves at `skill://{slug}/SKILL.md` — one
+    /// string and one digest, with no variant to keep in sync. Without this
+    /// method the opt-in is reachable only by hand-constructing a
+    /// `WorkflowPromptHandler` and registering it with `.prompt(name, handler)`,
+    /// which would make the guarantee true per workflow VALUE but not per
+    /// SERVER.
+    ///
+    /// # Ordering matters
+    ///
+    /// [`Self::prompt_workflow`] reads this setting at REGISTRATION time, so it
+    /// applies to workflows registered AFTER this call and leaves earlier ones
+    /// alone. Call it before the workflows it should affect:
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(all(feature = "skills", not(target_arch = "wasm32")))] {
+    /// # fn main() -> Result<(), pmcp::Error> {
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    ///
+    /// let server = ServerCoreBuilder::new()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    ///     .build()?;
+    /// # let _ = server;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// The default is `false`, so an existing server's transcripts do not move.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_workflow_skill_prepend(mut self, on: bool) -> Self {
+        self.prepend_projected_skill = on;
+        self
     }
 
     /// Register a registry of SEP-2640 Agent Skills.
@@ -1248,6 +1305,12 @@ impl ServerCoreBuilder {
             middleware_executor,
             self.resources.clone(),
         );
+
+        // D-04a: apply the projected-skill prepend BEFORE the task wrap below,
+        // so a `has_task_support` workflow inherits the setting through its
+        // `inner` handler and there is no second call site to keep in sync.
+        #[cfg(feature = "skills")]
+        let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
 
         // Wrap in TaskWorkflowPromptHandler if task support is enabled
         if has_task_support {

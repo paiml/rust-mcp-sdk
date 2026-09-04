@@ -1082,3 +1082,186 @@ async fn flag_on_still_rejects_an_unregistered_tool() {
         "the two flag states must fail identically"
     );
 }
+
+// ── Phase 126 plan 05 Task 4 (GATE B = `add-builder-path`) ────────────
+//
+// REVIEWS finding 2: an opt-in reachable only by hand-constructing a
+// `WorkflowPromptHandler` makes the anti-drift claim true per workflow VALUE
+// and false per SERVER. These two tests are the difference between the claim
+// being proven and merely asserted: one reaches message [0] through the NORMAL
+// registration API, the other proves the default is still off.
+
+/// Drive a `ServerCoreBuilder`-built core to a `prompts/get` and return the
+/// first message's text.
+///
+/// `ServerCore` exposes no prompt accessor — its only ingress is
+/// `ProtocolHandler::handle_request` — and a v1 core gates every non-`initialize`
+/// request behind the handshake, so the handshake runs first.
+async fn core_builder_first_prompt_message(prepend: bool) -> String {
+    use pmcp::server::core::ProtocolHandler;
+    use pmcp::types::jsonrpc::ResponsePayload;
+    use pmcp::types::{ClientRequest, Request, RequestId};
+
+    let mut builder = pmcp::server::builder::ServerCoreBuilder::new()
+        .name("prepend-core-fixture")
+        .version("1.0.0")
+        // Tools must be registered BEFORE `prompt_workflow`, which snapshots the
+        // tool registry at registration time; without them
+        // `create_assistant_plan()?` fails and no transcript is produced at all.
+        .tool(
+            "orders_get",
+            SimpleTool::new("orders_get", |_args, _extra| {
+                Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
+            })
+            .with_description("Fetch an order")
+            .with_schema(serde_json::json!({"type": "object"})),
+        )
+        .tool(
+            "refunds_create",
+            SimpleTool::new("refunds_create", |_args, _extra| {
+                Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
+            })
+            .with_description("Create a refund")
+            .with_schema(serde_json::json!({"type": "object"})),
+        );
+
+    if prepend {
+        // Ordering is load-bearing and documented on the setter: it applies to
+        // workflows registered AFTER this call.
+        builder = builder.with_workflow_skill_prepend(true);
+    }
+
+    let core = builder
+        .prompt_workflow(prepend_workflow())
+        .expect("the fixture workflow validates")
+        .build()
+        .expect("the core builds");
+    let core: Arc<dyn ProtocolHandler> = Arc::new(core);
+
+    let init: ClientRequest = serde_json::from_value(serde_json::json!({
+        "method": "initialize",
+        "params": {
+            "protocolVersion": pmcp::LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "prepend-fixture", "version": "0.0.0" },
+        },
+    }))
+    .expect("initialize deserializes into ClientRequest");
+    let handshake = core
+        .handle_request(RequestId::from(0i64), Request::Client(Box::new(init)), None)
+        .await;
+    assert!(
+        matches!(handshake.payload, ResponsePayload::Result(_)),
+        "the handshake must succeed before the prompts/get below means anything"
+    );
+
+    let get: ClientRequest = serde_json::from_value(serde_json::json!({
+        "method": "prompts/get",
+        "params": { "name": "refund_flow", "arguments": { "order_id": "ord-42" } },
+    }))
+    .expect("prompts/get deserializes into ClientRequest");
+    let response = core
+        .handle_request(RequestId::from(1i64), Request::Client(Box::new(get)), None)
+        .await;
+    let ResponsePayload::Result(result) = response.payload else {
+        panic!("a ServerCoreBuilder core answers prompts/get, got {response:?}");
+    };
+
+    result["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("message [0] carries text")
+        .to_string()
+}
+
+/// GATE B, `ServerCoreBuilder` half: the prepend is reachable from
+/// `prompt_workflow`, so the anti-drift guarantee holds per SERVER.
+#[tokio::test]
+async fn server_core_builder_prompt_workflow_reaches_the_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    assert!(body.len() > 200, "projected body was {} bytes", body.len());
+
+    assert_eq!(core_builder_first_prompt_message(true).await, body);
+}
+
+/// ...and the default is OFF, so an existing server's transcript does not move.
+#[tokio::test]
+async fn server_core_builder_prompt_workflow_defaults_to_no_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    let first = core_builder_first_prompt_message(false).await;
+
+    assert_ne!(first, body, "the prepend must not be default-on");
+    assert!(
+        first.starts_with("I want to process a refund."),
+        "message [0] must still be the user intent, got: {first:?}"
+    );
+}
+
+/// Register the two fixture tools on a `ServerBuilder`. `prompt_workflow`
+/// snapshots the tool registry at registration time, so this must run BEFORE it
+/// or `create_assistant_plan()?` fails and no transcript is produced at all.
+fn with_fixture_tools(builder: pmcp::ServerBuilder) -> pmcp::ServerBuilder {
+    builder
+        .tool(
+            "orders_get",
+            SimpleTool::new("orders_get", |_args, _extra| {
+                Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
+            })
+            .with_description("Fetch an order")
+            .with_schema(serde_json::json!({"type": "object"})),
+        )
+        .tool(
+            "refunds_create",
+            SimpleTool::new("refunds_create", |_args, _extra| {
+                Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
+            })
+            .with_description("Create a refund")
+            .with_schema(serde_json::json!({"type": "object"})),
+        )
+}
+
+/// GATE B, `ServerBuilder` half. This builder has no task wrap, and
+/// `Server::get_prompt` hands back the registered handler directly, so the
+/// transcript is reachable without the request/response round trip above.
+#[tokio::test]
+async fn server_builder_prompt_workflow_reaches_the_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+
+    let server = with_fixture_tools(
+        pmcp::Server::builder()
+            .name("prepend-server-fixture")
+            .version("1.0.0"),
+    )
+    .with_workflow_skill_prepend(true)
+    .prompt_workflow(prepend_workflow())
+    .expect("the fixture workflow validates")
+    .build()
+    .expect("the server builds");
+    let prompt = server
+        .get_prompt("refund_flow")
+        .expect("prompt_workflow registered the handler");
+    let result = prompt
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect("the workflow prompt resolves");
+
+    assert_eq!(message_text(&result.messages[0]), body);
+
+    // Negative case: the same construction WITHOUT the setter is flag-off.
+    let plain = with_fixture_tools(
+        pmcp::Server::builder()
+            .name("prepend-server-fixture")
+            .version("1.0.0"),
+    )
+    .prompt_workflow(prepend_workflow())
+    .expect("the fixture workflow validates")
+    .build()
+    .expect("the server builds");
+    let plain_result = plain
+        .get_prompt("refund_flow")
+        .expect("prompt_workflow registered the handler")
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect("the workflow prompt resolves");
+    assert_ne!(message_text(&plain_result.messages[0]), body);
+    assert!(message_text(&plain_result.messages[0]).starts_with("I want to process a refund."));
+}
