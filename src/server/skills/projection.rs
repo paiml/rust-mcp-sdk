@@ -576,6 +576,58 @@ mod tests {
             .to_string()
     }
 
+    /// The SC-3 fixture: one workflow exercising every renderable fact.
+    ///
+    /// Shared by the SC-3 coverage suite and the SC-2 / SC-5 property suite so
+    /// the coverage surface and the determinism surface are provably the same
+    /// workflow.
+    fn kitchen_sink_workflow() -> SequentialWorkflow {
+        kitchen_sink_workflow_with_execution_mechanics(false)
+    }
+
+    /// The SC-3 fixture, with both D-11-excluded server-execution accessors
+    /// driven together.
+    ///
+    /// `enabled` sets `SequentialWorkflow::with_task_support` AND
+    /// `WorkflowStep::retryable` on both tool steps. Driving them together is
+    /// what makes the exclusion pin non-vacuous: a fixture that sets only one,
+    /// or neither, would compare two bodies that were never going to differ for
+    /// a reason the test is claiming to prove.
+    fn kitchen_sink_workflow_with_execution_mechanics(enabled: bool) -> SequentialWorkflow {
+        SequentialWorkflow::new("refund_flow", "Process a customer refund")
+            .with_task_support(enabled)
+            .argument("order_id", "The order to refund", true)
+            .argument("reason", "Why the customer wants a refund", false)
+            .instruction(InternalPromptMessage::new(
+                Role::System,
+                PromptContent::Text("Never refund more than the original charge.".to_string()),
+            ))
+            .step(
+                WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                    .arg("id", DataSource::prompt_arg("order_id"))
+                    .arg("include_lines", DataSource::constant(json!(true)))
+                    .bind("order")
+                    .retryable(enabled),
+            )
+            .step(
+                WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                    .arg("amount", DataSource::from_step_field("order", "total"))
+                    .with_guidance("Confirm with the customer before issuing the refund.")
+                    .with_template_binding(
+                        "zeta_region",
+                        DataSource::from_step_field("order", "region"),
+                    )
+                    .with_template_binding("alpha_currency", DataSource::prompt_arg("reason"))
+                    .bind("refund")
+                    .retryable(enabled),
+            )
+            .step(
+                WorkflowStep::fetch_resources("read_policy")
+                    .with_resource("docs://refund-policy")
+                    .expect("valid resource URI"),
+            )
+    }
+
     /// Render a workflow carrying exactly one instruction message.
     fn body_with_instruction(content: PromptContent) -> String {
         SequentialWorkflow::new("refund_flow", "Process a refund")
@@ -1153,6 +1205,241 @@ mod tests {
         assert!(
             body.contains("Judgment: Confirm with the customer first."),
             "body was:\n{body}"
+        );
+    }
+
+    // ── SC-3: string-by-string coverage of every workflow fact ────────
+
+    /// SC-3 / D-11: every renderable workflow fact gets its OWN assertion with
+    /// its OWN failure message naming that fact.
+    ///
+    /// SC-3's wording is explicit — "asserted string-by-string rather than by a
+    /// length or substring heuristic" — so a single omnibus `contains` over a
+    /// concatenation would be exactly the heuristic it forbids.
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    // Why: a flat sequence of independent one-fact assertions. PMAT counts each
+    // `assert!` as a branch, but there is no nesting and no control flow to
+    // decompose — splitting this into helper fns would hide which fact failed,
+    // which is the entire point of SC-3's per-fact failure messages.
+    fn sc3_every_workflow_fact_renders() {
+        let body = kitchen_sink_workflow().as_skill().body().to_string();
+
+        // Anti-vacuity first: a scan over an empty body proves nothing.
+        assert!(
+            body.len() > 400,
+            "SC-3 anti-vacuity: body was only {} bytes",
+            body.len()
+        );
+
+        // — identity —
+        assert!(
+            body.starts_with("---\nname: \"refund-flow\"\n"),
+            "fact: the slugified workflow name in the frontmatter `name` key; body was:\n{body}"
+        );
+        assert!(
+            body.contains("Process a customer refund"),
+            "fact: the workflow description; body was:\n{body}"
+        );
+
+        // — arguments —
+        assert!(
+            body.contains("`order_id`"),
+            "fact: argument name `order_id`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("The order to refund"),
+            "fact: the `order_id` description; body was:\n{body}"
+        );
+        assert!(
+            body.contains("`order_id` (required)"),
+            "fact: the `required` marker on `order_id`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("`reason`"),
+            "fact: argument name `reason`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("Why the customer wants a refund"),
+            "fact: the `reason` description; body was:\n{body}"
+        );
+        assert!(
+            body.contains("`reason` (optional)"),
+            "fact: the `optional` marker on `reason`; body was:\n{body}"
+        );
+
+        // — instructions —
+        assert!(
+            body.contains("Never refund more than the original charge."),
+            "fact: the workflow-level instruction text; body was:\n{body}"
+        );
+
+        // — step names —
+        assert!(
+            body.contains("### Step 1: fetch_order"),
+            "fact: step name `fetch_order`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("### Step 2: issue_refund"),
+            "fact: step name `issue_refund`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("### Step 3: read_policy"),
+            "fact: step name `read_policy` (the resource-only step); body was:\n{body}"
+        );
+
+        // — tool names —
+        assert!(
+            body.contains("Call tool `orders_get`."),
+            "fact: tool name `orders_get`; body was:\n{body}"
+        );
+        assert!(
+            body.contains("Call tool `payments_refund`."),
+            "fact: tool name `payments_refund`; body was:\n{body}"
+        );
+
+        // — argument bindings and their data sources —
+        assert!(
+            body.contains("- Argument `id`: the `order_id` input"),
+            "fact: the `id` binding and its PromptArg source; body was:\n{body}"
+        );
+        assert!(
+            body.contains("- Argument `include_lines`: the constant value `true`"),
+            "fact: the `include_lines` binding and its Constant source; body was:\n{body}"
+        );
+        assert!(
+            body.contains("- Argument `amount`: the `total` field of the result of `order`"),
+            "fact: the `amount` binding and its StepOutput source; body was:\n{body}"
+        );
+
+        // — result bindings —
+        assert!(
+            body.contains("Save the result as `order`."),
+            "fact: the `order` result binding; body was:\n{body}"
+        );
+        assert!(
+            body.contains("Save the result as `refund`."),
+            "fact: the `refund` result binding; body was:\n{body}"
+        );
+
+        // — template bindings —
+        assert!(
+            body.contains("- Template variable `alpha_currency`: the `reason` input"),
+            "fact: the `alpha_currency` template binding; body was:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "- Template variable `zeta_region`: the `region` field of the result of `order`"
+            ),
+            "fact: the `zeta_region` template binding; body was:\n{body}"
+        );
+
+        // — attached resources —
+        assert!(
+            body.contains("Read the resource `docs://refund-policy`."),
+            "fact: the attached resource URI; body was:\n{body}"
+        );
+
+        // — guidance —
+        assert!(
+            body.contains("Judgment: Confirm with the customer before issuing the refund."),
+            "fact: the `with_guidance` line; body was:\n{body}"
+        );
+    }
+
+    // ── D-11: the exclusion pin (REVIEWS fable (f)) ───────────────────
+
+    /// The PRIMARY D-11 exclusion proof: the two excluded server-execution
+    /// accessors cannot influence a single rendered byte.
+    ///
+    /// Asserting only that their NAMES are absent proves little — the render
+    /// was never going to print an accessor's identifier. Byte equality across
+    /// the two settings is the real invariant.
+    #[test]
+    fn sc3_excluded_execution_mechanics_change_no_byte() {
+        let defaults = kitchen_sink_workflow_with_execution_mechanics(false)
+            .as_skill()
+            .body()
+            .to_string();
+        let enabled = kitchen_sink_workflow_with_execution_mechanics(true)
+            .as_skill()
+            .body()
+            .to_string();
+
+        // Anti-vacuity BEFORE the equality: two empty bodies are also equal.
+        assert!(
+            defaults.len() > 400,
+            "D-11 anti-vacuity: the defaults body was only {} bytes",
+            defaults.len()
+        );
+        assert!(
+            defaults.starts_with("---\nname: \"refund-flow\"\n"),
+            "D-11 anti-vacuity: the defaults body did not begin with the expected \
+             frontmatter; body was:\n{defaults}"
+        );
+
+        assert_eq!(
+            defaults, enabled,
+            "D-11: `has_task_support` and `is_retryable` are excluded from the \
+             render on purpose, so setting both to non-default values must not \
+             change a single byte"
+        );
+    }
+
+    /// Supplementary readability guard beside the byte-equality pin above.
+    /// It no longer carries the D-11 claim.
+    #[test]
+    fn sc3_excluded_accessor_names_are_absent() {
+        let body = kitchen_sink_workflow_with_execution_mechanics(true)
+            .as_skill()
+            .body()
+            .to_string();
+        for name in [
+            "retryable",
+            "is_retryable",
+            "task_support",
+            "has_task_support",
+            "task support",
+        ] {
+            assert!(
+                !body.contains(name),
+                "the excluded accessor `{name}` must not appear in the body:\n{body}"
+            );
+        }
+    }
+
+    /// D-12: no tool description and no tool input schema reaches the body.
+    ///
+    /// The client has `tools/list` one call away; a digested copy of a tool's
+    /// description could only drift from the live surface.
+    #[test]
+    fn sc3_no_tool_schema_or_description_reaches_the_body() {
+        let body = kitchen_sink_workflow().as_skill().body().to_string();
+        for marker in ["inputSchema", "input_schema", "properties", "\"type\":"] {
+            assert!(
+                !body.contains(marker),
+                "D-12: `{marker}` suggests a tool schema reached the body:\n{body}"
+            );
+        }
+    }
+
+    /// D-13: the frontmatter carries exactly two keys.
+    #[test]
+    fn sc3_frontmatter_carries_exactly_two_keys() {
+        let skill = kitchen_sink_workflow().as_skill();
+        let value = parsed_frontmatter(skill.body());
+        let obj = value
+            .as_object()
+            .expect("frontmatter must parse to a mapping");
+        assert_eq!(
+            obj.len(),
+            2,
+            "D-13: frontmatter must carry exactly `name` and `description`, got {obj:?}"
+        );
+        assert!(obj.contains_key("name"), "D-13: missing `name`");
+        assert!(
+            obj.contains_key("description"),
+            "D-13: missing `description`"
         );
     }
 
