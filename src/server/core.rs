@@ -2544,29 +2544,35 @@ const SKILLS_GET_URI_ECHO_LIMIT: usize = 96;
 /// attacker-controlled, so a byte-offset truncation would be a remotely reachable
 /// panic rather than a safety measure.
 ///
-/// # Control characters are replaced, not merely bounded
+/// # Record-forging characters are replaced, not merely bounded
 ///
 /// A length bound alone addresses only the amplification half of the ASVS V7
 /// threat. The injection half needs the CR/LF (and ANSI escape) to go: a URI of
 /// `skill://x\n2026-01-01 ERROR audit: auth bypassed` is well under the limit,
 /// so it reached the `-32602` message intact and appeared as its own record in
-/// any line-oriented log that rendered it. Every `char::is_control` character is
-/// replaced by U+FFFD, which keeps the message useful to the caller who mistyped
-/// a URI while making one forged line impossible.
+/// any line-oriented log that rendered it.
+///
+/// The classification and the substitution are NOT decided here: they come from
+/// [`crate::shared::log_sanitize::sanitize_for_log`], which the skills
+/// projection's own log sanitizer also uses. Sharing them is the point — this
+/// function previously tested `char::is_control()` alone, which is exactly the
+/// `Cc` category and therefore reaches NEITHER `U+2028` (LINE SEPARATOR) nor
+/// `U+2029` (PARAGRAPH SEPARATOR), both of which several log processors and
+/// JS-based log viewers treat as record terminators. The projection's copy had
+/// already closed that gap; this one had not.
 ///
 /// # The scan is bounded by the LIMIT, not by the input
 ///
-/// The truncation test reads one character past the budget rather than counting
-/// the whole string, so a body-cap-sized `uri` costs O(limit) work here instead
-/// of O(len) — the function that exists to bound hostile input does not itself
-/// walk all of it.
+/// The head is taken FIRST and sanitized second, and the truncation test reads
+/// one character past the budget rather than counting the whole string — so a
+/// body-cap-sized `uri` costs O(limit) work here instead of O(len). The function
+/// that exists to bound hostile input does not itself walk all of it. The one
+/// intermediate `String` is bounded by [`SKILLS_GET_URI_ECHO_LIMIT`] characters
+/// and buys the shared classification; this is an error path, not a hot one.
 fn truncated_uri_for_error(uri: &str) -> String {
     let mut chars = uri.chars();
-    let mut out: String = chars
-        .by_ref()
-        .take(SKILLS_GET_URI_ECHO_LIMIT)
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect();
+    let head: String = chars.by_ref().take(SKILLS_GET_URI_ECHO_LIMIT).collect();
+    let mut out = crate::shared::log_sanitize::sanitize_for_log(&head);
     if chars.next().is_some() {
         out.push('…');
     }
@@ -5213,6 +5219,52 @@ mod tests {
     use super::*;
     use crate::server::tool_middleware::ToolMiddlewareChain;
     use crate::types::ClientCapabilities;
+
+    /// The `skills/get` URI echo replaces every record-forging character, not
+    /// just the `Cc` set.
+    ///
+    /// `U+2028`/`U+2029` are the regression this pins: they are LINE SEPARATOR
+    /// and PARAGRAPH SEPARATOR, categories `Zl`/`Zp`, so `char::is_control()` —
+    /// which this function once tested alone — returns `false` for both while
+    /// several log processors and JS-based log viewers treat them as record
+    /// terminators. The premise is asserted below so the test cannot pass for a
+    /// stale reason if `char::is_control` ever widens.
+    #[test]
+    fn skills_get_uri_echo_replaces_every_record_forging_character() {
+        assert!(!'\u{2028}'.is_control());
+        assert!(!'\u{2029}'.is_control());
+
+        assert_eq!(
+            truncated_uri_for_error("skill://x\n2026-01-01 ERROR audit: bypassed"),
+            "skill://x\u{FFFD}2026-01-01 ERROR audit: bypassed"
+        );
+        assert_eq!(
+            truncated_uri_for_error("skill://a\u{2028}b\u{2029}c"),
+            "skill://a\u{FFFD}b\u{FFFD}c"
+        );
+        // Anti-vacuity: an ordinary URI survives byte for byte, so the
+        // assertions above are not trivially true of every input.
+        assert_eq!(
+            truncated_uri_for_error("skill://ok/SKILL.md"),
+            "skill://ok/SKILL.md"
+        );
+    }
+
+    /// The echo is bounded in CHARACTERS, and the marker is appended only when
+    /// the input actually overran the budget.
+    #[test]
+    fn skills_get_uri_echo_truncates_on_a_character_boundary() {
+        let long: String = "é".repeat(SKILLS_GET_URI_ECHO_LIMIT + 5);
+        let out = truncated_uri_for_error(&long);
+        assert_eq!(out.chars().count(), SKILLS_GET_URI_ECHO_LIMIT + 1);
+        assert!(out.ends_with('…'));
+
+        // Exactly at the limit: no marker.
+        let exact: String = "é".repeat(SKILLS_GET_URI_ECHO_LIMIT);
+        let out = truncated_uri_for_error(&exact);
+        assert_eq!(out.chars().count(), SKILLS_GET_URI_ECHO_LIMIT);
+        assert!(!out.ends_with('…'));
+    }
 
     struct TestTool;
 

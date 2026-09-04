@@ -255,48 +255,16 @@ fn fallback_slug(original_name: &str) -> String {
     format!("workflow-{hex}")
 }
 
-/// `true` for the two Unicode line separators that are NOT Unicode `Cc`.
+/// The log-forging classification and the lossy substitution both live in
+/// [`crate::shared::log_sanitize`], shared with `server::core`'s `skills/get`
+/// URI echo — the same mitigation, previously written twice and already drifted
+/// (that copy tested `is_control()` alone, reaching neither `U+2028` nor
+/// `U+2029`).
 ///
-/// `char::is_control()` is exactly the `Cc` category (`U+0000..=U+001F`,
-/// `U+007F..=U+009F`), so a bare `is_control()` test does NOT reach LINE
-/// SEPARATOR (`U+2028`, category `Zl`) or PARAGRAPH SEPARATOR (`U+2029`,
-/// category `Zp`). Both are nevertheless line terminators to the consumers
-/// this module hands text to — YAML 1.1's scanner and line-oriented log
-/// processors alike — so every site here that reasons about "characters that
-/// can end a line" must test this IN ADDITION to `is_control()`.
-///
-/// Extracted so the encoder ([`yaml_double_quoted`]) and the log sanitizer
-/// ([`sanitize_for_log`]) cannot drift apart on the classification again; they
-/// share the predicate and differ only in what they substitute (CR-01, WR-06).
-const fn is_unicode_line_separator(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
-}
-
-/// Replace every control character with `U+FFFD` before the value reaches a
-/// `tracing` field (T-126-01).
-///
-/// A workflow name is author-supplied and reaches a log sink; an embedded
-/// newline or terminal escape could forge a second log record. Follows Phase
-/// 125's WR-04 mitigation at `src/server/core.rs:2563`.
-///
-/// `U+2028`/`U+2029` are replaced alongside the `Cc` set even though the
-/// substitution differs from [`yaml_double_quoted`]'s: the risk is the same
-/// forged-record one, because several log processors and JS-based log viewers
-/// treat LS/PS as record terminators. A log field has no escape vocabulary to
-/// preserve the character with — it is display text, not a re-parsable scalar —
-/// so lossy replacement is the right disposition here where escaping is the
-/// right one there (WR-06).
-fn sanitize_for_log(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() || is_unicode_line_separator(c) {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
+/// [`yaml_double_quoted`] below shares only the CLASSIFICATION and deliberately
+/// not the substitution: a YAML scalar is re-parsable text with an escape
+/// vocabulary, so it escapes where a log field replaces (WR-06).
+use crate::shared::log_sanitize::{is_unicode_line_separator, sanitize_for_log};
 
 /// Encode `s` as a YAML double-quoted scalar, INCLUDING its surrounding quotes.
 ///
