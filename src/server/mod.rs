@@ -1723,7 +1723,6 @@ impl Server {
     /// already-serialized array keeps the shared projection feature-agnostic and
     /// gives the featureless build the honest answer (an empty catalog) instead of
     /// a second envelope implementation behind a `cfg`.
-    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
     pub(crate) fn handle_skills_list(
         &self,
         id: RequestId,
@@ -1835,7 +1834,6 @@ impl Server {
     /// behind a `cfg`. The serialization is BUILD-time work (see the
     /// `skill_entries` field), so a `skills/get` costs one hash lookup and one
     /// clone of the single matched entry, not a projection of the whole catalog.
-    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
     pub(crate) fn handle_skills_get(
         &self,
         id: RequestId,

@@ -19,6 +19,14 @@
 //! characters rather than replacing them, and shares only the classification
 //! below (WR-06).
 
+// Items here are `pub(crate)` so the enclosing `pub(crate) mod log_sanitize`
+// keeps them crate-internal AND `unreachable_pub`-clean. `redundant_pub_crate`
+// would prefer bare `pub`, but bare `pub` then trips `unreachable_pub` (the
+// module is not publicly reachable) — the two lints are mutually exclusive
+// here, so we keep `pub(crate)` and silence the former, the same way
+// `shared::pending_slot` does.
+#![allow(clippy::redundant_pub_crate)]
+
 /// `true` for the two Unicode line separators that are NOT Unicode `Cc`.
 ///
 /// `char::is_control()` is exactly the `Cc` category (`U+0000..=U+001F`,

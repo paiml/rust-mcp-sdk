@@ -264,7 +264,7 @@ fn fallback_slug(original_name: &str) -> String {
 /// [`yaml_double_quoted`] below shares only the CLASSIFICATION and deliberately
 /// not the substitution: a YAML scalar is re-parsable text with an escape
 /// vocabulary, so it escapes where a log field replaces (WR-06).
-use crate::shared::log_sanitize::{is_unicode_line_separator, sanitize_for_log};
+use crate::shared::log_sanitize::sanitize_for_log;
 
 /// Encode `s` as a YAML double-quoted scalar, INCLUDING its surrounding quotes.
 ///
@@ -1272,6 +1272,11 @@ impl<'w> SkillProjection<'w> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the test below reads the predicate directly: production code in this
+    // module reaches it through `sanitize_for_log`, and the encoder's escape
+    // table spells the two characters out by codepoint.
+    use crate::shared::log_sanitize::is_unicode_line_separator;
+
     use crate::server::workflow::{
         DataSource, InternalPromptMessage, PromptContent, ToolHandle, WorkflowStep,
     };
