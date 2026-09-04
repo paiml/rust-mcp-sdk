@@ -151,7 +151,7 @@ base64 = "0.23"
 jsonwebtoken = { version = "11.0", optional = true }
 
 # SEP-2640 Skills frontmatter extraction (feature `skills`, D-04).
-# Consumer: src/server/skills.rs `parse_frontmatter_value` — the ONE crate-private
+# Consumer: src/server/skills/mod.rs `parse_frontmatter_value` — the ONE crate-private
 # function that touches this crate, so swapping to a maintained fork later is a
 # one-file change. Version matches the dev-dep below and crates/mcp-tester, so no
 # new package enters the graph (already resolved at 0.9.34+deprecated).
@@ -308,7 +308,7 @@ composition = ["streamable-http"]
 # MCP Apps Extension - Interactive UI support for ChatGPT Apps, MCP-UI, and standard MCP hosts
 mcp-apps = []
 # SEP-2640 Skills support — Agent Skills as `ResourceHandler`-served resources
-# plus a parallel prompt fallback. See `src/server/skills.rs` (gated module).
+# plus a parallel prompt fallback. See `src/server/skills/mod.rs` (gated module).
 # Opt-in: NOT in `default`, NOT in `full`. Plan 80-02 fills the module.
 # `dep:serde_yaml` (Phase 125, D-04): verbatim frontmatter extraction for the
 # `skills/list` entry manifests. Deliberately NOT added to `full` / `full-v2` —

@@ -136,6 +136,10 @@ use crate::types::{
     Content, GetPromptResult, ListResourcesResult, PromptMessage, ReadResourceResult, ResourceInfo,
 };
 
+/// Deterministic [`crate::server::workflow::SequentialWorkflow`] -> SEP-2640
+/// [`Skill`] projection.
+pub mod projection;
+
 /// Reverse-domain key under `ServerCapabilities.extensions` advertising
 /// SEP-2640 skill support. Set automatically when any skill is registered.
 pub(crate) const SKILLS_EXTENSION_KEY: &str = "io.modelcontextprotocol/skills";

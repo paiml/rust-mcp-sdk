@@ -903,7 +903,7 @@ test-integration:
 	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test --test '*' --features "full"
 	@echo "$(GREEN)✓ Integration tests passed$(NC)"
 
-# The GATE's reach into `src/server/skills.rs` (Phase 125, 125-CONTEXT D-09).
+# The GATE's reach into `src/server/skills/` (Phase 125, 125-CONTEXT D-09).
 #
 # Same shape as the `test-cargo-pmcp` leg above -- the gate is green on what it
 # reaches, and the failures live in what it does not. MEASURED (125-RESEARCH.md
@@ -953,7 +953,7 @@ test-integration:
 # still exit 0.
 SKILLS_FEATURES := skills,streamable-http,http-client,testing
 
-# The GATE's LINT reach into `src/server/skills.rs` — the other half of D-09.
+# The GATE's LINT reach into `src/server/skills/` — the other half of D-09.
 #
 # `make lint` pins `--features "full"` and `skills` is in neither `full` nor
 # `full-v2`, so the pedantic+nursery policy CLAUDE.md calls zero-tolerance never
@@ -1498,7 +1498,7 @@ doc-open: doc
 # NOTE the `skills` member of the list below (Phase 125, D-09). This list is NOT
 # the `full` / `full-v2` enumerated pair -- it is local to this target and no
 # tripwire derives anything from it -- so extending it is safe, and without
-# `skills` the whole of `src/server/skills.rs` was invisible to the ONLY
+# `skills` the whole of `src/server/skills/` was invisible to the ONLY
 # zero-tolerance rustdoc check that runs locally.
 .PHONY: doc-check
 doc-check:
@@ -1910,7 +1910,7 @@ quality-gate:
 	@$(MAKE) test-skills
 	# lint-skills, for the identical reason one gate leg over: `make lint` also
 	# pins `--features "full"`, so the pedantic+nursery policy never compiled
-	# `src/server/skills.rs` at all.
+	# `src/server/skills/` at all.
 	@$(MAKE) lint-skills
 	@$(MAKE) pmcp-package-gate
 	@$(MAKE) audit
