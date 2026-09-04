@@ -259,6 +259,25 @@ impl WorkflowPromptHandler {
         self
     }
 
+    /// Skills-off twin of [`Self::with_projected_skill_prepend`].
+    ///
+    /// Signature-identical, ignores `on`, returns `self` unchanged — there is no
+    /// projection to render without the feature, so there is nothing to store.
+    ///
+    /// Why it exists: with this counterpart, neither builder's
+    /// `prompt_workflow` needs a `#[cfg]` around its call, so the registration
+    /// path is literally the same code in both feature configurations. That is
+    /// the same reasoning [`Self::projected_prepend`] and its null twin below
+    /// record, applied one layer up — and it is this repo's recorded house
+    /// decision (PROJECT.md, Key Decisions): paired modules for v1 severance,
+    /// not `#[cfg]` at call sites. Only the two PUBLIC builder setters stay
+    /// gated; the `bool` they write costs nothing to carry.
+    #[cfg(not(feature = "skills"))]
+    #[must_use]
+    pub fn with_projected_skill_prepend(self, _on: bool) -> Self {
+        self
+    }
+
     /// The single producer of the D-04a prepended message.
     ///
     /// Returns `None` when the opt-in is off. Otherwise clones the STORED body

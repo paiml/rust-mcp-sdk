@@ -3338,7 +3338,10 @@ pub struct ServerBuilder {
     /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
     /// workflows registered after the setter and not to earlier ones. Default
     /// `false`, so every existing server's transcript is byte-identical.
-    #[cfg(feature = "skills")]
+    ///
+    /// UNGATED, though the setter that writes it is not — see the identically
+    /// named field on [`ServerCoreBuilder`](crate::server::ServerCoreBuilder)
+    /// for why.
     prepend_projected_skill: bool,
     /// Legacy experimental task router backend (set via [`Self::with_task_store`]).
     #[cfg(not(target_arch = "wasm32"))]
@@ -3443,7 +3446,6 @@ impl ServerBuilder {
             icons: None,
             #[cfg(feature = "skills")]
             pending_skills: None,
-            #[cfg(feature = "skills")]
             prepend_projected_skill: false,
             #[cfg(not(target_arch = "wasm32"))]
             task_router: None,
@@ -4501,7 +4503,6 @@ impl ServerBuilder {
         );
 
         // D-04a: honor the builder-level opt-in, read here at REGISTRATION time.
-        #[cfg(feature = "skills")]
         let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
 
         // Register as a prompt

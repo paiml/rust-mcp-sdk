@@ -147,7 +147,12 @@ pub struct ServerCoreBuilder {
     /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
     /// workflows registered after the setter and not to earlier ones. Default
     /// `false`, so every existing server's transcript is byte-identical.
-    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    ///
+    /// UNGATED, though the setter that writes it is not. A `bool` costs nothing
+    /// to carry, and carrying it is what lets `prompt_workflow` hand it to
+    /// `WorkflowPromptHandler::with_projected_skill_prepend` — which has a null
+    /// twin — with no `#[cfg]` at the call site. Paired twins over call-site
+    /// `#[cfg]` is this repo's recorded house decision.
     prepend_projected_skill: bool,
 }
 
@@ -197,7 +202,6 @@ impl ServerCoreBuilder {
             payload_limits: PayloadLimits::default(),
             #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
             pending_skills: None,
-            #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
             prepend_projected_skill: false,
         }
     }
@@ -1334,7 +1338,6 @@ impl ServerCoreBuilder {
         // D-04a: apply the projected-skill prepend BEFORE the task wrap below,
         // so a `has_task_support` workflow inherits the setting through its
         // `inner` handler and there is no second call site to keep in sync.
-        #[cfg(feature = "skills")]
         let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
 
         // Wrap in TaskWorkflowPromptHandler if task support is enabled
