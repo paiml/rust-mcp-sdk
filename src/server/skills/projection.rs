@@ -635,6 +635,21 @@ pub struct ProjectionWarning {
 }
 
 impl ProjectionWarning {
+    /// Construct a warning. Module-private: warnings are produced by the
+    /// projection, never by a caller.
+    fn new(
+        kind: ProjectionWarningKind,
+        step: Option<String>,
+        tool: Option<String>,
+        message: String,
+    ) -> Self {
+        Self {
+            kind,
+            step,
+            tool,
+            message,
+        }
+    }
     /// Which condition this warning reports.
     pub fn kind(&self) -> ProjectionWarningKind {
         self.kind
@@ -654,6 +669,105 @@ impl ProjectionWarning {
     pub fn message(&self) -> &str {
         &self.message
     }
+}
+
+/// Is this tool ANNOTATED as side-effecting?
+///
+/// True only for an explicit `read_only_hint == Some(false)` or
+/// `destructive_hint == Some(true)`. MCP's own literal defaults — where an
+/// ABSENT `read_only_hint` means not-read-only — are deliberately NOT followed
+/// (D-08): under them essentially every existing workflow would trip the gate,
+/// and a warning that fires everywhere is a warning that gets muted. The
+/// missing-annotation case is reported honestly as
+/// [`ProjectionWarningKind::GateCheckUnverifiable`] instead of being guessed at.
+fn is_annotated_side_effecting(annotations: &ToolAnnotations) -> bool {
+    annotations.read_only_hint == Some(false) || annotations.destructive_hint == Some(true)
+}
+
+/// Classify ONE guidance-bearing tool step against the supplied tool map.
+///
+/// Split out of [`gate_check`] so each function keeps a single branch shape;
+/// `gate_check`'s loop plus this four-way lookup in one body is the specific
+/// PMAT cognitive-complexity risk in this module.
+fn gate_check_step(
+    step: &str,
+    tool: &str,
+    tools: &HashMap<String, Option<ToolAnnotations>>,
+) -> Option<ProjectionWarning> {
+    match tools.get(tool) {
+        // Annotated, and annotated side-effecting: the SC-6 finding.
+        Some(Some(annotations)) if is_annotated_side_effecting(annotations) => {
+            Some(ProjectionWarning::new(
+                ProjectionWarningKind::GuidanceOnSideEffectingStep,
+                Some(step.to_string()),
+                Some(tool.to_string()),
+                format!(
+                    "step `{step}` carries guidance, but its tool `{tool}` is annotated \
+                     side-effecting; server-side workflow execution runs this step \
+                     regardless of the guidance, so the guidance is a post-hoc judgment \
+                     the executing surface will ignore"
+                ),
+            ))
+        },
+        // Annotated, and not annotated side-effecting: nothing to report.
+        Some(Some(_)) => None,
+        // Present but unannotated, or absent entirely — the same class: the
+        // check could not be performed (D-08).
+        Some(None) | None => Some(ProjectionWarning::new(
+            ProjectionWarningKind::GateCheckUnverifiable,
+            Some(step.to_string()),
+            Some(tool.to_string()),
+            format!(
+                "step `{step}` carries guidance, but the side-effect check could not be \
+                 performed: tool `{tool}` carries no annotations in the supplied tool map, \
+                 so whether server-side execution would run this step regardless of the \
+                 guidance is unknown"
+            ),
+        )),
+    }
+}
+
+/// The SC-6 gate check: guidance attached to an annotated side-effecting step.
+///
+/// # Why this is a warning at all
+///
+/// Server-side workflow execution runs every deterministic step regardless of
+/// its guidance prose, so guidance attached to a step that will run anyway is a
+/// post-hoc judgment the executing surface ignores. That is the workflow
+/// surface's blind spot, and the projection is where it becomes visible.
+///
+/// # The trigger is structural, never textual (D-09)
+///
+/// There is no phrase list and no analysis of the guidance prose. The claim the
+/// warning makes is unconditionally true without reading the text — guidance IS
+/// prose the executing surface ignores — so a heuristic over the wording could
+/// only be paraphrased around, where this cannot.
+///
+/// # `tools == None` means the check does not run (D-07)
+///
+/// A `None` map is "no tool map was supplied", which is what a bare
+/// [`SequentialWorkflow::as_skill`](crate::server::workflow::SequentialWorkflow::as_skill)
+/// has; it returns no warnings at all. An EMPTY map is "a map was supplied and
+/// this tool is not in it", which is unverifiable, not silent. The two states
+/// are deliberately not collapsed.
+///
+/// Steps whose `tool()` is `None` are excluded entirely: they execute no tool
+/// and can carry no annotations.
+fn gate_check(
+    wf: &SequentialWorkflow,
+    tools: Option<&HashMap<String, Option<ToolAnnotations>>>,
+) -> Vec<ProjectionWarning> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    wf.steps()
+        .iter()
+        .filter(|step| step.guidance().is_some())
+        .filter_map(|step| {
+            step.tool()
+                .and_then(|handle| gate_check_step(step.name().as_str(), handle.name(), tools))
+        })
+        .collect()
 }
 
 /// What [`SkillProjection::build`] returns on success: the projected skill plus
@@ -810,8 +924,44 @@ impl<'w> SkillProjection<'w> {
     ///     .build()
     ///     .expect("legal workflow");
     ///
-    /// // Supplying a tool map never moves a rendered byte.
+    /// // A read-only tool trips nothing, and supplying a tool map never moves
+    /// // a rendered byte.
+    /// assert!(output.warnings.is_empty());
     /// assert_eq!(output.skill.body(), workflow.as_skill().body());
+    /// # }
+    /// ```
+    ///
+    /// With a step that carries guidance and a tool annotated destructive, the
+    /// SC-6 gate fires:
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::{ProjectionWarningKind, SkillProjection};
+    /// use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+    /// use pmcp::types::{ToolAnnotations, ToolInfo};
+    /// use serde_json::json;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund").step(
+    ///     WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+    ///         .with_guidance("Confirm with the customer before issuing the refund."),
+    /// );
+    ///
+    /// let output = SkillProjection::new(&workflow)
+    ///     .with_tools(vec![ToolInfo::with_annotations(
+    ///         "payments_refund",
+    ///         None,
+    ///         json!({ "type": "object" }),
+    ///         ToolAnnotations::new().with_destructive(true),
+    ///     )])
+    ///     .build()
+    ///     .expect("legal workflow");
+    ///
+    /// assert_eq!(output.warnings.len(), 1);
+    /// assert_eq!(
+    ///     output.warnings[0].kind(),
+    ///     ProjectionWarningKind::GuidanceOnSideEffectingStep
+    /// );
+    /// assert_eq!(output.warnings[0].step(), Some("issue_refund"));
     /// # }
     /// ```
     #[must_use]
@@ -922,7 +1072,7 @@ impl<'w> SkillProjection<'w> {
              shared seam cannot have substituted anything here"
         );
 
-        let warnings = Vec::new();
+        let warnings = gate_check(workflow, self.tools.as_ref());
 
         Ok(ProjectionOutput { skill, warnings })
     }

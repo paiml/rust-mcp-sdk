@@ -250,6 +250,29 @@ impl SequentialWorkflow {
     /// errors, and wants the warnings as data, uses the fallible builder path
     /// instead.
     ///
+    /// # This path holds no tool map, so it cannot warn about a destructive step
+    ///
+    /// The SC-6 gate warning — guidance attached to a step whose tool is
+    /// annotated side-effecting — needs
+    /// [`ToolAnnotations`](crate::types::ToolAnnotations), which live only on
+    /// [`crate::types::ToolInfo::annotations`]. Nothing reachable from a
+    /// `SequentialWorkflow` carries them: [`WorkflowStep::tool`] returns a
+    /// [`ToolHandle`](crate::server::workflow::ToolHandle), which is a name.
+    /// This method therefore cannot COMPUTE that warning; it is not that it
+    /// declines to log it.
+    ///
+    /// **SC-6 gate warnings have exactly one delivery channel: the structured
+    /// return from
+    /// [`SkillProjection::build`](crate::server::skills::SkillProjection::build),
+    /// with a tool map supplied through
+    /// [`SkillProjection::with_tools`](crate::server::skills::SkillProjection::with_tools).**
+    /// If you expected this method to warn about a destructive step and got
+    /// silence, that is why. The two conditions this path CAN observe — the
+    /// slug fallback and the empty-description substitution — are logged on
+    /// `mcp.skills` as described above.
+    ///
+    /// [`WorkflowStep::tool`]: crate::server::workflow::WorkflowStep::tool
+    ///
     /// The rendered text is not semver-stable; see
     /// [`crate::server::skills::projection`] for the re-pinning contract.
     ///
