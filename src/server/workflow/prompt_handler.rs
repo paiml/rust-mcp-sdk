@@ -100,6 +100,27 @@ pub struct WorkflowPromptHandler {
     tool_handlers: HashMap<Arc<str>, Arc<dyn ToolHandler>>,
     /// Resource handler for fetching resource content
     resource_handler: Option<Arc<dyn ResourceHandler>>,
+    /// The D-04a projected-skill prepend, as an ALREADY-RENDERED body.
+    ///
+    /// `None` (the default) means the opt-in is off and the transcript is
+    /// byte-identical to what it has always been. `Some(body)` holds the exact
+    /// string that the body of [`SequentialWorkflow::as_skill`] held at the moment
+    /// [`Self::with_projected_skill_prepend`] ran — it is a `String`, never a
+    /// `bool` consulted per request, for three measured reasons:
+    ///
+    /// 1. The D-15 slug-fallback `tracing::warn!` inside the projection would
+    ///    otherwise re-fire on **every `prompts/get`**, turning a build-time
+    ///    diagnostic into a per-request log flood.
+    /// 2. Message `[0]` would be re-derived from this handler's own clone of the
+    ///    workflow, while the digest published in `skills/list` is a snapshot
+    ///    taken at registry-build time. Two independently-derived strings that
+    ///    are *supposed* to be identical is exactly the drift this projection
+    ///    exists to prevent; caching makes them one string by construction.
+    /// 3. Rendering is not free and [`Self::handle`] is a hot path.
+    ///
+    /// [`SequentialWorkflow::as_skill`]: super::sequential::SequentialWorkflow::as_skill
+    #[cfg(feature = "skills")]
+    projected_skill_prepend: Option<String>,
 }
 
 impl std::fmt::Debug for WorkflowPromptHandler {
@@ -138,6 +159,8 @@ impl WorkflowPromptHandler {
             middleware_executor: None,
             tool_handlers,
             resource_handler,
+            #[cfg(feature = "skills")]
+            projected_skill_prepend: None,
         }
     }
 
@@ -164,7 +187,105 @@ impl WorkflowPromptHandler {
             middleware_executor: Some(middleware_executor),
             tool_handlers: HashMap::new(),
             resource_handler,
+            #[cfg(feature = "skills")]
+            projected_skill_prepend: None,
         }
+    }
+
+    /// Opt in to the D-04a projected-skill prepend (default: **off**).
+    ///
+    /// With the flag ON, the transcript [`Self::handle`] returns is:
+    ///
+    /// - `[0]` — the projected skill body, byte-equal to the body of the skill
+    ///   [`SequentialWorkflow::as_skill`] returns and therefore byte-equal to the
+    ///   bytes served at `skill://{slug}/SKILL.md` (D-05: one string, one digest,
+    ///   no variant to keep in sync).
+    /// - `[1]` — the user-intent message, **kept**. Its `Parameters:` block is
+    ///   the only place the caller's actual argument VALUES appear; the projected
+    ///   body carries argument SPECS. Suppressing it would remove information
+    ///   from the transcript entirely.
+    /// - `[2..]` — guidance, resource, tool-call-announcement and tool-result
+    ///   messages, unchanged.
+    ///
+    /// The assistant-plan MESSAGE is suppressed, because the projected body's
+    /// `## Procedure` section already carries its step-and-tool list. Only the
+    /// message is dropped: `create_assistant_plan()` is still CALLED and its
+    /// error still propagates, so the "tool not found in registry" validation
+    /// behaves identically in both flag states.
+    ///
+    /// With the flag OFF — the default — the transcript is byte-identical to
+    /// what this handler has always produced, message for message and role for
+    /// role.
+    ///
+    /// # Rendering happens HERE, exactly once
+    ///
+    /// The body is rendered by this call and stored. `prompts/get` never
+    /// re-renders it. A caller that mutates the workflow value afterwards will
+    /// therefore NOT see the change reflected in message `[0]`; re-run this
+    /// setter to re-render.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use std::collections::HashMap;
+    /// use pmcp::server::workflow::{SequentialWorkflow, WorkflowPromptHandler};
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    /// let body = workflow.as_skill().body().to_string();
+    ///
+    /// let handler = WorkflowPromptHandler::new(
+    ///     workflow,
+    ///     HashMap::new(),
+    ///     HashMap::new(),
+    ///     None,
+    /// )
+    /// .with_projected_skill_prepend(true);
+    ///
+    /// assert!(body.starts_with("---\nname: \"refund-flow\"\n"));
+    /// # let _ = handler;
+    /// # }
+    /// ```
+    ///
+    /// [`SequentialWorkflow::as_skill`]: super::sequential::SequentialWorkflow::as_skill
+    #[cfg(feature = "skills")]
+    #[must_use]
+    pub fn with_projected_skill_prepend(mut self, on: bool) -> Self {
+        self.projected_skill_prepend = if on {
+            Some(self.workflow.as_skill().body().to_string())
+        } else {
+            None
+        };
+        self
+    }
+
+    /// The single producer of the D-04a prepended message.
+    ///
+    /// Returns `None` when the opt-in is off. Otherwise clones the STORED body
+    /// into a user-role [`PromptMessage`]; it performs no rendering. Both
+    /// [`Self::handle`] and
+    /// [`TaskWorkflowPromptHandler`](super::TaskWorkflowPromptHandler)'s
+    /// independent message-building branch call this one method, which is what
+    /// makes it impossible for the two handlers to produce a different message
+    /// `[0]` for the same workflow.
+    #[cfg(feature = "skills")]
+    pub(crate) fn projected_prepend(&self) -> Option<PromptMessage> {
+        self.projected_skill_prepend
+            .as_ref()
+            .map(|body| PromptMessage::user(Content::text(body.clone())))
+    }
+
+    /// Skills-off twin of [`Self::projected_prepend`].
+    ///
+    /// Why it exists: with this always-`None` counterpart, neither `handle` nor
+    /// the task handler's branch needs a `#[cfg]` around its statement sequence,
+    /// so the flag-off code path is literally the same code in both feature
+    /// configurations. That is what D-04's unchanged-execution property asks
+    /// for, and a `#[cfg]`'d statement block would only approximate it.
+    #[cfg(not(feature = "skills"))]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn projected_prepend(&self) -> Option<PromptMessage> {
+        None
     }
 
     /// Substitute argument values into template text
@@ -767,11 +888,30 @@ impl PromptHandler for WorkflowPromptHandler {
         let mut messages = Vec::new();
         let mut execution_context = ExecutionContext::new();
 
+        // 0️⃣ Projected skill body (D-04a opt-in; `None` unless
+        // `with_projected_skill_prepend(true)` was called). It is inserted HERE,
+        // before the user-intent push, because the five later early-return /
+        // `break` exits each build a `GetPromptResult` from whatever `messages`
+        // holds — prepending at this point is what makes the projected body
+        // message [0] on every one of those paths.
+        let prepend = self.projected_prepend();
+        let suppress_plan = prepend.is_some();
+        messages.extend(prepend);
+
         // 1️⃣ User Intent Message
         messages.push(self.create_user_intent(&args));
 
         // 2️⃣ Assistant Plan Message (list all workflow steps)
-        messages.push(self.create_assistant_plan()?);
+        // Why: this call is the tool-registry validation — it is where
+        // `Error::Internal("Tool '{}' not found in registry")` is raised. It runs
+        // UNCONDITIONALLY and its `?` propagates in both flag states; only the
+        // push of its message is suppressed when the projected body already
+        // carries the step-and-tool list. Guarding the call instead of the push
+        // would silently delete a validation that flag-off callers have today.
+        let plan_message = self.create_assistant_plan()?;
+        if !suppress_plan {
+            messages.push(plan_message);
+        }
 
         // 3️⃣ Execute workflow steps sequentially with progress reporting
         let total_steps = self.workflow.steps().len();
