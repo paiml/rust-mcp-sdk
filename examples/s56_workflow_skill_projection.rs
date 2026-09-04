@@ -15,10 +15,13 @@
 //! `c10_client_skills`'s assert-then-print habit rather than `s44`'s
 //! print-only one:
 //!
-//! 1. **The projection and its slugification (SC-1, SC-2, SC-5).** A workflow
-//!    named `refund_flow` projects to a skill named `refund-flow`; the render
-//!    is deterministic (a second, independent derivation is byte-equal); and
-//!    the dual-surface invariant `as_prompt_text() == body()` holds.
+//! 1. **The projection, its slugification and the GOLDEN bytes (SC-1, SC-2,
+//!    SC-5).** A workflow named `refund_flow` projects to a skill named
+//!    `refund-flow`; the render is deterministic (a second, independent
+//!    derivation is byte-equal); the dual-surface invariant
+//!    `as_prompt_text() == body()` holds; and the rendered body is byte-equal
+//!    to `tests/golden/workflow_skill_projection.md` — the file whose sha256 is
+//!    published in the skill's `skills/list` entry.
 //! 2. **Registry pass-through (SC-4, in process).** The projected skill goes
 //!    into a `Skills` registry, its `skills/list` entry carries a
 //!    `sha256:`-prefixed digest whose `size` matches the served body, and
@@ -71,9 +74,18 @@
 //!
 //! It binds no socket and holds no client, so it issues no real `skills/list`
 //! or `skills/get` RPC — those are answered over streamable HTTP. The
-//! authoritative wire proof lives in `tests/skills_routing.rs`, and the exact
-//! bytes this example renders are pinned by
-//! `tests/golden/workflow_skill_projection.md`.
+//! authoritative wire proof lives in `tests/skills_routing.rs`.
+//!
+//! Note what "pinned by the golden" means HERE, because the distinction is the
+//! whole point of the [`GOLDEN`] assertion below. `make test-examples` only
+//! BUILDS examples; nothing in the quality gate RUNS this one. So the claim
+//! that these bytes are the golden's bytes is checked at two different
+//! strengths: the `include_str!` makes the golden a COMPILE-TIME dependency of
+//! this file (delete or move it and the example stops building, which the gate
+//! does see), and the byte comparison itself runs whenever the example does.
+//! Before the assertion existed the claim was prose only, and a re-recorded
+//! golden could silently falsify it while this file kept compiling, kept
+//! printing and kept passing.
 
 use std::collections::HashMap;
 
@@ -95,11 +107,26 @@ const SKILL_URI: &str = "skill://refund-flow/SKILL.md";
 /// The policy document `read_policy` fetches.
 const POLICY_URI: &str = "file:///policies/refunds.md";
 
+/// The D-14 golden: the exact bytes `refund_flow().as_skill().body()` renders.
+///
+/// `include_str!` resolves relative to THIS file at COMPILE time, so the
+/// example cannot pass by reading a stale or absent golden — a moved or deleted
+/// fixture is a build failure, which `make test-examples` and `make lint`'s
+/// `cargo check --examples` both see.
+///
+/// `tests/golden/workflow_skill_projection.md` is the same file
+/// `tests/skills_integration.rs`'s `golden_render_is_byte_equal` pins, and its
+/// sha256 is what a pinning consumer binds to. Asserting against it here is
+/// what keeps [`refund_flow`]'s "same shape as the golden fixture" from being
+/// an unverified comment.
+const GOLDEN: &str = include_str!("../tests/golden/workflow_skill_projection.md");
+
 /// The workflow this whole example projects.
 ///
 /// Deliberately the same shape as the D-14 golden fixture in
 /// `tests/skills_integration.rs`, so the bytes this example prints are the
-/// bytes `tests/golden/workflow_skill_projection.md` pins. Each element earns
+/// bytes `tests/golden/workflow_skill_projection.md` pins — and `main` ASSERTS
+/// that against [`GOLDEN`] rather than leaving it to this comment. Each element earns
 /// its place: `refund_flow` needs slugifying; the description carries a `: `
 /// mapping indicator and a `#` comment indicator so the frontmatter must be
 /// YAML-ENCODED rather than concatenated; the instruction is the only way
@@ -292,6 +319,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SC-2: the render must be deterministic across derivations"
     );
 
+    // D-14: the bytes this example prints ARE the golden's bytes.
+    //
+    // A red here has the two opposite causes `golden_break_message` in
+    // `tests/skills_integration.rs` spells out, plus a third that belongs to
+    // this file alone: the golden's fixture was extended and `refund_flow`
+    // above was not, so the two derivations drifted. Fix the fixture — do NOT
+    // re-record the golden from this example's output.
+    assert_eq!(
+        skill.body(),
+        GOLDEN,
+        "D-14: this example's projected body is no longer byte-equal to \
+         tests/golden/workflow_skill_projection.md, whose sha256 is published \
+         in the skill's skills/list entry. Either `refund_flow()` here drifted \
+         from `golden_workflow()` in tests/skills_integration.rs, or the \
+         renderer changed. Re-recording the golden from THIS output is never \
+         the fix."
+    );
+
     println!("== 1. The projected skill ==\n");
     println!("workflow name : {}", workflow.name());
     println!("skill name    : {}", skill.name());
@@ -478,6 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  SC-5  dual surface: `as_prompt_text() == body()`, one string for both surfaces");
     println!("  SC-6  gate warning: one GuidanceOnSideEffectingStep on `issue_refund`");
+    println!("  D-14  golden: the printed body is byte-equal to tests/golden/workflow_skill_projection.md");
     println!("  D-04a opt-in prepend reached through `ServerBuilder::with_workflow_skill_prepend`");
     println!("\nAll assertions passed.");
 
