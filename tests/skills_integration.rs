@@ -636,3 +636,449 @@ async fn projected_skill_with_an_awkward_description_still_registers_and_reads()
         .expect("entries must build for a projected skill");
     assert_eq!(entries.len(), 1);
 }
+
+// ── Phase 126 plan 05 (D-04a): the projected-skill prepend ────────────
+//
+// These tests live HERE, and NOT in `prompt_handler.rs`'s `mod tests`, for a
+// measured reason: that module path matches no `make test-skills` selector, and
+// the tests would be `#[cfg(feature = "skills")]`-conditional so no
+// `--features "full"` leg reaches them either. They would pass locally and be
+// invisible to the entire quality gate. `tests/workflow_prompt_e2e_test.rs` is
+// wrong for the same class of reason — its `#![cfg]` header is
+// `streamable-http`-gated and socket-based, not skills-gated.
+//
+// The harness is the in-process one from `prompt_handler.rs`'s own tests,
+// copied rather than referenced: `SimpleTool` -> `metadata()` ->
+// `workflow::conversion::ToolInfo` -> `tools` / `tool_handlers` maps ->
+// `WorkflowPromptHandler::new(..)` -> `handler.handle(args, extra).await`.
+// `Server::handle_request` is private, so the trait method is the only
+// in-process route (CONVENTIONS.md:102-106).
+
+use async_trait::async_trait;
+use pmcp::server::tasks::TaskRouter;
+use pmcp::server::workflow::conversion::ToolInfo as WorkflowToolInfo;
+use pmcp::server::workflow::{TaskWorkflowPromptHandler, WorkflowPromptHandler};
+use pmcp::types::{PromptMessage, Role};
+use pmcp::{PromptHandler, SimpleTool, ToolHandler};
+use serde_json::Value;
+
+/// Two tool steps, so the suppressed assistant-plan message has a step list
+/// worth suppressing and the projected `## Procedure` has something to
+/// duplicate.
+fn prepend_workflow() -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", "process a refund")
+        .argument("order_id", "Order identifier", true)
+        .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+        .step(WorkflowStep::new("issue_refund", ToolHandle::new("refunds_create")).bind("refund"))
+}
+
+fn prepend_args() -> HashMap<String, String> {
+    let mut args = HashMap::new();
+    args.insert("order_id".to_string(), "ord-42".to_string());
+    args
+}
+
+fn register_tool<T: ToolHandler + 'static>(
+    tools: &mut HashMap<Arc<str>, WorkflowToolInfo>,
+    handlers: &mut HashMap<Arc<str>, Arc<dyn ToolHandler>>,
+    tool: T,
+) {
+    let metadata = tool.metadata().expect("SimpleTool always reports metadata");
+    let name: Arc<str> = Arc::from(metadata.name.as_str());
+    tools.insert(
+        Arc::clone(&name),
+        WorkflowToolInfo {
+            name: metadata.name.clone(),
+            description: metadata.description.clone().unwrap_or_default(),
+            input_schema: metadata.input_schema.clone(),
+        },
+    );
+    handlers.insert(name, Arc::new(tool));
+}
+
+#[allow(clippy::type_complexity)]
+fn prepend_registry() -> (
+    HashMap<Arc<str>, WorkflowToolInfo>,
+    HashMap<Arc<str>, Arc<dyn ToolHandler>>,
+) {
+    let mut tools = HashMap::new();
+    let mut handlers: HashMap<Arc<str>, Arc<dyn ToolHandler>> = HashMap::new();
+
+    register_tool(
+        &mut tools,
+        &mut handlers,
+        SimpleTool::new("orders_get", |_args, _extra| {
+            Box::pin(async move { Ok(serde_json::json!({"order": {"id": "ord-42"}})) })
+        })
+        .with_description("Fetch an order")
+        .with_schema(serde_json::json!({"type": "object"})),
+    );
+    register_tool(
+        &mut tools,
+        &mut handlers,
+        SimpleTool::new("refunds_create", |_args, _extra| {
+            Box::pin(async move { Ok(serde_json::json!({"refund": {"id": "rf-1"}})) })
+        })
+        .with_description("Create a refund")
+        .with_schema(serde_json::json!({"type": "object"})),
+    );
+
+    (tools, handlers)
+}
+
+/// The opt-in left at its DEFAULT — the setter is never called. This is the
+/// shape every server registered before D-04a has, and its transcript is the
+/// byte-identity baseline.
+fn handler_default() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+}
+
+/// The opt-in explicitly OFF. Must be indistinguishable from the default.
+fn handler_prepend_off() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+        .with_projected_skill_prepend(false)
+}
+
+/// The opt-in explicitly ON.
+fn handler_prepend_on() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+        .with_projected_skill_prepend(true)
+}
+
+fn message_text(message: &PromptMessage) -> &str {
+    match &message.content {
+        Content::Text { text } => text.as_str(),
+        other => panic!("expected Content::Text in a transcript, got {other:?}"),
+    }
+}
+
+async fn run(handler: &dyn PromptHandler) -> pmcp::types::GetPromptResult {
+    handler
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect("the fixture workflow must execute cleanly")
+}
+
+/// D-04's unchanged-execution property. Asserts ROLE and TEXT for every
+/// message, never the count alone — a count-only assertion cannot tell a
+/// suppressed assistant plan from a dropped guidance message.
+#[tokio::test]
+async fn flag_off_transcript_is_unchanged() {
+    let result = run(&handler_default()).await;
+    let messages = &result.messages;
+
+    // Anti-vacuity: an empty transcript would satisfy any per-message loop.
+    assert!(
+        messages.len() >= 2,
+        "flag-off transcript collapsed to {} message(s)",
+        messages.len()
+    );
+    assert_eq!(
+        messages.len(),
+        6,
+        "expected intent + plan + (announce, result) x 2"
+    );
+
+    // [0] user intent — carries the caller's actual argument VALUES.
+    assert_eq!(messages[0].role, Role::User);
+    let intent = message_text(&messages[0]);
+    assert!(
+        intent.starts_with("I want to process a refund."),
+        "intent began: {intent:?}"
+    );
+    assert!(intent.contains("Parameters:"), "intent was: {intent:?}");
+    assert!(
+        intent.contains("order_id: \"ord-42\""),
+        "intent was: {intent:?}"
+    );
+
+    // [1] assistant plan — the step-and-tool list D-04a suppresses when ON.
+    assert_eq!(messages[1].role, Role::Assistant);
+    let plan = message_text(&messages[1]);
+    assert!(plan.starts_with("Here's my plan:\n"), "plan was: {plan:?}");
+    assert!(
+        plan.contains("1. orders_get - Fetch an order"),
+        "plan was: {plan:?}"
+    );
+    assert!(
+        plan.contains("2. refunds_create - Create a refund"),
+        "plan was: {plan:?}"
+    );
+
+    // [2..] tool-call announcement / tool result pairs, unchanged.
+    assert_eq!(messages[2].role, Role::Assistant);
+    assert!(message_text(&messages[2]).contains("Calling tool 'orders_get'"));
+    assert_eq!(messages[3].role, Role::User);
+    assert!(message_text(&messages[3]).contains("Tool result"));
+    assert_eq!(messages[4].role, Role::Assistant);
+    assert!(message_text(&messages[4]).contains("Calling tool 'refunds_create'"));
+    assert_eq!(messages[5].role, Role::User);
+    assert!(message_text(&messages[5]).contains("Tool result"));
+
+    // An explicit `false` must be indistinguishable from never calling the
+    // setter at all — the opt-in's default is off, not merely usually off.
+    let explicit_off = run(&handler_prepend_off()).await;
+    assert_eq!(explicit_off.messages.len(), messages.len());
+    for (a, b) in explicit_off.messages.iter().zip(messages.iter()) {
+        assert_eq!(a.role, b.role);
+        assert_eq!(message_text(a), message_text(b));
+    }
+}
+
+/// D-04a / D-05: message [0] IS the projected body, byte for byte.
+#[tokio::test]
+async fn flag_on_message_zero_is_the_skill_body() {
+    let body = prepend_workflow().as_skill().body().to_string();
+
+    // Anti-vacuity: an empty body would make the equality below trivial.
+    assert!(
+        body.len() > 200,
+        "projected body was only {} bytes",
+        body.len()
+    );
+
+    let result = run(&handler_prepend_on()).await;
+    assert_eq!(result.messages[0].role, Role::User);
+    assert_eq!(message_text(&result.messages[0]), body);
+}
+
+/// D-04a's rejected option (c) was NOT taken: `create_user_intent` survives at
+/// [1], because its `Parameters:` block is the only place the caller's actual
+/// argument VALUES appear. The projected body carries argument SPECS.
+#[tokio::test]
+async fn flag_on_keeps_user_intent_at_index_one() {
+    let result = run(&handler_prepend_on()).await;
+
+    assert_eq!(result.messages[1].role, Role::User);
+    let intent = message_text(&result.messages[1]);
+    assert!(
+        intent.starts_with("I want to process a refund."),
+        "intent began: {intent:?}"
+    );
+    assert!(intent.contains("Parameters:"), "intent was: {intent:?}");
+    assert!(
+        intent.contains("order_id: \"ord-42\""),
+        "intent was: {intent:?}"
+    );
+
+    // The distinction that makes suppressing [1] information-destroying: the
+    // runtime VALUE appears in the intent and nowhere in the body.
+    let body = message_text(&result.messages[0]);
+    assert!(
+        !body.contains("ord-42"),
+        "the projected body must carry argument SPECS, not runtime VALUES"
+    );
+    assert!(
+        body.contains("order_id"),
+        "the projected body must name the argument"
+    );
+}
+
+/// The assistant-plan MESSAGE is gone with the flag on, and the transcript is
+/// exactly as long as the flag-off one (one message added, one removed).
+#[tokio::test]
+async fn flag_on_suppresses_assistant_plan() {
+    let off = run(&handler_default()).await;
+    let on = run(&handler_prepend_on()).await;
+
+    let plan_text = message_text(&off.messages[1]).to_string();
+    assert!(plan_text.starts_with("Here's my plan:\n"));
+
+    assert!(
+        on.messages
+            .iter()
+            .all(|m| message_text(m) != plan_text.as_str()),
+        "the assistant-plan message survived with the flag on"
+    );
+    assert_eq!(
+        on.messages.len(),
+        off.messages.len(),
+        "one message prepended, one suppressed"
+    );
+}
+
+/// Stub router whose ONLY job is to put `TaskWorkflowPromptHandler::handle` on
+/// its INDEPENDENT branch. Every real `TaskRouter` impl in this tree is private
+/// to a test module, so none is reachable from here.
+struct PrependTestTaskRouter;
+
+#[async_trait]
+impl TaskRouter for PrependTestTaskRouter {
+    async fn handle_task_call(
+        &self,
+        _tool_name: &str,
+        _arguments: Value,
+        _task_params: Value,
+        _owner_id: &str,
+        _progress_token: Option<Value>,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_get(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_result(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_list(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_cancel(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    fn resolve_owner(
+        &self,
+        _subject: Option<&str>,
+        _client_id: Option<&str>,
+        _session_id: Option<&str>,
+    ) -> String {
+        "prepend-test-owner".to_string()
+    }
+
+    fn tool_requires_task(&self, _tool_name: &str, _tool_execution: Option<&Value>) -> bool {
+        false
+    }
+
+    fn task_capabilities(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    /// The one method that must SUCCEED. Its return shape is exactly what the
+    /// task-id extractor reads.
+    async fn create_workflow_task(
+        &self,
+        _workflow_name: &str,
+        _owner_id: &str,
+        _progress: Value,
+    ) -> pmcp::error::Result<Value> {
+        Ok(serde_json::json!({"task": {"taskId": "task-prepend-test-1"}}))
+    }
+}
+
+/// RESEARCH Pitfall 6: a prepend added to only one of the two prompt handlers
+/// would make `has_task_support(true)` workflows behave differently from plain
+/// ones — the exact drift this projection exists to prevent.
+///
+/// Branch selection, quoted from `task_prompt_handler.rs`: `handle` calls
+/// `create_workflow_task`, extracts `value["task"]["taskId"].as_str()`, and if
+/// that yields `None` it runs
+/// `let Some(task_id) = task_id else { return self.inner.handle(args, extra).await }`
+/// and DELEGATES. The stub above makes the extraction succeed, so the
+/// independent branch runs. The `_meta` assertion below is the proof: only the
+/// independent branch enriches its result with `_meta` (step 7 of `handle`);
+/// the delegating branch returns the inner result unchanged and carries none.
+#[tokio::test]
+async fn both_handlers_produce_the_same_message_zero() {
+    let plain = run(&handler_prepend_on()).await;
+
+    let task_handler = TaskWorkflowPromptHandler::new(
+        handler_prepend_on(),
+        Arc::new(PrependTestTaskRouter) as Arc<dyn TaskRouter>,
+        prepend_workflow(),
+    );
+    let tasked = run(&task_handler).await;
+
+    let meta = tasked._meta.as_ref().expect(
+        "no _meta: the task handler took the DELEGATING branch, so this test proved nothing",
+    );
+    assert_eq!(
+        meta.get("task_id").and_then(Value::as_str),
+        Some("task-prepend-test-1"),
+        "_meta did not carry the stub's minted task id"
+    );
+    assert!(
+        meta.contains_key("steps"),
+        "_meta must carry the independent branch's step plan"
+    );
+
+    assert_eq!(
+        message_text(&tasked.messages[0]),
+        message_text(&plain.messages[0]),
+        "the two handlers disagreed on message [0]"
+    );
+    assert_eq!(tasked.messages[0].role, plain.messages[0].role);
+}
+
+/// D-05's one-string claim, proven across BOTH surfaces in one test: the bytes
+/// served at `skill://{slug}/SKILL.md` through the real `ResourceHandler` are
+/// the bytes the prompt transcript opens with.
+#[tokio::test]
+async fn prepended_body_equals_served_skill_bytes() {
+    let skill = prepend_workflow().as_skill();
+    let uri = format!("skill://{}/SKILL.md", skill.name());
+
+    let resource_handler = Skills::new()
+        .add(skill)
+        .into_handler()
+        .expect("a projected skill must register cleanly");
+    let read = resource_handler
+        .read(&uri, RequestHandlerExtra::default())
+        .await
+        .expect("the projected skill's SKILL.md must read");
+    let (read_uri, served, mime) = extract_resource(&read.contents);
+    assert_eq!(read_uri, uri);
+    assert_eq!(mime, "text/markdown");
+    assert!(served.len() > 200, "served body was {} bytes", served.len());
+
+    let transcript = run(&handler_prepend_on()).await;
+    assert_eq!(message_text(&transcript.messages[0]), served);
+}
+
+/// REVIEWS fable (a): enabling the flag must not delete the unregistered-tool
+/// validation. `create_assistant_plan()` is where that error is raised, so the
+/// CALL is kept and only its message is suppressed. Both flag states must
+/// therefore fail identically.
+#[tokio::test]
+async fn flag_on_still_rejects_an_unregistered_tool() {
+    // Empty registry: every step names a tool absent from `tools`.
+    let on = WorkflowPromptHandler::new(prepend_workflow(), HashMap::new(), HashMap::new(), None)
+        .with_projected_skill_prepend(true);
+    let err_on = on
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect_err("flag ON must still reject an unregistered tool");
+    assert!(
+        err_on.to_string().contains("not found in registry"),
+        "flag-ON error was: {err_on}"
+    );
+
+    let off = WorkflowPromptHandler::new(prepend_workflow(), HashMap::new(), HashMap::new(), None);
+    let err_off = off
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect_err("flag OFF must reject an unregistered tool");
+    assert!(
+        err_off.to_string().contains("not found in registry"),
+        "flag-OFF error was: {err_off}"
+    );
+
+    assert_eq!(
+        err_on.to_string(),
+        err_off.to_string(),
+        "the two flag states must fail identically"
+    );
+}
