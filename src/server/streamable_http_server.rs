@@ -3819,11 +3819,13 @@ async fn handle_fast_path_request(
 /// assembler, so the fast and middleware paths can never drift on session-header
 /// gating or the v2 outbound echo.
 ///
-/// Two methods use it today — `server/discover` (Phase 112) and `tasks/update`
-/// (Phase 114 plan 13) — which is why it is not named after either. Both are
-/// classified out of the public-enum path by
-/// [`classify_http_ingress`] and both answer with a single JSON-RPC response, so
-/// both run the identical response tail. `subscriptions/listen` deliberately does
+/// Four methods use it today — `server/discover` (Phase 112), `tasks/update`
+/// (Phase 114 plan 13), `skills/list` and `skills/get` (Phase 125) — which is why
+/// it is not named after any of them. All are classified out of the public-enum
+/// path by [`classify_http_ingress`] and all answer with a single JSON-RPC
+/// response, so all run the identical response tail — which is why that tail also
+/// lives in one place, [`assemble_internal_fast`] /
+/// [`assemble_internal_with_middleware`]. `subscriptions/listen` deliberately does
 /// NOT use it: it answers with a held-open SSE stream that has no complete body
 /// and therefore no response-middleware or session-header step.
 struct InternalResponseShape<'a> {
@@ -3841,6 +3843,120 @@ struct InternalResponseShape<'a> {
     sessions_on: bool,
 }
 
+/// THE response tail every internal-method assembler runs on the FAST path.
+///
+/// Extracted because the tail below existed verbatim in four fast assemblers
+/// (`server/discover`, `tasks/update`, `skills/list`, `skills/get`) — the diff
+/// that added the skills pair had already lifted their shared *inputs* into
+/// [`InternalResponseShape`] but left the body copied. Every producer differs
+/// only in how it obtains its [`crate::types::JSONRPCResponse`]; from that value
+/// on, the steps and their ORDER are identical, and that order is the thing that
+/// must not drift:
+///
+/// store the response event -> build the response -> session header -> outbound
+/// protocol version -> the v2 outbound echo -> the code-driven v2 status.
+///
+/// None of these methods is ever an init request, so the outbound version is
+/// always computed by [`outbound_protocol_version_after_init`] — there is no
+/// init-time branch to parameterise.
+///
+/// `subscriptions/listen` deliberately does NOT use this: it answers with a
+/// held-open SSE stream that has no complete body, hence no session-header or
+/// status step. See [`InternalResponseShape`].
+async fn assemble_internal_fast(
+    state: &ServerState,
+    json_response: crate::types::JSONRPCResponse,
+    live_id: crate::types::RequestId,
+    era: Option<crate::types::protocol::Era>,
+    shape: InternalResponseShape<'_>,
+    session_id: Option<&String>,
+) -> Response {
+    let InternalResponseShape {
+        response_session_id,
+        asserted_protocol_version,
+        v2_outbound,
+        sessions_on,
+    } = shape;
+    let v2_status = v2_dispatch_response_status(era, &json_response);
+    // Same structural guarantee as every other direct response (HTTP-05).
+    let response_msg =
+        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
+
+    v1::store_response_event(state, era, response_session_id, &response_msg).await;
+
+    let mut response = build_response(state, response_msg, session_id, sessions_on);
+
+    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
+
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
+    response
+        .headers_mut()
+        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
+
+    // Echo the v2 outbound headers on BOTH success and structured error
+    // (VERS-05).
+    if let Some((method, name)) = &v2_outbound {
+        apply_v2_outbound_headers(response.headers_mut(), method, name);
+    }
+
+    if let Some(status) = v2_status {
+        *response.status_mut() = status;
+    }
+
+    response
+}
+
+/// THE response tail every internal-method assembler runs on the MIDDLEWARE path.
+///
+/// The middleware-path twin of [`assemble_internal_fast`], differing ONLY in the
+/// response-BUILDING step ([`build_success_response_with_middleware`] instead of
+/// [`build_response`] + [`v1::apply_session_header`]) — this file's established
+/// fast/middleware split. Both MUST exist or the two POST paths diverge on which
+/// servers can answer a method at all.
+async fn assemble_internal_with_middleware(
+    state: &ServerState,
+    json_response: crate::types::JSONRPCResponse,
+    live_id: crate::types::RequestId,
+    era: Option<crate::types::protocol::Era>,
+    shape: InternalResponseShape<'_>,
+    http_middleware: &ServerHttpMiddlewareChain,
+    http_context: &ServerHttpContext,
+) -> Response {
+    let InternalResponseShape {
+        response_session_id,
+        asserted_protocol_version,
+        v2_outbound,
+        sessions_on,
+    } = shape;
+    let v2_status = v2_dispatch_response_status(era, &json_response);
+    let response_msg =
+        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
+
+    v1::store_response_event(state, era, response_session_id, &response_msg).await;
+
+    let version_to_send =
+        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
+
+    let mut response = build_success_response_with_middleware(
+        &response_msg,
+        response_session_id,
+        &version_to_send,
+        sessions_on,
+        http_middleware,
+        http_context,
+    )
+    .await;
+
+    if let Some((method, name)) = &v2_outbound {
+        apply_v2_outbound_headers(response.headers_mut(), method, name);
+    }
+    if let Some(status) = v2_status {
+        *response.status_mut() = status;
+    }
+    response
+}
+
 /// D-10 decision (finding #4): a v2 connection projects the server's
 /// already-computed capabilities (incl. the `extensions` map); a v1 /
 /// non-opted-in connection returns JSON-RPC `-32601` at HTTP 200 with the
@@ -3855,46 +3971,20 @@ async fn assemble_discover_response_fast(
     shape: InternalResponseShape<'_>,
     session_id: Option<&String>,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_discover(id, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    // Same structural guarantee as every other direct response (HTTP-05).
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let mut response = build_response(state, response_msg, session_id, sessions_on);
-
-    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
-
-    // Discover is never an init request → compute the outbound version normally.
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-    response
-        .headers_mut()
-        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
-
-    // Echo the v2 outbound headers on an accepted v2 discover (VERS-05).
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-
-    response
+    assemble_internal_fast(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
+        session_id,
+    )
+    .await
 }
 
 // ===========================================================================
@@ -3952,12 +4042,10 @@ async fn tasks_update_json_response(
 
 /// Assemble the `tasks/update` response on the fast path (TASK-02).
 ///
-/// Structurally the twin of [`assemble_discover_response_fast`] and it shares that
-/// function's [`InternalResponseShape`] and response tail verbatim in shape:
-/// store the response event, build the response, attach session / version /
-/// outbound-v2 headers, apply the code-driven v2 status. Reached only AFTER
-/// session resolution, the v2 header matrix, legacy-version validation and auth —
-/// classify-then-continue, no pipeline bypass.
+/// Produces the JSON-RPC response, then hands it to the SHARED
+/// [`assemble_internal_fast`] tail every internal-method fast assembler runs.
+/// Reached only AFTER session resolution, the v2 header matrix, legacy-version
+/// validation and auth — classify-then-continue, no pipeline bypass.
 ///
 /// # The v1 answer, and why it is a deliberate change
 ///
@@ -3973,54 +4061,18 @@ async fn assemble_tasks_update_fast(
     shape: InternalResponseShape<'_>,
     session_id: Option<&String>,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = call.id.clone();
-    let protocol_context = call.protocol_context;
+    let era = call.protocol_context.map(|pc| pc.era);
     let json_response = tasks_update_json_response(state, &call).await;
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    // Same structural guarantee as every other direct response (HTTP-05).
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let mut response = build_response(state, response_msg, session_id, sessions_on);
-
-    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
-
-    // `tasks/update` is never an init request → compute the outbound version
-    // normally.
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-    response
-        .headers_mut()
-        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
-
-    // Echo the v2 outbound headers on BOTH success and structured error (VERS-05).
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-
-    response
+    assemble_internal_fast(state, json_response, live_id, era, shape, session_id).await
 }
 
 /// Assemble the `tasks/update` response on the middleware path (TASK-02).
 ///
-/// The middleware-path twin of [`assemble_tasks_update_fast`], differing ONLY in
-/// the response-BUILDING step ([`build_success_response_with_middleware`] instead
-/// of [`build_response`] + [`v1::apply_session_header`]) — this file's established
-/// fast/middleware split. The gate chain is identical because both call the SAME
-/// [`tasks_update_json_response`].
+/// The middleware-path twin of [`assemble_tasks_update_fast`]: same producer,
+/// [`assemble_internal_with_middleware`] instead of [`assemble_internal_fast`]
+/// for the tail — this file's established fast/middleware split. The gate chain
+/// is identical because both call the SAME [`tasks_update_json_response`].
 async fn assemble_tasks_update_with_middleware(
     state: &ServerState,
     call: TasksUpdateCall<'_>,
@@ -4028,42 +4080,19 @@ async fn assemble_tasks_update_with_middleware(
     http_middleware: &ServerHttpMiddlewareChain,
     http_context: &ServerHttpContext,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = call.id.clone();
-    let protocol_context = call.protocol_context;
+    let era = call.protocol_context.map(|pc| pc.era);
     let json_response = tasks_update_json_response(state, &call).await;
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-
-    let mut response = build_success_response_with_middleware(
-        &response_msg,
-        response_session_id,
-        &version_to_send,
-        sessions_on,
+    assemble_internal_with_middleware(
+        state,
+        json_response,
+        live_id,
+        era,
+        shape,
         http_middleware,
         http_context,
     )
-    .await;
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-    response
+    .await
 }
 
 // ===========================================================================
@@ -4072,8 +4101,8 @@ async fn assemble_tasks_update_with_middleware(
 
 /// Assemble the `skills/list` response on the fast path (Phase 125).
 ///
-/// Structurally the twin of [`assemble_discover_response_fast`] and it shares that
-/// function's [`InternalResponseShape`] and response tail verbatim in shape.
+/// Structurally the twin of [`assemble_discover_response_fast`]: it produces the
+/// JSON-RPC response and hands it to the SHARED [`assemble_internal_fast`] tail.
 /// Reached only AFTER session resolution, the v2 header matrix, legacy-version
 /// validation and auth — classify-then-continue, no pipeline bypass.
 ///
@@ -4097,55 +4126,28 @@ async fn assemble_skills_list_fast(
     shape: InternalResponseShape<'_>,
     session_id: Option<&String>,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_skills_list(id, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    // Same structural guarantee as every other direct response (HTTP-05).
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let mut response = build_response(state, response_msg, session_id, sessions_on);
-
-    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
-
-    // `skills/list` is never an init request → compute the outbound version
-    // normally.
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-    response
-        .headers_mut()
-        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-
-    response
+    assemble_internal_fast(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
+        session_id,
+    )
+    .await
 }
 
 /// Assemble the `skills/list` response on the middleware path (Phase 125).
 ///
-/// The middleware-path twin of [`assemble_skills_list_fast`], differing ONLY in
-/// the response-BUILDING step ([`build_success_response_with_middleware`] instead
-/// of [`build_response`] + [`v1::apply_session_header`]) — this file's established
-/// fast/middleware split. Both MUST exist or the two POST paths diverge on which
-/// servers can answer the method at all.
+/// The middleware-path twin of [`assemble_skills_list_fast`]: same producer,
+/// [`assemble_internal_with_middleware`] instead of [`assemble_internal_fast`]
+/// for the tail — this file's established fast/middleware split. Both MUST exist
+/// or the two POST paths diverge on which servers can answer the method at all.
 async fn assemble_skills_list_with_middleware(
     state: &ServerState,
     id: crate::types::RequestId,
@@ -4154,44 +4156,21 @@ async fn assemble_skills_list_with_middleware(
     http_middleware: &ServerHttpMiddlewareChain,
     http_context: &ServerHttpContext,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_skills_list(id, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-
-    let mut response = build_success_response_with_middleware(
-        &response_msg,
-        response_session_id,
-        &version_to_send,
-        sessions_on,
+    assemble_internal_with_middleware(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
         http_middleware,
         http_context,
     )
-    .await;
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-    response
+    .await
 }
 
 // ===========================================================================
@@ -4200,8 +4179,8 @@ async fn assemble_skills_list_with_middleware(
 
 /// Assemble the `skills/get` response on the fast path (Phase 125 plan 02).
 ///
-/// Structurally the twin of [`assemble_skills_list_fast`] above, and it shares
-/// that function's [`InternalResponseShape`] and response tail verbatim in shape.
+/// Structurally the twin of [`assemble_skills_list_fast`] above: it produces the
+/// JSON-RPC response and hands it to the SHARED [`assemble_internal_fast`] tail.
 /// Reached only AFTER session resolution, the v2 header matrix, legacy-version
 /// validation and auth — classify-then-continue, no pipeline bypass. That
 /// ordering is not incidental here: it is what makes an unauthenticated caller's
@@ -4228,55 +4207,28 @@ async fn assemble_skills_get_fast(
     shape: InternalResponseShape<'_>,
     session_id: Option<&String>,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_skills_get(id, params, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    // Same structural guarantee as every other direct response (HTTP-05).
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let mut response = build_response(state, response_msg, session_id, sessions_on);
-
-    v1::apply_session_header(response.headers_mut(), response_session_id, sessions_on);
-
-    // `skills/get` is never an init request → compute the outbound version
-    // normally.
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-    response
-        .headers_mut()
-        .insert(MCP_PROTOCOL_VERSION, version_to_send.parse().unwrap());
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-
-    response
+    assemble_internal_fast(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
+        session_id,
+    )
+    .await
 }
 
 /// Assemble the `skills/get` response on the middleware path (Phase 125 plan 02).
 ///
-/// The middleware-path twin of [`assemble_skills_get_fast`], differing ONLY in the
-/// response-BUILDING step ([`build_success_response_with_middleware`] instead of
-/// [`build_response`] + [`v1::apply_session_header`]) — this file's established
-/// fast/middleware split. Both MUST exist or the two POST paths diverge on which
-/// servers can answer the method at all.
+/// The middleware-path twin of [`assemble_skills_get_fast`]: same producer,
+/// [`assemble_internal_with_middleware`] instead of [`assemble_internal_fast`]
+/// for the tail — this file's established fast/middleware split. Both MUST exist
+/// or the two POST paths diverge on which servers can answer the method at all.
 async fn assemble_skills_get_with_middleware(
     state: &ServerState,
     id: crate::types::RequestId,
@@ -4286,44 +4238,21 @@ async fn assemble_skills_get_with_middleware(
     http_middleware: &ServerHttpMiddlewareChain,
     http_context: &ServerHttpContext,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_skills_get(id, params, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-
-    let mut response = build_success_response_with_middleware(
-        &response_msg,
-        response_session_id,
-        &version_to_send,
-        sessions_on,
+    assemble_internal_with_middleware(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
         http_middleware,
         http_context,
     )
-    .await;
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-    response
+    .await
 }
 
 // ===========================================================================
@@ -5255,10 +5184,11 @@ struct MiddlewareDispatch {
 /// Assemble the `server/discover` response on the middleware path (VERS-04).
 ///
 /// The middleware-path twin of [`assemble_discover_response_fast`]: projects via
-/// [`Server::handle_discover`](crate::server::Server::handle_discover), stores the
-/// response event, runs the SAME response-middleware assembly every other
-/// response runs ([`build_success_response_with_middleware`]), and echoes the v2
-/// outbound headers on an accepted v2 discover — preserving the original id.
+/// [`Server::handle_discover`](crate::server::Server::handle_discover), then runs
+/// the SHARED [`assemble_internal_with_middleware`] tail — which stores the
+/// response event, runs the same response-middleware assembly every other
+/// response runs, and echoes the v2 outbound headers on an accepted v2 discover,
+/// preserving the original id.
 /// Reached only AFTER session, the v2 matrix, legacy-version validation, and auth
 /// (no bypass). See [`assemble_discover_response_fast`] for the D-10 `-32601@200`
 /// decision on v1 / non-opted-in discover.
@@ -5270,46 +5200,21 @@ async fn assemble_discover_response_with_middleware(
     http_middleware: &ServerHttpMiddlewareChain,
     http_context: &ServerHttpContext,
 ) -> Response {
-    let InternalResponseShape {
-        response_session_id,
-        asserted_protocol_version,
-        v2_outbound,
-        sessions_on,
-    } = shape;
     let live_id = id.clone();
     let json_response = {
         let server = state.server.lock().await;
         server.handle_discover(id, protocol_context)
     };
-    let era = protocol_context.map(|pc| pc.era);
-    let v2_status = v2_dispatch_response_status(era, &json_response);
-    // Same structural guarantee as every other direct response (HTTP-05).
-    let response_msg =
-        TransportMessage::Response(envelope_for_live_request(json_response.payload, live_id));
-
-    v1::store_response_event(state, era, response_session_id, &response_msg).await;
-
-    // Discover is never an init request → compute the outbound version normally.
-    let version_to_send =
-        outbound_protocol_version_after_init(state, response_session_id, asserted_protocol_version);
-
-    let mut response = build_success_response_with_middleware(
-        &response_msg,
-        response_session_id,
-        &version_to_send,
-        sessions_on,
+    assemble_internal_with_middleware(
+        state,
+        json_response,
+        live_id,
+        protocol_context.map(|pc| pc.era),
+        shape,
         http_middleware,
         http_context,
     )
-    .await;
-
-    if let Some((method, name)) = &v2_outbound {
-        apply_v2_outbound_headers(response.headers_mut(), method, name);
-    }
-    if let Some(status) = v2_status {
-        *response.status_mut() = status;
-    }
-    response
+    .await
 }
 
 /// Dispatch the classified ingress on the fast path.
