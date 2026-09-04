@@ -4,18 +4,18 @@ milestone: v2.7
 milestone_name: SEP-2640 Skills Conformance & Positioning (Phase 125+)
 current_phase: 126
 current_phase_name: "Workflow to skill projection — `SequentialWorkflow::as_skill()`"
-status: In progress — phase 125 complete; phase 126 added, not yet planned
-stopped_at: Phase 126 context gathered
-last_updated: "2026-09-03T05:09:25.923Z"
-last_activity: 2026-09-02
-last_activity_desc: Milestone v2.6 archived; milestone pointer moved to v2.7 (phase 125 already complete)
-state_head: 291bb70e00e4c0e1bf1e9449402fd7c60639906a
+status: executing
+stopped_at: Completed 126-01-PLAN.md
+last_updated: "2026-09-04T04:55:55.669Z"
+last_activity: 2026-09-03
+last_activity_desc: Phase 126 execution started
+state_head: 3580e6e69889f2b6d76c514488a540dc51ea6745
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 12
-  completed_plans: 5
-  percent: 42
+  completed_plans: 6
+  percent: 50
 ---
 
 # Project State
@@ -29,14 +29,14 @@ See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 clo
 > v2.7 gets a fresh one — `/gsd-new-milestone` writes it. Do not go looking for the old file.
 
 **Core value:** An AI-Package built from configuration alone moves between pmcp.run environments with its tool surface intact, and the target environment is told exactly what it must supply.
-**Current focus:** v2.7 — SEP-2640 skills conformance and tri-surface positioning. Phase 125 COMPLETE; **Phase 126 (workflow→skill projection, `SequentialWorkflow::as_skill()`) is the next phase** — added 2026-09-02, not yet planned.
+**Current focus:** Phase 126 — Workflow to skill projection — `SequentialWorkflow::as_skill()`
 
 ## Current Position
 
-Phase: 126 (Workflow to skill projection — `SequentialWorkflow::as_skill()`) — READY TO EXECUTE
-Plan: 5 of 5 complete
-Status: v2.6 archived. v2.7 active — phase 125 COMPLETE, phase 126 added and awaiting `/gsd-plan-phase 126`.
-Last activity: 2026-09-02 — v2.6 completed and archived; milestone pointer moved v2.6 → v2.7
+Phase: 126 (Workflow to skill projection — `SequentialWorkflow::as_skill()`) — EXECUTING
+Plan: 2 of 7
+Status: Ready to execute
+Last activity: 2026-09-03 — Phase 126 execution started
 
 **Phase 125 close-out:** UAT 3/3 passed, verification `passed`, `threats_open: 0`. Three human
 decisions recorded — CR-01 accepted as a D-01-scoped residual risk (an advertised skills
@@ -547,6 +547,9 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase 125]: The book/source doctest mirror is rust,no_run and never EXECUTES its assertions in either harness, so a unit test now runs them — the D-03 frontmatter change is evidence rather than reasoning.
 - [Phase 125]: make quality-gate now compiles, rustdoc-lints and RUNS src/server/skills.rs via a four-selector make test-skills leg, each selector guarded on its own zero count (a summed total was proven inadequate by negative control)
 - [Phase 125]: Adding gate reach found two entirely RED quality-gate legs (make lint, make lint-plans) that four earlier plans of phase 125 never ran; bare cargo clippy --all-features -D warnings is strictly weaker than make lint
+- [Phase 126]: GATE A (LOCKED, one-way): SkillProjection::build() returns Result<ProjectionOutput> with pub struct ProjectionOutput { skill, warnings } — plan 126-04 implements it and MUST record the departure from D-02 as an explicit deviation; plan 126-06 MUST name it in the CHANGELOG.
+- [Phase 126]: GATE B (LOCKED, one-way): add-builder-path — plan 126-05 Task 4 adds a cfg(skills) field + must_use setter to BOTH ServerCoreBuilder and ServerBuilder so the D-04a prepend is reachable from prompt_workflow; the anti-drift claim then holds per SERVER, not merely per workflow value.
+- [Phase 126]: Projected frontmatter values are ALWAYS emitted as escaped YAML double-quoted scalars (closes T-126-21 / REVIEWS finding 1, HIGH): a raw concatenation lets an ordinary description break the parse, which build_artifact_inner downgrades to a diagnostic so validate_names silently SKIPS the SC-1 identity check instead of enforcing it.
 
 ### Pending Todos
 
@@ -637,9 +640,9 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-09-03T01:00:50.440Z
-Stopped at: Phase 126 context gathered
-Resume file: .planning/phases/126-workflow-to-skill-projection-sequentialworkflow-as-skill/126-CONTEXT.md
+Last session: 2026-09-04T04:55:55.611Z
+Stopped at: Completed 126-01-PLAN.md
+Resume file: None
 Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
 
@@ -800,6 +803,7 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 125 P03 | 35 min | 3 tasks | 2 files |
 | Phase 125 P04 | 42 min | 3 tasks | 9 files |
 | Phase 125 P05 | 51 min | 3 tasks | 13 files |
+| Phase 126 P01 | 41 min | 2 tasks | 6 files |
 
 ## Operator Next Steps
 

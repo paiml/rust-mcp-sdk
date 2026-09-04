@@ -166,13 +166,13 @@ Constant}`:
 - "Judgment:" lines ← `with_guidance` text
 - Closing "Server-accelerated alternative" ← names the prompt; the manual procedure stays complete
 
-**Plans:** 7 plans across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
+**Plans:** 1/7 plans executed across 5 waves — 1:{01} 2:{02,03} 3:{04,05} 4:{06} 5:{07}
 
 Plans:
 
 **Wave 1**
 
-- [ ] 126-01-PLAN.md — D-03 module split (alone, first) + TRACER: one trivial workflow projects, registers, and reads back byte-identical, with **safely encoded YAML frontmatter** and its round-trip proof *(carries the phase's two one-way decision gates: `build()`'s return shape, and builder-level reachability of the D-04a opt-in)*
+- [x] 126-01-PLAN.md — D-03 module split (alone, first) + TRACER: one trivial workflow projects, registers, and reads back byte-identical, with **safely encoded YAML frontmatter** and its round-trip proof *(carries the phase's two one-way decision gates: `build()`'s return shape, and builder-level reachability of the D-04a opt-in)*
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -219,7 +219,7 @@ Plans:
 | Phase | Requirements | Plans Complete | Status | Completed |
 |-------|--------------|----------------|--------|-----------|
 | 125. SEP-2640 Conformance — skills/list + skills/get | D-01..D-11 (`125-CONTEXT.md`; no formal REQ-IDs) | 5/5 | Complete | 2026-09-02 |
-| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 0/7 | Planned | - |
+| 126. Workflow→skill projection (`as_skill()`) | SC-1..SC-6 (ROADMAP) + D-01..D-16, D-04a/D-15a/D-16a (`126-CONTEXT.md`); no formal REQ-IDs | 1/7 | In Progress|  |
 
 **Phase 125 close-out record (2026-09-02).** All five ROADMAP Success Criteria above verified
 (`125-VERIFICATION.md`, status `passed`). UAT 3/3 passed (`125-UAT.md`) — three human decisions:
