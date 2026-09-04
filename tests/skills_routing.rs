@@ -1546,3 +1546,305 @@ fn fuzz_skill_entry_is_registered_and_scheduled() {
          {matrix_rows:?}"
     );
 }
+
+// ===========================================================================
+// 20-21 — Phase 126 (SC-4, the WIRE half): a PROJECTED workflow skill,
+//         served by the real `StreamableHttpServer`.
+// ===========================================================================
+//
+// Plan 126-01 proved SC-4's IN-PROCESS half in `tests/skills_integration.rs`:
+// a `SequentialWorkflow::as_skill()` result registers through the real
+// `Skills::into_handler()` and `handler.read(...)` returns `skill.body()`
+// verbatim. That is a struct-to-struct statement. These two tests are the other
+// half: the same skill on a loopback socket, with every assertion read off the
+// JSON a remote caller actually receives.
+//
+// They live HERE and not in a new `tests/skills_projection.rs` because a new
+// integration target matches NONE of `make test-skills`'s four selectors
+// (`--lib skills`, `--doc skills`, `--test skills_integration`,
+// `--test skills_routing`) and would need a fifth guarded selector to run at all.
+//
+// | # | test | property |
+// |---|------|----------|
+// | 20 | `projected_workflow_skill_is_conforming_on_the_wire` | a projected skill answers `skills/list` with a two-key verbatim frontmatter and a complete `{uri, digest, size}` manifest, and `resources/read` returns those exact bytes |
+// | 21 | `projected_workflow_skill_survives_an_adversarial_description_on_the_wire` | the same, for a description carrying `: `, `#` AND an embedded newline — REVIEWS finding 1 observed from OUTSIDE the SDK |
+
+use pmcp::server::workflow::{DataSource, SequentialWorkflow, ToolHandle, WorkflowStep};
+
+/// The projected skill's SKILL.md URI. `refund_flow` slugifies to `refund-flow`.
+const PROJECTED_SKILL_MD: &str = "skill://refund-flow/SKILL.md";
+
+/// An ordinary workflow description — the control for test 21.
+const PLAIN_DESCRIPTION: &str = "Process a customer refund";
+
+/// The adversarial description (REVIEWS finding 1 / T-126-21).
+///
+/// Three separate YAML hazards in one string: `: ` is a mapping indicator, `#`
+/// opens a comment, and the embedded newline is the injection that would append
+/// a THIRD frontmatter key (`metadata`) under a raw `description: {}` concat.
+///
+/// The failure this pins is SILENT, not loud. Under a raw concatenation the
+/// emitted block either grows a third key or fails `serde_yaml` outright — and on
+/// a parse failure `build_artifact_inner` DOWNGRADES to a diagnostic, sets
+/// `frontmatter = None`, and `validate_names` then `continue`s. The entry ships
+/// with no `name` at all and every name-identity assertion becomes unfalsifiable
+/// rather than red. That is why test 21 asserts the key COUNT and the presence of
+/// `name`, not merely the two values.
+const ADVERSARIAL_DESCRIPTION: &str = "Refund an order: fast path #urgent\nmetadata: injected";
+
+/// The workflow both tests project: one argument, two tool steps (one carrying
+/// guidance), and a step binding — enough render surface that the body is
+/// substantial rather than a bare frontmatter block.
+fn projected_workflow(description: &str) -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", description)
+        .argument("order_id", "The order to refund", true)
+        .step(
+            WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                .arg("id", DataSource::prompt_arg("order_id"))
+                .bind("order"),
+        )
+        .step(
+            WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                .arg("amount", DataSource::from_step_field("order", "total"))
+                .with_guidance("Confirm with the customer before issuing the refund.")
+                .bind("refund"),
+        )
+}
+
+/// `true` when `hex` is exactly 64 characters drawn from the LOWERCASE hex
+/// alphabet, checked character by character.
+///
+/// Prefix-plus-length is not enough: an uppercase rendering has the right prefix
+/// and the right length and is a silent host-side comparison failure, because a
+/// conforming host re-derives the digest and compares the strings.
+fn is_lowercase_hex_64(hex: &str) -> bool {
+    hex.len() == 64 && hex.chars().all(|c| "0123456789abcdef".contains(c))
+}
+
+/// The skill-name segment of a SKILL.md entry URI.
+///
+/// # Not `rsplit('/').next()`
+///
+/// The entry URI is `skill://{name}/SKILL.md`, so its literal final segment is
+/// `SKILL.md`. The identity `validate_names` enforces is between the frontmatter
+/// `name` and `final_path_segment(skill.resolved_path())` — the segment BEFORE
+/// the trailing `/SKILL.md`. Taking the literal last segment here would compare
+/// `refund-flow` against `SKILL.md` and fail on a correct implementation.
+fn skill_name_segment_of(entry_uri: &str) -> &str {
+    entry_uri
+        .strip_suffix("/SKILL.md")
+        .unwrap_or_else(|| panic!("a skills/list entry URI ends in /SKILL.md; got {entry_uri}"))
+        .rsplit('/')
+        .next()
+        .unwrap_or_else(|| panic!("entry URI has no path segment: {entry_uri}"))
+}
+
+/// Drive the full SC-4 wire assertion set for a workflow with `description`.
+///
+/// Every clause below names the SC-4 obligation it covers in its failure message,
+/// so a red run says which part of the contract broke rather than merely which
+/// line.
+async fn assert_sc4_holds_on_the_wire(description: &str) {
+    let workflow = projected_workflow(description);
+    let skill = workflow.as_skill();
+
+    // ── Anti-vacuity, BEFORE anything structural ──────────────────────
+    //
+    // Every assertion after this one is about the shape of what came back. A
+    // projection that rendered an empty body, or a server that answered with an
+    // empty skills array, would satisfy several of them by having nothing to
+    // check. Both are ruled out first.
+    assert!(
+        skill.body().len() > 200,
+        "SC-4 anti-vacuity: the projected body is only {} bytes, so the \
+         byte-identity assertion below would be near-trivial",
+        skill.body().len()
+    );
+
+    let (addr, handle) =
+        spawn_default_config(skills_fixture_server(Skills::new().add(skill.clone()))).await;
+
+    let response = post_v2_skills_list(addr, 126).await;
+    assert_eq!(
+        response.status, 200,
+        "SC-4: a projected skill must be LISTABLE at HTTP 200: {}",
+        response.raw
+    );
+    let result = result_of(&response);
+    let skills = result["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result.skills is an array; got {}", response.raw));
+    assert_eq!(
+        skills.len(),
+        1,
+        "SC-4 anti-vacuity: one projected skill, one entry; got {}",
+        response.raw
+    );
+
+    // ── (1) entry identity ────────────────────────────────────────────
+    let entry = &skills[0];
+    assert_eq!(
+        entry["uri"], PROJECTED_SKILL_MD,
+        "SC-4 clause 1 (entry identity): the projected skill is served at its \
+         slugified URI: {}",
+        response.raw
+    );
+
+    // ── (2) verbatim frontmatter, exactly two keys (D-13) ─────────────
+    //
+    // The COUNT is asserted as well as the two values. A third key is a D-13
+    // violation that a pair of value-only assertions cannot see — and it is
+    // precisely what a newline injection into `description` produces.
+    let frontmatter = entry["frontmatter"]
+        .as_object()
+        .unwrap_or_else(|| panic!("entry.frontmatter is a JSON object; got {}", response.raw));
+    assert_eq!(
+        frontmatter.len(),
+        2,
+        "SC-4 clause 2 (D-13): the projection emits EXACTLY {{name, description}}; \
+         got keys {:?} in {}",
+        frontmatter.keys().collect::<Vec<_>>(),
+        response.raw
+    );
+    let served_name = frontmatter["name"].as_str().unwrap_or_else(|| {
+        panic!(
+            "SC-4 clause 2: frontmatter `name` must be present AND a string — a \
+             missing name is the SILENT downgrade path, not a loud failure: {}",
+            response.raw
+        )
+    });
+    assert_eq!(
+        served_name, "refund-flow",
+        "SC-4 clause 2: the served name is the slugified workflow name: {}",
+        response.raw
+    );
+    assert_eq!(
+        frontmatter["description"].as_str(),
+        Some(description),
+        "SC-4 clause 2: the served description must equal the workflow's \
+         description VERBATIM, byte for byte: {}",
+        response.raw
+    );
+
+    // ── (3) name identity on the wire (SC-1, observed externally) ─────
+    let entry_uri = entry["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("entry.uri is a string; got {}", response.raw));
+    assert_eq!(
+        skill_name_segment_of(entry_uri),
+        served_name,
+        "SC-4 clause 3 / SC-1: the frontmatter `name` must equal the skill \
+         segment of the entry URI — this is `validate_names`' invariant seen \
+         from OUTSIDE the SDK: {}",
+        response.raw
+    );
+
+    // ── (4) a complete `{uri, digest, size}` manifest ─────────────────
+    let manifest = entry["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("entry.resources is an array; got {}", response.raw));
+    assert!(
+        !manifest.is_empty(),
+        "SC-4 clause 4: a conforming host fetches every manifest row, so an \
+         EMPTY manifest is a rejection and not a graceful degradation: {}",
+        response.raw
+    );
+    let skill_md_row = manifest
+        .iter()
+        .find(|row| row["uri"] == PROJECTED_SKILL_MD)
+        .unwrap_or_else(|| {
+            panic!(
+                "SC-4 clause 4: the manifest must carry a row for {PROJECTED_SKILL_MD}: {}",
+                response.raw
+            )
+        });
+
+    let digest = skill_md_row["digest"].as_str().unwrap_or_else(|| {
+        panic!(
+            "a manifest row carries a string digest; got {}",
+            response.raw
+        )
+    });
+    let hex = digest
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| panic!("SC-4 clause 4: digest must carry `sha256:`; got {digest}"));
+    assert!(
+        is_lowercase_hex_64(hex),
+        "SC-4 clause 4: digest must be `sha256:` + exactly 64 LOWERCASE hex \
+         characters, checked character by character; got {digest}"
+    );
+
+    let size = skill_md_row["size"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "a manifest row carries a numeric size; got {}",
+            response.raw
+        )
+    });
+    assert!(size > 0, "SC-4 clause 4: a served body has non-zero size");
+    assert_eq!(
+        usize::try_from(size).expect("a SKILL.md size fits in usize"),
+        skill.body().len(),
+        "SC-4 clause 4: the manifest `size` must equal the byte length of the \
+         SERVED body: {}",
+        response.raw
+    );
+
+    // ── (5) byte-identity on the wire ─────────────────────────────────
+    //
+    // D-05's one-body invariant, stated where a consumer can see it: the bytes
+    // the digest above covers are the bytes `resources/read` hands back.
+    let params = json!({ "uri": PROJECTED_SKILL_MD });
+    let read = post(
+        addr,
+        &v2_headers_for("resources/read", &params),
+        &v2_body("resources/read", json!(127), params),
+    )
+    .await;
+    assert!(
+        read.body.get("error").is_none(),
+        "SC-4 clause 5: the projected skill's SKILL.md must READ: {}",
+        read.raw
+    );
+    let contents = read.body["result"]["contents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resources/read returns a contents array; got {}", read.raw));
+    assert_eq!(
+        contents.len(),
+        1,
+        "SC-4 clause 5: one SKILL.md, one content item: {}",
+        read.raw
+    );
+    assert_eq!(
+        contents[0]["text"].as_str(),
+        Some(skill.body()),
+        "SC-4 clause 5: `resources/read` must return bytes byte-equal to \
+         `skill.body()` — the same bytes the published digest covers: {}",
+        read.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+/// SC-4 on the wire, for an ordinary workflow description.
+#[tokio::test]
+async fn projected_workflow_skill_is_conforming_on_the_wire() {
+    assert_sc4_holds_on_the_wire(PLAIN_DESCRIPTION).await;
+}
+
+/// SC-4 on the wire, for a description that would break a RAW frontmatter
+/// concatenation (REVIEWS finding 1 / T-126-21), observed from outside the SDK.
+///
+/// Plan 126-01 fixed this with `yaml_double_quoted`. If that encoder is ever
+/// weakened or made conditional, THIS test goes red at the SC-4 level — the
+/// frontmatter grows a `metadata` key, or the whole block fails to parse and the
+/// entry ships with no `name` at all.
+#[tokio::test]
+async fn projected_workflow_skill_survives_an_adversarial_description_on_the_wire() {
+    // Guard the fixture itself: the string must actually carry all three hazards,
+    // or this test is the plain one under a different name.
+    assert!(ADVERSARIAL_DESCRIPTION.contains(": "));
+    assert!(ADVERSARIAL_DESCRIPTION.contains('#'));
+    assert!(ADVERSARIAL_DESCRIPTION.contains('\n'));
+
+    assert_sc4_holds_on_the_wire(ADVERSARIAL_DESCRIPTION).await;
+}
