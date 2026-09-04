@@ -558,6 +558,8 @@ mod tests {
     use crate::types::{PromptArgumentType, Role};
     use proptest::prelude::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::sync::OnceLock;
 
     fn tracer_workflow(name: &str, description: &str) -> SequentialWorkflow {
         SequentialWorkflow::new(name, description)
@@ -1441,6 +1443,260 @@ mod tests {
             obj.contains_key("description"),
             "D-13: missing `description`"
         );
+    }
+
+    // ── SC-2: determinism ─────────────────────────────────────────────
+
+    /// Build a workflow whose single step's template bindings are inserted in
+    /// the given order. Everything else about the two workflows is identical.
+    fn workflow_with_binding_order(order: [&str; 3]) -> SequentialWorkflow {
+        let mut step = WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+            .arg("amount", DataSource::from_step_field("order", "total"))
+            .bind("refund");
+        for key in order {
+            step = step.with_template_binding(key, DataSource::prompt_arg(key));
+        }
+        SequentialWorkflow::new("refund_flow", "Process a customer refund")
+            .argument("order_id", "The order to refund", true)
+            .step(step)
+    }
+
+    /// The PRIMARY SC-2 proof (REVIEWS codex).
+    ///
+    /// Two workflows differing ONLY in the insertion order of their template
+    /// bindings must render byte-equal bodies. Deterministic, single-run,
+    /// cannot flake, and fails 100% of the time against an unsorted `HashMap`
+    /// iteration — which is what a repeated-reconstruction loop cannot promise,
+    /// since it only fails when the seeds happen to disagree.
+    ///
+    /// Three keys, not two: a two-element `HashMap` can iterate in the "right"
+    /// order by accident often enough to make the test a coin flip.
+    #[test]
+    fn sc2_binding_insertion_order_does_not_change_bytes() {
+        let forward = workflow_with_binding_order(["zeta", "middle", "alpha"])
+            .as_skill()
+            .body()
+            .to_string();
+        let reversed = workflow_with_binding_order(["alpha", "middle", "zeta"])
+            .as_skill()
+            .body()
+            .to_string();
+
+        // Anti-vacuity: two empty bodies are also byte-equal.
+        assert!(
+            forward.contains("- Template variable `alpha`:")
+                && forward.contains("- Template variable `middle`:")
+                && forward.contains("- Template variable `zeta`:"),
+            "SC-2 anti-vacuity: all three template bindings must actually render; \
+             body was:\n{forward}"
+        );
+
+        assert_eq!(
+            forward, reversed,
+            "SC-2: template-binding INSERTION order must not reach the rendered \
+             bytes — `template_bindings()` returns a `&HashMap` and is the one \
+             nondeterministic accessor in the input surface, so `render_step` \
+             collects it into a `BTreeMap` first"
+        );
+    }
+
+    /// The body of the FIRST kitchen-sink render in this process.
+    ///
+    /// `prop_sc2_rerender_is_byte_equal` compares every later render against
+    /// this one, which is what "byte-equal across re-derivations" means.
+    fn first_kitchen_sink_body() -> &'static str {
+        static FIRST: OnceLock<String> = OnceLock::new();
+        FIRST.get_or_init(|| kitchen_sink_workflow().as_skill().body().to_string())
+    }
+
+    proptest! {
+        /// SUPPLEMENTAL SC-2 proof.
+        ///
+        /// CONSTRUCTING A FRESH workflow inside the loop body is load-bearing:
+        /// Rust's `HashMap` randomizes per `RandomState`, which is per map
+        /// INSTANCE, so re-rendering one instance often hash-iterates
+        /// identically within a process and then differs across processes or
+        /// after a rehash. Rendering one instance twice is the shape of a
+        /// determinism test that cannot fail.
+        ///
+        /// `kitchen_sink_workflow()` is used because it carries template
+        /// bindings — the only nondeterministic input.
+        #[test]
+        fn prop_sc2_rerender_is_byte_equal(_n in 0..100u32) {
+            let fresh = kitchen_sink_workflow().as_skill().body().to_string();
+            prop_assert!(fresh.len() > 400, "anti-vacuity: body was {} bytes", fresh.len());
+            prop_assert_eq!(fresh.as_str(), first_kitchen_sink_body());
+        }
+    }
+
+    // ── SC-1: slug legality as a property over arbitrary names ────────
+
+    proptest! {
+        /// SC-1 (property half): whatever `as_skill()` produces for an
+        /// arbitrary workflow name, the result is an agentskills-legal skill
+        /// name — 1..=64 characters drawn from `[a-z0-9-]`, with no leading or
+        /// trailing hyphen and no `--`.
+        #[test]
+        fn prop_sc1_slug_is_agentskills_legal(name in ".*") {
+            let skill = SequentialWorkflow::new(name.as_str(), "Process a refund").as_skill();
+            let slug = skill.name();
+            prop_assert!(!slug.is_empty(), "slug was empty for name {:?}", name);
+            prop_assert!(
+                slug.len() <= MAX_SLUG_LEN,
+                "slug {:?} is {} chars, over the {} bound",
+                slug,
+                slug.len(),
+                MAX_SLUG_LEN
+            );
+            prop_assert!(
+                slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "slug {:?} left the [a-z0-9-] alphabet",
+                slug
+            );
+            prop_assert!(!slug.starts_with('-'), "slug {:?} has a leading hyphen", slug);
+            prop_assert!(!slug.ends_with('-'), "slug {:?} has a trailing hyphen", slug);
+            prop_assert!(!slug.contains("--"), "slug {:?} has a doubled hyphen", slug);
+        }
+
+        /// SC-1: the same name always projects to the same slug, across two
+        /// freshly constructed workflows.
+        #[test]
+        fn prop_sc1_slug_is_deterministic(name in ".*") {
+            let first = SequentialWorkflow::new(name.as_str(), "Process a refund")
+                .as_skill()
+                .name()
+                .to_string();
+            let second = SequentialWorkflow::new(name.as_str(), "Process a refund")
+                .as_skill()
+                .name()
+                .to_string();
+            prop_assert_eq!(first, second);
+        }
+
+        /// D-15: nothing panics. Arbitrary text reaches the name, the
+        /// description, an argument description, an instruction and a step's
+        /// guidance — every author-supplied string the renderer touches.
+        #[test]
+        fn prop_no_panic_on_arbitrary_text(
+            name in ".*",
+            description in ".*",
+            guidance in ".*",
+        ) {
+            let wf = SequentialWorkflow::new(name.as_str(), description.as_str())
+                .argument("arg", description.as_str(), true)
+                .instruction(InternalPromptMessage::new(
+                    Role::User,
+                    PromptContent::Text(description.clone()),
+                ))
+                .step(
+                    WorkflowStep::new("step", ToolHandle::new("tool"))
+                        .with_guidance(guidance.as_str())
+                        .bind("out"),
+                );
+            let skill = wf.as_skill();
+            prop_assert!(!skill.body().is_empty());
+            prop_assert!(skill.body().ends_with('\n'));
+        }
+    }
+
+    // ── SC-5: the dual surface ────────────────────────────────────────
+
+    /// SC-5: the SEP-2640 skill text and the prompt text are ONE content.
+    ///
+    /// The guards run BEFORE the equality on purpose. `as_prompt_text()`
+    /// returns `body` unchanged only when the body already ends in exactly one
+    /// newline AND the skill carries zero references; both are renderer
+    /// guarantees, not free properties, and the equality passes vacuously on an
+    /// empty body.
+    #[test]
+    fn sc5_prompt_text_equals_body() {
+        let skill = kitchen_sink_workflow().as_skill();
+        assert_eq!(
+            skill.references().count(),
+            0,
+            "SC-5 holds only for a reference-free skill; `as_prompt_text()` \
+             appends every reference body"
+        );
+        assert!(
+            skill.body().ends_with('\n'),
+            "SC-5 needs the body to end in a newline; `as_prompt_text()` appends one"
+        );
+        assert!(
+            !skill.body().ends_with("\n\n"),
+            "SC-5 needs EXACTLY one trailing newline"
+        );
+        assert!(
+            skill.body().len() > 200,
+            "SC-5 anti-vacuity: body was only {} bytes",
+            skill.body().len()
+        );
+        assert_eq!(skill.as_prompt_text(), skill.body());
+    }
+
+    /// Slice `body` to its `## Procedure` section, exclusive of the next
+    /// `## ` heading.
+    ///
+    /// Scoping the scan is required, not cosmetic (REVIEWS fable): a
+    /// `PromptContent::ToolHandle` instruction renders a backticked tool NAME
+    /// into `## Context`, so an unscoped scan over the whole body could pick up
+    /// a name the Procedure never called and fail the set equality for a reason
+    /// that is not a defect.
+    fn procedure_section(body: &str) -> &str {
+        const HEADING: &str = "## Procedure";
+        let start = body
+            .find(HEADING)
+            .expect("the rendered body must carry a Procedure section");
+        let rest = &body[start + HEADING.len()..];
+        rest.find("\n## ").map_or(rest, |end| &rest[..end])
+    }
+
+    /// SC-5 (surface equivalence): the SET of tool names in the rendered
+    /// Procedure EQUALS the set the workflow declares.
+    ///
+    /// Set equality in BOTH directions. One-way containment would pass a
+    /// renderer that emitted a tool name the workflow never declared, or that
+    /// silently dropped one.
+    ///
+    /// The first set is derived by parsing the RENDERED text, not by re-walking
+    /// the workflow — parsing the workflow twice would prove nothing about the
+    /// render.
+    #[test]
+    fn sc5_surface_equivalence_is_set_equality() {
+        let wf = kitchen_sink_workflow();
+        let skill = wf.as_skill();
+        let procedure = procedure_section(skill.body());
+        assert!(
+            procedure.contains("### Step 1:"),
+            "anti-vacuity: the Procedure slice must carry steps; slice was:\n{procedure}"
+        );
+
+        let rendered: BTreeSet<&str> = procedure
+            .lines()
+            .filter_map(|line| line.strip_prefix("Call tool `"))
+            .filter_map(|rest| rest.split_once('`').map(|(name, _)| name))
+            .collect();
+        let declared: BTreeSet<&str> = wf
+            .steps()
+            .iter()
+            .filter_map(WorkflowStep::tool)
+            .map(ToolHandle::name)
+            .collect();
+
+        assert!(
+            !declared.is_empty(),
+            "anti-vacuity: the fixture must declare at least one tool"
+        );
+        assert!(
+            rendered.is_subset(&declared),
+            "the render named a tool the workflow never declared: rendered={rendered:?}, \
+             declared={declared:?}"
+        );
+        assert!(
+            declared.is_subset(&rendered),
+            "the render dropped a declared tool: rendered={rendered:?}, \
+             declared={declared:?}"
+        );
+        assert_eq!(rendered, declared);
     }
 
     // ── REVIEWS finding 1: the round-trip property ────────────────────
