@@ -11,14 +11,22 @@
 //!
 //! # The rendered text is NOT semver-stable
 //!
-//! The exact bytes this module produces are pinned by a golden test so that no
-//! change is accidental, but they are explicitly **not** part of the crate's
-//! semver contract: the render may change on any minor bump (D-14). It changes
-//! with a CHANGELOG entry every time, because the bytes become the `sha256`
-//! digest published in the skill's `skills/list` entry, and a consumer that
-//! pinned that digest must re-pin. A digest mismatch is a fatal pre-loop
-//! revocation for such a consumer, not a warning — so a silent render change is
-//! a supply-chain event, not a cosmetic one.
+//! The exact bytes this module produces are pinned by a golden file —
+//! `tests/golden/workflow_skill_projection.md`, compared byte-for-byte by
+//! `golden_render_is_byte_equal` in `tests/skills_integration.rs` — so that no
+//! change is accidental. They are explicitly **not** part of the crate's semver
+//! contract: the render may change on any minor bump (D-14). It changes with a
+//! CHANGELOG entry every time, because the bytes become the `sha256` digest
+//! published in the skill's `skills/list` entry, and a consumer that pinned that
+//! digest must re-pin. A digest mismatch is a fatal pre-loop revocation for such
+//! a consumer, not a warning — so a silent render change is a supply-chain
+//! event, not a cosmetic one.
+//!
+//! When that golden goes red it has exactly two causes needing opposite fixes:
+//! the render changed on purpose (update the golden AND write the CHANGELOG
+//! entry) or the render regressed (fix the renderer). Re-recording the golden
+//! from current output resolves the symptom without deciding which. The
+//! comparison's failure message says so at the point of failure.
 //!
 //! # Two workflow accessors are excluded from the render on purpose
 //!
@@ -27,19 +35,130 @@
 //! LLM following the rendered procedure by hand neither schedules a task nor
 //! retries a step the way the server's own executor does. Rendering them would
 //! put facts in the body that the reader cannot act on. They are excluded
-//! deliberately, and a test asserts they do not appear (D-11).
+//! deliberately (D-11), which is what makes SC-3's "every workflow fact renders"
+//! a DEFINED universe rather than an open-ended one — the exclusions are named
+//! here, and everything else renders.
+//!
+//! `sc3_excluded_execution_mechanics_change_no_byte` pins their absence by BYTE
+//! EQUALITY: it renders the same fixture with both accessors at their defaults
+//! and with both non-default, and compares. An accessor-name-absence check is
+//! kept alongside it as a readability guard only — a name check passes the
+//! moment a future render spells the fact differently.
 //!
 //! [`SequentialWorkflow::has_task_support`]: crate::server::workflow::SequentialWorkflow::has_task_support
 //! [`WorkflowStep::is_retryable`]: crate::server::workflow::WorkflowStep::is_retryable
 //!
+//! # No tool description and no input schema reaches the body (D-12)
+//!
+//! Steps render their tool NAME and nothing else. The client reading this skill
+//! is already connected to the server that serves it and has `tools/list` one
+//! call away, so a tool's description and input schema are always available and
+//! always current. A copy digested into this body could only go stale, and
+//! staleness in a digested document is worse than absence: it looks
+//! authoritative.
+//!
+//! # Frontmatter carries `name` and `description` only (D-13)
+//!
+//! Hosts verify frontmatter field-by-field against the fetched file, so every
+//! additional key is additional conformance surface that can disagree. Two keys
+//! is the agentskills-legal minimum and therefore the smallest risk.
+//! `sc3_frontmatter_carries_exactly_two_keys` pins the count.
+//!
 //! # Frontmatter is written as encoded YAML scalars, never by concatenation
 //!
-//! Both frontmatter values go through the module-private `yaml_double_quoted`. A workflow
-//! description is arbitrary author text, and pushing it raw after
+//! Both frontmatter values go through the module-private `yaml_double_quoted`,
+//! **unconditionally**, for two independent reasons:
+//!
+//! 1. A slug drawn from `[a-z0-9-]` can still be a YAML type-alike — `true`,
+//!    `123`, `null`. Unquoted, such a value parses as a bool or an integer, and
+//!    the registry's `validate_names` guard reaches for `as_str()`, gets `None`,
+//!    and SKIPS the skill rather than enforcing the name-identity check. The
+//!    check silently not running is worse than it failing.
+//! 2. Conditional quoting would make the digested bytes depend on a predicate
+//!    over author text, so an innocuous description edit could move the digest
+//!    through a branch nobody was thinking about. Unconditional encoding removes
+//!    the branch.
+//!
+//! A workflow description is arbitrary author text, and pushing it raw after
 //! `description: ` lets an ordinary string like `Refund an order: fast path`
 //! break the YAML parse — which the registry DOWNGRADES to a diagnostic rather
 //! than an error, silently skipping the name-identity check instead of
 //! enforcing it. Encoding both values unconditionally removes the whole class.
+//!
+//! The tripwire is `prop_frontmatter_roundtrips`, whose ORACLE is the module's
+//! own `parse_frontmatter_value`: the encoder is hand-written, the decoder is
+//! library-verified, so round-tripping arbitrary text through both is a real
+//! check rather than a mirror of the encoder's own assumptions.
+//!
+//! # Description legality: substituted or rejected, never length-bounded
+//!
+//! `SequentialWorkflow::new` validates nothing, so an empty description is legal
+//! input while `description:` with nothing after it renders a YAML null and
+//! violates agentskills' non-empty rule. The infallible path substitutes a
+//! deterministic legal string; [`SkillProjection::build`] returns `Err` instead,
+//! pushing a strict caller to write one.
+//!
+//! **No length bound is enforced, because the current SEP-2640 / agentskills
+//! material states none.** It specifies the digest format, the per-skill file
+//! and byte limits and the name-identity rule, and says nothing about
+//! description length. The omission here is deliberate, not an oversight — do
+//! not invent a limit; the registry's existing over-limit warning already covers
+//! a pathologically large body.
+//!
+//! # Every `#[non_exhaustive]` catch-all arm emits a constant literal
+//!
+//! [`PromptContent`] and [`DataSource`] are `#[non_exhaustive]`, so a variant
+//! added upstream lands on this module's catch-all arms. Those arms emit ONE
+//! STABLE LITERAL each — never a `{:?}` of the value. A `Debug` fallback would
+//! let an upstream variant addition silently move the rendered bytes and
+//! invalidate every published digest, which is precisely the class D-14 exists
+//! to make loud. The arms carry `#[allow(unreachable_patterns)]` because within
+//! this crate the matches are exhaustive today; the allow is what buys the
+//! future-variant guard.
+//!
+//! # SC-6 gate warnings have exactly ONE delivery channel
+//!
+//! The gate warning — guidance attached to a step whose tool is annotated
+//! side-effecting — is delivered through [`SkillProjection::build`]'s structured
+//! return, and only when [`SkillProjection::with_tools`] supplied annotations.
+//! `SequentialWorkflow::as_skill` receives only a `&SequentialWorkflow`, and
+//! [`ToolAnnotations`] live solely on [`crate::types::ToolInfo::annotations`],
+//! which nothing reachable from a workflow carries — so `as_skill()` cannot
+//! COMPUTE the warning; it is not that it declines to log it. Do not describe
+//! SC-6 as having two channels. (The builder additionally logs each warning it
+//! returns on `mcp.skills`, but that is the same finding on the same path, not a
+//! second way to obtain it.)
+//!
+//! # `SequentialWorkflow::instruction()` becomes observable here, and only here
+//!
+//! `instruction()` is a shipped public builder method whose value every served
+//! surface currently drops. The `## Context` section this module renders is the
+//! FIRST place that text becomes observable to any consumer. That underlying
+//! defect is deliberately out of scope here — this note exists so a maintainer
+//! who notices the asymmetry knows it was seen, not missed.
+//!
+//! # Opting a server into the projected prepend
+//!
+//! [`WorkflowPromptHandler::with_projected_skill_prepend`] makes the projected
+//! body prompt message `[0]`, and
+//! [`ServerCoreBuilder::with_workflow_skill_prepend`] /
+//! [`ServerBuilder::with_workflow_skill_prepend`] reach that opt-in from
+//! `prompt_workflow` on either builder. All three default to OFF, so a
+//! flag-off transcript is byte-identical to one from before they existed.
+//!
+//! The builder setters read their flag at `prompt_workflow` time, so each
+//! applies to workflows registered AFTER the call. Their existence is what makes
+//! the anti-drift claim hold **per server** rather than merely per workflow
+//! value: without them the opt-in was reachable only by hand-constructing a
+//! `WorkflowPromptHandler`, and a renderer whose consumer is unreachable leaves
+//! the claim theoretical.
+//!
+//! [`PromptContent`]: crate::server::workflow::PromptContent
+//! [`DataSource`]: crate::server::workflow::DataSource
+//! [`ToolAnnotations`]: crate::types::ToolAnnotations
+//! [`WorkflowPromptHandler::with_projected_skill_prepend`]: crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend
+//! [`ServerCoreBuilder::with_workflow_skill_prepend`]: crate::server::builder::ServerCoreBuilder::with_workflow_skill_prepend
+//! [`ServerBuilder::with_workflow_skill_prepend`]: crate::server::ServerBuilder::with_workflow_skill_prepend
 
 use crate::error::{Error, Result};
 use crate::server::skills::Skill;

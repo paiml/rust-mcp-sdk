@@ -5,6 +5,121 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - Unreleased
+
+### Added — a `SequentialWorkflow` projects to a SEP-2640 skill
+
+`SequentialWorkflow::as_skill()` (feature `skills`) renders a workflow as an
+agentskills-legal `SKILL.md` body, so a server that already defines a workflow
+gets the skill surface for free:
+
+```rust
+let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+    .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+
+let skill = workflow.as_skill();      // name: "refund-flow"
+```
+
+The body is rendered from the workflow's own introspection surface, so the skill
+a host reads and the prompt a host runs are **one content rendered twice** — they
+cannot drift, because the SDK owns the renderer. The workflow name is normalized
+to the agentskills alphabet (`refund_flow` becomes `refund-flow`) and no URI path
+override is set, so the frontmatter `name` and the final segment of
+`skill://{name}/SKILL.md` agree by construction.
+
+`as_skill()` is infallible and never panics. When a workflow name normalizes to
+nothing legal it substitutes a deterministic `workflow-{8 hex}` slug; when the
+description is empty it substitutes a deterministic legal one. Both emit a
+`tracing::warn!` on the `mcp.skills` target.
+
+### Added — `SkillProjection`, the fallible, checking counterpart
+
+`SkillProjection::new(&workflow).with_tools(tools).build()` rejects what
+`as_skill()` resolves silently, and additionally runs a projection-time gate
+check. Both entry points call the same renderer, so the returned body is
+byte-identical to `as_skill()`'s for any workflow that builds at all — the
+difference is disposition, never bytes.
+
+**`build()` returns `Result<ProjectionOutput>`, not `Result<Skill>`.** This is a
+recorded deviation, made deliberately: the design called for both a fallible
+`build()` and structured warnings returned *from* `build()`, and a `Skill` cannot
+carry a warning vector. `#[non_exhaustive] pub struct ProjectionOutput { pub
+skill: Skill, pub warnings: Vec<ProjectionWarning> }` resolves that — named and
+self-documenting where a tuple is positional, and additive, so a later release
+can add a field without a breaking signature change. A consuming `into_parts()`
+returns both halves.
+
+**The gate warning.** When a tool map is supplied, a step that carries
+`with_guidance` prose whose tool is *annotated* side-effecting
+(`read_only_hint == Some(false)` or `destructive_hint == Some(true)`) produces a
+`ProjectionWarningKind::GuidanceOnSideEffectingStep`: server-side workflow
+execution runs every deterministic step regardless of the guidance, so guidance
+on such a step is a post-hoc judgment the executing surface will ignore. The
+trigger is purely structural — the prose is never analysed, so it cannot be
+paraphrased around. A guidance-bearing step whose tool carries no annotations
+reports `GateCheckUnverifiable` instead of guessing: MCP's literal annotation
+defaults would fire on essentially every existing workflow, and a warning that
+fires everywhere is a warning that gets muted.
+
+**These warnings have exactly one delivery channel: `build()`'s structured
+return, with annotations supplied through `with_tools`.** A bare `as_skill()`
+receives only a `&SequentialWorkflow`, and tool annotations live only on
+`pmcp::types::ToolInfo::annotations`, which nothing reachable from a workflow
+carries — so `as_skill()` cannot *compute* the warning; it is not that it
+declines to report it. If you expected `as_skill()` to warn about a destructive
+step and got silence, that is why.
+
+### Added — three new public methods opt a server into the projected prepend
+
+Off by default; all three are `skills`-gated. With the flag off, prompt
+transcripts are byte-identical to previous releases.
+
+- `WorkflowPromptHandler::with_projected_skill_prepend(bool)` — the
+  handler-level opt-in. With it on, the projected `SKILL.md` body becomes prompt
+  message `[0]`, ahead of the user-intent message, which stays at `[1]`. The body
+  is rendered once when the setter runs and cached, never re-rendered per
+  request.
+- `ServerCoreBuilder::with_workflow_skill_prepend(bool)`
+- `ServerBuilder::with_workflow_skill_prepend(bool)`
+
+The two builder setters are what make the anti-drift claim hold **per server**
+rather than merely per workflow value: before them the opt-in was reachable only
+by hand-constructing a `WorkflowPromptHandler`, so a server registering a
+workflow the normal way through `prompt_workflow` could not enable it at all.
+Each setter applies to workflows registered *after* the call, so place it before
+`prompt_workflow`:
+
+```rust
+Server::builder()
+    .with_workflow_skill_prepend(true)
+    .prompt_workflow(workflow)?
+```
+
+### The rendered markdown is NOT semver-stable
+
+The exact bytes `as_skill()` produces may change on any minor release. They are
+pinned by a golden test — `tests/golden/workflow_skill_projection.md` — so that
+no change is accidental, and **every change to them will be a CHANGELOG entry**,
+because the bytes become the `sha256` digest published in the skill's
+`skills/list` entry. A consumer that pinned that digest must re-pin: a digest
+mismatch is a fatal pre-loop revocation for such a consumer, not a warning. A
+silent render change would therefore be a supply-chain event, not a cosmetic one.
+
+Two consequences worth stating explicitly, because neither reads as a behaviour
+change at the call site:
+
+- **Constant key order is digest-significant.** A `DataSource::Constant` renders
+  through `serde_json`, which this crate builds with `preserve_order`, so object
+  keys emit in *construction* order. Reordering the keys of a `json!` literal in a
+  workflow definition changes the rendered body and therefore the published
+  digest. The keys are deliberately not sorted: the rendered constant documents
+  what the workflow will actually *send*, and a sorted render would make the
+  manual procedure disagree with the call it describes.
+- **Template-binding order is sorted, not insertion order.**
+  `WorkflowStep::template_bindings` returns a `HashMap`, whose iteration order is
+  randomized per instance; the renderer sorts through a `BTreeMap` so the bytes
+  are reproducible across processes and machines.
+
 ## [2.19.3] - 2026-08-30
 
 **A carrier release, following the v2.19.2 and v2.19.1 precedent.** No `pmcp`
