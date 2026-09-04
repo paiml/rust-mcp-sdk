@@ -2249,4 +2249,225 @@ mod tests {
         assert_eq!(skill.name(), "refund-flow");
         assert!(warnings.is_empty());
     }
+
+    // ── Plan 126-04 Task 2: the SC-6 gate warning (D-08 / D-09) ───────
+
+    /// A `crate::types::ToolInfo` with `annotations == None`.
+    fn unannotated_tool(name: &str) -> crate::types::ToolInfo {
+        crate::types::ToolInfo::new(name, None, json!({ "type": "object" }))
+    }
+
+    /// One tool step named `issue_refund` calling `payments_refund`, with or
+    /// without guidance.
+    fn one_step_workflow(guidance: Option<&str>) -> SequentialWorkflow {
+        let mut step = WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"));
+        if let Some(text) = guidance {
+            step = step.with_guidance(text);
+        }
+        SequentialWorkflow::new("refund_flow", "Process a refund").step(step)
+    }
+
+    fn warnings_for(
+        wf: &SequentialWorkflow,
+        tools: Vec<crate::types::ToolInfo>,
+    ) -> Vec<ProjectionWarning> {
+        SkillProjection::new(wf)
+            .with_tools(tools)
+            .build()
+            .expect("legal workflow")
+            .warnings
+    }
+
+    #[test]
+    fn gate_fires_for_guidance_on_a_destructive_tool() {
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )],
+        );
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(
+            warnings[0].kind(),
+            ProjectionWarningKind::GuidanceOnSideEffectingStep
+        );
+        assert_eq!(warnings[0].step(), Some("issue_refund"));
+        assert_eq!(warnings[0].tool(), Some("payments_refund"));
+        assert!(
+            warnings[0].message().contains("issue_refund"),
+            "the message must name the step: {:?}",
+            warnings[0].message()
+        );
+        assert!(
+            warnings[0].message().contains("regardless"),
+            "the message must say the step runs regardless of the guidance: {:?}",
+            warnings[0].message()
+        );
+    }
+
+    #[test]
+    fn gate_fires_for_guidance_on_an_explicitly_not_read_only_tool() {
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_read_only(false),
+            )],
+        );
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(
+            warnings[0].kind(),
+            ProjectionWarningKind::GuidanceOnSideEffectingStep
+        );
+    }
+
+    #[test]
+    fn gate_stays_silent_for_guidance_on_a_read_only_tool() {
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_read_only(true),
+            )],
+        );
+        assert_eq!(warnings.len(), 0, "got {warnings:?}");
+    }
+
+    #[test]
+    fn an_unannotated_tool_is_unverifiable_not_a_gate_finding() {
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let warnings = warnings_for(&wf, vec![unannotated_tool("payments_refund")]);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(
+            warnings[0].kind(),
+            ProjectionWarningKind::GateCheckUnverifiable,
+            "D-08: MCP's literal annotation defaults are NOT followed"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.kind() == ProjectionWarningKind::GuidanceOnSideEffectingStep)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_tool_absent_from_the_map_is_unverifiable() {
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool("orders_get", ToolAnnotations::new())],
+        );
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(
+            warnings[0].kind(),
+            ProjectionWarningKind::GateCheckUnverifiable
+        );
+        assert_eq!(warnings[0].tool(), Some("payments_refund"));
+    }
+
+    #[test]
+    fn a_destructive_tool_without_guidance_produces_nothing() {
+        let wf = one_step_workflow(None);
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )],
+        );
+        assert_eq!(
+            warnings.len(),
+            0,
+            "the trigger is guidance AND a side effect, never a side effect alone; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_only_step_with_guidance_produces_nothing() {
+        let wf = SequentialWorkflow::new("refund_flow", "Process a refund").step(
+            WorkflowStep::fetch_resources("read_policy")
+                .with_resource("docs://refund-policy")
+                .expect("valid resource URI")
+                .with_guidance("Read the policy before deciding."),
+        );
+        let warnings = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )],
+        );
+        assert_eq!(
+            warnings.len(),
+            0,
+            "a step that calls no tool can carry no annotations; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_tool_map_nothing_warns_even_for_a_tripping_workflow() {
+        // The SAME workflow that produces a gate warning WITH a map.
+        let wf = one_step_workflow(Some("Confirm with the customer first."));
+        let with_map = warnings_for(
+            &wf,
+            vec![annotated_tool(
+                "payments_refund",
+                ToolAnnotations::new().with_destructive(true),
+            )],
+        );
+        assert_eq!(with_map.len(), 1, "anti-vacuity: the fixture must trip");
+
+        let without_map = SkillProjection::new(&wf)
+            .build()
+            .expect("legal workflow")
+            .warnings;
+        assert_eq!(
+            without_map.len(),
+            0,
+            "D-07: no tool map means the check cannot run at all; got {without_map:?}"
+        );
+    }
+
+    #[test]
+    fn two_side_effecting_guidance_bearing_steps_produce_exactly_two_warnings() {
+        let wf = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(
+                WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                    .with_guidance("Confirm with the customer first."),
+            )
+            .step(
+                WorkflowStep::new("close_order", ToolHandle::new("orders_close"))
+                    .with_guidance("Only close once the refund settled."),
+            )
+            .step(WorkflowStep::new(
+                "fetch_order",
+                ToolHandle::new("orders_get"),
+            ));
+        let warnings = warnings_for(
+            &wf,
+            vec![
+                annotated_tool(
+                    "payments_refund",
+                    ToolAnnotations::new().with_destructive(true),
+                ),
+                annotated_tool("orders_close", ToolAnnotations::new().with_read_only(false)),
+                annotated_tool("orders_get", ToolAnnotations::new().with_read_only(true)),
+            ],
+        );
+        assert_eq!(warnings.len(), 2, "got {warnings:?}");
+        assert!(warnings
+            .iter()
+            .all(|w| w.kind() == ProjectionWarningKind::GuidanceOnSideEffectingStep));
+        let steps: Vec<_> = warnings
+            .iter()
+            .filter_map(ProjectionWarning::step)
+            .collect();
+        assert_eq!(steps, vec!["issue_refund", "close_order"]);
+    }
 }
