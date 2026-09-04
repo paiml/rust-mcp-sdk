@@ -1015,14 +1015,7 @@ impl Skills {
     /// ```
     pub fn entries(&self) -> Result<Vec<SkillEntry>> {
         let (entries, diagnostics) = self.entries_with_diagnostics()?;
-        for diagnostic in &diagnostics {
-            tracing::warn!(
-                target: "mcp.skills",
-                uri = %diagnostic.uri(),
-                "{}",
-                diagnostic.message()
-            );
-        }
+        log_skill_diagnostics(&diagnostics);
         Ok(entries)
     }
 
@@ -1235,6 +1228,30 @@ struct SkillBuildArtifact {
     resources: Vec<SkillResourceRef>,
     /// Every non-fatal finding about this skill.
     diagnostics: Vec<SkillDiagnostic>,
+}
+
+/// Emit every build-time diagnostic as one `mcp.skills` warn event.
+///
+/// THE single emitter. This loop existed twice — here, behind
+/// [`Skills::entries`], and inline in `ServerBuilder`'s
+/// `finalize_skills_resources` — and only the `entries()` copy was pinned by
+/// `entries_emits_exactly_one_warn_event_per_diagnostic`, which asserts the
+/// `target` string and the `uri` field NAME. The unguarded copy was the one
+/// every real server build takes, so a field rename there was invisible to the
+/// suite. With one emitter, that test covers both.
+///
+/// One event per diagnostic, never a summary: an operator filtering on
+/// `target: "mcp.skills"` needs the excluded skill's URI in a structured field,
+/// not inside a rendered message.
+pub(crate) fn log_skill_diagnostics(diagnostics: &[SkillDiagnostic]) {
+    for diagnostic in diagnostics {
+        tracing::warn!(
+            target: "mcp.skills",
+            uri = %diagnostic.uri(),
+            "{}",
+            diagnostic.message()
+        );
+    }
 }
 
 /// The final `/`-separated segment of a resolved skill path.

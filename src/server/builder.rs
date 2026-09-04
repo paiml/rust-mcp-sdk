@@ -1588,14 +1588,7 @@ pub(crate) fn finalize_skills_resources(
             let (skills_handler, entries, diagnostics) = skills.finalize().unwrap_or_else(|e| {
                 panic!("Skills: {e}; use try_skills(...) for fallible registration")
             });
-            for diagnostic in &diagnostics {
-                tracing::warn!(
-                    target: "mcp.skills",
-                    uri = %diagnostic.uri(),
-                    "{}",
-                    diagnostic.message()
-                );
-            }
+            crate::server::skills::log_skill_diagnostics(&diagnostics);
             let resources = match user_handler {
                 None => skills_handler,
                 Some(other) => Arc::new(ComposedResources {
