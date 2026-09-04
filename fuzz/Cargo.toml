@@ -336,3 +336,25 @@ path = "fuzz_targets/fuzz_skill_entry.rs"
 test = false
 doc = false
 bench = false
+
+# Phase 126-03 (SC-4 sibling, CLAUDE.md ALWAYS/FUZZ): the WORKFLOW-TO-SKILL
+# PROJECTION. `SequentialWorkflow::as_skill()` is a PUBLIC, INFALLIBLE method, so
+# the only failure mode its signature leaves the renderer is a panic — and two of
+# its steps are arithmetic over author text (the 64-unit slug truncation and the
+# YAML double-quoted frontmatter encoder, whose output becomes a published sha256
+# under D-14). T-126-02.
+#
+# It reaches the projection through the `skills` feature already enabled on
+# `[dependencies.pmcp]` above and declares NO dependency of its own.
+#
+# Like `fuzz_skill_entry` and unlike the two targets above it, this one IS in
+# `.github/workflows/fuzz.yml`'s matrix, so it is EXECUTED on the daily schedule
+# rather than merely registered.
+# `tests/skills_routing.rs::fuzz_workflow_projection_is_registered_and_scheduled`
+# fails if this stanza, the source file, or that matrix row goes missing.
+[[bin]]
+name = "fuzz_workflow_projection"
+path = "fuzz_targets/fuzz_workflow_projection.rs"
+test = false
+doc = false
+bench = false

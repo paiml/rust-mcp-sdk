@@ -1848,3 +1848,139 @@ async fn projected_workflow_skill_survives_an_adversarial_description_on_the_wir
 
     assert_sc4_holds_on_the_wire(ADVERSARIAL_DESCRIPTION).await;
 }
+
+// ── 22. The PROJECTION fuzz target exists, is registered, and is SCHEDULED ──
+
+/// The same three-artifact agreement `fuzz_skill_entry_is_registered_and_scheduled`
+/// checks, retargeted at Phase 126's projection fuzzer:
+///
+/// 1. `fuzz/fuzz_targets/fuzz_workflow_projection.rs` — the target source.
+/// 2. A `[[bin]]` stanza in `fuzz/Cargo.toml` naming it, whose `path` resolves
+///    to that source file.
+/// 3. A row in `.github/workflows/fuzz.yml`'s target matrix, so the target is
+///    EXECUTED on the daily schedule rather than merely registered.
+///
+/// # Why this test carries the whole ALWAYS/FUZZ claim for `as_skill()`
+///
+/// `make test-fuzz` cannot: it iterates `cargo fuzz list` and swallows every
+/// failure with `|| echo`. On this repository's pinned STABLE toolchain
+/// `cargo fuzz run` fails outright with `the option 'Z' is only accepted on the
+/// nightly compiler`, so that target exits 0 having run nothing at all — a claim
+/// of fuzz coverage backed by it is a claim of nothing. Reading the three files
+/// as TEXT needs no toolchain, runs under `make test-skills`, and is therefore
+/// the only artefact in this phase that goes RED when the fuzz target is
+/// deleted, renamed, or quietly dropped from CI.
+#[test]
+fn fuzz_workflow_projection_is_registered_and_scheduled() {
+    const TARGET: &str = "fuzz_workflow_projection";
+
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // (1) The target source exists.
+    let source_path = repo_root.join("fuzz/fuzz_targets/fuzz_workflow_projection.rs");
+    assert!(
+        source_path.is_file(),
+        "the fuzz target source is missing at {}. CLAUDE.md requires a fuzz \
+         target for every new feature; `SequentialWorkflow::as_skill()` is a \
+         public INFALLIBLE method, so deleting the file does not remove that \
+         requirement.",
+        source_path.display()
+    );
+    let source = std::fs::read_to_string(&source_path).expect("fuzz target source is readable");
+    assert!(
+        source.contains("fuzz_target!"),
+        "{} exists but declares no `fuzz_target!` entry point, so cargo-fuzz has \
+         nothing to drive",
+        source_path.display()
+    );
+
+    // (2) A `[[bin]]` stanza names it, and its `path` resolves to that file.
+    let manifest_path = repo_root.join("fuzz/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("fuzz/Cargo.toml is readable");
+
+    // Anti-vacuity: prove the scan is reading a manifest that carries `[[bin]]`
+    // stanzas at all before concluding anything from a search over it. Without
+    // this, a manifest emptied by a bad merge would report a missing
+    // registration for EVERY target, including the ones that predate this one.
+    assert!(
+        manifest.contains("[[bin]]"),
+        "fuzz/Cargo.toml carries no [[bin]] stanza at all — this scan would \
+         report a missing registration for every target in the crate"
+    );
+
+    let declared_path = manifest
+        .split("[[bin]]")
+        .find(|stanza| stanza.contains(&format!("name = \"{TARGET}\"")))
+        .and_then(|stanza| {
+            stanza
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("path = "))
+        })
+        .map(|value| value.trim().trim_matches('"').to_string());
+
+    let declared_path = declared_path.unwrap_or_else(|| {
+        panic!(
+            "fuzz/Cargo.toml has no [[bin]] stanza with `name = \"{TARGET}\"` and a \
+             `path` key. cargo-fuzz builds only registered bins, so an unregistered \
+             target file is never compiled and never run."
+        )
+    });
+
+    let resolved = repo_root.join("fuzz").join(&declared_path);
+    assert!(
+        resolved.is_file(),
+        "fuzz/Cargo.toml registers `{TARGET}` at path `{declared_path}`, which \
+         resolves to {} — a file that does not exist. The stanza and the source \
+         disagree.",
+        resolved.display()
+    );
+    assert_eq!(
+        std::fs::canonicalize(&resolved).expect("registered path canonicalizes"),
+        std::fs::canonicalize(&source_path).expect("source path canonicalizes"),
+        "fuzz/Cargo.toml registers `{TARGET}` at a DIFFERENT file from the one \
+         this test asserts the contents of"
+    );
+
+    // (3) The workflow matrix schedules it.
+    //
+    // This is the assertion reviewers add back when it is dropped (125-REVIEWS
+    // R-34). Registration proves a file exists; the ALWAYS/FUZZ requirement's
+    // substance is RECURRING execution against hostile input.
+    let workflow_path = repo_root.join(".github/workflows/fuzz.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("fuzz.yml is readable");
+
+    // SCOPED to the `target:` block, then WHOLE-LINE equality — both properties
+    // are load-bearing and were MEASURED on the sibling test: an unscoped scan
+    // also matched `schedule.cron`, the `restore-keys` lists and the artifact
+    // `path` list, and a `contains("- fuzz_workflow_projection")` check passes
+    // against a matrix whose only row reads `- fuzz_workflow_projectionX`.
+    let (_, after_target) = workflow
+        .split_once("target:")
+        .expect("fuzz.yml declares a strategy matrix `target:` key");
+    let matrix_rows: Vec<&str> = after_target
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#') || line.starts_with("- "))
+        .filter_map(|line| line.strip_prefix("- "))
+        .collect();
+
+    // Anti-vacuity: the matrix must still hold its established members, so a
+    // rewrite that empties it cannot make the assertion below pass by accident.
+    for established in ["protocol_parsing", "jsonrpc_handling", "fuzz_skill_entry"] {
+        assert!(
+            matrix_rows.contains(&established),
+            "the fuzz.yml target matrix no longer lists `{established}` — the \
+             matrix this test reads is not the one it was written against, so its \
+             verdict on `{TARGET}` means nothing. Rows seen: {matrix_rows:?}"
+        );
+    }
+    assert!(
+        matrix_rows.contains(&TARGET),
+        "`{TARGET}` is registered in fuzz/Cargo.toml but is NOT a row in \
+         .github/workflows/fuzz.yml's target matrix, so nothing ever runs it. \
+         Registration proves a file exists; the CLAUDE.md ALWAYS/FUZZ requirement \
+         is about recurring EXECUTION against hostile input. Rows seen: \
+         {matrix_rows:?}"
+    );
+}
