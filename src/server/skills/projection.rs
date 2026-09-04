@@ -1219,7 +1219,6 @@ mod tests {
     /// length or substring heuristic" — so a single omnibus `contains` over a
     /// concatenation would be exactly the heuristic it forbids.
     #[test]
-    #[allow(clippy::cognitive_complexity)]
     // Why: a flat sequence of independent one-fact assertions. PMAT counts each
     // `assert!` as a branch, but there is no nesting and no control flow to
     // decompose — splitting this into helper fns would hide which fact failed,
