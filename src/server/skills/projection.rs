@@ -41,10 +41,11 @@
 //! than an error, silently skipping the name-identity check instead of
 //! enforcing it. Encoding both values unconditionally removes the whole class.
 
+use crate::error::{Error, Result};
 use crate::server::skills::Skill;
 use crate::server::workflow::{DataSource, PromptContent, SequentialWorkflow, WorkflowStep};
-use crate::types::PromptArgumentType;
-use std::collections::BTreeMap;
+use crate::types::{PromptArgumentType, ToolAnnotations};
+use std::collections::{BTreeMap, HashMap};
 
 /// A condition the infallible projection path resolved on the author's behalf.
 ///
@@ -560,6 +561,20 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::OnceLock;
+
+    /// A `crate::types::ToolInfo` carrying annotations.
+    ///
+    /// `ToolAnnotations` and `ToolInfo` are both `#[non_exhaustive]`, so they
+    /// are built through their constructors here and everywhere else — never
+    /// with struct-literal syntax.
+    fn annotated_tool(name: &str, annotations: ToolAnnotations) -> crate::types::ToolInfo {
+        crate::types::ToolInfo::with_annotations(
+            name,
+            None,
+            json!({ "type": "object" }),
+            annotations,
+        )
+    }
 
     fn tracer_workflow(name: &str, description: &str) -> SequentialWorkflow {
         SequentialWorkflow::new(name, description)
@@ -1719,5 +1734,141 @@ mod tests {
                 prop_assert_eq!(parsed_description, Some(description.as_str()));
             }
         }
+    }
+
+    // ── Plan 126-04 Task 1: the fallible builder path (D-01 / D-02) ───
+
+    #[test]
+    fn build_and_as_skill_share_one_renderer() {
+        let wf = kitchen_sink_workflow();
+        let output = SkillProjection::new(&wf)
+            .build()
+            .expect("a legal name and a non-empty description must build");
+        assert_eq!(
+            output.skill.body(),
+            wf.as_skill().body(),
+            "D-05: the fallible and infallible entry points must share ONE renderer"
+        );
+        assert_eq!(output.skill.name(), wf.as_skill().name());
+        assert_eq!(
+            output.skill.resolved_description(),
+            wf.as_skill().resolved_description()
+        );
+    }
+
+    #[test]
+    fn build_without_a_tool_map_emits_no_warnings() {
+        // The kitchen-sink fixture carries a guidance-bearing step whose tool
+        // WOULD trip the SC-6 gate if a tool map were supplied.
+        let wf = kitchen_sink_workflow();
+        let output = SkillProjection::new(&wf).build().expect("legal workflow");
+        assert!(
+            output.warnings.is_empty(),
+            "D-07: with no tool map there is nothing to check, so nothing to warn about; got {:?}",
+            output.warnings
+        );
+    }
+
+    #[test]
+    fn build_rejects_a_name_that_normalizes_to_nothing() {
+        let wf = tracer_workflow("!!!", "Process a refund");
+        let err = SkillProjection::new(&wf)
+            .build()
+            .expect_err("D-15: the strict path rejects a name with nothing legal in it");
+        let message = err.to_string();
+        assert!(
+            message.contains("!!!"),
+            "the error must name the offending workflow; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn as_skill_falls_back_where_build_rejects_the_name() {
+        // Same input, two dispositions (D-15): `build()` errors, `as_skill()`
+        // substitutes and keeps going.
+        let wf = tracer_workflow("!!!", "Process a refund");
+        let skill = wf.as_skill();
+        let hex = skill
+            .name()
+            .strip_prefix("workflow-")
+            .expect("the infallible path substitutes a `workflow-{8 hex}` slug");
+        assert_eq!(hex.len(), 8, "slug was {:?}", skill.name());
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "slug was {:?}",
+            skill.name()
+        );
+    }
+
+    #[test]
+    fn build_rejects_an_empty_description() {
+        let wf = tracer_workflow("refund_flow", "");
+        let err = SkillProjection::new(&wf)
+            .build()
+            .expect_err("REVIEWS finding 6: an empty description is rejected by the strict path");
+        let message = err.to_string();
+        assert!(
+            message.contains("description"),
+            "the error must name the empty description; got {message:?}"
+        );
+        assert!(
+            message.contains("refund_flow"),
+            "the error must name the offending workflow; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_a_whitespace_only_description() {
+        let wf = tracer_workflow("refund_flow", "   \t  ");
+        let err = SkillProjection::new(&wf)
+            .build()
+            .expect_err("an all-whitespace description is empty after trimming");
+        assert!(err.to_string().contains("description"));
+    }
+
+    #[test]
+    fn as_skill_substitutes_where_build_rejects_the_description() {
+        let wf = tracer_workflow("refund_flow", "");
+        let skill = wf.as_skill();
+        assert_eq!(
+            skill.resolved_description(),
+            "Projected from the refund-flow workflow.",
+            "the pinned substitution from plan 126-01 Task 4"
+        );
+        let value = parsed_frontmatter(skill.body());
+        assert_eq!(
+            value.get("description").and_then(|v| v.as_str()),
+            Some("Projected from the refund-flow workflow.")
+        );
+    }
+
+    #[test]
+    fn with_tools_records_a_map_and_still_builds_the_same_bytes() {
+        let wf = kitchen_sink_workflow();
+        let tools = vec![annotated_tool(
+            "orders_get",
+            ToolAnnotations::new().with_read_only(true),
+        )];
+        let output = SkillProjection::new(&wf)
+            .with_tools(tools)
+            .build()
+            .expect("legal workflow");
+        assert_eq!(
+            output.skill.body(),
+            wf.as_skill().body(),
+            "supplying a tool map must not move a single rendered byte"
+        );
+    }
+
+    #[test]
+    fn projection_output_into_parts_returns_both_halves() {
+        let wf = kitchen_sink_workflow();
+        let (skill, warnings) = SkillProjection::new(&wf)
+            .build()
+            .expect("legal workflow")
+            .into_parts();
+        assert_eq!(skill.name(), "refund-flow");
+        assert!(warnings.is_empty());
     }
 }
