@@ -550,6 +550,384 @@ pub(crate) fn project(wf: &SequentialWorkflow) -> Skill {
     skill
 }
 
+// ── The fallible builder path (D-01 / D-02) ───────────────────────────
+
+/// Why a [`ProjectionWarning`] was emitted.
+///
+/// `#[non_exhaustive]`, so a later phase can add a kind without a breaking
+/// change; match on it with a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProjectionWarningKind {
+    /// SC-6 / D-09: a step carries `with_guidance` prose AND its tool is
+    /// annotated side-effecting (`read_only_hint == Some(false)` or
+    /// `destructive_hint == Some(true)`).
+    ///
+    /// Server-side workflow execution runs every deterministic step regardless
+    /// of the guidance, so guidance attached to a side-effecting step is a
+    /// post-hoc judgment the executing surface will ignore. The trigger is
+    /// purely structural — the prose is never analysed (D-09), so it cannot be
+    /// paraphrased around.
+    GuidanceOnSideEffectingStep,
+    /// D-08: the SC-6 check could not be performed for a guidance-bearing step,
+    /// because its tool carries no annotations or is absent from the supplied
+    /// tool map.
+    ///
+    /// This is deliberately DISTINCT from
+    /// [`Self::GuidanceOnSideEffectingStep`]. MCP's literal annotation defaults
+    /// (an absent `read_only_hint` meaning not-read-only) are NOT followed:
+    /// that would fire on essentially every existing workflow, and a warning
+    /// that fires everywhere is a warning that gets muted. Reporting "could not
+    /// check" honestly is the alternative D-08 chose.
+    GateCheckUnverifiable,
+    /// D-15: the workflow name normalized to nothing legal and a deterministic
+    /// `workflow-{8 hex}` slug was substituted.
+    ///
+    /// [`SkillProjection::build`] REJECTS that input rather than substituting
+    /// (see its `# Errors`), so the builder path does not emit this kind today.
+    /// It is declared so the warning vocabulary covers the conditions the
+    /// infallible [`SequentialWorkflow::as_skill`] resolves, and so a future
+    /// lenient mode is additive rather than breaking.
+    ///
+    /// [`SequentialWorkflow::as_skill`]: crate::server::workflow::SequentialWorkflow::as_skill
+    SlugFallback,
+}
+
+/// One condition the projection found worth reporting to the server author.
+///
+/// # Why this type is public where `SkillDiagnostic` is not
+///
+/// This module's sibling `SkillDiagnostic` (`src/server/skills/mod.rs`) is
+/// crate-private ON PURPOSE, as its own rustdoc records: it exists to be
+/// logged, not to be matched on. `ProjectionWarning` deliberately departs from
+/// that precedent because D-10 requires [`SkillProjection::build`] to RETURN
+/// its warnings — so that tests can assert on data instead of installing a
+/// `tracing` subscriber, and so that a caller can act on them (fail a build,
+/// annotate a review, surface them in a CLI). Do not "fix" the asymmetry by
+/// making this crate-private: that would break `build()`'s signature and remove
+/// the only channel SC-6 warnings have.
+///
+/// It is a struct rather than an enum so that added fields stay additive.
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "skills")] {
+/// use pmcp::server::skills::{ProjectionWarning, SkillProjection};
+/// use pmcp::server::workflow::SequentialWorkflow;
+///
+/// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+/// let warnings: Vec<ProjectionWarning> = SkillProjection::new(&workflow)
+///     .build()
+///     .expect("a legal name and a non-empty description")
+///     .warnings;
+///
+/// // No tool map was supplied, so the SC-6 gate check did not run (D-07).
+/// assert!(warnings.is_empty());
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ProjectionWarning {
+    kind: ProjectionWarningKind,
+    step: Option<String>,
+    tool: Option<String>,
+    message: String,
+}
+
+impl ProjectionWarning {
+    /// Which condition this warning reports.
+    pub fn kind(&self) -> ProjectionWarningKind {
+        self.kind
+    }
+
+    /// The workflow step this warning is about, when it is about one.
+    pub fn step(&self) -> Option<&str> {
+        self.step.as_deref()
+    }
+
+    /// The tool this warning is about, when it is about one.
+    pub fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
+    }
+
+    /// The human-readable message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// What [`SkillProjection::build`] returns on success: the projected skill plus
+/// every warning the projection could observe.
+///
+/// # Why a named struct rather than a tuple or a bare `Skill`
+///
+/// D-02's literal wording says `build() -> Result<Skill>`, but D-10 requires
+/// `build()` to return structured warnings, and a `Skill` cannot carry a
+/// warning vector — the two locked decisions are incompatible as written. This
+/// struct resolves them: it is named and self-documenting where a tuple is
+/// positional, and being a struct it stays ADDITIVE, so a later phase can add a
+/// field (a manifest, a strict verdict) without a breaking signature change.
+/// `#[non_exhaustive]` makes that additivity real for downstream crates, which
+/// read these fields but never construct the type.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ProjectionOutput {
+    /// The projected skill. Its body is byte-identical to
+    /// [`SequentialWorkflow::as_skill`]'s for the same workflow — both entry
+    /// points share one renderer (D-05).
+    ///
+    /// [`SequentialWorkflow::as_skill`]: crate::server::workflow::SequentialWorkflow::as_skill
+    pub skill: Skill,
+    /// Every warning the projection could observe, in step order. Empty when no
+    /// tool map was supplied (D-07).
+    pub warnings: Vec<ProjectionWarning>,
+}
+
+impl ProjectionOutput {
+    /// Consume this output and return both halves.
+    #[must_use]
+    pub fn into_parts(self) -> (Skill, Vec<ProjectionWarning>) {
+        (self.skill, self.warnings)
+    }
+}
+
+/// The fallible, checking counterpart to
+/// [`SequentialWorkflow::as_skill`](crate::server::workflow::SequentialWorkflow::as_skill).
+///
+/// `as_skill()` is infallible and resolves problems on the author's behalf.
+/// This builder rejects them instead, and additionally performs the SC-6 gate
+/// check when a tool map is supplied.
+///
+/// # A bare `as_skill()` cannot warn, and that is by construction
+///
+/// The SC-6 gate check needs [`ToolAnnotations`], which live only on
+/// [`crate::types::ToolInfo::annotations`]. No workflow type carries them —
+/// [`WorkflowStep::tool`] returns a [`ToolHandle`](crate::server::workflow::ToolHandle),
+/// which is a name. A projection that receives only a `&SequentialWorkflow`
+/// therefore cannot COMPUTE whether any step's tool is destructive; it is not
+/// that it declines to report it. Supply a tool map through
+/// [`Self::with_tools`] to get the check.
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "skills")] {
+/// use pmcp::server::skills::SkillProjection;
+/// use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+///
+/// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+///     .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+///
+/// let output = SkillProjection::new(&workflow)
+///     .build()
+///     .expect("a legal name and a non-empty description");
+///
+/// assert_eq!(output.skill.name(), "refund-flow");
+/// assert_eq!(output.skill.body(), workflow.as_skill().body());
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct SkillProjection<'w> {
+    workflow: &'w SequentialWorkflow,
+    /// `None` means no tool map was supplied and the gate check does not run at
+    /// all (D-07). An empty map means one WAS supplied and every guidance-
+    /// bearing step is unverifiable (D-08). Collapsing the two states would
+    /// erase that distinction.
+    tools: Option<HashMap<String, Option<ToolAnnotations>>>,
+}
+
+impl<'w> SkillProjection<'w> {
+    /// Start a projection of `workflow`.
+    ///
+    /// No tool map is attached, so [`Self::build`] performs no SC-6 gate check
+    /// and returns no gate warnings. **SC-6 gate warnings are delivered only
+    /// through `build()`'s structured return, and only when
+    /// [`Self::with_tools`] supplied annotations** — a bare
+    /// [`SequentialWorkflow::as_skill`](crate::server::workflow::SequentialWorkflow::as_skill)
+    /// holds no tool map and therefore cannot warn about a destructive step at
+    /// all. A caller who expected a warning and got silence wants
+    /// [`Self::with_tools`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::SkillProjection;
+    /// use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+    ///     .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+    ///
+    /// let output = SkillProjection::new(&workflow).build().expect("legal workflow");
+    ///
+    /// assert_eq!(output.skill.name(), "refund-flow");
+    /// // No tool map, so no gate check ran (D-07).
+    /// assert!(output.warnings.is_empty());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn new(workflow: &'w SequentialWorkflow) -> Self {
+        Self {
+            workflow,
+            tools: None,
+        }
+    }
+
+    /// Supply the tool annotations the SC-6 gate check needs.
+    ///
+    /// Takes [`crate::types::ToolInfo`] — the ONLY `ToolInfo` in this crate
+    /// that carries `annotations`. `crate::server::workflow::ToolInfo` has
+    /// three fields and structurally cannot, which is exactly why the check is
+    /// a builder-path capability rather than something the workflow surface
+    /// could do for itself.
+    ///
+    /// The `IntoIterator` form accepts a `Vec<ToolInfo>` straight off a
+    /// `tools/list` result, a `ToolsCapabilities` listing, or a hand-written
+    /// fixture; a `&HashMap` parameter would force callers to build a map they
+    /// do not otherwise need. Later entries win on a duplicate name.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::SkillProjection;
+    /// use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+    /// use pmcp::types::{ToolAnnotations, ToolInfo};
+    /// use serde_json::json;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+    ///     .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+    ///
+    /// let tools = vec![ToolInfo::with_annotations(
+    ///     "orders_get",
+    ///     None,
+    ///     json!({ "type": "object" }),
+    ///     ToolAnnotations::new().with_read_only(true),
+    /// )];
+    ///
+    /// let output = SkillProjection::new(&workflow)
+    ///     .with_tools(tools)
+    ///     .build()
+    ///     .expect("legal workflow");
+    ///
+    /// // Supplying a tool map never moves a rendered byte.
+    /// assert_eq!(output.skill.body(), workflow.as_skill().body());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = crate::types::ToolInfo>) -> Self {
+        self.tools = Some(
+            tools
+                .into_iter()
+                .map(|tool| (tool.name, tool.annotations))
+                .collect(),
+        );
+        self
+    }
+
+    /// Render the projection, rejecting what
+    /// [`SequentialWorkflow::as_skill`](crate::server::workflow::SequentialWorkflow::as_skill)
+    /// would silently resolve.
+    ///
+    /// Both entry points call the SAME renderer, so the returned skill's body
+    /// is byte-identical to `as_skill()`'s for any workflow that builds at all
+    /// (D-05). The difference is disposition, never bytes.
+    ///
+    /// # Return shape — a recorded deviation from D-02's literal wording
+    ///
+    /// D-02 says `build() -> Result<Skill>` while D-10 says `build()` returns
+    /// structured warnings; a `Skill` cannot carry a warning vector, so the two
+    /// cannot both hold. This ships [`ProjectionOutput`] — additive under a
+    /// future field, and named rather than positional. See that type's rustdoc.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` in exactly two cases:
+    ///
+    /// 1. **The workflow name normalizes to no agentskills-legal skill name**
+    ///    (D-15) — every character maps out of `[a-z0-9-]`, or truncation
+    ///    leaves nothing. `as_skill()` substitutes a deterministic
+    ///    `workflow-{8 hex}` slug for the same input; this pushes a strict
+    ///    caller to rename the workflow instead.
+    /// 2. **The workflow description is empty** after trimming.
+    ///    `SequentialWorkflow::new` validates nothing, so an empty description
+    ///    is legal input, but `description:` with nothing after it renders a
+    ///    YAML null and violates agentskills' non-empty rule. `as_skill()`
+    ///    substitutes a deterministic legal string for the same input.
+    ///
+    /// No description LENGTH bound is checked. SEP-2640 states the digest
+    /// format, the per-skill file and byte limits and the name-identity rule,
+    /// but states NO description length limit, so inventing one here would be a
+    /// guess; the registry's existing over-limit warning already covers a
+    /// pathologically large body.
+    ///
+    /// This method never panics — it returns `Err` rather than panicking inside
+    /// a `Result`-returning function (D-15).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::skills::SkillProjection;
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let good = SequentialWorkflow::new("refund_flow", "Process a refund");
+    /// assert!(SkillProjection::new(&good).build().is_ok());
+    ///
+    /// // Nothing in this name survives normalization.
+    /// let nameless = SequentialWorkflow::new("!!!", "Process a refund");
+    /// assert!(SkillProjection::new(&nameless).build().is_err());
+    ///
+    /// // The infallible path takes the same input and substitutes instead.
+    /// assert!(nameless.as_skill().name().starts_with("workflow-"));
+    ///
+    /// // So does an empty description.
+    /// let undescribed = SequentialWorkflow::new("refund_flow", "");
+    /// assert!(SkillProjection::new(&undescribed).build().is_err());
+    /// assert_eq!(
+    ///     undescribed.as_skill().resolved_description(),
+    ///     "Projected from the refund-flow workflow."
+    /// );
+    /// # }
+    /// ```
+    pub fn build(self) -> Result<ProjectionOutput> {
+        let workflow = self.workflow;
+        let name = workflow.name();
+
+        if slugify(name).is_none() {
+            return Err(Error::validation(format!(
+                "workflow {name:?} normalizes to no agentskills-legal skill name; \
+                 rename it to something containing at least one `[a-z0-9]` character, \
+                 or use `SequentialWorkflow::as_skill()`, which substitutes a \
+                 deterministic `workflow-{{8 hex}}` slug instead"
+            )));
+        }
+
+        if workflow.description().trim().is_empty() {
+            return Err(Error::validation(format!(
+                "workflow {name:?} has an empty description, which renders an \
+                 agentskills-illegal frontmatter value; write a description, or use \
+                 `SequentialWorkflow::as_skill()`, which substitutes a deterministic \
+                 legal one instead"
+            )));
+        }
+
+        // ONE renderer, not two: this wraps the same crate-private seam
+        // `as_skill()` wraps. Both strict conditions were just rejected, so the
+        // seam has nothing left to substitute and returns no notices.
+        let (skill, notices) = project_with_notices(workflow);
+        debug_assert!(
+            notices.is_empty(),
+            "build() rejects both substitution conditions before rendering, so the \
+             shared seam cannot have substituted anything here"
+        );
+
+        let warnings = Vec::new();
+
+        Ok(ProjectionOutput { skill, warnings })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

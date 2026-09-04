@@ -140,6 +140,10 @@ use crate::types::{
 /// [`Skill`] projection.
 pub mod projection;
 
+// The projection's public surface, re-exported so the canonical
+// `pmcp::server::skills::*` path covers it alongside `Skill` / `Skills`.
+pub use projection::{ProjectionOutput, ProjectionWarning, ProjectionWarningKind, SkillProjection};
+
 /// Reverse-domain key under `ServerCapabilities.extensions` advertising
 /// SEP-2640 skill support. Set automatically when any skill is registered.
 pub(crate) const SKILLS_EXTENSION_KEY: &str = "io.modelcontextprotocol/skills";
