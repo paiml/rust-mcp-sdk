@@ -361,12 +361,38 @@ pub(crate) fn project(wf: &SequentialWorkflow) -> Skill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::workflow::{ToolHandle, WorkflowStep};
+    use crate::server::workflow::{
+        DataSource, InternalPromptMessage, PromptContent, ToolHandle, WorkflowStep,
+    };
+    use crate::types::{PromptArgumentType, Role};
     use proptest::prelude::*;
+    use serde_json::json;
 
     fn tracer_workflow(name: &str, description: &str) -> SequentialWorkflow {
         SequentialWorkflow::new(name, description)
             .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+    }
+
+    /// Render a workflow whose single step binds one argument to `value`.
+    fn body_with_constant(value: serde_json::Value) -> String {
+        SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(
+                WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                    .arg("filter", DataSource::constant(value)),
+            )
+            .as_skill()
+            .body()
+            .to_string()
+    }
+
+    /// Render a workflow carrying exactly one instruction message.
+    fn body_with_instruction(content: PromptContent) -> String {
+        SequentialWorkflow::new("refund_flow", "Process a refund")
+            .instruction(InternalPromptMessage::new(Role::System, content))
+            .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+            .as_skill()
+            .body()
+            .to_string()
     }
 
     /// Parse the projected body's frontmatter through the crate's OWN parser
@@ -647,6 +673,296 @@ mod tests {
         assert_eq!(yaml_double_quoted("a\u{7f}b"), "\"a\\x7fb\"");
         // Non-ASCII is carried verbatim — a double-quoted YAML scalar is UTF-8.
         assert_eq!(yaml_double_quoted("héllo — 日本"), "\"héllo — 日本\"");
+    }
+
+    // ── SC-3 breadth: `## Context` ────────────────────────────────────
+
+    #[test]
+    fn context_renders_instruction_text_verbatim() {
+        let body = body_with_instruction(PromptContent::Text("Be careful.".to_string()));
+        assert!(body.contains("## Context"), "body was:\n{body}");
+        assert!(
+            body.contains("Be careful."),
+            "instruction text must render verbatim; body was:\n{body}"
+        );
+        assert!(
+            !body.contains("Text("),
+            "a Debug-formatted PromptContent leaked into the body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_without_instructions_omits_the_context_heading() {
+        let body = tracer_workflow("refund_flow", "Process a refund")
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(
+            !body.contains("## Context"),
+            "an empty Context section must not be emitted; body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn an_image_instruction_renders_only_its_mime_type() {
+        let payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+        let body = body_with_instruction(PromptContent::Image {
+            data: payload.to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        assert!(
+            body.contains("image/png"),
+            "the MIME type must render; body was:\n{body}"
+        );
+        assert!(
+            !body.contains(payload),
+            "the base64 payload must NEVER reach the body (T-126-03); body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_multi_instruction_renders_every_part_joined_by_a_blank_line() {
+        let parts: Vec<Box<PromptContent>> = vec![
+            Box::new(PromptContent::Text("First part.".to_string())),
+            Box::new(PromptContent::ResourceUri("docs://policy".to_string())),
+        ];
+        let body = body_with_instruction(PromptContent::Multi(parts.into()));
+        assert!(
+            body.contains("First part.\n\nRead the resource `docs://policy`."),
+            "Multi parts must join with a blank line; body was:\n{body}"
+        );
+        assert!(
+            !body.contains("Multi("),
+            "a Debug-formatted PromptContent leaked into the body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_tool_handle_instruction_renders_the_tool_name_only() {
+        let body = body_with_instruction(PromptContent::ToolHandle(ToolHandle::new("orders_get")));
+        assert!(
+            body.contains("Uses tool `orders_get`."),
+            "body was:\n{body}"
+        );
+        assert!(
+            !body.contains("ToolHandle("),
+            "a Debug-formatted PromptContent leaked into the body:\n{body}"
+        );
+    }
+
+    // ── SC-3 breadth: `## Inputs` ─────────────────────────────────────
+
+    #[test]
+    fn inputs_render_name_description_and_requiredness() {
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .argument("order_id", "The order to refund", true)
+            .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(body.contains("## Inputs"), "body was:\n{body}");
+        assert!(body.contains("`order_id`"), "body was:\n{body}");
+        assert!(body.contains("The order to refund"), "body was:\n{body}");
+        assert!(body.contains("required"), "body was:\n{body}");
+    }
+
+    #[test]
+    fn an_optional_argument_renders_optional_not_required() {
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .argument("reason", "Why the refund is being issued", false)
+            .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(body.contains("optional"), "body was:\n{body}");
+        assert!(
+            !body.contains("required"),
+            "an optional argument must not render as required; body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_without_arguments_omits_the_inputs_heading() {
+        let body = tracer_workflow("refund_flow", "Process a refund")
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(
+            !body.contains("## Inputs"),
+            "an empty Inputs section must not be emitted; body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn typed_arguments_render_the_lowercase_wire_spellings() {
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .typed_argument("count", "How many units", true, PromptArgumentType::Integer)
+            .typed_argument(
+                "dry_run",
+                "Whether to simulate",
+                false,
+                PromptArgumentType::Boolean,
+            )
+            .typed_argument(
+                "rate",
+                "The exchange rate",
+                false,
+                PromptArgumentType::Number,
+            )
+            .typed_argument(
+                "note",
+                "A free-text note",
+                false,
+                PromptArgumentType::String,
+            )
+            .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+            .as_skill()
+            .body()
+            .to_string();
+        for spelling in ["integer", "boolean", "number", "string"] {
+            assert!(
+                body.contains(spelling),
+                "the `{spelling}` wire spelling must render; body was:\n{body}"
+            );
+        }
+        // The capitalised spellings are `PromptArgumentType`'s `Debug` output.
+        // The type has NO `Display` impl, so `{:?}` is the reflex reach and the
+        // exact hazard D-14 forbids in a digested body.
+        for debug_spelling in ["Integer", "Boolean", "Number", "String"] {
+            assert!(
+                !body.contains(debug_spelling),
+                "`{debug_spelling}` is PromptArgumentType's Debug spelling and must never \
+                 reach the body; body was:\n{body}"
+            );
+        }
+    }
+
+    // ── SC-3 breadth: per-step detail ─────────────────────────────────
+
+    #[test]
+    fn step_arguments_render_every_name_and_source() {
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .argument("order_id", "The order to refund", true)
+            .step(
+                WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                    .arg("id", DataSource::prompt_arg("order_id"))
+                    .bind("order"),
+            )
+            .step(
+                WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                    .arg("amount", DataSource::from_step_field("order", "total"))
+                    .arg("whole", DataSource::from_step("order"))
+                    .bind("refund"),
+            )
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(body.contains("`id`"), "body was:\n{body}");
+        assert!(body.contains("`amount`"), "body was:\n{body}");
+        assert!(body.contains("`whole`"), "body was:\n{body}");
+        assert!(
+            body.contains("the `order_id` input"),
+            "the PromptArg source must render; body was:\n{body}"
+        );
+        assert!(
+            body.contains("the `total` field of the result of `order`"),
+            "the StepOutput-with-field source must render; body was:\n{body}"
+        );
+        assert!(
+            body.contains("the result of `order`"),
+            "the whole-output StepOutput source must render; body was:\n{body}"
+        );
+        assert!(
+            !body.contains("StepOutput"),
+            "a Debug-formatted DataSource leaked into the body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_constant_renders_in_construction_order() {
+        let body = body_with_constant(json!({"b": 2, "a": 1}));
+        assert!(
+            body.contains(r#"{"b":2,"a":1}"#),
+            "serde_json is built with `preserve_order`, so keys must emit in \
+             construction order; body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn constant_key_order_is_digest_significant() {
+        let ab = body_with_constant(json!({"a": 1, "b": 2}));
+        let ba = body_with_constant(json!({"b": 2, "a": 1}));
+        assert_ne!(
+            ab, ba,
+            "constant key order is digest-significant by DESIGN (REVIEWS gemini \
+             finding 4): the rendered constant documents what will actually be SENT, \
+             and `preserve_order` means the sent bytes are in construction order too. \
+             Sorting the render here would make the documentation disagree with the call."
+        );
+    }
+
+    #[test]
+    fn template_bindings_render_in_sorted_key_order() {
+        let step = WorkflowStep::fetch_resources("read_guide")
+            .with_resource("docs://guide")
+            .expect("valid resource URI")
+            .with_template_binding("zeta", DataSource::prompt_arg("z"))
+            .with_template_binding("alpha", DataSource::prompt_arg("a"));
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(step)
+            .as_skill()
+            .body()
+            .to_string();
+        let alpha = body.find("alpha").expect("alpha binding must render");
+        let zeta = body.find("zeta").expect("zeta binding must render");
+        assert!(
+            alpha < zeta,
+            "template bindings must render in sorted key order, not insertion order; \
+             body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_resource_only_step_renders_its_heading_and_every_resource() {
+        let step = WorkflowStep::fetch_resources("read_policy")
+            .with_resource("docs://refund-policy")
+            .expect("valid resource URI")
+            .with_resource("docs://escalation-matrix")
+            .expect("valid resource URI");
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(step)
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(
+            body.contains("### Step 1: read_policy"),
+            "body was:\n{body}"
+        );
+        assert!(body.contains("docs://refund-policy"), "body was:\n{body}");
+        assert!(
+            body.contains("docs://escalation-matrix"),
+            "body was:\n{body}"
+        );
+        assert!(
+            !body.contains("Call tool"),
+            "a resource-only step must not render a tool line; body was:\n{body}"
+        );
+    }
+
+    #[test]
+    fn guidance_renders_a_judgment_line() {
+        let body = SequentialWorkflow::new("refund_flow", "Process a refund")
+            .step(
+                WorkflowStep::new("confirm", ToolHandle::new("notify"))
+                    .with_guidance("Confirm with the customer first."),
+            )
+            .as_skill()
+            .body()
+            .to_string();
+        assert!(
+            body.contains("Judgment: Confirm with the customer first."),
+            "body was:\n{body}"
+        );
     }
 
     // ── REVIEWS finding 1: the round-trip property ────────────────────
