@@ -209,9 +209,11 @@ impl WorkflowPromptHandler {
     ///
     /// The assistant-plan MESSAGE is suppressed, because the projected body's
     /// `## Procedure` section already carries its step-and-tool list. Only the
-    /// message is dropped: [`Self::validate_tool_registry`] runs in its place, so
+    /// message is dropped: a registry-validation-only pass runs in its place, so
     /// the "tool not found in registry" validation raises the same error on the
-    /// same step in both flag states — see [`Self::opening_messages`].
+    /// same step in both flag states. Both halves are sequenced by the
+    /// crate-private `opening_messages`, the single producer of this handler's
+    /// header messages.
     ///
     /// With the flag OFF — the default — the transcript is byte-identical to
     /// what this handler has always produced, message for message and role for
