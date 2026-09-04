@@ -4788,13 +4788,26 @@ impl ServerBuilder {
     /// `name` disagrees with the final segment of its URI path.
     #[cfg(feature = "skills")]
     pub fn try_skills(mut self, skills_registry: skills::Skills) -> Result<Self> {
+        // Name identity is a PER-SKILL property — see `validate_name_identity`.
+        // Validating the arriving registry before the merge is what keeps this
+        // linear in registry size across K registrations.
+        skills_registry.validate_name_identity()?;
         let merged = match self.pending_skills.take() {
             Some(prior) => prior.merge(skills_registry),
             None => skills_registry,
         };
-        // Probe by cloning + into_handler; discard the handler. The real
+        // Probe WITHOUT cloning the registry or building a handler. The real
         // construction happens in `.build()` once everything is settled.
-        merged.clone().into_handler()?;
+        //
+        // Duplicate URIs are a cross-skill property, so this must see the
+        // MERGED registry — but URIs need no YAML parse and no SHA-256, so the
+        // merged probe is cheap. Name identity is per-skill and was validated
+        // for every prior registry by the call that added it, so only the newly
+        // supplied one is parsed here (see `validate_name_identity`). Probing
+        // through `into_handler` instead meant a deep clone of the whole
+        // accumulated registry AND a full name pass over it on every call: K
+        // registrations cost K(K+1)/2 YAML parses where upstream cost none.
+        merged.validate_unique_uris()?;
         self.pending_skills = Some(merged);
         skills::set_skills_capabilities(&mut self.capabilities);
         Ok(self)

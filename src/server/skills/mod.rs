@@ -1061,7 +1061,7 @@ impl Skills {
         // skills at one URI while `entries()` happily returned two entries
         // carrying that URI, so the public projection could emit a `skills/list`
         // payload the server that produced it refuses to build.
-        validate_unique_uris(&artifacts)?;
+        validate_unique_uris(artifact_uri_rows(&artifacts))?;
         Ok(entries_from_artifacts(artifacts))
     }
 
@@ -1094,14 +1094,21 @@ impl Skills {
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` on a name-identity offender or a
-    /// duplicate URI — the same two conditions, checked by the same functions,
-    /// that the separate entry points return.
+    /// duplicate URI — the same two conditions, checked by the same two
+    /// functions ([`validate_names`] and [`validate_unique_uris`]), that the
+    /// separate entry points return. That claim used to be true of name
+    /// identity only: the duplicate-URI rule had a second, inline
+    /// implementation in `build_handler` with a different message, so the same
+    /// registry produced different diagnostics depending on the entry point.
     pub(crate) fn finalize(self) -> Result<FinalizedSkills> {
         let artifacts = self.build_artifacts();
         validate_names(&artifacts)?;
+        // Explicit here because `build_handler` no longer carries this check —
+        // it is construction only, and its `IndexMap` inserts would silently
+        // overwrite a collision this refuses.
+        validate_unique_uris(artifact_uri_rows(&artifacts))?;
         let (entries, diagnostics) = entries_from_artifacts(artifacts);
-        let handler = self.build_handler()?;
-        Ok((handler, entries, diagnostics))
+        Ok((self.build_handler(), entries, diagnostics))
     }
 
     /// Flatten the registry into a [`crate::server::ResourceHandler`].
@@ -1126,77 +1133,77 @@ impl Skills {
     pub fn into_handler(self) -> Result<Arc<dyn ResourceHandler>> {
         // The NAME-ONLY pass: `validate_names` reads `frontmatter["name"]` and
         // `uri_segment` and nothing else, while the full pass SHA-256s every
-        // SKILL.md and every reference body. `try_skills` probes through this
-        // method on every registration call, so hashing here made a registry
-        // assembled in K calls cost K passes over its accumulated bodies.
-        // Duplicate URIs are still caught, by `build_handler` below.
-        validate_names(&self.build_name_artifacts())?;
-        self.build_handler()
+        // SKILL.md and every reference body.
+        let artifacts = self.build_name_artifacts();
+        validate_names(&artifacts)?;
+        // The duplicate-URI rule, from the ONE implementation both entry points
+        // now share — `build_handler` below is construction only and would
+        // silently overwrite on a collision.
+        validate_unique_uris(artifact_uri_rows(&artifacts))?;
+        drop(artifacts);
+        Ok(self.build_handler())
     }
 
-    /// The duplicate-URI half of [`Self::into_handler`], without the name
-    /// validation — split out so [`Self::finalize`] can run `validate_names`
-    /// once over artifacts it already holds instead of rebuilding them.
+    /// Flatten the validated registry into its handler. CONSTRUCTION ONLY.
+    ///
+    /// It carries no validation of its own: the duplicate-URI rule it used to
+    /// implement inline now lives in the ONE [`validate_unique_uris`], which
+    /// every caller of this function runs first. That is a precondition, not an
+    /// invariant this can restore — the `IndexMap` inserts below would silently
+    /// overwrite on a collision, which is exactly why the check must precede
+    /// them rather than accompany them.
+    fn build_handler(self) -> Arc<dyn ResourceHandler> {
+        let mut skill_md: IndexMap<String, Skill> = IndexMap::with_capacity(self.skills.len());
+        let mut references: IndexMap<String, (String, String)> = IndexMap::new();
+        for skill in self.skills {
+            for r in &skill.references {
+                references.insert(
+                    skill.reference_uri(&r.relative_path),
+                    (r.mime_type.clone(), r.body.clone()),
+                );
+            }
+            skill_md.insert(skill.skill_md_uri(), skill);
+        }
+        Arc::new(SkillsHandler::new(skill_md, references))
+    }
+
+    /// The [`validate_unique_uris`] rows for this registry, computed with NO
+    /// YAML parse and no SHA-256.
+    ///
+    /// Duplicate URIs are a cross-skill property, so the builder's `try_skills`
+    /// probe must check the MERGED registry on every registration call. Going
+    /// through an artifact pass to do that is what made K registrations cost
+    /// K(K+1)/2 YAML parses; a URI needs none of that pass.
+    fn uri_rows(&self) -> Vec<(String, Vec<String>)> {
+        self.skills
+            .iter()
+            .map(|skill| (skill.skill_md_uri(), skill_reference_uris(skill)))
+            .collect()
+    }
+
+    /// The duplicate-URI rule over this registry alone, with no YAML parse.
     ///
     /// # Errors
     ///
-    /// Returns `Err(pmcp::Error::Validation)` listing every duplicate
-    /// `SKILL.md` or reference URI. No silent overwrites.
-    fn build_handler(self) -> Result<Arc<dyn ResourceHandler>> {
-        let mut skill_md: IndexMap<String, Skill> = IndexMap::with_capacity(self.skills.len());
-        let mut references: IndexMap<String, (String, String)> = IndexMap::new();
-        let mut dup_skill: Vec<String> = Vec::new();
-        let mut dup_ref: Vec<String> = Vec::new();
-        for skill in self.skills {
-            for r in &skill.references {
-                let uri = skill.reference_uri(&r.relative_path);
-                match references.entry(uri) {
-                    indexmap::map::Entry::Occupied(e) => dup_ref.push(e.key().clone()),
-                    indexmap::map::Entry::Vacant(e) => {
-                        e.insert((r.mime_type.clone(), r.body.clone()));
-                    },
-                }
-            }
-            let uri = skill.skill_md_uri();
-            match skill_md.entry(uri) {
-                indexmap::map::Entry::Occupied(e) => dup_skill.push(e.key().clone()),
-                indexmap::map::Entry::Vacant(e) => {
-                    e.insert(skill);
-                },
-            }
-        }
-        // The two maps are populated independently, so a collision BETWEEN them
-        // is invisible to both loops above. It is reachable: `SkillsHandler::read`
-        // consults `skill_md` first, so a reference registered at, say,
-        // `sub/SKILL.md` on skill `a` is permanently shadowed by a second skill
-        // at `.with_path("a/sub")` — and, worse, `skill_resource_manifest`
-        // publishes skill `a`'s digest for a URI that serves the OTHER skill's
-        // bytes, which a conforming SEP-2640 host must refuse. `validate_reference_path`
-        // anticipated the class but rejects only the bare `"SKILL.md"`, so any
-        // nested `<dir>/SKILL.md` slipped through.
-        let mut dup_cross: Vec<String> = references
-            .keys()
-            .filter(|uri| skill_md.contains_key(*uri))
-            .cloned()
-            .collect();
-        dup_cross.sort();
-        if !dup_skill.is_empty() || !dup_ref.is_empty() || !dup_cross.is_empty() {
-            let mut msg = String::from("Skills::into_handler: duplicate URI(s):");
-            if !dup_skill.is_empty() {
-                msg.push_str(&format!(" SKILL.md=[{}]", dup_skill.join(", ")));
-            }
-            if !dup_ref.is_empty() {
-                msg.push_str(&format!(" references=[{}]", dup_ref.join(", ")));
-            }
-            if !dup_cross.is_empty() {
-                msg.push_str(&format!(
-                    " a reference collides with another skill's SKILL.md=[{}]",
-                    dup_cross.join(", ")
-                ));
-            }
-            return Err(Error::validation(msg));
-        }
-        Ok(Arc::new(SkillsHandler::new(skill_md, references)))
+    /// Returns `Err(pmcp::Error::Validation)` — see [`validate_unique_uris`].
+    pub(crate) fn validate_unique_uris(&self) -> Result<()> {
+        let rows = self.uri_rows();
+        validate_unique_uris(rows.iter().map(|(md, refs)| (md.as_str(), refs.as_slice())))
+    }
+
+    /// The SEP-2640 name-identity rule over this registry alone.
+    ///
+    /// Name identity is a PER-SKILL property with no cross-skill dependency, so
+    /// a caller accumulating registries can validate each one as it arrives
+    /// instead of re-validating everything already accepted. That is the whole
+    /// of the fix for `try_skills`'s quadratic cost: the parse this runs is
+    /// over the newly supplied skills, not over the accumulated total.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(pmcp::Error::Validation)` — see [`validate_names`].
+    pub(crate) fn validate_name_identity(&self) -> Result<()> {
+        validate_names(&self.build_name_artifacts())
     }
 }
 
@@ -1210,6 +1217,14 @@ impl Skills {
 struct SkillBuildArtifact {
     /// The skill's canonical `skill://<path>/SKILL.md` URI.
     uri: String,
+    /// Every reference's `skill://<path>/<relative>` URI, in registration
+    /// order.
+    ///
+    /// Populated on BOTH passes, unlike `resources` — a URI needs no SHA-256,
+    /// so carrying it here is what lets [`validate_unique_uris`] be the ONE
+    /// duplicate-URI implementation without dragging the expensive half of the
+    /// pass along with it.
+    reference_uris: Vec<String>,
     /// The final `/` segment of the resolved path — what SEP-2640 name
     /// identity is checked against.
     uri_segment: String,
@@ -1244,6 +1259,7 @@ fn final_path_segment(path: &str) -> &str {
 /// never reach [`entries_from_artifacts`].
 fn build_artifact_inner(skill: &Skill, with_manifest: bool) -> SkillBuildArtifact {
     let uri = skill.skill_md_uri();
+    let reference_uris = skill_reference_uris(skill);
     let uri_segment = final_path_segment(skill.resolved_path()).to_string();
     let mut diagnostics = Vec::new();
 
@@ -1313,11 +1329,27 @@ fn build_artifact_inner(skill: &Skill, with_manifest: bool) -> SkillBuildArtifac
 
     SkillBuildArtifact {
         uri,
+        reference_uris,
         uri_segment,
         frontmatter,
         resources,
         diagnostics,
     }
+}
+
+/// Every reference URI a skill publishes, in registration order.
+///
+/// The URI half of [`skill_resource_manifest`], split out because it is FREE —
+/// no SHA-256, no body walk — and therefore available to callers that must not
+/// pay for the manifest: the name-only artifact pass, and
+/// [`Skills::uri_rows`], which the builder's `try_skills` probe uses to check
+/// duplicate URIs without parsing a single line of YAML.
+fn skill_reference_uris(skill: &Skill) -> Vec<String> {
+    skill
+        .references
+        .iter()
+        .map(|r| skill.reference_uri(r.relative_path()))
+        .collect()
 }
 
 /// The full pass, manifest included — what entry synthesis needs.
@@ -1374,41 +1406,99 @@ fn entries_from_artifacts(
     (entries, diagnostics)
 }
 
-/// Every URI an artifact pass would serve appears exactly once.
+/// THE duplicate-URI rule. Every URI a registry would serve appears once.
 ///
-/// The projection twin of [`Skills::build_handler`]'s duplicate check, over the
-/// same URI population: each artifact's manifest names its own `SKILL.md` first
-/// and then every reference, which is precisely the key set the handler builds.
-/// Running it from [`Skills::entries_with_diagnostics`] is what makes that
-/// method's "a registry can never produce entries it would then refuse to
-/// serve" comment true in BOTH directions — before it, `into_handler` rejected
-/// a two-skills-one-URI registry while `entries()` happily returned two entries
-/// carrying that URI.
+/// # One implementation, because there were two
 ///
-/// Reads `artifact.resources`, so it is meaningful only over a FULL artifact
-/// pass; the name-only pass leaves that vector empty by design.
+/// This rule used to exist twice: here, flattening each artifact's manifest
+/// into one set, and inline in `Skills::build_handler`, categorising collisions
+/// into three classes as it built the maps. They agreed on WHICH registries to
+/// refuse and disagreed on the message, so the same registry produced a
+/// different error depending on whether the caller reached it through
+/// `entries()` or `into_handler()` — and nothing asserted that the twins
+/// agreed. `Skills::finalize`'s rustdoc claimed both entry points were "checked
+/// by the same functions", which was true of name identity and not of this.
+///
+/// The surviving message is the CATEGORISED one: knowing that a collision is
+/// `reference`-vs-`SKILL.md` rather than two `SKILL.md`s is what tells an
+/// author which registration to change. Its prefix names no entry point,
+/// because both raise it.
+///
+/// # Input, and why it is not `&[SkillBuildArtifact]`
+///
+/// It takes the URI rows directly — a skill's own `SKILL.md` URI plus its
+/// reference URIs — so it can run over a completed artifact pass OR over a bare
+/// registry with NO YAML parse at all. The builder's `try_skills` probe needs
+/// the second form: duplicate URIs are a cross-skill property and must see the
+/// MERGED registry on every call, which is exactly the shape that would
+/// otherwise make K registrations cost K full parse passes.
+///
+/// The three classes are computed in one pass over the rows, references before
+/// `SKILL.md` within each skill — the order the handler's own maps were
+/// populated in, so collected offenders appear in the same order they did
+/// before.
 ///
 /// # Errors
 ///
-/// Returns `Err(pmcp::Error::Validation)` naming every repeated URI, sorted so
-/// the message is stable across runs.
-fn validate_unique_uris(artifacts: &[SkillBuildArtifact]) -> Result<()> {
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut dups: Vec<&str> = Vec::new();
-    for row in artifacts.iter().flat_map(|a| a.resources.iter()) {
-        if !seen.insert(row.uri()) {
-            dups.push(row.uri());
+/// Returns `Err(pmcp::Error::Validation)` naming every repeated URI, grouped by
+/// class. The cross-class list is sorted so the message is stable across runs.
+fn validate_unique_uris<'a>(rows: impl IntoIterator<Item = (&'a str, &'a [String])>) -> Result<()> {
+    let mut skill_md: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut references: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dup_skill: Vec<&str> = Vec::new();
+    let mut dup_ref: Vec<&str> = Vec::new();
+
+    for (skill_md_uri, reference_uris) in rows {
+        for uri in reference_uris {
+            if !references.insert(uri.as_str()) {
+                dup_ref.push(uri.as_str());
+            }
+        }
+        if !skill_md.insert(skill_md_uri) {
+            dup_skill.push(skill_md_uri);
         }
     }
-    if dups.is_empty() {
+
+    // The two sets are populated independently, so a collision BETWEEN them is
+    // invisible to both loops above. It is reachable: `SkillsHandler::read`
+    // consults `skill_md` first, so a reference registered at, say,
+    // `sub/SKILL.md` on skill `a` is permanently shadowed by a second skill at
+    // `.with_path("a/sub")` — and, worse, `skill_resource_manifest` publishes
+    // skill `a`'s digest for a URI that serves the OTHER skill's bytes, which a
+    // conforming SEP-2640 host must refuse. `validate_reference_path`
+    // anticipated the class but rejects only the bare `"SKILL.md"`, so any
+    // nested `<dir>/SKILL.md` slipped through.
+    let mut dup_cross: Vec<&str> = references
+        .iter()
+        .filter(|uri| skill_md.contains(*uri))
+        .copied()
+        .collect();
+    dup_cross.sort_unstable();
+
+    if dup_skill.is_empty() && dup_ref.is_empty() && dup_cross.is_empty() {
         return Ok(());
     }
-    dups.sort_unstable();
-    dups.dedup();
-    Err(Error::validation(format!(
-        "Skills::entries: duplicate URI(s): [{}]",
-        dups.join(", ")
-    )))
+    let mut msg = String::from("Skills: duplicate URI(s):");
+    if !dup_skill.is_empty() {
+        msg.push_str(&format!(" SKILL.md=[{}]", dup_skill.join(", ")));
+    }
+    if !dup_ref.is_empty() {
+        msg.push_str(&format!(" references=[{}]", dup_ref.join(", ")));
+    }
+    if !dup_cross.is_empty() {
+        msg.push_str(&format!(
+            " a reference collides with another skill's SKILL.md=[{}]",
+            dup_cross.join(", ")
+        ));
+    }
+    Err(Error::validation(msg))
+}
+
+/// The [`validate_unique_uris`] rows for a completed artifact pass.
+fn artifact_uri_rows(artifacts: &[SkillBuildArtifact]) -> impl Iterator<Item = (&str, &[String])> {
+    artifacts
+        .iter()
+        .map(|a| (a.uri.as_str(), a.reference_uris.as_slice()))
 }
 
 /// SEP-2640 name identity (spike gap 4c, ROADMAP success criterion 3): a
@@ -2028,6 +2118,92 @@ mod tests {
             },
             Err(other) => panic!("expected Validation, got {other:?}"),
             Ok(_) => panic!("expected Err for colliding reference URIs"),
+        }
+    }
+
+    /// The duplicate-URI rule has ONE implementation, so every entry point
+    /// refuses the same registry with the SAME diagnostic.
+    ///
+    /// This is the guard the rule went without while it had two
+    /// implementations: `entries()` raised `Skills::entries: duplicate URI(s):
+    /// [...]` and `into_handler()` raised `Skills::into_handler: duplicate
+    /// URI(s): SKILL.md=[...]`, so the answer a caller got depended on which
+    /// door they came through and nothing said the twins had to agree.
+    ///
+    /// All three collision classes are exercised, because a single flat-set
+    /// implementation and a three-class one can agree on the two-`SKILL.md`
+    /// case and still differ on the cross case.
+    #[test]
+    fn every_entry_point_refuses_a_duplicate_uri_with_the_same_message() {
+        /// A registry factory, one per collision class.
+        type Case = (&'static str, fn() -> Skills);
+        let cases: Vec<Case> =
+            vec![
+                ("two SKILL.md", || {
+                    Skills::new()
+                        .add(Skill::new("a", "").with_path("p"))
+                        .add(Skill::new("b", "").with_path("p"))
+                }),
+                ("two references", || {
+                    Skills::new()
+                        .add(Skill::new("a", "").with_reference(SkillReference::new(
+                            "references/shared.md",
+                            "text/markdown",
+                            "x",
+                        )))
+                        .add(Skill::new("b", "").with_path("a").with_reference(
+                            SkillReference::new("references/shared.md", "text/markdown", "y"),
+                        ))
+                }),
+                ("a reference shadowing a SKILL.md", || {
+                    Skills::new()
+                        .add(Skill::new("a", "").with_reference(SkillReference::new(
+                            "sub/SKILL.md",
+                            "text/markdown",
+                            "x",
+                        )))
+                        .add(Skill::new("b", "").with_path("a/sub"))
+                }),
+            ];
+
+        for (label, build) in cases {
+            let via_entries = build()
+                .entries()
+                .expect_err(&format!("{label}: entries() must refuse"));
+            let via_handler = build()
+                .into_handler()
+                .err()
+                .unwrap_or_else(|| panic!("{label}: into_handler() must refuse"));
+            let via_finalize = build()
+                .finalize()
+                .err()
+                .unwrap_or_else(|| panic!("{label}: finalize() must refuse"));
+            let via_probe = build()
+                .validate_unique_uris()
+                .expect_err(&format!("{label}: the try_skills probe must refuse"));
+
+            let Error::Validation(expected) = &via_entries else {
+                panic!("{label}: expected Validation, got {via_entries:?}");
+            };
+            for (door, got) in [
+                ("into_handler", &via_handler),
+                ("finalize", &via_finalize),
+                ("try_skills probe", &via_probe),
+            ] {
+                let Error::Validation(msg) = got else {
+                    panic!("{label}/{door}: expected Validation, got {got:?}");
+                };
+                assert_eq!(
+                    msg, expected,
+                    "{label}: entries() and {door} must produce the same message"
+                );
+            }
+            // Anti-vacuity: the shared message actually names the offence, so
+            // the equality above is not four copies of an empty string.
+            assert!(
+                expected.starts_with("Skills: duplicate URI(s):"),
+                "{label}: msg = {expected}"
+            );
         }
     }
 
