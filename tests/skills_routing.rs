@@ -78,8 +78,8 @@ mod common;
 mod duplex;
 
 use common::v2::{
-    header, post, post_raw, spawn_default_config, teardown, v1_body, v2_body, v2_headers_for,
-    BearerSubjects, Resp, V1, V2,
+    header, post, post_raw, result_of, spawn_default_config, teardown, v1_body, v1_session,
+    v2_body, v2_headers_for, BearerSubjects, Resp, V1, V2,
 };
 use pmcp::server::skills::{Skill, SkillReference, Skills};
 use pmcp::types::protocol::ProtocolVersion;
@@ -213,40 +213,9 @@ async fn post_v2_skills_list(addr: SocketAddr, id: i64) -> Resp {
     .await
 }
 
-/// Complete a v1 handshake and return the minted session id.
-async fn v1_session(addr: SocketAddr) -> String {
-    // A `--no-default-features --features full-v2` build mints nothing and
-    // validates nothing, so a placeholder keeps every v1 leg RUNNING there.
-    if !cfg!(feature = "v1-compat") {
-        return "no-session-on-a-severed-build".to_string();
-    }
-    let init = post(
-        addr,
-        &[],
-        &v1_body(
-            "initialize",
-            json!(1),
-            json!({
-                "protocolVersion": V1,
-                "capabilities": {},
-                "clientInfo": { "name": "skills-routing-v1-client", "version": "1.0.0" },
-            }),
-        ),
-    )
-    .await;
-    init.mcp_session_id
-        .unwrap_or_else(|| panic!("a v1 initialize mints a session; body was {}", init.raw))
-}
-
-fn result_of(response: &Resp) -> &Value {
-    let result = &response.body["result"];
-    assert!(
-        !result.is_null(),
-        "expected a JSON-RPC result, got: {}",
-        response.raw
-    );
-    result
-}
+/// The `clientInfo.name` this file's v1 handshakes declare, so a red on the
+/// shared [`v1_session`] names the file that opened the session.
+const V1_CLIENT_NAME: &str = "skills-routing-v1-client";
 
 // ===========================================================================
 // 1 — the live wire.
@@ -309,21 +278,7 @@ async fn skills_list_returns_a_conforming_entry_on_v2() {
     );
 
     // The digest, verified on the wire: `sha256:` + 64 LOWERCASE hex characters.
-    let digest = manifest[0]["digest"].as_str().unwrap_or_else(|| {
-        panic!(
-            "a manifest row carries a string digest; got {}",
-            response.raw
-        )
-    });
-    let hex = digest
-        .strip_prefix("sha256:")
-        .unwrap_or_else(|| panic!("digest must carry the `sha256:` prefix, got {digest}"));
-    assert_eq!(hex.len(), 64, "64 hex characters, got {digest}");
-    assert!(
-        hex.chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-        "digest hex must be LOWERCASE, got {digest}"
-    );
+    assert_digest_shape(&manifest[0], "skills/list on v2", &response.raw);
 
     assert_eq!(
         manifest[0]["size"],
@@ -372,7 +327,7 @@ async fn skills_list_returns_a_conforming_entry_on_v2() {
 #[tokio::test]
 async fn skills_list_answers_on_v1_without_the_caching_attributes() {
     let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
-    let session = v1_session(addr).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
 
     let response = post(
         addr,
@@ -633,7 +588,7 @@ fn skills_methods_do_not_parse_as_public_client_requests() {
 #[tokio::test]
 async fn skills_list_has_no_era_gate_and_server_discover_still_does() {
     let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
-    let session = v1_session(addr).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
 
     let served = post(
         addr,
@@ -818,12 +773,10 @@ async fn skills_get_returns_the_single_conforming_entry_on_v2() {
         .as_array()
         .unwrap_or_else(|| panic!("entry.resources is an array; got {}", response.raw));
     assert_eq!(manifest[0]["uri"], REFUNDS_SKILL_MD);
-    assert!(
-        manifest[0]["digest"]
-            .as_str()
-            .is_some_and(|d| d.starts_with("sha256:") && d.len() == "sha256:".len() + 64),
-        "the manifest digest survives the get projection unchanged: {}",
-        response.raw
+    assert_digest_shape(
+        &manifest[0],
+        "the manifest digest survives the skills/get projection unchanged",
+        &response.raw,
     );
     assert_eq!(manifest[0]["size"], json!(REFUNDS_BODY.len()));
 
@@ -924,7 +877,7 @@ async fn skills_get_reference_uri_returns_invalid_params() {
 #[tokio::test]
 async fn skills_get_malformed_params_return_invalid_params() {
     let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
-    let session = v1_session(addr).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
 
     // (a) NO `params` key at all — the `Value::Null` path.
     let absent = post_raw(
@@ -1141,7 +1094,7 @@ async fn skills_get_result_carries_no_cache_attributes_on_either_era() {
         v2.raw
     );
 
-    let session = v1_session(addr).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
     let v1 = post(
         addr,
         &[header(SESSION_HEADER, &session)],
@@ -1651,6 +1604,31 @@ fn is_lowercase_hex_64(hex: &str) -> bool {
     hex.len() == 64 && hex.chars().all(|c| "0123456789abcdef".contains(c))
 }
 
+/// Assert that `row`'s `digest` is `sha256:` + exactly 64 LOWERCASE hex
+/// characters, and return the hex.
+///
+/// One spelling, because there were three and the weakest of them checked only
+/// the prefix and the length — which [`is_lowercase_hex_64`]'s own rustdoc says
+/// is not enough, since an uppercase rendering has both and is a silent
+/// host-side comparison failure.
+///
+/// `context` names the SC-4 obligation or the wire surface under test, so a red
+/// says which contract broke rather than merely which line.
+fn assert_digest_shape<'a>(row: &'a Value, context: &str, raw: &str) -> &'a str {
+    let digest = row["digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{context}: a manifest row carries a string digest; got {raw}"));
+    let hex = digest.strip_prefix("sha256:").unwrap_or_else(|| {
+        panic!("{context}: digest must carry the `sha256:` prefix, got {digest}")
+    });
+    assert!(
+        is_lowercase_hex_64(hex),
+        "{context}: digest must be `sha256:` + exactly 64 LOWERCASE hex \
+         characters, checked character by character; got {digest}"
+    );
+    hex
+}
+
 /// The skill-name segment of a SKILL.md entry URI.
 ///
 /// # Not `rsplit('/').next()`
@@ -1789,20 +1767,7 @@ async fn assert_sc4_holds_on_the_wire(description: &str) {
             )
         });
 
-    let digest = skill_md_row["digest"].as_str().unwrap_or_else(|| {
-        panic!(
-            "a manifest row carries a string digest; got {}",
-            response.raw
-        )
-    });
-    let hex = digest
-        .strip_prefix("sha256:")
-        .unwrap_or_else(|| panic!("SC-4 clause 4: digest must carry `sha256:`; got {digest}"));
-    assert!(
-        is_lowercase_hex_64(hex),
-        "SC-4 clause 4: digest must be `sha256:` + exactly 64 LOWERCASE hex \
-         characters, checked character by character; got {digest}"
-    );
+    assert_digest_shape(skill_md_row, "SC-4 clause 4", &response.raw);
 
     let size = skill_md_row["size"].as_u64().unwrap_or_else(|| {
         panic!(

@@ -943,3 +943,54 @@ pub async fn delete(addr: SocketAddr, extra: &[(String, String)]) -> Resp {
         .header("accept", "application/json");
     send(request, extra).await
 }
+
+// ===========================================================================
+// Response readers.
+// ===========================================================================
+
+/// The `result` of a JSON-RPC response, with a loud failure when there is none.
+///
+/// Lives here because SEVEN `tests/*.rs` files had grown their own copy of these
+/// five lines. The failure prints [`Resp::raw`] rather than the parsed body: an
+/// error response has no `result`, and the raw text is what says WHICH error.
+pub fn result_of(response: &Resp) -> &Value {
+    let result = &response.body["result"];
+    assert!(
+        !result.is_null(),
+        "expected a JSON-RPC result, got: {}",
+        response.raw
+    );
+    result
+}
+
+/// Complete a v1 handshake against `addr` and return the minted session id.
+///
+/// `client_name` is a parameter and not a constant so a red names the file that
+/// opened the session; every other line of this handshake was identical across
+/// the callers that used to keep private copies.
+///
+/// A `--no-default-features --features full-v2` build mints nothing and
+/// validates nothing — the transport spec's "an inbound `Mcp-Session-Id` is
+/// IGNORED" is structural there. Returning a placeholder exercises exactly that
+/// and keeps every v1 leg RUNNING on the severed build instead of skipping.
+pub async fn v1_session(addr: SocketAddr, client_name: &str) -> String {
+    if !cfg!(feature = "v1-compat") {
+        return "no-session-on-a-severed-build".to_string();
+    }
+    let init = post(
+        addr,
+        &[],
+        &v1_body(
+            "initialize",
+            json!(1),
+            json!({
+                "protocolVersion": V1,
+                "capabilities": {},
+                "clientInfo": { "name": client_name, "version": "1.0.0" },
+            }),
+        ),
+    )
+    .await;
+    init.mcp_session_id
+        .unwrap_or_else(|| panic!("a v1 initialize mints a session; body was {}", init.raw))
+}
