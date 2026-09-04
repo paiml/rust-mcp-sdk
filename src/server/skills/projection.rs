@@ -34,7 +34,7 @@
 //!
 //! # Frontmatter is written as encoded YAML scalars, never by concatenation
 //!
-//! Both frontmatter values go through [`yaml_double_quoted`]. A workflow
+//! Both frontmatter values go through the module-private `yaml_double_quoted`. A workflow
 //! description is arbitrary author text, and pushing it raw after
 //! `description: ` lets an ordinary string like `Refund an order: fast path`
 //! break the YAML parse — which the registry DOWNGRADES to a diagnostic rather
@@ -47,8 +47,8 @@ use crate::server::workflow::{SequentialWorkflow, WorkflowStep};
 /// A condition the infallible projection path resolved on the author's behalf.
 ///
 /// The crate-private seam returns these instead of logging them, so the
-/// fallible builder path can surface them as structured warnings while
-/// [`project`] logs them on `mcp.skills`.
+/// fallible builder path can surface them as structured warnings while the
+/// logging wrapper emits them on the `mcp.skills` tracing target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectionNotice {
     /// The workflow name contained nothing legal; a deterministic
@@ -67,66 +67,294 @@ pub(crate) enum ProjectionNotice {
     },
 }
 
+/// The maximum skill-name length agentskills permits (D-15a).
+const MAX_SLUG_LEN: usize = 64;
+
+/// The deterministic description substituted when a workflow has none.
+///
+/// Derived from the SLUG rather than the raw workflow name on purpose: the slug
+/// is already `[a-z0-9-]`, so the substitute can carry no control character, no
+/// quote and no YAML indicator, and needs no escaping of its own.
+fn fallback_description(slug: &str) -> String {
+    format!("Projected from the {slug} workflow.")
+}
+
 /// Normalize a workflow name into an agentskills-legal skill name.
-fn slugify(_name: &str) -> Option<String> {
-    None
+///
+/// The rule set is `[a-z0-9-]`, 1..=64 characters, with no leading, trailing or
+/// doubled hyphen. Returns `None` when nothing legal survives — the caller then
+/// substitutes [`fallback_slug`] (D-15).
+fn slugify(name: &str) -> Option<String> {
+    let mapped: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    let mut slug = mapped
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if slug.is_empty() {
+        return None;
+    }
+
+    if slug.len() > MAX_SLUG_LEN {
+        // PANIC-FREE ONLY BECAUSE OF THE MAP ABOVE: every surviving character
+        // is ASCII alphanumeric or `-`, so byte index equals char index and
+        // `truncate` cannot land inside a multi-byte character. Reordering the
+        // steps so this runs before the map reintroduces a panic, and D-15
+        // says nothing panics.
+        slug.truncate(MAX_SLUG_LEN);
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+        if slug.is_empty() {
+            return None;
+        }
+    }
+
+    Some(slug)
 }
 
 /// Deterministic `workflow-{8 hex}` slug for a name with nothing legal in it.
-fn fallback_slug(_original_name: &str) -> String {
-    String::new()
+///
+/// Hashes the ORIGINAL un-normalized name, never the empty normalized string:
+/// hashing the latter collides every failing workflow onto one slug, which
+/// `Skills::into_handler`'s duplicate-URI check would then reject — converting
+/// a warn path into a hard build failure.
+fn fallback_slug(original_name: &str) -> String {
+    let digest = super::sha256_digest_hex(original_name.as_bytes());
+    // Iterator slicing rather than `&digest[..]`: no index can panic, even if
+    // the digest format ever changes underneath this function.
+    let hex: String = digest.chars().skip("sha256:".len()).take(8).collect();
+    format!("workflow-{hex}")
 }
 
 /// Replace every control character with `U+FFFD` before the value reaches a
 /// `tracing` field (T-126-01).
-fn sanitize_for_log(_s: &str) -> String {
-    String::new()
+///
+/// A workflow name is author-supplied and reaches a log sink; an embedded
+/// newline or terminal escape could forge a second log record. Follows Phase
+/// 125's WR-04 mitigation at `src/server/core.rs:2563`.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
 }
 
 /// Encode `s` as a YAML double-quoted scalar, INCLUDING its surrounding quotes.
-fn yaml_double_quoted(_s: &str) -> String {
-    String::new()
+///
+/// # Always quoted, never conditionally
+///
+/// 1. A slug is `[a-z0-9-]`, but that alphabet still contains YAML type-alikes.
+///    `slugify("True")` yields `true` and `slugify("123")` yields `123`;
+///    unquoted, those parse to a YAML boolean and a YAML integer, the
+///    registry's `as_str()` guard returns `None`, and the SC-1 name-identity
+///    rule silently SKIPS the skill instead of enforcing it.
+/// 2. Conditional quoting would make the emitted bytes depend on a predicate
+///    over author text, and those bytes are a published digest (D-14).
+///    Unconditional quoting keeps the shape constant.
+///
+/// The emitter is hand-written rather than delegated to `serde_yaml::to_string`
+/// because that crate's quoting style and line wrapping are emitter heuristics,
+/// and D-14 makes these bytes a supply-chain pin. `serde_yaml` is used as the
+/// test ORACLE instead, through the module's own `parse_frontmatter_value`.
+fn yaml_double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Every remaining C0/C1 control as `\xNN`. `char::is_control()` is
+            // the Unicode `Cc` category, whose maximum scalar is `U+009F`, so
+            // two lowercase hex digits always suffice.
+            _ if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            // Everything else verbatim, including all non-ASCII: a
+            // double-quoted YAML scalar carries UTF-8 directly, and
+            // re-encoding it would break D-13's verbatim-description contract.
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The `---`-delimited frontmatter block: `name` then `description`, both
 /// encoded.
-fn render_frontmatter(_slug: &str, _description: &str) -> String {
-    String::new()
+///
+/// Exactly two keys, in this order, and nothing else — the minimum
+/// agentskills-legal set (D-13). Neither value is ever produced by
+/// concatenating author text after a `key: ` literal (T-126-21).
+fn render_frontmatter(slug: &str, description: &str) -> String {
+    format!(
+        "---\nname: {}\ndescription: {}\n---\n",
+        yaml_double_quoted(slug),
+        yaml_double_quoted(description)
+    )
 }
 
 /// Render one step as a `### Step {n}: {name}` section.
-fn render_step(_index: usize, _step: &WorkflowStep) -> String {
-    String::new()
+///
+/// `index` is 1-based. A resource-only step carries no tool line; breadth
+/// beyond the tool and the binding (arguments, guidance, resources, template
+/// bindings) is deliberately absent here and is filled by a later plan — this
+/// is a functionality gap, not an architectural one.
+fn render_step(index: usize, step: &WorkflowStep) -> String {
+    let mut out = format!("### Step {index}: {}\n", step.name());
+    if let Some(tool) = step.tool() {
+        out.push_str(&format!("Call tool `{}`.\n", tool.name()));
+    }
+    if let Some(binding) = step.binding() {
+        out.push_str(&format!("Save the result as `{binding}`.\n"));
+    }
+    out.push('\n');
+    out
 }
 
 /// Render the `## Procedure` section over every step in order.
-fn render_procedure(_wf: &SequentialWorkflow) -> String {
-    String::new()
+fn render_procedure(wf: &SequentialWorkflow) -> String {
+    let mut out = String::from("## Procedure\n\n");
+    for (offset, step) in wf.steps().iter().enumerate() {
+        out.push_str(&render_step(offset + 1, step));
+    }
+    out
 }
 
 /// Render the closing `## Server-accelerated alternative` instruction (D-06).
-fn render_closing(_wf: &SequentialWorkflow) -> String {
-    String::new()
+///
+/// One instruction addressed to the MODEL, not a cross-reference for a reader:
+/// MCP prompts are user-controlled, so a model cannot invoke one and a
+/// "prefer the prompt" note would be inert. Its job is closing the DISCOVERY
+/// gap for users who do not know the prompt exists. It is conditioned on
+/// context the model can actually resolve, so the same bytes read correctly
+/// both as a cold skill read and as message [0] of a prompt result.
+///
+/// Uses the raw workflow name, not the slug — that is the prompt's own name.
+fn render_closing(wf: &SequentialWorkflow) -> String {
+    let name = wf.name();
+    format!(
+        "## Server-accelerated alternative\n\n\
+         If you are reading this as part of a result from this server's `{name}` prompt, \
+         the steps above have already been executed server-side. Otherwise, mention once, \
+         at the end of your reply, that this server also offers the `{name}` prompt, \
+         which runs these steps server-side.\n"
+    )
 }
 
 /// The description the render actually uses (D-15 / REVIEWS finding 6).
-fn resolve_description(_wf: &SequentialWorkflow, _slug: &str) -> String {
-    String::new()
+///
+/// `SequentialWorkflow::new` validates nothing, so an empty description is
+/// legal input — and `description:` with nothing after it renders YAML null,
+/// violating agentskills' non-empty rule. The infallible path substitutes a
+/// deterministic legal string; the fallible builder path rejects instead, so a
+/// strict caller is pushed to write a description.
+///
+/// No length bound is imposed: `sep-2640-conformance.md` states the digest
+/// format, the per-skill file/byte limits and the name-identity rule, but NO
+/// description length limit, and the registry's existing over-limit warning
+/// already covers a pathologically large body.
+fn resolve_description(wf: &SequentialWorkflow, slug: &str) -> String {
+    if wf.description().is_empty() {
+        fallback_description(slug)
+    } else {
+        wf.description().to_string()
+    }
 }
 
 /// Compose the whole SKILL.md body.
-fn render_body(_wf: &SequentialWorkflow, _slug: &str) -> String {
-    String::new()
+///
+/// A straight sequence over leaf helpers and nothing else. The layout is
+/// locked: frontmatter, an `# ` heading, `## Procedure` with one section per
+/// step, then the closing instruction — later plans extend it but do not
+/// rearrange it. The body terminates in exactly one `'\n'`, which is half of
+/// what makes `Skill::as_prompt_text() == Skill::body()` hold (SC-5).
+fn render_body(wf: &SequentialWorkflow, slug: &str) -> String {
+    let description = resolve_description(wf, slug);
+    let mut out = String::new();
+    out.push_str(&render_frontmatter(slug, &description));
+    out.push('\n');
+    out.push_str("# ");
+    out.push_str(&description);
+    out.push_str("\n\n");
+    out.push_str(&render_procedure(wf));
+    out.push_str(&render_closing(wf));
+    out
 }
 
 /// The crate-private projection seam.
-pub(crate) fn project_with_notices(_wf: &SequentialWorkflow) -> (Skill, Vec<ProjectionNotice>) {
-    (Skill::new("", ""), Vec::new())
+///
+/// Returns the notices instead of logging them so a fallible builder path can
+/// surface them as structured data; [`project`] is the logging wrapper. Kept
+/// crate-private so a later plan can wrap it without rewriting it.
+pub(crate) fn project_with_notices(wf: &SequentialWorkflow) -> (Skill, Vec<ProjectionNotice>) {
+    let mut notices = Vec::new();
+
+    let slug = if let Some(slug) = slugify(wf.name()) {
+        slug
+    } else {
+        let slug = fallback_slug(wf.name());
+        notices.push(ProjectionNotice::SlugFallback {
+            original: wf.name().to_string(),
+            slug: slug.clone(),
+        });
+        slug
+    };
+
+    if wf.description().is_empty() {
+        notices.push(ProjectionNotice::EmptyDescription {
+            substituted: fallback_description(&slug),
+        });
+    }
+
+    let description = resolve_description(wf, &slug);
+    let body = render_body(wf, &slug);
+
+    // NEVER set a URI path override on a projected skill: leaving the path
+    // unset is what makes `resolved_path() == slug`, the URI's final segment
+    // `== slug`, and the frontmatter `name` `== slug` all agree, so the
+    // registry's name-identity validation passes by construction (SC-1).
+    //
+    // `.with_description(...)` is explicit because `Skill::new` would
+    // otherwise derive the description via a `strip_prefix("description: ")`
+    // scan with NO YAML decoding, surfacing the ENCODED scalar — quotes and
+    // backslashes intact — in `prompts/list`.
+    let skill = Skill::new(slug, body).with_description(description);
+
+    (skill, notices)
 }
 
 /// Project `wf` into a [`Skill`], logging every notice on `mcp.skills`.
 pub(crate) fn project(wf: &SequentialWorkflow) -> Skill {
-    let (skill, _notices) = project_with_notices(wf);
+    let (skill, notices) = project_with_notices(wf);
+    for notice in &notices {
+        match notice {
+            ProjectionNotice::SlugFallback { original, slug } => {
+                tracing::warn!(
+                    target: "mcp.skills",
+                    workflow = %sanitize_for_log(original),
+                    slug = %slug,
+                    "workflow name has no agentskills-legal characters; \
+                     projected skill uses a deterministic fallback slug"
+                );
+            },
+            ProjectionNotice::EmptyDescription { substituted } => {
+                tracing::warn!(
+                    target: "mcp.skills",
+                    workflow = %sanitize_for_log(wf.name()),
+                    substituted = %substituted,
+                    "workflow description is empty; projected skill uses a \
+                     deterministic fallback description"
+                );
+            },
+        }
+    }
     skill
 }
 
