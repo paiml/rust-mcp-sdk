@@ -91,6 +91,25 @@ if [ "$status" -ne 0 ]; then
 	exit "$status"
 fi
 
+# Every guard below matches against the ANSI-STRIPPED text, never `$out`.
+#
+# `.github/workflows/ci.yml` sets `CARGO_TERM_COLOR: always`, so in CI cargo
+# emits its target lines with escapes embedded — `Doc-tests pmcp` arrives as
+# `ESC[1mESC[92m   Doc-testsESC[0m pmcp`. An anchored literal match cannot see
+# that, and the doctest guard below (which greps, rather than delegating to the
+# extractor) reported the harness "did not run" for a run whose 16 doctests had
+# just all passed, three lines above it in the same log.
+#
+# `named-test-binary-count.awk` has stripped ANSI since it was written; the
+# doctest branch was added later with a grep and did not inherit it. Stripping
+# once, HERE, is what stops the two from disagreeing again — a future guard gets
+# the colour-blindness by default instead of having to remember it. `$out` is
+# still what gets printed, so CI logs stay coloured for the operator.
+clean="$(printf '%s\n' "$out" | awk '
+	BEGIN { ansi = sprintf("%c", 27) "\\[[0-9;]*[a-zA-Z]" }
+	{ gsub(ansi, ""); print }
+')"
+
 # ---------------------------------------------------------------------------
 # Guard 1: the selector ran a NONZERO number of tests.
 # ---------------------------------------------------------------------------
@@ -98,7 +117,7 @@ fi
 # Field 4 of the `test result:` line is the PASSED count, which is the only
 # field that reports 0 for an all-ignored suite; `running N tests` does not.
 # See scripts/named-test-binary-count.awk's header for the measurement.
-ran="$(printf '%s\n' "$out" | awk '/^test result:/ { total += $4 } END { print total+0 }')"
+ran="$(printf '%s\n' "$clean" | awk '/^test result:/ { total += $4 } END { print total+0 }')"
 if [ "$ran" -eq 0 ]; then
 	printf '%s✗ %s reported 0 tests. %s%s\n' "$RED" "$label" "$dark_message" "$NC"
 	exit 1
@@ -115,14 +134,14 @@ Doc-tests*)
 	# The doctest trailer prints `   Doc-tests <pkg>` with no `Running <path>`
 	# line, so the extractor has nothing to key on and the target LINE is the
 	# proof instead.
-	if ! printf '%s\n' "$out" | grep -q "^ *$want\$"; then
+	if ! printf '%s\n' "$clean" | grep -q "^ *$want\$"; then
 		printf '%s✗ %s: no '\''%s'\'' target line in the captured output — the doctest harness did not run for this package.%s\n' \
 			"$RED" "$label" "$want" "$NC"
 		exit 1
 	fi
 	;;
 *)
-	n="$(printf '%s\n' "$out" | awk -v want="$want" -f "$extractor")"
+	n="$(printf '%s\n' "$clean" | awk -v want="$want" -f "$extractor")"
 	case "$n" in
 	-1)
 		printf '%s✗ %s: the target '\''%s'\'' never RAN. A dropped or mistyped cargo selector is exactly how a leg reports green over nothing.%s\n' \
