@@ -72,6 +72,16 @@ pub mod event_store;
 #[cfg(feature = "http-client")]
 pub(crate) mod http_body_cap;
 pub mod http_utils;
+/// Neutralising untrusted text before it reaches a log sink or an error message.
+///
+/// Feature-agnostic: its two consumers sit on opposite sides of a FEATURE gate
+/// (`server::core`'s `skills/get` URI echo is ungated, the skills projection is
+/// `feature = "skills"`), which is exactly why the classification had drifted
+/// before it lived here. Both consumers are nevertheless server-side and thus
+/// `not(wasm32)`, so the module carries that target gate — the wasm server core
+/// is a separate minimal surface that renders no untrusted text into a sink.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod log_sanitize;
 pub mod logging;
 pub mod middleware;
 pub mod middleware_presets;

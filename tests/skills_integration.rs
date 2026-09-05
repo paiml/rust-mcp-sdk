@@ -1,9 +1,13 @@
 //! SEP-2640 Skills integration test.
 //!
-//! Exercises all four SEP-2640 endpoints (resources/list, resources/read
-//! for SKILL.md, resources/read for a reference, resources/read for the
-//! discovery index) via direct trait-impl calls on the `ResourceHandler`
-//! returned by `Skills::into_handler()`.
+//! Exercises the SEP-2640 resource surface (resources/list, resources/read
+//! for SKILL.md, resources/read for a reference) via direct trait-impl calls
+//! on the `ResourceHandler` returned by `Skills::into_handler()`.
+//!
+//! Discovery itself is NOT a resource: it is the `skills/list` / `skills/get`
+//! method pair, proven end to end over the wire in `tests/skills_routing.rs`.
+//! The synthesized `skill://` discovery index this file used to read was
+//! retired in Phase 125 plan 04; a replacement test asserts it now errors.
 //!
 //! The load-bearing tests are:
 //!
@@ -74,8 +78,8 @@ fn build_trivial_skill() -> Skill {
     Skill::new("hello", "---\nname: hello\n---\nHi.")
 }
 
-/// Extract URI + body + MIME from a Resource-variant Content. Reads MUST
-/// be the Resource variant — Content::Text would drop the per-URI MIME.
+/// Extract URI + body + MIME from a Resource-variant `Content`. Reads MUST
+/// be the Resource variant — `Content::Text` would drop the per-URI MIME.
 fn extract_resource(contents: &[Content]) -> (String, String, String) {
     match contents.first() {
         Some(Content::Resource {
@@ -164,8 +168,12 @@ async fn wire_level_prompt_text(skill: Skill, prompt_name: &str) -> String {
 }
 
 // Test 3.1
+//
+// Renamed from `resources_list_returns_skill_md_and_index_only` in Phase 125
+// plan 04: the old NAME encoded the retired shape as strongly as its length
+// assertion did.
 #[tokio::test]
-async fn resources_list_returns_skill_md_and_index_only() {
+async fn resources_list_returns_skill_md_only() {
     let handler = build_handler().await;
     let result = handler
         .list(None, RequestHandlerExtra::default())
@@ -174,12 +182,15 @@ async fn resources_list_returns_skill_md_and_index_only() {
     let uris: Vec<&str> = result.resources.iter().map(|r| r.uri.as_str()).collect();
     assert_eq!(
         result.resources.len(),
-        3,
-        "2 SKILL.md + 1 index = 3, got {uris:?}"
+        2,
+        "2 SKILL.md and nothing else = 2, got {uris:?}"
     );
     assert!(uris.contains(&"skill://hello/SKILL.md"));
     assert!(uris.contains(&"skill://widget-builder/SKILL.md"));
-    assert!(uris.contains(&"skill://index.json"));
+    assert!(
+        !uris.contains(&"skill://index.json"),
+        "the synthesized discovery index was retired (125-CONTEXT D-08): {uris:?}"
+    );
     assert!(
         !uris.iter().any(|u| u.contains("/references/")),
         "SEP-2640 section 9: references MUST NOT be enumerated"
@@ -220,32 +231,42 @@ async fn resources_read_reference_carries_per_resource_mime() {
     assert!(text.contains("Widget Spec"));
 }
 
-// wire shape: the discovery index is served as Content::Resource (application/json)
+// The retired discovery index is no longer readable.
+//
+// REPLACES `resources_read_index_returns_resource_with_text_application_json`,
+// which asserted the synthesized index came back as an `application/json`
+// resource. A deleted test is a silent coverage loss; a replaced one pins the
+// decision, so a reintroduced short-circuit fails here (125-CONTEXT D-08).
+//
+// The retired URI takes the ORDINARY unknown-URI path — the same
+// `METHOD_NOT_FOUND` `resources_read_unknown_uri_method_not_found` pins for a
+// URI that was never registered. Note that is the HANDLER-level code: over
+// streamable HTTP the dispatch tail re-wraps it, so a caller on the wire sees
+// -32603 carrying -32601 inside the message (measured in 125-02).
 #[tokio::test]
-async fn resources_read_index_returns_resource_with_text_application_json() {
+async fn resources_read_retired_index_uri_is_unknown() {
     let handler = build_handler().await;
-    let result = handler
+    let err = handler
         .read("skill://index.json", RequestHandlerExtra::default())
         .await
-        .unwrap();
-    let (uri, text, mime) = extract_resource(&result.contents);
-    assert_eq!(uri, "skill://index.json");
-    assert_eq!(mime, "application/json");
-    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        parsed["$schema"],
-        "https://schemas.agentskills.io/discovery/0.2.0/schema.json"
-    );
-    let arr = parsed["skills"].as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    for entry in arr {
-        assert_eq!(entry["type"], "skill-md");
-        let url = entry["url"].as_str().unwrap();
-        assert!(
-            !url.contains("/references/"),
-            "index MUST NOT enumerate references"
-        );
+        .expect_err("the retired discovery URI must no longer be served");
+    match err {
+        pmcp::Error::Protocol { code, message, .. } => {
+            assert_eq!(code, ErrorCode::METHOD_NOT_FOUND);
+            assert!(
+                message.contains("skill://index.json"),
+                "message = {message}"
+            );
+        },
+        other => panic!("expected Protocol error with METHOD_NOT_FOUND, got {other:?}"),
     }
+    // Control: the handler is not simply refusing every read.
+    let ok = handler
+        .read("skill://hello/SKILL.md", RequestHandlerExtra::default())
+        .await
+        .expect("a registered SKILL.md must still read");
+    let (uri, _, _) = extract_resource(&ok.contents);
+    assert_eq!(uri, "skill://hello/SKILL.md");
 }
 
 // Test 3.5 — METHOD_NOT_FOUND on unknown URI
@@ -315,6 +336,143 @@ async fn dual_surface_byte_equal_crlf_and_mixed_line_endings() {
     }
 }
 
+// ── SEP-2640 entry manifests (Phase 125, plan 03) ─────────────────────
+
+/// D-02: a frontmatter-less skill is excluded from the SKILLS listing ONLY.
+/// It stays enumerated by `resources/list` and stays readable byte-identically
+/// through `resources/read` — the exclusion never removes it from the resource
+/// surface, which is what makes a partial listing SEP-legal rather than lossy.
+#[tokio::test]
+async fn frontmatter_less_skill_is_excluded_from_entries_but_still_served() {
+    const BARE_BODY: &str = "# Bare\n\nThis skill has no YAML frontmatter at all.\n";
+
+    let registry = Skills::new()
+        .add(build_widget_skill_lf())
+        .add(Skill::new("bare", BARE_BODY));
+
+    let entries = registry.entries().expect("entries build");
+    assert_eq!(entries.len(), 1, "only the annotated skill is listed");
+    assert_eq!(entries[0].uri(), "skill://widget-builder/SKILL.md");
+
+    let handler = registry.into_handler().expect("fixture has no duplicates");
+    let list = handler
+        .list(None, RequestHandlerExtra::default())
+        .await
+        .unwrap();
+    let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(
+        uris.contains(&"skill://bare/SKILL.md"),
+        "the excluded skill is still enumerated by resources/list, got {uris:?}"
+    );
+
+    let read = handler
+        .read("skill://bare/SKILL.md", RequestHandlerExtra::default())
+        .await
+        .expect("the excluded skill is still readable");
+    let (uri, text, mime) = extract_resource(&read.contents);
+    assert_eq!(uri, "skill://bare/SKILL.md");
+    assert_eq!(mime, "text/markdown");
+    assert_eq!(text, BARE_BODY, "served byte-identically");
+}
+
+/// The entry manifest names EVERY file the skill is made of — its `SKILL.md`
+/// first, then each reference in registration order — and every row's `size` is
+/// the byte length of what `resources/read` actually returns for that URI.
+///
+/// Reading the bytes back THROUGH the handler is the point: a test that
+/// re-derived them from the `Skill` would pass against an implementation where
+/// the manifest and the served content agreed only because both were wrong.
+#[tokio::test]
+async fn entry_manifest_names_every_file_and_sizes_match_the_served_bytes() {
+    let registry = Skills::new().add(build_widget_skill_lf());
+    let entries = registry.entries().expect("entries build");
+    assert_eq!(entries.len(), 1, "the LF fixture carries frontmatter");
+
+    let manifest = entries[0].resources();
+    let uris: Vec<&str> = manifest.iter().map(|r| r.uri()).collect();
+    assert_eq!(
+        uris,
+        vec![
+            "skill://widget-builder/SKILL.md",
+            "skill://widget-builder/references/spec.md",
+            "skill://widget-builder/references/checklist.md",
+        ],
+        "SKILL.md first, then references in registration order"
+    );
+
+    let handler = registry.into_handler().expect("fixture has no duplicates");
+    for row in manifest {
+        let read = handler
+            .read(row.uri(), RequestHandlerExtra::default())
+            .await
+            .expect("every manifest URI must be readable");
+        let (uri, text, _mime) = extract_resource(&read.contents);
+        assert_eq!(uri, row.uri());
+        assert_eq!(
+            text.len(),
+            row.size(),
+            "manifest size must equal the served byte length for {}",
+            row.uri()
+        );
+        assert!(
+            row.digest().starts_with("sha256:") && row.digest().len() == "sha256:".len() + 64,
+            "digest shape for {}: {}",
+            row.uri(),
+            row.digest()
+        );
+    }
+}
+
+/// An LF-authored SKILL.md and a CRLF twin of the SAME content produce
+/// byte-identical `frontmatter` JSON.
+///
+/// The CRLF twin is derived from the LF fixture's own body here rather than
+/// taken from [`build_widget_skill_crlf`]: that shipped fixture deliberately
+/// differs in BOTH of its frontmatter fields (`name` and `description`), so
+/// "equal except for the differing keys" would compare an empty key set and
+/// prove nothing. The shipped fixture is still exercised below for its key set.
+#[test]
+fn lf_and_crlf_frontmatter_are_identical() {
+    let lf_skill = build_widget_skill_lf();
+    let crlf_body = lf_skill.body().replace('\n', "\r\n");
+
+    let lf_entries = Skills::new()
+        .add(lf_skill.clone())
+        .entries()
+        .expect("entries build");
+    let crlf_entries = Skills::new()
+        .add(Skill::new("widget-builder", crlf_body))
+        .entries()
+        .expect("entries build");
+
+    assert_eq!(
+        lf_entries[0].frontmatter(),
+        crlf_entries[0].frontmatter(),
+        "line endings must not reach the emitted frontmatter"
+    );
+    assert_eq!(
+        lf_entries[0].frontmatter()["name"],
+        "widget-builder",
+        "and the comparison above is not vacuous — the object has real keys"
+    );
+
+    // The shipped CRLF fixture parses to the same KEY SET (its values differ by
+    // design), which is what locks the CRLF path for a separately-authored file.
+    let shipped = Skills::new()
+        .add(build_widget_skill_crlf())
+        .entries()
+        .expect("entries build");
+    let key_set = |v: &serde_json::Value| {
+        let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        key_set(lf_entries[0].frontmatter()),
+        key_set(shipped[0].frontmatter())
+    );
+}
+
 // Test 3.8 — proptest construction-level byte equality under arbitrary content
 proptest! {
     #[test]
@@ -329,13 +487,15 @@ proptest! {
             let mut skill = Skill::new("propskill", body);
             for i in 0..n {
                 // try_with_reference returns Err on invalid paths (e.g. duplicates); skip those.
-                match skill.clone().try_with_reference(SkillReference::new(
+                // A rejected path leaves `skill` as it was and the loop moves
+                // on — proptest generates paths `validate_reference_path` is
+                // entitled to refuse.
+                if let Ok(s) = skill.clone().try_with_reference(SkillReference::new(
                     &ref_paths[i],
                     "text/markdown",
                     &ref_bodies[i],
                 )) {
-                    Ok(s) => skill = s,
-                    Err(_) => continue,
+                    skill = s;
                 }
             }
             let prompt = skill.as_prompt_text();
@@ -360,10 +520,12 @@ proptest! {
             );
             let handler = Skills::new().add(skill).into_handler().unwrap();
             let extra = RequestHandlerExtra::default();
+            // The retired discovery URI is deliberately absent from this
+            // list: it no longer reads, so asserting a wire shape for it
+            // would assert that an error is a well-formed resource.
             for uri in [
                 "skill://propmime/SKILL.md",
                 "skill://propmime/references/a.md",
-                "skill://index.json",
             ] {
                 let r = handler.read(uri, extra.clone()).await.unwrap();
                 match &r.contents[0] {
@@ -378,4 +540,916 @@ proptest! {
             Ok::<(), proptest::test_runner::TestCaseError>(())
         })?;
     }
+}
+
+// ── Phase 126 plan 01 (SC-4, in-process half) ─────────────────────────
+//
+// A `SequentialWorkflow` projects to a `Skill`, registers through the real
+// `Skills::into_handler()` choke point, and reads back byte-identical from the
+// real `ResourceHandler`. This is SC-4's in-process half; the wire half lives
+// in `tests/skills_routing.rs`.
+//
+// These tests live HERE rather than in a new `tests/skills_projection.rs`
+// because a new integration file is invisible to all four `make test-skills`
+// selectors and would need a fifth Makefile selector to run at all.
+
+use pmcp::server::workflow::{SequentialWorkflow, ToolHandle, WorkflowStep};
+
+fn tracer_workflow(description: &str) -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", description)
+        .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+}
+
+/// Register `skill` through the real `Skills::into_handler()` choke point and
+/// read `uri` back, returning `extract_resource`'s `(uri, text, mime)` triple.
+///
+/// `uri` is passed in rather than derived from `skill.name()` on purpose: the
+/// literal stays at the call site, so the read still PINS the slug instead of
+/// echoing back whatever the projection happened to produce.
+///
+/// `register_expect` is a parameter because `into_handler()` returning `Ok` is
+/// the load-bearing half for one of the two callers — it proves the skill did
+/// not take the diagnostic-downgrade path that silently skips the SC-1
+/// name-identity check — and a generic message would lose that.
+async fn read_projected_skill_md(
+    skill: &Skill,
+    uri: &str,
+    register_expect: &str,
+) -> (String, String, String) {
+    let handler = Skills::new()
+        .add(skill.clone())
+        .into_handler()
+        .unwrap_or_else(|error| panic!("{register_expect}: {error}"));
+
+    let result = handler
+        .read(uri, RequestHandlerExtra::default())
+        .await
+        .expect("the projected skill's SKILL.md must read");
+
+    extract_resource(&result.contents)
+}
+
+#[tokio::test]
+async fn projected_workflow_skill_reads_back_byte_identical() {
+    let skill = tracer_workflow("Process a refund").as_skill();
+
+    // Anti-vacuity: a projection that rendered nothing would otherwise make
+    // the byte-identity assertion below trivially true.
+    assert!(
+        skill.body().len() > 120,
+        "projected body was only {} bytes",
+        skill.body().len()
+    );
+    assert!(
+        skill.body().starts_with("---\nname: \"refund-flow\"\n"),
+        "projected body began: {:?}",
+        &skill.body()[..skill.body().len().min(60)]
+    );
+
+    let (uri, text, mime) = read_projected_skill_md(
+        &skill,
+        "skill://refund-flow/SKILL.md",
+        "a projected skill must register cleanly",
+    )
+    .await;
+
+    assert_eq!(uri, "skill://refund-flow/SKILL.md");
+    assert_eq!(mime, "text/markdown");
+    assert_eq!(
+        text,
+        skill.body(),
+        "the served bytes must equal the projected body exactly"
+    );
+}
+
+/// The same proof for a description that would break a RAW frontmatter
+/// concatenation (REVIEWS finding 1): it carries a `: ` mapping indicator AND
+/// a `#` comment indicator. `into_handler()` returning `Ok` is the load-bearing
+/// half — it proves the skill did NOT take the diagnostic-downgrade path that
+/// silently skips the SC-1 name-identity check.
+#[tokio::test]
+async fn projected_skill_with_an_awkward_description_still_registers_and_reads() {
+    let workflow = tracer_workflow("Refund an order: fast path #urgent");
+    let skill = workflow.as_skill();
+
+    assert_eq!(skill.name(), "refund-flow");
+    assert_eq!(skill.resolved_description(), workflow.description());
+
+    let (_uri, text, _mime) = read_projected_skill_md(
+        &skill,
+        "skill://refund-flow/SKILL.md",
+        "an awkward description must not fail registration",
+    )
+    .await;
+    assert_eq!(text, skill.body());
+
+    // The registry's own name-identity validation runs inside `entries()`;
+    // reaching it at all requires the frontmatter to have PARSED.
+    let entries = Skills::new()
+        .add(skill)
+        .entries()
+        .expect("entries must build for a projected skill");
+    assert_eq!(entries.len(), 1);
+}
+
+// ── Phase 126 plan 05 (D-04a): the projected-skill prepend ────────────
+//
+// These tests live HERE, and NOT in `prompt_handler.rs`'s `mod tests`, for a
+// measured reason: that module path matches no `make test-skills` selector, and
+// the tests would be `#[cfg(feature = "skills")]`-conditional so no
+// `--features "full"` leg reaches them either. They would pass locally and be
+// invisible to the entire quality gate. `tests/workflow_prompt_e2e_test.rs` is
+// wrong for the same class of reason — its `#![cfg]` header is
+// `streamable-http`-gated and socket-based, not skills-gated.
+//
+// The harness is the in-process one from `prompt_handler.rs`'s own tests,
+// copied rather than referenced: `SimpleTool` -> `metadata()` ->
+// `workflow::conversion::ToolInfo` -> `tools` / `tool_handlers` maps ->
+// `WorkflowPromptHandler::new(..)` -> `handler.handle(args, extra).await`.
+// `Server::handle_request` is private, so the trait method is the only
+// in-process route (CONVENTIONS.md:102-106).
+
+use async_trait::async_trait;
+use pmcp::server::tasks::TaskRouter;
+use pmcp::server::workflow::conversion::ToolInfo as WorkflowToolInfo;
+use pmcp::server::workflow::{TaskWorkflowPromptHandler, WorkflowPromptHandler};
+use pmcp::types::{PromptMessage, Role};
+use pmcp::{PromptHandler, SimpleTool, ToolHandler};
+use serde_json::Value;
+
+/// One definition of a fixture tool.
+///
+/// The two tools below were built THREE times — in [`prepend_registry`], in
+/// [`core_builder_first_prompt_message`] and in [`with_fixture_tools`] — with
+/// identical closures, descriptions and schemas. The descriptions in particular
+/// are asserted elsewhere in this file (the assistant plan renders
+/// `1. orders_get - Fetch an order`), so those literals used to live in three
+/// hand-synced places.
+///
+/// The closure clones `result` per call rather than moving it, because
+/// `SimpleTool` needs `Fn`, not `FnOnce`.
+fn fixture_tool(name: &str, description: &str, result: Value) -> impl ToolHandler + 'static {
+    SimpleTool::new(name.to_string(), move |_args, _extra| {
+        let result = result.clone();
+        Box::pin(async move { Ok(result) })
+    })
+    .with_description(description.to_string())
+    .with_schema(serde_json::json!({"type": "object"}))
+}
+
+/// Step 1's tool. Its description is rendered into the assistant plan.
+fn orders_get_tool() -> impl ToolHandler + 'static {
+    fixture_tool(
+        "orders_get",
+        "Fetch an order",
+        serde_json::json!({"order": {"id": "ord-42"}}),
+    )
+}
+
+/// Step 2's tool. Its description is rendered into the assistant plan.
+fn refunds_create_tool() -> impl ToolHandler + 'static {
+    fixture_tool(
+        "refunds_create",
+        "Create a refund",
+        serde_json::json!({"refund": {"id": "rf-1"}}),
+    )
+}
+
+/// Two tool steps, so the suppressed assistant-plan message has a step list
+/// worth suppressing and the projected `## Procedure` has something to
+/// duplicate.
+fn prepend_workflow() -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", "process a refund")
+        .argument("order_id", "Order identifier", true)
+        .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")).bind("order"))
+        .step(WorkflowStep::new("issue_refund", ToolHandle::new("refunds_create")).bind("refund"))
+}
+
+fn prepend_args() -> HashMap<String, String> {
+    let mut args = HashMap::new();
+    args.insert("order_id".to_string(), "ord-42".to_string());
+    args
+}
+
+fn register_tool<T: ToolHandler + 'static>(
+    tools: &mut HashMap<Arc<str>, WorkflowToolInfo>,
+    handlers: &mut HashMap<Arc<str>, Arc<dyn ToolHandler>>,
+    tool: T,
+) {
+    let metadata = tool.metadata().expect("SimpleTool always reports metadata");
+    let name: Arc<str> = Arc::from(metadata.name.as_str());
+    tools.insert(
+        Arc::clone(&name),
+        WorkflowToolInfo {
+            name: metadata.name.clone(),
+            description: metadata.description.clone().unwrap_or_default(),
+            input_schema: metadata.input_schema.clone(),
+        },
+    );
+    handlers.insert(name, Arc::new(tool));
+}
+
+// Why: the pair below IS the registry shape `WorkflowPromptHandler::new` takes
+// (its second and third parameters), so naming it through an alias would put a
+// second spelling of that signature in a test file. `make lint-skills` denies
+// `clippy::all`, which this lint belongs to, hence the explicit allow.
+#[allow(clippy::type_complexity)]
+fn prepend_registry() -> (
+    HashMap<Arc<str>, WorkflowToolInfo>,
+    HashMap<Arc<str>, Arc<dyn ToolHandler>>,
+) {
+    let mut tools = HashMap::new();
+    let mut handlers: HashMap<Arc<str>, Arc<dyn ToolHandler>> = HashMap::new();
+
+    register_tool(&mut tools, &mut handlers, orders_get_tool());
+    register_tool(&mut tools, &mut handlers, refunds_create_tool());
+
+    (tools, handlers)
+}
+
+/// The opt-in left at its DEFAULT — the setter is never called. This is the
+/// shape every server registered before D-04a has, and its transcript is the
+/// byte-identity baseline.
+fn handler_default() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+}
+
+/// The opt-in explicitly OFF. Must be indistinguishable from the default.
+fn handler_prepend_off() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+        .with_projected_skill_prepend(false)
+}
+
+/// The opt-in explicitly ON.
+fn handler_prepend_on() -> WorkflowPromptHandler {
+    let (tools, handlers) = prepend_registry();
+    WorkflowPromptHandler::new(prepend_workflow(), tools, handlers, None)
+        .with_projected_skill_prepend(true)
+}
+
+fn message_text(message: &PromptMessage) -> &str {
+    match &message.content {
+        Content::Text { text } => text.as_str(),
+        other => panic!("expected Content::Text in a transcript, got {other:?}"),
+    }
+}
+
+async fn run(handler: &dyn PromptHandler) -> pmcp::types::GetPromptResult {
+    handler
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect("the fixture workflow must execute cleanly")
+}
+
+/// D-04's unchanged-execution property. Asserts ROLE and TEXT for every
+/// message, never the count alone — a count-only assertion cannot tell a
+/// suppressed assistant plan from a dropped guidance message.
+#[tokio::test]
+async fn flag_off_transcript_is_unchanged() {
+    let result = run(&handler_default()).await;
+    let messages = &result.messages;
+
+    // Anti-vacuity: an empty transcript would satisfy any per-message loop.
+    assert!(
+        messages.len() >= 2,
+        "flag-off transcript collapsed to {} message(s)",
+        messages.len()
+    );
+    assert_eq!(
+        messages.len(),
+        6,
+        "expected intent + plan + (announce, result) x 2"
+    );
+
+    // [0] user intent — carries the caller's actual argument VALUES.
+    assert_eq!(messages[0].role, Role::User);
+    let intent = message_text(&messages[0]);
+    assert!(
+        intent.starts_with("I want to process a refund."),
+        "intent began: {intent:?}"
+    );
+    assert!(intent.contains("Parameters:"), "intent was: {intent:?}");
+    assert!(
+        intent.contains("order_id: \"ord-42\""),
+        "intent was: {intent:?}"
+    );
+
+    // [1] assistant plan — the step-and-tool list D-04a suppresses when ON.
+    assert_eq!(messages[1].role, Role::Assistant);
+    let plan = message_text(&messages[1]);
+    assert!(plan.starts_with("Here's my plan:\n"), "plan was: {plan:?}");
+    assert!(
+        plan.contains("1. orders_get - Fetch an order"),
+        "plan was: {plan:?}"
+    );
+    assert!(
+        plan.contains("2. refunds_create - Create a refund"),
+        "plan was: {plan:?}"
+    );
+
+    // [2..] tool-call announcement / tool result pairs, unchanged.
+    assert_eq!(messages[2].role, Role::Assistant);
+    assert!(message_text(&messages[2]).contains("Calling tool 'orders_get'"));
+    assert_eq!(messages[3].role, Role::User);
+    assert!(message_text(&messages[3]).contains("Tool result"));
+    assert_eq!(messages[4].role, Role::Assistant);
+    assert!(message_text(&messages[4]).contains("Calling tool 'refunds_create'"));
+    assert_eq!(messages[5].role, Role::User);
+    assert!(message_text(&messages[5]).contains("Tool result"));
+
+    // An explicit `false` must be indistinguishable from never calling the
+    // setter at all — the opt-in's default is off, not merely usually off.
+    let explicit_off = run(&handler_prepend_off()).await;
+    assert_eq!(explicit_off.messages.len(), messages.len());
+    for (a, b) in explicit_off.messages.iter().zip(messages.iter()) {
+        assert_eq!(a.role, b.role);
+        assert_eq!(message_text(a), message_text(b));
+    }
+}
+
+/// D-04a / D-05: message [0] IS the projected body, byte for byte.
+#[tokio::test]
+async fn flag_on_message_zero_is_the_skill_body() {
+    let body = prepend_workflow().as_skill().body().to_string();
+
+    // Anti-vacuity: an empty body would make the equality below trivial.
+    assert!(
+        body.len() > 200,
+        "projected body was only {} bytes",
+        body.len()
+    );
+
+    let result = run(&handler_prepend_on()).await;
+    assert_eq!(result.messages[0].role, Role::User);
+    assert_eq!(message_text(&result.messages[0]), body);
+}
+
+/// D-04a's rejected option (c) was NOT taken: `create_user_intent` survives at
+/// [1], because its `Parameters:` block is the only place the caller's actual
+/// argument VALUES appear. The projected body carries argument SPECS.
+#[tokio::test]
+async fn flag_on_keeps_user_intent_at_index_one() {
+    let result = run(&handler_prepend_on()).await;
+
+    assert_eq!(result.messages[1].role, Role::User);
+    let intent = message_text(&result.messages[1]);
+    assert!(
+        intent.starts_with("I want to process a refund."),
+        "intent began: {intent:?}"
+    );
+    assert!(intent.contains("Parameters:"), "intent was: {intent:?}");
+    assert!(
+        intent.contains("order_id: \"ord-42\""),
+        "intent was: {intent:?}"
+    );
+
+    // The distinction that makes suppressing [1] information-destroying: the
+    // runtime VALUE appears in the intent and nowhere in the body.
+    let body = message_text(&result.messages[0]);
+    assert!(
+        !body.contains("ord-42"),
+        "the projected body must carry argument SPECS, not runtime VALUES"
+    );
+    assert!(
+        body.contains("order_id"),
+        "the projected body must name the argument"
+    );
+}
+
+/// The assistant-plan MESSAGE is gone with the flag on, and the transcript is
+/// exactly as long as the flag-off one (one message added, one removed).
+#[tokio::test]
+async fn flag_on_suppresses_assistant_plan() {
+    let off = run(&handler_default()).await;
+    let on = run(&handler_prepend_on()).await;
+
+    let plan_text = message_text(&off.messages[1]).to_string();
+    assert!(plan_text.starts_with("Here's my plan:\n"));
+
+    assert!(
+        on.messages
+            .iter()
+            .all(|m| message_text(m) != plan_text.as_str()),
+        "the assistant-plan message survived with the flag on"
+    );
+    assert_eq!(
+        on.messages.len(),
+        off.messages.len(),
+        "one message prepended, one suppressed"
+    );
+}
+
+/// Stub router whose ONLY job is to put `TaskWorkflowPromptHandler::handle` on
+/// its INDEPENDENT branch. Every real `TaskRouter` impl in this tree is private
+/// to a test module, so none is reachable from here.
+struct PrependTestTaskRouter;
+
+#[async_trait]
+impl TaskRouter for PrependTestTaskRouter {
+    async fn handle_task_call(
+        &self,
+        _tool_name: &str,
+        _arguments: Value,
+        _task_params: Value,
+        _owner_id: &str,
+        _progress_token: Option<Value>,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_get(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_result(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_list(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    async fn handle_tasks_cancel(
+        &self,
+        _params: Value,
+        _owner_id: &str,
+    ) -> pmcp::error::Result<Value> {
+        Err(pmcp::Error::internal("unused by this test"))
+    }
+
+    fn resolve_owner(
+        &self,
+        _subject: Option<&str>,
+        _client_id: Option<&str>,
+        _session_id: Option<&str>,
+    ) -> String {
+        "prepend-test-owner".to_string()
+    }
+
+    fn tool_requires_task(&self, _tool_name: &str, _tool_execution: Option<&Value>) -> bool {
+        false
+    }
+
+    fn task_capabilities(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    /// The one method that must SUCCEED. Its return shape is exactly what the
+    /// task-id extractor reads.
+    async fn create_workflow_task(
+        &self,
+        _workflow_name: &str,
+        _owner_id: &str,
+        _progress: Value,
+    ) -> pmcp::error::Result<Value> {
+        Ok(serde_json::json!({"task": {"taskId": "task-prepend-test-1"}}))
+    }
+}
+
+/// RESEARCH Pitfall 6: a prepend added to only one of the two prompt handlers
+/// would make `has_task_support(true)` workflows behave differently from plain
+/// ones — the exact drift this projection exists to prevent.
+///
+/// Branch selection, quoted from `task_prompt_handler.rs`: `handle` calls
+/// `create_workflow_task`, extracts `value["task"]["taskId"].as_str()`, and if
+/// that yields `None` it runs
+/// `let Some(task_id) = task_id else { return self.inner.handle(args, extra).await }`
+/// and DELEGATES. The stub above makes the extraction succeed, so the
+/// independent branch runs. The `_meta` assertion below is the proof: only the
+/// independent branch enriches its result with `_meta` (step 7 of `handle`);
+/// the delegating branch returns the inner result unchanged and carries none.
+#[tokio::test]
+async fn both_handlers_produce_the_same_message_zero() {
+    let plain = run(&handler_prepend_on()).await;
+
+    let task_handler = TaskWorkflowPromptHandler::new(
+        handler_prepend_on(),
+        Arc::new(PrependTestTaskRouter) as Arc<dyn TaskRouter>,
+        prepend_workflow(),
+    );
+    let tasked = run(&task_handler).await;
+
+    let meta = tasked._meta.as_ref().expect(
+        "no _meta: the task handler took the DELEGATING branch, so this test proved nothing",
+    );
+    assert_eq!(
+        meta.get("task_id").and_then(Value::as_str),
+        Some("task-prepend-test-1"),
+        "_meta did not carry the stub's minted task id"
+    );
+    assert!(
+        meta.contains_key("steps"),
+        "_meta must carry the independent branch's step plan"
+    );
+
+    assert_eq!(
+        message_text(&tasked.messages[0]),
+        message_text(&plain.messages[0]),
+        "the two handlers disagreed on message [0]"
+    );
+    assert_eq!(tasked.messages[0].role, plain.messages[0].role);
+}
+
+/// D-05's one-string claim, proven across BOTH surfaces in one test: the bytes
+/// served at `skill://{slug}/SKILL.md` through the real `ResourceHandler` are
+/// the bytes the prompt transcript opens with.
+#[tokio::test]
+async fn prepended_body_equals_served_skill_bytes() {
+    let skill = prepend_workflow().as_skill();
+    let uri = format!("skill://{}/SKILL.md", skill.name());
+
+    let resource_handler = Skills::new()
+        .add(skill)
+        .into_handler()
+        .expect("a projected skill must register cleanly");
+    let read = resource_handler
+        .read(&uri, RequestHandlerExtra::default())
+        .await
+        .expect("the projected skill's SKILL.md must read");
+    let (read_uri, served, mime) = extract_resource(&read.contents);
+    assert_eq!(read_uri, uri);
+    assert_eq!(mime, "text/markdown");
+    assert!(served.len() > 200, "served body was {} bytes", served.len());
+
+    let transcript = run(&handler_prepend_on()).await;
+    assert_eq!(message_text(&transcript.messages[0]), served);
+}
+
+/// REVIEWS fable (a): enabling the flag must not delete the unregistered-tool
+/// validation. `create_assistant_plan()` is where that error is raised, so the
+/// CALL is kept and only its message is suppressed. Both flag states must
+/// therefore fail identically.
+#[tokio::test]
+async fn flag_on_still_rejects_an_unregistered_tool() {
+    // Empty registry: every step names a tool absent from `tools`.
+    let on = WorkflowPromptHandler::new(prepend_workflow(), HashMap::new(), HashMap::new(), None)
+        .with_projected_skill_prepend(true);
+    let err_on = on
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect_err("flag ON must still reject an unregistered tool");
+    assert!(
+        err_on.to_string().contains("not found in registry"),
+        "flag-ON error was: {err_on}"
+    );
+
+    let off = WorkflowPromptHandler::new(prepend_workflow(), HashMap::new(), HashMap::new(), None);
+    let err_off = off
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect_err("flag OFF must reject an unregistered tool");
+    assert!(
+        err_off.to_string().contains("not found in registry"),
+        "flag-OFF error was: {err_off}"
+    );
+
+    assert_eq!(
+        err_on.to_string(),
+        err_off.to_string(),
+        "the two flag states must fail identically"
+    );
+}
+
+// ── Phase 126 plan 05 Task 4 (GATE B = `add-builder-path`) ────────────
+//
+// REVIEWS finding 2: an opt-in reachable only by hand-constructing a
+// `WorkflowPromptHandler` makes the anti-drift claim true per workflow VALUE
+// and false per SERVER. These two tests are the difference between the claim
+// being proven and merely asserted: one reaches message [0] through the NORMAL
+// registration API, the other proves the default is still off.
+
+/// Drive a `ServerCoreBuilder`-built core to a `prompts/get` and return the
+/// first message's text.
+///
+/// `ServerCore` exposes no prompt accessor — its only ingress is
+/// `ProtocolHandler::handle_request` — and a v1 core gates every non-`initialize`
+/// request behind the handshake, so the handshake runs first.
+async fn core_builder_first_prompt_message(prepend: bool) -> String {
+    use pmcp::server::core::ProtocolHandler;
+    use pmcp::types::jsonrpc::ResponsePayload;
+    use pmcp::types::{ClientRequest, Request, RequestId};
+
+    let mut builder = pmcp::server::builder::ServerCoreBuilder::new()
+        .name("prepend-core-fixture")
+        .version("1.0.0")
+        // Tools must be registered BEFORE `prompt_workflow`, which snapshots the
+        // tool registry at registration time; without them
+        // `create_assistant_plan()?` fails and no transcript is produced at all.
+        .tool("orders_get", orders_get_tool())
+        .tool("refunds_create", refunds_create_tool());
+
+    if prepend {
+        // Ordering is load-bearing and documented on the setter: it applies to
+        // workflows registered AFTER this call.
+        builder = builder.with_workflow_skill_prepend(true);
+    }
+
+    let core = builder
+        .prompt_workflow(prepend_workflow())
+        .expect("the fixture workflow validates")
+        .build()
+        .expect("the core builds");
+    let core: Arc<dyn ProtocolHandler> = Arc::new(core);
+
+    let init: ClientRequest = serde_json::from_value(serde_json::json!({
+        "method": "initialize",
+        "params": {
+            "protocolVersion": pmcp::LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "prepend-fixture", "version": "0.0.0" },
+        },
+    }))
+    .expect("initialize deserializes into ClientRequest");
+    let handshake = core
+        .handle_request(RequestId::from(0i64), Request::Client(Box::new(init)), None)
+        .await;
+    assert!(
+        matches!(handshake.payload, ResponsePayload::Result(_)),
+        "the handshake must succeed before the prompts/get below means anything"
+    );
+
+    let get: ClientRequest = serde_json::from_value(serde_json::json!({
+        "method": "prompts/get",
+        "params": { "name": "refund_flow", "arguments": { "order_id": "ord-42" } },
+    }))
+    .expect("prompts/get deserializes into ClientRequest");
+    let response = core
+        .handle_request(RequestId::from(1i64), Request::Client(Box::new(get)), None)
+        .await;
+    let ResponsePayload::Result(result) = response.payload else {
+        panic!("a ServerCoreBuilder core answers prompts/get, got {response:?}");
+    };
+
+    result["messages"][0]["content"]["text"]
+        .as_str()
+        .expect("message [0] carries text")
+        .to_string()
+}
+
+/// GATE B, `ServerCoreBuilder` half: the prepend is reachable from
+/// `prompt_workflow`, so the anti-drift guarantee holds per SERVER.
+#[tokio::test]
+async fn server_core_builder_prompt_workflow_reaches_the_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    assert!(body.len() > 200, "projected body was {} bytes", body.len());
+
+    assert_eq!(core_builder_first_prompt_message(true).await, body);
+}
+
+/// ...and the default is OFF, so an existing server's transcript does not move.
+#[tokio::test]
+async fn server_core_builder_prompt_workflow_defaults_to_no_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    let first = core_builder_first_prompt_message(false).await;
+
+    assert_ne!(first, body, "the prepend must not be default-on");
+    assert!(
+        first.starts_with("I want to process a refund."),
+        "message [0] must still be the user intent, got: {first:?}"
+    );
+}
+
+/// Register the two fixture tools on a `ServerBuilder`. `prompt_workflow`
+/// snapshots the tool registry at registration time, so this must run BEFORE it
+/// or `create_assistant_plan()?` fails and no transcript is produced at all.
+fn with_fixture_tools(builder: pmcp::ServerBuilder) -> pmcp::ServerBuilder {
+    builder
+        .tool("orders_get", orders_get_tool())
+        .tool("refunds_create", refunds_create_tool())
+}
+
+/// Drive a `ServerBuilder`-built server to its workflow prompt and return the
+/// first message's text.
+///
+/// The `ServerCoreBuilder` twin above is [`core_builder_first_prompt_message`];
+/// this is the same shape, so the two halves of GATE B read as one pair of
+/// experiments rather than one factored test and one inlined one. This builder
+/// has no task wrap and `Server::get_prompt` hands back the registered handler
+/// directly, so no request/response round trip is needed here.
+///
+/// The OFF case omits the setter entirely, so what it measures is the DEFAULT
+/// rather than an explicit `false`.
+async fn server_builder_first_prompt_message(prepend: bool) -> String {
+    let builder = with_fixture_tools(
+        pmcp::Server::builder()
+            .name("prepend-server-fixture")
+            .version("1.0.0"),
+    );
+    let builder = if prepend {
+        builder.with_workflow_skill_prepend(true)
+    } else {
+        builder
+    };
+
+    let server = builder
+        .prompt_workflow(prepend_workflow())
+        .expect("the fixture workflow validates")
+        .build()
+        .expect("the server builds");
+    let result = server
+        .get_prompt("refund_flow")
+        .expect("prompt_workflow registered the handler")
+        .handle(prepend_args(), RequestHandlerExtra::default())
+        .await
+        .expect("the workflow prompt resolves");
+
+    message_text(&result.messages[0]).to_string()
+}
+
+/// GATE B, `ServerBuilder` half: the prepend is reachable from
+/// `prompt_workflow`, so the anti-drift guarantee holds per SERVER.
+#[tokio::test]
+async fn server_builder_prompt_workflow_reaches_the_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    assert!(body.len() > 200, "projected body was {} bytes", body.len());
+
+    assert_eq!(server_builder_first_prompt_message(true).await, body);
+}
+
+/// ...and the default is OFF, so an existing server's transcript does not move.
+#[tokio::test]
+async fn server_builder_prompt_workflow_defaults_to_no_prepend() {
+    let body = prepend_workflow().as_skill().body().to_string();
+    let first = server_builder_first_prompt_message(false).await;
+
+    assert_ne!(first, body, "the prepend must not be default-on");
+    assert!(
+        first.starts_with("I want to process a refund."),
+        "message [0] must still be the user intent, got: {first:?}"
+    );
+}
+
+// ── Phase 126 plan 06 (D-14, SC-2 golden half) ────────────────────────
+//
+// `tests/golden/workflow_skill_projection.md` holds the exact rendered bytes
+// of the fixture below. The SC-2 property tests in
+// `src/server/skills/projection.rs` prove the renderer is PURE — the same
+// workflow always renders the same bytes. The golden proves something the
+// property tests structurally cannot: that those bytes have not MOVED since
+// they were recorded.
+//
+// That distinction matters because the body is hashed into the `sha256` digest
+// published in the skill's `skills/list` entry. A consumer that pinned the
+// digest treats a mismatch as a fatal pre-loop revocation, not a warning
+// (spike 010), so a silent render change is a supply-chain event.
+//
+// The mechanism is `include_str!`, deliberately NOT `insta`: `insta` is a
+// dev-dependency used nowhere else in this tree and `cargo insta review` has no
+// story in this repo's quality gate. `include_str!` also registers a cargo
+// rebuild dependency on the golden, so editing the file re-runs this test —
+// which is exactly the D-14 tripwire behaviour.
+
+use pmcp::server::workflow::{DataSource, InternalPromptMessage};
+use pmcp::types::PromptArgumentType;
+use serde_json::json;
+
+/// The exact bytes `golden_workflow().as_skill().body()` must render.
+///
+/// `include_str!` rather than a runtime read: the path is resolved at compile
+/// time relative to THIS file, so the test cannot pass by silently reading a
+/// stale or absent file, and cargo rebuilds the test binary when the golden
+/// changes.
+const GOLDEN: &str = include_str!("golden/workflow_skill_projection.md");
+
+/// The D-14 golden fixture — a workflow exercising the whole D-11 render
+/// universe in one value.
+///
+/// Every element here is load-bearing for what the golden can catch:
+///
+/// - `refund_flow` requires slugification, so the frontmatter `name` pins
+///   `slugify`'s output rather than an already-legal passthrough.
+/// - The description carries a `: ` mapping indicator AND a `#` comment
+///   indicator, so the pinned `description:` line is a NON-TRIVIAL
+///   `yaml_double_quoted` output. A golden whose description were a plain word
+///   would stay green through a regression that dropped the escaping entirely.
+/// - One workflow-level instruction pins `## Context`, which is the only place
+///   `SequentialWorkflow::instruction()` becomes observable on any surface.
+/// - One typed required argument and one untyped optional argument pin both
+///   `## Inputs` bullet shapes and the lowercase wire spelling of the type hint.
+/// - Step 1 pins two argument bindings, a `Constant` source (whose key order is
+///   digest-significant under `serde_json`'s `preserve_order`) and a result
+///   binding.
+/// - Step 2 pins guidance, a `StepOutput` source, and two template bindings
+///   inserted in an order that SORTS DIFFERENTLY (`zeta_total` before
+///   `alpha_reason`) — without them the golden could not catch a regression
+///   from `render_step`'s `BTreeMap` back to raw `HashMap` iteration.
+/// - Step 3 pins the resource-only step shape and an attached resource.
+fn golden_workflow() -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", "Process a customer refund: policy #7")
+        .instruction(InternalPromptMessage::system(
+            "Refunds above the policy ceiling need a supervisor's approval.",
+        ))
+        .typed_argument(
+            "order_id",
+            "The order to refund",
+            true,
+            PromptArgumentType::String,
+        )
+        .argument("reason", "Why the customer asked for the refund", false)
+        .step(
+            WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                .arg("id", DataSource::prompt_arg("order_id"))
+                .arg(
+                    "options",
+                    DataSource::constant(json!({ "zeta": 1, "alpha": 2 })),
+                )
+                .bind("order"),
+        )
+        .step(
+            WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                .arg("order", DataSource::from_step_field("order", "id"))
+                .with_template_binding("zeta_total", DataSource::from_step_field("order", "total"))
+                .with_template_binding("alpha_reason", DataSource::prompt_arg("reason"))
+                .with_guidance("Confirm the customer accepted the policy before issuing."),
+        )
+        .step(
+            WorkflowStep::fetch_resources("read_policy")
+                .with_resource("file:///policies/refunds.md")
+                .expect("a literal resource URI carries no template variables"),
+        )
+}
+
+/// The text the golden byte-comparison fails with.
+///
+/// Factored out into a named `fn` rather than inlined for the same reason
+/// `wire_break_message` is in `tests/embedded_resource_golden.rs`: this is the
+/// string a reviewer greps for when asking "what is a maintainer told to do
+/// when this goes red?", and an inline literal buried in an `assert_eq!` is not
+/// greppable as a policy.
+///
+/// It states the ONE thing a maintainer must not do. A red golden has exactly
+/// two causes and they need opposite fixes, so re-recording the file from the
+/// current output resolves the symptom without deciding which cause it was.
+fn golden_break_message(rendered: &str) -> String {
+    format!(
+        "D-14: the projected SKILL.md bytes no longer match the golden at \
+         tests/golden/workflow_skill_projection.md. This has exactly two causes and \
+         they need OPPOSITE fixes. (1) The render changed on purpose: update \
+         tests/golden/workflow_skill_projection.md AND add a CHANGELOG entry, because \
+         these bytes are hashed into the sha256 digest published in the skill's \
+         skills/list entry and every consumer that pinned that digest must re-pin — \
+         a digest mismatch is a fatal pre-loop revocation for them, not a warning. \
+         (2) The render REGRESSED: fix the renderer, not the golden. Do NOT re-record \
+         the golden from the current output to turn this test green without first \
+         deciding which of the two it is. Rendered body was: {rendered:?}"
+    )
+}
+
+/// D-14 / SC-2 (golden half): the projected body is byte-equal to the recorded
+/// golden.
+#[test]
+fn golden_render_is_byte_equal() {
+    // Anti-vacuity FIRST: two empty strings are also byte-equal, so an empty or
+    // truncated golden would otherwise pass by matching an empty render.
+    assert!(
+        GOLDEN.len() > 400,
+        "the golden is only {} bytes — it cannot be the full render",
+        GOLDEN.len()
+    );
+    assert!(
+        GOLDEN.starts_with("---\nname: \"refund-flow\"\n"),
+        "the golden does not begin with the encoded frontmatter name; first 60 bytes: {:?}",
+        &GOLDEN[..GOLDEN.len().min(60)]
+    );
+    // Pins the ESCAPED form specifically. A regression to raw `key: ` + author
+    // text would still produce a plausible-looking `description:` line, so
+    // checking only that SOME description line exists would not catch it.
+    assert!(
+        GOLDEN.contains("description: \"Process a customer refund: policy #7\"\n"),
+        "the golden does not pin the yaml_double_quoted description line"
+    );
+    assert!(
+        GOLDEN.ends_with('\n') && !GOLDEN.ends_with("\n\n"),
+        "the golden must end in exactly one newline (SC-5 depends on it)"
+    );
+    // The two template bindings are inserted zeta-first and must render
+    // alpha-first: this is what makes the golden able to catch a regression
+    // from `render_step`'s BTreeMap back to raw HashMap iteration.
+    let alpha = GOLDEN
+        .find("Template variable `alpha_reason`")
+        .expect("the golden must pin both template bindings");
+    let zeta = GOLDEN
+        .find("Template variable `zeta_total`")
+        .expect("the golden must pin both template bindings");
+    assert!(
+        alpha < zeta,
+        "template bindings must render in sorted, not insertion, order"
+    );
+
+    let rendered = golden_workflow().as_skill().body().to_string();
+    assert_eq!(rendered, GOLDEN, "{}", golden_break_message(&rendered));
 }

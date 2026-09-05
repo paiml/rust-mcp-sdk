@@ -475,6 +475,30 @@ pub struct Server {
     uri_to_tool_meta: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     prompts: HashMap<String, Arc<dyn PromptHandler>>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// The SEP-2640 `skills/list` entry set, keyed by SKILL.md URI in
+    /// REGISTRATION order (Phase 125, D-01/D-11).
+    ///
+    /// Carried as its OWN field, never reached by downcasting
+    /// [`resources`](Self::resources): the builder wraps the skills handler in
+    /// `ComposedResources` whenever the author also called `.resources(...)`, so
+    /// a downcast would silently report "no skills" for exactly the servers that
+    /// registered the most. Populated at build time from the single
+    /// `finalize_skills_resources` call, which is also where `ServerCoreBuilder`
+    /// gets its handler — one source, two build paths.
+    ///
+    /// An `IndexMap` rather than a `Vec` because plan 125-02's `skills/get`
+    /// resolves a URI to one entry, and the map keeps registration order for the
+    /// list projection at the same time.
+    ///
+    /// Stored ALREADY SERIALIZED. The entries are immutable after `build()`, so
+    /// projecting them to JSON is build-time work; doing it per request made a
+    /// single-URI `skills/get` cost one `serde_json::to_value` per registered
+    /// skill — and both transport call sites run that under the process-wide
+    /// `state.server` mutex, so the cost landed on every concurrent request too.
+    /// Serializing once here also keeps the `feature = "skills"` boundary in the
+    /// one place that already spells it.
+    #[cfg(feature = "skills")]
+    skill_entries: Arc<indexmap::IndexMap<String, Value>>,
     /// Completion provider backing `completion/complete` (Phase 118.1-04,
     /// CONF-05). Mirrors `ServerCore`'s field of the same name so BOTH native
     /// dispatchers consult the same registered seam through the same shared
@@ -1670,6 +1694,159 @@ impl Server {
                 &self.capabilities,
                 self.supported_protocol_versions(),
             ),
+            &self.info,
+            protocol_context,
+        )
+    }
+
+    /// Handle the SEP-2640 `skills/list` request (Phase 125, D-01/D-07/D-11).
+    ///
+    /// The production `skills/list` caller, and a THIN delegate exactly like
+    /// [`handle_discover`](Self::handle_discover) beside it: the streamable-HTTP
+    /// transport classifies a `skills/list` POST as `HttpIngress::SkillsList` and,
+    /// at the per-path response-assembly step, calls this. It projects the entry
+    /// set computed once at BUILD time through the ONE shared
+    /// [`build_skills_list_response`](crate::server::core::build_skills_list_response)
+    /// free fn.
+    ///
+    /// **It defines no gate of its own.** In particular there is no era gate:
+    /// unlike `server/discover`, `skills/list` rides the base Resources primitive
+    /// and answers on 2025-11-25 as well as 2026-07-28. Only the `ttlMs` /
+    /// `cacheScope` attributes on the result are era-conditional, and that
+    /// condition lives in the shared v2 envelope, not here.
+    ///
+    /// # Why the entries are serialized here rather than passed as typed values
+    ///
+    /// `SkillEntry` exists only under `feature = "skills"`, while the classifier
+    /// that routes `skills/list` is ungated — a server built WITHOUT the feature
+    /// can still receive the method and must answer it. Handing `core.rs` an
+    /// already-serialized array keeps the shared projection feature-agnostic and
+    /// gives the featureless build the honest answer (an empty catalog) instead of
+    /// a second envelope implementation behind a `cfg`.
+    pub(crate) fn handle_skills_list(
+        &self,
+        id: RequestId,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> JSONRPCResponse {
+        if let Some(refusal) = self.skills_method_not_found(&id) {
+            return refusal;
+        }
+        crate::server::core::build_skills_list_response(
+            id,
+            self.serialized_skill_catalog(),
+            &self.info,
+            protocol_context,
+        )
+    }
+
+    /// The registered skills as one serialized, registration-ordered catalog.
+    ///
+    /// The SINGLE place `skill_entries` is read. Both `skills/*` delegates use
+    /// this, so the two methods cannot disagree about the catalog's shape or its
+    /// order, and the `feature = "skills"` boundary is spelled once instead of
+    /// once per method.
+    ///
+    /// The map is BORROWED, not rebuilt: the projection to JSON happens once at
+    /// `build()` time (see the `skill_entries` field), so a `skills/get` costs
+    /// one hash lookup rather than one `serde_json::to_value` per registered
+    /// skill. A featureless build borrows a shared empty map, which is what
+    /// gives it the honest answer on both methods — an empty listing, and every
+    /// URI a `-32602` miss — rather than a second implementation behind a `cfg`.
+    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
+    fn serialized_skill_catalog(&self) -> &indexmap::IndexMap<String, Value> {
+        #[cfg(feature = "skills")]
+        {
+            &self.skill_entries
+        }
+        #[cfg(not(feature = "skills"))]
+        {
+            static EMPTY: std::sync::OnceLock<indexmap::IndexMap<String, Value>> =
+                std::sync::OnceLock::new();
+            EMPTY.get_or_init(indexmap::IndexMap::new)
+        }
+    }
+
+    /// `Some(-32601)` when this server never DECLARED the SEP-2640 skills
+    /// extension, `None` when it did.
+    ///
+    /// Both skills methods are routed by the ungated `InternalClientRequest`
+    /// classifier, so without this gate EVERY streamable-HTTP pmcp server —
+    /// including one compiled without `feature = "skills"` and one that never
+    /// registered a skill — answered `skills/list` with `200 {"skills": []}`
+    /// where it previously answered `-32601`. A host that probes for SEP-2640
+    /// support by CALLING the method (the natural approach, since the extension
+    /// is not part of base `ServerCapabilities`) then read a false positive that
+    /// contradicted the same server's own `initialize` result.
+    ///
+    /// The gate is the capability itself, not the catalog's size: a server that
+    /// called `.skills(Skills::new())` DID declare the extension and must answer
+    /// with an empty listing, because an empty catalog that refused the method
+    /// would make that declaration a lie. This is the same shape
+    /// `assemble_subscriptions_listen` uses for `subscriptions/listen`.
+    #[allow(clippy::unused_self)] // `self` IS read under `feature = "skills"`.
+    fn skills_method_not_found(&self, id: &RequestId) -> Option<JSONRPCResponse> {
+        #[cfg(feature = "skills")]
+        let declared = self
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|e| e.contains_key(skills::SKILLS_EXTENSION_KEY));
+        // Without the feature the extension is undeclarable: every call site of
+        // `set_skills_capabilities` is a `feature = "skills"` builder method.
+        #[cfg(not(feature = "skills"))]
+        let declared = false;
+
+        if declared {
+            return None;
+        }
+        // The single-source envelope builder, rather than a hand-written
+        // `JSONRPCResponse` literal re-spelling `"2.0"` and `data: None`.
+        Some(crate::server::task_dispatch::error_response(
+            id.clone(),
+            crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+            "Method not found: this server does not declare the \
+             io.modelcontextprotocol/skills extension"
+                .to_string(),
+        ))
+    }
+
+    /// Handle the SEP-2640 `skills/get` request (Phase 125 plan 02, D-06/D-07).
+    ///
+    /// The production `skills/get` caller, and a THIN delegate exactly like
+    /// [`handle_skills_list`](Self::handle_skills_list) beside it: the
+    /// streamable-HTTP transport classifies a `skills/get` POST as
+    /// `HttpIngress::SkillsGet` and, at the per-path response-assembly step, calls
+    /// this. **It defines no gate of its own — every gate lives in the shared
+    /// projection.** In particular the `uri` is NOT read here: the params travel
+    /// raw all the way into
+    /// [`build_skills_get_response`](crate::server::core::build_skills_get_response),
+    /// which is what keeps the `-32602` behind the header and auth pipeline
+    /// (T-125-07).
+    ///
+    /// # Why the entries reach `core.rs` already serialized
+    ///
+    /// The same feature-gating reason [`handle_skills_list`](Self::handle_skills_list)
+    /// records: `SkillEntry` exists only under `feature = "skills"` while the
+    /// classifier that routes the method is ungated, so handing `core.rs` an
+    /// already-serialized map keeps the shared projection feature-agnostic and
+    /// gives a featureless build the honest answer — an empty catalog in which
+    /// every URI is a `-32602` miss — rather than a second lookup implementation
+    /// behind a `cfg`. The serialization is BUILD-time work (see the
+    /// `skill_entries` field), so a `skills/get` costs one hash lookup and one
+    /// clone of the single matched entry, not a projection of the whole catalog.
+    pub(crate) fn handle_skills_get(
+        &self,
+        id: RequestId,
+        params: &Value,
+        protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+    ) -> JSONRPCResponse {
+        if let Some(refusal) = self.skills_method_not_found(&id) {
+            return refusal;
+        }
+        crate::server::core::build_skills_get_response(
+            id,
+            self.serialized_skill_catalog(),
+            params,
             &self.info,
             protocol_context,
         )
@@ -3154,6 +3331,18 @@ pub struct ServerBuilder {
     /// `.skill(...)` / `.skills(...)` calls never produce nested wrappers.
     #[cfg(feature = "skills")]
     pending_skills: Option<skills::Skills>,
+    /// Whether workflows registered from here on get the D-04a projected-skill
+    /// prepend as prompt message `[0]`, set via
+    /// [`Self::with_workflow_skill_prepend`].
+    ///
+    /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
+    /// workflows registered after the setter and not to earlier ones. Default
+    /// `false`, so every existing server's transcript is byte-identical.
+    ///
+    /// UNGATED, though the setter that writes it is not — see the identically
+    /// named field on [`ServerCoreBuilder`](crate::server::ServerCoreBuilder)
+    /// for why.
+    prepend_projected_skill: bool,
     /// Legacy experimental task router backend (set via [`Self::with_task_store`]).
     #[cfg(not(target_arch = "wasm32"))]
     task_router: Option<Arc<dyn crate::server::tasks::TaskRouter>>,
@@ -3257,6 +3446,7 @@ impl ServerBuilder {
             icons: None,
             #[cfg(feature = "skills")]
             pending_skills: None,
+            prepend_projected_skill: false,
             #[cfg(not(target_arch = "wasm32"))]
             task_router: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -4312,6 +4502,9 @@ impl ServerBuilder {
             self.resources.clone(),
         );
 
+        // D-04a: honor the builder-level opt-in, read here at REGISTRATION time.
+        let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
+
         // Register as a prompt
         self.prompts.insert(name, Arc::new(handler));
 
@@ -4479,7 +4672,10 @@ impl ServerBuilder {
     /// # Panics
     ///
     /// Panics at `.build()` time if multiple registered skills resolve to
-    /// the same `skill://` URI. Use [`Self::try_skills`] with a pre-built
+    /// the same `skill://` URI, if a registered reference URI collides with
+    /// another skill's `SKILL.md` URI, or if a skill's frontmatter `name`
+    /// disagrees with the final segment of its URI path (the SEP-2640
+    /// name-identity rule). Use [`Self::try_skills`] with a pre-built
     /// [`skills::Skills`] registry to surface duplicates as a `Result`.
     ///
     /// # Examples
@@ -4504,6 +4700,77 @@ impl ServerBuilder {
         self.skills(skills::Skills::new().add(skill))
     }
 
+    /// Prepend the projected skill body to workflow prompts (default: **off**).
+    ///
+    /// Turns on
+    /// [`WorkflowPromptHandler::with_projected_skill_prepend`](crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend)
+    /// for every workflow this builder registers, so `prompts/get` opens with
+    /// the bytes `workflow.as_skill().body()` renders. Without this method the
+    /// opt-in is reachable only by hand-constructing a `WorkflowPromptHandler`
+    /// and registering it with `.prompt(name, handler)`, which would make the
+    /// setting true per workflow VALUE but not per SERVER.
+    ///
+    /// # It does NOT register the skill — you must do that too
+    ///
+    /// This setter touches the PROMPT surface only. It never adds anything to
+    /// the skills registry, so on a builder that does nothing else the server
+    /// hands a client a document identifying itself as `skill://{slug}/SKILL.md`
+    /// while `resources/read` on that URI fails and `skills/list` answers
+    /// `-32601` (no skill was registered, so the extension is never declared).
+    ///
+    /// For the "one string, one digest, no variant to keep in sync" property to
+    /// actually hold, register the projected skill from the SAME workflow value
+    /// in the same builder chain:
+    ///
+    /// ```text
+    /// builder
+    ///     .try_skills(Skills::new().add(workflow.as_skill()))?
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    /// ```
+    ///
+    /// Nothing enforces the pairing, so a workflow edited after only one of the
+    /// two calls desynchronizes the prompt bytes from the digest published in
+    /// `skills/list`.
+    ///
+    /// # Ordering matters
+    ///
+    /// [`Self::prompt_workflow`] reads this setting at REGISTRATION time, so it
+    /// applies to workflows registered AFTER this call and leaves earlier ones
+    /// alone. Call it before the workflows it should affect:
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// # fn main() -> Result<(), pmcp::Error> {
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    /// use pmcp::Server;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    ///
+    /// let server = Server::builder()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    ///     .build()?;
+    ///
+    /// // The workflow is registered under its OWN name, not the skill slug:
+    /// // the prompt stays `refund_flow` while the projected skill is
+    /// // `refund-flow`.
+    /// assert!(server.get_prompt("refund_flow").is_some());
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// The default is `false`, so an existing server's transcripts do not move.
+    #[cfg(feature = "skills")]
+    #[must_use]
+    pub fn with_workflow_skill_prepend(mut self, on: bool) -> Self {
+        self.prepend_projected_skill = on;
+        self
+    }
+
     /// Register a registry of SEP-2640 Agent Skills.
     ///
     /// Merges into any prior accumulated skills (a previous `.skill(...)` or
@@ -4513,8 +4780,12 @@ impl ServerBuilder {
     ///
     /// # Panics
     ///
-    /// Panics at `.build()` if two registered skills resolve to the same
-    /// `skill://` URI. Use [`Self::try_skills`] for fallible registration.
+    /// Panics at `.build()` on any condition the registry refuses: two skills
+    /// resolving to the same `skill://` URI, a reference URI colliding with
+    /// another skill's `SKILL.md` URI, or a frontmatter `name` that disagrees
+    /// with the final segment of its URI path (the SEP-2640 name-identity
+    /// rule, added in Phase 125). Use [`Self::try_skills`] for fallible
+    /// registration.
     #[cfg(feature = "skills")]
     #[must_use]
     pub fn skills(mut self, skills_registry: skills::Skills) -> Self {
@@ -4527,23 +4798,53 @@ impl ServerBuilder {
         self
     }
 
-    /// Fallible variant of [`Self::skills`] — returns `Err` immediately if
-    /// the merged registry would contain duplicate URIs. Useful for
-    /// runtime-dynamic registration where panicking is unacceptable.
+    /// Fallible variant of [`Self::skills`]. Useful for runtime-dynamic
+    /// registration where panicking is unacceptable.
+    ///
+    /// # What it checks, and what it does NOT
+    ///
+    /// Duplicate URIs are a CROSS-skill property, so they are checked over the
+    /// whole accumulated registry. Name identity is a PER-skill property and is
+    /// checked over the registry passed to THIS call only — which is what keeps
+    /// K registrations linear rather than quadratic.
+    ///
+    /// The consequence is worth stating plainly, because it is the one case
+    /// where this method does not save you from `.build()`: skills deposited by
+    /// the INFALLIBLE [`Self::skills`] / [`Self::skill`] /
+    /// [`Self::bootstrap_skill_and_prompt`] are never name-checked at
+    /// registration time, so a later `try_skills` can return `Ok` while
+    /// `.build()` still panics on one of them. Register every skill through
+    /// `try_skills` if you need the failure as a `Result`.
     ///
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` if the merged registry would
-    /// produce duplicate `skill://` URIs.
+    /// produce duplicate `skill://` URIs (including a reference URI that
+    /// collides with another skill's `SKILL.md`), or if a skill in the registry
+    /// PASSED HERE has a frontmatter `name` that disagrees with the final
+    /// segment of its URI path.
     #[cfg(feature = "skills")]
     pub fn try_skills(mut self, skills_registry: skills::Skills) -> Result<Self> {
+        // Name identity is a PER-SKILL property — see `validate_name_identity`.
+        // Validating the arriving registry before the merge is what keeps this
+        // linear in registry size across K registrations.
+        skills_registry.validate_name_identity()?;
         let merged = match self.pending_skills.take() {
             Some(prior) => prior.merge(skills_registry),
             None => skills_registry,
         };
-        // Probe by cloning + into_handler; discard the handler. The real
+        // Probe WITHOUT cloning the registry or building a handler. The real
         // construction happens in `.build()` once everything is settled.
-        merged.clone().into_handler()?;
+        //
+        // Duplicate URIs are a cross-skill property, so this must see the
+        // MERGED registry — but URIs need no YAML parse and no SHA-256, so the
+        // merged probe is cheap. Name identity is per-skill and was validated
+        // for every prior registry by the call that added it, so only the newly
+        // supplied one is parsed here (see `validate_name_identity`). Probing
+        // through `into_handler` instead meant a deep clone of the whole
+        // accumulated registry AND a full name pass over it on every call: K
+        // registrations cost K(K+1)/2 YAML parses where upstream cost none.
+        merged.validate_unique_uris()?;
         self.pending_skills = Some(merged);
         skills::set_skills_capabilities(&mut self.capabilities);
         Ok(self)
@@ -4561,7 +4862,7 @@ impl ServerBuilder {
         skill: skills::Skill,
         prompt_name: impl Into<String>,
     ) -> Self {
-        let prompt_handler = skills::SkillPromptHandler::new(skill.clone());
+        let prompt_handler = skills::SkillPromptHandler::new(&skill);
         self.skill(skill).prompt(prompt_name, prompt_handler)
     }
 
@@ -5367,9 +5668,29 @@ impl ServerBuilder {
         // itself stays "last write wins" — composition lives here so the
         // setter's semantics are unchanged for callers that don't use
         // skills.
+        //
+        // The SEP-2640 entry set comes back from the SAME call (Phase 125): it is
+        // the one place that sees the registry, so it is the only place both build
+        // paths can take entries from without drifting.
+        // Re-apply the skills capability LAST, because `capabilities(..)` is
+        // last-write-wins and REPLACES the whole `ServerCapabilities` value: a
+        // `.skill(..).capabilities(..)` ordering wiped the
+        // `io.modelcontextprotocol/skills` extension that `.skill(..)` had just
+        // inserted. That was inert until Phase 125 gave `skills_method_not_found`
+        // a reason to read the extension key; since then it silently turned both
+        // SEP-2640 methods into `-32601` on a server whose `skill_entries` were
+        // fully populated and whose `resources/*` surface still served every
+        // skill. Keyed on the registry rather than on the capability so the
+        // declaration follows the skills that are actually registered.
         #[cfg(feature = "skills")]
-        let final_resources: Option<Arc<dyn ResourceHandler>> =
-            builder::finalize_skills_resources(self.pending_skills, self.resources);
+        if self.pending_skills.is_some() {
+            skills::set_skills_capabilities(&mut self.capabilities);
+        }
+        #[cfg(feature = "skills")]
+        let (final_resources, skill_entries): (
+            Option<Arc<dyn ResourceHandler>>,
+            Vec<skills::SkillEntry>,
+        ) = builder::finalize_skills_resources(self.pending_skills, self.resources);
         #[cfg(not(feature = "skills"))]
         let final_resources = self.resources;
 
@@ -5436,6 +5757,23 @@ impl ServerBuilder {
             uri_to_tool_meta,
             prompts: self.prompts,
             resources: final_resources,
+            // Projected to JSON HERE, once, because the catalog is immutable
+            // after this point. Doing it per request cost one
+            // `serde_json::to_value` per registered skill on every `skills/list`
+            // AND every `skills/get`, under the transport's server mutex.
+            #[cfg(feature = "skills")]
+            skill_entries: Arc::new(
+                skill_entries
+                    .into_iter()
+                    .map(|entry| {
+                        let uri = entry.uri().to_string();
+                        let value = serde_json::to_value(entry).expect(
+                            "SkillEntry is String/Value/Vec only — serialization cannot fail",
+                        );
+                        (uri, value)
+                    })
+                    .collect(),
+            ),
             completions: self.completions,
             sampling: self.sampling,
             client_capabilities: Arc::new(RwLock::new(None)),

@@ -226,6 +226,78 @@ impl SequentialWorkflow {
         &self.instructions
     }
 
+    /// Project this workflow into a SEP-2640 [`Skill`] (D-01).
+    ///
+    /// The returned skill's `SKILL.md` body is rendered from this workflow's
+    /// own introspection surface, so the skill a host reads and the prompt a
+    /// host runs are one content rendered twice — they cannot drift, because
+    /// the SDK owns the renderer.
+    ///
+    /// The skill's name is this workflow's name normalized to the
+    /// agentskills alphabet (`refund_flow` becomes `refund-flow`), and no URI
+    /// path override is set, so the frontmatter `name` and the final segment of
+    /// `skill://{name}/SKILL.md` agree by construction.
+    ///
+    /// # Infallible by design
+    ///
+    /// This method never fails and never panics (D-02, D-15). When a workflow
+    /// name normalizes to nothing legal it emits a `tracing::warn!` on the
+    /// `mcp.skills` target and substitutes a deterministic `workflow-{8 hex}`
+    /// slug; when the description is empty it substitutes a deterministic legal
+    /// one. This deliberately DIVERGES from [`Skill::with_reference`]'s
+    /// `Err(e) => panic!` arm — restoring a panic here would reintroduce Phase
+    /// 125's WR-03 finding. A caller that wants those conditions to be hard
+    /// errors, and wants the warnings as data, uses the fallible builder path
+    /// instead.
+    ///
+    /// # This path holds no tool map, so it cannot warn about a destructive step
+    ///
+    /// The SC-6 gate warning — guidance attached to a step whose tool is
+    /// annotated side-effecting — needs
+    /// [`ToolAnnotations`](crate::types::ToolAnnotations), which live only on
+    /// [`crate::types::ToolInfo::annotations`]. Nothing reachable from a
+    /// `SequentialWorkflow` carries them: [`WorkflowStep::tool`] returns a
+    /// [`ToolHandle`](crate::server::workflow::ToolHandle), which is a name.
+    /// This method therefore cannot COMPUTE that warning; it is not that it
+    /// declines to log it.
+    ///
+    /// **SC-6 gate warnings have exactly one delivery channel: the structured
+    /// return from
+    /// [`SkillProjection::build`](crate::server::skills::SkillProjection::build),
+    /// with a tool map supplied through
+    /// [`SkillProjection::with_tools`](crate::server::skills::SkillProjection::with_tools).**
+    /// If you expected this method to warn about a destructive step and got
+    /// silence, that is why. The two conditions this path CAN observe — the
+    /// slug fallback and the empty-description substitution — are logged on
+    /// `mcp.skills` as described above.
+    ///
+    /// [`WorkflowStep::tool`]: crate::server::workflow::WorkflowStep::tool
+    ///
+    /// The rendered text is not semver-stable; see
+    /// [`crate::server::skills::projection`] for the re-pinning contract.
+    ///
+    /// [`Skill`]: crate::server::skills::Skill
+    /// [`Skill::with_reference`]: crate::server::skills::Skill::with_reference
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "skills")] {
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    /// let skill = workflow.as_skill();
+    ///
+    /// assert_eq!(skill.name(), "refund-flow");
+    /// assert!(skill.body().starts_with("---\nname: \"refund-flow\"\n"));
+    /// # }
+    /// ```
+    #[cfg(feature = "skills")]
+    #[must_use]
+    pub fn as_skill(&self) -> crate::server::skills::Skill {
+        crate::server::skills::projection::project(self)
+    }
+
     /// Validate the workflow
     ///
     /// Checks:

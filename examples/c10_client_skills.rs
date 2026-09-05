@@ -5,12 +5,37 @@
 //!
 //! ## Flow A — SEP-2640 host
 //!
-//! Capable hosts call `resources/list`, see SKILL.md + index entries, then
-//! `resources/read` each URI lazily. Reference files (like
+//! Capable hosts call `resources/list`, see one entry per registered
+//! SKILL.md, then `resources/read` each URI lazily. Reference files (like
 //! `skill://code-mode/references/schema.graphql`) are read by URI without
 //! being enumerated. Each read response carries the URI and the
 //! per-resource MIME type per SEP-2640 §4 wire shape — locked by
 //! 80-REVIEWS.md Fix 3.
+//!
+//! ## What this example does NOT do: call `skills/list` or `skills/get`
+//!
+//! SEP-2640 discovery is the `skills/list` / `skills/get` METHOD pair, which
+//! pmcp answers over **streamable HTTP**. This example holds no client, no
+//! server and no transport — it builds a [`Skills`] registry, calls
+//! `into_handler()`, and drives the resulting `ResourceHandler` **in
+//! process**. It therefore cannot issue either call, and it does not pretend
+//! to.
+//!
+//! What it demonstrates instead is the entry PROJECTION: the same
+//! [`pmcp::server::skills::SkillEntry`] values a `skills/list` response
+//! carries, obtained directly from the registry via `Skills::entries()`. The
+//! example ASSERTS on that projection so a regression panics here rather than
+//! printing something plausible and wrong.
+//!
+//! The authoritative end-to-end wire proof — real `skills/list` and
+//! `skills/get` POSTs against a live `StreamableHttpServer`, asserted on the
+//! response bodies — lives in `tests/skills_routing.rs`. If you are looking
+//! for a working `skills/get` CLIENT, this file is not it; copying it and
+//! expecting one will not work.
+//!
+//! (An earlier revision read a synthesized `skill://` discovery-index
+//! resource here. That resource was retired in favour of the method-based
+//! surface — 125-CONTEXT D-08.)
 //!
 //! ## Flow B — legacy prompt host
 //!
@@ -93,7 +118,8 @@ fn append_with_trailing_newline(out: &mut String, body: &str) {
 async fn sep_2640_flow(handler: &dyn ResourceHandler, skill: &Skill) -> String {
     let extra = RequestHandlerExtra::default();
 
-    // 1. resources/list — SKILL.md + index ONLY (references excluded per §9).
+    // 1. resources/list — one entry per registered SKILL.md, and nothing
+    //    else (references excluded per §9; no synthesized discovery entry).
     let list = handler.list(None, extra.clone()).await.unwrap();
     println!(
         "resources/list returned {} resource(s):",
@@ -104,22 +130,7 @@ async fn sep_2640_flow(handler: &dyn ResourceHandler, skill: &Skill) -> String {
     }
     println!();
 
-    // 2. resources/read index — assert wire shape per Fix 3.
-    let index_result = handler
-        .read("skill://index.json", extra.clone())
-        .await
-        .unwrap();
-    let (index_uri, index_text, index_mime) = extract_resource(&index_result.contents);
-    assert_eq!(index_uri, "skill://index.json");
-    assert_eq!(index_mime, "application/json");
-    println!(
-        "resources/read index uri={index_uri} mime={index_mime} bytes={}",
-        index_text.len()
-    );
-    println!("{}", &index_text[..index_text.len().min(240)]);
-    println!();
-
-    // 3. resources/read SKILL.md — assert wire shape.
+    // 2. resources/read SKILL.md — assert wire shape.
     let skill_uri = "skill://code-mode/SKILL.md";
     let md_result = handler.read(skill_uri, extra.clone()).await.unwrap();
     let (md_uri, main_text, md_mime) = extract_resource(&md_result.contents);
@@ -130,7 +141,7 @@ async fn sep_2640_flow(handler: &dyn ResourceHandler, skill: &Skill) -> String {
         main_text.len()
     );
 
-    // 4. resources/read each reference URI — registration order — per-reference MIME.
+    // 3. resources/read each reference URI — registration order — per-reference MIME.
     let mut concatenated = String::new();
     append_with_trailing_newline(&mut concatenated, &main_text);
     for r in skill.references() {
@@ -190,13 +201,81 @@ async fn legacy_prompt_flow_via_get_prompt(skill: Skill) -> String {
     prompt_text
 }
 
+/// The SEP-2640 entry projection — the values a `skills/list` response
+/// carries — read directly from the registry.
+///
+/// This is NOT an RPC. `sep_2640_flow` above takes a `&dyn ResourceHandler`,
+/// and `skills/get` is not a `ResourceHandler` method; reaching a real
+/// `skills/get` would mean turning this example into an HTTP client/server
+/// harness, which is a different example. So this function demonstrates the
+/// projection honestly and says so, rather than simulating a call.
+///
+/// It asserts rather than only printing: an example that panics on regression
+/// is a stronger doc surface than one that prints something plausible.
+fn skills_entry_projection(registry: &Skills) {
+    // `entries` borrows and `into_handler` consumes, so this must run BEFORE
+    // the handler is built — hence the ordering in `main`. No clone needed.
+    let entries = registry
+        .entries()
+        .expect("the code-mode skill's frontmatter name matches its URI segment");
+
+    assert_eq!(entries.len(), 1, "one registered skill => one entry");
+    let entry = &entries[0];
+
+    assert_eq!(entry.uri(), "skill://code-mode/SKILL.md");
+    assert_eq!(
+        entry.frontmatter().get("name").and_then(|v| v.as_str()),
+        Some("code-mode"),
+        "frontmatter is emitted verbatim from SKILL.md"
+    );
+    assert_eq!(
+        entry.resources().len(),
+        4,
+        "manifest = SKILL.md + 3 references, in registration order"
+    );
+
+    let digest = entry.resources()[0].digest();
+    assert!(
+        digest.starts_with("sha256:")
+            && digest.len() == "sha256:".len() + 64
+            && digest["sha256:".len()..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "digest must be sha256: + 64 lowercase hex, got {digest}"
+    );
+
+    println!("Entry projection (the value a skills/list response carries):");
+    println!("  uri     = {}", entry.uri());
+    println!("  name    = code-mode (verbatim from SKILL.md frontmatter)");
+    println!(
+        "  files   = {} (SKILL.md + 3 references)",
+        entry.resources().len()
+    );
+    for r in entry.resources() {
+        println!("    {} {} ({} bytes)", r.digest(), r.uri(), r.size());
+    }
+    println!();
+    println!("  NOTE: this is Skills::entries(), read IN PROCESS. This example");
+    println!("  holds no transport, so it does NOT exercise skills/list or");
+    println!("  skills/get over MCP. The end-to-end wire proof — real POSTs");
+    println!("  against a live StreamableHttpServer — is tests/skills_routing.rs.");
+    println!();
+}
+
 #[tokio::main]
 async fn main() {
     let skill = build_code_mode_skill();
 
+    // Build the registry ONCE. `entries()` borrows it and `into_handler()`
+    // consumes it, so the projection must be read first — that ordering is
+    // why no clone of the registry is needed.
+    let registry = Skills::new().add(skill.clone());
+
+    println!("=== SEP-2640 discovery: skills/list + skills/get (projection only) ===");
+    skills_entry_projection(&registry);
+
     // Build the handler that an SEP-2640-capable host would interact with.
-    let handler = Skills::new()
-        .add(skill.clone())
+    let handler = registry
         .into_handler()
         .expect("skill registration must not collide");
 

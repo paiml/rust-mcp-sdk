@@ -1757,6 +1757,32 @@ const ENVELOPE_SITES: &[EnvelopeSite] = &[
     },
     EnvelopeSite {
         file: "src/server/core.rs",
+        function: "build_skills_list_response",
+        hits: 1,
+        why: "The SEP-2640 `skills/list` egress (Phase 125). Like `server/discover` beside it, it \
+              rides the crate-private `InternalClientRequest` route and therefore never reaches \
+              `request_is_cacheable`, so it names `Cacheable::Yes` HERE — the extension says a \
+              2026-07-28 `skills/list` result carries the base protocol's list-caching \
+              attributes. It mints no reserved MRTR or tasks field, so it owns none of them, and \
+              it is a complete listing rather than a task, so its disposition is `Complete`.",
+    },
+    EnvelopeSite {
+        file: "src/server/core.rs",
+        function: "build_skills_get_response",
+        hits: 1,
+        why: "The SEP-2640 `skills/get` egress (Phase 125 plan 02). It rides the same \
+              crate-private `InternalClientRequest` route as its `skills/list` sibling and so \
+              never reaches `request_is_cacheable` either — but it names `Cacheable::No`, not \
+              `Yes`. The extension gives `skills/list` the base protocol's list-caching \
+              attributes EXPLICITLY and leaves the equivalent question OPEN for `skills/get`, so \
+              pmcp claims nothing and the result carries neither `ttlMs` nor `cacheScope` on \
+              either era. The two entries differing on exactly this argument is the point: it is \
+              a decision with a stated reason, not an omission. It mints no reserved MRTR or \
+              tasks field, so it owns none of them, and a single fetched entry is complete rather \
+              than a task, so its disposition is `Complete`.",
+    },
+    EnvelopeSite {
+        file: "src/server/core.rs",
         function: "handle_request",
         hits: 1,
         why: "The native chokepoint. Every dispatched result passes through here exactly once, \

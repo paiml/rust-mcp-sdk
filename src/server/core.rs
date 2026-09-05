@@ -2427,6 +2427,286 @@ pub(crate) fn build_discover_response(
     response
 }
 
+/// Build the SEP-2640 `skills/list` response (Phase 125, D-07/D-11).
+///
+/// The SINGLE shared projection consumed by the production HTTP caller
+/// (`Server::handle_skills_list` → the streamable-HTTP `HttpIngress::SkillsList`
+/// classifier). Modelled on [`build_discover_response`] above, with four
+/// deliberate deltas — each one is a decision, not an omission:
+///
+/// 1. **No era gate.** `server/discover` is a 2026-07-28-only method and answers
+///    `-32601` on v1. `skills/list` has no version gate in the SEP-2640 draft: it
+///    rides the base Resources primitive, and only the caching ATTRIBUTES on its
+///    result are era-conditional. Deleting the gate here is the point; do not
+///    translate `build_discover_response`'s copy of it.
+/// 2. **[`ResponseDisposition::Complete`]**, which is what emits
+///    `resultType: "complete"` — the value the draft's own `skills/list` example
+///    carries.
+/// 3. **[`Cacheable::Yes`] is named HERE, at the projection call site**, exactly
+///    as `build_discover_response` names its own. This is also why
+///    [`request_is_cacheable`] gains no `skills/list` row: that table is keyed on
+///    public `ClientRequest` variants, `skills/list` deliberately has none, its
+///    `match` carries no wildcard arm, and its rustdoc calls a row for a variant
+///    that cannot occur "a lie about where the claim is made".
+/// 4. **Single page, no cursor.** Every entry is returned in one response and no
+///    `nextCursor` key is emitted (D-11). An absent cursor means the listing is
+///    complete, which is conformant. Cursor pagination is a recorded deferral —
+///    revisit if a registry with hundreds of skills materializes — and is recorded
+///    here rather than as an in-code marker.
+///
+/// `skills` arrives ALREADY SERIALIZED. `SkillEntry` exists only under
+/// `feature = "skills"` while the classifier that routes the method is ungated, so
+/// taking a `Value` array keeps this projection feature-agnostic and lets a
+/// featureless build answer with an honest empty catalog rather than a second
+/// envelope implementation behind a `cfg`.
+///
+/// # An EMPTY catalog answers the method; it does not deny it
+///
+/// A server with no registered skills returns `{"skills": []}`, never `-32601`.
+/// The capability is declared at build time regardless of catalog size, so an
+/// empty catalog that refused the method would make that declaration a lie.
+///
+/// # The route, and the route that does not exist
+///
+/// `Server::handle_skills_list` → the streamable-HTTP `HttpIngress::SkillsList`
+/// classifier is the ONE production route, stated here in the same shape
+/// [`build_discover_response`] states its own.
+///
+/// **There is no `ServerCore` route, and there is deliberately no
+/// `ServerCore::handle_skills_list`.** A `ServerCore`'s only request ingress is
+/// [`ProtocolHandler::handle_request`], which accepts the typed public
+/// [`crate::types::Request`] enum; neither skills method has a variant in it, and
+/// Phase 125 adds none because a variant on a public exhaustive enum is a
+/// semver-MAJOR break. A delegate here would therefore be a `pub(crate)` function
+/// nothing could call, and the entry set feeding it a field nothing could read.
+/// Phase 112 reached the same conclusion for `server/discover` and DELETED its
+/// `ServerCore` wrappers rather than annotating them `#[allow(dead_code)]`; this
+/// function and its `skills/get` sibling follow that precedent.
+///
+/// What a `ServerCoreBuilder`-built core DOES still serve is the skills RESOURCE
+/// surface — every skill is answerable through `resources/list` and
+/// `resources/read`, which is asserted by
+/// `server_core_builder_still_serves_skills_as_resources` in
+/// `tests/skills_routing.rs`. The absent METHOD reach is a recorded deferral, and
+/// `server_core_declares_no_skills_field_or_skills_method` in the same file fails
+/// if the dead delegates are re-added.
+pub(crate) fn build_skills_list_response(
+    id: RequestId,
+    // The SAME borrowed map the `build_skills_get_response` sibling takes, so
+    // one serialized catalog feeds both projections instead of each caller
+    // building its own container shape (a `Vec` here, an `IndexMap` there) from
+    // the same `skill_entries` field. `IndexMap` preserves registration order,
+    // so iterating `.values()` keeps the STABLE entry order `Skills::entries`
+    // promises — the guarantee was previously enforced by the `Vec` on this
+    // path and by insertion order on the other.
+    //
+    // It is BORROWED, not owned: the projection only serializes the entries, so
+    // ownership bought nothing, and `clippy::needless_pass_by_value` (pedantic,
+    // enabled by `make lint`) is a hard error under this repo's lint policy.
+    // That went unnoticed because `make lint` is reached only through
+    // `make quality-gate`, which no earlier plan of this phase ran — the same
+    // class of blind spot `make test-skills` exists to close, one gate leg over.
+    skills: &indexmap::IndexMap<String, Value>,
+    info: &Implementation,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+) -> JSONRPCResponse {
+    // Built as a `Map` rather than through `serde_json::json!`. The macro's
+    // object arm routes a non-literal value expression through
+    // `json_internal!($other:expr) => to_value(&$other).unwrap()`, so a
+    // `json!({ "skills": <expr> })` walks the whole catalog through the serde
+    // `Serializer` to rebuild a `Value` tree it is already holding — on top of a
+    // `Vec<&Value>` staging allocation that buys nothing. One clone per entry is
+    // unavoidable (`inject_v2_result_envelope` mutates the result in place); the
+    // serializer round-trip is not. Both `skills/*` call sites build their
+    // response while holding `state.server.lock()`, so the saved work is work
+    // that was serializing concurrent traffic.
+    let mut result = serde_json::Map::with_capacity(1);
+    result.insert(
+        "skills".to_string(),
+        Value::Array(skills.values().cloned().collect()),
+    );
+    let mut response = ServerCore::success_response(id, Value::Object(result));
+    inject_v2_result_envelope(
+        &mut response,
+        protocol_context,
+        info,
+        ResponseDisposition::Complete,
+        // `skills/list` mints no reserved MRTR/tasks result field, so it owns none.
+        ReservedFieldOwner::None,
+        // SEP-2640 §Dependencies: "In protocol versions 2026-07-28 and later,
+        // `skills/list` results additionally carry the base protocol's
+        // list-caching attributes." The claim is made HERE — see delta 3 above for
+        // why it is not a `request_is_cacheable` row.
+        Cacheable::Yes,
+    );
+    response
+}
+
+/// The longest prefix of a caller-supplied URI that may appear in an error
+/// message.
+///
+/// ASVS V7: an error must not echo attacker-controlled input unbounded — that
+/// turns a `-32602` into a log-injection and response-amplification primitive.
+/// The value is a prefix rather than a hard reject because a truncated URI is
+/// genuinely useful to the legitimate caller who mistyped one.
+const SKILLS_GET_URI_ECHO_LIMIT: usize = 96;
+
+/// Render a caller-supplied `skills/get` URI for inclusion in an error message.
+///
+/// Truncated at [`SKILLS_GET_URI_ECHO_LIMIT`] **characters, not bytes** — slicing
+/// a `String` at a byte offset that is not a UTF-8 boundary panics, and the URI is
+/// attacker-controlled, so a byte-offset truncation would be a remotely reachable
+/// panic rather than a safety measure.
+///
+/// # Record-forging characters are replaced, not merely bounded
+///
+/// A length bound alone addresses only the amplification half of the ASVS V7
+/// threat. The injection half needs the CR/LF (and ANSI escape) to go: a URI of
+/// `skill://x\n2026-01-01 ERROR audit: auth bypassed` is well under the limit,
+/// so it reached the `-32602` message intact and appeared as its own record in
+/// any line-oriented log that rendered it.
+///
+/// The classification and the substitution are NOT decided here: they come from
+/// [`crate::shared::log_sanitize::sanitize_for_log`], which the skills
+/// projection's own log sanitizer also uses. Sharing them is the point — this
+/// function previously tested `char::is_control()` alone, which is exactly the
+/// `Cc` category and therefore reaches NEITHER `U+2028` (LINE SEPARATOR) nor
+/// `U+2029` (PARAGRAPH SEPARATOR), both of which several log processors and
+/// JS-based log viewers treat as record terminators. The projection's copy had
+/// already closed that gap; this one had not.
+///
+/// # The scan is bounded by the LIMIT, not by the input
+///
+/// The head is taken FIRST and sanitized second, and the truncation test reads
+/// one character past the budget rather than counting the whole string — so a
+/// body-cap-sized `uri` costs O(limit) work here instead of O(len). The function
+/// that exists to bound hostile input does not itself walk all of it. The one
+/// intermediate `String` is bounded by [`SKILLS_GET_URI_ECHO_LIMIT`] characters
+/// and buys the shared classification; this is an error path, not a hot one.
+fn truncated_uri_for_error(uri: &str) -> String {
+    let mut chars = uri.chars();
+    let head: String = chars.by_ref().take(SKILLS_GET_URI_ECHO_LIMIT).collect();
+    let mut out = crate::shared::log_sanitize::sanitize_for_log(&head);
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Build the SEP-2640 `skills/get` response (Phase 125 plan 02, D-06/D-07).
+///
+/// The SINGLE shared projection consumed by the production HTTP caller
+/// (`Server::handle_skills_get` → the streamable-HTTP `HttpIngress::SkillsGet`
+/// classifier). There is no `ServerCore` route: `ProtocolHandler::handle_request`
+/// accepts the typed public `Request` enum, which this method deliberately has no
+/// variant in, so a `ServerCore` delegate would be unreachable dead code — the
+/// same conclusion Phase 112 reached for `server/discover` and acted on by
+/// deleting its `ServerCore` wrappers. `tests/skills_routing.rs` carries a
+/// source-scan guard that fails if one is re-added.
+///
+/// Four deliberate deltas from the [`build_skills_list_response`] sibling above:
+///
+/// 1. **The params are READ here, in the SERVED branch.** This is the first place
+///    in the phase where a caller-supplied value is decoded, and the location is
+///    the point: `classify_internal_method` stays body-blind so that a malformed
+///    body becomes a `-32602` AFTER the header and auth pipeline, never a parse
+///    error ahead of it. A classifier that deserialized would hand an
+///    unauthenticated caller a params error instead of the authentication refusal
+///    (T-125-07).
+/// 2. **A miss is [`error_codes::INVALID_PARAMS`] (`-32602`), NOT
+///    [`error_codes::METHOD_NOT_FOUND`]** — the code the current SEP-2640 draft
+///    specifies for an unresolvable `skills/get` URI (D-06). This diverges from
+///    two neighbours ON PURPOSE. [`build_discover_response`] uses `-32601` because
+///    a v1 `server/discover` genuinely is an unknown METHOD; and the shipped
+///    `SkillsHandler::read` raises `-32601` for an unknown `resources/read` URI,
+///    which reaches the wire re-wrapped as `-32603`. That `resources/read`
+///    divergence is a KNOWN, separately-tracked observation which this phase
+///    deliberately neither copies nor fixes — changing a shipped error code is
+///    observable behaviour with its own test
+///    (`resources_read_unknown_uri_method_not_found` in
+///    `tests/skills_integration.rs`, plus the measured wire control in
+///    `tests/skills_routing.rs`).
+/// 3. **The lookup is an EXACT map hit and nothing else** (T-125-06). The caller's
+///    string is never joined, normalized, percent-decoded or otherwise
+///    manipulated into a path. Registration-time `validate_reference_path`
+///    already rejects `..` segments, leading `/`, embedded `://` and null bytes;
+///    the lookup side must not re-open that surface by being clever. A
+///    consequence worth stating: only a SKILL.md URI resolves, so a registered
+///    skill's reference file — readable via `resources/read` — answers `-32602`
+///    here, which is what the draft's "the `uri` MUST be a skill's SKILL.md"
+///    requires.
+/// 4. **[`Cacheable::No`] is named at this call site**, where
+///    `build_skills_list_response` names `Cacheable::Yes`. SEP-2640 gives
+///    `skills/list` the base protocol's list-caching attributes explicitly and
+///    leaves the equivalent question OPEN for `skills/get`, so pmcp claims
+///    nothing and the result carries neither `ttlMs` nor `cacheScope` on either
+///    era. Naming it here rather than omitting it is what makes the claim
+///    reviewable: a later phase that decides the draft has settled changes ONE
+///    argument with a stated reason. As with its sibling this is also why
+///    [`request_is_cacheable`] gains no row — that table is keyed on public
+///    `ClientRequest` variants, `skills/get` deliberately has none, its `match`
+///    carries no wildcard arm, and its rustdoc calls a row for a variant that
+///    cannot occur "a lie about where the claim is made".
+///
+/// `entries` arrives ALREADY SERIALIZED, keyed by SKILL.md URI, for the reason
+/// [`build_skills_list_response`] records: `SkillEntry` exists only under
+/// `feature = "skills"` while the classifier that routes the method is ungated, so
+/// a featureless build must still answer — with an honest empty catalog, in which
+/// every URI is a `-32602` miss.
+pub(crate) fn build_skills_get_response(
+    id: RequestId,
+    entries: &indexmap::IndexMap<String, Value>,
+    params: &Value,
+    info: &Implementation,
+    protocol_context: Option<&crate::types::protocol::ProtocolContext>,
+) -> JSONRPCResponse {
+    // Delta 1: the params are decoded HERE. `params` is `Value::Null` when the
+    // frame carried none, a non-object when the caller sent a scalar, and may
+    // carry a `uri` of any type — all four shapes land on the same `-32602`.
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return ServerCore::error_response(
+            id,
+            crate::types::protocol::error_codes::INVALID_PARAMS,
+            "Invalid params: skills/get requires a string `uri` naming a skill's SKILL.md"
+                .to_string(),
+        );
+    };
+
+    // Delta 3: an exact map hit. No join, no normalization, no decode.
+    let Some(entry) = entries.get(uri) else {
+        // Delta 2: -32602, not -32601. The URI is echoed TRUNCATED (ASVS V7).
+        return ServerCore::error_response(
+            id,
+            crate::types::protocol::error_codes::INVALID_PARAMS,
+            format!(
+                "Invalid params: no skill is served at `{}`",
+                truncated_uri_for_error(uri)
+            ),
+        );
+    };
+
+    // Built as a `Map`, not via `serde_json::json!` — see the sibling
+    // `build_skills_list_response` for why. The saving is larger here: the macro
+    // would deep-COPY `entry` for the `&$other` borrow and then walk that copy
+    // through the `Serializer` to build a second fresh tree, discarding the
+    // first. The one clone below is the copy that is actually needed.
+    let mut result = serde_json::Map::with_capacity(1);
+    result.insert("skill".to_string(), entry.clone());
+    let mut response = ServerCore::success_response(id, Value::Object(result));
+    inject_v2_result_envelope(
+        &mut response,
+        protocol_context,
+        info,
+        ResponseDisposition::Complete,
+        // `skills/get` mints no reserved MRTR/tasks result field, so it owns none.
+        ReservedFieldOwner::None,
+        // Delta 4 — see this function's rustdoc. The draft leaves get-caching open;
+        // pmcp claims nothing, on either era.
+        Cacheable::No,
+    );
+    response
+}
+
 // ===========================================================================
 // MRTR ingress + egress (Plan 113-06, HTTP-02 / HTTP-03).
 //
@@ -4960,6 +5240,52 @@ mod tests {
     use crate::server::tool_middleware::ToolMiddlewareChain;
     use crate::types::ClientCapabilities;
 
+    /// The `skills/get` URI echo replaces every record-forging character, not
+    /// just the `Cc` set.
+    ///
+    /// `U+2028`/`U+2029` are the regression this pins: they are LINE SEPARATOR
+    /// and PARAGRAPH SEPARATOR, categories `Zl`/`Zp`, so `char::is_control()` —
+    /// which this function once tested alone — returns `false` for both while
+    /// several log processors and JS-based log viewers treat them as record
+    /// terminators. The premise is asserted below so the test cannot pass for a
+    /// stale reason if `char::is_control` ever widens.
+    #[test]
+    fn skills_get_uri_echo_replaces_every_record_forging_character() {
+        assert!(!'\u{2028}'.is_control());
+        assert!(!'\u{2029}'.is_control());
+
+        assert_eq!(
+            truncated_uri_for_error("skill://x\n2026-01-01 ERROR audit: bypassed"),
+            "skill://x\u{FFFD}2026-01-01 ERROR audit: bypassed"
+        );
+        assert_eq!(
+            truncated_uri_for_error("skill://a\u{2028}b\u{2029}c"),
+            "skill://a\u{FFFD}b\u{FFFD}c"
+        );
+        // Anti-vacuity: an ordinary URI survives byte for byte, so the
+        // assertions above are not trivially true of every input.
+        assert_eq!(
+            truncated_uri_for_error("skill://ok/SKILL.md"),
+            "skill://ok/SKILL.md"
+        );
+    }
+
+    /// The echo is bounded in CHARACTERS, and the marker is appended only when
+    /// the input actually overran the budget.
+    #[test]
+    fn skills_get_uri_echo_truncates_on_a_character_boundary() {
+        let long: String = "é".repeat(SKILLS_GET_URI_ECHO_LIMIT + 5);
+        let out = truncated_uri_for_error(&long);
+        assert_eq!(out.chars().count(), SKILLS_GET_URI_ECHO_LIMIT + 1);
+        assert!(out.ends_with('…'));
+
+        // Exactly at the limit: no marker.
+        let exact: String = "é".repeat(SKILLS_GET_URI_ECHO_LIMIT);
+        let out = truncated_uri_for_error(&exact);
+        assert_eq!(out.chars().count(), SKILLS_GET_URI_ECHO_LIMIT);
+        assert!(!out.ends_with('…'));
+    }
+
     struct TestTool;
 
     #[async_trait]
@@ -5406,6 +5732,274 @@ mod tests {
             "supportedVersions": ["2025-11-25", "2026-07-28"]
         });
         assert_eq!(value, expected, "discover wire shape drifted from golden");
+    }
+
+    // ---- Phase 125 plan 02: the two SEP-2640 projections, DIRECTLY ----
+    //
+    // These are "projection parity" in the only sense the repository's type
+    // architecture allows, and the distinction is worth stating because an earlier
+    // revision of the plan claimed something stronger.
+    //
+    // What is NOT claimed: `ServerCoreBuilder` wire parity. A `ServerCore` answers
+    // NO skills method, because `ProtocolHandler::handle_request` accepts the typed
+    // public `Request` enum and neither method has a variant in it. The reachable
+    // half of that retired claim — that a `ServerCoreBuilder`-built core still
+    // serves its skills through `resources/list` / `resources/read` — is asserted
+    // in `tests/skills_routing.rs`, where a `ServerCore` can actually be driven.
+    //
+    // What IS claimed here: both free functions have coverage that depends on NO
+    // transport, built the way the `build_discover_response` tests above are. A
+    // transport-only proof would leave the projections untested whenever the
+    // transport feature is off.
+
+    /// The fixture entry set, in the ALREADY-SERIALIZED shape both projections
+    /// take.
+    ///
+    /// Serialized because `SkillEntry` exists only under `feature = "skills"`
+    /// while the classifier that routes both methods is ungated — the same reason
+    /// the production delegates serialize at the `Server` boundary.
+    fn skills_entry_fixture(uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "uri": uri,
+            "frontmatter": { "name": "refunds", "description": "Issue refunds" },
+            "resources": [{
+                "uri": uri,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "size": 42,
+            }],
+        })
+    }
+
+    fn skills_entry_map() -> indexmap::IndexMap<String, serde_json::Value> {
+        let mut map = indexmap::IndexMap::new();
+        map.insert(
+            "skill://refunds/SKILL.md".to_string(),
+            skills_entry_fixture("skill://refunds/SKILL.md"),
+        );
+        map.insert(
+            "skill://returns/SKILL.md".to_string(),
+            skills_entry_fixture("skill://returns/SKILL.md"),
+        );
+        map
+    }
+
+    fn skills_info() -> Implementation {
+        Implementation::new("skills-projection-server", "1.0.0")
+    }
+
+    /// `build_skills_list_response` returns every entry in ONE complete page.
+    ///
+    /// The absent-cursor assertion is the D-11 property and is a real check rather
+    /// than a restatement: an implementation that paginated would emit the key,
+    /// and an absent cursor is what tells a conforming host the listing is done.
+    #[test]
+    fn build_skills_list_response_projects_one_complete_page() {
+        // The SAME map the `skills/get` sibling projection takes — both now read
+        // one serialized catalog, so this also pins that iterating `.values()`
+        // preserves registration order (asserted on element 0 below).
+        let entries = skills_entry_map();
+        let ctx = v2_ctx();
+        let response =
+            build_skills_list_response(RequestId::from(1i64), &entries, &skills_info(), Some(&ctx));
+
+        let ResponsePayload::Result(value) = response.payload else {
+            panic!("skills/list must return a result");
+        };
+        assert_eq!(value["resultType"], "complete");
+        assert_eq!(
+            value["skills"]
+                .as_array()
+                .expect("skills is an array")
+                .len(),
+            2,
+            "one element per entry, no filtering in the projection"
+        );
+        assert_eq!(value["skills"][0]["uri"], "skill://refunds/SKILL.md");
+        assert!(
+            value.get("nextCursor").is_none(),
+            "D-11: a single complete page emits NO cursor key"
+        );
+        // The `Cacheable::Yes` named at this projection's call site, observable.
+        assert!(value.get("ttlMs").is_some() && value.get("cacheScope").is_some());
+    }
+
+    /// `build_skills_get_response` answers a hit with the single entry and a miss
+    /// with `-32602` — and the two legs run against the SAME map so the difference
+    /// is attributable to the URI alone.
+    ///
+    /// The `-32601` inequality is stated separately because that is the SPECIFIC
+    /// wrong answer: it is what [`build_discover_response`] returns for its own
+    /// refusal and what the shipped `SkillsHandler::read` raises for an unknown
+    /// `resources/read` URI. D-06 says the draft wants `-32602` here.
+    #[test]
+    fn build_skills_get_response_answers_a_hit_and_refuses_a_miss_with_invalid_params() {
+        let entries = skills_entry_map();
+        let info = skills_info();
+        let ctx = v2_ctx();
+
+        // Hit.
+        let hit = build_skills_get_response(
+            RequestId::from(1i64),
+            &entries,
+            &serde_json::json!({ "uri": "skill://refunds/SKILL.md" }),
+            &info,
+            Some(&ctx),
+        );
+        let ResponsePayload::Result(value) = hit.payload else {
+            panic!("a resolvable skills/get uri must return a result");
+        };
+        assert_eq!(value["resultType"], "complete");
+        assert_eq!(value["skill"]["uri"], "skill://refunds/SKILL.md");
+        assert_eq!(value["skill"]["frontmatter"]["name"], "refunds");
+        assert!(
+            value.get("skills").is_none(),
+            "a get returns a single `skill`, never the list key"
+        );
+        // The `Cacheable::No` named at this projection's call site, observable —
+        // and the ONLY difference in disposition from the list twin above.
+        assert!(
+            value.get("ttlMs").is_none() && value.get("cacheScope").is_none(),
+            "the draft leaves get-caching open, so pmcp claims nothing even on v2"
+        );
+
+        // Miss, on the SAME map.
+        for (uri, why) in [
+            ("skill://nope/SKILL.md", "an unregistered skill"),
+            (
+                "skill://refunds/SKILL.md.bak",
+                "a suffix appended to a registered URI — the lookup is an exact hit",
+            ),
+            (
+                "skill://refunds/../refunds/SKILL.md",
+                "a traversal-shaped URI is never normalized into a hit (T-125-06)",
+            ),
+        ] {
+            let miss = build_skills_get_response(
+                RequestId::from(2i64),
+                &entries,
+                &serde_json::json!({ "uri": uri }),
+                &info,
+                Some(&ctx),
+            );
+            let ResponsePayload::Error(e) = miss.payload else {
+                panic!("`{uri}` must NOT resolve ({why})");
+            };
+            assert_eq!(
+                e.code,
+                crate::types::protocol::error_codes::INVALID_PARAMS,
+                "D-06: `{uri}` is -32602 ({why})"
+            );
+            assert_eq!(e.code, -32602);
+            assert_ne!(
+                e.code,
+                crate::types::protocol::error_codes::METHOD_NOT_FOUND,
+                "stated separately: -32601 is what build_discover_response and \
+                 SkillsHandler::read return, and is the answer this must NOT copy"
+            );
+        }
+
+        // Malformed params reach the same code, and none of them panics.
+        for params in [
+            serde_json::Value::Null,
+            serde_json::json!("not-an-object"),
+            serde_json::json!({}),
+            serde_json::json!({ "uri": 17 }),
+        ] {
+            let refused =
+                build_skills_get_response(RequestId::from(3i64), &entries, &params, &info, None);
+            let ResponsePayload::Error(e) = refused.payload else {
+                panic!("malformed params must be refused, got a result for {params}");
+            };
+            assert_eq!(e.code, crate::types::protocol::error_codes::INVALID_PARAMS);
+        }
+    }
+
+    /// An EMPTY entry map answers `skills/get` with `-32602`, never a panic and
+    /// never `-32601`.
+    ///
+    /// This is the featureless-build shape: a server compiled without
+    /// `feature = "skills"` still routes the method and hands the projection an
+    /// empty map, in which every URI is a miss.
+    #[test]
+    fn build_skills_get_response_on_an_empty_map_is_invalid_params() {
+        let empty = indexmap::IndexMap::new();
+        let refused = build_skills_get_response(
+            RequestId::from(1i64),
+            &empty,
+            &serde_json::json!({ "uri": "skill://refunds/SKILL.md" }),
+            &skills_info(),
+            None,
+        );
+        let ResponsePayload::Error(e) = refused.payload else {
+            panic!("an empty catalog resolves nothing");
+        };
+        assert_eq!(e.code, crate::types::protocol::error_codes::INVALID_PARAMS);
+    }
+
+    /// The `-32602` message TRUNCATES the caller's URI (ASVS V7, T-125-08).
+    ///
+    /// An error that echoed attacker-controlled input unbounded would be a
+    /// log-injection and response-amplification primitive. The truncation is by
+    /// CHARACTERS rather than bytes, so the multi-byte leg below is not decorative:
+    /// a byte-offset slice of a `String` at a non-boundary offset panics, and this
+    /// input is attacker-controlled — that would be a remotely reachable panic
+    /// dressed up as a safety measure.
+    #[test]
+    fn build_skills_get_response_truncates_the_echoed_uri() {
+        let entries = indexmap::IndexMap::new();
+        let info = skills_info();
+
+        let long = "skill://".to_string() + &"a".repeat(4000);
+        let refused = build_skills_get_response(
+            RequestId::from(1i64),
+            &entries,
+            &serde_json::json!({ "uri": long }),
+            &info,
+            None,
+        );
+        let ResponsePayload::Error(e) = refused.payload else {
+            panic!("an unresolvable uri is an error");
+        };
+        assert!(
+            e.message.chars().count() < 200,
+            "the message must not echo the caller's URI unbounded; got {} chars",
+            e.message.chars().count()
+        );
+        assert!(
+            e.message.contains('…'),
+            "a truncated echo is marked as truncated: {}",
+            e.message
+        );
+
+        // Multi-byte input: character-boundary truncation, not a byte slice.
+        let multibyte: String = "🙂".repeat(400);
+        let refused = build_skills_get_response(
+            RequestId::from(2i64),
+            &entries,
+            &serde_json::json!({ "uri": multibyte }),
+            &info,
+            None,
+        );
+        let ResponsePayload::Error(e) = refused.payload else {
+            panic!("an unresolvable uri is an error");
+        };
+        assert!(e.message.chars().count() < 200);
+
+        // A SHORT uri is echoed whole and carries no truncation marker — the
+        // control that stops the assertions above passing against an
+        // implementation that echoed nothing at all.
+        let refused = build_skills_get_response(
+            RequestId::from(3i64),
+            &entries,
+            &serde_json::json!({ "uri": "skill://short/SKILL.md" }),
+            &info,
+            None,
+        );
+        let ResponsePayload::Error(e) = refused.payload else {
+            panic!("an unresolvable uri is an error");
+        };
+        assert!(e.message.contains("skill://short/SKILL.md"));
+        assert!(!e.message.contains('…'));
     }
 
     // ---- Plan 114-05 (TASK-01, D-02): the per-era capability projection ----

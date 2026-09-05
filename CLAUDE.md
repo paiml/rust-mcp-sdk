@@ -663,3 +663,7 @@ git commit --no-verify -m "HOTFIX: critical issue - bypassing quality gates"
 
 **Note**: Emergency overrides require immediate follow-up commits to restore quality standards.
 - Before pushing a new commit or a PR you need to run `make quality-gate`.
+
+## Spike Findings Auto-Load
+
+- **Spike findings for rust-mcp-sdk** (implementation patterns, constraints, gotchas) → `Skill("spike-findings-rust-mcp-sdk")`

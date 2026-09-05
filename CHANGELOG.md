@@ -5,6 +5,329 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - 2026-09-04
+
+### Removed — the synthesized `skill://index.json` discovery resource (feature `skills`)
+
+Every skills-enabled server used to auto-synthesize a discovery index: it was
+enumerated in `resources/list` as `skill://index.json` (mime `application/json`)
+and served by `resources/read`. **It is gone.** `resources/list` no longer
+carries that entry, so a host counting entries sees one fewer, and
+`resources/read skill://index.json` now answers `Skill resource not found`.
+
+Discovery moved to the two SEP-2640 methods below. A host that hard-coded or
+cached the index URI must switch to `skills/list`.
+
+### Added — the SEP-2640 `skills/list` and `skills/get` methods (feature `skills`)
+
+Servers that register a skill now declare the `io.modelcontextprotocol/skills`
+extension and answer both methods over streamable HTTP. Each entry carries the
+skill's frontmatter verbatim plus a `resources` manifest of `sha256:`-prefixed
+digests. `skills/list` results carry the base protocol's list-caching attributes
+on 2026-07-28 and neither attribute on 2025-11-25; `skills/get` claims neither on
+either era.
+
+Two limits on the reach, both deliberate and both recorded as deferrals:
+
+- **Streamable HTTP only.** The methods ride the crate-private internal-request
+  classifier, which no other transport consumes. Over **stdio** a `skills/list`
+  frame fails `parse_message` — and because the transport actor breaks its loop
+  on a receive error, that **tears the connection down** rather than answering
+  `-32601`. A stdio server that registers a skill still declares the extension,
+  so avoid advertising it to hosts that will call the methods until the
+  transport reach widens.
+- **No `ServerCore` route.** A `ServerCoreBuilder`-built server serves skills
+  through `resources/list` / `resources/read` but answers neither method.
+
+Also note a v1 wire change that reaches **every** streamable-HTTP server,
+including one compiled without `feature = "skills"`: `skills/list` and
+`skills/get` are now classified before the typed parse, so a 2025-11-25 client
+sending either gets `HTTP 200` with a `-32601` body and its original `id`, where
+it previously got `HTTP 400` with `-32700` and `id: null`.
+
+### Breaking (feature `skills`) — the SEP-2640 name-identity rule is now enforced
+
+`Skills::into_handler()` — and therefore `.build()` on both builders — now
+rejects a registry in which a skill's frontmatter `name` differs from the final
+segment of its URI path, and rejects a reference URI that collides with another
+skill's `SKILL.md` URI. Upstream detected duplicate SKILL.md URIs only.
+
+Because `resolved_path()` defaults to the constructor name, this bites hardest
+with `Skill::with_path(..)`: `Skill::new("refunds", body).with_path("acme/billing/policy")`
+where `body` opens `---\nname: refunds\n---` built and served on 2.19.x and now
+**panics at `.build()`**. Either align the frontmatter `name` with the final path
+segment, or register through `try_skills(..)` to get the failure as a `Result`.
+
+One caveat on `try_skills`: name identity is validated for the registry passed to
+that call only. Skills deposited by the infallible `.skill(..)` / `.skills(..)` /
+`.bootstrap_skill_and_prompt(..)` are name-checked at `.build()`, so a mixed
+chain can see `try_skills` return `Ok` and `.build()` still panic. Register
+everything through `try_skills` if you need the `Result`.
+
+### Changed — `feature = "skills"` now pulls in `serde_yaml`
+
+Frontmatter is parsed rather than scanned, so `skills` gained a `dep:serde_yaml`
+requirement. `skills` remains outside both `full` and `full-v2`.
+
+A skill whose SKILL.md carries no frontmatter block, or a malformed one, is
+EXCLUDED from `skills/list` (with a `mcp.skills` warn naming it) while staying
+readable via `resources/read`. Such a skill therefore appears in `resources/list`
+and answers `skills/get` with `-32602`.
+
+### Added — a `SequentialWorkflow` projects to a SEP-2640 skill
+
+`SequentialWorkflow::as_skill()` (feature `skills`) renders a workflow as an
+agentskills-legal `SKILL.md` body, so a server that already defines a workflow
+gets the skill surface for free:
+
+```rust
+let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+    .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+
+let skill = workflow.as_skill();      // name: "refund-flow"
+```
+
+The body is rendered from the workflow's own introspection surface, so the skill
+a host reads and the prompt a host runs are **one content rendered twice** — they
+cannot drift, because the SDK owns the renderer. The workflow name is normalized
+to the agentskills alphabet (`refund_flow` becomes `refund-flow`) and no URI path
+override is set, so the frontmatter `name` and the final segment of
+`skill://{name}/SKILL.md` agree by construction.
+
+`as_skill()` is infallible and never panics. When a workflow name normalizes to
+nothing legal it substitutes a deterministic `workflow-{8 hex}` slug; when the
+description is empty it substitutes a deterministic legal one. Both emit a
+`tracing::warn!` on the `mcp.skills` target.
+
+### Added — `SkillProjection`, the fallible, checking counterpart
+
+`SkillProjection::new(&workflow).with_tools(tools).build()` rejects what
+`as_skill()` resolves silently, and additionally runs a projection-time gate
+check. Both entry points call the same renderer, so the returned body is
+byte-identical to `as_skill()`'s for any workflow that builds at all — the
+difference is disposition, never bytes.
+
+**`build()` returns `Result<ProjectionOutput>`, not `Result<Skill>`.** This is a
+recorded deviation, made deliberately: the design called for both a fallible
+`build()` and structured warnings returned *from* `build()`, and a `Skill` cannot
+carry a warning vector. `#[non_exhaustive] pub struct ProjectionOutput { pub
+skill: Skill, pub warnings: Vec<ProjectionWarning> }` resolves that — named and
+self-documenting where a tuple is positional, and additive, so a later release
+can add a field without a breaking signature change. A consuming `into_parts()`
+returns both halves.
+
+**The gate warning.** When a tool map is supplied, a step that carries
+`with_guidance` prose whose tool is *annotated* side-effecting
+(`read_only_hint == Some(false)` or `destructive_hint == Some(true)`) produces a
+`ProjectionWarningKind::GuidanceOnSideEffectingStep`: server-side workflow
+execution runs every deterministic step regardless of the guidance, so guidance
+on such a step is a post-hoc judgment the executing surface will ignore. The
+trigger is purely structural — the prose is never analysed, so it cannot be
+paraphrased around. A guidance-bearing step whose tool carries no annotations
+reports `GateCheckUnverifiable` instead of guessing: MCP's literal annotation
+defaults would fire on essentially every existing workflow, and a warning that
+fires everywhere is a warning that gets muted.
+
+**These warnings have exactly one delivery channel: `build()`'s structured
+return, with annotations supplied through `with_tools`.** A bare `as_skill()`
+receives only a `&SequentialWorkflow`, and tool annotations live only on
+`pmcp::types::ToolInfo::annotations`, which nothing reachable from a workflow
+carries — so `as_skill()` cannot *compute* the warning; it is not that it
+declines to report it. If you expected `as_skill()` to warn about a destructive
+step and got silence, that is why.
+
+### Added — three new public methods opt a server into the projected prepend
+
+Off by default; all three are `skills`-gated. With the flag off, prompt
+transcripts are byte-identical to previous releases.
+
+- `WorkflowPromptHandler::with_projected_skill_prepend(bool)` — the
+  handler-level opt-in. With it on, the projected `SKILL.md` body becomes prompt
+  message `[0]`, ahead of the user-intent message, which stays at `[1]`. The body
+  is rendered once when the setter runs and cached, never re-rendered per
+  request.
+- `ServerCoreBuilder::with_workflow_skill_prepend(bool)`
+- `ServerBuilder::with_workflow_skill_prepend(bool)`
+
+The two builder setters are what make the anti-drift claim hold **per server**
+rather than merely per workflow value: before them the opt-in was reachable only
+by hand-constructing a `WorkflowPromptHandler`, so a server registering a
+workflow the normal way through `prompt_workflow` could not enable it at all.
+Each setter applies to workflows registered *after* the call, so place it before
+`prompt_workflow`:
+
+```rust
+Server::builder()
+    .with_workflow_skill_prepend(true)
+    .prompt_workflow(workflow)?
+```
+
+### The rendered markdown is NOT semver-stable
+
+The exact bytes `as_skill()` produces may change on any minor release. They are
+pinned by a golden test — `tests/golden/workflow_skill_projection.md` — so that
+no change is accidental, and **every change to them will be a CHANGELOG entry**,
+because the bytes become the `sha256` digest published in the skill's
+`skills/list` entry. A consumer that pinned that digest must re-pin: a digest
+mismatch is a fatal pre-loop revocation for such a consumer, not a warning. A
+silent render change would therefore be a supply-chain event, not a cosmetic one.
+
+Two consequences worth stating explicitly, because neither reads as a behaviour
+change at the call site:
+
+- **Constant key order is digest-significant.** A `DataSource::Constant` renders
+  through `serde_json`, which this crate builds with `preserve_order`, so object
+  keys emit in *construction* order. Reordering the keys of a `json!` literal in a
+  workflow definition changes the rendered body and therefore the published
+  digest. The keys are deliberately not sorted: the rendered constant documents
+  what the workflow will actually *send*, and a sorted render would make the
+  manual procedure disagree with the call it describes.
+- **Template-binding order is sorted, not insertion order.**
+  `WorkflowStep::template_bindings` returns a `HashMap`, whose iteration order is
+  randomized per instance; the renderer sorts through a `BTreeMap` so the bytes
+  are reproducible across processes and machines.
+
+### Fixed — `U+2028`/`U+2029` are now escaped in the projected frontmatter
+
+**This is a render change under the digest rule above.** The rendered bytes move
+for any workflow whose description or name contains LINE SEPARATOR (`U+2028`) or
+PARAGRAPH SEPARATOR (`U+2029`); a consumer that pinned such a skill's `sha256`
+must re-pin. `tests/golden/workflow_skill_projection.md` is unaffected — its
+fixture contains neither codepoint — so the golden did not move.
+
+The frontmatter encoder escaped `\\`, `"`, `\n`, `\r`, `\t` and then everything
+`char::is_control()` accepts. That predicate is exactly the Unicode `Cc`
+category, but the YAML the frontmatter is read back as is **YAML 1.1**, whose
+scanner counts *five* line breaks: `\r`, `\n`, `U+0085`, `U+2028` and `U+2029`.
+The last two are `Zl`/`Zp`, not `Cc`, so they were emitted raw, with two
+measured consequences:
+
+- **A skill could be silently dropped from `skills/list`.** When the text after
+  the separator began `--- ` or `... `, the parse failed on a document
+  indicator. That failure is *downgraded* to a diagnostic, so the frontmatter
+  became `None`, the name-identity check was skipped, and the server built and
+  served the `SKILL.md` over `resources/read` while the SEP-2640 discovery
+  surface silently omitted it.
+- **The published description could diverge from the served one.** Blanks
+  adjacent to the separator fold away, so `"a<LS>   b"` round-tripped as
+  `"a<LS>b"` — `frontmatter.description` no longer matched
+  `Skill::resolved_description()` or `SequentialWorkflow::description()`.
+
+Both are escaped as `\uNNNN`. Not `\xNN`: that escape consumes exactly two hex
+digits, so `\x2028` would decode as a space followed by the literal text `28`.
+`sanitize_for_log` shared the same `Cc`-only assumption and now replaces both
+with `U+FFFD` alongside the control characters, closing the same forged-log-record
+vector the function was added for.
+
+### Fixed — `U+FFFE`/`U+FFFF` are escaped too, closing the last gap in that table
+
+**A second render change under the digest rule above,** and the same class as
+the entry immediately preceding it: a consumer that pinned the `sha256` of a
+skill whose name or description contains either codepoint must re-pin. The
+golden fixture contains neither, so it did not move.
+
+The `U+2028`/`U+2029` fix reasoned about YAML 1.1's *line breaks*. It left the
+neighbouring question — YAML 1.1's *printable set* — unasked. `unsafe-libyaml`'s
+reader admits `U+E000..=U+FFFD` in the BMP and stops there, so the two BMP
+noncharacters are rejected outright as unacceptable characters. Neither is
+Unicode `Cc`, so the `is_control()` arm never reached them, and neither is a
+line separator, so the new arms did not either: they were emitted raw and the
+whole frontmatter block then failed to parse. The registry downgrades that
+failure to a diagnostic, so the skill was silently dropped from `skills/list`
+while `as_skill()` and `SkillProjection::build()` both still returned `Ok`.
+
+These two are the ONLY gap: every other non-printable BMP scalar is `Cc`,
+surrogates cannot exist in a `char`, and the supplementary noncharacters
+(`U+1FFFE` and friends) fall inside libyaml's 4-byte accept range.
+
+### Fixed — a whitespace-only workflow description now takes the fallback
+
+**A render change under the digest rule.** `SequentialWorkflow::new("x", "   ")`
+previously rendered `description: "   "` into the frontmatter and `#    ` as the
+body heading, and logged nothing.
+
+`SkillProjection::build()` rejected such a description on
+`description().trim().is_empty()`, but `resolve_description` and
+`project_with_notices` substituted the deterministic fallback only on the
+UNTRIMMED `is_empty()`. So the two disagreed for every all-whitespace string,
+and `build()`'s own rustdoc — which claims `as_skill()` substitutes a legal
+string "for the same input" — was false. Both now share one
+`description_is_absent()` predicate, and the substitution emits its notice.
+
+### Fixed — a frontmatter delimiter may carry trailing whitespace
+
+**Wire-visible: a skill that was silently dropped from `skills/list` now
+appears in it.** The opening and closing `---` were compared byte-exactly, with
+only a trailing `\r` stripped. A `SKILL.md` beginning `"--- \n"` — accepted by
+Jekyll, gray-matter and every mainstream frontmatter reader — was therefore
+reported as `FrontmatterAbsent`: the skill contributed no `skills/list` entry
+while `resources/read` continued to serve its body, and the operator was told to
+"add a `---`-delimited YAML block at the top of the file" that was already
+there. Precisely the misdiagnosis the four-way `FrontmatterParse` split exists
+to prevent. Both readers now share one `is_frontmatter_delimiter()` that
+`trim_end()`s.
+
+### Fixed — hand-authored skill descriptions are YAML-decoded before publication
+
+**Wire-visible: `resources/list` and `prompts/*` descriptions change for any
+skill whose frontmatter `description` is folded, literal or quoted.**
+`Skill::new`'s eager scan was a raw `strip_prefix("description: ")` with no YAML
+decoding, so `description: >` surfaced as the literal `">"` and
+`description: "Refund: fast path"` kept its quotes — while the `skills/list`
+entry built from the same block by `parse_frontmatter_value` carried the
+properly decoded string. Two surfaces of one skill disagreeing about its
+description. `projection.rs` already worked around this for the projected path
+with `.with_description(..)`; hand-authored skills had no such escape. The
+strict reader's value is now preferred, with the loose scanner retained as the
+fallback so nothing that resolves today stops resolving.
+
+### Fixed — `.capabilities(...)` no longer erases the skills extension
+
+Registering a skill and then calling `.capabilities(caps)` wholesale-replaced
+`ServerCapabilities`, dropping the `io.modelcontextprotocol/skills` extension
+that `.skill(...)` had inserted. The registry itself survived, so the server
+went on serving every skill over `resources/list` and `resources/read` while
+`skills/list` and `skills/get` both answered `-32601 "this server does not
+declare the io.modelcontextprotocol/skills extension"`. Reversing the two calls
+worked, making the surface silently order-dependent. Both build paths now
+re-apply the extension when a registry is pending.
+
+### Changed — skill resources ride the FIRST page of a paginated `resources/list`
+
+When a server registers skills alongside its own `.resources(...)` handler, the
+composed listing previously re-emitted every `skill://` URI on **every** page of
+that handler's pagination. Skills do not paginate — the skills handler ignores
+its cursor and returns them all in one page — so they are now appended only to
+the caller's first page, and the user handler's `next_cursor`, `ttl_ms` and
+`cache_scope` are preserved rather than discarded.
+
+The accepted cost, recorded because it is a real trade-off rather than a
+strict improvement: a user handler that *ignores* its cursor and returns its
+full vector every time yields no skills for a cursor-bearing request. A
+conforming client never sends such a handler a cursor (it never issues one), so
+this needs a replayed or stale cursor to reach. Distinguishing a paginating
+handler from a cursor-ignoring one is not possible through the `ResourceHandler`
+trait. Both halves of the decision are pinned by tests.
+
+### Fixed — `Skills::into_handler()` logs the diagnostics it computes
+
+`into_handler()` — the public, documented registration path — built every
+build-time `SkillDiagnostic` (`FrontmatterAbsent`, `FrontmatterInvalid`,
+`FrontmatterNotAMapping`, `FrontmatterNameNotAString`, `NameMismatch`) and then
+discarded them unlogged, making it the only one of the three build paths that
+never warned. A server author whose skill was silently excluded from
+`skills/list` heard nothing.
+
+### Fixed — skill diagnostics are sanitized before they reach a log sink
+
+`log_skill_diagnostics` wrote the author-controlled skill URI and the rendered
+diagnostic message raw, bypassing the `shared::log_sanitize` module added in
+this same release for exactly this purpose. A skill registered with a newline in
+its path — `Skill::new("a", body).with_path("a\n2026-01-01 ERROR ...")` — could
+forge a second record in any line-oriented log. The `uri` field and the message
+now both route through `sanitize_for_log`, matching the sibling emitter in
+`projection.rs`.
+
 ## [2.19.3] - 2026-08-30
 
 **A carrier release, following the v2.19.2 and v2.19.1 precedent.** No `pmcp`

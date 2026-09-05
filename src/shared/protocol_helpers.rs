@@ -634,7 +634,9 @@ mod tests {
             // absorb a future internally-routed method.
             IngressRequest::Public(_)
             | IngressRequest::Internal(
-                crate::types::protocol::InternalClientRequest::ServerDiscover(_),
+                crate::types::protocol::InternalClientRequest::ServerDiscover(_)
+                | crate::types::protocol::InternalClientRequest::SkillsList { .. }
+                | crate::types::protocol::InternalClientRequest::SkillsGet { .. },
             ) => {
                 panic!("tasks/update must classify as InternalClientRequest::TasksUpdate")
             },

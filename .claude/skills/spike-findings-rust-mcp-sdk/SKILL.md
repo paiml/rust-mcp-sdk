@@ -1,6 +1,6 @@
 ---
 name: spike-findings-rust-mcp-sdk
-description: Implementation blueprint from spike experiments — SEP-2640 Skills support AND the schema-server toolkit lift (config-driven MCP servers for SQL / GraphQL / OpenAPI backends). Requirements, proven patterns, multi-dialect SQL connector trait, two-axis Skills (Type 1 build-time vs Type 2 runtime SEP-2640), and the dual-surface invariant. Auto-loaded during implementation work.
+description: Implementation blueprint from spike experiments — SEP-2640 Skills support (incl. current-draft conformance gaps), the schema-server toolkit lift (config-driven MCP servers for SQL / GraphQL / OpenAPI backends), AND tri-surface skills positioning (skill vs workflow-prompt vs agent — where judgment runs). Requirements, proven patterns, multi-dialect SQL connector trait, two-axis Skills, the dual-surface invariant, and the digest-pin trust model. Auto-loaded during implementation work.
 ---
 
 <context>
@@ -29,7 +29,20 @@ workspace crate, ships per-backend connector crates with multi-dialect
 SQL support, AND ships a `pmcp-config-helper` MCP server with Type 2
 SEP-2640 authoring Skills (consumed by end-users in their MCP client).
 
-Spike sessions wrapped: 2026-05-12, 2026-05-17.
+**Session 3 (2026-09-01, spikes 008-011):** Skills positioning.
+With the `skills` feature shipped (`src/server/skills.rs`, examples
+s44/c10), these spikes re-validated conformance against the CURRENT
+SEP-2640 draft (rewritten 2026-08-29: `skills/list` + `skills/get` now
+mandatory — the shipped module is non-conformant on the one thing it
+declares) and settled how Skills relate to the SDK's two other
+instruction-carrying mechanisms: prompts-as-workflows
+(`SequentialWorkflow`) and pmcp-agent. Verdict: three points on one
+execution-locus axis sharing one content type — the axis is WHERE
+JUDGMENT RUNS. Skill is the canonical content primitive the other two
+project to (workflow → skill) and consume from (agent ← pinned skill).
+Alongside, composing — never instead.
+
+Spike sessions wrapped: 2026-05-12, 2026-05-17, 2026-09-01.
 </context>
 
 <requirements>
@@ -112,6 +125,47 @@ reference file below builds on this base.
   arc-registration methods that `ServerCoreBuilder` already has
   (`src/server/builder.rs:203`). Without them, every config-driven
   toolkit author writes a 20-line delegating wrapper shim.
+
+### From session 3 (Skills positioning, idea `skills-positioning`):
+
+- **SEP-2640 conformance target is the CURRENT draft, not the 2026-05-12
+  one the module shipped against.** `skills/list` (MUST), `skills/get`
+  (MUST), optional `resources/directory/read`; entries carry verbatim
+  frontmatter JSON + `{uri, digest: sha256, size}` manifests;
+  `skill://index.json` is nonstandard; archive mode formally dead.
+- **Declaring-but-not-implementing is indefensible.** Until the two MUST
+  methods land (via the `InternalClientRequest` classifier pattern at
+  `src/types/protocol/mod.rs:583` — NO new public `ClientRequest`
+  variant, 2.x promise), stop auto-declaring the extension key in
+  `set_skills_capabilities`.
+- **Workflow↔skill is a projection, not a rival feature.** Ship
+  `SequentialWorkflow::as_skill()` (SDK-owned renderer, deterministic,
+  byte-equal on re-derivation). Generated body stays a COMPLETE manual
+  procedure; the "Server-accelerated alternative" section
+  cross-references the workflow prompt but never redirects.
+- **Projection owns name slugification** (`refund_flow` → `refund-flow`);
+  final URI segment must equal the skill name.
+- **Post-hoc judgment is the workflow surface's blind spot.** Guidance
+  prose cannot gate server-side execution. Projection-time warning
+  required when a side-effecting step carries gate-like guidance. The
+  surfaces differ on WHERE JUDGMENT RUNS, not on transport.
+- **AgentPackage digest pins ARE SEP-2640 content-bound approval.**
+  `[[skills]]` slots `{connector, uri, digest}`, digest REQUIRED; packing
+  is the approval ceremony; resolve-time mismatch is revocation (fatal
+  ResolveError, pre-loop; never fetch-and-continue). Composition must be
+  origin-tagged.
+- **System-prompt placement is a privilege decision.** Pinned skill → may
+  compose into instructions. Unpinned or `"resources": "dynamic"` → must
+  NOT; user-role turn or refusal. Skill-driven supporting-file reads stay
+  origin-scoped to the pinning connector (`ToolCall.connector`).
+- **Positioning is settled: alongside, composing — never instead.**
+  Measured (spike 011): the ineligible order got refunded ONLY by the
+  workflow surface. Context cost is NOT monotone — workflow transcript
+  outweighed skill body at demo scale (1401 B vs 624 B; agent 82 B).
+- **The Skill data model stays as-is.** A fully conforming `skills/list`
+  entry is derivable from existing `Skill` fields; fixes are API surface
+  (`Skills::entries()`, digest/size computation, name-identity validation
+  at build), never a data-model rework.
 </requirements>
 
 <findings_index>
@@ -124,6 +178,8 @@ reference file below builds on this base.
 | Schema-Server Architecture | [`references/schema-server-architecture.md`](references/schema-server-architecture.md) | Proto-SDK already extracted at `mcp-server-common` (~2.2k LoC); lift promotes, doesn't rewrite. No single `SchemaServer<S, C>` trait — per-backend executors diverge semantically. Three user-facing shapes: pure-config binary (headline), scaffolded crate, library use (12 lines). |
 | SQL Multi-Dialect Connectors | [`references/schema-server-sql-dialects.md`](references/schema-server-sql-dialects.md) | `SqlConnector` 3-method trait + `Dialect` 4-variant enum + 2 free helpers handle Postgres / MySQL / Athena / SQLite. Adding Oracle / SQL Server / DuckDB is a 3-step extension that does NOT touch toolkit core. |
 | Type 2 Authoring Skills | [`references/schema-server-authoring-skills.md`](references/schema-server-authoring-skills.md) | `pmcp-config-helper` MCP server ships SEP-2640 Skill bundle for `config.toml` authoring. ~15-line server, content via `include_str!` for Lambda-suitable hermetic binary. End-users consume via their MCP client. |
+| SEP-2640 Conformance (current draft) | [`references/sep-2640-conformance.md`](references/sep-2640-conformance.md) | Shipped module is NON-CONFORMANT vs the current draft: auto-declares the extension but lacks the now-mandatory `skills/list` + `skills/get` (a conforming host's first call gets -32601). 7 gaps with file/line fixes; data model sufficient; fix path is the `InternalClientRequest` classifier route. |
+| Skills Positioning / Tri-Surface | [`references/skills-positioning-tri-surface.md`](references/skills-positioning-tri-surface.md) | Skill / workflow / agent differ on WHERE JUDGMENT RUNS. Workflow projects to skill (~90 lines, byte-equal); agent consumes digest-pinned skills (~60 lines, zero pmcp-agent changes); measured matrix: only the workflow surface refunded an ineligible order. |
 
 ## Source Files
 
@@ -135,6 +191,10 @@ Original spike source files preserved in [`sources/`](sources/):
 - [`sources/004-schema-server-thin-slice-sql/`](sources/004-schema-server-thin-slice-sql/) — Inline toolkit slice + SQLite reference + 12-line user surface.
 - [`sources/005-multi-dialect-sql-connector/`](sources/005-multi-dialect-sql-connector/) — `SqlConnector` trait + `Dialect` enum + Postgres/MySQL/Athena/SQLite drivers.
 - [`sources/006-authoring-skills-server/`](sources/006-authoring-skills-server/) — `pmcp-config-helper` MCP server + SEP-2640 Skill bundle.
+- [`sources/008-sep-2640-drift-check/`](sources/008-sep-2640-drift-check/) — Wire-proof drift check vs the current SEP-2640 draft; 7-gap verdict table.
+- [`sources/009-workflow-skill-projection/`](sources/009-workflow-skill-projection/) — `project_skill()` renderer + coverage/determinism/registry assertions + the post-hoc judgment transcript.
+- [`sources/010-agent-instructions-from-skills/`](sources/010-agent-instructions-from-skills/) — SkillPin + fetch/verify/compose + engine system-prompt byte-equality + tamper refusal.
+- [`sources/011-three-mechanisms-one-task/`](sources/011-three-mechanisms-one-task/) — One refund task on three surfaces; shared policy brain; measured decision matrix.
 
 Each source binary is self-contained and runnable:
 ```bash
@@ -146,13 +206,15 @@ cargo run --manifest-path .planning/spikes/00N-name/Cargo.toml
 ### Phase 0 (Skills support — from session 1)
 
 1. Land GAP #1 (`extensions` on `ServerCapabilities`) — additive, ~10 LOC.
+   *(Already done — spike 008 confirms the declaration is live in
+   `set_skills_capabilities`.)*
 2. Lift `Skill` / `SkillReference` / `Skills` from spike 002 into `pmcp`
    behind a `skills` feature flag. *(Already done — Phase 80 shipped.)*
 3. Add `.skill(...)`, `.skills(...)`, `.bootstrap_skill_and_prompt(...)`
    to `ServerCoreBuilder`. Internal composition over any existing
    `.resources(...)` handler. *(Already done.)*
 4. Make `Skills::into_handler()` reject duplicate URIs. *(Already done.)*
-5. Add `examples/s38_server_skills.rs` + `examples/c38_client_skills.rs`.
+5. Add server + client skills examples. *(Already done — shipped as s44/c10.)*
 6. Add `tests/skills_integration.rs` asserting all four SEP-2640 endpoints
    AND the byte-equal dual-surface invariant.
 
@@ -198,6 +260,33 @@ cargo run --manifest-path .planning/spikes/00N-name/Cargo.toml
 18. Same for `ai-agents/kiro/`.
 19. Cross-link Type 1 ↔ Type 2 (Type 1 docs mention `pmcp-config-helper`
     as runtime companion for end-user-facing config curation).
+
+### Session 3 follow-ups (SEP-2640 conformance + positioning)
+
+20. **Land `skills/list` + `skills/get`** via the `InternalClientRequest`
+    classifier route (`src/types/protocol/mod.rs:583`) — or stop
+    auto-declaring the extension key until they land. CRITICAL: the
+    shipped module currently declares a capability it cannot answer.
+21. **`Skills::entries()`** — verbatim frontmatter JSON + sha256/size
+    manifests, computed at `into_handler()`/build; decide the YAML dep
+    (serde_yaml deprecated → serde_yaml_ng / serde-yml / saphyr, or a
+    documented flat-frontmatter limit).
+22. **Retire (or legacy-gate) `skill://index.json`** in the same change;
+    validate name == final URI segment at build; add ≤512-file / ≤16 MiB
+    guards.
+23. **`SequentialWorkflow::as_skill()`** projection — slugification owned
+    by the projection; "Server-accelerated alternative" cross-references,
+    never redirects; projection-time warning for gate-like guidance on
+    side-effecting steps.
+24. **`[[skills]]` digest-pinned slots on AgentPackage** + resolver-side
+    fetch/verify/compose in `pmcp-agent::config::resolver`; encode the
+    trust rules (pinned→system prompt; unpinned/dynamic→user turn or
+    refuse; mismatch→fatal pre-loop; origin-scoped reads via
+    `ToolCall.connector`). Grow the pin to the full entry manifest once
+    `skills/get` (item 20) lands.
+25. **Decision-matrix docs page** for skill vs workflow-prompt vs agent,
+    carrying spike 011's measured numbers — mechanism choice is
+    deployment, not content.
 </findings_index>
 
 <metadata>
@@ -215,9 +304,26 @@ cargo run --manifest-path .planning/spikes/00N-name/Cargo.toml
 - 005-multi-dialect-sql-connector (VALIDATED — 3-method trait + 4-variant Dialect enum handle Postgres/MySQL/Athena/SQLite; 3-step extension protocol for new dialects)
 - 006-authoring-skills-server (VALIDATED on first compile — Type 2 SEP-2640 authoring skills via composition of upstream Skill machinery)
 
+### Session 3 (2026-09-01)
+
+- 008-sep-2640-drift-check (VALIDATED — 7 drift gaps vs current draft; declaring-but-not-implementing is the one indefensible state)
+- 009-workflow-skill-projection (VALIDATED — faithful deterministic ~90-line projection; post-hoc judgment trap observed live)
+- 010-agent-instructions-from-skills (VALIDATED — zero pmcp-agent changes; digest pin == SEP content-bound approval)
+- 011-three-mechanisms-one-task (VALIDATED — measured decision matrix; judgment locus is the real axis)
+
+### Not wrappable
+
+- 007-azure-containerapp-deploy — directory holds Azure Container Apps
+  deploy/redeploy run logs + a server scaffold from the Phase 80 era; no
+  README, never indexed (MANIFEST marks it UNDOCUMENTED). The spike slot
+  number is consumed; the content carries no findings to wrap.
+
 ## Deferred (not yet spiked)
 
-- **007 openapi-auth-policy-pluggability** — gates Phase 3 OpenAPI lift. Can ONE `PolicyEvaluator` trait + auth-passthrough shape serve AVP, OPA, Cedar, bespoke RBAC? If no, OpenAPI stays at pmcp-run.
+- **openapi-auth-policy-pluggability** — gates Phase 3 OpenAPI lift. Can ONE `PolicyEvaluator` trait + auth-passthrough shape serve AVP, OPA, Cedar, bespoke RBAC? If no, OpenAPI stays at pmcp-run. (Formerly penciled in as "spike 007"; that number was since consumed by the untracked Azure deploy logs above — this spike remains unnumbered.)
+- **tasks-vertical-slice** — validate `tasks-feature-design.md` compiles + runs end-to-end before scaffolding `crates/pmcp-tasks/`.
+- **task-retry-expiry-gaps** — pragmatic retry/expiry policy layer above SEP-1686.
+- **skills-describing-tasks** — composition of the two primitives in an agent workflow.
 - **008 cargo-pmcp-new-from-schema** — scaffolds Shape B (custom-handlers Cargo project). Low risk; depends on Phase 1 toolkit lift being shippable.
 - **009 schema-codemode-as-skill** — composition: code-mode bootstrap as SEP-2640 Skill (vs current `/start_code_mode` prompt convention). Connective work after Phase 1 lands.
 - `tasks-vertical-slice` — validate `docs/design/tasks-feature-design.md` architecture before scaffolding `crates/pmcp-tasks/`.

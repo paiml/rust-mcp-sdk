@@ -1,0 +1,1875 @@
+//! SEP-2640 `skills/list` + `skills/get` ROUTING and the guarantees those routes
+//! must keep true (Phase 125, plans 01 and 02).
+//!
+//! # Two halves, and they are not the same kind of test
+//!
+//! **Half one — the LIVE WIRE.** Both methods are routed through the
+//! crate-private `InternalClientRequest` classifier that Phase 112 built for
+//! `server/discover`, so nothing about the answer can be trusted from source
+//! alone. These tests drive REAL bytes over a loopback socket through the real
+//! `StreamableHttpServer` and assert the shape of the JSON that comes back —
+//! including the digest, which is verified ON THE WIRE and not on an in-process
+//! struct.
+//!
+//! **Half two — the LOST GUARDS.** Because the design adds NOTHING to the public
+//! `ClientRequest` enum, none of that enum's compile-time protections apply here.
+//! The source scan, the runtime wire proof, the era-gate control, the
+//! name-bearing assertion and the stdio-reach probe replace them, and each one
+//! catches a DIFFERENT mistake.
+//!
+//! # The properties
+//!
+//! | # | test | property |
+//! |---|------|----------|
+//! | 1 | `skills_list_returns_a_conforming_entry_on_v2` | a live v2 POST answers with a conforming entry: verbatim frontmatter, `sha256:`+64-hex digest, byte-accurate size, `resultType: "complete"`, no `nextCursor` |
+//! | 2 | `skills_list_answers_on_v1_without_the_caching_attributes` | the D-07 era split, in BOTH directions: v2 carries `ttlMs`+`cacheScope`, v1 carries NEITHER |
+//! | 3 | `empty_registry_answers_skills_list_with_an_empty_array` | a declared-but-empty catalog ANSWERS the method rather than denying it |
+//! | 4 | `client_request_has_no_skills_variants` | the SEMVER mistake, as a source scan — there is no `cargo semver-checks` in `Makefile` or `.github/workflows/` (grep: zero hits), so this test IS the enforcement |
+//! | 5 | `skills_methods_do_not_parse_as_public_client_requests` | the same property at RUNTIME, with a `resources/list` control that MUST parse |
+//! | 6 | `skills_list_has_no_era_gate_and_server_discover_still_does` | the no-era-gate property, with the `server/discover` `-32601` negative control that stops it passing vacuously |
+//! | 7 | `neither_skills_method_is_routing_name_bearing` | the omission from the `Mcp-Name` table is a DECISION, resolved through the production seam rather than a restated method list |
+//! | 8 | `stdio_ingress_rejects_a_skills_list_frame` | the D-01 reach: over stdio the frame fails at `parse_message`, with a `resources/list` control that MUST parse |
+//!
+//! Plan 125-02 adds the `skills/get` half and the `ServerCore` boundary:
+//!
+//! | # | test | property |
+//! |---|------|----------|
+//! | 9 | `skills_get_returns_the_single_conforming_entry_on_v2` | a live `skills/get` on a registered SKILL.md URI answers with ONE entry identical in shape to a `skills/list` entry, `resultType: "complete"`, no cursor |
+//! | 10 | `skills_get_unknown_uri_returns_invalid_params` | D-06: an unserved URI is `-32602`, asserted as the exact numeric code |
+//! | 11 | `skills_get_reference_uri_returns_invalid_params` | the draft says `uri` MUST name a SKILL.md; a registered skill's REFERENCE file is `-32602` even though `resources/read` serves it |
+//! | 12 | `skills_get_malformed_params_return_invalid_params` | absent params, non-object params and a non-string `uri` all reach `-32602` from the SERVED branch, and none panics |
+//! | 13 | `skills_get_traversal_shaped_uri_returns_invalid_params` | T-125-06: `..` segments and appended path suffixes are `-32602` because the lookup is an exact map hit, never a path join |
+//! | 14 | `resources_read_unknown_uri_still_returns_method_not_found` | the DIVERGENCE control, MEASURED: `resources/read` keeps its pre-existing behaviour — handler-level `-32601`, re-wrapped to `-32603` on the wire — and in particular is not `-32602`, so the `skills/get` code reads as a decision rather than an inconsistency |
+//! | 15 | `skills_get_result_carries_no_cache_attributes_on_either_era` | R-17: `ttlMs` and `cacheScope` are ABSENT from a `skills/get` result on v1 AND on v2 — asserted on the wire, not inferred from the source not naming `Cacheable::Yes` |
+//! | 16 | `skills_get_auth_refusal_precedes_the_params_error` | R-16: against an auth-carrying server an UNCREDENTIALED malformed-params `skills/get` gets the authentication refusal; the SAME request WITH credentials gets `-32602`. Both halves are required |
+//! | 17 | `server_core_builder_still_serves_skills_as_resources` | the reachable half of the retired parity claim: a `ServerCoreBuilder`-built core answers typed `resources/list` / `resources/read` for its skills |
+//! | 18 | `server_core_declares_no_skills_field_or_skills_method` | the dead-code guard: `ServerCore` must gain neither a `skill_entries` field nor a skills method, because neither could ever be reached |
+//!
+//! Tests 4 and 5 are deliberately NOT redundant, and the difference is
+//! measurable: typing `SkillsList` into the `pub enum ClientRequest` block fails
+//! 4 and not 5 until something also makes serde accept it, while a
+//! `#[serde(rename = "skills/list")]` smuggled onto an EXISTING variant fails 5
+//! and not 4 (the block gains no new variant name). Tests 3 and 6 are likewise
+//! distinct: 3 is about an empty CATALOG, 6 about an absent ERA GATE.
+//!
+//! # Why the method literals are restated here
+//!
+//! A Rust integration test is its own crate, so it cannot reach the crate's
+//! single-sourced `pub(crate) SKILLS_LIST_METHOD` / `SKILLS_GET_METHOD`. The
+//! restatement below carries the same justification
+//! `tests/v2_tasks_update_routing.rs` uses for `tasks/update`.
+
+#![cfg(all(
+    feature = "skills",
+    feature = "streamable-http",
+    feature = "http-client",
+    not(target_arch = "wasm32")
+))]
+
+mod common;
+
+// The in-process duplex seam, included per-crate exactly as its own module docs
+// prescribe. It is the ONE harness that accepts a `ServerCore`, which is what
+// test 17 needs — and the fact that it takes a typed `Request` too is the same
+// fact that makes test 18's boundary real. Declared at the top level (not inside
+// a nested module) because `#[path]` on a nested module resolves relative to the
+// ENCLOSING module's directory.
+#[path = "common/duplex.rs"]
+mod duplex;
+
+use common::v2::{
+    header, post, post_raw, result_of, spawn_default_config, teardown, v1_body, v1_session,
+    v2_body, v2_headers_for, BearerSubjects, Resp, V1, V2,
+};
+use pmcp::server::skills::{Skill, SkillReference, Skills};
+use pmcp::types::protocol::ProtocolVersion;
+use pmcp::Server;
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+
+/// The wire method under test. Spelled once here; the crate's own single-sourced
+/// constant is `pub(crate)` and therefore unreachable from an integration crate.
+const SKILLS_LIST: &str = "skills/list";
+
+/// The sibling SEP-2640 method, routed by plan 125-02.
+///
+/// Two of the properties below are about the method STRING and held even before
+/// the route existed: its absence from `ClientRequest` (tests 4 and 5) and its
+/// absence from the routing-name table (test 7). Tests 9-16 are about the route.
+const SKILLS_GET: &str = "skills/get";
+
+/// The `Mcp-Session-Id` request header, for the v1 legs: a v1 caller against a
+/// default-config harness must complete a real handshake or it gets `-32600`,
+/// which looks like a skills bug and is not one.
+const SESSION_HEADER: &str = "Mcp-Session-Id";
+
+/// The canonical fixture skill's SKILL.md body.
+///
+/// Frontmatter discipline (phase-wide rule): `name` equals the FINAL `/` segment
+/// of the resolved URI. Plan 125-03 makes a mismatch a build-time rejection, so a
+/// fixture that violated it here would surface in a later wave as a confusing
+/// failure inside a plan that did not author it.
+///
+/// `license` is the non-required third field: it is what proves the frontmatter
+/// is emitted VERBATIM rather than curated down to the two fields SEP-2640
+/// requires.
+const REFUNDS_BODY: &str = "---\nname: refunds\ndescription: Process customer refund requests\nlicense: Apache-2.0\n---\n# Refunds\n\nFollow company policy.\n";
+
+/// Build the fixture server for this suite.
+///
+/// # The explicit accept list is LOAD-BEARING — do not "simplify" it away
+///
+/// `common::v2::spawn_default_config` takes an already-built `Server` and only
+/// selects the HTTP config; it does not touch the server's accepted protocol
+/// versions. A plain `Server::builder()` accepts the DEFAULT version set, so a
+/// 2026-07-28-framed POST would be refused by the version gate BEFORE skills
+/// dispatch is ever reached — and the test would fail on a version error while
+/// appearing to indict the routing work. The chain below is the same explicit
+/// `[V1, V2]` accept list `common::v2::build_v2_server_with` uses, with both
+/// values read from the harness rather than retyped.
+fn skills_fixture_server(registry: Skills) -> Server {
+    Server::builder()
+        .name("skills-routing-fixture")
+        .version("1.0.0")
+        .with_supported_protocol_versions([
+            ProtocolVersion(V1.to_string()),
+            ProtocolVersion(V2.to_string()),
+        ])
+        .skills(registry)
+        .build()
+        .expect("fixture server builds")
+}
+
+/// A registry holding the one canonical fixture skill.
+fn one_skill_registry() -> Skills {
+    Skills::new().add(Skill::new("refunds", REFUNDS_BODY))
+}
+
+/// The canonical fixture skill's SKILL.md URI — the ONE `skills/get` key that
+/// resolves.
+const REFUNDS_SKILL_MD: &str = "skill://refunds/SKILL.md";
+
+/// A reference file registered on the fixture skill.
+///
+/// SEP-2640 §9: a reference is READABLE via `resources/read` but is never a
+/// `skills/get` key — the draft says the `uri` MUST name a skill's SKILL.md. That
+/// asymmetry is what test 11 pins.
+const REFUNDS_REFERENCE_PATH: &str = "examples/email.md";
+const REFUNDS_REFERENCE_URI: &str = "skill://refunds/examples/email.md";
+const REFUNDS_REFERENCE_BODY: &str = "Dear customer,\n";
+
+/// The one-skill registry plus a reference file, for the tests that need a URI
+/// which the RESOURCE surface serves and the SKILLS surface must not.
+fn skill_with_reference_registry() -> Skills {
+    Skills::new().add(
+        Skill::new("refunds", REFUNDS_BODY).with_reference(SkillReference::new(
+            REFUNDS_REFERENCE_PATH,
+            "text/markdown",
+            REFUNDS_REFERENCE_BODY,
+        )),
+    )
+}
+
+/// POST a v2-framed `skills/get` for `uri` and return the raw response view.
+async fn post_v2_skills_get(addr: SocketAddr, id: i64, uri: &str) -> Resp {
+    let params = json!({ "uri": uri });
+    post(
+        addr,
+        &v2_headers_for(SKILLS_GET, &params),
+        &v2_body(SKILLS_GET, json!(id), params),
+    )
+    .await
+}
+
+/// The numeric JSON-RPC error code carried by a response, or a panic naming the
+/// body.
+///
+/// Every `-32602` assertion below goes through this rather than merely checking
+/// that `error` is present: "an error was returned" would also hold for the
+/// `-32601` this plan must NOT emit, which is the specific confusion D-06 exists
+/// to prevent.
+fn error_code_of(response: &Resp) -> i64 {
+    response.body["error"]["code"].as_i64().unwrap_or_else(|| {
+        panic!(
+            "expected a JSON-RPC error with a numeric code, got: {}",
+            response.raw
+        )
+    })
+}
+
+/// `-32602`, read from the crate's own constant rather than retyped.
+fn invalid_params() -> i64 {
+    i64::from(pmcp::types::protocol::error_codes::INVALID_PARAMS)
+}
+
+/// POST a v2-framed `skills/list` and return the raw response view.
+async fn post_v2_skills_list(addr: SocketAddr, id: i64) -> Resp {
+    let params = json!({});
+    post(
+        addr,
+        &v2_headers_for(SKILLS_LIST, &params),
+        &v2_body(SKILLS_LIST, json!(id), params),
+    )
+    .await
+}
+
+/// The `clientInfo.name` this file's v1 handshakes declare, so a red on the
+/// shared [`v1_session`] names the file that opened the session.
+const V1_CLIENT_NAME: &str = "skills-routing-v1-client";
+
+// ===========================================================================
+// 1 — the live wire.
+// ===========================================================================
+
+/// A live `StreamableHttpServer` carrying ONE frontmatter-bearing skill answers a
+/// v2 `skills/list` POST with a single conforming entry.
+///
+/// Every assertion below reads the WIRE BODY, not an in-process struct. That is
+/// the point of the tracer: the entry could be perfect in memory and still never
+/// reach a caller if any of the five transport sites were missed.
+#[tokio::test]
+async fn skills_list_returns_a_conforming_entry_on_v2() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+
+    let response = post_v2_skills_list(addr, 4).await;
+    assert_eq!(
+        response.status, 200,
+        "a served method answers at HTTP 200: {}",
+        response.raw
+    );
+    assert_eq!(
+        response.body["id"],
+        json!(4),
+        "the ORIGINAL id is preserved"
+    );
+
+    let result = result_of(&response);
+    assert_eq!(
+        result["resultType"], "complete",
+        "SEP-2640's own skills/list example carries resultType complete: {}",
+        response.raw
+    );
+
+    let skills = result["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result.skills is an array; got {}", response.raw));
+    assert_eq!(skills.len(), 1, "one registered skill, one entry");
+
+    let entry = &skills[0];
+    assert_eq!(entry["uri"], "skill://refunds/SKILL.md");
+
+    // VERBATIM: all three authored fields survive, including the non-required
+    // one. A curated `{name, description}` subset is a guaranteed host-side
+    // rejection, because the host re-reads the SKILL.md and compares field by
+    // field.
+    assert_eq!(entry["frontmatter"]["name"], "refunds");
+    assert_eq!(
+        entry["frontmatter"]["description"],
+        "Process customer refund requests"
+    );
+    assert_eq!(entry["frontmatter"]["license"], "Apache-2.0");
+
+    let manifest = entry["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("entry.resources is an array; got {}", response.raw));
+    assert_eq!(
+        manifest[0]["uri"], "skill://refunds/SKILL.md",
+        "SKILL.md is the first manifest row"
+    );
+
+    // The digest, verified on the wire: `sha256:` + 64 LOWERCASE hex characters.
+    assert_digest_shape(&manifest[0], "skills/list on v2", &response.raw);
+
+    assert_eq!(
+        manifest[0]["size"],
+        json!(REFUNDS_BODY.len()),
+        "size is the byte length of the SERVED SKILL.md"
+    );
+
+    // D-11: a single complete page. An absent cursor means the listing is
+    // complete, so the key must not appear at all.
+    assert!(
+        result.get("nextCursor").is_none(),
+        "skills/list returns a single page and emits NO nextCursor: {}",
+        response.raw
+    );
+
+    // D-07 / R-03: the caching attributes. These two keys have exactly ONE writer
+    // in the tree — the shared v2 projection, which ensures both under
+    // `Cacheable::Yes` with `Some(Era::V2)`. Their presence here is therefore the
+    // only OBSERVABLE proof that the `Cacheable::Yes` named at the
+    // `build_skills_list_response` call site actually reached the envelope;
+    // without this assertion the claim would be about source text, not behaviour.
+    assert!(
+        result.get("ttlMs").is_some(),
+        "a v2 skills/list result carries ttlMs: {}",
+        response.raw
+    );
+    assert!(
+        result.get("cacheScope").is_some(),
+        "a v2 skills/list result carries cacheScope: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 2 — the v1 twin: answered, but WITHOUT the caching attributes.
+// ===========================================================================
+
+/// `skills/list` answers on a v1 connection too — it carries no era gate — and
+/// its v1 result carries NEITHER caching attribute.
+///
+/// The negative half is what makes the v2 assertion meaningful: without it, a
+/// server that emitted `ttlMs`/`cacheScope` unconditionally would pass test 1 and
+/// nothing would notice.
+#[tokio::test]
+async fn skills_list_answers_on_v1_without_the_caching_attributes() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
+
+    let response = post(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &v1_body(SKILLS_LIST, json!(11), json!({})),
+    )
+    .await;
+
+    assert_eq!(
+        response.status, 200,
+        "answered, not refused: {}",
+        response.raw
+    );
+    let result = result_of(&response);
+    assert_eq!(
+        result["skills"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.skills is an array; got {}", response.raw))
+            .len(),
+        1,
+        "the same catalog is served on 2025-11-25"
+    );
+
+    assert!(
+        result.get("ttlMs").is_none(),
+        "the v1 result carries NO ttlMs — the attributes are 2026-07-28+: {}",
+        response.raw
+    );
+    assert!(
+        result.get("cacheScope").is_none(),
+        "the v1 result carries NO cacheScope: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 3 — an empty catalog ANSWERS the method.
+// ===========================================================================
+
+/// A server built with an EMPTY skills registry answers `skills/list` with an
+/// empty array, not `-32601`.
+///
+/// The capability is declared at build time regardless of catalog size, so an
+/// empty catalog that denied the method would make that declaration a lie.
+#[tokio::test]
+async fn empty_registry_answers_skills_list_with_an_empty_array() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(Skills::new())).await;
+
+    let response = post_v2_skills_list(addr, 5).await;
+    assert_eq!(
+        response.status, 200,
+        "answered, not refused: {}",
+        response.raw
+    );
+
+    let result = result_of(&response);
+    assert_eq!(
+        result["skills"],
+        json!([]),
+        "an empty catalog is an empty array: {}",
+        response.raw
+    );
+    assert_eq!(result["resultType"], "complete");
+
+    teardown(handle, ()).await;
+}
+
+/// A server that never DECLARED the extension answers `-32601`, on BOTH methods.
+///
+/// The negative half of the test above, and the half that was missing: the two
+/// methods ride the ungated `InternalClientRequest` classifier, so without a
+/// capability gate EVERY streamable-HTTP pmcp server — one that never called
+/// `.skills(..)`, and one compiled without `feature = "skills"` at all —
+/// answered `skills/list` with `200 {"skills": []}` where it previously answered
+/// method-not-found. A host that probes for SEP-2640 support by CALLING the
+/// method then read a false positive contradicting the same server's own
+/// `initialize` result.
+///
+/// The distinction the pair pins is DECLARED-vs-EMPTY, not empty-vs-populated:
+/// `.skills(Skills::new())` above declares the extension and must answer, while
+/// this fixture declares nothing and must refuse.
+#[tokio::test]
+async fn a_server_that_declares_no_skills_extension_refuses_both_methods() {
+    let undeclared = Server::builder()
+        .name("no-skills-fixture")
+        .version("1.0.0")
+        .with_supported_protocol_versions([
+            ProtocolVersion(V1.to_string()),
+            ProtocolVersion(V2.to_string()),
+        ])
+        .build()
+        .expect("fixture server builds");
+    let (addr, handle) = spawn_default_config(undeclared).await;
+
+    let listed = post_v2_skills_list(addr, 6).await;
+    assert_eq!(
+        error_code_of(&listed),
+        i64::from(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "an undeclared extension must answer -32601, not an empty listing: {}",
+        listed.raw
+    );
+
+    let got = post_v2_skills_get(addr, 7, REFUNDS_SKILL_MD).await;
+    assert_eq!(
+        error_code_of(&got),
+        i64::from(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "skills/get must refuse too — a -32602 there asserts the method EXISTS: {}",
+        got.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 4 — the SEMVER mistake, as a source scan.
+// ===========================================================================
+
+/// `pub enum ClientRequest` must never gain a `SkillsList` / `SkillsGet` variant.
+///
+/// `ClientRequest` carries `#[serde(tag = "method", content = "params")]` with
+/// **no `#[non_exhaustive]`**, so `enum_variant_added` is a semver-MAJOR break and
+/// every downstream exhaustive `match` stops compiling; adding
+/// `#[non_exhaustive]` instead is itself a source break. Both SEP-2640 methods
+/// are carried by the crate-private `InternalClientRequest` and classified by
+/// `classify_internal_method`.
+///
+/// **This test IS the enforcement.** There is no `cargo semver-checks` in
+/// `Makefile` or `.github/workflows/` — grep returns zero hits — so nothing else
+/// in the repository catches the regression. It reads the SOURCE from disk rather
+/// than a compiled constant, exactly like
+/// `client_request_has_no_tasks_update_variant`, and is scoped to the enum BLOCK
+/// rather than the file: `src/types/protocol/mod.rs` legitimately names
+/// `SkillsList` on the crate-private enum that carries the method instead.
+#[test]
+fn client_request_has_no_skills_variants() {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/types/protocol/mod.rs");
+    let source = std::fs::read_to_string(&path).expect("protocol/mod.rs is readable");
+
+    let start = source
+        .find("\npub enum ClientRequest {")
+        .expect("the `pub enum ClientRequest` declaration still exists");
+    let rest = &source[start + 1..];
+    let end = rest
+        .find("\n}\n")
+        .expect("the ClientRequest block is brace-terminated at column 0");
+    let block = &rest[..end];
+
+    // Anti-vacuity: an empty or truncated block would pass both assertions below
+    // while measuring nothing.
+    assert!(
+        block.contains("ListResources"),
+        "the extracted block is not the real ClientRequest enum; scan is vacuous.\n\
+         Block was:\n{block}"
+    );
+
+    for variant in ["SkillsList", "SkillsGet"] {
+        assert!(
+            !block.contains(variant),
+            "`pub enum ClientRequest` gained a {variant} variant. That is \
+             enum_variant_added on a PUBLIC EXHAUSTIVE enum — a semver-MAJOR break, and every \
+             downstream exhaustive match stops compiling. Adding #[non_exhaustive] instead is \
+             ALSO a source break. The SEP-2640 methods are carried by the crate-private \
+             InternalClientRequest and classified by classify_internal_method; route them \
+             there.\n\nBlock was:\n{block}"
+        );
+    }
+
+    // The message above names `#[non_exhaustive]` as an equally breaking route
+    // to the same harm, so the test has to actually check for it — the sibling
+    // guard `v2_tasks_update_routing::client_request_has_no_tasks_update_variant`
+    // does, and this scan was modelled on that one without carrying the leg over.
+    //
+    // Checked in TWO places because they catch different spellings: inside the
+    // block finds a per-variant attribute, while the real enum-level attribute
+    // sits ABOVE the `pub enum` line and is therefore outside the slice
+    // entirely.
+    assert!(
+        !block.contains("non_exhaustive"),
+        "ClientRequest must stay exhaustive: adding #[non_exhaustive] breaks every downstream \
+         exhaustive match, which is the same harm by another route.\n\nBlock was:\n{block}"
+    );
+    // The preceding window starts after the previous item's closing brace, which
+    // means it also contains `ClientRequest`'s own rustdoc — so DOC LINES ARE
+    // DROPPED before the scan. Without that, the obvious explanatory comment
+    // this guard's failure message argues for ("Deliberately NOT
+    // `#[non_exhaustive]`: downstream exhaustive matches depend on it.") would
+    // fail the test, blocking CI on a change that made the invariant MORE
+    // visible. An earlier revision claimed the window excluded doc comments; it
+    // did not, and the claim was checkably false.
+    let window = source[..start]
+        .rfind("\n}\n")
+        .map_or(&source[..start], |prev| &source[prev..start]);
+    let attrs: String = window
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !attrs.contains("#[non_exhaustive]"),
+        "`pub enum ClientRequest` gained an enum-level #[non_exhaustive]. That breaks every \
+         downstream exhaustive match — the same semver harm as adding a variant.\n\n\
+         Attributes were:\n{attrs}"
+    );
+}
+
+// ===========================================================================
+// 5 — the same property at RUNTIME, with a control that MUST parse.
+// ===========================================================================
+
+/// Neither SEP-2640 method deserializes into the public `ClientRequest` enum,
+/// and `resources/list` still does.
+///
+/// Spike 008's technique. The passing CONTROL is load-bearing: without it the
+/// assertion would also hold against a malformed fixture, a broken `from_value`
+/// call, or a `ClientRequest` that stopped parsing anything at all — none of
+/// which says a word about routing.
+///
+/// Not redundant with the source scan above. That one fails the moment the
+/// variant NAME is typed into the enum block, before anything routes it; this one
+/// fails only once serde would actually accept the method — so a
+/// `#[serde(rename = "skills/list")]` smuggled onto an existing variant would
+/// pass the scan and fail here.
+#[test]
+fn skills_methods_do_not_parse_as_public_client_requests() {
+    for method in [SKILLS_LIST, SKILLS_GET] {
+        let frame = json!({ "method": method, "params": {} });
+        assert!(
+            serde_json::from_value::<pmcp::types::ClientRequest>(frame).is_err(),
+            "{method} must NOT deserialize into the public ClientRequest enum — \
+             the 2.x exhaustive-enum promise depends on it having no variant"
+        );
+    }
+
+    // The control. If this ever fails, the two assertions above prove nothing.
+    let control = json!({ "method": "resources/list", "params": {} });
+    assert!(
+        serde_json::from_value::<pmcp::types::ClientRequest>(control).is_ok(),
+        "resources/list MUST parse — without a passing control the Err assertions \
+         above are unfalsifiable"
+    );
+}
+
+// ===========================================================================
+// 6 — the no-era-gate property, with the server/discover negative control.
+// ===========================================================================
+
+/// `skills/list` answers on a v1 connection; `server/discover` still does not.
+///
+/// `server/discover` is a 2026-07-28-only method and answers `-32601` on v1.
+/// `skills/list` has no such gate in SEP-2640 — it rides the base Resources
+/// primitive. The `server/discover` leg is the negative control: it is what stops
+/// this test from passing vacuously against a server that answers EVERYTHING, and
+/// both legs run against the SAME server over the SAME session so the difference
+/// is attributable to the method alone.
+#[tokio::test]
+async fn skills_list_has_no_era_gate_and_server_discover_still_does() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
+
+    let served = post(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &v1_body(SKILLS_LIST, json!(21), json!({})),
+    )
+    .await;
+    assert!(
+        served.body.get("error").is_none(),
+        "skills/list carries NO era gate and must be served on v1: {}",
+        served.raw
+    );
+    assert!(
+        !result_of(&served)["skills"].is_null(),
+        "the v1 answer is a real result: {}",
+        served.raw
+    );
+
+    let refused = post(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &v1_body("server/discover", json!(22), json!({})),
+    )
+    .await;
+    assert_eq!(
+        refused.body["error"]["code"],
+        json!(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "the control: server/discover IS era-gated and answers -32601 on v1: {}",
+        refused.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 7 — the not-name-bearing property, as a tested NON-change.
+// ===========================================================================
+
+/// Neither SEP-2640 method carries a routing name, so the v2 `Mcp-Name` header is
+/// discarded for both — and a v2 `skills/list` POST built with an empty `Mcp-Name`
+/// is ACCEPTED rather than rejected with `-32020`.
+///
+/// This is pinned as a DECISION, not left as an absence. `skills/get` carries a
+/// `uri` param, structurally identical to `resources/read`, which IS in the
+/// name-bearing table — so the omission reads like an oversight. Adding either
+/// method to that table is a deliberate deferral: it would require editing the
+/// method table in `contracts/mcp-protocol-sdk-v1.yaml` and the literal-contract
+/// test in `src/server/streamable_http_server.rs` alongside `src/types/mrtr.rs`.
+///
+/// The lookup resolves through `pmcp::testing::routing_name_key`, the PRODUCTION
+/// combined table both the `Mcp-Name` emitter and the server's cross-check read.
+/// A test that restated a method list here would be validating itself.
+#[tokio::test]
+async fn neither_skills_method_is_routing_name_bearing() {
+    for method in [SKILLS_LIST, SKILLS_GET] {
+        assert!(
+            pmcp::testing::routing_name_key(method).is_none(),
+            "{method} must carry no routing name — see this test's rustdoc for the \
+             deferral this pins"
+        );
+    }
+
+    // And the wire consequence: `v2_headers_for` derives `Mcp-Name` through that
+    // same production table, so it emits the EMPTY string here. An accepted
+    // request is the proof the server discards it rather than cross-checking it.
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+    let response = post_v2_skills_list(addr, 31).await;
+    assert_eq!(
+        response.status, 200,
+        "an empty Mcp-Name on a name-less method is accepted, not -32020: {}",
+        response.raw
+    );
+    assert!(
+        response.body.get("error").is_none(),
+        "no header-mismatch refusal: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 8 — the D-01 stdio reach, measured rather than asserted in prose.
+// ===========================================================================
+
+/// Over stdio a `skills/list` frame fails at `parse_message`; `resources/list`
+/// parses.
+///
+/// # The full measured chain, of which this asserts the FIRST link
+///
+/// `classify_http_ingress` is the ONLY production consumer of
+/// `IngressRequest::Internal` (that sentence is verbatim in the seam's own
+/// rustdoc at `src/shared/protocol_helpers.rs`), so every other transport reaches
+/// requests through the PUBLIC `parse_request`, which maps `Internal` to
+/// method-not-found. On stdio that `Err` becomes a
+/// `TransportError::InvalidMessage`, and `run_transport_actor`'s receive arm
+/// (`src/server/mod.rs`) BREAKS the loop on any receive error — so over stdio a
+/// `skills/list` does not merely answer `-32601`, it tears the connection down.
+///
+/// The teardown half is NOT asserted here: reproducing it means driving a real
+/// stdio actor with a live process on both ends. What is asserted is the link the
+/// teardown follows from, and the deferral of stdio reach itself is a recorded
+/// phase deferral with an owner — never a code TODO.
+///
+/// The `resources/list` control is load-bearing: without it this assertion would
+/// pass equally against a parser that rejected EVERY frame, which would say
+/// nothing about skills.
+#[test]
+fn stdio_ingress_rejects_a_skills_list_frame() {
+    let skills_frame =
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{SKILLS_LIST}","params":{{}}}}"#);
+    let parsed = pmcp::shared::transport::parse_message(skills_frame.as_bytes());
+    assert!(
+        parsed.is_err(),
+        "a skills/list frame must FAIL the stdio ingress parse today (D-01): \
+         the InternalClientRequest route reaches streamable HTTP only"
+    );
+
+    // The control. Without it, a parser that rejected everything would pass.
+    let control = br#"{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}"#;
+    assert!(
+        pmcp::shared::transport::parse_message(control).is_ok(),
+        "resources/list MUST parse — without a passing control the assertion above \
+         is unfalsifiable"
+    );
+}
+
+// ===========================================================================
+// 9 — `skills/get`: the hit.
+// ===========================================================================
+
+/// A live `skills/get` on a registered SKILL.md URI answers with ONE entry whose
+/// shape is IDENTICAL to a `skills/list` entry.
+///
+/// The shape identity is the property, not an incidental convenience: SEP-2640
+/// defines `skills/get` as returning the same entry object a listing carries, and
+/// a host that read one and then the other would reject a skill on any
+/// discrepancy. The assertions below therefore restate the `skills/list` entry
+/// assertions verbatim rather than checking a looser "some object came back".
+#[tokio::test]
+async fn skills_get_returns_the_single_conforming_entry_on_v2() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+
+    let response = post_v2_skills_get(addr, 41, REFUNDS_SKILL_MD).await;
+    assert_eq!(
+        response.status, 200,
+        "a served method answers at HTTP 200: {}",
+        response.raw
+    );
+    assert_eq!(
+        response.body["id"],
+        json!(41),
+        "the ORIGINAL id is preserved"
+    );
+
+    let result = result_of(&response);
+    assert_eq!(
+        result["resultType"], "complete",
+        "D-07: a skills/get result is complete: {}",
+        response.raw
+    );
+
+    let entry = &result["skill"];
+    assert!(
+        !entry.is_null(),
+        "the result carries a single `skill` object, not an array: {}",
+        response.raw
+    );
+    assert_eq!(entry["uri"], REFUNDS_SKILL_MD);
+    assert_eq!(entry["frontmatter"]["name"], "refunds");
+    assert_eq!(
+        entry["frontmatter"]["description"],
+        "Process customer refund requests"
+    );
+    assert_eq!(
+        entry["frontmatter"]["license"], "Apache-2.0",
+        "VERBATIM frontmatter — the non-required field survives here too: {}",
+        response.raw
+    );
+
+    let manifest = entry["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("entry.resources is an array; got {}", response.raw));
+    assert_eq!(manifest[0]["uri"], REFUNDS_SKILL_MD);
+    assert_digest_shape(
+        &manifest[0],
+        "the manifest digest survives the skills/get projection unchanged",
+        &response.raw,
+    );
+    assert_eq!(manifest[0]["size"], json!(REFUNDS_BODY.len()));
+
+    assert!(
+        result.get("nextCursor").is_none(),
+        "a single-entry get carries no pagination cursor: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 10 — `skills/get`: the unknown URI is -32602 (D-06).
+// ===========================================================================
+
+/// `skills/get` on a URI the server does not serve answers `-32602`, the code the
+/// CURRENT SEP-2640 draft specifies.
+///
+/// The numeric code is asserted, not merely the presence of an error: the shipped
+/// `SkillsHandler::read` answers `-32601` for the analogous `resources/read` miss,
+/// so "an error came back" would pass against exactly the code this test exists to
+/// rule out. Test 14 pins the other side of that divergence.
+#[tokio::test]
+async fn skills_get_unknown_uri_returns_invalid_params() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+
+    let response = post_v2_skills_get(addr, 42, "skill://nope/SKILL.md").await;
+    assert_eq!(
+        error_code_of(&response),
+        invalid_params(),
+        "D-06: an unresolvable skills/get uri is -32602: {}",
+        response.raw
+    );
+    assert_ne!(
+        error_code_of(&response),
+        i64::from(pmcp::types::protocol::error_codes::METHOD_NOT_FOUND),
+        "stated separately because -32601 here is the SPECIFIC regression this test \
+         exists for — it is what resources/read returns and what must NOT be copied: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 11 — a REFERENCE file is readable but is not a skills/get key.
+// ===========================================================================
+
+/// `skills/get` on a registered skill's REFERENCE file answers `-32602`, while the
+/// same URI is READABLE through `resources/read`.
+///
+/// The `resources/read` half is the control, and it is what makes the assertion
+/// mean something: without it the `-32602` would also hold on a server that had
+/// simply failed to register the reference at all, which says nothing about the
+/// draft's "the `uri` MUST be a skill's SKILL.md" rule.
+#[tokio::test]
+async fn skills_get_reference_uri_returns_invalid_params() {
+    let (addr, handle) =
+        spawn_default_config(skills_fixture_server(skill_with_reference_registry())).await;
+
+    let refused = post_v2_skills_get(addr, 43, REFUNDS_REFERENCE_URI).await;
+    assert_eq!(
+        error_code_of(&refused),
+        invalid_params(),
+        "a reference file is not a skills/get key: {}",
+        refused.raw
+    );
+
+    // The control: the very same URI IS served by the resource surface.
+    let params = json!({ "uri": REFUNDS_REFERENCE_URI });
+    let read = post(
+        addr,
+        &v2_headers_for("resources/read", &params),
+        &v2_body("resources/read", json!(44), params),
+    )
+    .await;
+    assert!(
+        read.body.get("error").is_none(),
+        "the control: resources/read SERVES the reference URI, so the -32602 above is \
+         about the skills surface and not about registration: {}",
+        read.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 12 — malformed params reach -32602 from the SERVED branch, never a panic.
+// ===========================================================================
+
+/// Absent params, non-object params and a non-string `uri` all answer `-32602`.
+///
+/// Each leg reaches the served branch: the classifier is body-blind by design, so
+/// a malformed body cannot become a parse error ahead of the pipeline. A panic in
+/// any leg would surface as a dropped connection rather than a JSON-RPC error, so
+/// "the server answered at all" is itself part of what is asserted.
+#[tokio::test]
+async fn skills_get_malformed_params_return_invalid_params() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
+
+    // (a) NO `params` key at all — the `Value::Null` path.
+    let absent = post_raw(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &format!(r#"{{"jsonrpc":"2.0","id":45,"method":"{SKILLS_GET}"}}"#),
+    )
+    .await;
+    assert_eq!(
+        error_code_of(&absent),
+        invalid_params(),
+        "absent params answer -32602 rather than panicking: {}",
+        absent.raw
+    );
+
+    // (b) `params` present but NOT an object.
+    let non_object = post_raw(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &format!(r#"{{"jsonrpc":"2.0","id":46,"method":"{SKILLS_GET}","params":"nonsense"}}"#),
+    )
+    .await;
+    assert_eq!(
+        error_code_of(&non_object),
+        invalid_params(),
+        "a non-object params body answers -32602: {}",
+        non_object.raw
+    );
+
+    // (c) `params.uri` present but NOT a string.
+    let wrong_type = {
+        let params = json!({ "uri": 17 });
+        post(
+            addr,
+            &v2_headers_for(SKILLS_GET, &params),
+            &v2_body(SKILLS_GET, json!(47), params),
+        )
+        .await
+    };
+    assert_eq!(
+        error_code_of(&wrong_type),
+        invalid_params(),
+        "a non-string uri answers -32602: {}",
+        wrong_type.raw
+    );
+
+    // (d) `params` an object with NO `uri` key.
+    let missing_key = {
+        let params = json!({ "cursor": "x" });
+        post(
+            addr,
+            &v2_headers_for(SKILLS_GET, &params),
+            &v2_body(SKILLS_GET, json!(48), params),
+        )
+        .await
+    };
+    assert_eq!(
+        error_code_of(&missing_key),
+        invalid_params(),
+        "a missing uri key answers -32602: {}",
+        missing_key.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 13 — traversal-shaped URIs are -32602 because the lookup is an exact map hit.
+// ===========================================================================
+
+/// A `skills/get` `uri` carrying `..` segments, or a suffix appended to a
+/// registered URI, answers `-32602` (T-125-06).
+///
+/// The mitigation is structural rather than a filter: the lookup is an exact-match
+/// hit in the entry map keyed by SKILL.md URI, so no caller string is ever joined,
+/// normalized or decoded into a path. This test is what proves the structure holds
+/// on the wire — a future implementation that "helpfully" normalized the key would
+/// pass every other test in this file and fail here.
+///
+/// The positive control at the end is load-bearing: it proves the server does
+/// resolve the CANONICAL form, so the four refusals above are about the mangled
+/// shapes rather than about a lookup that resolves nothing at all.
+#[tokio::test]
+async fn skills_get_traversal_shaped_uri_returns_invalid_params() {
+    let (addr, handle) =
+        spawn_default_config(skills_fixture_server(skill_with_reference_registry())).await;
+
+    for (id, uri) in [
+        (51_i64, "skill://refunds/../refunds/SKILL.md"),
+        (52, "skill://refunds/SKILL.md/../../SKILL.md"),
+        (53, "skill://refunds/SKILL.md.bak"),
+        (54, "skill://refunds/SKILL.md/"),
+    ] {
+        let response = post_v2_skills_get(addr, id, uri).await;
+        assert_eq!(
+            error_code_of(&response),
+            invalid_params(),
+            "`{uri}` must not resolve — the lookup is an exact map hit, never a path \
+             join (T-125-06): {}",
+            response.raw
+        );
+    }
+
+    // The positive control: the CANONICAL spelling of the same skill resolves.
+    let ok = post_v2_skills_get(addr, 59, REFUNDS_SKILL_MD).await;
+    assert!(
+        ok.body.get("error").is_none(),
+        "the control: the canonical URI resolves, so the refusals above are about the \
+         mangled shapes and not about a lookup that finds nothing: {}",
+        ok.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 14 — the DIVERGENCE control: resources/read keeps its -32601.
+// ===========================================================================
+
+/// `resources/read` on an unknown URI answers exactly what it answered before this
+/// plan — and that is MEASURED here rather than assumed.
+///
+/// # The measurement, which corrects D-06's phrasing
+///
+/// D-06 records the divergence as "`SkillsHandler::read` returns `-32601`". That is
+/// true at the HANDLER level and is pinned by
+/// `resources_read_unknown_uri_method_not_found` (`tests/skills_integration.rs`),
+/// which calls `ResourceHandler::read` directly and matches on
+/// `Error::Protocol { code }`.
+///
+/// ON THE WIRE it is not what a caller sees. The handler's `Error::Protocol` is
+/// re-wrapped by the dispatch tail, so a `resources/read` POST for an unserved URI
+/// comes back as `-32603` (internal error) whose MESSAGE carries the original
+/// `-32601`. Both facts are asserted below, because a reader who trusted the
+/// summary phrasing alone would write a wrong test.
+///
+/// This plan changes neither. It does not copy the code into `skills/get` and it
+/// does not fix the wrapping: changing a shipped error code is observable
+/// behaviour with its own test, and D-06 scopes the whole divergence out. The
+/// assertion lives HERE, beside the `skills/get` `-32602` tests, so a reader sees
+/// the codes side by side and reads the difference as a decision rather than an
+/// inconsistency to "clean up".
+#[tokio::test]
+async fn resources_read_unknown_uri_still_returns_method_not_found() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+
+    let params = json!({ "uri": "skill://nope/SKILL.md" });
+    let response = post(
+        addr,
+        &v2_headers_for("resources/read", &params),
+        &v2_body("resources/read", json!(60), params),
+    )
+    .await;
+
+    assert_eq!(
+        error_code_of(&response),
+        i64::from(pmcp::types::protocol::error_codes::INTERNAL_ERROR),
+        "MEASURED: the handler's -32601 reaches the wire re-wrapped as -32603. This \
+         plan changes neither the handler code nor the wrapping: {}",
+        response.raw
+    );
+    assert!(
+        response.body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("-32601")),
+        "the handler-level -32601 survives inside the message, which is the half \
+         `resources_read_unknown_uri_method_not_found` pins directly: {}",
+        response.raw
+    );
+    assert_ne!(
+        error_code_of(&response),
+        invalid_params(),
+        "the contrast that matters: `resources/read` does NOT answer -32602, so the \
+         `skills/get` -32602 above is a deliberate divergence and not a shared \
+         convention: {}",
+        response.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 15 — the get result carries NEITHER caching key, on BOTH eras (R-17).
+// ===========================================================================
+
+/// A `skills/get` result carries neither `ttlMs` nor `cacheScope`, on a v2 framing
+/// and on a v1 framing.
+///
+/// The draft leaves the `skills/get` caching question open (unlike `skills/list`,
+/// which it explicitly gives the base list-caching attributes), so pmcp claims
+/// nothing. Absence is asserted ON THE WIRE rather than inferred from the source
+/// not naming `Cacheable::Yes`, and the v2 leg is the one that matters:
+/// `project_caching_hints` is the single writer of both keys and is TOTAL — every
+/// input either ensures both or removes both — so an absent pair under a v2 era is
+/// a real measurement of the disposition passed at the projection call site.
+///
+/// The v2 leg pairs with `skills_list_returns_a_conforming_entry_on_v2`, which
+/// asserts both keys PRESENT on the same server under the same framing. Together
+/// they show the two methods are treated differently on purpose.
+#[tokio::test]
+async fn skills_get_result_carries_no_cache_attributes_on_either_era() {
+    let (addr, handle) = spawn_default_config(skills_fixture_server(one_skill_registry())).await;
+
+    let v2 = post_v2_skills_get(addr, 61, REFUNDS_SKILL_MD).await;
+    let v2_result = result_of(&v2);
+    assert!(
+        v2_result.get("ttlMs").is_none(),
+        "a v2 skills/get result carries NO ttlMs — the draft leaves get-caching open: {}",
+        v2.raw
+    );
+    assert!(
+        v2_result.get("cacheScope").is_none(),
+        "a v2 skills/get result carries NO cacheScope: {}",
+        v2.raw
+    );
+
+    let session = v1_session(addr, V1_CLIENT_NAME).await;
+    let v1 = post(
+        addr,
+        &[header(SESSION_HEADER, &session)],
+        &v1_body(SKILLS_GET, json!(62), json!({ "uri": REFUNDS_SKILL_MD })),
+    )
+    .await;
+    let v1_result = result_of(&v1);
+    assert!(
+        v1_result.get("ttlMs").is_none() && v1_result.get("cacheScope").is_none(),
+        "a v1 skills/get result carries neither key: {}",
+        v1.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 16 — the auth gate runs BEFORE the params error (R-16).
+// ===========================================================================
+
+/// Against a server carrying an auth provider, an UNCREDENTIALED `skills/get` with
+/// deliberately malformed params receives the authentication refusal; the SAME
+/// request WITH credentials receives `-32602`.
+///
+/// **Both halves are required and neither is decorative.** The first alone would
+/// also pass against a server that refused everything, including well-formed
+/// requests. The second alone would say nothing about ordering. Run together on
+/// ONE server with ONE body, the only difference is the bearer, so the change in
+/// answer is attributable to authentication alone.
+///
+/// This is the test that would catch a future refactor which started deserializing
+/// `params` inside `classify_internal_method` or `classify_http_ingress`. The
+/// classifier's raw-params discipline is the MECHANISM, but the mechanism is not
+/// the proof — such a refactor would leak a params error to an unauthenticated
+/// caller while every other test in this file still passed.
+#[tokio::test]
+async fn skills_get_auth_refusal_precedes_the_params_error() {
+    let server = Server::builder()
+        .name("skills-routing-auth-fixture")
+        .version("1.0.0")
+        .with_supported_protocol_versions([
+            ProtocolVersion(V1.to_string()),
+            ProtocolVersion(V2.to_string()),
+        ])
+        .auth_provider(BearerSubjects)
+        .skills(one_skill_registry())
+        .build()
+        .expect("auth fixture server builds");
+    let (addr, handle) = spawn_default_config(server).await;
+
+    // The ONE malformed body used by both legs: `uri` is a number.
+    let params = json!({ "uri": 17 });
+    let headers = v2_headers_for(SKILLS_GET, &params);
+    let body = v2_body(SKILLS_GET, json!(70), params);
+
+    let anonymous = post(addr, &headers, &body).await;
+    assert_eq!(
+        error_code_of(&anonymous),
+        i64::from(pmcp::types::protocol::error_codes::AUTHENTICATION_REQUIRED),
+        "the auth refusal precedes the params parse even though the classifier saw the \
+         body: {}",
+        anonymous.raw
+    );
+    assert_ne!(
+        error_code_of(&anonymous),
+        invalid_params(),
+        "stated separately because -32602 here is the SPECIFIC regression this test \
+         exists for: an unauthenticated caller must not get a free parse of its own \
+         chosen body: {}",
+        anonymous.raw
+    );
+
+    let mut credentialed = headers.clone();
+    credentialed.push(header("Authorization", "Bearer alice"));
+    let authenticated = post(addr, &credentialed, &body).await;
+    assert_eq!(
+        error_code_of(&authenticated),
+        invalid_params(),
+        "the SAME malformed body, once authenticated, reaches the served branch and \
+         answers -32602 — without this half the assertion above would also hold on a \
+         server that refused everything: {}",
+        authenticated.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+// ===========================================================================
+// 17 — the ServerCoreBuilder RESOURCE surface: the reachable half.
+// ===========================================================================
+
+/// A `ServerCoreBuilder`-built `ServerCore` carrying a skills registry still
+/// answers typed `resources/list` and `resources/read` for its skills.
+///
+/// # What this test does NOT prove, stated so nobody reads more into it
+///
+/// **A `ServerCore` answers NO skills METHOD.** Its only request ingress is
+/// `ProtocolHandler::handle_request(&self, id, request: Request, auth)`, which
+/// accepts the typed PUBLIC `Request` enum — and neither `skills/list` nor
+/// `skills/get` has a variant in it, deliberately, because a variant on a public
+/// exhaustive enum is a semver-MAJOR break. `duplex::raw_via_core` is the
+/// one harness that accepts a `ServerCore`, and it takes a typed `Request` too,
+/// which is precisely why it can drive `resources/list` here and could never drive
+/// `skills/list`. That limit is a recorded phase deferral (125-05), and test 18
+/// below guards against "fixing" it with dead code.
+///
+/// # What it DOES prove, and why it earns its place
+///
+/// 125-01 changed `finalize_skills_resources` to return a tuple, and the
+/// `ServerCoreBuilder::build` call site discards the entries half. This is the
+/// surface that regresses if that change was made wrong: a mis-destructure that
+/// dropped the HANDLER instead of the entries would compile, and every
+/// `skills/list` test would still pass — because those run against a `Server`
+/// built by the OTHER path.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn server_core_builder_still_serves_skills_as_resources() {
+    use pmcp::server::core::ProtocolHandler;
+    use std::sync::Arc;
+
+    let core = pmcp::server::builder::ServerCoreBuilder::new()
+        .name("skills-core-fixture")
+        .version("1.0.0")
+        .skills(one_skill_registry())
+        .build()
+        .expect("ServerCoreBuilder with skills builds");
+    let core: Arc<dyn ProtocolHandler> = Arc::new(core);
+
+    // A v1 core gates every non-`initialize` request behind the init handshake,
+    // so the handshake runs first or both legs below get -32002 and the test would
+    // indict skills for a gate that has nothing to do with them.
+    let init = duplex::initialize_via_core(&core).await;
+    assert!(
+        matches!(
+            init.payload,
+            pmcp::types::jsonrpc::ResponsePayload::Result(_)
+        ),
+        "the handshake must succeed before the two legs below mean anything"
+    );
+
+    let list_request: pmcp::types::ClientRequest =
+        serde_json::from_value(json!({ "method": "resources/list", "params": {} }))
+            .expect("resources/list deserializes into ClientRequest");
+    let listed = duplex::raw_via_core(
+        Arc::clone(&core),
+        pmcp::types::Request::Client(Box::new(list_request)),
+    )
+    .await;
+    let pmcp::types::jsonrpc::ResponsePayload::Result(listed) = listed.payload else {
+        panic!("a ServerCoreBuilder core answers resources/list");
+    };
+    let uris: Vec<&str> = listed["resources"]
+        .as_array()
+        .expect("resources is an array")
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    assert!(
+        uris.contains(&REFUNDS_SKILL_MD),
+        "the registry's SKILL.md URI must be enumerated; got {uris:?}"
+    );
+
+    let read = duplex::raw_via_core(
+        Arc::clone(&core),
+        duplex::read_resource_request(REFUNDS_SKILL_MD, pmcp::types::protocol::Era::V1),
+    )
+    .await;
+    let pmcp::types::jsonrpc::ResponsePayload::Result(read) = read.payload else {
+        panic!("a ServerCoreBuilder core answers resources/read for a skill");
+    };
+    let body = serde_json::to_string(&read["contents"]).expect("contents serializes");
+    assert!(
+        body.contains("Follow company policy"),
+        "the skill BODY comes back, not merely a successful envelope: {body}"
+    );
+}
+
+// ===========================================================================
+// 18 — the dead-code guard: ServerCore must gain neither the field nor a method.
+// ===========================================================================
+
+/// `src/server/core.rs` must declare neither a `skill_entries` field on
+/// `ServerCore` nor a `ServerCore` method named for either skills method.
+///
+/// # This test is a RECORD, not merely a block
+///
+/// A future contributor reading the phase summary could reasonably conclude the
+/// `ServerCore` delegates were forgotten. They were omitted ON PURPOSE, and this
+/// is where that is written down in a form that fails loudly.
+///
+/// # What a future widener must change FIRST
+///
+/// The blocking fact is the signature of `ProtocolHandler::handle_request`: it
+/// takes the typed PUBLIC `pmcp::types::Request` enum, so a `ServerCore` can only
+/// ever receive a request that has a variant there. Adding a `skills/*` variant to
+/// that exhaustive public enum is a semver-MAJOR break, which is the whole reason
+/// both methods ride the crate-private `InternalClientRequest` classifier instead.
+///
+/// So widening the reach means changing the INGRESS — giving `ProtocolHandler` a
+/// seam that accepts an internally-routed request, the same change the D-01 stdio
+/// deferral needs — and only then adding delegates. Adding the delegates first
+/// produces code that nothing can call, which is exactly what Phase 112 DELETED
+/// when it consolidated `server/discover` into the free fn `build_discover_response`.
+///
+/// The scan filters comment lines because the plan's own instructions put
+/// explanatory prose at the discard site naming the very identifiers this test
+/// forbids; an unfiltered count would turn documentation into a gate failure.
+#[test]
+fn server_core_declares_no_skills_field_or_skills_method() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/server/core.rs");
+    let source = std::fs::read_to_string(&path).expect("server/core.rs is readable");
+
+    let code: Vec<&str> = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+
+    // Anti-vacuity: if the comment filter (or the path) ever removed everything
+    // that matters, both assertions below would pass while measuring nothing.
+    assert!(
+        code.iter().any(|l| l.contains("pub struct ServerCore")),
+        "the extracted code lines are not `src/server/core.rs`; the scan is vacuous"
+    );
+    assert!(
+        code.iter()
+            .any(|l| l.contains("fn build_skills_get_response")),
+        "the shared projection is missing from the scanned code; the scan is vacuous"
+    );
+
+    for (needle, why) in [
+        (
+            "skill_entries",
+            "a `skill_entries` field on `ServerCore` would be a field NOTHING could \
+             read: a ServerCore receives only the typed public `Request` enum, which \
+             has no skills variant",
+        ),
+        (
+            "fn handle_skills",
+            "a `ServerCore::handle_skills_*` would be a function NOTHING could call, \
+             for the same reason — Phase 112 DELETED exactly these wrappers for \
+             `server/discover` rather than annotating them `#[allow(dead_code)]`",
+        ),
+    ] {
+        let hits: Vec<&&str> = code.iter().filter(|l| l.contains(needle)).collect();
+        assert!(
+            hits.is_empty(),
+            "`{needle}` reappeared in the CODE of src/server/core.rs.\n{why}.\n\
+             To widen the reach legitimately, change `ProtocolHandler::handle_request`'s \
+             typed-`Request` signature FIRST — see this test's rustdoc.\n\
+             Offending lines: {hits:?}"
+        );
+    }
+}
+
+// ── 19. The fuzz target exists, is registered, and is SCHEDULED ────────
+
+/// Assert that a cargo-fuzz target is registered AND scheduled.
+///
+/// The three legs are independent and each catches a different mistake, so a
+/// helper that dropped any of them would leave the calling test claiming more
+/// than it checks:
+///
+/// 1. `fuzz/fuzz_targets/{target}.rs` exists and declares a `fuzz_target!`.
+/// 2. A `[[bin]]` stanza in `fuzz/Cargo.toml` names it and its `path` resolves
+///    to that same file, canonicalized.
+/// 3. `.github/workflows/fuzz.yml`'s strategy matrix carries a row equal to it.
+///
+/// `established` is the anti-vacuity list for leg 3: rows the matrix must still
+/// hold, so a rewrite that empties it cannot make the `{target}` row assertion
+/// pass by having nothing to disagree with. `source_note` is appended to the
+/// missing-source failure, because each caller has its own reason the target is
+/// REQUIRED and that reason is what a maintainer needs on a red.
+///
+/// # Why a source-text gate and not `cargo fuzz list`
+///
+/// The `fuzz/` crate is in the root workspace's `exclude` array, so no gate in
+/// this repository compiles it, and `cargo fuzz list` additionally needs a
+/// nightly toolchain that `rust-toolchain.toml` does not provide (`fuzz.yml`
+/// deletes that file and installs nightly explicitly before it can run).
+/// `make test-fuzz` cannot be the evidence either: it iterates `cargo fuzz list`
+/// and swallows every failure with `|| echo`, and on this repository's pinned
+/// STABLE toolchain `cargo fuzz run` fails outright with `the option 'Z' is only
+/// accepted on the nightly compiler` — so that target exits 0 having run nothing
+/// at all. Reading the three files as TEXT needs none of that and runs under
+/// `make test-skills`, and therefore under `make quality-gate`.
+///
+/// # Why the matrix row is checked and not just the registration
+///
+/// Registration alone proves a file exists. The ALWAYS/FUZZ requirement's
+/// substance is recurring EXECUTION against hostile input, and `fuzz.yml`'s
+/// matrix is an EXPLICIT list — several registered targets in `fuzz/Cargo.toml`
+/// are deliberately absent from it, so enrolment is never automatic. Without
+/// this third assertion the phase could claim compliance for a target that never
+/// ran (125-REVIEWS R-34).
+fn assert_fuzz_target_registered_and_scheduled(
+    target: &str,
+    established: &[&str],
+    source_note: &str,
+) {
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // (1) The target source exists.
+    let source_path = repo_root.join(format!("fuzz/fuzz_targets/{target}.rs"));
+    assert!(
+        source_path.is_file(),
+        "the fuzz target source is missing at {}. CLAUDE.md requires a fuzz \
+         target for every new feature; {source_note}",
+        source_path.display()
+    );
+    let source = std::fs::read_to_string(&source_path).expect("fuzz target source is readable");
+    assert!(
+        source.contains("fuzz_target!"),
+        "{} exists but declares no `fuzz_target!` entry point, so cargo-fuzz has \
+         nothing to drive",
+        source_path.display()
+    );
+
+    // (2) A `[[bin]]` stanza names it, and its `path` resolves to that file.
+    let manifest_path = repo_root.join("fuzz/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("fuzz/Cargo.toml is readable");
+
+    // Anti-vacuity: prove the scan is reading a manifest that carries `[[bin]]`
+    // stanzas at all before concluding anything from a search over it. Without
+    // this, a manifest emptied by a bad merge would report a missing
+    // registration for EVERY target, including the ones that predate this one.
+    assert!(
+        manifest.contains("[[bin]]"),
+        "fuzz/Cargo.toml carries no [[bin]] stanza at all — this scan would \
+         report a missing registration for every target in the crate"
+    );
+
+    let declared_path = manifest
+        .split("[[bin]]")
+        .find(|stanza| stanza.contains(&format!("name = \"{target}\"")))
+        .and_then(|stanza| {
+            stanza
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("path = "))
+        })
+        .map(|value| value.trim().trim_matches('"').to_string());
+
+    let declared_path = declared_path.unwrap_or_else(|| {
+        panic!(
+            "fuzz/Cargo.toml has no [[bin]] stanza with `name = \"{target}\"` and a \
+             `path` key. cargo-fuzz builds only registered bins, so an unregistered \
+             target file is never compiled and never run."
+        )
+    });
+
+    let resolved = repo_root.join("fuzz").join(&declared_path);
+    assert!(
+        resolved.is_file(),
+        "fuzz/Cargo.toml registers `{target}` at path `{declared_path}`, which \
+         resolves to {} — a file that does not exist. The stanza and the source \
+         disagree.",
+        resolved.display()
+    );
+    assert_eq!(
+        std::fs::canonicalize(&resolved).expect("registered path canonicalizes"),
+        std::fs::canonicalize(&source_path).expect("source path canonicalizes"),
+        "fuzz/Cargo.toml registers `{target}` at a DIFFERENT file from the one \
+         this test asserts the contents of"
+    );
+
+    // (3) The workflow matrix schedules it.
+    //
+    // This is the assertion reviewers add back when it is dropped (125-REVIEWS
+    // R-34).
+    let workflow_path = repo_root.join(".github/workflows/fuzz.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("fuzz.yml is readable");
+
+    // SCOPED to the `target:` block, then WHOLE-LINE equality. Both properties
+    // are load-bearing and both were MEASURED.
+    //
+    // Scope first: reading every `- item` in the whole file also matched
+    // `schedule.cron`, both `restore-keys` lists and the artifact `path` list,
+    // so a `- {target}` line sitting in ANY of them — or surviving a
+    // commented-out matrix — satisfied the assertion while nothing scheduled the
+    // target. The rustdoc claims this check makes "registered but never run"
+    // impossible; unscoped it was weaker than that claim.
+    //
+    // Then whole-line equality, deliberately not `contains`: a
+    // `workflow.contains("- {target}")` check passes against a matrix whose only
+    // row reads `- {target}X`, so a typo'd or renamed row reports green while
+    // nothing runs. Collecting the trimmed rows and comparing for equality
+    // removes the class.
+    let (_, after_target) = workflow
+        .split_once("target:")
+        .expect("fuzz.yml declares a strategy matrix `target:` key");
+    // The block ends at the first line that is neither blank, a comment, nor a
+    // `- ` row — `steps:` in the current file.
+    let matrix_rows: Vec<&str> = after_target
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with('#') || line.starts_with("- "))
+        .filter_map(|line| line.strip_prefix("- "))
+        .collect();
+
+    // Anti-vacuity: the matrix must still hold its established members, so a
+    // rewrite that empties it cannot make the assertion below pass by accident.
+    for established in established {
+        assert!(
+            matrix_rows.contains(established),
+            "the fuzz.yml target matrix no longer lists `{established}` — the \
+             matrix this test reads is not the one it was written against, so its \
+             verdict on `{target}` means nothing. Rows seen: {matrix_rows:?}"
+        );
+    }
+    assert!(
+        matrix_rows.contains(&target),
+        "`{target}` is registered in fuzz/Cargo.toml but is NOT a row in \
+         .github/workflows/fuzz.yml's target matrix, so nothing ever runs it. \
+         Registration proves a file exists; the CLAUDE.md ALWAYS/FUZZ requirement \
+         is about recurring EXECUTION against hostile input. Rows seen: \
+         {matrix_rows:?}"
+    );
+}
+
+/// Three artifacts must agree for the CLAUDE.md ALWAYS/FUZZ requirement to be
+/// satisfied for the skills feature, and this test is the only thing that checks
+/// they do (Phase 125, plan 05): the target source, its `[[bin]]` registration,
+/// and its row in the daily fuzz matrix.
+///
+/// The three checks, and why each one is load-bearing, live on
+/// [`assert_fuzz_target_registered_and_scheduled`].
+#[test]
+fn fuzz_skill_entry_is_registered_and_scheduled() {
+    assert_fuzz_target_registered_and_scheduled(
+        "fuzz_skill_entry",
+        &["protocol_parsing", "jsonrpc_handling"],
+        "deleting the file does not remove that requirement.",
+    );
+}
+
+// ===========================================================================
+// 20-21 — Phase 126 (SC-4, the WIRE half): a PROJECTED workflow skill,
+//         served by the real `StreamableHttpServer`.
+// ===========================================================================
+//
+// Plan 126-01 proved SC-4's IN-PROCESS half in `tests/skills_integration.rs`:
+// a `SequentialWorkflow::as_skill()` result registers through the real
+// `Skills::into_handler()` and `handler.read(...)` returns `skill.body()`
+// verbatim. That is a struct-to-struct statement. These two tests are the other
+// half: the same skill on a loopback socket, with every assertion read off the
+// JSON a remote caller actually receives.
+//
+// They live HERE and not in a new `tests/skills_projection.rs` because a new
+// integration target matches NONE of `make test-skills`'s four selectors
+// (`--lib skills`, `--doc skills`, `--test skills_integration`,
+// `--test skills_routing`) and would need a fifth guarded selector to run at all.
+//
+// | # | test | property |
+// |---|------|----------|
+// | 20 | `projected_workflow_skill_is_conforming_on_the_wire` | a projected skill answers `skills/list` with a two-key verbatim frontmatter and a complete `{uri, digest, size}` manifest, and `resources/read` returns those exact bytes |
+// | 21 | `projected_workflow_skill_survives_an_adversarial_description_on_the_wire` | the same, for a description carrying `: `, `#` AND an embedded newline — REVIEWS finding 1 observed from OUTSIDE the SDK |
+
+use pmcp::server::workflow::{DataSource, SequentialWorkflow, ToolHandle, WorkflowStep};
+
+/// The projected skill's SKILL.md URI. `refund_flow` slugifies to `refund-flow`.
+const PROJECTED_SKILL_MD: &str = "skill://refund-flow/SKILL.md";
+
+/// An ordinary workflow description — the control for test 21.
+const PLAIN_DESCRIPTION: &str = "Process a customer refund";
+
+/// The adversarial description (REVIEWS finding 1 / T-126-21).
+///
+/// Three separate YAML hazards in one string: `: ` is a mapping indicator, `#`
+/// opens a comment, and the embedded newline is the injection that would append
+/// a THIRD frontmatter key (`metadata`) under a raw `description: {}` concat.
+///
+/// The failure this pins is SILENT, not loud. Under a raw concatenation the
+/// emitted block either grows a third key or fails `serde_yaml` outright — and on
+/// a parse failure `build_artifact_inner` DOWNGRADES to a diagnostic, sets
+/// `frontmatter = None`, and `validate_names` then `continue`s. The entry ships
+/// with no `name` at all and every name-identity assertion becomes unfalsifiable
+/// rather than red. That is why test 21 asserts the key COUNT and the presence of
+/// `name`, not merely the two values.
+const ADVERSARIAL_DESCRIPTION: &str = "Refund an order: fast path #urgent\nmetadata: injected";
+
+/// The workflow both tests project: one argument, two tool steps (one carrying
+/// guidance), and a step binding — enough render surface that the body is
+/// substantial rather than a bare frontmatter block.
+fn projected_workflow(description: &str) -> SequentialWorkflow {
+    SequentialWorkflow::new("refund_flow", description)
+        .argument("order_id", "The order to refund", true)
+        .step(
+            WorkflowStep::new("fetch_order", ToolHandle::new("orders_get"))
+                .arg("id", DataSource::prompt_arg("order_id"))
+                .bind("order"),
+        )
+        .step(
+            WorkflowStep::new("issue_refund", ToolHandle::new("payments_refund"))
+                .arg("amount", DataSource::from_step_field("order", "total"))
+                .with_guidance("Confirm with the customer before issuing the refund.")
+                .bind("refund"),
+        )
+}
+
+/// `true` when `hex` is exactly 64 characters drawn from the LOWERCASE hex
+/// alphabet, checked character by character.
+///
+/// Prefix-plus-length is not enough: an uppercase rendering has the right prefix
+/// and the right length and is a silent host-side comparison failure, because a
+/// conforming host re-derives the digest and compares the strings.
+fn is_lowercase_hex_64(hex: &str) -> bool {
+    hex.len() == 64 && hex.chars().all(|c| "0123456789abcdef".contains(c))
+}
+
+/// Assert that `row`'s `digest` is `sha256:` + exactly 64 LOWERCASE hex
+/// characters, and return the hex.
+///
+/// One spelling, because there were three and the weakest of them checked only
+/// the prefix and the length — which [`is_lowercase_hex_64`]'s own rustdoc says
+/// is not enough, since an uppercase rendering has both and is a silent
+/// host-side comparison failure.
+///
+/// `context` names the SC-4 obligation or the wire surface under test, so a red
+/// says which contract broke rather than merely which line.
+fn assert_digest_shape<'a>(row: &'a Value, context: &str, raw: &str) -> &'a str {
+    let digest = row["digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{context}: a manifest row carries a string digest; got {raw}"));
+    let hex = digest.strip_prefix("sha256:").unwrap_or_else(|| {
+        panic!("{context}: digest must carry the `sha256:` prefix, got {digest}")
+    });
+    assert!(
+        is_lowercase_hex_64(hex),
+        "{context}: digest must be `sha256:` + exactly 64 LOWERCASE hex \
+         characters, checked character by character; got {digest}"
+    );
+    hex
+}
+
+/// The skill-name segment of a SKILL.md entry URI.
+///
+/// # Not `rsplit('/').next()`
+///
+/// The entry URI is `skill://{name}/SKILL.md`, so its literal final segment is
+/// `SKILL.md`. The identity `validate_names` enforces is between the frontmatter
+/// `name` and `final_path_segment(skill.resolved_path())` — the segment BEFORE
+/// the trailing `/SKILL.md`. Taking the literal last segment here would compare
+/// `refund-flow` against `SKILL.md` and fail on a correct implementation.
+fn skill_name_segment_of(entry_uri: &str) -> &str {
+    entry_uri
+        .strip_suffix("/SKILL.md")
+        .unwrap_or_else(|| panic!("a skills/list entry URI ends in /SKILL.md; got {entry_uri}"))
+        .rsplit('/')
+        .next()
+        .unwrap_or_else(|| panic!("entry URI has no path segment: {entry_uri}"))
+}
+
+/// Drive the full SC-4 wire assertion set for a workflow with `description`.
+///
+/// Every clause below names the SC-4 obligation it covers in its failure message,
+/// so a red run says which part of the contract broke rather than merely which
+/// line.
+async fn assert_sc4_holds_on_the_wire(description: &str) {
+    let workflow = projected_workflow(description);
+    let skill = workflow.as_skill();
+
+    // ── Anti-vacuity, BEFORE anything structural ──────────────────────
+    //
+    // Every assertion after this one is about the shape of what came back. A
+    // projection that rendered an empty body, or a server that answered with an
+    // empty skills array, would satisfy several of them by having nothing to
+    // check. Both are ruled out first.
+    assert!(
+        skill.body().len() > 200,
+        "SC-4 anti-vacuity: the projected body is only {} bytes, so the \
+         byte-identity assertion below would be near-trivial",
+        skill.body().len()
+    );
+
+    let (addr, handle) =
+        spawn_default_config(skills_fixture_server(Skills::new().add(skill.clone()))).await;
+
+    let response = post_v2_skills_list(addr, 126).await;
+    assert_eq!(
+        response.status, 200,
+        "SC-4: a projected skill must be LISTABLE at HTTP 200: {}",
+        response.raw
+    );
+    let result = result_of(&response);
+    let skills = result["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result.skills is an array; got {}", response.raw));
+    assert_eq!(
+        skills.len(),
+        1,
+        "SC-4 anti-vacuity: one projected skill, one entry; got {}",
+        response.raw
+    );
+
+    // ── (1) entry identity ────────────────────────────────────────────
+    let entry = &skills[0];
+    assert_eq!(
+        entry["uri"], PROJECTED_SKILL_MD,
+        "SC-4 clause 1 (entry identity): the projected skill is served at its \
+         slugified URI: {}",
+        response.raw
+    );
+
+    // ── (2) verbatim frontmatter, exactly two keys (D-13) ─────────────
+    //
+    // The COUNT is asserted as well as the two values. A third key is a D-13
+    // violation that a pair of value-only assertions cannot see — and it is
+    // precisely what a newline injection into `description` produces.
+    let frontmatter = entry["frontmatter"]
+        .as_object()
+        .unwrap_or_else(|| panic!("entry.frontmatter is a JSON object; got {}", response.raw));
+    assert_eq!(
+        frontmatter.len(),
+        2,
+        "SC-4 clause 2 (D-13): the projection emits EXACTLY {{name, description}}; \
+         got keys {:?} in {}",
+        frontmatter.keys().collect::<Vec<_>>(),
+        response.raw
+    );
+    let served_name = frontmatter["name"].as_str().unwrap_or_else(|| {
+        panic!(
+            "SC-4 clause 2: frontmatter `name` must be present AND a string — a \
+             missing name is the SILENT downgrade path, not a loud failure: {}",
+            response.raw
+        )
+    });
+    assert_eq!(
+        served_name, "refund-flow",
+        "SC-4 clause 2: the served name is the slugified workflow name: {}",
+        response.raw
+    );
+    assert_eq!(
+        frontmatter["description"].as_str(),
+        Some(description),
+        "SC-4 clause 2: the served description must equal the workflow's \
+         description VERBATIM, byte for byte: {}",
+        response.raw
+    );
+
+    // ── (3) name identity on the wire (SC-1, observed externally) ─────
+    let entry_uri = entry["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("entry.uri is a string; got {}", response.raw));
+    assert_eq!(
+        skill_name_segment_of(entry_uri),
+        served_name,
+        "SC-4 clause 3 / SC-1: the frontmatter `name` must equal the skill \
+         segment of the entry URI — this is `validate_names`' invariant seen \
+         from OUTSIDE the SDK: {}",
+        response.raw
+    );
+
+    // ── (4) a complete `{uri, digest, size}` manifest ─────────────────
+    let manifest = entry["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("entry.resources is an array; got {}", response.raw));
+    assert!(
+        !manifest.is_empty(),
+        "SC-4 clause 4: a conforming host fetches every manifest row, so an \
+         EMPTY manifest is a rejection and not a graceful degradation: {}",
+        response.raw
+    );
+    let skill_md_row = manifest
+        .iter()
+        .find(|row| row["uri"] == PROJECTED_SKILL_MD)
+        .unwrap_or_else(|| {
+            panic!(
+                "SC-4 clause 4: the manifest must carry a row for {PROJECTED_SKILL_MD}: {}",
+                response.raw
+            )
+        });
+
+    assert_digest_shape(skill_md_row, "SC-4 clause 4", &response.raw);
+
+    let size = skill_md_row["size"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "a manifest row carries a numeric size; got {}",
+            response.raw
+        )
+    });
+    assert!(size > 0, "SC-4 clause 4: a served body has non-zero size");
+    assert_eq!(
+        usize::try_from(size).expect("a SKILL.md size fits in usize"),
+        skill.body().len(),
+        "SC-4 clause 4: the manifest `size` must equal the byte length of the \
+         SERVED body: {}",
+        response.raw
+    );
+
+    // ── (5) byte-identity on the wire ─────────────────────────────────
+    //
+    // D-05's one-body invariant, stated where a consumer can see it: the bytes
+    // the digest above covers are the bytes `resources/read` hands back.
+    let params = json!({ "uri": PROJECTED_SKILL_MD });
+    let read = post(
+        addr,
+        &v2_headers_for("resources/read", &params),
+        &v2_body("resources/read", json!(127), params),
+    )
+    .await;
+    assert!(
+        read.body.get("error").is_none(),
+        "SC-4 clause 5: the projected skill's SKILL.md must READ: {}",
+        read.raw
+    );
+    let contents = read.body["result"]["contents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resources/read returns a contents array; got {}", read.raw));
+    assert_eq!(
+        contents.len(),
+        1,
+        "SC-4 clause 5: one SKILL.md, one content item: {}",
+        read.raw
+    );
+    assert_eq!(
+        contents[0]["text"].as_str(),
+        Some(skill.body()),
+        "SC-4 clause 5: `resources/read` must return bytes byte-equal to \
+         `skill.body()` — the same bytes the published digest covers: {}",
+        read.raw
+    );
+
+    teardown(handle, ()).await;
+}
+
+/// SC-4 on the wire, for an ordinary workflow description.
+#[tokio::test]
+async fn projected_workflow_skill_is_conforming_on_the_wire() {
+    assert_sc4_holds_on_the_wire(PLAIN_DESCRIPTION).await;
+}
+
+/// SC-4 on the wire, for a description that would break a RAW frontmatter
+/// concatenation (REVIEWS finding 1 / T-126-21), observed from outside the SDK.
+///
+/// Plan 126-01 fixed this with `yaml_double_quoted`. If that encoder is ever
+/// weakened or made conditional, THIS test goes red at the SC-4 level — the
+/// frontmatter grows a `metadata` key, or the whole block fails to parse and the
+/// entry ships with no `name` at all.
+#[tokio::test]
+async fn projected_workflow_skill_survives_an_adversarial_description_on_the_wire() {
+    // Guard the fixture itself: the string must actually carry all three hazards,
+    // or this test is the plain one under a different name.
+    assert!(ADVERSARIAL_DESCRIPTION.contains(": "));
+    assert!(ADVERSARIAL_DESCRIPTION.contains('#'));
+    assert!(ADVERSARIAL_DESCRIPTION.contains('\n'));
+
+    assert_sc4_holds_on_the_wire(ADVERSARIAL_DESCRIPTION).await;
+}
+
+// ── 22. The PROJECTION fuzz target exists, is registered, and is SCHEDULED ──
+
+/// The same three-artifact agreement `fuzz_skill_entry_is_registered_and_scheduled`
+/// checks, retargeted at Phase 126's projection fuzzer:
+///
+/// 1. `fuzz/fuzz_targets/fuzz_workflow_projection.rs` — the target source.
+/// 2. A `[[bin]]` stanza in `fuzz/Cargo.toml` naming it, whose `path` resolves
+///    to that source file.
+/// 3. A row in `.github/workflows/fuzz.yml`'s target matrix, so the target is
+///    EXECUTED on the daily schedule rather than merely registered.
+///
+/// # Why this test carries the whole ALWAYS/FUZZ claim for `as_skill()`
+///
+/// `make test-fuzz` cannot — the helper's rustdoc records why it exits 0 having
+/// run nothing on this repository's pinned stable toolchain. This source-text
+/// check is therefore the only artefact in this phase that goes RED when the
+/// projection fuzz target is deleted, renamed, or quietly dropped from CI.
+#[test]
+fn fuzz_workflow_projection_is_registered_and_scheduled() {
+    assert_fuzz_target_registered_and_scheduled(
+        "fuzz_workflow_projection",
+        // `fuzz_skill_entry` joins the anti-vacuity list here: this target was
+        // added after it, so a matrix that lost the older row is provably not
+        // the matrix this test was written against.
+        &["protocol_parsing", "jsonrpc_handling", "fuzz_skill_entry"],
+        "`SequentialWorkflow::as_skill()` is a public INFALLIBLE method, so \
+         deleting the file does not remove that requirement.",
+    );
+}

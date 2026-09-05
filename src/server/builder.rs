@@ -140,6 +140,20 @@ pub struct ServerCoreBuilder {
     /// `.skill(...)` / `.skills(...)` calls never produce nested wrappers.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pending_skills: Option<Skills>,
+    /// Whether workflows registered from here on get the D-04a projected-skill
+    /// prepend as prompt message `[0]`, set via
+    /// [`Self::with_workflow_skill_prepend`].
+    ///
+    /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
+    /// workflows registered after the setter and not to earlier ones. Default
+    /// `false`, so every existing server's transcript is byte-identical.
+    ///
+    /// UNGATED, though the setter that writes it is not. A `bool` costs nothing
+    /// to carry, and carrying it is what lets `prompt_workflow` hand it to
+    /// `WorkflowPromptHandler::with_projected_skill_prepend` — which has a null
+    /// twin — with no `#[cfg]` at the call site. Paired twins over call-site
+    /// `#[cfg]` is this repo's recorded house decision.
+    prepend_projected_skill: bool,
 }
 
 impl Default for ServerCoreBuilder {
@@ -188,6 +202,7 @@ impl ServerCoreBuilder {
             payload_limits: PayloadLimits::default(),
             #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
             pending_skills: None,
+            prepend_projected_skill: false,
         }
     }
 
@@ -439,7 +454,10 @@ impl ServerCoreBuilder {
     /// # Panics
     ///
     /// Panics at `.build()` time if multiple registered skills resolve to
-    /// the same `skill://` URI. Use [`Self::try_skills`] with a pre-built
+    /// the same `skill://` URI, if a registered reference URI collides with
+    /// another skill's `SKILL.md` URI, or if a skill's frontmatter `name`
+    /// disagrees with the final segment of its URI path (the SEP-2640
+    /// name-identity rule). Use [`Self::try_skills`] with a pre-built
     /// [`Skills`] registry to surface duplicates as a `Result`.
     ///
     /// # Examples
@@ -463,6 +481,85 @@ impl ServerCoreBuilder {
         self.skills(Skills::new().add(skill))
     }
 
+    /// Prepend the projected skill body to workflow prompts (default: **off**).
+    ///
+    /// Turns on
+    /// [`WorkflowPromptHandler::with_projected_skill_prepend`](crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend)
+    /// for every workflow this builder registers, so `prompts/get` opens with
+    /// the bytes `workflow.as_skill().body()` renders. Without this method the
+    /// opt-in is reachable only by hand-constructing a `WorkflowPromptHandler`
+    /// and registering it with `.prompt(name, handler)`, which would make the
+    /// setting true per workflow VALUE but not per SERVER.
+    ///
+    /// # It does NOT register the skill — you must do that too
+    ///
+    /// This setter touches the PROMPT surface only. It never adds anything to
+    /// the skills registry, so on a builder that does nothing else the server
+    /// hands a client a document identifying itself as `skill://{slug}/SKILL.md`
+    /// while `resources/read` on that URI fails and `skills/list` answers
+    /// `-32601` (no skill was registered, so the extension is never declared).
+    ///
+    /// For the "one string, one digest, no variant to keep in sync" property to
+    /// actually hold, register the projected skill from the SAME workflow value
+    /// in the same builder chain:
+    ///
+    /// ```text
+    /// builder
+    ///     .try_skills(Skills::new().add(workflow.as_skill()))?
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    /// ```
+    ///
+    /// Nothing enforces the pairing, so a workflow edited after only one of the
+    /// two calls desynchronizes the prompt bytes from the digest published in
+    /// `skills/list`.
+    ///
+    /// # Ordering matters
+    ///
+    /// [`Self::prompt_workflow`] reads this setting at REGISTRATION time, so it
+    /// applies to workflows registered AFTER this call and leaves earlier ones
+    /// alone. Call it before the workflows it should affect:
+    ///
+    /// ```rust
+    /// # #[cfg(all(feature = "skills", not(target_arch = "wasm32")))] {
+    /// # fn main() -> Result<(), pmcp::Error> {
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    ///
+    /// // The exact bytes `prompts/get` will now open with, and the same bytes
+    /// // served at `skill://refund-flow/SKILL.md`.
+    /// let message_zero = workflow.as_skill().body().to_string();
+    ///
+    /// let server = ServerCoreBuilder::new()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    ///     .build()?;
+    ///
+    /// assert!(message_zero.starts_with("---\nname: \"refund-flow\"\n"));
+    /// # let _ = server;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// `ServerCore` exposes no synchronous prompt accessor, so the assertion
+    /// above is on the projected bytes rather than on the built server; the
+    /// end-to-end proof that this setter actually reaches message `[0]` is
+    /// `server_core_builder_prompt_workflow_reaches_the_prepend` in
+    /// `tests/skills_integration.rs`, with its flag-off negative case alongside.
+    ///
+    /// The default is `false`, so an existing server's transcripts do not move.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_workflow_skill_prepend(mut self, on: bool) -> Self {
+        self.prepend_projected_skill = on;
+        self
+    }
+
     /// Register a registry of SEP-2640 Agent Skills.
     ///
     /// Merges into any prior accumulated skills (a previous `.skill(...)` or
@@ -472,8 +569,12 @@ impl ServerCoreBuilder {
     ///
     /// # Panics
     ///
-    /// Panics at `.build()` if two registered skills resolve to the same
-    /// `skill://` URI. Use [`Self::try_skills`] for fallible registration.
+    /// Panics at `.build()` on any condition the registry refuses: two skills
+    /// resolving to the same `skill://` URI, a reference URI colliding with
+    /// another skill's `SKILL.md` URI, or a frontmatter `name` that disagrees
+    /// with the final segment of its URI path (the SEP-2640 name-identity
+    /// rule, added in Phase 125). Use [`Self::try_skills`] for fallible
+    /// registration.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn skills(mut self, skills: Skills) -> Self {
@@ -488,23 +589,53 @@ impl ServerCoreBuilder {
         self
     }
 
-    /// Fallible variant of [`Self::skills`] — returns `Err` immediately if
-    /// the merged registry would contain duplicate URIs. Useful for
-    /// runtime-dynamic registration where panicking is unacceptable.
+    /// Fallible variant of [`Self::skills`]. Useful for runtime-dynamic
+    /// registration where panicking is unacceptable.
+    ///
+    /// # What it checks, and what it does NOT
+    ///
+    /// Duplicate URIs are a CROSS-skill property, so they are checked over the
+    /// whole accumulated registry. Name identity is a PER-skill property and is
+    /// checked over the registry passed to THIS call only — which is what keeps
+    /// K registrations linear rather than quadratic.
+    ///
+    /// The consequence is worth stating plainly, because it is the one case
+    /// where this method does not save you from `.build()`: skills deposited by
+    /// the INFALLIBLE [`Self::skills`] / [`Self::skill`] /
+    /// [`Self::bootstrap_skill_and_prompt`] are never name-checked at
+    /// registration time, so a later `try_skills` can return `Ok` while
+    /// `.build()` still panics on one of them. Register every skill through
+    /// `try_skills` if you need the failure as a `Result`.
     ///
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` if the merged registry would
-    /// produce duplicate `skill://` URIs.
+    /// produce duplicate `skill://` URIs (including a reference URI that
+    /// collides with another skill's `SKILL.md`), or if a skill in the registry
+    /// PASSED HERE has a frontmatter `name` that disagrees with the final
+    /// segment of its URI path.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pub fn try_skills(mut self, skills: Skills) -> Result<Self> {
+        // Name identity is a PER-SKILL property — see `validate_name_identity`.
+        // Validating the arriving registry before the merge is what keeps this
+        // linear in registry size across K registrations.
+        skills.validate_name_identity()?;
         let merged = match self.pending_skills.take() {
             Some(prior) => prior.merge(skills),
             None => skills,
         };
-        // Probe by cloning + into_handler; discard the handler. The real
+        // Probe WITHOUT cloning the registry or building a handler. The real
         // construction happens in `.build()` once everything is settled.
-        merged.clone().into_handler()?;
+        //
+        // Duplicate URIs are a cross-skill property, so this must see the
+        // MERGED registry — but URIs need no YAML parse and no SHA-256, so the
+        // merged probe is cheap. Name identity is per-skill and was validated
+        // for every prior registry by the call that added it, so only the newly
+        // supplied one is parsed here (see `validate_name_identity`). Probing
+        // through `into_handler` instead meant a deep clone of the whole
+        // accumulated registry AND a full name pass over it on every call: K
+        // registrations cost K(K+1)/2 YAML parses where upstream cost none.
+        merged.validate_unique_uris()?;
         self.pending_skills = Some(merged);
         crate::server::skills::set_skills_capabilities(&mut self.capabilities);
         Ok(self)
@@ -518,7 +649,7 @@ impl ServerCoreBuilder {
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn bootstrap_skill_and_prompt(self, skill: Skill, prompt_name: impl Into<String>) -> Self {
-        let prompt_handler = SkillPromptHandler::new(skill.clone());
+        let prompt_handler = SkillPromptHandler::new(&skill);
         self.skill(skill).prompt(prompt_name, prompt_handler)
     }
 
@@ -1240,6 +1371,11 @@ impl ServerCoreBuilder {
             self.resources.clone(),
         );
 
+        // D-04a: apply the projected-skill prepend BEFORE the task wrap below,
+        // so a `has_task_support` workflow inherits the setting through its
+        // `inner` handler and there is no second call site to keep in sync.
+        let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
+
         // Wrap in TaskWorkflowPromptHandler if task support is enabled
         if has_task_support {
             let task_router = self.task_router.as_ref().ok_or_else(|| {
@@ -1353,8 +1489,47 @@ impl ServerCoreBuilder {
         // itself stays "last write wins" — composition lives here so the
         // setter's semantics are unchanged for callers that don't use
         // skills.
+        //
+        // The SEP-2640 entry set is DISCARDED here, and that is a decision rather
+        // than an oversight.
+        //
+        // A `ServerCore`'s only request ingress is
+        // `ProtocolHandler::handle_request(&self, id, request: Request, auth)`
+        // (`src/server/core.rs`), which accepts the typed PUBLIC `Request` enum.
+        // Neither `skills/list` nor `skills/get` will ever appear in it — adding a
+        // variant to a public exhaustive enum is a semver-MAJOR break, which is
+        // the whole reason both methods ride the crate-private
+        // `InternalClientRequest` classifier instead. So a `skill_entries` field
+        // here would be a field nothing could ever read, and a
+        // `ServerCore::handle_skills_*` would be a function nothing could ever
+        // call.
+        //
+        // PRECEDENT, not preference: Phase 112 reached exactly this conclusion for
+        // `server/discover` and acted on it. The `ServerCore` discover wrappers
+        // were DELETED, the projection was consolidated into the single free fn
+        // `build_discover_response`, and no `#[allow(dead_code)]` was left behind;
+        // `handle_tasks_update` followed the same shape and exists only on the
+        // high-level `Server`. `tests/skills_routing.rs` carries a source-scan
+        // guard that fails if either dead item is re-added, and its rustdoc names
+        // the `handle_request` signature as the fact a future widener must change
+        // first.
+        //
+        // The skills RESOURCE surface a `ServerCoreBuilder` server exposes is
+        // real and unaffected: the handler bound below still serves every skill
+        // through `resources/list` and `resources/read`. Only the two skills
+        // METHODS are out of reach, and that limit is a recorded phase deferral.
+        // Re-apply the skills capability LAST — see the twin comment in
+        // `ServerBuilder::build`. `capabilities(..)` REPLACES the whole
+        // `ServerCapabilities` value, so a `.skill(..).capabilities(..)` ordering
+        // dropped the `io.modelcontextprotocol/skills` extension that `.skill(..)`
+        // had inserted, leaving a server that serves every skill as a resource
+        // while declaring nothing.
         #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
-        let final_resources: Option<Arc<dyn ResourceHandler>> =
+        if self.pending_skills.is_some() {
+            crate::server::skills::set_skills_capabilities(&mut self.capabilities);
+        }
+        #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+        let (final_resources, _): (Option<Arc<dyn ResourceHandler>>, Vec<_>) =
             finalize_skills_resources(self.pending_skills.take(), self.resources.take());
         #[cfg(not(all(feature = "skills", not(target_arch = "wasm32"))))]
         let final_resources = self.resources.take();
@@ -1423,31 +1598,54 @@ impl ServerCoreBuilder {
     }
 }
 
-/// Finalize accumulated `Skills` into a single `ResourceHandler`, optionally
-/// composed with the user's `.resources(...)` slot.
+/// Finalize accumulated `Skills` into a single `ResourceHandler` PLUS the
+/// SEP-2640 `skills/list` entry set, optionally composing the handler with the
+/// user's `.resources(...)` slot.
 ///
 /// Called from both [`ServerCoreBuilder::build`] and the `ServerBuilder::build`
 /// path in `src/server/mod.rs` so the composition logic exists in exactly
 /// one place. Panics on duplicate URIs — surface the failure via
 /// [`ServerCoreBuilder::try_skills`] for fallible registration.
+///
+/// # Why the entries come back in the tuple rather than off the handler
+///
+/// This is the ONE place both build paths see the registry, so it is the only
+/// place both can get entries from without drifting. Reaching them later by
+/// downcasting the returned `ResourceHandler` would silently return "no skills"
+/// the moment [`ComposedResources`] wraps it — which it already does whenever the
+/// author also called `.resources(...)` — so entries travel as their own value
+/// and are stored in their own field.
+///
+/// [`Skills::entries`] is called BEFORE [`Skills::into_handler`] because the
+/// latter consumes `self`. `into_handler`'s public signature is deliberately
+/// unchanged: widening it to a tuple would be a semver-MAJOR break on a shipped
+/// public method.
 #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
 pub(crate) fn finalize_skills_resources(
     pending: Option<Skills>,
     user: Option<Arc<dyn ResourceHandler>>,
-) -> Option<Arc<dyn ResourceHandler>> {
+) -> (
+    Option<Arc<dyn ResourceHandler>>,
+    Vec<crate::server::skills::SkillEntry>,
+) {
     match (pending, user) {
-        (None, other) => other,
-        (Some(skills), None) => Some(skills.into_handler().unwrap_or_else(|e| {
-            panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
-        })),
-        (Some(skills), Some(user_handler)) => {
-            let skills_handler = skills.into_handler().unwrap_or_else(|e| {
-                panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
+        (None, other) => (other, Vec::new()),
+        (Some(skills), user_handler) => {
+            // ONE artifact pass for both products. Calling `entries()` and then
+            // `into_handler()` here parsed every skill's YAML twice and
+            // SHA-256'd every SKILL.md and reference body twice per build.
+            let (skills_handler, entries, diagnostics) = skills.finalize().unwrap_or_else(|e| {
+                panic!("Skills: {e}; use try_skills(...) for fallible registration")
             });
-            Some(Arc::new(ComposedResources {
-                skills: skills_handler,
-                other: user_handler,
-            }))
+            crate::server::skills::log_skill_diagnostics(&diagnostics);
+            let resources = match user_handler {
+                None => skills_handler,
+                Some(other) => Arc::new(ComposedResources {
+                    skills: skills_handler,
+                    other,
+                }),
+            };
+            (Some(resources), entries)
         },
     }
 }
@@ -2294,12 +2492,21 @@ mod skills_builder_tests {
         // calling `.build()` (which moves the handler into ServerCore).
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let list = composed.list(None, extra()).await.unwrap();
         let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
         assert!(uris.contains(&"skill://a/SKILL.md"));
-        assert!(uris.contains(&"skill://index.json"));
+        // The synthesized discovery index was retired in Phase 125 plan 04.
+        // Asserting its ABSENCE — rather than deleting the line — keeps a
+        // reintroduction detectable from the composed-handler side, which is
+        // the surface a server author actually observes.
+        assert!(
+            !uris.contains(&"skill://index.json"),
+            "retired discovery index reappeared: {uris:?}"
+        );
         assert!(uris.contains(&"docs://handbook"));
 
         let res = composed.read("docs://handbook", extra()).await.unwrap();
@@ -2323,7 +2530,9 @@ mod skills_builder_tests {
         // the builder method call order. Verifies the same outcome.
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let res = composed.read("skill://a/SKILL.md", extra()).await.unwrap();
         match &res.contents[0] {
@@ -2386,6 +2595,7 @@ mod skills_builder_tests {
         // No skill calls — finalize should pass through user only.
         let final_handler =
             finalize_skills_resources(None, Some(Arc::new(B) as Arc<dyn ResourceHandler>))
+                .0
                 .expect("user handler preserved");
         let res = final_handler.read("test://uri", extra()).await.unwrap();
         match &res.contents[0] {

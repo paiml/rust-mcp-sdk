@@ -681,15 +681,22 @@ impl PromptHandler for TaskWorkflowPromptHandler {
         // 4. Active execution loop
         let step_count = self.workflow.steps().len();
         let total_steps = step_count;
-        let mut messages: Vec<PromptMessage> = Vec::new();
         let mut execution_context = ExecutionContext::new();
         let mut step_results: Vec<(String, Value)> = Vec::new();
         let mut step_statuses: Vec<StepStatus> = vec![StepStatus::Pending; step_count];
         let mut pause_reason: Option<PauseReason> = None;
 
-        // Add header messages
-        messages.push(self.inner.create_user_intent(&args));
-        messages.push(self.inner.create_assistant_plan()?);
+        // Add header messages.
+        //
+        // This branch rebuilds the message list itself rather than delegating to
+        // `WorkflowPromptHandler::handle`, so it must reproduce that handler's
+        // header sequence exactly — otherwise a `has_task_support(true)` workflow
+        // would get a different transcript from a plain one. It does not
+        // reproduce it, it USES it: the whole opening sequence (D-04a prepend,
+        // user intent, and the plan-or-its-validation) comes from the ONE
+        // producer on `inner`, so the two handlers cannot drift anywhere in the
+        // header rather than only at message [0].
+        let mut messages: Vec<PromptMessage> = self.inner.opening_messages(&args)?;
 
         for (idx, step) in self.workflow.steps().iter().enumerate() {
             // Check cancellation

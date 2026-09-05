@@ -1,8 +1,8 @@
 # Spike Wrap-Up Summary
 
-**Dates:** 2026-05-12 (session 1), 2026-05-17 (session 2)
-**Spikes processed:** 6 total (2 + 4)
-**Feature areas:** 5 (Wire Protocol, DX Layer, Schema-Server Architecture, SQL Dialects, Type 2 Authoring Skills)
+**Dates:** 2026-05-12 (session 1), 2026-05-17 (session 2), 2026-09-01 (session 3)
+**Spikes processed:** 10 total (2 + 4 + 4)
+**Feature areas:** 7 (Wire Protocol, DX Layer, Schema-Server Architecture, SQL Dialects, Type 2 Authoring Skills, SEP-2640 Conformance, Skills Positioning / Tri-Surface)
 **Skill output:** `./.claude/skills/spike-findings-rust-mcp-sdk/`
 
 ## Processed Spikes
@@ -22,6 +22,18 @@
 | 004 | schema-server-thin-slice-sql | standard | ✓ VALIDATED | Schema-Server Architecture |
 | 005 | multi-dialect-sql-connector | standard | ✓ VALIDATED | SQL Multi-Dialect Connectors |
 | 006 | authoring-skills-server | standard | ✓ VALIDATED | Type 2 Authoring Skills |
+
+### Session 3 — Skills positioning (idea `skills-positioning`)
+
+| # | Name | Type | Verdict | Feature Area |
+|---|------|------|---------|--------------|
+| 008 | sep-2640-drift-check | standard | ✓ VALIDATED | SEP-2640 Conformance |
+| 009 | workflow-skill-projection | standard | ✓ VALIDATED | Skills Positioning / Tri-Surface |
+| 010 | agent-instructions-from-skills | standard | ✓ VALIDATED | Skills Positioning / Tri-Surface |
+| 011 | three-mechanisms-one-task | standard | ✓ VALIDATED | Skills Positioning / Tri-Surface |
+
+(Slot 007, `azure-containerapp-deploy`, holds undocumented Phase-80-era
+Azure deploy run logs — no README, never indexed, nothing to wrap.)
 
 ## Key Findings
 
@@ -93,6 +105,35 @@ crate concern.
    only drive `ToolHandler::handle` directly. Either expose a public
    in-process driver or document the handler-level pattern.
 
+### From session 3 (Skills positioning)
+
+**The shipped skills module is non-conformant with the CURRENT SEP-2640
+draft on the one thing it advertises.** The draft (rewritten 2026-08-29)
+now defines `skills/list` (MUST) + `skills/get` (MUST); pmcp auto-declares
+the extension and implements neither, so a conforming host's first call
+gets -32601. Fix via the `InternalClientRequest` classifier route — no
+public `ClientRequest` variant (2.x promise). The `Skill` data model is
+sufficient; the gap is API surface. Until the methods land,
+declaring-but-not-implementing is the one indefensible state.
+
+**The three instruction-carrying mechanisms differ on WHERE JUDGMENT
+RUNS, not on transport.** Measured with identical tools, data, and one
+shared `decide()` policy brain: the ineligible order got refunded ONLY by
+the workflow surface (deterministic prefix cannot host judgment); the
+skill and agent surfaces both declined because judgment gates the side
+effect pre-action. Context cost is not monotone — the workflow transcript
+outweighed the skill body at demo scale (1401 B vs 624 B; agent 82 B).
+
+**They compose rather than compete.** Workflow projects to skill
+(`as_skill()`, ~90-line deterministic renderer, byte-equal re-derivation,
+projection owns slugification); agent consumes digest-pinned skills
+(~60-line resolve layer, zero pmcp-agent changes). The AgentPackage
+digest pin and SEP-2640 content-bound approval are the same mechanism
+seen from two sides: packing is the approval ceremony, resolve-time
+mismatch is revocation (fatal, pre-loop, never fetch-and-continue) — and
+the WG explicitly scoped installable bundles out of the SEP, exactly
+where pmcp-package already is.
+
 ## Recommended Implementation Path
 
 ### Phase 0 — Skills support (mostly already shipped)
@@ -127,11 +168,13 @@ v2).
 
 ## Deferred for Future Spikes
 
-- **007 openapi-auth-policy-pluggability** — gates Phase 3 OpenAPI lift.
-- **008 cargo-pmcp-new-from-schema** — Shape B scaffold (low risk;
-  depends on Phase 1 shipping).
-- **009 schema-codemode-as-skill** — composition: code-mode bootstrap
-  as SEP-2640 Skill vs current `/start_code_mode` prompt convention.
+- **openapi-auth-policy-pluggability** — gates Phase 3 OpenAPI lift.
+  (Was penciled in as "spike 007" — that slot has since been consumed.)
+- **cargo-pmcp-new-from-schema** — Shape B scaffold (low risk; depends
+  on Phase 1 shipping). (Was penciled in as "008", since consumed.)
+- **schema-codemode-as-skill** — composition: code-mode bootstrap as
+  SEP-2640 Skill vs current `/start_code_mode` prompt convention.
+  (Was penciled in as "009", since consumed.)
 - **tasks-vertical-slice** — validate `docs/design/tasks-feature-design.md`
   architecture before scaffolding `crates/pmcp-tasks/`.
 - **task-retry-expiry-gaps** — pragmatic retry/expiry policy layer

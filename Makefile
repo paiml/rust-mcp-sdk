@@ -154,52 +154,68 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 	@echo "$(GREEN)✓ Code formatting OK$(NC)"
 
+# The ONE clippy policy, shared by `lint` and `lint-skills`.
+#
+# `lint-skills` used to carry a verbatim 33-line copy of this list, with a
+# comment saying it was `make lint`'s "verbatim: this leg exists to widen the
+# policy's REACH, not to give one module a softer policy" — and nothing enforced
+# the word "verbatim". The next `-A` added to `make lint` (this file already
+# records one such addition, the Rust-1.98 `unused_async_trait_impl` note below)
+# would silently have given the skills module a STRICTER policy than the rest of
+# the crate, the inverse of the stated intent, surfacing as a confusing CI-only
+# failure in a module nobody touched. One variable removes the class.
+#
+# The two targets now differ only in `--features` and `-p pmcp`, which is the
+# whole of the real difference between them.
+#
+# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
+# 1.98 split part of `unused_async` — already allowed here, deliberately —
+# into a sibling lint the old allow does not cover, and it fires on 9
+# pre-existing sites. THREE of them are `pub async fn` on the public API
+# (`CognitoProvider::new`, `NotificationDebouncer::start`,
+# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
+# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
+# design — its body says "this would make an HTTP request". Allowing it
+# restores the policy this list already encodes rather than weakening it.
+CLIPPY_POLICY := \
+	-D clippy::all \
+	-W clippy::pedantic \
+	-W clippy::nursery \
+	-W clippy::cargo \
+	-A clippy::module_name_repetitions \
+	-A clippy::must_use_candidate \
+	-A clippy::missing_errors_doc \
+	-A clippy::missing_const_for_fn \
+	-A clippy::return_self_not_must_use \
+	-A clippy::missing_fields_in_debug \
+	-A clippy::uninlined_format_args \
+	-A clippy::if_not_else \
+	-A clippy::result_large_err \
+	-A clippy::multiple_crate_versions \
+	-A clippy::implicit_hasher \
+	-A clippy::unused_async \
+	-A clippy::cast_lossless \
+	-A clippy::redundant_clone \
+	-A clippy::redundant_closure_for_method_calls \
+	-A clippy::significant_drop_tightening \
+	-A clippy::missing_panics_doc \
+	-A clippy::cast_possible_truncation \
+	-A clippy::cast_precision_loss \
+	-A clippy::option_if_let_else \
+	-A clippy::derive_partial_eq_without_eq \
+	-A clippy::redundant_else \
+	-A clippy::match_same_arms \
+	-A clippy::manual_string_new \
+	-A clippy::default_trait_access \
+	-A clippy::format_push_string \
+	-A clippy::too_many_lines \
+	-A clippy::cargo_common_metadata \
+	-A clippy::unused_async_trait_impl
+
 .PHONY: lint
 lint:
 	@echo "$(BLUE)Running clippy...$(NC)"
-	# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
-	# 1.98 split part of `unused_async` — already allowed here, deliberately —
-	# into a sibling lint the old allow does not cover, and it fires on 9
-	# pre-existing sites. THREE of them are `pub async fn` on the public API
-	# (`CognitoProvider::new`, `NotificationDebouncer::start`,
-	# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
-	# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
-	# design — its body says "this would make an HTTP request". Allowing it
-	# restores the policy this list already encodes rather than weakening it.
-	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- \
-		-D clippy::all \
-		-W clippy::pedantic \
-		-W clippy::nursery \
-		-W clippy::cargo \
-		-A clippy::module_name_repetitions \
-		-A clippy::must_use_candidate \
-		-A clippy::missing_errors_doc \
-		-A clippy::missing_const_for_fn \
-		-A clippy::return_self_not_must_use \
-		-A clippy::missing_fields_in_debug \
-		-A clippy::uninlined_format_args \
-		-A clippy::if_not_else \
-		-A clippy::result_large_err \
-		-A clippy::multiple_crate_versions \
-		-A clippy::implicit_hasher \
-		-A clippy::unused_async \
-		-A clippy::cast_lossless \
-		-A clippy::redundant_clone \
-		-A clippy::redundant_closure_for_method_calls \
-		-A clippy::significant_drop_tightening \
-		-A clippy::missing_panics_doc \
-		-A clippy::cast_possible_truncation \
-		-A clippy::cast_precision_loss \
-		-A clippy::option_if_let_else \
-		-A clippy::derive_partial_eq_without_eq \
-		-A clippy::redundant_else \
-		-A clippy::match_same_arms \
-		-A clippy::manual_string_new \
-		-A clippy::default_trait_access \
-		-A clippy::format_push_string \
-		-A clippy::too_many_lines \
-		-A clippy::cargo_common_metadata \
-		-A clippy::unused_async_trait_impl
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- $(CLIPPY_POLICY)
 	@echo "$(BLUE)Checking examples...$(NC)"
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) check --features "full" --examples
 	@echo "$(GREEN)✓ No lint issues$(NC)"
@@ -903,6 +919,126 @@ test-integration:
 	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test --test '*' --features "full"
 	@echo "$(GREEN)✓ Integration tests passed$(NC)"
 
+# The GATE's reach into `src/server/skills/` (Phase 125, 125-CONTEXT D-09).
+#
+# Same shape as the `test-cargo-pmcp` leg above -- the gate is green on what it
+# reaches, and the failures live in what it does not. MEASURED (125-RESEARCH.md
+# Pitfall 2, re-confirmed after every wave of phase 125): EVERY test leg in this
+# file pins `--features "full"`, and `skills` is a member of neither `full` nor
+# `full-v2`, so `make quality-gate` compiled and executed ZERO tests from this
+# module while four plans of new behaviour landed behind it. `make build` and
+# `make test-examples` compile the module; neither runs one of its tests.
+#
+# `skills` deliberately STAYS OUT of `full` and `full-v2`. Those two are
+# enumerated lists whose relationship `tests/v1_severability_tripwire.rs` derives
+# from `Cargo.toml` at test time and asserts; adding a member changes what the
+# severance proof covers. A dedicated leg is the honest fix, not a wider `full`.
+#
+# Why an explicit feature list and NOT `--all-features`: `--all-features` would
+# re-run a large share of what `test-all` already ran moments earlier in the same
+# gate, which buys no signal and lengthens every local gate run. The narrow list
+# is also the better failure signal -- when this leg stops compiling for want of
+# a feature, the missing feature is named right here in the recipe instead of
+# being hidden inside a blanket flag. The three companions of `skills` are
+# exactly what the selected test files' own `#![cfg]` headers require:
+#   streamable-http + http-client -> tests/skills_routing.rs:62-67, and the
+#                                    tests/common/v2.rs loopback harness it uses
+#   testing                       -> tests/common/duplex.rs, the ONE harness that
+#                                    accepts a `ServerCore` (routing tests 17/18)
+#
+# Why FOUR separately-captured selectors each with its OWN guard, and never one
+# summed total: a healthy selector reporting a hundred tests keeps a summed total
+# comfortably nonzero while a sibling silently matches nothing, so the aggregate
+# reports green over exactly the blind spot this leg exists to close. That is the
+# `--features "full"` false green above, reintroduced one level down.
+# `test-cargo-pmcp` learned this the expensive way (927 bin-target tests went
+# dark beneath a nonzero sum); this leg ships with the lesson already applied.
+#
+# What each selector holds up, i.e. what goes dark if its guard is removed:
+#   1  --lib skills                the whole in-module unit + proptest body
+#   2  --doc skills                the `entries()` doctest and the module-header
+#                                  mirror that `pmcp-book` copies byte for byte
+#   3  --test skills_integration   the resource-surface and byte-identity suite
+#   4  --test skills_routing       every wire proof, tripwire and routing guarantee
+#
+# `-- --test-threads=1` is CLAUDE.md-mandated and this workspace has recorded
+# real parallel-test races. `make test-unit` / `make test-integration` are NOT
+# usable here (they pin `--features "full"` and would report success having run
+# nothing from this module), and neither is a `cargo nextest -E 'test(...)'`
+# selector, which is a project-recorded false green: it can match zero tests and
+# still exit 0.
+#
+# The guards themselves live in `scripts/guarded-cargo-test.sh`, ONE copy driven
+# four times, because the four blocks that used to be expanded inline here
+# differed only in the label, the cargo arguments, the `want=` target and two
+# prose strings — and had already begun to drift. Read that script's header
+# before relaxing anything in it; `test-cargo-pmcp` above is the in-repo
+# precedent for the same collapse.
+SKILLS_FEATURES := skills,streamable-http,http-client,testing
+
+# The GATE's LINT reach into `src/server/skills/` — the other half of D-09.
+#
+# `make lint` pins `--features "full"` and `skills` is in neither `full` nor
+# `full-v2`, so the pedantic+nursery policy CLAUDE.md calls zero-tolerance never
+# compiled this module: ~2,300 new lines shipped unlinted. The module itself
+# records two consequences of that blind spot in its own comments (a
+# `clippy::needless_pass_by_value` that survived four plans, and a
+# `clippy::type_complexity` the alias exists to dodge). CI's
+# `clippy --all-targets --all-features -D warnings` does reach the file but
+# carries NO pedantic/nursery groups, which CLAUDE.md states outright is the
+# weaker form.
+#
+# The lint policy is `$(CLIPPY_POLICY)`, the SAME variable `make lint` uses, so
+# "verbatim" is now structural rather than a promise nobody checked: this leg
+# exists to widen the policy's REACH, not to give one module a softer (or, once
+# the copy drifted, a stricter) policy.
+#
+# The feature set is `full` PLUS `skills`, deliberately NOT `$(SKILLS_FEATURES)`.
+# `test-skills` uses the narrow set because the test files' own `#![cfg]` headers
+# name exactly those features; a LINT leg has the opposite requirement. Measured:
+# the narrow set drops `jwt-auth`, which compiles `CachedJwks`'s
+# `HashMap<String, ()>` fallback branch and trips `clippy::zero_sized_map_values`
+# in `src/server/auth/jwt.rs` — a finding about a feature combination nobody
+# ships, in a module this phase never touched. `full,skills` is the one-feature
+# delta from what `make lint` already lints, so every finding it reports is a
+# finding about the reach this leg exists to add.
+LINT_SKILLS_FEATURES := full,skills
+
+.PHONY: lint-skills
+lint-skills:
+	@echo "$(BLUE)Linting the skills module (features: $(LINT_SKILLS_FEATURES))...$(NC)"
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- $(CLIPPY_POLICY)
+	@echo "$(GREEN)✓ No lint issues in the skills module$(NC)"
+
+# The environment every `test-skills` selector runs under. `RUSTFLAGS=` is
+# EMPTY on purpose — the file-level `-D warnings` must not reach these builds.
+SKILLS_TEST_ENV := RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE)
+
+.PHONY: test-skills
+test-skills:
+	@echo "$(BLUE)Running the skills module's tests (features: $(SKILLS_FEATURES))...$(NC)"
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 1 (--lib skills)" \
+		"src/lib.rs" \
+		"The entire in-module unit + proptest body is dark; a missing feature gate on '$(SKILLS_FEATURES)' is the likely cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --lib skills -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 2 (--doc skills)" \
+		"Doc-tests pmcp" \
+		"The entries() doctest and the module-header mirror that pmcp-book copies byte for byte are unchecked." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --doc skills -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 3 (--test skills_integration)" \
+		"tests/skills_integration.rs" \
+		"The resource-surface and byte-identity suite is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_integration -- --test-threads=1
+	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 4 (--test skills_routing)" \
+		"tests/skills_routing.rs" \
+		"Every wire proof, tripwire and routing guarantee is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_routing -- --test-threads=1
+	@echo "$(GREEN)✓ skills module tests passed across all four selectors$(NC)"
+
 # Phase 117 (SMPL-01/02) — RUN the v1-severance proofs on the severed build.
 #
 # Deliberately NOT chained into `quality-gate`: it compiles every test target and
@@ -1313,11 +1449,16 @@ doc-open: doc
 	@echo "$(BLUE)Opening API documentation...$(NC)"
 	$(CARGO) doc --all-features --no-deps --open
 
+# NOTE the `skills` member of the list below (Phase 125, D-09). This list is NOT
+# the `full` / `full-v2` enumerated pair -- it is local to this target and no
+# tripwire derives anything from it -- so extending it is safe, and without
+# `skills` the whole of `src/server/skills/` was invisible to the ONLY
+# zero-tolerance rustdoc check that runs locally.
 .PHONY: doc-check
 doc-check:
 	@echo "$(BLUE)Checking rustdoc warnings (zero-tolerance)...$(NC)"
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps \
-		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,simd,sse,streamable-http,validation,websocket,v1-compat
+		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,simd,skills,sse,streamable-http,validation,websocket,v1-compat
 	@echo "$(GREEN)✓ Zero rustdoc warnings$(NC)"
 
 # Book documentation
@@ -1715,6 +1856,16 @@ quality-gate:
 	@$(MAKE) doc-check
 	@$(MAKE) build
 	@$(MAKE) test-all
+	# test-skills runs HERE because `test-all` cannot: every one of its legs pins
+	# `--features "full"`, and `skills` is in neither `full` nor `full-v2`. Same
+	# framing as the doc-check leg above -- the gate is green on what it reaches,
+	# and until this leg existed the failures lived in what it did not. See the
+	# target's own header for why it uses four separately-guarded selectors.
+	@$(MAKE) test-skills
+	# lint-skills, for the identical reason one gate leg over: `make lint` also
+	# pins `--features "full"`, so the pedantic+nursery policy never compiled
+	# `src/server/skills/` at all.
+	@$(MAKE) lint-skills
 	@$(MAKE) pmcp-package-gate
 	@$(MAKE) audit
 	@$(MAKE) unused-deps
@@ -2127,6 +2278,8 @@ help:
 	@echo "  test-doc        - Run doctests"
 	@echo "  test-property   - Run property tests"
 	@echo "  test-all        - Run all tests"
+	@echo "  test-skills     - Run the skills module's tests (feature 'skills' is in neither full nor full-v2)"
+	@echo "  lint-skills     - Clippy the skills module under make lint's exact policy (same reach gap)"
 	@echo "  test-feature-flags - Verify pmcp-tasks feature flag combinations"
 	@echo "  coverage        - Generate coverage report"
 	@echo "  mutants         - Run mutation testing"

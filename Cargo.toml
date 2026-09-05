@@ -1,6 +1,6 @@
 [package]
 name = "pmcp"
-version = "2.19.3"
+version = "2.20.0"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "High-quality Rust SDK for Model Context Protocol (MCP) with full TypeScript SDK compatibility"
@@ -149,6 +149,13 @@ http-body-util = "0.1"
 sha2 = "0.11"
 base64 = "0.23"
 jsonwebtoken = { version = "11.0", optional = true }
+
+# SEP-2640 Skills frontmatter extraction (feature `skills`, D-04).
+# Consumer: src/server/skills/mod.rs `parse_frontmatter_value` — the ONE crate-private
+# function that touches this crate, so swapping to a maintained fork later is a
+# one-file change. Version matches the dev-dep below and crates/mcp-tester, so no
+# new package enters the graph (already resolved at 0.9.34+deprecated).
+serde_yaml = { version = "0.9", optional = true }
 
 # Cross-target CSPRNG for the wasm-safe PKCE helper (src/shared/pkce.rs).
 # HIGH-1: must be a NORMAL [dependencies] entry so the ungated pkce module links
@@ -301,9 +308,14 @@ composition = ["streamable-http"]
 # MCP Apps Extension - Interactive UI support for ChatGPT Apps, MCP-UI, and standard MCP hosts
 mcp-apps = []
 # SEP-2640 Skills support — Agent Skills as `ResourceHandler`-served resources
-# plus a parallel prompt fallback. See `src/server/skills.rs` (gated module).
+# plus a parallel prompt fallback. See `src/server/skills/mod.rs` (gated module).
 # Opt-in: NOT in `default`, NOT in `full`. Plan 80-02 fills the module.
-skills = []
+# `dep:serde_yaml` (Phase 125, D-04): verbatim frontmatter extraction for the
+# `skills/list` entry manifests. Deliberately NOT added to `full` / `full-v2` —
+# both are enumerated lists whose drift is asserted by
+# `tests/v1_severability_tripwire.rs`, and D-09 wires coverage through a dedicated
+# `make test-skills` leg instead.
+skills = ["dep:serde_yaml"]
 jwt-auth = ["http-client", "dep:jsonwebtoken"]
 http-client = ["dep:reqwest"]
 logging = ["dep:tracing-subscriber"]
@@ -696,6 +708,13 @@ required-features = ["skills", "full"]
 [[example]]
 name = "c10_client_skills"
 path = "examples/c10_client_skills.rs"
+required-features = ["skills", "full"]
+
+# Phase 126 (D-16): the workflow -> skill PROJECTION sibling of s44. `s45` is
+# taken by `s45_tool_as_task_lifecycle` below, hence `s56`.
+[[example]]
+name = "s56_workflow_skill_projection"
+path = "examples/s56_workflow_skill_projection.rs"
 required-features = ["skills", "full"]
 
 [[example]]

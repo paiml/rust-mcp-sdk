@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"

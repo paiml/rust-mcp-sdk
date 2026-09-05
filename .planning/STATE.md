@@ -1,88 +1,54 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.6
-milestone_name: AI-Package Portability
-current_phase: 124
-current_phase_name: Release & Publish Order
-status: executing
-stopped_at: Phase 124 context gathered
-last_updated: "2026-08-27T16:32:28.237Z"
-last_activity: 2026-08-27
-last_activity_desc: Phase 124 execution started
-state_head: e094f01104471682610b296520d0233e8bca6b5f
+milestone: v2.7
+milestone_name: SEP-2640 Skills Conformance & Positioning (Phase 125+)
+current_phase: 126
+status: completed
+stopped_at: Phase 126 complete — all phases complete
+last_updated: "2026-09-04T22:32:35.569Z"
+last_activity: 2026-09-04
+last_activity_desc: Phase 126 complete
+state_head: e30131292eaa9dd72b585405343bac424dc20397
 progress:
-  total_phases: 5
-  completed_phases: 4
-  total_plans: 32
-  completed_plans: 25
-  percent: 78
+  total_phases: 2
+  completed_phases: 2
+  total_plans: 12
+  completed_plans: 12
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-22, milestone v2.6 open) · .planning/ROADMAP.md (`## v2.6 AI-Package Portability (Phases 120-124)` + `## Phase Details — Current Milestone`) · .planning/REQUIREMENTS.md (7 v2.6 requirements, 7/7 mapped) · .planning/MILESTONES.md (v2.5 record incl. the override_closeout rationale) · .planning/milestones/v2.5-{ROADMAP,REQUIREMENTS}.md (archived detail) · .planning/milestones/v2.5-phases/ (101 archived phase dirs)
+See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 close — `## v2.7 …` is the ACTIVE section; every earlier milestone is a row in the `## Milestones` index) · `.planning/MILESTONES.md` (v2.6 record incl. the `override_closeout` rationale) · `.planning/milestones/v2.6-{ROADMAP,REQUIREMENTS}.md` · `.planning/milestones/v2.6-phases/` (phases 120–124) · `.planning/milestones/pre-v2.7-ROADMAP-history.md` (v2.1–v2.4 detail, which has no per-milestone archive of its own)
 
-> `.planning/v2.6-REQUIREMENTS-STAGED.md` was consumed and removed when v2.6 opened — its content is now `.planning/REQUIREMENTS.md`. Do not look for it.
+> **There is no `.planning/REQUIREMENTS.md` right now.** It was archived to
+> `milestones/v2.6-REQUIREMENTS.md` and removed at the v2.6 close, as the workflow prescribes.
+> v2.7 gets a fresh one — `/gsd-new-milestone` writes it. Do not go looking for the old file.
 
 **Core value:** An AI-Package built from configuration alone moves between pmcp.run environments with its tool surface intact, and the target environment is told exactly what it must supply.
-**Current focus:** Phase 124 — Release & Publish Order
+**Current focus:** None — every phase in the v2.7 roadmap (125, 126) is complete. v2.7's remaining scope (spikes 010 digest-pinned agent skill consumption, 011 tri-surface docs) has no phase yet; `/gsd-phase add` or `/gsd-complete-milestone`.
 
 ## Current Position
 
-Phase: 124 (Release & Publish Order) — EXECUTING
-Plan: 1 of 7
-Status: Executing Phase 124
-Last activity: 2026-08-27 — Phase 124 execution started
-Next: Execute Phase 123 — `/gsd-execute-phase 123`. 7 plans across 6 waves
-(1:{01} 2:{02,03} 3:{04} 4:{05} 5:{06} 6:{07}), all carrying PKGX-02.
+Phase: 126
+Plan: Not started
+Status: All phases complete
+Last activity: 2026-09-04 — Phase 126 complete
 
-> **The two lines above were STALE and are corrected 2026-08-26.** They said Phase 123 was
-> "not yet discussed" and had "no phase directory yet". Both were false by then: the phase dir
-> exists with CONTEXT (D-01..D-16), RESEARCH, PATTERNS, VALIDATION, seven PLANs, REVIEWS and
-> COVERAGE. Left uncorrected, a reader following STATE.md would have re-run discuss-phase over
-> settled decisions.
+**Phase 125 close-out:** UAT 3/3 passed, verification `passed`, `threats_open: 0`. Three human
+decisions recorded — CR-01 accepted as a D-01-scoped residual risk (an advertised skills
+capability tears down a **stdio** session *silently*: no JSON-RPC error to the client, and
+`crate::log` is a no-op stub at `src/lib.rs:373-386`), WR-06 shipped as-is with the capability
+guard retained, and three code-review findings (WR-03, WR-04-partial, WR-05) carried forward in
+that phase's `deferred-items.md`.
 
-**Phase 123 planning currency (2026-08-26):** plans were cross-AI reviewed (`123-REVIEWS.md`,
-commit `8f2bc451`) and then replanned against that review (commit `2b7d59b4`). Codex returned
-HIGH/non-executable with four architectural findings — all four independently re-verified against
-source — while Gemini returned "APPROVED"; Gemini's verdict is marked
-`[reviewed-without-source-citations]` and is NOT counted at full consensus weight, because the six
-files it cited as read do not exist (they are this phase's planned outputs). Do not re-read that
-approval as evidence the original plans were ready.
-
-The replan also caught two defects neither reviewer found: `bytes_stream()` is
-`#[cfg(feature = "stream")]` and `cargo-pmcp/Cargo.toml:111` sets `default-features = false`
-without it (so the originally planned call would not have compiled), and two self-invalidating
-greps in plan 05. Wave count went 5 → 6 because four plans now edit the `Makefile` under the
-same-commit registration rule (`Makefile:337-339`, the Phase 122 precedent) and same-wave plans
-must not share `files_modified` — recorded in ROADMAP.md so it is not "optimized" back.
-
-> **Corrected again 2026-08-25 (Phase 122 close) — my first correction was WRONG.**
-> `phase.complete 122` returned `next_phase: 120`, and I initially wrote here that this was
-> correct "because 120 is genuinely `[ ]`". That was a mistake: I checked the CHECKBOX at
-> ROADMAP line 2301 instead of the **Progress table**, which is what the Phase 121 note below
-> tells you to check. The Progress table has read
-> `| 120. Config-Server Packaging | ... | 5/5 | Complete | 2026-08-23 |` since 2026-08-23, and
-> `120-VERIFICATION.md` carries `status: passed`. Phase 120 has 5 plans, 5 summaries and a passing
-> verification — it finished two days before Phase 122 ran.
->
-> The stale `[ ]` checkbox is the ROOT CAUSE of this verb misrouting twice (once at the 121 close,
-> once at the 122 close). It has now been ticked, so the next `phase.complete` should route
-> correctly. **Check the Progress table, not the checkbox** — they can disagree, and the table wins.
->
-> Retracted: an earlier version of this note speculated that Phase 122's declared
-> "Depends on: Phase 120" edge might be inaccurate, because 122 appeared to complete while 120 was
-> open. That premise was false. Phase 120 completed 2026-08-23, BEFORE 122 executed, so the
-> dependency was properly satisfied in the normal order. There is nothing to re-measure.
-
-> **Corrected by hand 2026-08-25.** `gsd-tools query phase.complete 121` returned
-> `next_phase: 120` and wrote `current_phase: 120` here — a phase that was already
-> complete with verification passed — alongside a self-contradictory
-> `Next: Phase 121`. The roadmap execution order is 120 → 121 → 122 ∥ 123 → 124,
-> so the real next phase is 122. Do not trust that verb's `next_phase` on this
-> project without checking it against the ROADMAP progress table.
+> **The v2.6 → v2.7 pointer move was made BY HAND, 2026-09-02.** `milestone.complete` left
+> `milestone: v2.6` in this frontmatter even after archiving that milestone, which is the same
+> stale-pointer condition that made `phase.complete 125` return `next_phase: "124"` and
+> `roadmap_updated: false` earlier the same day. Recorded so the next reader knows the value was
+> corrected deliberately rather than written by the tool.
 
 ## v2.6 Phase Plan (5 phases, 7 requirements)
 
@@ -140,6 +106,10 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase ?]: 110-06: agent example drives the PRODUCTION run_fixed_source seam, not a re-implemented AgentEngine loop (Codex 110-06 HIGH)
 - [Phase ?]: 110-06: fuzz_package_kind targets the RAW-bytes untrusted manifest-parse boundary, the real package show seam
 - [Phase ?]: 110-06: the three lib seams are #[doc(hidden)] internal support surface for examples/fuzz, not stable API (Codex 110-06 MEDIUM)
+- [Phase 126]: GATE A — `SkillProjection::build()` returns `Result<ProjectionOutput>`, not `Result<Skill>`. Resolves a literal contradiction between two locked decisions (D-02 said the bare artifact, D-10 said warnings return FROM `build()`). Chosen for being additive: a later field costs no breaking signature change. Recorded as an explicit deviation from D-02's wording in the rustdoc, the SUMMARYs and CHANGELOG `## [2.20.0]`.
+- [Phase 126]: GATE B — the D-04a prompt-prepend opt-in is reachable from BOTH `ServerCoreBuilder` and `ServerBuilder` via a `#[cfg(feature = "skills")]`, default-off, `#[must_use]` setter. Without it the opt-in was reachable only by hand-constructing a `WorkflowPromptHandler`, so a server registering workflows normally could not enable it — and an unreachable consumer leaves the anti-drift claim exactly as theoretical as shipping no consumer. Flag-off transcripts measured byte-identical.
+- [Phase 126]: SC-6 warnings have ONE delivery channel — `build()`'s structured return (the D-10 narrowing supersedes earlier "dual channel" plan text). `as_skill()` never calls `gate_check`.
+- [Phase 126]: frontmatter escaping keys on what the PARSER breaks on, not on `char::is_control()`. The resolved `unsafe-libyaml` treats five characters as line breaks; `U+2028`/`U+2029` are `Zl`/`Zp`, not `Cc`, and went in raw — silently dropping the skill from `skills/list` while `into_handler()` still returned `Ok`. Escaped as `\uNNNN`, chosen empirically: `\x2028` was measured to decode wrongly because libyaml's `\x` takes exactly two hex digits.
 - [Phase 112]: 112-01: v2 reached only via opt-in accept-list; LATEST stays 2025-11-25, 2026-07-28 NOT in SUPPORTED (Pitfall 1); protocol_era classifies only exact 2026-07-28 as V2, unknown->V1
 - [Phase 112]: 112-01: TraceContext::from_meta bounds W3C values at 8192 (over-bound traceparent->None, tracestate/baggage dropped); values documented RAW/UNVALIDATED/untrusted; proptest + fuzz target added (T-112-09)
 - [Phase 112]: 112-01: semver tooling pinned (cargo-semver-checks 0.49.0, cargo-public-api 0.52.0); baseline pmcp 2.17.0; authoritative check-release MINOR assertion deferred to Plan 07/08
@@ -566,6 +536,38 @@ Decisions are logged in PROJECT.md Key Decisions table. Decisions framing this m
 - [Phase ?]: 119-01: Phase 113 re-verification obligation DISCHARGED — 113-SPEC-RECHECK verdict PENDING -> PUBLISHED-CONFIRMED, both arms run 2026-08-18
 - [Phase ?]: 119-01: eleven requirements HTTP-01..08 / CLNT-01/02/05 flipped [~] -> [x]; TASK-01..06 deliberately NOT flipped (DQ6 still STILL-ABSENT)
 - [Phase ?]: 119-01: arm 2 re-run rather than cited (A-03) against newer conformance HEAD 74edef34 — byte-identical predicate, v2_conformance_pin 5/5
+- [Phase 125]: skills/get answers -32602 for every unresolvable-URI and malformed-params case (D-06) — Deliberately diverges from the -32601 that build_discover_response returns and that the shipped SkillsHandler::read raises for resources/read. MEASURED during 125-02: that handler-level -32601 reaches the wire re-wrapped as -32603, which D-06's phrasing did not say; the divergence is pinned by a control test and neither copied nor fixed.
+- [Phase 125]: build_skills_get_response names Cacheable::No at the projection call site — SEP-2640 gives skills/list the base list-caching attributes explicitly and leaves the equivalent question OPEN for skills/get, so pmcp claims nothing and the result carries neither ttlMs nor cacheScope on either era. Naming it rather than omitting it makes the claim reviewable: a later phase changes ONE argument with a stated reason.
+- [Phase 125]: ServerCore gains no skills field and no skills delegate; the ServerCoreBuilder::build call site destructures the 125-01 tuple and discards the entries — ProtocolHandler::handle_request accepts the typed public Request enum, which neither skills method has a variant in, so both would be unreachable dead code. Phase 112 reached the same conclusion for server/discover and DELETED its ServerCore wrappers. A source-scan guard in tests/skills_routing.rs fails if either is re-added and names the handle_request signature as what a future widener must change first.
+- [Phase 125]: 125-03: entry manifests are COMPLETE (SKILL.md + every reference) and each digest/size is computed from the exact &str SkillsHandler::read returns for the same URI, so manifest-vs-served divergence is unconstructible (T-125-14)
+- [Phase 125]: 125-03: FrontmatterParse gained a FOURTH outcome, NotAMapping, split out of Invalid; three distinct SkillDiagnostic frontmatter variants so a YAML typo is never reported as a missing block (R-20)
+- [Phase 125]: 125-03: gap 4c (frontmatter name vs URI final segment) ships as a hard Err from BOTH entries() and into_handler(); gap 4a (constructor-name mismatch) ships as a WARNING because three in-repo constructions and a taught pmcp-book exercise deliberately violate it
+- [Phase 125]: 125-03: exceeds_skill_limits is a pure zero-alloc predicate whose rustdoc WITHDRAWS the DoS-mitigation claim (R-22) — it fires after the bodies are retained; the transport collected-body cap is the real allocation bound
+- [Phase 125]: 125-03: SkillBuildArtifact + build_artifacts give ONE parse pass per build consumed by validate_names, entries_with_diagnostics and into_handler; parse_frontmatter_value now has exactly one non-test call site (R-21)
+- [Phase 125]: The synthesized skill://index.json discovery index is RETIRED (D-08) — one discovery surface, the skills/list + skills/get method pair. An intentional, authorized published behavior break, not a proven-safe one: a repo grep cannot establish absence of external consumers.
+- [Phase 125]: Both index-asserting tests were REPLACED with error/absence assertions rather than deleted, and two further sites inverted their assertions, so a reintroduced index fails in four places.
+- [Phase 125]: examples/c10_client_skills.rs demonstrates the Skills::entries() PROJECTION and states plainly it is not an RPC — no skills/get is reachable from a file holding no transport; tests/skills_routing.rs is named as the wire proof.
+- [Phase 125]: The book/source doctest mirror is rust,no_run and never EXECUTES its assertions in either harness, so a unit test now runs them — the D-03 frontmatter change is evidence rather than reasoning.
+- [Phase 125]: make quality-gate now compiles, rustdoc-lints and RUNS src/server/skills.rs via a four-selector make test-skills leg, each selector guarded on its own zero count (a summed total was proven inadequate by negative control)
+- [Phase 125]: Adding gate reach found two entirely RED quality-gate legs (make lint, make lint-plans) that four earlier plans of phase 125 never ran; bare cargo clippy --all-features -D warnings is strictly weaker than make lint
+- [Phase 126]: GATE A (LOCKED, one-way): SkillProjection::build() returns Result<ProjectionOutput> with pub struct ProjectionOutput { skill, warnings } — plan 126-04 implements it and MUST record the departure from D-02 as an explicit deviation; plan 126-06 MUST name it in the CHANGELOG.
+- [Phase 126]: GATE B (LOCKED, one-way): add-builder-path — plan 126-05 Task 4 adds a cfg(skills) field + must_use setter to BOTH ServerCoreBuilder and ServerBuilder so the D-04a prepend is reachable from prompt_workflow; the anti-drift claim then holds per SERVER, not merely per workflow value.
+- [Phase 126]: Projected frontmatter values are ALWAYS emitted as escaped YAML double-quoted scalars (closes T-126-21 / REVIEWS finding 1, HIGH): a raw concatenation lets an ordinary description break the parse, which build_artifact_inner downgrades to a diagnostic so validate_names silently SKIPS the SC-1 identity check instead of enforcing it.
+- [Phase 126]: Constant JSON key order in a projected workflow skill is digest-significant by design — not sorted, because preserve_order means the rendered constant matches what will actually be SENT; sorting would make the manual procedure disagree with the call it documents. Pinned by constant_key_order_is_digest_significant and declared CHANGELOG-worthy in render_data_source's rustdoc.
+- [Phase 126]: The D-11 exclusion claim is carried by BYTE EQUALITY across the two settings (has_task_support + is_retryable at defaults vs both non-default), not by accessor-name absence; the name check is demoted to a supplementary readability guard (REVIEWS fable (f)).
+- [Phase 126]: SC-2's primary determinism proof is a DETERMINISTIC permutation test over template-binding insertion order, with the 100x fresh-reconstruction proptest retained only as supplemental (REVIEWS codex).
+- [Phase 126]: render_step's emission order (tool, argument bindings, sorted template bindings, resources, result binding, guidance) is now load-bearing — plan 126-06's golden and the published sha256 pin it, so changing it is a D-14 re-pin event.
+- [Phase 126]: SC-4 wire clause 3 compares the frontmatter name against the segment BEFORE the trailing /SKILL.md, not the literal final URI segment — The entry URI is skill://{name}/SKILL.md, so its literal last segment is SKILL.md. validate_names enforces identity against final_path_segment(skill.resolved_path()) — the name segment. The plan's clause-3 wording would have compared refund-flow to SKILL.md and failed on a correct implementation.
+- [Phase 126]: The projection fuzz target chunks the ORIGINAL byte slice with split_at and lossy-decodes each chunk independently; it never range-slices a decoded String — from_utf8_lossy emits three-byte U+FFFD, so a computed quarter index into the decoded string need not be a char boundary and panics — surfacing as a libFuzzer crash falsely attributed to as_skill(). REVIEWS finding 3 / T-126-22. split_at over bytes removes the boundary arithmetic entirely.
+- [Phase 126]: make test-fuzz is rejected as fuzz evidence for this phase; the registration tripwire plus a hand-run under +nightly is the evidence — cargo fuzz run passes -Z flags and fails on this repo pinned stable toolchain, and the Makefile swallows that with || echo, exiting 0 having run nothing. The tripwire was proven red on all three legs (source hidden, stanza renamed, matrix row suffixed).
+- [Phase 126]: GATE A implemented: SkillProjection::build() -> Result<ProjectionOutput> with #[non_exhaustive] pub struct ProjectionOutput { skill, warnings } plus into_parts() — D-02 and D-10 are literally incompatible (a Skill cannot carry a warning vector). #[non_exhaustive] supplies the additivity the plan text sought via accessors, while keeping the locked field-access ergonomics (build()?.skill). Deviation recorded in the build() and ProjectionOutput rustdocs and in 126-04-SUMMARY.md.
+- [Phase 126]: D-10 NARROWED: SC-6 gate warnings have exactly ONE delivery channel, the structured return from build() — ToolAnnotations are reachable only through crate::types::ToolInfo::annotations; no SequentialWorkflow/WorkflowStep accessor exposes them, so as_skill() cannot compute an SC-6 warning and cannot be a channel for one. build() emits BOTH channels for everything it can see; as_skill() logs only the slug fallback and the empty-description substitution.
+- [Phase 126]: GATE B implemented as answered (add-builder-path): ServerCoreBuilder::with_workflow_skill_prepend and ServerBuilder::with_workflow_skill_prepend make the D-04a prepend reachable from prompt_workflow, so the anti-drift claim holds per SERVER, not per workflow value. Two new public methods on published 2.x builder types — one-way.
+- [Phase 126]: create_assistant_plan() is CALLED unconditionally in both handlers and only its MESSAGE is suppressed. Guarding the call would silently delete the unregistered-tool validation whenever the D-04a flag was on (REVIEWS fable (a)).
+- [Phase 126]: The prepend field holds an already-rendered String, not a bool: a per-request render would re-fire the D-15 slug warning on every prompts/get and re-derive message [0] independently of the digested snapshot (REVIEWS fable (b)).
+- [Phase 126]: The pmcp-package attestation-opacity failure was fixed, not deferred: the cause is Canonical JSON NFC normalization in olpc-cjson (U+F900 has a singleton canonical decomposition to U+8C48), NOT macOS path normalization; the property now asserts the round-trip modulo NFC.
+- [Phase 126]: A plan verify command that pipes to tail must be wrapped in bash -o pipefail -c, or the pipeline exit status is the pager's and a FAILING build reports PASS (7 of 9 D-19 repairs in 126-07).
+- [Phase 126]: Examples assert before printing (c10 habit, not s44's print-only one), so cargo run --example is a verification that can go red rather than a demo.
 
 ### Pending Todos
 
@@ -599,6 +601,7 @@ yet. (Research flags per phase to be surfaced during `/gsd:plan-phase`.)
 - A pmcp Client cannot answer a server-to-client request issued during its own call: Client::dispatch_request awaits transport.send(..) to complete before entering its receive loop, and the server holds the tools/call POST for the whole handler. Blocks v1 sampling/roots round trips over StreamableHttpServer (era_matrix reports no-live-stream with a 30s dispatch timeout).
 - ~~118.2-11 CHECKPOINT: official suite re-measured at held pin 0.2.0-alpha.11 — v1 leg 72/2 -> 71/3, exit 1. tools-call-with-logging 1/1 -> 0/2. Root cause: LogMessageParams emits 'message'; spec requires 'data'. Gate hardening (D-16) and CONF-09 booking BLOCKED on a src/ wire-format decision.~~ **RESOLVED 2026-08-17.** The developer chose the src/ fix; 118.2-13 shipped it (emit_log_record defaults `data` to the message string; semver-checks clean). 118.2-11 re-measured at the SAME held pin over 9 fresh runs: tools-call-with-logging **0/2 -> 2/0** (logCount 3, WireSchemaValid 10 messages / 0 violations), v1 leg **73 passed / 1 failed, exit 0**, GAP_ATTRIBUTABLE_FAILURES **-> 0**, G-3 CLOSED in full. Gate hardened (D-16): 2025-11-25 joined FULLY_SCORED_GREEN_REVISIONS with a per-revision scored floor, BLOCKING_GREEN_SCENARIOS widened 29 -> 30. CONF-09 booked. See 118-CONFORMANCE-GAPS.md '## Dispositions — Phase 118.2 (amendment 2)'.
 - 118.2-11 MEASURED FLAKE (new, open): 2025-11-25:tools-call-elicitation failed 1 of 9 fresh suite runs with 'Dispatch oneshot channel closed' — the same client request-lifecycle race as the blocker above. It is a pre-existing BLOCKING_GREEN_SCENARIOS entry and was ALREADY gate-fatal before the leg was hardened, so the hardening added no new exposure. Stated in the script's own output, NOT exempted. WINDOWS.md entry 9.
+- make book-test is red repo-wide (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical before and after phase 125; pre-existing build-tooling breakage, see 125 deferred-items.md
 
 ## Deferred Items
 
@@ -611,6 +614,9 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 | Memory | Scaled team-memory backends (embeddings/vector stores) in the open SDK | Deferred (DEFER-03) | v2.4 scope |
 | Platform | pmcp.run adopting the loop/traits (companion §8 note) | Deferred (DEFER-04) | not SDK work |
 | Audit | **461 open audit items carried forward UNACKNOWLEDGED at the v2.5 close** — 3 debug sessions, 7 phases with incomplete UAT, 3 verification gaps (Phase 78 `gaps_found`; Phases 107/77 `human_needed`), 5 incomplete quick tasks, 443 deferred items | Open — 0 acknowledged, 0 suppressed | v2.5 close (2026-08-22) |
+| Audit | **486 open audit items carried forward UNACKNOWLEDGED at the v2.6 close** — 453 from already-archived milestones, 11 from phase 125 (v2.7, not this milestone), 9 unscoped (5 quick tasks, 4 debug sessions), and **13 genuinely v2.6-scoped** (phases 120/121) | Open — 0 acknowledged, 0 suppressed | v2.6 close (2026-09-02) |
+| Release | **4 crates carry an `mcp-tester` dev-dep pin and publish BEFORE `mcp-tester` itself** (toolkit `:192`, sql-server `:57`, openapi-server `:63`, workbook-server `:58`) — green only while the pinned `0.8.0` stays published | Open — standing release risk | v2.6 close (2026-09-02) |
+| Release | **crates.io OWNERSHIP is an unchecked publish precondition** — `check-release-coverage.sh` verifies a publish STEP exists, not that the CI token may use it. This is what failed v2.19.1 (403 on `pmcp-team-servers`, 11/14 published) | Open — no in-repo check | v2.6 close (2026-09-02) |
 
 > **Why nothing was acknowledged at the v2.5 close.** Acknowledgment could not be performed safely:
 > (1) `gsd-tools query audit-open --json` emits invalid JSON (unescaped `\(`/`\.`/`\s`/`\|` and
@@ -621,6 +627,19 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 > acknowledgment would have corrupted `deferred-items.md` files. The real debt is smaller than 461
 > but is genuinely unresolved and stays visible to the next audit. Both gsd-tools defects should be
 > reported upstream. See `.planning/MILESTONES.md` § *Known verification overrides*.
+
+> **The same two defects RECURRED at the v2.6 close (2026-09-02), one of them confirmed exactly.**
+> Acknowledgment was attempted on only the 13 genuinely v2.6-scoped items — deliberately not on
+> the 453 archived ones or the 11 belonging to phase 125 — and **11 of the 13 were refused** with
+> `Error: no deferred item matched --text`. The v2.5 diagnosis above is precisely right about the
+> cause: the scanner emits one item per markdown **table row** and per **sub-bullet**, while
+> `acknowledge --text` only matches a top-level `##` heading. The 2 calls that DID apply were the
+> only two `##` headings in `120/deferred-items.md`, and both were reverted so no half-applied
+> suppression survived. One correction to the v2.5 note: the writer does not corrupt the file on a
+> miss — it refuses cleanly. It does, however, **exit 0 while refusing**, so a naive
+> `if ! cmd; then` guard reports success; check the OUTPUT for `Error:`, not the exit status. The
+> v2.6 close therefore proceeded as `override_closeout` with these items disclosed rather than
+> suppressed.
 
 ## Shipped Milestones
 
@@ -639,10 +658,10 @@ Items deferred by design for this milestone (design §7 / REQUIREMENTS v2):
 
 ## Session Continuity
 
-Last session: 2026-08-27T04:51:52.614Z
-Stopped at: Phase 124 context gathered
-Resume file: .planning/phases/124-release-publish-order/124-CONTEXT.md
-Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
+Last session: 2026-09-04T20:31:18.995Z
+Stopped at: Phase 126 complete — all phases complete
+Resume file: None
+Next: **v2.7 has no unplanned phase left — phases 125 and 126 are both complete.** Decide the milestone's next move: `/gsd-phase add` to scope spike 010 (digest-pinned agent skill consumption) or spike 011 (tri-surface docs), or `/gsd-complete-milestone` to close v2.7 as-is. Two phase-126 hooks are configured but unrun: `workflow.nyquist_validation` is true and `126-VALIDATION.md` is still `status: draft` / `nyquist_compliant: false` (`/gsd-validate-phase 126`), and `workflow.security_enforcement` is true with no `126-SECURITY.md` (`/gsd-secure-phase 126`). Six code-review warnings (WR-01, WR-03, WR-04, WR-05, WR-07, WR-08) were deliberately deferred by the human with provenance in phase 126's `deferred-items.md` — they are logged debt, not gaps. Also from phase 126: **`Cargo.toml` reads `2.19.3` against a `## [2.20.0] - Unreleased` CHANGELOG section** — a releaser must bump it before tagging or `release.yml`'s note extraction exits 1. *(The pointer below is RETAINED VERBATIM for its three standing obligations; its own phase target is stale.)* **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` is committed (`21215f12`) with 17 locked decisions; Phase 118.1 is 14/14 COMPLETE and its plan-04 pointer that stood here is retired. Two residuals to plan: the client live-SSE read (BOTH collect sites — `src/shared/streamable_http.rs:1002` GET and `:1543` POST-response; the POST case deadlocks in-tool elicitation and was added to scope during discussion) and the `notifications/message` emitter on `RequestHandlerExtra` (no `PeerHandle` method — D-06 declines the roadmap's implied trait addition). Mint `CONF-09`/`CONF-10` **with REQUIREMENTS.md table rows**, not body-only IDs. **Carry forward: `make quality-gate` does NOT run `make doc-check`** (standalone target at `Makefile:546-551`), **`make test-fuzz` cannot fail** (`Makefile:242-249` swallows a crashing target behind `|| echo`), and **there is no pre-commit hook installed** (`.git/hooks/` holds only `.sample` files) — run `cargo fmt --all`, the repo's clippy invocation and `doc-check` explicitly, and read a fuzz campaign's real exit code rather than the target's. **Also carry forward from the 118.1 `/code-review` (2026-08-11): the cross-session `client_capabilities` misattribution is UNOWNED** — `ServerState.server` is one `Arc<Mutex<Server>>` shared by every StreamableHTTP session, so a handler serving client A can read client B's capabilities; it was offered as a 118.2 fold-in and declined, and it needs a phase. *(The block below is retained verbatim for its three standing obligations; Phase 116 itself is complete and its own `Next` pointer is stale.)* **Phase 116 (Auth Hardening SEPs)** — `/gsd:discuss-phase 116`, then `/gsd:plan-phase 116`. It depends only on Phase 112's era gate and is independent of the 113/114 holds. **Three standing obligations carry forward, and Phase 115's sign-off discharged NONE of them:** (1) **watch `modelcontextprotocol/ext-tasks`** — `gh api repos/modelcontextprotocol/ext-tasks/contents/schema --jq '.[].name'`; when it returns anything but `draft` alone, re-run `114-SPEC-RECHECK.md` `## Procedure` end to end, which flips TASK-01..06 as a group and re-enters the contract-first question. Nothing automates this (**D-114-S**). `115-01` vendored the CORE half of that two-repository trigger and closed `D-114-R`; the `ext-tasks` half is untouched, so Phase 114's D-18 hold stays ENGAGED. (2) **D-113-U still needs an owner before this branch merges**, per `deferred-items.md` § *Inherited from Phase 113*. (3) **UNAS-01** (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) is still an unassigned v2.5 requirement with no phase — it is closest to CLNT-01's header work and was explicitly NOT folded into Phase 114 (`D-114-Y`); Phase 118.1 plan 14 carried it to v2.6 with the measurement as the reason.
 **The derived-view disagreement recorded here on 2026-08-01 by `114-18` is now RESOLVED — by capitulation, not by decision, and the record must say so rather than quietly agree.** That note read: the SDK RECOMPUTES `completed_phases` from `ROADMAP.md` and reports **60** while this file correctly STORES **59**; the stored value is authoritative; the SDK helpers twice tried to mark Phase 114 `[x]` and bump the counter during `114-18` and both were reverted. **Measured 2026-08-01 by `115-10`: the stored value moved 59 → 60 in `1d1493b8` (`docs(state): record phase 115 context session`), the very next STATE-touching commit after `114-18`'s close, via an SDK helper's recompute — the exact edit the note forbade, made by the tool rather than by hand.** It was not caught then and is not being silently reverted now, because eight Phase-115 plans have since incremented `completed_plans` off that base. **What the counter therefore MEANS, stated plainly so nobody re-derives it wrongly: `completed_phases: 61` = 60 (which already counts Phase 114, still `[~]` and HELD, as complete) + Phase 115 (genuinely complete).** The counter is a plan-shipped tally, NOT a requirements tally. **Phase 114's `[~]` in `ROADMAP.md` and its `[~]` TASK-01..06 bookings are the authoritative statement of its status — not this number.** Do not "fix" Phase 114's marker to agree with the counter; fix the counter's interpretation, which is what this paragraph is.
 
 ## Performance Metrics
@@ -797,6 +816,18 @@ Next: **Phase 118.2 planning — `/gsd:plan-phase 118.2`.** `118.2-CONTEXT.md` i
 | Phase 118.2 P16 | ~15 min | 2 tasks | 2 files |
 | Phase 118.2 P18 | ~1h50m | 3 tasks | 3 files |
 | Phase 119 P01 | 35m | 3 tasks | 3 files |
+| Phase 125 P01 | 36 min | 2 tasks | 10 files |
+| Phase 125 P02 | 33 min | 2 tasks | 8 files |
+| Phase 125 P03 | 35 min | 3 tasks | 2 files |
+| Phase 125 P04 | 42 min | 3 tasks | 9 files |
+| Phase 125 P05 | 51 min | 3 tasks | 13 files |
+| Phase 126 P01 | 41 min | 2 tasks | 6 files |
+| Phase 126 P02 | 1h 27m | 3 tasks | 1 files |
+| Phase 126 P03 | 27 min | 2 tasks | 4 files |
+| Phase 126 P04 | 35 min | 3 tasks | 2 files |
+| Phase 126 P05 | 54 min | 4 tasks | 5 files |
+| Phase 126 P06 | 25 min | 3 tasks | 7 files |
+| Phase 126 P07 | 1h 32m | 3 tasks | 10 files |
 
 ## Operator Next Steps
 

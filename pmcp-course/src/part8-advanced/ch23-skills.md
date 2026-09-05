@@ -167,10 +167,24 @@ let _server = pmcp::Server::builder()
 
 `Skill::new(name, body)` constructs the value. `.skill(...)` registers it
 on the builder. The resulting URI is `skill://hello-world/SKILL.md` (the
-default path is derived from the skill name). Additionally, PMCP
-auto-synthesizes a `skill://index.json` discovery URI listing all
-registered skills — that index entry is what an SEP-2640 host uses to
-detect "this server supports skills, here are the top-level ones."
+default path is derived from the skill name), and it is the only entry
+`resources/list` returns for this server.
+
+**Discovery is a method pair, not a resource.** An SEP-2640 host learns
+what a server offers by calling `skills/list` — and `skills/get` for a
+single skill — which PMCP answers over streamable HTTP. Each response
+carries one entry per skill: the SKILL.md `uri`, the skill's frontmatter
+emitted verbatim, and a `resources` manifest naming every file (SKILL.md
+first, then each reference) with a `sha256:` digest and a byte size.
+
+A skill whose body carries no frontmatter is **excluded** from that
+projection, with a build-time warning naming it — which is why every
+snippet in this chapter gives its skill a real frontmatter block. It
+remains listable and readable as a resource; it is simply not discoverable.
+
+(Earlier versions of PMCP also synthesized a `skill://` discovery-index
+resource into `resources/list`. It was retired: the methods supersede it,
+and its URI violated the draft's own structure rule.)
 
 Full example:
 [`examples/s44_server_skills.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s44_server_skills.rs).
@@ -215,13 +229,17 @@ refunds:
 ```
 
 The crucial SEP-2640 §9 rule: **supporting files are addressable via
-`resources/read`, but they MUST NOT appear in `resources/list` or the
-discovery index.** The discovery surface is intentionally focused on
-top-level skills — one entry per `SKILL.md` plus the `skill://index.json`
-entry. References live at predictable URIs (e.g.
-`skill://acme/billing/refunds/references/policy.md`) and are fetched by
-URI when the agent decides it needs them, based on what the `SKILL.md`
-body tells it to fetch.
+`resources/read`, but they MUST NOT appear in `resources/list`.** That
+listing is intentionally focused on top-level skills — exactly one entry
+per `SKILL.md`, and nothing else. References live at predictable URIs
+(e.g. `skill://acme/billing/refunds/references/policy.md`) and are
+fetched by URI when the agent decides it needs them, based on what the
+`SKILL.md` body tells it to fetch.
+
+Not listed is not the same as hidden. A skill's **complete** file
+manifest — every reference, each with its digest and size — is carried by
+that skill's `skills/list` / `skills/get` entry. That is where a host
+learns which reference URIs exist and may then read them.
 
 The reason for the rule is UX: an agent picking a skill from
 `resources/list` should see "one refund workflow" — not "one refund workflow
@@ -233,7 +251,7 @@ the agent reads, in what order, by writing it into `SKILL.md`.
 PMCP enforces this in `SkillsHandler::list()` — references are simply
 never returned, regardless of how many are registered. The test
 `tests/skills_integration.rs` asserts that listing returns only `SKILL.md`
-URIs and the discovery index, never reference URIs.
+URIs, never reference URIs and nothing synthesized.
 
 Full example:
 [`examples/s44_server_skills.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s44_server_skills.rs).

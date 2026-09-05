@@ -163,6 +163,87 @@ three shapes. Entirely additive — a 2.x minor.
 
 ---
 
+## Milestone: v2.6 — AI-Package Portability
+
+**Shipped:** 2026-08-27 (tag `v2.19.1`) · **Archived:** 2026-09-02
+**Phases:** 5 (120–124) | **Plans:** 32 | **Tasks:** 77
+
+### What Was Built
+
+A config-only MCP server became genuinely portable. `pmcp-package` grew vendor media-type layers
+carrying a server's own `config.toml` and OpenAPI spec byte-verbatim, a dual-mode binary (embedded
+bootstrap or `BinaryRef` by digest), and a typed slot vocabulary that answers *"what must the target
+environment supply?"* — a question `detect_deviation` is structurally incapable of answering. A
+london-tube package packs in environment A, moves to a distinct environment B, and serves an equal
+`(tool name, inputSchema)` set there. Attestation rides as a kind-neutral opaque OCI layer whose
+subject lives in layer-descriptor annotations, so it is inside the manifest digest. `save`/`load`
+are a complete offline file round trip; `pull` is a six-stage pipeline whose only parked step is the
+HTTP call. Release hygiene closed the loop: the coverage gate now discovers workspace-EXCLUDED
+publishable crates and machine-checks the publish ORDER.
+
+### What Worked
+
+- **Contract-first parking.** Phases 122 and 123 were scoped from the start as "the in-repo half is
+  completable and verifiable offline; the live leg is `#[ignore]`d until the backend exists." Both
+  delivered real, tested value against a platform that still does not have the endpoints. Unparking
+  is deleting a gate, not writing the security-relevant half.
+- **Mutation-proving guards.** Repeatedly, a test was degraded on purpose to confirm it goes red.
+  The adversarial-annotation property found a real defect on its FIRST run — a control character in
+  an attestation annotation produced a package that packed cleanly and could never be unpacked.
+- **Measuring the registry instead of reasoning about it.** The 0.2→0.3 bump was safe only because
+  the entire 0.2 line was never published. That was a *measurement*, and the plan explicitly warned
+  against generalizing it into a rule.
+- **Writing the "do nothing" row down.** The nine-emitter inventory lists an emitter whose correct
+  action is inaction. An earlier revision dropped exactly that row and a reviewer read the omission
+  as an arithmetic error. Enumerating the no-op is what kept the count checkable.
+
+### What Was Inefficient
+
+- **Paperwork lagged the ship by six days.** Plans 124-06/07 executed and the release went live on
+  2026-08-27, but no SUMMARY was written, so the ROADMAP row read `0/7 | Planned` until 2026-09-02.
+  Every milestone-scoped tool consequently treated v2.6 as unfinished — and `phase.complete 125`
+  returned `next_phase: "124"`, which in `yolo` mode would have auto-replanned a shipped phase. The
+  cost of a missing SUMMARY is not documentation debt; it is *tooling misdirection*.
+- **A new milestone was opened as a ROADMAP heading without closing the old one.** v2.7 existed as
+  `## v2.7 …` while `milestone: v2.6` stayed in STATE.md, so every milestone-scoped verb stayed
+  blind to phase 125 for its entire execution.
+- **The release job failed on something no gate could see.** `check-release-coverage.sh` verifies a
+  publish STEP exists per crate; it cannot see whether the CI token may USE it. A crates.io
+  ownership 403 killed the job mid-order, and the per-crate registry verification — not the run
+  status — is what caught the two collateral skips.
+
+### Patterns Established
+
+- **Verify a release per crate against the registry API, never against the workflow's status.** The
+  run said "failure"; only the per-crate probe said *which three crates were missing*.
+- **`cargo search` / `cargo info` are forbidden as published-version oracles** — they report the
+  in-tree path override as published fact. The crates.io API with a `User-Agent` is the only oracle.
+- **A version set moves together or not at all.** `pmcp-package` plus everything pinning it, in one
+  commit, with the one compiler-invisible emitter guarded by its own drift test.
+
+### Key Lessons
+
+1. **A phase is not done when it ships; it is done when its record says it shipped.** Six days of
+   correct code and wrong metadata sent the automation backwards.
+2. **Ownership is a publish precondition, and nothing checks it.** Add the owners probe to
+   Pre-Flight; `cargo owner --add` sends an invitation that must be accepted, so it is not a
+   tag-time fix.
+3. **A partial publish is incomplete, not corrupt** — worth knowing before panicking. The 11
+   published crates were mutually consistent and the 3 stragglers stayed at self-consistent
+   versions.
+4. **When a gate's own tooling cannot clear it, disclose rather than force.** 486 audit items,
+   only 13 of them this milestone's; acknowledge-all would have been a false statement about 443
+   of them.
+
+### Cost Observations
+
+- Model mix: predominantly opus (planner and executor both `opus`, checker `sonnet`).
+- Notable: the `override_closeout` path was exercised twice in a row (v2.5 and v2.6) for the *same*
+  `audit-open` scanner/writer defect, first diagnosed at the v2.5 close and re-confirmed here. Two
+  milestone closes have now paid for a tool fix that has not been made.
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution

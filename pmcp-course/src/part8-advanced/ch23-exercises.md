@@ -30,17 +30,32 @@ of the registered URIs.
    When the user greets the agent, respond warmly and offer to help.
    ```
 4. Call `pmcp::Server::builder().name("hello-skills").version("0.1.0").skill(Skill::new("hello-world", body)).build()?`.
-5. Print a confirmation line that includes the expected registered URIs:
-   `skill://hello-world/SKILL.md` and the auto-synthesized
-   `skill://index.json`.
+5. Print a confirmation line naming the expected registered URI:
+   `skill://hello-world/SKILL.md`.
+6. Also print the SEP-2640 discovery projection — the value a `skills/list`
+   response carries. Build a separate `Skills` registry holding the same
+   skill and call `entries()` on it (before `into_handler()`, which
+   consumes the registry):
+   ```rust,ignore
+   let registry = pmcp::server::skills::Skills::new().add(skill.clone());
+   let entries = registry.entries()?;
+   println!("{} conforming entry: {}", entries.len(), entries[0].uri());
+   ```
 
 ### Verify your solution
 
-Run the binary. The exercise passes when the printed output names BOTH
-`skill://hello-world/SKILL.md` AND `skill://index.json`. If either URI is
-missing from the printed list, the registration is incomplete — most
-likely you forgot to call `.skill(...)` on the builder, or you constructed
-the `Skill` with a different name than the one in your frontmatter.
+Run the binary. The exercise passes when the printed output names
+`skill://hello-world/SKILL.md` AND reports exactly ONE conforming entry
+whose `uri()` is that same URI. If the URI is missing from the printed
+list, the registration is incomplete — most likely you forgot to call
+`.skill(...)` on the builder.
+
+If the URI lists but the entry count is **zero**, the registration
+succeeded and discovery did not: your body has no frontmatter block, so
+the skill was excluded from the projection (a build-time warning names
+it). If `entries()` returns an `Err` instead, your frontmatter `name` does
+not equal the final segment of the resolved URI — the URI is the identity
+and the frontmatter must agree with it.
 
 For an executable reference, see
 [`examples/s44_server_skills.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s44_server_skills.rs)
@@ -98,24 +113,34 @@ references appear in `resources/read` but NOT in `resources/list`.
    ```
 6. Call `handler.list(None, extra.clone()).await?` and
    `handler.read("skill://acme/billing/refunds/references/policy.md", extra.clone()).await?`.
-7. Assert: the list contains the SKILL.md URI + `skill://index.json` but
-   NOT either reference URI.
+7. Assert: the list contains the SKILL.md URI and NOTHING else — not
+   either reference URI, and not any synthesized entry. `len() == 1` is
+   the assertion to write.
 8. Assert: the read of `references/policy.md` returns the file's body.
+9. Assert on the discovery projection: call `entries()` on a registry
+   holding the same skill (before `into_handler()` consumes it) and check
+   that the single entry's `resources()` manifest DOES name every
+   reference URI, each with a `sha256:`-prefixed `digest()` and a `size()`
+   equal to the body length the read in step 8 returned.
 
 ### Verify your solution
 
 Wrap your assertions in a `cargo test` (or `cargo run` with `assert!` in
-`main`). The exercise solution is verified when BOTH of these assertions
-pass simultaneously:
+`main`). The exercise solution is verified when ALL THREE of these
+assertions pass simultaneously:
 
 - (a) `resources/list` for the SkillsHandler returns URIs that EXCLUDE
-  every `references/*.md` URI.
+  every `references/*.md` URI, and has length 1.
 - (b) `resources/read` on a reference URI (e.g.
   `skill://acme/billing/refunds/references/policy.md`) returns a content
   body byte-equal to the embedded reference file.
+- (c) the `skills/list` entry projection INCLUDES that same reference URI
+  in its `resources` manifest, with a size matching (b)'s body length.
 
 If only (b) passes, you forgot the §9 filter check. If only (a) passes,
-your read path is wrong — likely a typo in the URI you passed.
+your read path is wrong — likely a typo in the URI you passed. (c) is the
+half that keeps the rule from being misread as "references are hidden":
+they are not listed, but they are fully described by discovery.
 
 For a working reference of the read path (including how to pattern-match
 `Content::Resource` correctly), see

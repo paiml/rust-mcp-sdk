@@ -82,6 +82,15 @@ toml = "1"
 proptest = "1.11"
 # Explicit temp-dir dev-dep for the OCI layout tests — do NOT hand-roll temp dirs.
 tempfile = "3"
+# NFC normalization, for asserting the annotation round-trip in
+# tests/attestation_opacity.rs. Canonical JSON normalizes strings to NFC by
+# specification, so a verbatim assertion is false for non-NFC input; see the
+# `nfc` helper there for the full account.
+#
+# This adds NO crate to the resolved graph that `make no-crypto-check`
+# allowlists: olpc-cjson (a direct runtime dependency) already pulls
+# unicode-normalization in to do exactly this normalization.
+unicode-normalization = "0.1"
 
 # docs.rs build configuration (PKG-01): the crate has no cargo features, so
 # all-features is a no-op safety net; docsrs cfg enables doc_cfg badging if used.

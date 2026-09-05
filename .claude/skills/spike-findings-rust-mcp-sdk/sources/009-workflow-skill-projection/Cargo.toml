@@ -1,0 +1,21 @@
+[package]
+name = "spike-009-workflow-skill-projection"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Baseline spike deps only (pmcp / tokio / async-trait / serde_json / anyhow).
+# The pmcp path-dep needs BOTH the `skills` feature (projection target) and
+# whatever compiles the workflow module (always-on natively).
+[workspace]
+
+[dependencies]
+pmcp = { path = "../../..", default-features = false, features = ["skills"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "spike-009"
+path = "src/main.rs"

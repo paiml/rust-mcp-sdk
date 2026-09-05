@@ -32,6 +32,7 @@ use pmcp_package::package::{CedarPolicySet, ServerPackage};
 use pmcp_package::PackageError;
 use proptest::prelude::*;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 mod common;
 
@@ -85,6 +86,38 @@ fn try_pack_at(
 fn pack_at(dir: &Path, attestation: Option<AttestationFile<'_>>) -> (OciLayout, ManifestDigest) {
     let (layout, result) = try_pack_at(dir, attestation);
     (layout, result.expect("the property package must pack"))
+}
+
+/// `value` in Unicode Normalization Form C.
+///
+/// Annotation values do NOT round-trip byte-verbatim, and no change to this
+/// crate can make them: the manifest is written as Canonical JSON, and the
+/// Canonical JSON specification requires strings to be NFC-normalized.
+/// `olpc-cjson`'s `write_string_fragment` applies `str::nfc` to every fragment
+/// it writes, so what reaches the blob is already normalized before the digest
+/// is taken over it. `unpack_server` reads back exactly what was written.
+///
+/// Concretely, and this is the case proptest found (seed
+/// `tests/attestation_opacity.proptest-regressions`): U+F900 CJK COMPATIBILITY
+/// IDEOGRAPH-F900 has a *singleton* canonical decomposition to U+8C48, so NFC
+/// maps one to the other. The two render identically, which is why the failure
+/// reads as `left: "<CJK>", right: "<CJK>"` with no visible difference.
+///
+/// # Why the property is normalized rather than the input
+///
+/// Restricting the generator to NFC input would make the test agree with the
+/// implementation by construction and stop covering the transformation at all.
+/// Making `pack_server` REFUSE non-NFC annotations was the other candidate and
+/// is worse: it is exactly the "quietly widen into refusing legitimate
+/// non-ASCII issuers" failure this property's own doc names below, since an
+/// issuer legitimately written in NFD would start being rejected.
+///
+/// NFC normalization does not weaken what this property exists to prove. The
+/// claim is that annotation values are inert DATA — they reach no filesystem
+/// API and are never interpreted as paths. A normalization applied uniformly
+/// by the serializer, before any byte is written, touches neither half.
+fn nfc(value: &str) -> String {
+    value.nfc().collect()
 }
 
 /// The first C0 control character in `value`, mirroring the range
@@ -387,13 +420,15 @@ proptest! {
             .expect("a package packed WITH an attestation must unpack with one");
         prop_assert_eq!(
             attestation.issuer,
-            issuer,
-            "the issuer annotation must come back verbatim, as data"
+            nfc(&issuer),
+            "the issuer annotation must come back as data, NFC-normalized and \
+             otherwise untouched"
         );
         prop_assert_eq!(
             attestation.payload_type,
-            payload_type,
-            "the payload-type annotation must come back verbatim, as data"
+            nfc(&payload_type),
+            "the payload-type annotation must come back as data, NFC-normalized and \
+             otherwise untouched"
         );
     }
 }

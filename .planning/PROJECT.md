@@ -12,6 +12,13 @@ Tool handlers can manage long-running operations through a durable task lifecycl
 
 ### Validated
 
+<!-- v2.6 AI-Package Portability — shipped 2026-08-27 as tag v2.19.1 (14 crate versions live). -->
+- ✓ **PKG-01** A config-only server packs end to end — `config.toml` + OpenAPI spec as vendor-media-type layers — v2.6
+- ✓ **PKG-02** Dual-mode binary: embedded bootstrap bytes or referenced `BinaryRef { digest, media_type }` — v2.6
+- ✓ **PKG-03** Baked-vs-slot split decided and machine-checkable (spec baked; endpoint/credentials/auth mode are slots) — v2.6
+- ✓ **PKG-04** Package round-trips A→B with tool-list parity asserted on behaviour, not manifest shape — v2.6
+- ✓ **PKGR-01** Publish ledger complete and machine-checked — the coverage gate discovers workspace-EXCLUDED crates (24→25 members) and asserts `pmcp-package` precedes all four consumers — v2.6
+
 - ✓ Core protocol types (Task, TaskStatus, CreateTaskResult, etc.) matching MCP spec 2025-11-25 — v1.0
 - ✓ Task status state machine with validated transitions (5 states, 46 transition tests) — v1.0
 - ✓ TaskStore trait with pluggable storage backends (11 async methods) — v1.0
@@ -77,43 +84,52 @@ Tool handlers can manage long-running operations through a durable task lifecycl
 
 ### Active
 
-<!-- Milestone v2.6 AI-Package Portability. Full text with traceability in .planning/REQUIREMENTS.md. -->
+<!-- Milestone v2.7 SEP-2640 Skills Conformance & Positioning. v2.7 has no REQUIREMENTS.md yet — /gsd-new-milestone writes one. -->
 
-- [ ] **PKG-01**: A server with no bespoke binary can be packed — vendor media types carry the server's own `config.toml` and its OpenAPI spec as layers
-- [ ] **PKG-02**: The binary is dual-mode — embedded (bootstrap bytes) or referenced (`BinaryRef { digest, media_type }`) resolved in the target environment
-- [ ] **PKG-03**: What is baked versus what is a slot is decided and documented (spec baked; endpoint, credentials and auth mode are slots)
-- [ ] **PKG-04**: A package round-trips between environments with tool-list parity as the asserted property, on behaviour via `parity_replay.rs`
-- [ ] **PKGX-01**: A package carries a pmcp.run-issued attestation and verifies against pmcp.run's identity — carriage and verification only, no crypto dependency *(contract-first; parked on backend)*
-- [ ] **PKGX-02**: `cargo pmcp package pack | unpack | export | import` resolving environments through `configure`'s resolver and the existing `pmcp_run/{graphql,auth}.rs` seam *(`pack`/`unpack` land now; `export`/`import` contract-first, parked on backend)*
-- [ ] **PKGR-01**: `pmcp-openapi-server` added to CLAUDE.md's publish order
+**Carried over from v2.6 — both parked on the pmcp.run backend, not on this repo:**
 
-## Current Milestone: v2.6 AI-Package Portability
+- [ ] **PKGX-01**: A package carries a pmcp.run-issued attestation and verifies against pmcp.run's identity *(in-repo carriage half SHIPPED in v2.6; verification against pmcp.run's identity is parked — the backend endpoint does not exist)*
+- [ ] **PKGX-02**: `cargo pmcp package pack | unpack | export | import` *(`save`/`load` SHIPPED complete in v2.6; `pull`'s live leg is `#[ignore]`d because the backend endpoint does not exist. Contract-verified, never executed against the platform)*
 
-**Goal:** Make an AI-Package genuinely portable between pmcp.run environments — build a server from
-configuration only, test and attest it in one AWS account/region, export it, and import it into
-another with the target environment told exactly what it must supply. The proving case is
-`pmcp-openapi-server`: a Shape A pure-config binary whose entire identity is a `config.toml` plus an
-OpenAPI spec.
+**v2.7 requirements:** not yet defined. The milestone's later phases (workflow→skill projection
+`as_skill()`, `[[skills]]` digest pins on AgentPackage, tri-surface decision-matrix docs) are added
+via `/gsd-phase add` as taken up — implementation-order items 23-25 in the spike-findings skill.
 
-**Target features:**
-- Config-server packaging — vendor media types for `config.toml` + OpenAPI spec as layers, dual-mode binary (embedded bootstrap or referenced `BinaryRef`), documented baked-vs-slot split (Phase 120)
-- Local round-trip E2E asserting tool-list parity on behaviour, never on manifest structure — the regression net every later refactor leans on (Phase 121)
-- Attestation carriage and verification for a pmcp.run-issued attestation; no signing, no crypto dependency (Phase 122, contract-first)
-- `cargo pmcp package pack | unpack | export | import` verbs reusing the existing pmcp.run GraphQL/auth seam rather than a second API path (Phase 123, contract-first)
-- Release hygiene — `pmcp-openapi-server` into the publish ledger; `pmcp-package` 0.2.0 and `cargo-pmcp` 0.19.0 (Phase 124)
+## Current Milestone: v2.7 SEP-2640 Skills Conformance & Positioning
 
-**Scoping decisions taken at milestone open (2026-08-22):**
-- Phases 122/123 stay **parked** — vendored contract plus offline blocking contract test only. The
-  live E2E leg activates when the pmcp.run backend work (package import, attestation issuance) is
-  scheduled. PKGX-01/02 therefore cannot fully close inside this repo, by design.
-- UNAS-01 (SEP-2243 `x-mcp-header` / `Mcp-Param-{Name}`) **deferred again** — stays in Future
-  Requirements, unassigned, out of the v2.6 roadmap.
-- Work continues on a **rebased `feat/package-remote-capture-show`** (249 commits ahead of `main`,
-  20 behind; zero overlap with `src/server/`, `src/shared/`, `src/types/`).
+**Goal:** Bring the shipped `skills` module (feature `skills`) into conformance with the CURRENT
+SEP-2640 draft, then land the positioning work spikes 009-011 validated: workflow→skill projection,
+digest-pinned agent skill consumption, and the tri-surface decision-matrix docs.
 
-**Non-goals:** signing keys or PKI in the SDK; an ECR client in the CLI (`oci-client` is not added,
-`oci-spec` types stay); changing `LATEST_PROTOCOL_VERSION`; refactoring the manifest schema for
-elegance — the schema is expected to churn, so the E2E is the asset, not the API.
+**Status (2026-09-04):** Phases 125 and 126 COMPLETE.
+
+Phase 125 shipped the conformance fix. `skills/list` and `skills/get` are routed via the
+crate-private `InternalClientRequest` classifier (no new public `ClientRequest` variant, honouring
+the 2.x exhaustive-enum promise), answered from the shipped `Skills` registry with verbatim
+frontmatter and complete `{uri, digest, size}` manifests; the nonstandard `skill://index.json` is
+retired; name-identity is validated at build.
+
+Phase 126 shipped the first positioning piece, spike 009's workflow→skill projection.
+`SequentialWorkflow::as_skill()` derives a SEP-2640-conforming skill from the workflow's
+already-public introspection surface, and the two surfaces cannot drift because the SDK owns the
+one renderer — with `with_workflow_skill_prepend(true)` they share a STRING, not merely a renderer:
+the skill served at `skill://{name}/SKILL.md` and the prompt's message [0] are the same bytes, one
+digest, no variant to keep in sync. Verified 6/6 against SC-1..SC-6; `tests/golden/` pins the
+rendered bytes and CHANGELOG `## [2.20.0]` records that constant key order is digest-significant.
+Six code-review warnings were deliberately deferred with provenance in the phase's
+`deferred-items.md`. No further v2.7 phase has been added yet — spikes 010 (digest-pinned agent
+skill consumption) and 011 (tri-surface docs) remain unscheduled.
+
+**Known residual risk accepted in phase 125 (CR-01):** a server that declares
+`io.modelcontextprotocol/skills` and runs on **stdio** tears down the session on `skills/list` —
+*silently*, with no JSON-RPC error to the client and no operator log (`crate::log` is a no-op stub
+at `src/lib.rs:373-386`). Accepted because the SDK targets remote streamable-HTTP servers, stdio is
+discouraged, and skills are strictly opt-in (`skills` is in neither `default` nor `full`). The
+underlying receive-arm defect is pre-existing and general: ANY unroutable method frame kills a stdio
+session, `server/discover` included.
+
+**Non-goals:** a new public `ClientRequest` variant; client-side `skills/*` wrappers and
+`resources/directory/read` (both explicitly deferred, never silently dropped).
 
 ### Future
 
@@ -216,6 +232,9 @@ Tech stack: `pmcp-tasks` (serde, async-trait, dashmap, uuid, chrono, tokio, park
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
+| Projection returns an output struct, not the bare artifact (v2.7, Phase 126) | Two locked decisions collided — one said `build() -> Result<Skill>`, the other said warnings return FROM `build()`; a bare success type cannot carry both | ✓ Good — `ProjectionOutput` is additive, so a later field costs no breaking change; all three cross-AI lanes had flagged the collision |
+| A renderer ships with its consumer, or the anti-drift claim is theoretical (v2.7, Phase 126) | The opt-in was reachable only by hand-constructing a handler; a server registering workflows normally could not enable it at all | ✓ Good — one feature-gated default-off setter per builder makes the claim hold per SERVER, not merely per workflow value; flag-off transcripts measured byte-identical |
+| Escape what the PARSER breaks on, not what the language calls a control character (v2.7, Phase 126) | `char::is_control()` is category `Cc`, but the resolved libyaml treats five characters as line breaks — `U+2028`/`U+2029` are `Zl`/`Zp` and went in raw, silently dropping the skill from `skills/list` | ✓ Good — caught by code review, not by any test; the guarding generators used `.` = `[^\n]` and could never sample the failing input |
 | Separate crate (`pmcp-tasks`) | Experimental spec isolation, independent versioning | ✓ Good — clean separation, pmcp core unchanged for non-task users |
 | Polling-only for tasks/result | Simpler implementation, Lambda-compatible, spec allows it | ✓ Good — 11 integration tests validate polling flow |
 | Trait-level variable size limits | Consistent enforcement across backends, not just DynamoDB's 400KB | ✓ Good — `StoreConfig.max_variable_size_bytes` enforced in InMemoryTaskStore |
@@ -272,4 +291,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-22 after milestone v2.6 (AI-Package Portability) opened — pre-scoped from the v2.5 close (2026-07-27 scoping); staged requirements folded back into REQUIREMENTS.md as PKG-01..04 / PKGX-01/02 / PKGR-01; four opening decisions recorded: scope taken as scoped, Phases 122/123 stay parked contract-first, UNAS-01 (SEP-2243) deferred again unassigned, work continues on a rebased `feat/package-remote-capture-show`; previously 2026-08-22 after v2.5 milestone — **Milestone v2.5 (MCP Spec 2026-07-28 v2 Support) COMPLETE and archived**: 11 phases / 176 plans, all verification `passed`, published as pmcp v2.19.0 (PR #337, tag v2.19.0). pmcp is now a dual-version SDK — one binary serving both MCP 2025-11-25 and 2026-07-28 via per-request negotiation, v2 primary (stateless, Tasks-as-extension, JSON Schema 2020-12) and v1 cleanly severable at compile time. Nine official-suite conformance gaps closed. Closed as an override_closeout with 461 audit items recorded as open debt rather than acknowledged (two gsd-tools defects made acknowledgment unsafe — see MILESTONES.md). v2.6 (AI-Package Portability, Phases 120-124) scoped in ROADMAP.md with requirements staged in `.planning/v2.6-REQUIREMENTS-STAGED.md`, not yet opened; previously 2026-07-22 — Milestone v2.5 started: dual-version stack per the 2026-07-22 impact assessment (stateless core, Tasks-as-extension, JSON Schema 2020-12, auth SEPs, official conformance suite); v2.4 phases 106–110 moved to Validated (published as pmcp 2.17.0), v2.4 Phase 111 docs folded into v2.5 scope; previously 2026-07-19 — Phase 109 complete (Team Reference Servers: `pmcp-team-servers` one feature-flagged crate with dev-grade team-fs/mem-mcp/approval-mcp/team-mcp reference servers + additive pmcp-core namespaced `_meta` enablement + in-process "small team, one process" runtime + exportable wire-level conformance harness matching PKG-03 fixtures; TEAM-01..06 done, 7/7 must-haves re-verified after one `pmcp/http` feature-flag gap-closure fix; WR-01/WR-02 tracked as non-blocking follow-ups); previously 2026-07-18 — Phase 107 complete (Contracts & Package Format: pmcp-package adopted as workspace-excluded crate + wire-frozen via pinned-digest golden fixtures, team-server tool contracts as provable-contracts YAML; PKG-01/03 done, PKG-02 pending release-tag publish; WR-01/WR-02 review findings fixed; 3/3 must-haves verified); previously 2026-07-17 — Milestone v2.4 (Agents & Teams — SDK Extraction) started; design doc `docs/design/agents-teams-sdk-extraction-plan.md` approved incl. §6 recommendations; previously 2026-07-05 — Phase 104 complete (Task-Augmented Tool Results DX, SEP-1686 junction; ToolOutput verbatim pass-through + double-wrap tripwire + client TaskMetadata surface + migration guide; re-verified 7/7, make quality-gate green); previously 2026-06-15 — Phase 96 complete (Shape B `cargo pmcp new --kind workbook-server` scaffold + dialect-version declaration with both-lane fail-closed gate + WBEX-01 second-workbook served-schema generalization gate + WBEX-02 8-quirk corpus; WBCL-05/WBDL-02/WBEX-01/WBEX-02 validated, make quality-gate + purity-check green); previously 2026-06-14 — Phase 95 complete (pmcp-workbook-server Shape A pure-config binary mirroring pmcp-sql-server; test trio + --bundle-id proptest + reader-free purity gate + slot-9a wiring; requirement WBCL-06 validated)*
+*Last updated: 2026-09-04 after Phase 126 (workflow-to-skill projection: `SequentialWorkflow::as_skill()`, the `SkillProjection` builder, the D-04a prompt opt-in reachable from both builders, the D-14 golden, and a runnable example; verified 6/6 on SC-1..SC-6). Two defects were fixed at the human's direction rather than deferred: a `pmcp-package` proptest asserting a round-trip the Canonical JSON format cannot provide, and the CR-01 frontmatter-encoding blocker above. Six review warnings deferred with provenance; previously 2026-09-02 after milestone v2.7 opened and **v2.6 (AI-Package Portability) COMPLETED and archived** — 5 phases / 32 plans / 77 tasks, shipped 2026-08-27 as tag `v2.19.1` (14 crate versions live on crates.io). Closed as an `override_closeout`: 5 of 7 requirements Complete, with PKGX-01/02 still Pending because both are parked on a pmcp.run backend that does not exist yet — exactly as scoped at milestone open, not a slip. 486 audit items carried forward UNACKNOWLEDGED (453 belong to already-archived milestones, 11 to phase 125/v2.7, only 13 genuinely v2.6-scoped); acknowledgment refused 11 of the 13 because `audit-open`'s scanner emits table rows and sub-bullets while its `acknowledge` writer only matches `##` headings — the SAME defect recorded at the v2.5 close. The release itself did NOT ship cleanly: run #33122173433 failed on a crates.io ownership 403 (`pmcp-team-servers`), publishing 11 of 14 crates and skipping `cargo-pmcp` 0.23.0 and `pmcp-tasks` 0.1.1 as collateral; all three recovered by hand, and ownership remains a publish precondition no in-repo check covers. Phase 124's SUMMARYs and VERIFICATION were written retroactively — the work shipped 2026-08-27 but its record sat at `0/7 | Planned` for six days, which is what made every milestone-scoped GSD verb treat v2.6 as unfinished. v2.7 is now open with phase 125 already complete; previously 2026-08-22 after milestone v2.6 (AI-Package Portability) opened — pre-scoped from the v2.5 close (2026-07-27 scoping); staged requirements folded back into REQUIREMENTS.md as PKG-01..04 / PKGX-01/02 / PKGR-01; four opening decisions recorded: scope taken as scoped, Phases 122/123 stay parked contract-first, UNAS-01 (SEP-2243) deferred again unassigned, work continues on a rebased `feat/package-remote-capture-show`; previously 2026-08-22 after v2.5 milestone — **Milestone v2.5 (MCP Spec 2026-07-28 v2 Support) COMPLETE and archived**: 11 phases / 176 plans, all verification `passed`, published as pmcp v2.19.0 (PR #337, tag v2.19.0). pmcp is now a dual-version SDK — one binary serving both MCP 2025-11-25 and 2026-07-28 via per-request negotiation, v2 primary (stateless, Tasks-as-extension, JSON Schema 2020-12) and v1 cleanly severable at compile time. Nine official-suite conformance gaps closed. Closed as an override_closeout with 461 audit items recorded as open debt rather than acknowledged (two gsd-tools defects made acknowledgment unsafe — see MILESTONES.md). v2.6 (AI-Package Portability, Phases 120-124) scoped in ROADMAP.md with requirements staged in `.planning/v2.6-REQUIREMENTS-STAGED.md`, not yet opened; previously 2026-07-22 — Milestone v2.5 started: dual-version stack per the 2026-07-22 impact assessment (stateless core, Tasks-as-extension, JSON Schema 2020-12, auth SEPs, official conformance suite); v2.4 phases 106–110 moved to Validated (published as pmcp 2.17.0), v2.4 Phase 111 docs folded into v2.5 scope; previously 2026-07-19 — Phase 109 complete (Team Reference Servers: `pmcp-team-servers` one feature-flagged crate with dev-grade team-fs/mem-mcp/approval-mcp/team-mcp reference servers + additive pmcp-core namespaced `_meta` enablement + in-process "small team, one process" runtime + exportable wire-level conformance harness matching PKG-03 fixtures; TEAM-01..06 done, 7/7 must-haves re-verified after one `pmcp/http` feature-flag gap-closure fix; WR-01/WR-02 tracked as non-blocking follow-ups); previously 2026-07-18 — Phase 107 complete (Contracts & Package Format: pmcp-package adopted as workspace-excluded crate + wire-frozen via pinned-digest golden fixtures, team-server tool contracts as provable-contracts YAML; PKG-01/03 done, PKG-02 pending release-tag publish; WR-01/WR-02 review findings fixed; 3/3 must-haves verified); previously 2026-07-17 — Milestone v2.4 (Agents & Teams — SDK Extraction) started; design doc `docs/design/agents-teams-sdk-extraction-plan.md` approved incl. §6 recommendations; previously 2026-07-05 — Phase 104 complete (Task-Augmented Tool Results DX, SEP-1686 junction; ToolOutput verbatim pass-through + double-wrap tripwire + client TaskMetadata surface + migration guide; re-verified 7/7, make quality-gate green); previously 2026-06-15 — Phase 96 complete (Shape B `cargo pmcp new --kind workbook-server` scaffold + dialect-version declaration with both-lane fail-closed gate + WBEX-01 second-workbook served-schema generalization gate + WBEX-02 8-quirk corpus; WBCL-05/WBDL-02/WBEX-01/WBEX-02 validated, make quality-gate + purity-check green); previously 2026-06-14 — Phase 95 complete (pmcp-workbook-server Shape A pure-config binary mirroring pmcp-sql-server; test trio + --bundle-id proptest + reader-free purity gate + slot-9a wiring; requirement WBCL-06 validated)*
