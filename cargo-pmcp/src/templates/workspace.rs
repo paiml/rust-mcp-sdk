@@ -30,7 +30,7 @@ use std::path::Path;
 ///
 /// `emitted_pmcp_requirement_matches_workspace_major_minor_line` asserts this
 /// tracks the workspace-root `pmcp` version so it cannot silently drift.
-const PMCP_VERSION_REQ: &str = "2.19";
+const PMCP_VERSION_REQ: &str = "2.20";
 
 /// Generate workspace files (Cargo.toml, Makefile, README.md)
 pub fn generate(workspace_dir: &Path, name: &str) -> Result<()> {

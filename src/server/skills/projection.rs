@@ -320,6 +320,21 @@ fn yaml_double_quoted(s: &str) -> String {
             // is `U+009F` and two digits therefore always suffice there.
             '\u{2028}' => out.push_str("\\u2028"),
             '\u{2029}' => out.push_str("\\u2029"),
+            // The two BMP NONCHARACTERS, for the SAME reason and by the same
+            // spelling. YAML 1.1's printable set — which `unsafe-libyaml`'s
+            // reader enforces — admits `U+E000..=U+FFFD` and stops there, so
+            // `U+FFFE` and `U+FFFF` are rejected as unacceptable characters.
+            // Neither is Unicode `Cc`, so the `is_control()` arm below does not
+            // reach them, and neither is a line separator, so the arms above do
+            // not either: emitted raw they make the rendered frontmatter block
+            // FAIL to parse, which the registry downgrades to a diagnostic and
+            // then silently drops the skill from `skills/list` while
+            // `into_handler()` still returns `Ok` — the CR-01 class again, in
+            // the one gap the original escape table left. They are the ONLY
+            // gap: every other non-printable BMP scalar is `Cc`, surrogates
+            // cannot exist in a `char`, and the supplementary noncharacters
+            // (`U+1FFFE` and friends) are inside libyaml's 4-byte accept range.
+            '\u{fffe}' | '\u{ffff}' => out.push_str(&format!("\\u{:04x}", c as u32)),
             // Every remaining C0/C1 control as `\xNN`. `char::is_control()` is
             // the Unicode `Cc` category, whose maximum scalar is `U+009F`, so
             // two lowercase hex digits always suffice.
@@ -595,11 +610,26 @@ fn render_closing(wf: &SequentialWorkflow) -> String {
 /// description length limit, and the registry's existing over-limit warning
 /// already covers a pathologically large body.
 fn resolve_description(wf: &SequentialWorkflow, slug: &str) -> String {
-    if wf.description().is_empty() {
+    if description_is_absent(wf) {
         fallback_description(slug)
     } else {
         wf.description().to_string()
     }
+}
+
+/// The ONE spelling of "this workflow has no usable description".
+///
+/// `.trim()` is load-bearing and used to be missing here. `SkillProjection::build`
+/// has always rejected on `description().trim().is_empty()`, while this path
+/// substituted only on the UNTRIMMED `is_empty()` — so a description of `"   "`
+/// was rejected by the fallible entry point and passed straight through by the
+/// infallible one, rendering `description: "   "` into a frontmatter block whose
+/// bytes are a published digest (D-14) and emitting no
+/// [`ProjectionNotice::EmptyDescription`], so the operator was never told. The
+/// two entry points are documented to differ in DISPOSITION over the same
+/// condition; sharing this predicate is what makes that true.
+fn description_is_absent(wf: &SequentialWorkflow) -> bool {
+    wf.description().trim().is_empty()
 }
 
 /// Compose the whole SKILL.md body.
@@ -644,7 +674,7 @@ pub(crate) fn project_with_notices(wf: &SequentialWorkflow) -> (Skill, Vec<Proje
         slug
     };
 
-    if wf.description().is_empty() {
+    if description_is_absent(wf) {
         notices.push(ProjectionNotice::EmptyDescription {
             substituted: fallback_description(&slug),
         });
@@ -1222,7 +1252,7 @@ impl<'w> SkillProjection<'w> {
             )));
         }
 
-        if workflow.description().trim().is_empty() {
+        if description_is_absent(workflow) {
             return Err(Error::validation(format!(
                 "workflow {name:?} has an empty description, which renders an \
                  agentskills-illegal frontmatter value; write a description, or use \
@@ -2625,7 +2655,13 @@ mod tests {
             prop_assert_eq!(obj.len(), 2);
             prop_assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("refund-flow"));
             let parsed_description = obj.get("description").and_then(|v| v.as_str());
-            if description.is_empty() {
+            // `trim()`, not `is_empty()`: a description of `"\n"` or `"   "` is
+            // BLANK, and the substitution branch is what the infallible path
+            // takes for it — `description_is_absent` is the one predicate both
+            // entry points share. Testing `is_empty()` here asserted a verbatim
+            // round-trip of a blank scalar, i.e. exactly the agentskills-illegal
+            // frontmatter value the substitution exists to prevent.
+            if description.trim().is_empty() {
                 prop_assert_eq!(
                     parsed_description,
                     Some("Projected from the refund-flow workflow.")
@@ -2741,6 +2777,83 @@ mod tests {
             value.get("description").and_then(|v| v.as_str()),
             Some("Projected from the refund-flow workflow.")
         );
+    }
+
+    /// The whitespace-only case of the property above, as its own regression.
+    ///
+    /// `build()` has always rejected `"   \t  "` (see
+    /// `build_rejects_a_whitespace_only_description` two tests up), while
+    /// `resolve_description` substituted only on the UNTRIMMED `is_empty()` — so
+    /// the infallible path rendered `description: "   \t  "` into a digested
+    /// frontmatter block and emitted NO notice. The test named
+    /// `as_skill_substitutes_where_build_rejects_the_description` covered only
+    /// `""`, so it was true of its own name for one of the two rejected shapes.
+    #[test]
+    fn as_skill_substitutes_for_a_whitespace_only_description_too() {
+        for blank in ["   \t  ", "\n", " "] {
+            let wf = tracer_workflow("refund_flow", blank);
+            let skill = wf.as_skill();
+            assert_eq!(
+                skill.resolved_description(),
+                "Projected from the refund-flow workflow.",
+                "a blank description must take the same substitution `build()` rejects it for; \
+                 input was {blank:?}"
+            );
+            let value = parsed_frontmatter(skill.body());
+            assert_eq!(
+                value.get("description").and_then(|v| v.as_str()),
+                Some("Projected from the refund-flow workflow."),
+                "input was {blank:?}"
+            );
+            assert!(
+                SkillProjection::new(&wf).build().is_err(),
+                "the anti-vacuity half: `build()` must still REJECT {blank:?}, so the two entry \
+                 points differ in disposition over one shared condition rather than in the \
+                 condition itself"
+            );
+        }
+
+        // A description that merely CONTAINS whitespace is untouched.
+        let kept = tracer_workflow("refund_flow", "  Process a refund  ");
+        assert_eq!(
+            kept.as_skill().resolved_description(),
+            "  Process a refund  "
+        );
+    }
+
+    /// `U+FFFE` and `U+FFFF` are escaped, so the rendered block still parses.
+    ///
+    /// Neither is Unicode `Cc` and neither is a line separator, so both slipped
+    /// past every arm of the encoder and reached the frontmatter raw — where
+    /// YAML 1.1's printable set (`U+E000..=U+FFFD` in the BMP) rejects them, the
+    /// block fails to parse, and the registry silently drops the skill from
+    /// `skills/list` while `into_handler()` still returns `Ok`. That is the
+    /// CR-01 class the encoder's own comment block claims to have removed.
+    #[test]
+    fn the_bmp_noncharacters_survive_the_frontmatter_round_trip() {
+        for description in ["Refund \u{FFFF} orders", "Refund \u{FFFE} orders"] {
+            let wf = tracer_workflow("refund_flow", description);
+            let body = wf.as_skill().body().to_string();
+            // Only the FRONTMATTER block is asserted: it is the half a YAML
+            // reader sees. The `# ` heading below the closing `---` is markdown
+            // and carries the author's character verbatim, which is correct —
+            // `parse_frontmatter_value` never hands those bytes to libyaml.
+            let frontmatter_block = body
+                .split("\n---\n")
+                .next()
+                .expect("split always yields a first element");
+            assert!(
+                !frontmatter_block.contains('\u{FFFE}') && !frontmatter_block.contains('\u{FFFF}'),
+                "the noncharacter must be ESCAPED in the frontmatter, not emitted raw: \
+                 {frontmatter_block:?}"
+            );
+            let value = parsed_frontmatter(&body);
+            assert_eq!(
+                value.get("description").and_then(|v| v.as_str()),
+                Some(description),
+                "the escaped form must decode back to the author's exact text"
+            );
+        }
     }
 
     #[test]

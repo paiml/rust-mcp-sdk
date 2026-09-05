@@ -4705,12 +4705,33 @@ impl ServerBuilder {
     /// Turns on
     /// [`WorkflowPromptHandler::with_projected_skill_prepend`](crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend)
     /// for every workflow this builder registers, so `prompts/get` opens with
-    /// the same bytes the server serves at `skill://{slug}/SKILL.md` — one
-    /// string and one digest, with no variant to keep in sync. Without this
-    /// method the opt-in is reachable only by hand-constructing a
-    /// `WorkflowPromptHandler` and registering it with `.prompt(name, handler)`,
-    /// which would make the guarantee true per workflow VALUE but not per
-    /// SERVER.
+    /// the bytes `workflow.as_skill().body()` renders. Without this method the
+    /// opt-in is reachable only by hand-constructing a `WorkflowPromptHandler`
+    /// and registering it with `.prompt(name, handler)`, which would make the
+    /// setting true per workflow VALUE but not per SERVER.
+    ///
+    /// # It does NOT register the skill — you must do that too
+    ///
+    /// This setter touches the PROMPT surface only. It never adds anything to
+    /// the skills registry, so on a builder that does nothing else the server
+    /// hands a client a document identifying itself as `skill://{slug}/SKILL.md`
+    /// while `resources/read` on that URI fails and `skills/list` answers
+    /// `-32601` (no skill was registered, so the extension is never declared).
+    ///
+    /// For the "one string, one digest, no variant to keep in sync" property to
+    /// actually hold, register the projected skill from the SAME workflow value
+    /// in the same builder chain:
+    ///
+    /// ```text
+    /// builder
+    ///     .try_skills(Skills::new().add(workflow.as_skill()))?
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    /// ```
+    ///
+    /// Nothing enforces the pairing, so a workflow edited after only one of the
+    /// two calls desynchronizes the prompt bytes from the digest published in
+    /// `skills/list`.
     ///
     /// # Ordering matters
     ///
@@ -4777,16 +4798,31 @@ impl ServerBuilder {
         self
     }
 
-    /// Fallible variant of [`Self::skills`] — returns `Err` immediately on any
-    /// condition that would otherwise panic at `.build()`. Useful for
-    /// runtime-dynamic registration where panicking is unacceptable.
+    /// Fallible variant of [`Self::skills`]. Useful for runtime-dynamic
+    /// registration where panicking is unacceptable.
+    ///
+    /// # What it checks, and what it does NOT
+    ///
+    /// Duplicate URIs are a CROSS-skill property, so they are checked over the
+    /// whole accumulated registry. Name identity is a PER-skill property and is
+    /// checked over the registry passed to THIS call only — which is what keeps
+    /// K registrations linear rather than quadratic.
+    ///
+    /// The consequence is worth stating plainly, because it is the one case
+    /// where this method does not save you from `.build()`: skills deposited by
+    /// the INFALLIBLE [`Self::skills`] / [`Self::skill`] /
+    /// [`Self::bootstrap_skill_and_prompt`] are never name-checked at
+    /// registration time, so a later `try_skills` can return `Ok` while
+    /// `.build()` still panics on one of them. Register every skill through
+    /// `try_skills` if you need the failure as a `Result`.
     ///
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` if the merged registry would
     /// produce duplicate `skill://` URIs (including a reference URI that
-    /// collides with another skill's `SKILL.md`), or if a skill's frontmatter
-    /// `name` disagrees with the final segment of its URI path.
+    /// collides with another skill's `SKILL.md`), or if a skill in the registry
+    /// PASSED HERE has a frontmatter `name` that disagrees with the final
+    /// segment of its URI path.
     #[cfg(feature = "skills")]
     pub fn try_skills(mut self, skills_registry: skills::Skills) -> Result<Self> {
         // Name identity is a PER-SKILL property — see `validate_name_identity`.
@@ -5636,6 +5672,20 @@ impl ServerBuilder {
         // The SEP-2640 entry set comes back from the SAME call (Phase 125): it is
         // the one place that sees the registry, so it is the only place both build
         // paths can take entries from without drifting.
+        // Re-apply the skills capability LAST, because `capabilities(..)` is
+        // last-write-wins and REPLACES the whole `ServerCapabilities` value: a
+        // `.skill(..).capabilities(..)` ordering wiped the
+        // `io.modelcontextprotocol/skills` extension that `.skill(..)` had just
+        // inserted. That was inert until Phase 125 gave `skills_method_not_found`
+        // a reason to read the extension key; since then it silently turned both
+        // SEP-2640 methods into `-32601` on a server whose `skill_entries` were
+        // fully populated and whose `resources/*` surface still served every
+        // skill. Keyed on the registry rather than on the capability so the
+        // declaration follows the skills that are actually registered.
+        #[cfg(feature = "skills")]
+        if self.pending_skills.is_some() {
+            skills::set_skills_capabilities(&mut self.capabilities);
+        }
         #[cfg(feature = "skills")]
         let (final_resources, skill_entries): (
             Option<Arc<dyn ResourceHandler>>,

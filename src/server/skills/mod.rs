@@ -318,7 +318,7 @@ impl Skill {
     /// avoid re-scanning the body on every request.
     pub fn new(name: impl Into<String>, body: impl Into<String>) -> Self {
         let body = body.into();
-        let description = parse_frontmatter_description(&body).unwrap_or_default();
+        let description = resolved_frontmatter_description(&body);
         Self {
             name: name.into(),
             body,
@@ -1133,7 +1133,17 @@ impl Skills {
         // now share — `build_handler` below is construction only and would
         // silently overwrite on a collision.
         validate_unique_uris(artifact_uri_rows(&artifacts))?;
-        drop(artifacts);
+        // The pass ALREADY computed these; discarding them made this — the
+        // public, doc-example, `pmcp-book`-taught build path — the only one of
+        // the three that never warned. A skill whose frontmatter is malformed
+        // is silently absent from `skills/list`, and this is the operator's one
+        // chance to hear about it. The manifest-only `LimitExceeded` finding
+        // cannot arise on the name-only pass, so nothing here needs it.
+        let diagnostics: Vec<SkillDiagnostic> = artifacts
+            .into_iter()
+            .flat_map(|artifact| artifact.diagnostics)
+            .collect();
+        log_skill_diagnostics(&diagnostics);
         Ok(self.build_handler())
     }
 
@@ -1243,13 +1253,26 @@ struct SkillBuildArtifact {
 /// One event per diagnostic, never a summary: an operator filtering on
 /// `target: "mcp.skills"` needs the excluded skill's URI in a structured field,
 /// not inside a rendered message.
+///
+/// Both the `uri` FIELD and the rendered message are neutralized through
+/// [`crate::shared::log_sanitize::sanitize_for_log`]. Nothing validates a
+/// `Skill`'s name or its `with_path` override, so both reach `skill_md_uri()`
+/// verbatim, and every `SkillDiagnostic` message interpolates author text
+/// (`uri`, `skill_name`, `uri_segment`, and the YAML parser's own `reason`).
+/// A path of `a\n2026-01-01 ERROR audit: auth bypassed` therefore forged a
+/// second record in any line-oriented sink. This is the third consumer of the
+/// shared classification the sibling projection emitter already uses
+/// (`projection.rs`'s `SkillProjection::build`) — inheriting it rather than
+/// re-deriving it is the whole reason `shared::log_sanitize` exists.
 pub(crate) fn log_skill_diagnostics(diagnostics: &[SkillDiagnostic]) {
+    use crate::shared::log_sanitize::sanitize_for_log;
+
     for diagnostic in diagnostics {
         tracing::warn!(
             target: "mcp.skills",
-            uri = %diagnostic.uri(),
+            uri = %sanitize_for_log(diagnostic.uri()),
             "{}",
-            diagnostic.message()
+            sanitize_for_log(&diagnostic.message())
         );
     }
 }
@@ -1789,13 +1812,57 @@ impl ResourceHandler for ComposedResources {
 
 // ── Frontmatter parsing (internal) ───────────────────────────────────
 
+/// The description [`Skill::new`] caches, DECODED where the block is decodable.
+///
+/// The strict [`parse_frontmatter_value`] reader is tried first and its
+/// `description` string is preferred, because [`parse_frontmatter_description`]
+/// is a raw `strip_prefix("description: ")` scan with no YAML decoding at all:
+/// `description: "Refund: fast path"` surfaced WITH its quotes and
+/// `description: >` surfaced as the literal `">"`. Those values are what
+/// `resources/list` and `SkillPromptHandler` publish, while the `skills/list`
+/// entry built by the same block carries the properly decoded string — two
+/// surfaces of one skill disagreeing about its description. `projection.rs`
+/// already worked around this for the projected path by overriding with
+/// `.with_description(..)`; hand-authored skills had no such escape.
+///
+/// The loose scanner remains the fallback so nothing that resolves today stops
+/// resolving: a body the strict reader calls `Absent`, `Invalid` or
+/// `NotAMapping`, or one whose `description` is absent or non-string, gets
+/// exactly the value it got before.
+fn resolved_frontmatter_description(body: &str) -> String {
+    if let FrontmatterParse::Parsed(value) = parse_frontmatter_value(body) {
+        if let Some(description) = value.get("description").and_then(serde_json::Value::as_str) {
+            return description.to_string();
+        }
+    }
+    parse_frontmatter_description(body).unwrap_or_default()
+}
+
+/// `true` for a `---` frontmatter delimiter line, ignoring trailing whitespace.
+///
+/// The `\r` half is what makes a CRLF-authored SKILL.md behave like an LF one.
+/// The rest of the trim is the fix for a defect that was worth a build failure:
+/// a single trailing SPACE after the opening `---` — invisible in most editors,
+/// accepted by Jekyll, gray-matter and every mainstream frontmatter reader —
+/// made [`parse_frontmatter_value`] return [`FrontmatterParse::Absent`] for a
+/// fully-annotated file. The skill was then dropped from `skills/list` and the
+/// operator was told "its SKILL.md carries NO frontmatter block. Add a
+/// `---`-delimited YAML block at the top of the file", which is exactly the
+/// misdiagnosis the four-way `FrontmatterParse` split exists to prevent.
+///
+/// Used by BOTH readers in this module so they cannot disagree about where a
+/// block starts and ends.
+fn is_frontmatter_delimiter(line: &str) -> bool {
+    line.trim_end() == "---"
+}
+
 fn parse_frontmatter_description(body: &str) -> Option<String> {
     // Strip UTF-8 BOM so frontmatter authored on Windows still parses;
     // `str::lines()` already handles both \n and \r\n line endings.
     let body = body.strip_prefix('\u{FEFF}').unwrap_or(body);
     let mut in_frontmatter = false;
     for line in body.lines().take(40) {
-        if line == "---" {
+        if is_frontmatter_delimiter(line) {
             if in_frontmatter {
                 break;
             }
@@ -1860,7 +1927,7 @@ fn parse_frontmatter_value(body: &str) -> FrontmatterParse {
     let body = body.strip_prefix('\u{FEFF}').unwrap_or(body);
     let mut lines = body.lines();
     match lines.next() {
-        Some(first) if first.trim_end_matches('\r') == "---" => {},
+        Some(first) if is_frontmatter_delimiter(first) => {},
         _ => return FrontmatterParse::Absent,
     }
 
@@ -1868,7 +1935,7 @@ fn parse_frontmatter_value(body: &str) -> FrontmatterParse {
     let mut terminated = false;
     for line in lines {
         let line = line.trim_end_matches('\r');
-        if line == "---" {
+        if is_frontmatter_delimiter(line) {
             terminated = true;
             break;
         }
@@ -2525,6 +2592,210 @@ mod tests {
         assert_eq!(list.resources.len(), 2);
         assert_eq!(list.resources[0].uri, "skill://a/SKILL.md");
         assert_eq!(list.resources[1].uri, "docs://handbook");
+    }
+
+    // ── Test 1.16b (cursor semantics of the composition) ──────────────
+    //
+    // A handler that genuinely paginates. It records the cursor it was handed
+    // so the test can prove `ComposedResources` FORWARDS it rather than
+    // swallowing it, and it sets `next_cursor` so the test can prove the user
+    // handler's pagination state survives the composition.
+    struct PaginatedDocsHandler {
+        seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl ResourceHandler for PaginatedDocsHandler {
+        async fn read(&self, uri: &str, _extra: RequestHandlerExtra) -> Result<ReadResourceResult> {
+            Ok(ReadResourceResult::new(vec![Content::text(format!(
+                "DOCS:{uri}"
+            ))]))
+        }
+
+        async fn list(
+            &self,
+            cursor: Option<String>,
+            _extra: RequestHandlerExtra,
+        ) -> Result<ListResourcesResult> {
+            self.seen.lock().unwrap().push(cursor.clone());
+            match cursor.as_deref() {
+                None => Ok(ListResourcesResult::new(vec![ResourceInfo::new(
+                    "docs://page1",
+                    "page1",
+                )])
+                .with_next_cursor("p2")),
+                Some("p2") => Ok(ListResourcesResult::new(vec![ResourceInfo::new(
+                    "docs://page2",
+                    "page2",
+                )])),
+                Some(other) => panic!("unexpected cursor {other:?}"),
+            }
+        }
+    }
+
+    /// Pins the CHOSEN cursor semantics: skills ride the caller's FIRST page
+    /// only.
+    ///
+    /// Skills do not paginate — [`SkillsHandler::list`] ignores its cursor and
+    /// returns every skill in one page with `next_cursor: None` — so the cursor
+    /// reaching [`ComposedResources::list`] is wholly the USER handler's. The
+    /// composition therefore has to choose where the non-paginating half lands,
+    /// and there are only two defensible answers:
+    ///
+    /// - **every page** — which is what the code did before, and it repeated
+    ///   every `skill://` URI on every page of the user handler's pagination;
+    /// - **the first page** — chosen here, and pinned by this test.
+    ///
+    /// The known cost of this choice is asserted by its sibling test
+    /// [`test_1_16d_composed_resources_drops_skills_for_a_cursor_ignoring_handler`],
+    /// which is the reason this pair exists rather than a single test: neither
+    /// disposition was covered by any test, so the behaviour was incidental and
+    /// a future edit could flip it silently in either direction. Read BOTH
+    /// before changing this.
+    #[tokio::test]
+    async fn test_1_16b_composed_resources_emits_skills_on_the_first_page_only() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let skills: Arc<dyn ResourceHandler> = Skills::new()
+            .add(Skill::new("a", ""))
+            .into_handler()
+            .unwrap();
+        let other: Arc<dyn ResourceHandler> = Arc::new(PaginatedDocsHandler {
+            seen: Arc::clone(&seen),
+        });
+        let composed = ComposedResources { skills, other };
+
+        // Page 1: skills first, then the user handler's first page, and the
+        // user handler's own `next_cursor` survives the composition (building
+        // on the skills result instead would have discarded it).
+        let page1 = composed.list(None, extra()).await.unwrap();
+        assert_eq!(
+            page1
+                .resources
+                .iter()
+                .map(|r| r.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill://a/SKILL.md", "docs://page1"]
+        );
+        assert_eq!(page1.next_cursor.as_deref(), Some("p2"));
+
+        // Page 2: the user handler's page only. No skill URI is repeated.
+        let page2 = composed
+            .list(Some("p2".to_string()), extra())
+            .await
+            .unwrap();
+        assert_eq!(
+            page2
+                .resources
+                .iter()
+                .map(|r| r.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs://page2"]
+        );
+        assert_eq!(page2.next_cursor, None);
+
+        // The cursor reached the user handler verbatim on both calls — the
+        // composition forwards it, it does not consume it.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, Some("p2".to_string())],
+            "ComposedResources must forward the caller's cursor to the user handler"
+        );
+    }
+
+    /// The composition must never enumerate a skill twice across a paginated
+    /// walk — the regression this cursor gate was introduced to fix.
+    ///
+    /// Asserted over the whole walk rather than per page so that adding a third
+    /// page cannot quietly reintroduce a duplicate on it.
+    #[tokio::test]
+    async fn test_1_16c_composed_resources_never_repeats_a_skill_across_pages() {
+        let skills: Arc<dyn ResourceHandler> = Skills::new()
+            .add(Skill::new("a", ""))
+            .add(Skill::new("b", ""))
+            .into_handler()
+            .unwrap();
+        let other: Arc<dyn ResourceHandler> = Arc::new(PaginatedDocsHandler {
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let composed = ComposedResources { skills, other };
+
+        let mut skill_uris = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = composed.list(cursor, extra()).await.unwrap();
+            skill_uris.extend(
+                page.resources
+                    .iter()
+                    .map(|r| r.uri.clone())
+                    .filter(|u| u.starts_with("skill://")),
+            );
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            skill_uris,
+            vec!["skill://a/SKILL.md", "skill://b/SKILL.md"],
+            "each skill must appear exactly once across the full paginated walk"
+        );
+    }
+
+    /// Pins the KNOWN COST of the first-page-only rule, so that it is a
+    /// recorded trade-off rather than an undiscovered bug.
+    ///
+    /// A user handler that IGNORES the cursor and returns its full vector every
+    /// time (a common shape) reports `next_cursor: None`, so a conforming
+    /// client never sends it one and never reaches this path. A client that
+    /// replays a STALE cursor does, and it then receives every user resource
+    /// and NO skills — silently, with no error.
+    ///
+    /// This is accepted: it is strictly narrower than the unconditional
+    /// emission it replaced, which repeated every skill URI on every page for
+    /// every correctly-paginating server. Distinguishing a paginating handler
+    /// from a cursor-ignoring one is not possible through the
+    /// [`ResourceHandler`] trait — the composition cannot tell whether a cursor
+    /// it was handed is one the user handler ever issued.
+    ///
+    /// If this assertion ever needs to change, the sibling
+    /// [`test_1_16b_composed_resources_emits_skills_on_the_first_page_only`]
+    /// changes with it; they encode the two halves of one decision.
+    #[tokio::test]
+    async fn test_1_16d_composed_resources_drops_skills_for_a_cursor_ignoring_handler() {
+        let skills: Arc<dyn ResourceHandler> = Skills::new()
+            .add(Skill::new("a", ""))
+            .into_handler()
+            .unwrap();
+        // DocsHandler ignores its cursor and always returns the same one page.
+        let other: Arc<dyn ResourceHandler> = Arc::new(DocsHandler);
+        let composed = ComposedResources { skills, other };
+
+        let with_cursor = composed
+            .list(Some("stale".to_string()), extra())
+            .await
+            .unwrap();
+        assert_eq!(
+            with_cursor
+                .resources
+                .iter()
+                .map(|r| r.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs://handbook"],
+            "a cursor-bearing call yields the user handler's resources and no skills"
+        );
+
+        // The same handler, called with no cursor, DOES carry the skills — so
+        // the assertion above is about the cursor and not about the handler.
+        let without_cursor = composed.list(None, extra()).await.unwrap();
+        assert_eq!(
+            without_cursor
+                .resources
+                .iter()
+                .map(|r| r.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill://a/SKILL.md", "docs://handbook"]
+        );
     }
 
     // ── Test 1.17 (property: no reference ever listed) ────────────────

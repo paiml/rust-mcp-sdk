@@ -65,3 +65,15 @@ clippy:
 # `make purity-check` implementation so both D-09 entrypoints exist.
 purity-check:
     make purity-check
+
+# Run the skills module's tests (Phase 125, D-09). Delegates for the same reason
+# `purity-check` above does: the four guarded selectors and their zero-test
+# tripwires have ONE implementation, in the Makefile, and both entrypoints exist.
+# `skills` is in neither `full` nor `full-v2`, so no other test leg reaches it.
+test-skills:
+    make test-skills
+
+# Clippy the skills module under `make lint`'s exact pedantic+nursery policy.
+# Same reach gap one gate leg over: `make lint` pins `--features "full"`.
+lint-skills:
+    make lint-skills

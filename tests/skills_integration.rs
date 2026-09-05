@@ -749,6 +749,10 @@ fn register_tool<T: ToolHandler + 'static>(
     handlers.insert(name, Arc::new(tool));
 }
 
+// Why: the pair below IS the registry shape `WorkflowPromptHandler::new` takes
+// (its second and third parameters), so naming it through an alias would put a
+// second spelling of that signature in a test file. `make lint-skills` denies
+// `clippy::all`, which this lint belongs to, hence the explicit allow.
 #[allow(clippy::type_complexity)]
 fn prepend_registry() -> (
     HashMap<Arc<str>, WorkflowToolInfo>,

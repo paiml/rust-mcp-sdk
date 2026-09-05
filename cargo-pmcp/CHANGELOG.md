@@ -5,6 +5,24 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-09-04
+
+### Changed
+
+- **`PMCP_VERSION` 2.19.3 -> 2.20.0** (`src/templates/workbook_server.rs`) and
+  **`PMCP_VERSION_REQ` "2.19" -> "2.20"** (`src/templates/workspace.rs`), so a
+  scaffold pins the `pmcp` shipping at this tag. Both were caught by their own
+  drift guards (`emitted_pmcp_version_matches_workspace_pin`,
+  `emitted_pmcp_requirement_matches_workspace_major_minor_line`) rather than by
+  review — the guards are the reason a `pmcp` bump cannot silently ship a stale
+  scaffold.
+
+  This crate is bumped rather than left alone because it is already published at
+  0.24.0: the release workflow skips a version that exists on crates.io, so the
+  scaffold change would otherwise never reach users. `cargo-pmcp` publishes well
+  after `pmcp` in the release order, so the emitted `pmcp = "2.20"` resolves by
+  the time this crate is published.
+
 ## [0.24.0] - 2026-08-29
 
 ### Added (R1, folded into this unreleased version)

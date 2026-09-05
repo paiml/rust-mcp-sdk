@@ -43,7 +43,7 @@ default-features = false
 # the seam itself is gated `#[cfg(all(feature = "fuzzing", feature =
 # "validation"))]`.
 #
-# `skills` (Phase 125-05) gates `src/server/skills.rs` in its entirety: without
+# `skills` (Phase 125-05) gates `src/server/skills/` in its entirety: without
 # it `pmcp::server::skills` does not exist and `fuzz_skill_entry` has no seam to
 # reach. It needs no `fuzzing` companion — `Skill`, `Skills`, `SkillEntry` and
 # `SkillResourceRef` are all PUBLIC, so the target drives the same API a server

@@ -552,9 +552,22 @@ impl WorkflowPromptHandler {
         let args_display = if args.is_empty() {
             String::new()
         } else {
+            // BTreeMap, not `args.iter()`: `args` is a freshly deserialized
+            // `HashMap` on every request and `RandomState` is seeded per map,
+            // so iterating it directly made message [1] of the transcript a
+            // DIFFERENT string on every `prompts/get` with two or more
+            // arguments. That is the same nondeterminism `render_step` already
+            // routes `template_bindings` through a `BTreeMap` to avoid, one
+            // message over — and it defeats any byte-equality claim over the
+            // transcript, including the parity `opening_messages` exists to
+            // guarantee between this handler and `TaskWorkflowPromptHandler`.
+            // Byte order via `String`'s `Ord` is locale-independent, so the
+            // rendering is stable across machines as well as across calls.
+            let ordered: std::collections::BTreeMap<&String, &String> = args.iter().collect();
             format!(
                 "\nParameters:\n{}",
-                args.iter()
+                ordered
+                    .into_iter()
                     .map(|(k, v)| format!("  - {}: \"{}\"", k, v))
                     .collect::<Vec<_>>()
                     .join("\n")
