@@ -142,3 +142,53 @@ Spike 001/002 baseline = `pmcp` path-dep + `tokio` + `async-trait` +
 it — spike 004 added `toml` + `rusqlite` (bundled) because the question
 was specifically "does this run against a real DB". Document the
 justification in the spike's `Cargo.toml` comments.
+
+## Patterns (additions from spikes 008-011 session, skills-positioning)
+
+### Drift-check spikes against in-review specs
+
+When a spike validates against a spec that is still a PR (SEP drafts), the
+source of truth is the PR head branch's raw markdown, not the docs site:
+`gh pr view NNNN --json headRefName,updatedAt,files` then fetch
+`raw.githubusercontent.com/<org>/<repo>/<head-branch>/<path>`. Record BOTH
+the fetch date and the PR's last-push date in the README — the delta between
+"what we shipped against" and "what the draft says now" is the spike's
+subject. (Spike 008; the SEP had been rewritten 3 days before the spike ran.)
+
+### Wire-proof that a method is unrouteable
+
+`pmcp::types::protocol::ClientRequest` is a `#[serde(tag = "method",
+content = "params")]` enum, so
+`serde_json::from_value::<ClientRequest>(json!({"method": M, "params": {}}))`
+returning `Err` IS the proof that method M cannot be routed (server answers
+-32601). Always pair with a control method that DOES parse. New methods must
+NOT become `ClientRequest` variants (2.x exhaustive-enum promise) — the fix
+path is the crate-private `InternalClientRequest` + `classify_internal_method`
+route documented at `src/types/protocol/mod.rs:583`.
+
+### Shared-cell capture for seam mocks
+
+`pmcp-agent`'s `AgentEngine` owns its seams privately; a mock seam that must
+report what it saw shares an `Arc<Mutex<Option<T>>>` cell with the harness
+(capture in the trait impl, read from the test after `run()`). Used for
+system-prompt capture (010) and observation-sharing between a rule-driven
+`CompletionSource` and its `RecordingInvoker` (011).
+
+### pmcp-agent in-process harness baseline
+
+`AgentEngine::new(source, invoker, InMemoryStore::default(), config)` with:
+`CreateMessageResultWithTools::new(model, Role::Assistant, vec![content])
+.with_stop_reason("end_turn" | "tool_use")`; `SamplingMessageContent::Text
+{ text, meta: None }` / `::ToolUse { name, id, input, meta: None }`;
+`ToolCallResult::ok(call.id, value)`. Spikes may path-dep sibling crates
+(`pmcp-agent = { path = "../../../crates/pmcp-agent" }`) next to the pmcp
+path-dep; cargo unifies the pmcp features.
+
+### Policy-brain pattern for judgment-locus comparisons
+
+To compare "who decides" across mechanisms, extract the decision rules into
+ONE pure `fn decide(observations) -> Action` and host it at each locus
+(client-side interpreter, remote CompletionSource). Identical outcomes then
+isolate the mechanism as the only variable — and divergent outcomes (the
+workflow surface refunding an ineligible order) are measurements, not
+opinions. (Spike 011.)
