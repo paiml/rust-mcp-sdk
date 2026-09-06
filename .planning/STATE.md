@@ -35,7 +35,7 @@ See: `.planning/PROJECT.md` · `.planning/ROADMAP.md` (collapsed at the v2.6 clo
 Phase: 126
 Plan: Not started
 Status: All phases complete
-Last activity: 2026-09-04 — Phase 126 complete
+Last activity: 2026-09-06 - Completed quick task 260906-lx3: widen the workbook dialect (ROUNDDOWN/MAX/MIN/XLOOKUP, exact-match enforcement)
 
 **Phase 125 close-out:** UAT 3/3 passed, verification `passed`, `threats_open: 0`. Three human
 decisions recorded — CR-01 accepted as a D-01-scoped residual risk (an advertised skills
@@ -602,6 +602,12 @@ yet. (Research flags per phase to be surfaced during `/gsd:plan-phase`.)
 - ~~118.2-11 CHECKPOINT: official suite re-measured at held pin 0.2.0-alpha.11 — v1 leg 72/2 -> 71/3, exit 1. tools-call-with-logging 1/1 -> 0/2. Root cause: LogMessageParams emits 'message'; spec requires 'data'. Gate hardening (D-16) and CONF-09 booking BLOCKED on a src/ wire-format decision.~~ **RESOLVED 2026-08-17.** The developer chose the src/ fix; 118.2-13 shipped it (emit_log_record defaults `data` to the message string; semver-checks clean). 118.2-11 re-measured at the SAME held pin over 9 fresh runs: tools-call-with-logging **0/2 -> 2/0** (logCount 3, WireSchemaValid 10 messages / 0 violations), v1 leg **73 passed / 1 failed, exit 0**, GAP_ATTRIBUTABLE_FAILURES **-> 0**, G-3 CLOSED in full. Gate hardened (D-16): 2025-11-25 joined FULLY_SCORED_GREEN_REVISIONS with a per-revision scored floor, BLOCKING_GREEN_SCENARIOS widened 29 -> 30. CONF-09 booked. See 118-CONFORMANCE-GAPS.md '## Dispositions — Phase 118.2 (amendment 2)'.
 - 118.2-11 MEASURED FLAKE (new, open): 2025-11-25:tools-call-elicitation failed 1 of 9 fresh suite runs with 'Dispatch oneshot channel closed' — the same client request-lifecycle race as the blocker above. It is a pre-existing BLOCKING_GREEN_SCENARIOS entry and was ALREADY gate-fatal before the leg was hardened, so the hardening added no new exposure. Stated in the script's own output, NOT exempted. WINDOWS.md entry 9.
 - make book-test is red repo-wide (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical before and after phase 125; pre-existing build-tooling breakage, see 125 deferred-items.md
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260906-lx3 | Widen the workbook dialect: add ROUNDDOWN/MAX/MIN, add a constrained XLOOKUP, and enforce the exact-match contract VLOOKUP/MATCH already claim | 2026-09-06 | c0d84d14 | [260906-lx3-widen-the-workbook-dialect-add-rounddown](./quick/260906-lx3-widen-the-workbook-dialect-add-rounddown/) |
 
 ## Deferred Items
 
