@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — `VLOOKUP` / `MATCH` silently returned a wrong number (workbook dialect)
+
+`MATCH(x, rng, 1)` and a bare `MATCH(x, rng)` — whose **Excel default is
+APPROXIMATE** — both evaluated as EXACT match and returned a wrong number **with
+no signal**. The same held for a bare `VLOOKUP(x, tbl, 2)` and for
+`VLOOKUP(x, tbl, 2, TRUE)`. The exact-match-only contract had been *documented*
+in the evaluator since the dialect shipped, but nothing checked it, so the
+mis-evaluation was invisible: no `#VALUE!`, no lint finding, just a wrong number
+propagating through every downstream formula.
+
+All four shapes are now refused at **two** layers:
+
+- **Parse time** (BA-facing): a new typed `formula::ParseError::UnsupportedCallShape`
+  carrying a literal repair, surfaced through the compiler's existing
+  `CompileError::Lint("parse {sheet}!{addr}: …")` wrapping, so the refusal names
+  the cell. The rendered messages are, verbatim:
+  - `` call to `VLOOKUP` has an unsupported shape: write VLOOKUP(key, table, col, FALSE) — the dialect supports EXACT match only ``
+  - `` call to `MATCH` has an unsupported shape: write MATCH(key, range, 0) — the dialect supports EXACT match only; Excel's default is approximate ``
+- **Eval time** (defense in depth): a typed `#VALUE!` from the evaluator.
+
+No workbook or fixture in this repository needed an edit — every
+`VLOOKUP`/`MATCH` call already authored the exact-match argument.
+
+### Added — four first-class workbook-dialect functions
+
+`ROUNDDOWN`, `MAX`, `MIN` and `XLOOKUP` join the constrained Excel dialect
+whitelist (13 names → 17), each with a real evaluator body, unit tests and
+proptest invariants:
+
+- `ROUNDDOWN` rounds toward zero, mirroring the existing `ROUNDUP` helper and
+  inheriting its bounded-`digits` guard.
+- `MAX`/`MIN` mirror `SUM`'s Excel scalar/range asymmetry exactly: a direct
+  scalar argument coerces, a range member that is text/bool/empty is ignored, an
+  error member propagates, and a range with no numeric member yields `0`.
+- `XLOOKUP` is accepted only in its narrow 3/4-argument EXACT form
+  (`XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])`).
+  `match_mode`/`search_mode` are refused, `return_array` must be single-column,
+  the arrays must be conformable, and a miss without `if_not_found` is `#N/A`.
+
+New runnable example: `cargo run -p pmcp-workbook-compiler --example dialect_widening_demo`.
+
+### Changed — workbook dialect version 1.0 → 1.1
+
+`SUPPORTED_DIALECT_VERSION` moves to `1.1`; `BASELINE_DIALECT_VERSION` stays at
+`1.0`, so every `1.0`-declaring and every undeclared workbook keeps compiling
+unchanged. The narrowing above rode a MINOR rather than a MAJOR bump
+deliberately; the reasoning is recorded in the published contract at
+`docs/workbook-dialect-spec.md` §7.6, not only here.
+
+### Release note — no `[package].version` was changed by this entry
+
+`pmcp-workbook-dialect` (0.1.1), `pmcp-workbook-runtime` (0.2.0) and
+`pmcp-workbook-compiler` (0.1.1) all still carry their previous versions. At
+release time these three need a **coordinated 0.x MINOR bump**: a `0.x` minor
+bump is semver-INCOMPATIBLE, so `pmcp-workbook-compiler`'s
+`pmcp-workbook-dialect = "0.1.0"` pin (`crates/pmcp-workbook-compiler/Cargo.toml:45`)
+must move in the SAME commit, under the move-as-one-set rule in `CLAUDE.md`
+item 13. Doing half of a coordinated set move is exactly the failure that rule
+exists to prevent.
+
 ## [2.20.0] - 2026-09-04
 
 ### Removed — the synthesized `skill://index.json` discovery resource (feature `skills`)

@@ -40,6 +40,26 @@
 //! | external-workbook ref `[B]S!A1` | NO        | `ParseError::ExternalRef`          |
 //! | array-formula braces `{…}`      | NO        | `ParseError::ArrayFormula`         |
 //! | nesting past `MAX_PARSE_DEPTH`  | NO        | `ParseError::TooDeep`              |
+//! | `VLOOKUP(k,t,c)` (no 4th arg)   | NO        | `ParseError::UnsupportedCallShape` |
+//! | `VLOOKUP(k,t,c,TRUE)` / `…,1)`  | NO        | `ParseError::UnsupportedCallShape` |
+//! | `MATCH(k,r)` (no match_type)    | NO        | `ParseError::UnsupportedCallShape` |
+//! | `MATCH(k,r,1)` / `MATCH(k,r,-1)`| NO        | `ParseError::UnsupportedCallShape` |
+//! | `XLOOKUP` w/ match/search_mode  | NO        | `ParseError::UnsupportedCallShape` |
+//! | `XLOOKUP` non-conformable arrays| NO        | `ParseError::UnsupportedCallShape` |
+//!
+//! # The call-shape gate (dialect 1.1, D-Q1 / D-Q4)
+//!
+//! A WHITELISTED name may still be called in a shape the dialect refuses. After
+//! the whitelist gate accepts the name and the argument list is collected,
+//! `validate_call_shape` runs BEFORE the node is built. The refusals it raises
+//! are dialect POLICY carrying a BA-actionable repair — distinct from
+//! [`ParseError::Malformed`], which is a structural failure.
+//!
+//! The lookup rules exist because Excel's DEFAULT for `VLOOKUP`'s
+//! `range_lookup` and `MATCH`'s `match_type` is APPROXIMATE. Before dialect 1.1
+//! a bare `MATCH(x, rng)` silently evaluated as EXACT and returned a wrong
+//! number with no signal; refusing it is the fix. The evaluator carries an
+//! independent `#VALUE!` backstop for the same conditions.
 //!
 //! A bare NAME not followed by `(` is `Expr::Name(n)` (resolved at the DAG
 //! layer) — DISTINCT from an out-of-whitelist function (it is NOT a parse
@@ -61,6 +81,7 @@
 //! never `.unwrap()`.
 
 use pmcp_workbook_dialect::WHITELIST;
+use pmcp_workbook_runtime::resolve::a1_to_zero_indexed_row_col;
 use pmcp_workbook_runtime::{BinOp, ExcelError, Expr, RangeRef, UnOp};
 use serde::Serialize;
 
@@ -93,6 +114,19 @@ pub enum ParseError {
     /// parens, a stray operator, a malformed argument list, trailing tokens, an
     /// unexpected end). Carries a short human description.
     Malformed(String),
+    /// A WHITELISTED function was called in a shape the dialect does not
+    /// support — an approximate or omitted lookup argument, or an `XLOOKUP`
+    /// `match_mode`/`search_mode` (D-Q1 / D-Q4, dialect 1.1).
+    ///
+    /// Deliberately NOT folded into [`ParseError::Malformed`]: this is a dialect
+    /// POLICY decision carrying a BA-actionable `repair`, not a structural parse
+    /// failure, and a caller must be able to tell the two apart.
+    UnsupportedCallShape {
+        /// The offending function name, as authored.
+        name: String,
+        /// The literal repair to write instead.
+        repair: String,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -111,6 +145,9 @@ impl std::fmt::Display for ParseError {
                 "formula nesting exceeds the {MAX_PARSE_DEPTH}-level bound"
             ),
             ParseError::Malformed(msg) => write!(f, "malformed formula: {msg}"),
+            ParseError::UnsupportedCallShape { name, repair } => {
+                write!(f, "call to `{name}` has an unsupported shape: {repair}")
+            },
         }
     }
 }
@@ -331,8 +368,137 @@ impl Parser {
             }
         }
 
+        // Call-shape gate (dialect 1.1): runs AFTER the whitelist gate and
+        // BEFORE the node is built, so a refused shape never reaches the IR.
+        validate_call_shape(&name, &args)?;
+
         Ok(Expr::Call { name, args })
     }
+}
+
+/// The dialect's per-function CALL-SHAPE gate (dialect 1.1): a whitelisted name
+/// may still be called in a shape the dialect refuses.
+///
+/// Kept a free function rather than inline arms in `parse_call`, and split into
+/// one small helper per function family, so neither this nor `parse_call` grows
+/// past the cognitive-complexity cap. A name with no shape rule is `Ok(())`.
+///
+/// Matching is case-insensitive, mirroring the whitelist gate's
+/// `eq_ignore_ascii_case`, so `vlookup(` reaches the same rule as `VLOOKUP(`.
+///
+/// # Errors
+/// [`ParseError::UnsupportedCallShape`] carrying the offending name and a
+/// literal, copy-pasteable repair.
+fn validate_call_shape(name: &str, args: &[Expr]) -> Result<(), ParseError> {
+    if name.eq_ignore_ascii_case("VLOOKUP") {
+        return validate_vlookup_shape(name, args);
+    }
+    if name.eq_ignore_ascii_case("MATCH") {
+        return validate_match_shape(name, args);
+    }
+    if name.eq_ignore_ascii_case("XLOOKUP") {
+        return validate_xlookup_shape(name, args);
+    }
+    Ok(())
+}
+
+/// Build the typed shape refusal for `name` with the given literal `repair`.
+fn shape_error(name: &str, repair: &str) -> ParseError {
+    ParseError::UnsupportedCallShape {
+        name: name.to_string(),
+        repair: repair.to_string(),
+    }
+}
+
+/// Is this argument the dialect's literal EXACT-match flag (`FALSE` or `0`)?
+fn is_exact_match_literal(arg: &Expr) -> bool {
+    match arg {
+        Expr::Bool(b) => !*b,
+        Expr::Number(n) => *n == 0.0,
+        _ => false,
+    }
+}
+
+/// `VLOOKUP(key, table, col, range_lookup)` — the 4th argument is REQUIRED and
+/// must be literally `FALSE` or `0` (D-Q1). Excel's default is APPROXIMATE, so
+/// an omitted argument is refused as firmly as an explicit `TRUE`.
+fn validate_vlookup_shape(name: &str, args: &[Expr]) -> Result<(), ParseError> {
+    if args.len() == 4 && is_exact_match_literal(&args[3]) {
+        return Ok(());
+    }
+    Err(shape_error(
+        name,
+        "write VLOOKUP(key, table, col, FALSE) — the dialect supports EXACT match only",
+    ))
+}
+
+/// `MATCH(key, range, match_type)` — the 3rd argument is REQUIRED and must be
+/// literally `0` (D-Q1). Excel's default `match_type` is `1` (APPROXIMATE).
+fn validate_match_shape(name: &str, args: &[Expr]) -> Result<(), ParseError> {
+    if args.len() == 3 && matches!(&args[2], Expr::Number(n) if *n == 0.0) {
+        return Ok(());
+    }
+    Err(shape_error(
+        name,
+        "write MATCH(key, range, 0) — the dialect supports EXACT match only; \
+         Excel's default is approximate",
+    ))
+}
+
+/// The one accepted `XLOOKUP` signature, quoted verbatim in every refusal.
+const XLOOKUP_SIGNATURE: &str = "XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])";
+
+/// `XLOOKUP` in its constrained 3/4-argument exact form (D-Q4).
+///
+/// Arity is always checkable. The array shape checks fire ONLY when both array
+/// arguments are literal [`Expr::Range`]s AND both resolve — a shape this gate
+/// cannot MEASURE is left to the evaluator's typed backstop rather than guessed
+/// at.
+fn validate_xlookup_shape(name: &str, args: &[Expr]) -> Result<(), ParseError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(shape_error(
+            name,
+            &format!(
+                "write {XLOOKUP_SIGNATURE} — match_mode and search_mode are not supported; \
+                 the dialect is exact-match only"
+            ),
+        ));
+    }
+    let (Expr::Range(lookup), Expr::Range(ret)) = (&args[1], &args[2]) else {
+        return Ok(());
+    };
+    let (Some((lookup_rows, lookup_cols)), Some((ret_rows, ret_cols))) =
+        (range_extent(lookup), range_extent(ret))
+    else {
+        return Ok(());
+    };
+    if ret_cols > 1 {
+        return Err(shape_error(
+            name,
+            &format!(
+                "return_array must be a SINGLE column — write {XLOOKUP_SIGNATURE} with a \
+                 one-column return_array"
+            ),
+        ));
+    }
+    if lookup_rows * u32::from(lookup_cols) != ret_rows * u32::from(ret_cols) {
+        return Err(shape_error(
+            name,
+            &format!(
+                "lookup_array and return_array must cover the SAME number of cells — \
+                 write {XLOOKUP_SIGNATURE} with conformable arrays"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The `(rows, cols)` extent of a literal A1 range, or `None` when either
+/// endpoint is not a resolvable A1 address (a shape the gate must not guess at).
+fn range_extent(range: &RangeRef) -> Option<(u32, u16)> {
+    let (r0, c0) = a1_to_zero_indexed_row_col(&range.start)?;
+    let (r1, c1) = a1_to_zero_indexed_row_col(&range.end)?;
+    Some((r1.abs_diff(r0) + 1, c1.abs_diff(c0) + 1))
 }
 
 /// Map a `#…` error lexeme to the shared [`ExcelError`]. An unrecognized error
@@ -647,5 +813,163 @@ mod tests {
     #[test]
     fn unbalanced_paren_is_malformed() {
         assert!(matches!(p("(A1+B1"), Err(ParseError::Malformed(_))));
+    }
+
+    // ---- Call-shape gate (dialect 1.1, D-Q1 / D-Q4) ----
+    //
+    // The dialect supports EXACT lookup only. Excel's DEFAULT for VLOOKUP's
+    // `range_lookup` and MATCH's `match_type` is APPROXIMATE, so an OMITTED
+    // argument is refused exactly as firmly as an explicit approximate one —
+    // assuming exact is the silently-wrong answer this gate exists to prevent.
+
+    /// The exact shapes the repo's own fixtures already author must keep parsing.
+    #[test]
+    fn authored_fixture_shapes_still_parse() {
+        for formula in [
+            "IFERROR(VLOOKUP(B2,D2:E4,2,FALSE),0.08)",
+            "IFERROR(INDEX(E2:E4,MATCH(B2,D2:D4,0)),0.08)",
+            "VLOOKUP(B2,D2:E4,2,0)",
+        ] {
+            assert!(
+                p(formula).is_ok(),
+                "authored fixture shape must still parse: {formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_new_functions_parse_clean() {
+        for formula in [
+            "ROUNDDOWN(A1,2)",
+            "MAX(A1:A9)",
+            "MIN(A1:A9,B1)",
+            "XLOOKUP(B2,D2:D4,E2:E4)",
+            "XLOOKUP(B2,D2:D4,E2:E4,0.08)",
+        ] {
+            assert!(
+                p(formula).is_ok(),
+                "dialect 1.1 shape must parse: {formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn vlookup_without_the_exact_match_argument_is_a_shape_error() {
+        let err = p("VLOOKUP(B2,D2:E4,2)").expect_err("a bare VLOOKUP must be refused");
+        assert!(
+            matches!(err, ParseError::UnsupportedCallShape { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vlookup_with_an_approximate_match_argument_is_a_shape_error() {
+        for formula in ["VLOOKUP(B2,D2:E4,2,TRUE)", "VLOOKUP(B2,D2:E4,2,1)"] {
+            let err = p(formula).expect_err("an approximate VLOOKUP must be refused");
+            assert!(
+                matches!(err, ParseError::UnsupportedCallShape { .. }),
+                "{formula} got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_without_the_match_type_argument_is_a_shape_error() {
+        // Excel's DEFAULT match_type is 1 (APPROXIMATE) — this is the form that
+        // silently returned a wrong number before dialect 1.1.
+        let err = p("MATCH(B2,D2:D4)").expect_err("a bare MATCH must be refused");
+        assert!(
+            matches!(err, ParseError::UnsupportedCallShape { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn match_with_an_approximate_match_type_is_a_shape_error() {
+        for formula in ["MATCH(B2,D2:D4,1)", "MATCH(B2,D2:D4,-1)"] {
+            let err = p(formula).expect_err("an approximate MATCH must be refused");
+            assert!(
+                matches!(err, ParseError::UnsupportedCallShape { .. }),
+                "{formula} got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xlookup_with_a_mode_argument_is_a_shape_error() {
+        for formula in [
+            "XLOOKUP(B2,D2:D4,E2:E4,0,0)",
+            "XLOOKUP(B2,D2:D4,E2:E4,0,0,1)",
+        ] {
+            let err = p(formula).expect_err("match_mode/search_mode must be refused");
+            assert!(
+                matches!(err, ParseError::UnsupportedCallShape { .. }),
+                "{formula} got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xlookup_statically_knowable_array_violations_are_shape_errors() {
+        // Both array arguments are literal ranges, so the widths and member
+        // counts are knowable WITHOUT evaluating anything.
+        let wide =
+            p("XLOOKUP(B2,D2:D4,E2:F4)").expect_err("a multi-column return_array must be refused");
+        assert!(
+            matches!(wide, ParseError::UnsupportedCallShape { .. }),
+            "got {wide:?}"
+        );
+
+        let ragged =
+            p("XLOOKUP(B2,D2:D4,E2:E9)").expect_err("non-conformable arrays must be refused");
+        assert!(
+            matches!(ragged, ParseError::UnsupportedCallShape { .. }),
+            "got {ragged:?}"
+        );
+    }
+
+    /// A shape the gate cannot MEASURE statically is not guessed at — it is left
+    /// to the evaluator's typed backstop. Never reject a form you could not
+    /// measure.
+    #[test]
+    fn xlookup_with_non_literal_arrays_is_not_statically_refused() {
+        assert!(
+            p("XLOOKUP(B2,named_keys,named_values)").is_ok(),
+            "a non-Range array argument must pass the static gate untouched"
+        );
+    }
+
+    /// MESSAGE QUALITY: each refusal's rendered Display must name the offending
+    /// function AND carry the literal repair a BA can act on. These strings are
+    /// the BA-facing contract, so they are asserted, not merely produced.
+    #[test]
+    fn shape_errors_render_a_named_actionable_repair() {
+        let vlookup = p("VLOOKUP(B2,D2:E4,2)").expect_err("refused").to_string();
+        assert!(vlookup.contains("VLOOKUP"), "{vlookup}");
+        assert!(vlookup.contains("FALSE"), "{vlookup}");
+
+        let match_err = p("MATCH(B2,D2:D4)").expect_err("refused").to_string();
+        assert!(match_err.contains("MATCH"), "{match_err}");
+        assert!(
+            match_err.contains("MATCH(key, range, 0)"),
+            "the repair must be literal and copy-pasteable: {match_err}"
+        );
+
+        let xlookup = p("XLOOKUP(B2,D2:D4,E2:E4,0,0)")
+            .expect_err("refused")
+            .to_string();
+        assert!(xlookup.contains("XLOOKUP"), "{xlookup}");
+        assert!(
+            xlookup.contains("XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])"),
+            "the accepted signature must be named: {xlookup}"
+        );
+    }
+
+    /// REGRESSION: the whitelist gate must still run FIRST, so an
+    /// out-of-whitelist name is an UnsupportedFunction and never a shape error.
+    #[test]
+    fn the_whitelist_gate_is_not_shadowed_by_the_shape_gate() {
+        let err = p("OFFSET(A1,1,1)").expect_err("OFFSET is out of whitelist");
+        assert_eq!(err, ParseError::UnsupportedFunction("OFFSET".to_string()));
     }
 }
