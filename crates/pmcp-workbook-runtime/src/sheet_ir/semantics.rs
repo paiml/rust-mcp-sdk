@@ -1,8 +1,8 @@
-//! The Excel-semantics layer: real bodies for all 13 whitelisted functions
+//! The Excel-semantics layer: real bodies for all 17 whitelisted functions
 //! over the range-capable [`EvalValue`] (D-09).
 //!
 //! [`apply`] dispatches on the [`crate::formula::Expr::Call`] `name` (D-02 keeps
-//! `name` a `String`) over the 13-name [`crate::dialect::rules::WHITELIST`] —
+//! `name` a `String`) over the 17-name [`crate::dialect::rules::WHITELIST`] —
 //! mirroring the small exhaustive `match` + early-return shape of
 //! `dialect::rules::candidate_role`. Each function owns the genuinely-Excel
 //! concerns (1-based indexing, empty-cell-as-0, error propagation, lookup); leaf
@@ -12,14 +12,15 @@
 //! Boundaries (D-04, finding #4):
 //! - `IFERROR`/`ISNUMBER` inspect the argument's [`CellValue`] DIRECTLY — never
 //!   routed through eval.
-//! - `SUM`/`SUMIF`/`VLOOKUP`/`INDEX`/`MATCH` consume [`EvalValue::Range`].
+//! - `SUM`/`SUMIF`/`VLOOKUP`/`INDEX`/`MATCH`/`MAX`/`MIN`/`XLOOKUP` consume
+//!   [`EvalValue::Range`].
 //! - Every index/lookup is 1-based and bounds-checked → an [`ExcelError`] (never
 //!   a panic, T-09-13).
 
 use crate::excel_error::ExcelError;
 
 use super::eval_value::EvalValue;
-use super::rounding::{excel_ceiling, excel_round, excel_roundup};
+use super::rounding::{excel_ceiling, excel_round, excel_rounddown, excel_roundup};
 use super::value::CellValue;
 
 /// Dispatch an Excel function call by `name` over its range-capable `args`.
@@ -38,7 +39,11 @@ pub fn apply(name: &str, args: &[EvalValue]) -> CellValue {
         "MATCH" => f_match(args),
         "ROUND" => f_round(args),
         "ROUNDUP" => f_roundup(args),
+        "ROUNDDOWN" => f_rounddown(args),
         "CEILING" => f_ceiling(args),
+        "MAX" => f_max(args),
+        "MIN" => f_min(args),
+        "XLOOKUP" => f_xlookup(args),
         "IFERROR" => f_iferror(args),
         "ISNUMBER" => f_isnumber(args),
         "SEARCH" => f_search(args),
@@ -121,7 +126,7 @@ fn values_equal(a: &CellValue, b: &CellValue) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The 13 whitelisted functions.
+// The 17 whitelisted functions.
 // ---------------------------------------------------------------------------
 
 /// `IF(condition, then, else)` — returns the `then`/`else` branch by truthiness.
@@ -167,6 +172,67 @@ fn f_sum(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
     Ok(CellValue::Number(total))
 }
 
+/// `MAX(value, …)` — the largest number across every scalar/range argument.
+///
+/// # The deliberate Excel scalar/range asymmetry (mirrors [`f_sum`])
+///
+/// A DIRECT scalar argument coerces through [`to_number`], so `MAX(1, TRUE)`
+/// sees `1` for the boolean and `MAX(1, "99")` sees `99` for the numeric text.
+/// A RANGE MEMBER of the same shape is IGNORED — Excel does not coerce text or
+/// booleans found inside a range. This is Excel's rule, not an oversight: do not
+/// "fix" it into uniformity.
+///
+/// An `Error` member propagates. A range with no numeric member yields `0`
+/// (Excel's answer), not an error.
+fn f_max(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    extremum(args, |candidate, current| candidate > current)
+}
+
+/// `MIN(value, …)` — the smallest number across every scalar/range argument.
+///
+/// Carries exactly the same scalar/range asymmetry, error propagation and
+/// no-numeric-member-is-zero rules as [`f_max`]; see its rustdoc.
+fn f_min(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    extremum(args, |candidate, current| candidate < current)
+}
+
+/// The single aggregate walk `MAX` and `MIN` share: `better(candidate, current)`
+/// decides which of the two survives, so the range traversal, the error
+/// propagation and the ignore-text-and-bool rule exist in exactly one place.
+fn extremum(args: &[EvalValue], better: fn(f64, f64) -> bool) -> Result<CellValue, ExcelError> {
+    let mut best: Option<f64> = None;
+    for a in args {
+        match a {
+            // A DIRECT scalar coerces (the documented Excel asymmetry).
+            EvalValue::Scalar(cv) => consider(&mut best, to_number(cv)?, better),
+            EvalValue::Range(rows) => {
+                for cv in flatten(rows) {
+                    match cv {
+                        CellValue::Error(e) => return Err(*e),
+                        CellValue::Number(n) => consider(&mut best, *n, better),
+                        // Range members that are text/bool/empty are ignored for
+                        // the extremum (Excel's range rule).
+                        CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_) => {},
+                    }
+                }
+            },
+        }
+    }
+    // No numeric member anywhere → Excel's 0, not an error.
+    Ok(CellValue::Number(best.unwrap_or(0.0)))
+}
+
+/// Fold one candidate into the running extremum.
+fn consider(best: &mut Option<f64>, candidate: f64, better: fn(f64, f64) -> bool) {
+    let replace = match best {
+        Some(current) => better(candidate, *current),
+        None => true,
+    };
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
 /// `SUMIF(criteria_range, criteria, [sum_range])` — sums `sum_range` (or
 /// `criteria_range` when omitted) where `criteria_range` matches `criteria`.
 fn f_sumif(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
@@ -189,10 +255,42 @@ fn f_sumif(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
     Ok(CellValue::Number(total))
 }
 
-/// `VLOOKUP(lookup_value, table_array, col_index, [range_lookup])` — EXACT match
-/// only (we require `FALSE`/0 for `range_lookup`; an approximate lookup is out of
-/// scope). Returns the matched row's `col_index` (1-based) value; `#N/A` on miss.
+/// Enforce the dialect's EXACT-match contract (D-Q1) for `VLOOKUP`/`MATCH`: the
+/// argument at index `i` must be PRESENT and literally `FALSE` or `0`.
+///
+/// A missing argument is refused as firmly as an approximate one, because
+/// Excel's DEFAULT for both `VLOOKUP`'s `range_lookup` and `MATCH`'s
+/// `match_type` is APPROXIMATE — treating an omitted argument as exact would be
+/// the silently-wrong answer this check exists to prevent.
+///
+/// This is the evaluator's defense-in-depth backstop; the BA-facing refusal is
+/// the compiler's parse-time `ParseError::UnsupportedCallShape`, which carries a
+/// located repair.
+///
+/// # Errors
+/// `ExcelError::Value` for a missing argument, a range, or any value other than
+/// `FALSE` / `0`.
+fn require_exact_match_flag(args: &[EvalValue], i: usize) -> Result<(), ExcelError> {
+    match args.get(i) {
+        Some(EvalValue::Scalar(CellValue::Bool(false))) => Ok(()),
+        Some(EvalValue::Scalar(CellValue::Number(n))) if *n == 0.0 => Ok(()),
+        _ => Err(ExcelError::Value),
+    }
+}
+
+/// `VLOOKUP(lookup_value, table_array, col_index, range_lookup)` — EXACT match
+/// only, and the contract is now **ENFORCED** (D-Q1, dialect 1.1): the
+/// `range_lookup` argument is REQUIRED and must be literally `FALSE` or `0`.
+/// A missing or approximate argument is `#VALUE!`, never a guessed exact match.
+///
+/// Until dialect 1.1 this rustdoc claimed the contract without checking it, so
+/// `VLOOKUP(x, tbl, 2)` — whose Excel default is APPROXIMATE — silently
+/// evaluated as EXACT and returned a wrong number with no signal. The repair a
+/// BA is given is: write `VLOOKUP(key, table, col, FALSE)`.
+///
+/// Returns the matched row's `col_index` (1-based) value; `#N/A` on miss.
 fn f_vlookup(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    require_exact_match_flag(args, 3)?;
     let lookup = arg_scalar(args, 0)?;
     let table = arg_range(args, 1)?;
     let col = to_number(arg_scalar(args, 2)?)?;
@@ -244,10 +342,20 @@ fn one_based_index(n: f64) -> Result<usize, ExcelError> {
     Ok(n as usize)
 }
 
-/// `MATCH(lookup_value, range, [match_type])` — EXACT match only (we honour
-/// `match_type == 0`); returns the 1-based position of `lookup_value` in the
-/// (single-row/column) `range`; `#N/A` on miss.
+/// `MATCH(lookup_value, range, match_type)` — EXACT match only, and the contract
+/// is now **ENFORCED** (D-Q1, dialect 1.1): the `match_type` argument is
+/// REQUIRED and must be literally `0`. A missing or approximate `match_type`
+/// (`1` / `-1`) is `#VALUE!`, never a guessed exact match.
+///
+/// Excel's DEFAULT `match_type` is `1` (APPROXIMATE), so a bare
+/// `MATCH(x, rng)` is precisely the form that was silently mis-evaluated as
+/// EXACT before dialect 1.1. The repair a BA is given is: write
+/// `MATCH(key, range, 0)`.
+///
+/// Returns the 1-based position of `lookup_value` in the (single-row/column)
+/// `range`; `#N/A` on miss.
 fn f_match(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    require_exact_match_flag(args, 2)?;
     let lookup = arg_scalar(args, 0)?;
     let range = arg_range(args, 1)?;
     for (i, cv) in flatten(range).enumerate() {
@@ -258,6 +366,50 @@ fn f_match(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
     Ok(CellValue::Error(ExcelError::Na))
 }
 
+/// `XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])` — the
+/// CONSTRAINED form (D-Q4): EXACT match only, single-column `return_array`,
+/// conformable arrays.
+///
+/// `match_mode` / `search_mode` are NOT supported: a 5th or 6th argument is
+/// `#VALUE!`, checked FIRST so the evaluator can never silently ignore a mode it
+/// was asked for. A spilling XLOOKUP is separately unrepresentable — [`apply`]
+/// returns a scalar `CellValue` — and is already refused by the linter's
+/// `formula/array` rule.
+///
+/// On a miss: `if_not_found` when supplied, otherwise Excel's `#N/A`.
+fn f_xlookup(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    // Refuse a mode argument BEFORE reading anything, so no partially-honoured
+    // call can produce a number.
+    if args.len() > 4 {
+        return Err(ExcelError::Value);
+    }
+    let lookup = arg_scalar(args, 0)?;
+    let lookup_array = arg_range(args, 1)?;
+    let return_array = arg_range(args, 2)?;
+    // A multi-column return_array would spill; the dialect is scalar-only.
+    if return_array.iter().any(|row| row.len() > 1) {
+        return Err(ExcelError::Value);
+    }
+    let keys: Vec<&CellValue> = flatten(lookup_array).collect();
+    let values: Vec<&CellValue> = flatten(return_array).collect();
+    // Non-conformable arrays would make the positional pairing meaningless.
+    if keys.len() != values.len() {
+        return Err(ExcelError::Value);
+    }
+    for (key, value) in keys.iter().zip(values.iter()) {
+        // Reuses `values_equal`, so XLOOKUP inherits VLOOKUP/MATCH's exact-match
+        // key rules verbatim.
+        if values_equal(key, lookup) {
+            return Ok((*value).clone());
+        }
+    }
+    Ok(match args.get(3) {
+        Some(EvalValue::Scalar(cv)) => cv.clone(),
+        Some(EvalValue::Range(_)) => CellValue::Error(ExcelError::Value),
+        None => CellValue::Error(ExcelError::Na),
+    })
+}
+
 /// `ROUND(number, digits)` — half away from zero (via [`excel_round`]).
 fn f_round(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
     round_like(args, excel_round)
@@ -266,6 +418,12 @@ fn f_round(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
 /// `ROUNDUP(number, digits)` — away from zero (via [`excel_roundup`]).
 fn f_roundup(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
     round_like(args, excel_roundup)
+}
+
+/// `ROUNDDOWN(number, digits)` — toward zero (via [`excel_rounddown`]). Shares
+/// `round_like`, so it inherits the WR-01 / CR-02 `digits` bound.
+fn f_rounddown(args: &[EvalValue]) -> Result<CellValue, ExcelError> {
+    round_like(args, excel_rounddown)
 }
 
 /// The inclusive `digits` magnitude Excel accepts for ROUND/ROUNDUP before it
@@ -725,5 +883,373 @@ mod tests {
             apply("OFFSET", &[num(1.0)]),
             CellValue::Error(ExcelError::Name)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ROUNDDOWN (dialect 1.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rounddown_delegates_to_rounding() {
+        assert_eq!(
+            apply("ROUNDDOWN", &[num(3.999), num(2.0)]),
+            CellValue::Number(3.99)
+        );
+        assert_eq!(
+            apply("ROUNDDOWN", &[num(-3.999), num(2.0)]),
+            CellValue::Number(-3.99)
+        );
+    }
+
+    #[test]
+    fn rounddown_inherits_the_round_like_digit_bounds() {
+        // A fractional `digits` is #VALUE!.
+        assert_eq!(
+            apply("ROUNDDOWN", &[num(3.5), num(1.5)]),
+            CellValue::Error(ExcelError::Value)
+        );
+        // WR-01 / CR-02: `|digits| > 307` must be #NUM! BEFORE the `as i32`
+        // cast — a saturating cast would make pow10 +inf and leak a non-finite
+        // CellValue::Number.
+        assert_eq!(
+            apply("ROUNDDOWN", &[num(1.5), num(1e20)]),
+            CellValue::Error(ExcelError::Num)
+        );
+        assert_eq!(
+            apply("ROUNDDOWN", &[num(1.5), num(-1e20)]),
+            CellValue::Error(ExcelError::Num)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAX / MIN (dialect 1.1) — the f_sum scalar/range asymmetry, pinned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_and_min_over_a_numeric_range() {
+        let r = col(&[
+            CellValue::Number(10.0),
+            CellValue::Number(-3.0),
+            CellValue::Number(5.0),
+        ]);
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&r)),
+            CellValue::Number(10.0)
+        );
+        assert_eq!(apply("MIN", &[r]), CellValue::Number(-3.0));
+    }
+
+    #[test]
+    fn max_and_min_ignore_text_bool_and_empty_range_members() {
+        let r = col(&[
+            CellValue::Text("99".into()),
+            CellValue::Bool(true),
+            CellValue::Empty,
+            CellValue::Number(4.0),
+            CellValue::Number(7.0),
+        ]);
+        // The numeric text "99" and the Bool are IGNORED for a RANGE member
+        // (Excel's range rule), so the extremum is over {4, 7} only.
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&r)),
+            CellValue::Number(7.0)
+        );
+        assert_eq!(apply("MIN", &[r]), CellValue::Number(4.0));
+    }
+
+    #[test]
+    fn max_and_min_propagate_an_error_member() {
+        let r = col(&[
+            CellValue::Number(1.0),
+            CellValue::Error(ExcelError::DivZero),
+        ]);
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&r)),
+            CellValue::Error(ExcelError::DivZero)
+        );
+        assert_eq!(apply("MIN", &[r]), CellValue::Error(ExcelError::DivZero));
+    }
+
+    #[test]
+    fn max_and_min_with_no_numeric_member_are_zero_not_an_error() {
+        // Excel returns 0 for MAX/MIN over a range with no numeric member.
+        let all_text = col(&[CellValue::Text("a".into()), CellValue::Text("b".into())]);
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&all_text)),
+            CellValue::Number(0.0)
+        );
+        assert_eq!(apply("MIN", &[all_text]), CellValue::Number(0.0));
+
+        let all_empty = col(&[CellValue::Empty, CellValue::Empty]);
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&all_empty)),
+            CellValue::Number(0.0)
+        );
+        assert_eq!(apply("MIN", &[all_empty]), CellValue::Number(0.0));
+
+        let empty_shaped = EvalValue::Range(vec![]);
+        assert_eq!(
+            apply("MAX", std::slice::from_ref(&empty_shaped)),
+            CellValue::Number(0.0)
+        );
+        assert_eq!(apply("MIN", &[empty_shaped]), CellValue::Number(0.0));
+    }
+
+    #[test]
+    fn max_and_min_coerce_direct_scalar_arguments() {
+        // The deliberate Excel asymmetry `f_sum` already encodes: a DIRECT
+        // scalar argument coerces through `to_number` (Bool(true) is 1, a
+        // numeric Text is its value) even though a RANGE member of the same
+        // shape is ignored. This is intentional — do not "fix" it.
+        assert_eq!(
+            apply("MAX", &[num(1.0), scalar(CellValue::Bool(true))]),
+            CellValue::Number(1.0)
+        );
+        assert_eq!(
+            apply("MAX", &[num(1.0), text("99")]),
+            CellValue::Number(99.0)
+        );
+        assert_eq!(
+            apply("MIN", &[num(1.0), text("-5")]),
+            CellValue::Number(-5.0)
+        );
+    }
+
+    #[test]
+    fn max_and_min_span_mixed_scalars_and_ranges() {
+        let r = col(&[CellValue::Number(4.0), CellValue::Number(7.0)]);
+        assert_eq!(
+            apply("MAX", &[r.clone(), num(12.0), num(-1.0)]),
+            CellValue::Number(12.0)
+        );
+        assert_eq!(
+            apply("MIN", &[r, num(12.0), num(-1.0)]),
+            CellValue::Number(-1.0)
+        );
+    }
+
+    #[test]
+    fn min_is_never_greater_than_max() {
+        let r = col(&[
+            CellValue::Number(3.0),
+            CellValue::Number(-8.0),
+            CellValue::Number(0.5),
+        ]);
+        let (max, min) = (apply("MAX", std::slice::from_ref(&r)), apply("MIN", &[r]));
+        match (max, min) {
+            (CellValue::Number(hi), CellValue::Number(lo)) => assert!(lo <= hi),
+            other => panic!("expected two Numbers, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XLOOKUP (dialect 1.1) — the constrained 3/4-arg exact form (D-Q4)
+    // -----------------------------------------------------------------------
+
+    fn xlookup_arrays() -> (EvalValue, EvalValue) {
+        let keys = col(&[
+            CellValue::Text("X".into()),
+            CellValue::Text("Y".into()),
+            CellValue::Text("Z".into()),
+        ]);
+        let values = col(&[
+            CellValue::Number(10.0),
+            CellValue::Number(20.0),
+            CellValue::Number(30.0),
+        ]);
+        (keys, values)
+    }
+
+    #[test]
+    fn xlookup_hit_returns_the_positional_counterpart() {
+        let (keys, values) = xlookup_arrays();
+        assert_eq!(
+            apply("XLOOKUP", &[text("Y"), keys, values]),
+            CellValue::Number(20.0)
+        );
+    }
+
+    #[test]
+    fn xlookup_miss_with_if_not_found_returns_it() {
+        let (keys, values) = xlookup_arrays();
+        assert_eq!(
+            apply("XLOOKUP", &[text("Q"), keys, values, num(0.08)]),
+            CellValue::Number(0.08)
+        );
+    }
+
+    #[test]
+    fn xlookup_miss_without_if_not_found_is_na() {
+        let (keys, values) = xlookup_arrays();
+        assert_eq!(
+            apply("XLOOKUP", &[text("Q"), keys, values]),
+            CellValue::Error(ExcelError::Na)
+        );
+    }
+
+    #[test]
+    fn xlookup_non_conformable_arrays_are_value_error() {
+        let (keys, _) = xlookup_arrays();
+        let short = col(&[CellValue::Number(10.0), CellValue::Number(20.0)]);
+        assert_eq!(
+            apply("XLOOKUP", &[text("X"), keys, short]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn xlookup_multi_column_return_array_is_value_error() {
+        let (keys, _) = xlookup_arrays();
+        let wide = EvalValue::Range(vec![
+            vec![CellValue::Number(10.0), CellValue::Number(11.0)],
+            vec![CellValue::Number(20.0), CellValue::Number(21.0)],
+            vec![CellValue::Number(30.0), CellValue::Number(31.0)],
+        ]);
+        assert_eq!(
+            apply("XLOOKUP", &[text("X"), keys, wide]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn xlookup_with_a_match_mode_argument_is_value_error() {
+        // The evaluator NEVER guesses a mode. The parse gate is the BA-facing
+        // refusal; this is the defense-in-depth backstop.
+        let (keys, values) = xlookup_arrays();
+        assert_eq!(
+            apply(
+                "XLOOKUP",
+                &[text("X"), keys.clone(), values.clone(), num(0.0), num(0.0)]
+            ),
+            CellValue::Error(ExcelError::Value)
+        );
+        assert_eq!(
+            apply(
+                "XLOOKUP",
+                &[text("X"), keys, values, num(0.0), num(0.0), num(1.0)]
+            ),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn xlookup_with_too_few_arguments_is_na() {
+        let (keys, _) = xlookup_arrays();
+        assert_eq!(
+            apply("XLOOKUP", &[text("X"), keys]),
+            CellValue::Error(ExcelError::Na)
+        );
+        assert_eq!(apply("XLOOKUP", &[]), CellValue::Error(ExcelError::Na));
+    }
+
+    // -----------------------------------------------------------------------
+    // The VLOOKUP / MATCH exact-match backstop (D-Q1) — the silently-wrong-answer fix
+    // -----------------------------------------------------------------------
+
+    fn lookup_table() -> EvalValue {
+        EvalValue::Range(vec![
+            vec![CellValue::Text("X".into()), CellValue::Number(100.0)],
+            vec![CellValue::Text("Y".into()), CellValue::Number(200.0)],
+        ])
+    }
+
+    #[test]
+    fn vlookup_without_the_exact_match_argument_is_refused() {
+        // Previously this evaluated as EXACT and returned 200 with no signal,
+        // even though Excel's default for an omitted `range_lookup` is
+        // APPROXIMATE. A silently wrong answer is worse than a refusal.
+        assert_eq!(
+            apply("VLOOKUP", &[text("Y"), lookup_table(), num(2.0)]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn vlookup_with_an_approximate_match_argument_is_refused() {
+        assert_eq!(
+            apply(
+                "VLOOKUP",
+                &[
+                    text("Y"),
+                    lookup_table(),
+                    num(2.0),
+                    scalar(CellValue::Bool(true))
+                ]
+            ),
+            CellValue::Error(ExcelError::Value)
+        );
+        assert_eq!(
+            apply("VLOOKUP", &[text("Y"), lookup_table(), num(2.0), num(1.0)]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn vlookup_accepts_both_exact_match_spellings() {
+        // `FALSE` and the numeric `0` are the two authored spellings.
+        assert_eq!(
+            apply(
+                "VLOOKUP",
+                &[
+                    text("Y"),
+                    lookup_table(),
+                    num(2.0),
+                    scalar(CellValue::Bool(false))
+                ]
+            ),
+            CellValue::Number(200.0)
+        );
+        assert_eq!(
+            apply("VLOOKUP", &[text("Y"), lookup_table(), num(2.0), num(0.0)]),
+            CellValue::Number(200.0)
+        );
+    }
+
+    #[test]
+    fn match_without_the_match_type_argument_is_refused() {
+        // Excel's DEFAULT match_type is 1 (APPROXIMATE) — this is the form that
+        // was silently mis-evaluated as EXACT.
+        let r = col(&[CellValue::Number(1.0), CellValue::Number(2.0)]);
+        assert_eq!(
+            apply("MATCH", &[num(2.0), r]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    #[test]
+    fn match_with_an_approximate_match_type_is_refused() {
+        let r = col(&[CellValue::Number(1.0), CellValue::Number(2.0)]);
+        assert_eq!(
+            apply("MATCH", &[num(2.0), r.clone(), num(1.0)]),
+            CellValue::Error(ExcelError::Value)
+        );
+        assert_eq!(
+            apply("MATCH", &[num(2.0), r, num(-1.0)]),
+            CellValue::Error(ExcelError::Value)
+        );
+    }
+
+    // PROPERTY tests for the aggregates (CLAUDE.md ALWAYS requirement).
+    proptest::proptest! {
+        #[test]
+        fn prop_max_and_min_bound_every_member(
+            members in proptest::collection::vec(-1e6f64..1e6f64, 1..24),
+        ) {
+            let range = EvalValue::Range(
+                members.iter().map(|n| vec![CellValue::Number(*n)]).collect(),
+            );
+            let max = apply("MAX", std::slice::from_ref(&range));
+            let min = apply("MIN", &[range]);
+            let (CellValue::Number(hi), CellValue::Number(lo)) = (max, min) else {
+                return Err(proptest::test_runner::TestCaseError::fail(
+                    "MAX/MIN over a numeric range must both be Numbers",
+                ));
+            };
+            for m in &members {
+                proptest::prop_assert!(*m <= hi, "MAX {hi} is below member {m}");
+                proptest::prop_assert!(*m >= lo, "MIN {lo} is above member {m}");
+            }
+            proptest::prop_assert!(lo <= hi, "MIN {lo} exceeds MAX {hi}");
+        }
     }
 }
