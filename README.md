@@ -1,9 +1,9 @@
 # PMCP - Pragmatic Model Context Protocol
 <!-- QUALITY BADGES START -->
-[![Quality Gate](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-gate.yml/badge.svg?branch=main)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-gate.yml)
-[![TDG Score](https://img.shields.io/badge/TDG%20Score-0.00-brightgreen)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
+[![Quality Gate](https://img.shields.io/badge/Quality%20Gate-passing-brightgreen)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
+[![TDG Score](https://img.shields.io/badge/TDG%20Score-0.000.00-red)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
 [![Complexity](https://img.shields.io/badge/Complexity-clean-brightgreen)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
-[![Technical Debt](https://img.shields.io/badge/Tech%20Debt-0h-brightgreen)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
+[![Technical Debt](https://img.shields.io/badge/Tech%20Debt-00h-brightgreen)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/quality-badges.yml)
 <!-- QUALITY BADGES END -->
 
 [![CI](https://github.com/paiml/rust-mcp-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/paiml/rust-mcp-sdk/actions/workflows/ci.yml)
