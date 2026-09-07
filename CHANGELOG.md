@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.20.1] - 2026-09-06
 
 ### Fixed — `VLOOKUP` / `MATCH` silently returned a wrong number (workbook dialect)
 
@@ -56,16 +56,41 @@ unchanged. The narrowing above rode a MINOR rather than a MAJOR bump
 deliberately; the reasoning is recorded in the published contract at
 `docs/workbook-dialect-spec.md` §7.6, not only here.
 
-### Release note — no `[package].version` was changed by this entry
+### Release note — three PATCH bumps, and why NOT the minor bump this entry first claimed
 
-`pmcp-workbook-dialect` (0.1.1), `pmcp-workbook-runtime` (0.2.0) and
-`pmcp-workbook-compiler` (0.1.1) all still carry their previous versions. At
-release time these three need a **coordinated 0.x MINOR bump**: a `0.x` minor
-bump is semver-INCOMPATIBLE, so `pmcp-workbook-compiler`'s
-`pmcp-workbook-dialect = "0.1.0"` pin (`crates/pmcp-workbook-compiler/Cargo.toml:45`)
-must move in the SAME commit, under the move-as-one-set rule in `CLAUDE.md`
-item 13. Doing half of a coordinated set move is exactly the failure that rule
-exists to prevent.
+`pmcp-workbook-runtime` 0.2.0 → **0.2.1**, `pmcp-workbook-dialect` 0.1.1 →
+**0.1.2**, `pmcp-workbook-compiler` 0.1.1 → **0.1.2**.
+
+An earlier draft of this entry called for a *coordinated 0.x MINOR bump* on the
+grounds that a `0.x` minor is semver-incompatible and would drag
+`pmcp-workbook-compiler`'s `pmcp-workbook-dialect = "0.1.0"` pin
+(`crates/pmcp-workbook-compiler/Cargo.toml:45`) under CLAUDE.md item 13's
+move-as-one-set rule. **That was an axis error, and it was measured rather than
+argued away.** `cargo semver-checks check-release` against each crate's
+published crates.io baseline reports `no semver update required` for all three
+(196 checks pass, 0 fail, per crate). The new
+`formula::ParseError::UnsupportedCallShape` variant is free because `ParseError`
+is `#[non_exhaustive]`; everything else added is a new item or a `const` *value*
+change, neither of which is an API break.
+
+So the correct axis is PATCH, and CLAUDE.md's **caret exception** applies: `^0.2.0`
+already admits `0.2.1` and `^0.1.0` already admits `0.1.2`, so **no pin moves and
+no downstream crate is bumped** — not `pmcp-workbook-compiler`'s two pins, not
+`pmcp-server-toolkit`'s, not `cargo-pmcp`'s. Taking the minor axis would have
+cascaded a bug fix through the whole toolkit tree for no API reason.
+
+The BEHAVIOURAL narrowing (`VLOOKUP`/`MATCH` now refuse what they previously
+mis-evaluated) is signalled on the axis that actually governs it for workbook
+authors: the **dialect** version, 1.0 → 1.1, with the rationale published in
+`docs/workbook-dialect-spec.md` §7.6. Crate semver covers the Rust API; the
+dialect version covers the workbook contract. Refusing input that previously
+produced a *wrong answer* is a fix, not a capability withdrawal.
+
+The root `pmcp` crate is **not** bumped — no `pmcp` source changed, and bumping it
+would drag `cargo-pmcp`'s template drift-guard constants
+(`PMCP_VERSION` / `PMCP_VERSION_REQ`) with it for no reason. The `v2.20.1` tag is
+the release marker; `pmcp` 2.20.0 is already on crates.io and its publish step
+skips gracefully.
 
 ## [2.20.0] - 2026-09-04
 
