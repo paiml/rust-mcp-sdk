@@ -1,10 +1,10 @@
 ---
 schema_version: 1
-open_count: 53
+open_count: 57
 waived_count: 0
 fixed_count: 9
-total_count: 62
-last_updated: 2026-09-02T07:59:41.332Z
+total_count: 66
+last_updated: 2026-09-04T20:49:19.150Z
 ---
 
 # Broken Windows Ledger
@@ -77,6 +77,10 @@ last_updated: 2026-09-02T07:59:41.332Z
 | 60 | 125 | stub | src/server/skills.rs |  | Skills::entries() returns Result with no Err path; validation arrives in 125-03 | open |  | 2026-09-02T05:53:25.978Z |  |
 | 61 | 125 | stub | src/server/skills.rs |  | Frontmatter-less/malformed skills excluded with only a debug! breadcrumb; D-02 build-time warning is 125-03's | open |  | 2026-09-02T05:53:26.065Z |  |
 | 62 | 125 | unrun-verify | pmcp-book/src/ch12-8-skills.md |  | make book-test exits 2 (26 chapters, mdbook not linking the pmcp rlib) — MEASURED identical at HEAD baseline; pre-existing, out of scope for 125-04 | open |  | 2026-09-02T07:59:41.332Z |  |
+| 63 | 125 | deviation | .github/workflows/fuzz.yml |  | fuzz_skill_entry is in fuzz.yml's fuzz job matrix but NOT in the hardcoded target lists of the fuzz-coverage and fuzz-24h jobs; those two still enumerate only the original four targets | open |  | 2026-09-02T08:56:20.314Z |  |
+| 64 | 125 | unrun-verify | Makefile |  | make book-test remains RED repo-wide (26 chapters, mdbook not linking the pmcp rlib); measured identical to HEAD baseline by 125-04 and deliberately not chained into quality-gate | open |  | 2026-09-02T08:56:20.392Z |  |
+| 65 | 126 | unrun-verify | Makefile |  | Three doctest legs (workflow::sequential, skill_prepend, and the skills selector's blind spot) are reachable by no make leg; 126-07 ran them by hand | open |  | 2026-09-04T20:49:19.059Z |  |
+| 66 | 126 | deviation | src/server/builder.rs | 1501 | Phase 125 WR-03 still open: finalize_skills_resources panics inside a Result-returning build(); phase 126 neither fixes nor worsens it | open |  | 2026-09-04T20:49:19.150Z |  |
 
 ````json
 [
@@ -822,6 +826,54 @@ last_updated: 2026-09-02T07:59:41.332Z
     "status": "open",
     "reason": "",
     "recorded_at": "2026-09-02T07:59:41.332Z",
+    "resolved_at": null
+  },
+  {
+    "id": 63,
+    "kind": "deviation",
+    "phase": "125",
+    "file": ".github/workflows/fuzz.yml",
+    "line": null,
+    "description": "fuzz_skill_entry is in fuzz.yml's fuzz job matrix but NOT in the hardcoded target lists of the fuzz-coverage and fuzz-24h jobs; those two still enumerate only the original four targets",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T08:56:20.314Z",
+    "resolved_at": null
+  },
+  {
+    "id": 64,
+    "kind": "unrun-verify",
+    "phase": "125",
+    "file": "Makefile",
+    "line": null,
+    "description": "make book-test remains RED repo-wide (26 chapters, mdbook not linking the pmcp rlib); measured identical to HEAD baseline by 125-04 and deliberately not chained into quality-gate",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-02T08:56:20.392Z",
+    "resolved_at": null
+  },
+  {
+    "id": 65,
+    "kind": "unrun-verify",
+    "phase": "126",
+    "file": "Makefile",
+    "line": null,
+    "description": "Three doctest legs (workflow::sequential, skill_prepend, and the skills selector's blind spot) are reachable by no make leg; 126-07 ran them by hand",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-04T20:49:19.059Z",
+    "resolved_at": null
+  },
+  {
+    "id": 66,
+    "kind": "deviation",
+    "phase": "126",
+    "file": "src/server/builder.rs",
+    "line": 1501,
+    "description": "Phase 125 WR-03 still open: finalize_skills_resources panics inside a Result-returning build(); phase 126 neither fixes nor worsens it",
+    "status": "open",
+    "reason": "",
+    "recorded_at": "2026-09-04T20:49:19.150Z",
     "resolved_at": null
   }
 ]

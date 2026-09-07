@@ -1,0 +1,1 @@
+Permission allow rule (.claude/settings.local.json): Bash(/usr/bin/sed 's/.*--> //') has a wildcard before the rest of the command, so it also matches any options inserted at that position and approves them without a prompt. Replace that * with the exact value you mean, or only use * after the subcommand.

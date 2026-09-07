@@ -1,0 +1,24 @@
+[package]
+name = "spike-010-agent-instructions-from-skills"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deps beyond baseline:
+# - pmcp-agent: the crate under test (agent loop consuming skills as instructions).
+# - sha2: digest verification of the fetched SKILL.md against the pack-time pin —
+#   the SEP-2640 "content-bound approval" realized in the AgentPackage model.
+[workspace]
+
+[dependencies]
+pmcp = { path = "../../..", default-features = false, features = ["skills"] }
+pmcp-agent = { path = "../../../crates/pmcp-agent" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "spike-010"
+path = "src/main.rs"
