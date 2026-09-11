@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.2] - 2026-09-11
+
+### Fixed — Excel for Mac workbook provenance and builder dependency freshness
+
+The workbook compiler now recognizes the exact OOXML application identity
+`Microsoft Macintosh Excel` as a genuine Excel save when the existing positive
+`AppVersion` and `calcId` checks also pass. Matching remains fail-closed and is
+now exact for both supported identities, so prefix spoofs such as
+`Microsoft Excelerator` are rejected.
+
+The formula front-end now normalizes Excel's persisted `_xlfn.` future-function
+prefix before the parser's whitelist check and resolves documented
+`Table[Column]` references to sheet-qualified Table-body ranges. This closes the
+gap where a formula passed the dialect linter but failed later while building
+the IR. Formatting-only blank input cells retained by Excel below a resized
+Table are also ignored after the real Table/named-range declaration paths run;
+named blank inputs and populated unnamed inputs remain subject to the existing
+fail-closed rules.
+
+`pmcp-workbook-compiler` 0.1.2 → **0.1.3** and `cargo-pmcp` 0.24.1 →
+**0.24.2**. The CLI's compiler requirement now starts at 0.1.3 so a locked CLI
+installation cannot silently retain the pre-fix workbook compiler.
+
 ## [2.20.1] - 2026-09-06
 
 ### Fixed — `VLOOKUP` / `MATCH` silently returned a wrong number (workbook dialect)

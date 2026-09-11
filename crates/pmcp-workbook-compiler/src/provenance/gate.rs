@@ -16,9 +16,10 @@
 //! an ad-hoc check. Classification reads ORIGINAL bytes (`docProps/app.xml`
 //! `<Application>`/`<AppVersion>` + `calcPr@calcId`):
 //!
-//! - [`ProvenanceClass::ExcelTrusted`] — anchored `<Application>` starts_with
-//!   "Microsoft Excel" AND a POSITIVE Excel marker is present (an `<AppVersion>`
-//!   build string AND a calcId that is NOT the umya sentinel) → ACCEPT.
+//! - [`ProvenanceClass::ExcelTrusted`] — `<Application>` exactly matches a known
+//!   Microsoft Excel identity (Windows or Mac) AND a POSITIVE Excel marker is
+//!   present (an `<AppVersion>` build string AND a calcId that is NOT the umya
+//!   sentinel) → ACCEPT.
 //! - [`ProvenanceClass::UmyaFabricated`] — `<Application>` says "Microsoft Excel"
 //!   but the umya fabrication signal is present (calcId == [`UMYA_SENTINEL_CALC_ID`]
 //!   AND/OR the `<AppVersion>` build string is ABSENT) → REFUSE
@@ -32,10 +33,11 @@
 //!
 //! # False-positive policy
 //!
-//! The ONLY path to [`ProvenanceClass::ExcelTrusted`] requires BOTH the anchored
-//! name AND a positive Excel marker (an `<AppVersion>` build string). A real
-//! Excel file always carries an `<AppVersion>` build string, so genuine Excel
-//! saves are not refused. If a real Excel file is ever observed with a sentinel
+//! The ONLY path to [`ProvenanceClass::ExcelTrusted`] requires BOTH a recognized
+//! exact application identity AND a positive Excel marker (an `<AppVersion>`
+//! build string). A real Excel file always carries an `<AppVersion>` build
+//! string, so genuine Excel saves are not refused. If a real Excel file is ever
+//! observed with a sentinel
 //! calcId, the positive-AppVersion marker still admits it — the sentinel calcId
 //! ALONE never refuses; it only contributes to UmyaFabricated when paired with
 //! an absent AppVersion, OR is overridden by a present AppVersion. (umya writes
@@ -60,6 +62,11 @@ use super::{OracleCorpus, OracleProvenance, ProvenanceError, RegionHashes};
 /// `<calcPr calcId="122211"/>` on every write, so a workbook carrying this
 /// calcId AND no Excel `<AppVersion>` build string is umya-fabricated (WBCO-07).
 pub(crate) const UMYA_SENTINEL_CALC_ID: u32 = 122211;
+
+/// Exact OOXML `<Application>` identities emitted by supported Microsoft Excel
+/// desktop applications. Exact matching is deliberate: prefix matching would
+/// admit spoofed values such as `Microsoft Excelerator`.
+const MICROSOFT_EXCEL_APPLICATIONS: &[&str] = &["Microsoft Excel", "Microsoft Macintosh Excel"];
 
 /// The genuine-STALENESS freshness rules a `#[cfg(test)]` trusted-fixture override
 /// may demote from `Error` to `Warning` (so a committed fixture written by a
@@ -91,8 +98,9 @@ const SOFTENABLE_FRESHNESS_RULES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProvenanceClass {
-    /// Anchored "Microsoft Excel" name AND a positive Excel marker (`<AppVersion>`
-    /// build string AND a non-sentinel calcId) — the ONLY accept class.
+    /// A recognized exact Microsoft Excel application identity AND a positive
+    /// Excel marker (`<AppVersion>` build string AND a non-sentinel calcId) —
+    /// the ONLY accept class.
     ExcelTrusted,
     /// `<Application>` is not "Microsoft Excel" → REFUSE.
     NonExcel,
@@ -120,15 +128,14 @@ pub(crate) fn classify(
         // app.xml absent or `<Application>` empty → fail closed.
         return ProvenanceClass::UnknownStale;
     };
-    // Anchored identity (NOT a spoofable `.contains`): the trimmed string must
-    // START with "Microsoft Excel" ("Not Microsoft Excel"/"FauxMicrosoft
-    // Excelerator" do not pass).
-    let anchored_excel = app.trim_start().starts_with("Microsoft Excel");
-    if !anchored_excel {
+    // Exact known identity, after insignificant surrounding whitespace. Do not
+    // use contains/starts_with: either would admit a spoofed application name.
+    let recognized_excel = MICROSOFT_EXCEL_APPLICATIONS.contains(&app.trim());
+    if !recognized_excel {
         return ProvenanceClass::NonExcel;
     }
 
-    // Anchored Excel NAME present — now require a POSITIVE Excel marker to admit.
+    // Recognized Excel NAME present — now require a POSITIVE Excel marker to admit.
     // A genuine Excel save always carries an `<AppVersion>` build string; umya
     // writes NONE (and stamps the sentinel calcId).
     let has_app_version = app_version.is_some_and(|v| !v.trim().is_empty());
@@ -147,8 +154,8 @@ pub(crate) fn classify(
         // alone).
         ProvenanceClass::ExcelTrusted
     } else {
-        // Anchored "Microsoft Excel" name but NO positive Excel marker (absent
-        // AppVersion), with/without the sentinel calcId → umya-fabricated.
+        // Recognized Excel name but NO positive Excel marker (absent AppVersion),
+        // with/without the sentinel calcId → umya-fabricated.
         ProvenanceClass::UmyaFabricated
     }
 }
@@ -526,8 +533,9 @@ fn push_identity_finding(
              genuine Excel save — its cached values were not Excel-computed"
         ),
         ProvenanceClass::NonExcel => format!(
-            "the workbook was last saved by {app_name}, not Microsoft Excel — \
-             its cached values were not Excel-computed"
+            "the workbook was last saved by {app_name}, not a recognized \
+             Microsoft Excel application — its cached values were not \
+             Excel-computed"
         ),
         ProvenanceClass::UnknownStale => {
             "the workbook's authoring application could not be determined — \
@@ -542,8 +550,9 @@ fn push_identity_finding(
         sheet.to_string(),
         None,
         reason,
-        "Re-save the workbook from Microsoft Excel (a genuine Excel save \
-         carries an Excel AppVersion build string and a real calcId).",
+        "Re-save the workbook from Microsoft Excel for Windows or Mac (a \
+         genuine Excel save carries an Excel AppVersion build string and a \
+         real calcId).",
     ));
 }
 
@@ -591,6 +600,7 @@ mod tests {
     use crate::ingest::{CellRecord, FormulaKind, SheetRecord};
     use crate::provenance::raw_parts::zip_with;
     use crate::{CellRole, Dtype, Role};
+    use proptest::prelude::*;
 
     const WORKBOOK_PART: &str = "xl/workbook.xml";
     const APP_PART: &str = "docProps/app.xml";
@@ -696,6 +706,19 @@ mod tests {
     }
 
     #[test]
+    fn classify_excel_for_mac_trusted() {
+        // Excel for Mac writes this exact OOXML Application identity. It is a
+        // genuine Excel save and must be admitted by the same positive-marker
+        // checks as Excel for Windows.
+        let c = classify(
+            Some("Microsoft Macintosh Excel"),
+            Some("16.0300"),
+            Some(191029),
+        );
+        assert_eq!(c, ProvenanceClass::ExcelTrusted);
+    }
+
+    #[test]
     fn classify_umya_fabricated() {
         // umya fingerprint: anchored name, NO AppVersion, sentinel calcId.
         let c = classify(Some("Microsoft Excel"), None, Some(UMYA_SENTINEL_CALC_ID));
@@ -735,6 +758,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_rejects_excel_prefix_spoofs() {
+        for spoofed in ["Microsoft Excelerator", "Microsoft Macintosh Excelerator"] {
+            assert_eq!(
+                classify(Some(spoofed), Some("16.0"), Some(1)),
+                ProvenanceClass::NonExcel,
+                "a known application-name prefix is not sufficient: {spoofed}"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn classify_rejects_arbitrary_suffix_spoofs(
+            suffix in "[A-Za-z0-9_-]{1,32}"
+        ) {
+            for known in MICROSOFT_EXCEL_APPLICATIONS {
+                let spoofed = format!("{known}{suffix}");
+                prop_assert_eq!(
+                    classify(Some(&spoofed), Some("16.0"), Some(1)),
+                    ProvenanceClass::NonExcel
+                );
+            }
+        }
+    }
+
     // --- gate() behavior tests (the seven plan-required behaviors) ---
 
     #[test]
@@ -748,6 +797,18 @@ mod tests {
         assert_eq!(prov.class, ProvenanceClass::ExcelTrusted);
         let corpus = result.expect("a trusted, fresh Excel workbook is accepted");
         assert_eq!(corpus.cells.get("S!A1").map(String::as_str), Some("10"));
+    }
+
+    #[test]
+    fn classify_excel_for_mac_is_accepted() {
+        // Regression: production workbooks saved by Excel for Mac identify as
+        // "Microsoft Macintosh Excel", not "Microsoft Excel".
+        let wb = r#"<?xml version="1.0"?><workbook><calcPr calcMode="auto" calcId="191029"/></workbook>"#;
+        let app = r#"<?xml version="1.0"?><Properties><Application>Microsoft Macintosh Excel</Application><AppVersion>16.0300</AppVersion></Properties>"#;
+        let bytes = xlsx(wb, app);
+        let (prov, result) = gate(&bytes, &clean_map(), &manifest());
+        assert_eq!(prov.class, ProvenanceClass::ExcelTrusted);
+        result.expect("a trusted, fresh Excel for Mac workbook is accepted");
     }
 
     #[test]

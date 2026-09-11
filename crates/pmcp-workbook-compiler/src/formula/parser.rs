@@ -36,6 +36,7 @@
 //! | boolean `TRUE` / `FALSE`        | yes       | —                                  |
 //! | error value `#REF!`/`#DIV/0!`   | yes       | — (parsed to `Expr::ErrorLit`)     |
 //! | whitelisted call (e.g. `ROUND`) | yes       | —                                  |
+//! | Excel future prefix `_xlfn.F(`  | yes       | normalized to `F`                  |
 //! | out-of-whitelist call `OFFSET`  | NO        | `ParseError::UnsupportedFunction`  |
 //! | external-workbook ref `[B]S!A1` | NO        | `ParseError::ExternalRef`          |
 //! | array-formula braces `{…}`      | NO        | `ParseError::ArrayFormula`         |
@@ -341,6 +342,11 @@ impl Parser {
     /// [`ParseError::UnsupportedFunction`] — the node is NEVER built for a
     /// rejected function.
     fn parse_call(&mut self, name: String, depth: usize) -> Result<Expr, ParseError> {
+        // Excel persists newer worksheet functions with the compatibility
+        // prefix `_xlfn.` in OOXML. The linter already normalizes it; the parser
+        // must do the same so a formula cannot pass lint and then fail IR build.
+        let name = normalize_future_function_name(name);
+
         // Whitelist-at-parse-time: reject BEFORE building the node. An
         // out-of-whitelist function never reaches the IR.
         if !WHITELIST.iter().any(|w| w.eq_ignore_ascii_case(&name)) {
@@ -373,6 +379,21 @@ impl Parser {
         validate_call_shape(&name, &args)?;
 
         Ok(Expr::Call { name, args })
+    }
+}
+
+/// Remove Excel's OOXML future-function compatibility prefix from a function
+/// name, case-insensitively. Only a leading, dot-terminated `_xlfn.` is removed;
+/// lookalikes remain subject to the normal whitelist rejection.
+fn normalize_future_function_name(name: String) -> String {
+    const PREFIX: &str = "_xlfn.";
+    if name
+        .get(..PREFIX.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(PREFIX))
+    {
+        name[PREFIX.len()..].to_string()
+    } else {
+        name
     }
 }
 
@@ -851,6 +872,23 @@ mod tests {
                 "dialect 1.1 shape must parse: {formula}"
             );
         }
+    }
+
+    #[test]
+    fn excel_future_function_prefix_is_normalized_before_whitelist_check() {
+        let expr = p("_xlfn.XLOOKUP(B2,D2:D4,E2:E4)").expect("Excel OOXML prefix parses");
+        assert!(matches!(expr, Expr::Call { name, .. } if name == "XLOOKUP"));
+
+        let mixed_case = p("_XlFn.ROUNDDOWN(A1,0)").expect("prefix match is case-insensitive");
+        assert!(matches!(mixed_case, Expr::Call { name, .. } if name == "ROUNDDOWN"));
+    }
+
+    #[test]
+    fn future_function_prefix_lookalike_remains_rejected() {
+        assert!(matches!(
+            p("_xlfnXLOOKUP(B2,D2:D4,E2:E4)"),
+            Err(ParseError::UnsupportedFunction(_))
+        ));
     }
 
     #[test]

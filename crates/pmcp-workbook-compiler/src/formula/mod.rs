@@ -17,6 +17,8 @@
 pub mod parser;
 /// Per-cell row-offset rebasing for a loop / row-block template.
 pub mod rebase;
+/// Excel Table structured-reference expansion into the runtime's A1-range IR.
+pub(crate) mod structured_ref;
 /// The Excel-formula tokenizer.
 pub mod token;
 
@@ -27,3 +29,9 @@ pub use pmcp_workbook_runtime::{BinOp, Expr, UnOp};
 pub use parser::{parse, ParseError, MAX_PARSE_DEPTH};
 pub use rebase::{rebase, BlockRange};
 pub use token::{tokenize, LexError, Token, MAX_FORMULA_LEN};
+
+/// Fuzz-only totality hook for Excel Table structured-reference expansion.
+#[cfg(fuzzing)]
+pub fn fuzz_expand_structured_references(formula: &str) {
+    structured_ref::fuzz_expand_structured_references(formula);
+}
