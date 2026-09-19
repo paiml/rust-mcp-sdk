@@ -1010,34 +1010,119 @@ lint-skills:
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- $(CLIPPY_POLICY)
 	@echo "$(GREEN)✓ No lint issues in the skills module$(NC)"
 
-# The environment every `test-skills` selector runs under. `RUSTFLAGS=` is
-# EMPTY on purpose — the file-level `-D warnings` must not reach these builds.
-SKILLS_TEST_ENV := RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE)
+# The environment every guarded test leg runs under — `test-skills` and
+# `test-oauth` both use it. `RUSTFLAGS=` is EMPTY on purpose: the file-level
+# `-D warnings` must not reach these builds, which `make lint` never compiled
+# (it pins `--features full`) and which therefore carry unreviewed warning debt
+# unrelated to any change under test. Lint policy stays `make lint`'s job.
+#
+# Shared rather than copied per leg: the two were character-identical, with the
+# second carrying a comment whose only content was "for the same reason the
+# first one does". One definition makes that coupling structural.
+GUARDED_TEST_ENV := RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE)
 
 .PHONY: test-skills
 test-skills:
 	@echo "$(BLUE)Running the skills module's tests (features: $(SKILLS_FEATURES))...$(NC)"
-	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
 		"selector 1 (--lib skills)" \
 		"src/lib.rs" \
 		"The entire in-module unit + proptest body is dark; a missing feature gate on '$(SKILLS_FEATURES)' is the likely cause." \
 		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --lib skills -- --test-threads=1
-	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
 		"selector 2 (--doc skills)" \
 		"Doc-tests pmcp" \
 		"The entries() doctest and the module-header mirror that pmcp-book copies byte for byte are unchecked." \
 		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --doc skills -- --test-threads=1
-	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
 		"selector 3 (--test skills_integration)" \
 		"tests/skills_integration.rs" \
 		"The resource-surface and byte-identity suite is dark; an emptied #![cfg] header is the classic cause." \
 		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_integration -- --test-threads=1
-	@$(SKILLS_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
 		"selector 4 (--test skills_routing)" \
 		"tests/skills_routing.rs" \
 		"Every wire proof, tripwire and routing guarantee is dark; an emptied #![cfg] header is the classic cause." \
 		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_routing -- --test-threads=1
 	@echo "$(GREEN)✓ skills module tests passed across all four selectors$(NC)"
+
+# Issue #368 — RUN the oauth-gated test files, which `--features "full"` cannot
+# reach.
+#
+# What it reaches that no other leg does: `oauth` is NOT a member of `full`
+# (`Cargo.toml:280` lists `full`, `:322` defines `oauth`), and every gate leg
+# pins `--features "full"` — `make test` (nextest), `test-unit`,
+# `test-integration` and `make lint`. Seven test files carry a file-level
+# `#![cfg(feature = "oauth")]`, so under the gate each compiles to an EMPTY
+# binary that prints `running 0 tests` and exits 0.
+#
+# Measured 2026-09-18 with `cargo test --test 'oauth_*'`:
+#   --features full,oauth  ->  13 binaries, 291 tests, 291 passed, 0 failed
+#   --features full        ->            167 tests
+# i.e. exactly 124 tests across these SEVEN binaries were dark:
+#   oauth_credential_file 29, oauth_dcr_integration 24, oauth_iss_integration 13,
+#   oauth_issuer_precedence 7, oauth_refresh 21, oauth_state_csrf 12,
+#   oauth_store_wiring 18.
+#
+# NOT redundant coverage. The other six `oauth_*` files — `oauth_application_type`
+# 14, `oauth_credential_store` 54, `oauth_discovery_urls` 38,
+# `oauth_discovery_validation` 19, `oauth_iss_validation` 27,
+# `oauth_provider_discovery` 15 — gate at a finer granularity than the file level
+# and ALREADY run under `full`. They are deliberately absent from the list below,
+# so this leg is the 124-test delta and nothing more. Do not "complete" the list
+# by adding them.
+#
+# Why it exists: `tests/oauth_issuer_precedence.rs` is the RFC 8414 §3.3
+# issuer-identity fence, and its own header states that if it ever goes
+# green-by-omission the fix has regressed into a security hole. It was
+# green-by-omission in the gate from the day it was written. Measured both ways
+# on that one file: `--features full` -> `running 0 tests`, exit 0;
+# `--features full,oauth` -> 7 passed.
+#
+# Native-only ON PURPOSE: `oauth` pulls `dep:webbrowser`/`dep:dirs`/`dep:rand`,
+# none of which build for wasm32.
+#
+# Do NOT "simplify" this by adding `oauth` to `full`. Two real blockers, neither
+# of which is the wasm32 fence — an earlier revision of this comment claimed the
+# fence was the reason, and that is measurably wrong: `wasm-build` is
+# `--no-default-features --features wasm` (see the target above), so `full`
+# never reaches the wasm32 build at all and would be unaffected. The actual
+# blockers are:
+#
+#   1. `tests/v1_severability_tripwire.rs:141` asserts `full` minus `full-v2` is
+#      EXACTLY `{v1-compat}`, in both directions, so `oauth` would have to be
+#      added to both feature sets or that tripwire goes red.
+#   2. `full` is published API. Downstream consumers who enable it would start
+#      pulling three new native-only dependencies, which is a breaking change
+#      for any wasm32 or minimal-dependency consumer.
+#
+# The nonzero-count assertion is the load-bearing part. A cargo selector that
+# matches zero tests EXITS 0, so without the guard this leg could itself go green
+# over nothing — the exact failure it exists to prevent. `guarded-cargo-test.sh`
+# refuses a zero count and also proves the named binary actually contributed.
+OAUTH_TEST_FEATURES := full,oauth
+
+# The seven binaries that contribute ZERO tests under `--features "full"`.
+OAUTH_DARK_TESTS := \
+	oauth_credential_file \
+	oauth_dcr_integration \
+	oauth_iss_integration \
+	oauth_issuer_precedence \
+	oauth_refresh \
+	oauth_state_csrf \
+	oauth_store_wiring
+
+.PHONY: test-oauth
+test-oauth:
+	@echo "$(BLUE)Running the oauth-gated tests (features: $(OAUTH_TEST_FEATURES))...$(NC)"
+	@for t in $(OAUTH_DARK_TESTS); do \
+		$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+			"--test $$t (features: $(OAUTH_TEST_FEATURES))" \
+			"tests/$$t.rs" \
+			"This file is #![cfg(feature = \"oauth\")]; under --features \"full\" it compiles to an empty binary that exits 0. An emptied or mis-spelled cfg header, or a dropped --features oauth, is the classic cause." \
+			-- $(CARGO) test -p pmcp --features "$(OAUTH_TEST_FEATURES)" --test "$$t" -- --test-threads=1 || exit 1; \
+	done
+	@echo "$(GREEN)✓ oauth-gated tests passed with non-zero counts across all seven binaries$(NC)"
 
 # Phase 117 (SMPL-01/02) — RUN the v1-severance proofs on the severed build.
 #
@@ -1866,6 +1951,15 @@ quality-gate:
 	# pins `--features "full"`, so the pedantic+nursery policy never compiled
 	# `src/server/skills/` at all.
 	@$(MAKE) lint-skills
+	# test-oauth runs HERE for the third instance of the identical shape: every
+	# `test-all` leg pins `--features "full"`, and `oauth` is in neither `full`
+	# nor `full-v2`, so SEVEN oauth test binaries (124 tests) compiled to empty
+	# binaries that printed `running 0 tests` and exited 0. One of them,
+	# `oauth_issuer_precedence`, is the RFC 8414 §3.3 issuer-identity security
+	# fence, and it was green-by-omission from the day it was written. See the
+	# target's own header for the measured 124/167/291 split and for why it must
+	# stay native-only.
+	@$(MAKE) test-oauth
 	@$(MAKE) pmcp-package-gate
 	@$(MAKE) audit
 	@$(MAKE) unused-deps

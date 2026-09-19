@@ -274,6 +274,19 @@ jobs:
     - name: Check rustdoc zero-warnings
       run: make doc-check
 
+    # Issue #368's oauth leg (`make test-oauth`) is NOT a step of its own here.
+    # It runs inside `make quality-gate` below, and `quality-gate` is in
+    # `gate.needs`, so the leg is already merge-blocking.
+    #
+    # A dedicated step was tried and removed. Unlike `doc-check` — whose second
+    # run is near-free because rustdoc output is fingerprint-cached — cargo never
+    # caches test EXECUTION, so a named step would re-run all 124 tests and
+    # re-pay the full ~150s on every run of this job for zero extra coverage.
+    # It also inverted the deliberate fail-fast order, aborting before
+    # `fmt-check`/`lint`/`test-all` ever ran. The guard's own red line already
+    # names the failing binary, which is the only thing a dedicated step added.
+    # `test-skills` and `lint-skills`, the two legs `test-oauth` models itself
+    # on, likewise have no named step.
     - name: Run quality gate
       run: make quality-gate
 

@@ -32,7 +32,10 @@ pub struct LoginArgs {
     #[arg(long, env = "MCP_OAUTH_CLIENT_ID")]
     pub oauth_client_id: Option<String>,
 
-    /// OAuth issuer URL for OIDC discovery.
+    /// OAuth issuer URL for OIDC discovery. Set this when the authorization
+    /// server is a third party (Cognito, Auth0, Okta, Entra) rather than the
+    /// MCP server itself; discovery then runs against this issuer instead of
+    /// one derived from <URL>.
     #[arg(long, env = "MCP_OAUTH_ISSUER")]
     pub oauth_issuer: Option<String>,
 
@@ -87,6 +90,17 @@ pub async fn execute(args: LoginArgs, global_flags: &GlobalFlags) -> Result<()> 
         }
         if args.oauth_client_id.is_some() {
             println!("  Client ID: (pre-registered, DCR skipped)");
+        }
+        // Stated explicitly because it changes WHERE discovery goes and which
+        // value the RFC 8414 section 3.3 anchor check is applied to. An
+        // operator overriding discovery should see that the override took
+        // effect rather than having to infer it.
+        if let Some(ref issuer) = args.oauth_issuer {
+            println!(
+                "  Issuer: {} {}",
+                issuer.bright_white(),
+                "(explicit — discovery uses this, not a value derived from the URL above)".dimmed()
+            );
         }
         println!();
     }

@@ -1138,9 +1138,11 @@ impl OAuthHelper {
     ///
     /// The specification describes an authorization-server change as one
     /// "detected via updated protected resource metadata" — RFC 9728 Protected
-    /// Resource Metadata. `pmcp` does not implement RFC 9728: it derives the
-    /// authorization server from the MCP base URL directly (see
-    /// [`Self::discover_metadata_with_extras`]), and RFC 9728 discovery is
+    /// Resource Metadata. `pmcp` does not implement RFC 9728: absent an
+    /// explicitly-configured issuer it derives the authorization server from the
+    /// MCP base URL directly (see [`Self::get_metadata_with_extras`] for the
+    /// precedence, and [`Self::discover_metadata_with_extras`] for the probe),
+    /// and RFC 9728 discovery is
     /// **DEFERRED by owner decision (2026-08-02)**, recorded with a named owner
     /// in this phase's deferred-items file.
     ///
@@ -1693,34 +1695,104 @@ impl OAuthHelper {
         Ok(base)
     }
 
-    /// Discover OAuth metadata from MCP server URL using OIDC discovery.
+    /// Run OIDC / RFC 8414 discovery against an ALREADY-RESOLVED issuer.
+    ///
+    /// This is the single discovery seam: both the explicit-issuer and the
+    /// derived-issuer routes go through it, so there is one client
+    /// construction, one success-log block and one remediation template. It
+    /// used to be the derived route only, with the explicit route carrying an
+    /// inline near-copy — and that copy is how the pre-#368 remediation text
+    /// survived on the very route this fix steers operators toward. One body
+    /// cannot drift from itself.
+    ///
+    /// `derived_from` is `Some(mcp_url)` when `base_url` was DERIVED from that
+    /// URL, and `None` when the operator named the issuer explicitly. It
+    /// selects the remediation, and the two cases differ in KIND rather than
+    /// wording: a derived issuer is a guess that naming the real one corrects,
+    /// whereas for an explicitly-named issuer "name the issuer" is precisely
+    /// the useless advice that made the old message a dead end.
     async fn discover_metadata_with_extras(
         &self,
-        mcp_url: &str,
+        base_url: &str,
+        derived_from: Option<&str>,
     ) -> Result<(OidcDiscoveryMetadata, AuthorizationServerExtras)> {
-        let base_url = Self::extract_base_url(mcp_url)?;
-
-        tracing::info!("Discovering OAuth configuration from {}...", base_url);
+        tracing::info!("Discovering OAuth configuration from {base_url}...");
 
         let discovery_client = OidcDiscoveryClient::new();
 
-        match discovery_client.discover_with_extras(&base_url).await {
+        match discovery_client.discover_with_extras(base_url).await {
             Ok((metadata, extras)) => {
                 tracing::info!("OAuth discovery successful");
                 tracing::debug!("Issuer: {}", metadata.issuer);
                 if let Some(ref device_endpoint) = metadata.device_authorization_endpoint {
-                    tracing::debug!("Device endpoint: {}", device_endpoint);
+                    tracing::debug!("Device endpoint: {device_endpoint}");
                 }
                 Ok((metadata, extras))
             },
-            Err(e) => Err(Error::internal(format!(
-                "Failed to discover OAuth configuration at {}: {}\n\
-                 \n\
-                 Please provide --oauth-issuer explicitly, or ensure the server\n\
-                 exposes OAuth metadata at {}/.well-known/openid-configuration",
-                base_url, e, base_url
+            Err(e) => Err(Error::internal(Self::discovery_remediation(
+                base_url,
+                &e,
+                derived_from,
             ))),
         }
+    }
+
+    /// Build the operator-facing remediation for a failed discovery.
+    ///
+    /// Split out so both routes share the diagnosis header and the
+    /// unattended-path tail, and only the middle paragraph — the part that
+    /// genuinely differs by provenance — varies.
+    ///
+    /// The advice is deliberately specific, because the generic text this
+    /// replaced was actively misleading on the most common failure. Two
+    /// corrections:
+    ///
+    ///  - It told the operator to "ensure the server exposes OAuth metadata at
+    ///    .../openid-configuration". On an issuer MISMATCH that is a dead end:
+    ///    `IssuerMismatch` is classified `Terminal`
+    ///    (`classify_discovery_failure`), so the probe aborts and the
+    ///    `openid-configuration` candidate is never requested. Serving a second
+    ///    document changes nothing.
+    ///  - It told the operator to "provide `--oauth-issuer` explicitly" without
+    ///    saying that this is the fix for a THIRD-PARTY authorization server,
+    ///    which is the case that produces the mismatch — and it gave that same
+    ///    advice on the route where the issuer had ALREADY been named
+    ///    explicitly, where it is not merely vague but impossible to act on.
+    fn discovery_remediation(base_url: &str, e: &Error, derived_from: Option<&str>) -> String {
+        let diagnosis = match derived_from {
+            Some(mcp_url) => format!(
+                "The issuer above was DERIVED from the MCP server URL `{mcp_url}`, which \
+                 assumes the MCP server is also its own authorization server.\n\
+                 \n\
+                 If this deployment's authorization server is a third party (Amazon Cognito, \
+                 Auth0, Okta, Microsoft Entra), that assumption is wrong. Name the real \
+                 issuer explicitly — if the error above reports a declared issuer, that is \
+                 the value to use:\n\
+                 \x20   --oauth-issuer <issuer>        (or MCP_OAUTH_ISSUER=<issuer>)\n\
+                 Discovery then runs against that issuer, and the RFC 8414 section 3.3 \
+                 anchor check is applied to it."
+            ),
+            None => "The issuer above was supplied EXPLICITLY, so discovery ran against it \
+                     rather than against a value derived from the MCP server URL, and the \
+                     RFC 8414 section 3.3 anchor check was applied to it.\n\
+                     \n\
+                     Re-supplying it will not change this result. Check instead that the \
+                     value is the authorization server's OWN issuer identifier, exactly as \
+                     that server declares it — including scheme, and any trailing path — and \
+                     that it serves RFC 8414 or OpenID Connect discovery metadata whose \
+                     `issuer` field equals it byte for byte."
+                .to_string(),
+        };
+
+        format!(
+            "Failed to discover OAuth configuration at {base_url}: {e}\n\
+             \n\
+             {diagnosis}\n\
+             \n\
+             For an unattended caller (CI, an acceptance-test harness) supply a \
+             pre-minted bearer token instead. This skips OAuth discovery altogether:\n\
+             \x20   --api-key <token>              (or MCP_API_KEY=<token>)"
+        )
     }
 
     /// Get OAuth metadata (either by discovering or constructing from issuer).
@@ -1737,30 +1809,76 @@ impl OAuthHelper {
     /// fit on [`OidcDiscoveryMetadata`] — in particular RFC 9207's
     /// `authorization_response_iss_parameter_supported`, which is tier 3 of the
     /// `iss` precedence chain.
+    ///
+    /// # Precedence: an EXPLICIT issuer outranks a DERIVED one
+    ///
+    /// `config.issuer` is consulted FIRST, and `config.mcp_server_url` is the
+    /// fallback. The two are not interchangeable sources of the same fact:
+    ///
+    /// - `config.issuer` is a value an operator supplied out of band
+    ///   (`--oauth-issuer`, `MCP_OAUTH_ISSUER`). It is a statement about which
+    ///   authorization server this deployment actually uses.
+    /// - `config.mcp_server_url` yields an issuer only by DERIVATION
+    ///   ([`Self::extract_base_url`] keeps scheme + host + port): it assumes the
+    ///   MCP resource server is its own authorization server.
+    ///
+    /// That assumption is false for the common enterprise deployment, where the
+    /// authorization server is a third party — Cognito, Auth0, Okta, Entra. For
+    /// those, the derived issuer is simply the WRONG issuer, and because the
+    /// RFC 8414 §3.3 anchor comparison is (correctly) byte-exact, discovery
+    /// refuses a perfectly honest document. The right fix for the operator is to
+    /// state the issuer; this ordering is what makes stating it have an effect.
+    ///
+    /// **This ordering does not relax the mix-up defence.** RFC 8414 §3.3
+    /// requires the document's `issuer` to be identical to the issuer the
+    /// well-known URI was inserted into. When the URL is built from
+    /// `config.issuer`, that issuer *is* the anchor, and
+    /// [`issuer_matches_metadata`](crate::shared::oauth_validation::issuer_matches_metadata)
+    /// still runs byte-exact on every fetched document. An operator-supplied
+    /// issuer is a BETTER-provenance anchor than a hostname heuristic — it is
+    /// precisely the "validated source" the RFC 9207 guidance asks for. An
+    /// attacker who controls the MCP server cannot exploit this: the client
+    /// fetches from the operator's issuer and still demands the document name it.
+    ///
+    /// Credential ADDRESSING is deliberately unaffected — [`Self::server_key`]
+    /// stays `mcp_server_url`-first, because credentials are keyed by
+    /// `(issuer, account, server)` and the "server" component must remain the
+    /// MCP server even when the issuer is stated explicitly.
     async fn get_metadata_with_extras(
         &self,
     ) -> Result<(OidcDiscoveryMetadata, AuthorizationServerExtras)> {
-        if let Some(ref mcp_url) = self.config.mcp_server_url {
-            // Discover from MCP server URL
-            self.discover_metadata_with_extras(mcp_url).await
-        } else if let Some(ref issuer) = self.config.issuer {
-            // Manually provided issuer - try to discover from it
-            tracing::info!("Discovering OAuth configuration from {}...", issuer);
-
-            let discovery_client = OidcDiscoveryClient::new();
-            match discovery_client.discover_with_extras(issuer).await {
-                Ok(found) => {
-                    tracing::info!("OAuth discovery successful");
-                    Ok(found)
-                },
-                Err(e) => Err(Error::internal(format!(
-                    "Failed to discover OAuth configuration from issuer {}: {}\n\
-                     \n\
-                     Please ensure the issuer URL exposes OAuth metadata at\n\
-                     {}/.well-known/openid-configuration",
-                    issuer, e, issuer
-                ))),
+        // Resolve WHICH issuer anchors discovery, then delegate. Keeping
+        // resolution and discovery separate is what stops the two routes from
+        // drifting: there is exactly one discovery body below this match.
+        if let Some(ref issuer) = self.config.issuer {
+            // An explicitly-configured issuer wins over one derived from the MCP
+            // server URL. Announced at `info` rather than `debug`: an operator
+            // who overrides discovery should be able to see that the override
+            // took effect, which is exactly what was previously unobservable.
+            if let Some(ref mcp_url) = self.config.mcp_server_url {
+                tracing::info!(
+                    "Using the explicitly-configured OAuth issuer `{issuer}` for discovery \
+                     instead of deriving one from the MCP server URL `{mcp_url}`. The \
+                     RFC 8414 section 3.3 anchor check is applied against the configured \
+                     issuer."
+                );
             }
+
+            self.discover_metadata_with_extras(issuer, None).await
+        } else if let Some(ref mcp_url) = self.config.mcp_server_url {
+            // Derive the issuer from the MCP server URL. Correct only when the
+            // MCP server is also its own authorization server.
+            //
+            // DEF-116-01 (owner-deferred): this tier is a stopgap for a MISSING mechanism,
+            // not a design. RFC 9728 protected-resource metadata is how a client
+            // should LEARN the authorization server instead of guessing it from
+            // the resource's own origin; until that lands, a third-party-IdP
+            // deployment needs a human to type `--oauth-issuer`. The explicit
+            // tier above is tier 1 of the eventual three (explicit > PRM
+            // `authorization_servers[]` > derived), so it is not wasted work.
+            let base_url = Self::extract_base_url(mcp_url)?;
+            self.discover_metadata_with_extras(&base_url, Some(mcp_url))
+                .await
         } else {
             Err(Error::internal(
                 "Either oauth_issuer or mcp_server_url must be provided for OAuth authentication"

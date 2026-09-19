@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.24.2"
+version = "0.24.3"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"
@@ -65,7 +65,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # (Phase 116). `path` wins locally, but a published cargo-pmcp 0.19.0 claiming
 # compatibility with an older pmcp would not compile: `auth_cmd` resolves every
 # credential through that seam.
-pmcp = { version = "2.19.0", path = "..", features = ["streamable-http", "oauth"] }
+pmcp = { version = "2.20.3", path = "..", features = ["streamable-http", "oauth"] }
 mcp-tester = { version = "0.8.0", path = "../crates/mcp-tester" }
 # Collects the SDK's `pmcp::wire` tracing target for `--dump-wire`. The SDK emits
 # those events unconditionally-but-guarded; without a subscriber installed here

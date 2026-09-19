@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [2.20.3] - 2026-09-18
+
+### Fixed — `--oauth-issuer` was documented but inert (issue #368)
+
+`OAuthHelper::get_metadata_with_extras` tested `mcp_server_url` before
+`issuer`, and `cargo pmcp auth login` always sets the server URL (it is a
+required positional). An explicitly supplied issuer could therefore never
+change where discovery went, so the `--oauth-issuer` flag did nothing on the
+one verb whose help text advertised it — while the failure message told the
+operator to "provide `--oauth-issuer` explicitly". Precedence is now: an
+EXPLICIT issuer outranks a DERIVED one.
+
+This is **not** a relaxation of the RFC 8414 §3.3 / OIDC Discovery §4.3
+issuer-identity check. That comparison remains byte-exact and still runs on
+every document; only which value serves as the anchor changes. Two tests pin
+the security property: an explicit issuer that lies is still refused, and it
+does not fall back to the derived authorization server.
+
+The remediation text is corrected too. The old message pointed at
+`/.well-known/openid-configuration`, which the probe never requests —
+`IssuerMismatch` is classified `Terminal`, so the probe aborts first.
+
+Practical effect: for a deployment whose authorization server is a third party
+(Cognito, Auth0, Okta, Entra), an operator can now anchor discovery on the real
+issuer instead of the MCP server's own origin.
+
+### Fixed — 124 oauth tests were green by omission in the quality gate
+
+`oauth` is a member of neither `full` nor `full-v2`, and every test leg pinned
+`--features "full"`, so seven oauth test binaries compiled to empty binaries
+that printed `running 0 tests` and exited 0.
+
+Measured with `cargo test --test 'oauth_*'`:
+
+| features | tests |
+|---|---|
+| `full,oauth` | 13 binaries, 291 tests, 291 passed |
+| `full` | 167 tests |
+
+That is 124 dead tests across `oauth_credential_file` (29),
+`oauth_dcr_integration` (24), `oauth_iss_integration` (13),
+`oauth_issuer_precedence` (7), `oauth_refresh` (21), `oauth_state_csrf` (12)
+and `oauth_store_wiring` (18). `tests/oauth_issuer_precedence.rs` is the
+issuer-identity security fence, and its own header states that if it ever goes
+green by omission the fix has regressed into a security hole — it was green by
+omission from the day it was written.
+
+Closed by a `make test-oauth` leg chained into `make quality-gate`, plus a
+named CI step in the merge-blocking `quality-gate` job. The leg asserts a
+NONZERO test count, because a selector matching zero tests exits 0 and is
+indistinguishable from success. `oauth` is deliberately NOT added to `full`:
+it pulls `dep:webbrowser`/`dep:dirs`/`dep:rand`, which is exactly why the
+wasm32 purity fence excludes it.
+
+### Note on versioning
+
+`2.20.1` and `2.20.2` have CHANGELOG entries above but were never published —
+the manifest stayed at `2.20.0` and crates.io's newest `pmcp` is `2.20.0`. Those
+numbers are therefore not reused; this release is `2.20.3`, and publishing it
+also ships the `pmcp-workbook-compiler` work documented under `2.20.1` and
+`2.20.2`.
 ## [2.20.2] - 2026-09-11
 
 ### Fixed — Excel for Mac workbook provenance and builder dependency freshness

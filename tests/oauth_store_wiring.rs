@@ -10,14 +10,22 @@
 //!
 //! # Why several rows SEED the store rather than driving a second flow
 //!
-//! `pmcp` derives the authorization server from the MCP base URL directly
-//! (`get_metadata_with_extras` -> `discover_metadata_with_extras`), and RFC 8414
-//! section 3.3 anchoring (116-07) then requires the fetched document to declare
-//! exactly that issuer. So two MCP servers at two different origins ALWAYS
-//! resolve two different issuers today, and the D-116-R1 case — two MCP servers
-//! sharing ONE authorization server and ONE account — is not reachable through
-//! the live flow until RFC 9728 Protected Resource Metadata lands, which is
-//! DEFERRED by owner decision (2026-08-02).
+//! Absent an explicitly-configured issuer, `pmcp` derives the authorization
+//! server from the MCP base URL directly (`get_metadata_with_extras` ->
+//! `discover_metadata_with_extras`), and RFC 8414 section 3.3 anchoring (116-07)
+//! then requires the fetched document to declare exactly that issuer. So two
+//! MCP servers at two different origins resolve two different issuers on the
+//! DERIVED path.
+//!
+//! That is no longer the only path. Issue #368 made an explicitly-configured
+//! issuer outrank a derived one, so two MCP server URLs sharing one
+//! `MCP_OAUTH_ISSUER` now DO resolve the same issuer, which makes the D-116-R1
+//! collision reachable through the live flow — contrary to what this header
+//! claimed while nothing ran it. Seeding is retained because it remains the
+//! sharper assertion (see below), not because driving it is impossible; a live
+//! two-URL/one-issuer row would be a legitimate addition. RFC 9728 Protected
+//! Resource Metadata is still unimplemented and DEFERRED by owner decision
+//! (2026-08-02, DEF-116-01).
 //!
 //! Seeding the second server's entry directly is therefore not a shortcut, it is
 //! the only way to build the collision at all — and it makes the assertion

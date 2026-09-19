@@ -5,6 +5,33 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-09-18
+
+### Fixed
+
+- **`--oauth-issuer` now takes effect on `auth login`** (issue #368). The flag
+  was documented and accepted but inert: the discovery path in `pmcp` tested
+  `mcp_server_url` before `issuer`, and `login.rs` always sets the server URL
+  (it is a required positional), so an explicit issuer could never change where
+  discovery went. The failure message meanwhile advised passing this very flag.
+  The functional fix is in `pmcp` 2.20.3; this crate now also prints the issuer
+  when it is set explicitly, so an operator can see the override took effect
+  rather than having to infer it.
+
+### Changed
+
+- **`PMCP_VERSION` 2.20.0 -> 2.20.3** (`src/templates/workbook_server.rs`), so a
+  scaffold pins the `pmcp` shipping at this tag. Caught by its own drift guard
+  (`emitted_pmcp_version_matches_workspace_pin`) rather than by review.
+  `PMCP_VERSION_REQ` (`src/templates/workspace.rs`) stays `"2.20"` — it is a
+  minor-level requirement and `2.20` already admits `2.20.3`.
+
+- **`pmcp` dependency pin 2.19.0 -> 2.20.3** (`Cargo.toml`). This is deliberately
+  tighter than the caret rule in the root `CLAUDE.md` requires: `^2.19.0` would
+  *permit* the fixed `pmcp` but not *require* it, so a stale lockfile could
+  install this version against a `pmcp` whose `--oauth-issuer` is still inert.
+  The flag's behaviour depends on the patch, so the requirement names it.
+
 ## [0.24.1] - 2026-09-04
 
 ### Changed
