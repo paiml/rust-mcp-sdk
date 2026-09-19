@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.20.4] - 2026-09-19
+
+### Fixed — discovery refused a conformant Cognito document (RFC 8414 §2 optional fields)
+
+`OidcDiscoveryMetadata` declared five `Vec` fields with no `#[serde(default)]`
+and no `Option`, so serde treated all of them as required. Four are OPTIONAL or
+RECOMMENDED under RFC 8414 §2, and a conformant authorization server may omit
+them. Amazon Cognito omits exactly two — `grant_types_supported` and
+`code_challenge_methods_supported` — so discovery against a Cognito pool failed
+to parse a perfectly valid document.
+
+The symptom is misleading: serde reports the *closing brace* (a 976-byte
+document reported `line 1, column 664`-style positions at its final byte), which
+is the standard missing-required-field signature but reads like truncation. The
+SDK's own wrapper deliberately does not reproduce the parser's message, because
+a serde data error echoes the offending input — correct for secret hygiene, but
+it left only the column number to diagnose from.
+
+This was reachable only *because* 2.20.3 fixed `--oauth-issuer` (#368): with the
+flag finally reaching discovery, the client cleared the §3.3 anchor check and
+landed straight on this. The two defects are independent.
+
+Defaults follow the spec rather than being uniformly empty:
+
+| field | RFC 8414 §2 | default applied |
+|---|---|---|
+| `grant_types_supported` | OPTIONAL, default `["authorization_code","implicit"]` | `[AuthorizationCode]` — `GrantType` models no `Implicit` variant (deprecated by OAuth 2.1, unimplemented here) |
+| `token_endpoint_auth_methods_supported` | OPTIONAL, default `["client_secret_basic"]` | `["client_secret_basic"]` |
+| `scopes_supported` | RECOMMENDED, no default | empty |
+| `code_challenge_methods_supported` | OPTIONAL, no default | empty |
+| `response_types_supported` | **REQUIRED** | unchanged — still required |
+
+An empty default for `grant_types_supported` would have claimed the server
+supports no grant types at all, which is a different assertion than the spec's.
+Defaulting `code_challenge_methods_supported` to empty is safe because the
+client never gates on it — PKCE is unconditional in `client::oauth`, which
+always sends `code_challenge_method=S256`. Cognito supports S256 while omitting
+the advertisement.
+
+`tests/oauth_discovery_optional_fields.rs` fences both directions: a
+Cognito-shaped document omitting only OPTIONAL fields must parse, and a document
+missing the REQUIRED `issuer` must still be refused, so the relaxation cannot
+decay into a parser that accepts anything.
+
+Reported by the pmcp.run platform team and a tenant, against 2.20.3.
+
 ## [2.20.3] - 2026-09-18
 
 ### Fixed — `--oauth-issuer` was documented but inert (issue #368)
