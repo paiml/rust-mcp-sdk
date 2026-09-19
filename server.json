@@ -6,7 +6,7 @@
     "url": "https://github.com/paiml/rust-mcp-sdk",
     "source": "github"
   },
-  "version": "1.10.3",
+  "version": "2.20.3",
   "installInstructions": "Install via Cargo: cargo install pmcp",
   "homepage": "https://github.com/paiml/rust-mcp-sdk",
   "license": "MIT",
