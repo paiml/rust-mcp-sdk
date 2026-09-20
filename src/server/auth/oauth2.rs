@@ -166,6 +166,20 @@ pub struct OAuthError {
     pub error_uri: Option<String>,
 }
 
+/// RFC 8414 §2 default for an absent `grant_types_supported`.
+///
+/// The spec says `["authorization_code", "implicit"]`. `GrantType` has no
+/// `Implicit` variant, so this returns the representable part rather than an
+/// empty list.
+fn default_grant_types_supported() -> Vec<GrantType> {
+    vec![GrantType::AuthorizationCode]
+}
+
+/// RFC 8414 §2 default for an absent `token_endpoint_auth_methods_supported`.
+fn default_token_endpoint_auth_methods() -> Vec<String> {
+    vec!["client_secret_basic".to_string()]
+}
+
 /// `OpenID Connect Discovery` metadata.
 /// Represents the well-known configuration for OAuth 2.0/OIDC servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,15 +221,33 @@ pub struct OidcDiscoveryMetadata {
     pub response_types_supported: Vec<ResponseType>,
 
     /// Supported grant types.
+    ///
+    /// OPTIONAL per RFC 8414 §2. When absent the spec's default is
+    /// `["authorization_code", "implicit"]`; `GrantType` models no `Implicit`
+    /// variant (the implicit flow is deprecated by OAuth 2.1 and unimplemented
+    /// here), so the representable part of that default is used. Never empty by
+    /// default — an empty list would claim the server supports no grants.
+    #[serde(default = "default_grant_types_supported")]
     pub grant_types_supported: Vec<GrantType>,
 
     /// Supported scopes.
+    /// RECOMMENDED per RFC 8414 §2, with no specified default.
+    #[serde(default)]
     pub scopes_supported: Vec<String>,
 
     /// Supported token endpoint auth methods.
+    /// OPTIONAL per RFC 8414 §2; the spec's default when absent is
+    /// `["client_secret_basic"]`.
+    #[serde(default = "default_token_endpoint_auth_methods")]
     pub token_endpoint_auth_methods_supported: Vec<String>,
 
     /// Supported PKCE code challenge methods.
+    ///
+    /// OPTIONAL per RFC 8414 §2 with no specified default, so absence means
+    /// "not advertised" rather than "not supported" — Amazon Cognito supports
+    /// S256 while omitting this field. Safe to default to empty because the
+    /// client never gates on it: PKCE is unconditional in `client::oauth`.
+    #[serde(default)]
     pub code_challenge_methods_supported: Vec<String>,
 }
 
