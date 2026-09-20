@@ -53,7 +53,9 @@ use pmcp::server::auth::traits::{AuthContext, AuthProvider};
 use pmcp::server::auth::OAuthProvider;
 use pmcp::server::task_store::{InMemoryTaskStore, TaskStore};
 use pmcp::server::typed_tool::TypedTool;
-use pmcp::shared::streamable_http::{StreamableHttpTransport, StreamableHttpTransportConfig};
+use pmcp::shared::streamable_http::{
+    StreamableHttpTransport, StreamableHttpTransportConfigBuilder,
+};
 use pmcp::types::tasks::TaskStatus;
 use pmcp::types::{CallToolResult, ClientCapabilities, Content, TaskSupport, ToolExecution};
 use pmcp::{Client, ErrorCode, Server, ToolCallResponse};
@@ -349,19 +351,16 @@ fn mcp_client(
     bound: SocketAddr,
     bearer: Option<&str>,
 ) -> pmcp::Result<Client<StreamableHttpTransport>> {
-    let extra_headers = bearer
-        .map(|t| vec![("authorization".to_string(), format!("Bearer {t}"))])
-        .unwrap_or_default();
-    let config = StreamableHttpTransportConfig {
-        url: Url::parse(&format!("http://{bound}"))
-            .map_err(|e| pmcp::Error::internal(e.to_string()))?,
-        extra_headers,
-        auth_provider: None,
-        session_id: None,
-        enable_json_response: true,
-        on_resumption_token: None,
-        http_middleware_chain: None,
-    };
+    // Builder, not a struct literal: `session_id` / `on_resumption_token` are
+    // `v1-compat`-only, so a literal naming them breaks the `full-v2` build.
+    let mut builder = StreamableHttpTransportConfigBuilder::new(
+        Url::parse(&format!("http://{bound}")).map_err(|e| pmcp::Error::internal(e.to_string()))?,
+    )
+    .enable_json_response();
+    if let Some(t) = bearer {
+        builder = builder.with_header("authorization", format!("Bearer {t}"));
+    }
+    let config = builder.build();
     Ok(Client::new(StreamableHttpTransport::new(config)))
 }
 

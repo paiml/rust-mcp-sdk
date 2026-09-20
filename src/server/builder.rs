@@ -22,6 +22,12 @@ use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashSet;
 use std::sync::Arc;
+// Scrubs the by-value `[u8; 32]` / `Vec<[u8; 32]>` setter parameters after their
+// contents move into the zeroizing fields (D-113-P, copy 2 of 3). `zeroize` is
+// only compiled in under `streamable-http`, so the import carries the same gate
+// as the fields it serves.
+#[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+use zeroize::Zeroize;
 
 /// Builder for constructing a `ServerCore` instance.
 ///
@@ -68,6 +74,10 @@ pub struct ServerCoreBuilder {
     /// Cached prompt metadata (populated at registration, avoids per-request cloning)
     prompt_infos: HashMap<String, PromptInfo>,
     resources: Option<Arc<dyn ResourceHandler>>,
+    /// Completion provider backing `completion/complete` (Phase 118.1-04,
+    /// CONF-05). A SINGLE non-keyed slot in the shape of `resources` above,
+    /// set via [`Self::completions`].
+    completions: Option<Arc<dyn crate::types::completable::CompletionProviderTrait>>,
     sampling: Option<Arc<dyn SamplingHandler>>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
     tool_authorizer: Option<Arc<dyn ToolAuthorizer>>,
@@ -87,6 +97,35 @@ pub struct ServerCoreBuilder {
     suppress_double_wrap: HashSet<String>,
     /// Stateless mode for serverless deployments (None = auto-detect)
     stateless_mode: Option<bool>,
+    /// Configured protocol-version accept-list (Phase 112, VERS-01/02).
+    ///
+    /// Defaults to the v1-only legacy set (EXCLUDES `2026-07-28`) so an
+    /// un-opted-in server behaves exactly as today. Overridden via
+    /// [`Self::with_supported_protocol_versions`]; an explicitly-empty accept-list
+    /// falls back to this v1-only default (never an all-reject server).
+    supported_protocol_versions: Vec<crate::types::ProtocolVersion>,
+    /// Explicit `requestState` minting key (Phase 113, HTTP-02), set via
+    /// [`Self::with_request_state_key`]. Overrides `PMCP_REQUEST_STATE_KEY`.
+    ///
+    /// Copy 1 of 3 (D-113-P): held as a
+    /// [`SecretKey`](crate::server::request_state::SecretKey), never as bare
+    /// `[u8; 32]`, so the destructor rides on the value and scrubs on drop —
+    /// including on every early-`?` path out of [`Self::build`]. Reverting this
+    /// to bare bytes is caught at COMPILE time by
+    /// `request_state_key_field_is_the_zeroizing_type`.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    request_state_key: Option<crate::server::request_state::SecretKey>,
+    /// Rotated-out `requestState` keys accepted for VERIFICATION only, set via
+    /// [`Self::with_request_state_previous_keys`].
+    ///
+    /// Copy 1 of 3 (D-113-P), the rotated-out half: each element scrubs itself
+    /// when the `Vec` drops.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    request_state_previous_keys: Vec<crate::server::request_state::SecretKey>,
+    /// Explicit continuation lifetime, set via [`Self::with_request_state_ttl`].
+    /// Beats both the 300-second default and `PMCP_REQUEST_STATE_TTL_SECS` (D-05).
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    request_state_ttl: Option<std::time::Duration>,
     /// Host-specific metadata layers (e.g., `ChatGpt` for openai/* keys)
     #[cfg(feature = "mcp-apps")]
     host_layers: Vec<crate::types::mcp_apps::HostType>,
@@ -101,6 +140,20 @@ pub struct ServerCoreBuilder {
     /// `.skill(...)` / `.skills(...)` calls never produce nested wrappers.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pending_skills: Option<Skills>,
+    /// Whether workflows registered from here on get the D-04a projected-skill
+    /// prepend as prompt message `[0]`, set via
+    /// [`Self::with_workflow_skill_prepend`].
+    ///
+    /// Read by [`Self::prompt_workflow`] at REGISTRATION time, so it applies to
+    /// workflows registered after the setter and not to earlier ones. Default
+    /// `false`, so every existing server's transcript is byte-identical.
+    ///
+    /// UNGATED, though the setter that writes it is not. A `bool` costs nothing
+    /// to carry, and carrying it is what lets `prompt_workflow` hand it to
+    /// `WorkflowPromptHandler::with_projected_skill_prepend` — which has a null
+    /// twin — with no `#[cfg]` at the call site. Paired twins over call-site
+    /// `#[cfg]` is this repo's recorded house decision.
+    prepend_projected_skill: bool,
 }
 
 impl Default for ServerCoreBuilder {
@@ -121,6 +174,7 @@ impl ServerCoreBuilder {
             tool_infos: HashMap::new(),
             prompt_infos: HashMap::new(),
             resources: None,
+            completions: None,
             sampling: None,
             auth_provider: None,
             tool_authorizer: None,
@@ -134,6 +188,13 @@ impl ServerCoreBuilder {
             #[cfg(not(target_arch = "wasm32"))]
             suppress_double_wrap: HashSet::new(),
             stateless_mode: None, // Auto-detect by default
+            supported_protocol_versions: crate::types::protocol::context::default_accept_list(),
+            #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+            request_state_key: None,
+            #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+            request_state_previous_keys: Vec::new(),
+            #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+            request_state_ttl: None,
             #[cfg(feature = "mcp-apps")]
             host_layers: Vec::new(),
             website_url: None,
@@ -141,6 +202,7 @@ impl ServerCoreBuilder {
             payload_limits: PayloadLimits::default(),
             #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
             pending_skills: None,
+            prepend_projected_skill: false,
         }
     }
 
@@ -315,6 +377,72 @@ impl ServerCoreBuilder {
         self
     }
 
+    /// Set the completion provider backing `completion/complete`.
+    ///
+    /// A SINGLE, server-wide provider — the [`Self::resources`] shape, not the
+    /// name-keyed [`Self::prompt`] shape. The spec routes every
+    /// `completion/complete` to one seam and passes the `ref` (`ref/prompt` or
+    /// `ref/resource`) as data, so a per-name registry would invent a dispatch
+    /// dimension the protocol does not have. The reference reaches the provider
+    /// through
+    /// [`CompletionRequest::context`](crate::types::completable::CompletionRequest::context).
+    ///
+    /// Registering a provider auto-advertises `capabilities.completions`, the
+    /// way [`Self::resources`] auto-advertises `capabilities.resources`.
+    ///
+    /// Not registering one is NOT an error: `completion/complete` still answers
+    /// the spec `CompleteResult` shape with an empty `values` array.
+    ///
+    /// The high-level [`ServerBuilder`](crate::server::ServerBuilder) carries an
+    /// identically-named setter, so a provider registered through either family
+    /// reaches its own dispatcher.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::types::completable::StaticCompletionProvider;
+    ///
+    /// # fn example() -> pmcp::Result<()> {
+    /// let server = ServerCoreBuilder::new()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .completions(StaticCompletionProvider::from_strings(vec![
+    ///         "alpha".to_string(),
+    ///         "beta".to_string(),
+    ///     ]))
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn completions(
+        self,
+        provider: impl crate::types::completable::CompletionProviderTrait + 'static,
+    ) -> Self {
+        self.completions_arc(Arc::new(provider))
+    }
+
+    /// Set the completion provider with an Arc.
+    ///
+    /// This variant is useful when the provider is shared with something outside
+    /// the builder. Behaviour is otherwise identical to [`Self::completions`].
+    #[must_use]
+    pub fn completions_arc(
+        mut self,
+        provider: Arc<dyn crate::types::completable::CompletionProviderTrait>,
+    ) -> Self {
+        self.completions = Some(provider);
+
+        // Update capabilities to include completions.
+        // Use Some(default) instead of None to ensure the field serializes.
+        if self.capabilities.completions.is_none() {
+            self.capabilities.completions = Some(crate::types::CompletionCapabilities::default());
+        }
+
+        self
+    }
+
     /// Register a single SEP-2640 Agent Skill.
     ///
     /// Convenience over [`Self::skills`] for the single-skill case. The skill
@@ -326,7 +454,10 @@ impl ServerCoreBuilder {
     /// # Panics
     ///
     /// Panics at `.build()` time if multiple registered skills resolve to
-    /// the same `skill://` URI. Use [`Self::try_skills`] with a pre-built
+    /// the same `skill://` URI, if a registered reference URI collides with
+    /// another skill's `SKILL.md` URI, or if a skill's frontmatter `name`
+    /// disagrees with the final segment of its URI path (the SEP-2640
+    /// name-identity rule). Use [`Self::try_skills`] with a pre-built
     /// [`Skills`] registry to surface duplicates as a `Result`.
     ///
     /// # Examples
@@ -350,6 +481,85 @@ impl ServerCoreBuilder {
         self.skills(Skills::new().add(skill))
     }
 
+    /// Prepend the projected skill body to workflow prompts (default: **off**).
+    ///
+    /// Turns on
+    /// [`WorkflowPromptHandler::with_projected_skill_prepend`](crate::server::workflow::WorkflowPromptHandler::with_projected_skill_prepend)
+    /// for every workflow this builder registers, so `prompts/get` opens with
+    /// the bytes `workflow.as_skill().body()` renders. Without this method the
+    /// opt-in is reachable only by hand-constructing a `WorkflowPromptHandler`
+    /// and registering it with `.prompt(name, handler)`, which would make the
+    /// setting true per workflow VALUE but not per SERVER.
+    ///
+    /// # It does NOT register the skill — you must do that too
+    ///
+    /// This setter touches the PROMPT surface only. It never adds anything to
+    /// the skills registry, so on a builder that does nothing else the server
+    /// hands a client a document identifying itself as `skill://{slug}/SKILL.md`
+    /// while `resources/read` on that URI fails and `skills/list` answers
+    /// `-32601` (no skill was registered, so the extension is never declared).
+    ///
+    /// For the "one string, one digest, no variant to keep in sync" property to
+    /// actually hold, register the projected skill from the SAME workflow value
+    /// in the same builder chain:
+    ///
+    /// ```text
+    /// builder
+    ///     .try_skills(Skills::new().add(workflow.as_skill()))?
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    /// ```
+    ///
+    /// Nothing enforces the pairing, so a workflow edited after only one of the
+    /// two calls desynchronizes the prompt bytes from the digest published in
+    /// `skills/list`.
+    ///
+    /// # Ordering matters
+    ///
+    /// [`Self::prompt_workflow`] reads this setting at REGISTRATION time, so it
+    /// applies to workflows registered AFTER this call and leaves earlier ones
+    /// alone. Call it before the workflows it should affect:
+    ///
+    /// ```rust
+    /// # #[cfg(all(feature = "skills", not(target_arch = "wasm32")))] {
+    /// # fn main() -> Result<(), pmcp::Error> {
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::server::workflow::SequentialWorkflow;
+    ///
+    /// let workflow = SequentialWorkflow::new("refund_flow", "Process a refund");
+    ///
+    /// // The exact bytes `prompts/get` will now open with, and the same bytes
+    /// // served at `skill://refund-flow/SKILL.md`.
+    /// let message_zero = workflow.as_skill().body().to_string();
+    ///
+    /// let server = ServerCoreBuilder::new()
+    ///     .name("my-server")
+    ///     .version("1.0.0")
+    ///     .with_workflow_skill_prepend(true)
+    ///     .prompt_workflow(workflow)?
+    ///     .build()?;
+    ///
+    /// assert!(message_zero.starts_with("---\nname: \"refund-flow\"\n"));
+    /// # let _ = server;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// `ServerCore` exposes no synchronous prompt accessor, so the assertion
+    /// above is on the projected bytes rather than on the built server; the
+    /// end-to-end proof that this setter actually reaches message `[0]` is
+    /// `server_core_builder_prompt_workflow_reaches_the_prepend` in
+    /// `tests/skills_integration.rs`, with its flag-off negative case alongside.
+    ///
+    /// The default is `false`, so an existing server's transcripts do not move.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_workflow_skill_prepend(mut self, on: bool) -> Self {
+        self.prepend_projected_skill = on;
+        self
+    }
+
     /// Register a registry of SEP-2640 Agent Skills.
     ///
     /// Merges into any prior accumulated skills (a previous `.skill(...)` or
@@ -359,8 +569,12 @@ impl ServerCoreBuilder {
     ///
     /// # Panics
     ///
-    /// Panics at `.build()` if two registered skills resolve to the same
-    /// `skill://` URI. Use [`Self::try_skills`] for fallible registration.
+    /// Panics at `.build()` on any condition the registry refuses: two skills
+    /// resolving to the same `skill://` URI, a reference URI colliding with
+    /// another skill's `SKILL.md` URI, or a frontmatter `name` that disagrees
+    /// with the final segment of its URI path (the SEP-2640 name-identity
+    /// rule, added in Phase 125). Use [`Self::try_skills`] for fallible
+    /// registration.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn skills(mut self, skills: Skills) -> Self {
@@ -375,23 +589,53 @@ impl ServerCoreBuilder {
         self
     }
 
-    /// Fallible variant of [`Self::skills`] — returns `Err` immediately if
-    /// the merged registry would contain duplicate URIs. Useful for
-    /// runtime-dynamic registration where panicking is unacceptable.
+    /// Fallible variant of [`Self::skills`]. Useful for runtime-dynamic
+    /// registration where panicking is unacceptable.
+    ///
+    /// # What it checks, and what it does NOT
+    ///
+    /// Duplicate URIs are a CROSS-skill property, so they are checked over the
+    /// whole accumulated registry. Name identity is a PER-skill property and is
+    /// checked over the registry passed to THIS call only — which is what keeps
+    /// K registrations linear rather than quadratic.
+    ///
+    /// The consequence is worth stating plainly, because it is the one case
+    /// where this method does not save you from `.build()`: skills deposited by
+    /// the INFALLIBLE [`Self::skills`] / [`Self::skill`] /
+    /// [`Self::bootstrap_skill_and_prompt`] are never name-checked at
+    /// registration time, so a later `try_skills` can return `Ok` while
+    /// `.build()` still panics on one of them. Register every skill through
+    /// `try_skills` if you need the failure as a `Result`.
     ///
     /// # Errors
     ///
     /// Returns `Err(pmcp::Error::Validation)` if the merged registry would
-    /// produce duplicate `skill://` URIs.
+    /// produce duplicate `skill://` URIs (including a reference URI that
+    /// collides with another skill's `SKILL.md`), or if a skill in the registry
+    /// PASSED HERE has a frontmatter `name` that disagrees with the final
+    /// segment of its URI path.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     pub fn try_skills(mut self, skills: Skills) -> Result<Self> {
+        // Name identity is a PER-SKILL property — see `validate_name_identity`.
+        // Validating the arriving registry before the merge is what keeps this
+        // linear in registry size across K registrations.
+        skills.validate_name_identity()?;
         let merged = match self.pending_skills.take() {
             Some(prior) => prior.merge(skills),
             None => skills,
         };
-        // Probe by cloning + into_handler; discard the handler. The real
+        // Probe WITHOUT cloning the registry or building a handler. The real
         // construction happens in `.build()` once everything is settled.
-        merged.clone().into_handler()?;
+        //
+        // Duplicate URIs are a cross-skill property, so this must see the
+        // MERGED registry — but URIs need no YAML parse and no SHA-256, so the
+        // merged probe is cheap. Name identity is per-skill and was validated
+        // for every prior registry by the call that added it, so only the newly
+        // supplied one is parsed here (see `validate_name_identity`). Probing
+        // through `into_handler` instead meant a deep clone of the whole
+        // accumulated registry AND a full name pass over it on every call: K
+        // registrations cost K(K+1)/2 YAML parses where upstream cost none.
+        merged.validate_unique_uris()?;
         self.pending_skills = Some(merged);
         crate::server::skills::set_skills_capabilities(&mut self.capabilities);
         Ok(self)
@@ -405,7 +649,7 @@ impl ServerCoreBuilder {
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn bootstrap_skill_and_prompt(self, skill: Skill, prompt_name: impl Into<String>) -> Self {
-        let prompt_handler = SkillPromptHandler::new(skill.clone());
+        let prompt_handler = SkillPromptHandler::new(&skill);
         self.skill(skill).prompt(prompt_name, prompt_handler)
     }
 
@@ -729,6 +973,123 @@ impl ServerCoreBuilder {
         self
     }
 
+    /// Opt into a protocol-version accept-list (Phase 112, VERS-01/02; D-02/D-04).
+    ///
+    /// This is the v2 opt-in. With no call, the server is **v1-only** and behaves
+    /// exactly as today (the default set EXCLUDES `2026-07-28`). Pass a list
+    /// including [`PROTOCOL_VERSION_2026_07_28`](crate::types::protocol::PROTOCOL_VERSION_2026_07_28)
+    /// to serve v2 (dual, or v2-only). One API expresses v1-only, dual, and
+    /// v2-only — directly supporting the Phase 117 severability story.
+    ///
+    /// # Empty accept-list
+    ///
+    /// An EMPTY iterator falls back to the v1-only legacy default rather than
+    /// producing an all-reject server (documented safe fallback). De-duplication
+    /// is left to the resolver.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use pmcp::server::builder::ServerCoreBuilder;
+    /// use pmcp::types::protocol::PROTOCOL_VERSION_2026_07_28;
+    /// use pmcp::types::ProtocolVersion;
+    ///
+    /// // Dual v1 + v2 server.
+    /// let builder = ServerCoreBuilder::new().with_supported_protocol_versions([
+    ///     ProtocolVersion("2025-11-25".to_string()),
+    ///     ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
+    /// ]);
+    /// ```
+    #[must_use]
+    pub fn with_supported_protocol_versions(
+        mut self,
+        versions: impl IntoIterator<Item = crate::types::ProtocolVersion>,
+    ) -> Self {
+        // An explicitly-empty accept-list falls back to the v1-only legacy
+        // default — never an all-reject server (D-02/D-04). De-duplication is
+        // left to the resolver.
+        self.supported_protocol_versions =
+            crate::types::protocol::context::normalize_accept_list(versions);
+        self
+    }
+
+    /// Configure the shared `requestState` minting key (Phase 113, HTTP-02, D-03).
+    ///
+    /// The [`ServerCoreBuilder`] twin of
+    /// [`ServerBuilder::with_request_state_key`](crate::ServerBuilder::with_request_state_key).
+    /// With no call, the key is resolved from `PMCP_REQUEST_STATE_KEY`; when that
+    /// variable is unset the core generates a per-process key and WARNs at build
+    /// time (D-04). Calling this overrides the environment entirely.
+    ///
+    /// Has no effect on a core that did not opt into the v2 (`2026-07-28`) era.
+    ///
+    /// The parameter type is deliberately still `[u8; 32]`: the SDK owns the
+    /// copy it takes, not the caller's (D-113-P, T-113-121).
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_request_state_key(mut self, mut key: [u8; 32]) -> Self {
+        // Closes copy 1 of 3 (D-113-P): the FIELD now scrubs on drop.
+        self.request_state_key = Some(crate::server::request_state::SecretKey::new(key));
+        // Closes copy 2 of 3 (D-113-P): this by-value parameter's OWN stack
+        // slot. `[u8; 32]` is `Copy`, so the line above copied out of it and
+        // left the caller's key bytes sitting here.
+        key.zeroize();
+        self
+    }
+
+    /// Accept rotated-out `requestState` keys for VERIFICATION only.
+    ///
+    /// Tokens minted under a listed key still verify, but new tokens are always
+    /// minted under the current key — so a rotation does not strand in-flight
+    /// continuations. With no call, only the current key is accepted.
+    ///
+    /// Has no effect on a core that did not opt into the v2 (`2026-07-28`) era.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_request_state_previous_keys(mut self, mut keys: Vec<[u8; 32]>) -> Self {
+        // Closes copy 1 of 3 (D-113-P), rotated-out half.
+        self.request_state_previous_keys = keys
+            .iter()
+            .copied()
+            .map(crate::server::request_state::SecretKey::new)
+            .collect();
+        // Closes copy 2 of 3 (D-113-P): the by-value `Vec`'s own heap buffer,
+        // which the copy above read out of and would otherwise return to the
+        // allocator holding every rotated-out key in the clear. `Vec::zeroize`
+        // scrubs the initialized elements AND the spare capacity.
+        keys.zeroize();
+        self
+    }
+
+    /// Configure the `requestState` continuation lifetime (D-05).
+    ///
+    /// With no call, the lifetime is `PMCP_REQUEST_STATE_TTL_SECS` if parseable,
+    /// else 300 seconds. A builder value beats both.
+    ///
+    /// Has no effect on a core that did not opt into the v2 (`2026-07-28`) era.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_request_state_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.request_state_ttl = Some(ttl);
+        self
+    }
+
+    /// Populate a reverse-DNS-keyed entry in the server's `extensions` capability
+    /// map (Phase 112, VERS-08).
+    ///
+    /// Convenience over mutating [`ServerCapabilities::extensions`](crate::types::ServerCapabilities)
+    /// directly. Use a namespaced reverse-DNS id (e.g.
+    /// `io.modelcontextprotocol/foo`). Does NOT change the `ServerCapabilities`
+    /// type.
+    #[must_use]
+    pub fn with_extension(mut self, id: impl Into<String>, value: serde_json::Value) -> Self {
+        self.capabilities
+            .extensions
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), value);
+        self
+    }
+
     /// Enable experimental MCP Tasks support with a task router (LEGACY).
     ///
     /// **Legacy / experimental.** This is the older `pmcp-tasks`
@@ -738,13 +1099,19 @@ impl ServerCoreBuilder {
     /// [`TaskStore`](crate::server::task_store::TaskStore) via
     /// [`Self::task_store`] instead (see `examples/s45_tool_as_task_lifecycle.rs`).
     ///
-    /// The task router handles task lifecycle operations (`tasks/get`, `tasks/result`,
-    /// `tasks/list`, `tasks/cancel`) and task-augmented `tools/call` requests.
+    /// The task router handles task lifecycle operations and task-augmented
+    /// `tools/call` requests. The served method set is ERA-DEPENDENT (Phase
+    /// 114): v1 (2025-11-25) is `tasks/get`, `tasks/result`, `tasks/list`,
+    /// `tasks/cancel`; v2 (2026-07-28) is `tasks/get`, `tasks/update`,
+    /// `tasks/cancel`, with the other two retired to `-32601`.
     ///
     /// This method:
     /// - Stores the task router for use during request handling
     /// - Auto-configures `experimental.tasks` in server capabilities so clients
-    ///   know the server supports the tasks protocol extension
+    ///   know the server supports the tasks protocol extension. **v1-only:**
+    ///   `project_capabilities_for_v2` strips `experimental` on the 2026-07-28
+    ///   path, where tasks are declared through the `extensions` map key
+    ///   `io.modelcontextprotocol/tasks` instead (plan 114-05)
     ///
     /// The `router` parameter is typically created by the `pmcp-tasks` crate,
     /// which wraps a `TaskStore` with routing logic.
@@ -792,9 +1159,14 @@ impl ServerCoreBuilder {
     ///   support) in `initialize` — the mere presence of a store flips the
     ///   capability on, unless an explicit `tasks` capability was already
     ///   configured (additive-only; an explicit value is preserved verbatim).
-    /// - Handles `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`
-    ///   requests via the store
-    /// - Resolves task owner from auth context (OAuth subject, client ID, or session ID)
+    /// - Handles the `tasks/*` surface via the store. The method set is
+    ///   ERA-DEPENDENT (Phase 114): v1 (2025-11-25) serves `tasks/get`,
+    ///   `tasks/result`, `tasks/list` and `tasks/cancel`; v2 (2026-07-28)
+    ///   serves `tasks/get`, `tasks/update` and `tasks/cancel`, and answers
+    ///   `-32601` for the two retired methods
+    /// - Resolves task owner from auth context. **v1** falls back through OAuth
+    ///   subject → client ID → session ID; **v2** has no session to fall back
+    ///   to and binds fail-closed on an auth-configured server (TASK-05, D-07)
     ///
     /// A tool declaring
     /// [`TaskSupport::Required`](crate::types::tools::TaskSupport::Required)
@@ -999,6 +1371,11 @@ impl ServerCoreBuilder {
             self.resources.clone(),
         );
 
+        // D-04a: apply the projected-skill prepend BEFORE the task wrap below,
+        // so a `has_task_support` workflow inherits the setting through its
+        // `inner` handler and there is no second call site to keep in sync.
+        let handler = handler.with_projected_skill_prepend(self.prepend_projected_skill);
+
         // Wrap in TaskWorkflowPromptHandler if task support is enabled
         if has_task_support {
             let task_router = self.task_router.as_ref().ok_or_else(|| {
@@ -1112,11 +1489,70 @@ impl ServerCoreBuilder {
         // itself stays "last write wins" — composition lives here so the
         // setter's semantics are unchanged for callers that don't use
         // skills.
+        //
+        // The SEP-2640 entry set is DISCARDED here, and that is a decision rather
+        // than an oversight.
+        //
+        // A `ServerCore`'s only request ingress is
+        // `ProtocolHandler::handle_request(&self, id, request: Request, auth)`
+        // (`src/server/core.rs`), which accepts the typed PUBLIC `Request` enum.
+        // Neither `skills/list` nor `skills/get` will ever appear in it — adding a
+        // variant to a public exhaustive enum is a semver-MAJOR break, which is
+        // the whole reason both methods ride the crate-private
+        // `InternalClientRequest` classifier instead. So a `skill_entries` field
+        // here would be a field nothing could ever read, and a
+        // `ServerCore::handle_skills_*` would be a function nothing could ever
+        // call.
+        //
+        // PRECEDENT, not preference: Phase 112 reached exactly this conclusion for
+        // `server/discover` and acted on it. The `ServerCore` discover wrappers
+        // were DELETED, the projection was consolidated into the single free fn
+        // `build_discover_response`, and no `#[allow(dead_code)]` was left behind;
+        // `handle_tasks_update` followed the same shape and exists only on the
+        // high-level `Server`. `tests/skills_routing.rs` carries a source-scan
+        // guard that fails if either dead item is re-added, and its rustdoc names
+        // the `handle_request` signature as the fact a future widener must change
+        // first.
+        //
+        // The skills RESOURCE surface a `ServerCoreBuilder` server exposes is
+        // real and unaffected: the handler bound below still serves every skill
+        // through `resources/list` and `resources/read`. Only the two skills
+        // METHODS are out of reach, and that limit is a recorded phase deferral.
+        // Re-apply the skills capability LAST — see the twin comment in
+        // `ServerBuilder::build`. `capabilities(..)` REPLACES the whole
+        // `ServerCapabilities` value, so a `.skill(..).capabilities(..)` ordering
+        // dropped the `io.modelcontextprotocol/skills` extension that `.skill(..)`
+        // had inserted, leaving a server that serves every skill as a resource
+        // while declaring nothing.
         #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
-        let final_resources: Option<Arc<dyn ResourceHandler>> =
+        if self.pending_skills.is_some() {
+            crate::server::skills::set_skills_capabilities(&mut self.capabilities);
+        }
+        #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+        let (final_resources, _): (Option<Arc<dyn ResourceHandler>>, Vec<_>) =
             finalize_skills_resources(self.pending_skills.take(), self.resources.take());
         #[cfg(not(all(feature = "skills", not(target_arch = "wasm32"))))]
         let final_resources = self.resources.take();
+
+        // Resolve the server-owned `requestState` codec EXACTLY ONCE, here at
+        // BUILD time (Phase 113, HTTP-02) — before `supported_protocol_versions`
+        // is moved into the core below. A malformed CONFIGURED key fails the
+        // build; an UNSET key falls back to a per-process key with a genuine
+        // startup WARN. A v1-only core gets `None` and reads no env var.
+        //
+        // Both key arguments go BY REFERENCE, which closes copy 3 of 3
+        // (D-113-P): the by-value form manufactured an unscrubbed stack copy on
+        // every call. Because they are borrowed rather than moved, the two
+        // fields are still owned by `self` here and drop through the zeroizing
+        // destructor — on this path AND on every early `?` above, none of which
+        // moves the key material anywhere.
+        #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+        let request_state_codec = crate::server::request_state::resolve_codec_at_build(
+            &self.supported_protocol_versions,
+            self.request_state_key.as_ref(),
+            &self.request_state_previous_keys,
+            self.request_state_ttl,
+        )?;
 
         let core = ServerCore::new(
             info,
@@ -1144,35 +1580,72 @@ impl ServerCoreBuilder {
         // `Server` uses (no drift between the two dispatchers).
         #[cfg(not(target_arch = "wasm32"))]
         let core = core.with_suppress_double_wrap(self.suppress_double_wrap);
+        // Thread the `completion/complete` provider (CONF-05, G-4) so the core's
+        // own dispatch arm reaches the registered seam. Without this the arm
+        // would read `None` forever — still spec-shaped, but silently ignoring
+        // every registered provider.
+        #[cfg(not(target_arch = "wasm32"))]
+        let core = core.with_completions(self.completions);
+        // Thread the configured protocol-version accept-list (Phase 112,
+        // VERS-01/02) so ingress era-resolution enforces the exact set the author
+        // opted into. Default (unset) is v1-only — the server behaves as today.
+        let core = core.with_supported_protocol_versions(self.supported_protocol_versions);
+        // Thread the once-resolved `requestState` codec (Phase 113, HTTP-02) into
+        // the running core. `None` for a v1-only core.
+        #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+        let core = core.with_request_state_codec(request_state_codec);
         Ok(core)
     }
 }
 
-/// Finalize accumulated `Skills` into a single `ResourceHandler`, optionally
-/// composed with the user's `.resources(...)` slot.
+/// Finalize accumulated `Skills` into a single `ResourceHandler` PLUS the
+/// SEP-2640 `skills/list` entry set, optionally composing the handler with the
+/// user's `.resources(...)` slot.
 ///
 /// Called from both [`ServerCoreBuilder::build`] and the `ServerBuilder::build`
 /// path in `src/server/mod.rs` so the composition logic exists in exactly
 /// one place. Panics on duplicate URIs — surface the failure via
 /// [`ServerCoreBuilder::try_skills`] for fallible registration.
+///
+/// # Why the entries come back in the tuple rather than off the handler
+///
+/// This is the ONE place both build paths see the registry, so it is the only
+/// place both can get entries from without drifting. Reaching them later by
+/// downcasting the returned `ResourceHandler` would silently return "no skills"
+/// the moment [`ComposedResources`] wraps it — which it already does whenever the
+/// author also called `.resources(...)` — so entries travel as their own value
+/// and are stored in their own field.
+///
+/// [`Skills::entries`] is called BEFORE [`Skills::into_handler`] because the
+/// latter consumes `self`. `into_handler`'s public signature is deliberately
+/// unchanged: widening it to a tuple would be a semver-MAJOR break on a shipped
+/// public method.
 #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
 pub(crate) fn finalize_skills_resources(
     pending: Option<Skills>,
     user: Option<Arc<dyn ResourceHandler>>,
-) -> Option<Arc<dyn ResourceHandler>> {
+) -> (
+    Option<Arc<dyn ResourceHandler>>,
+    Vec<crate::server::skills::SkillEntry>,
+) {
     match (pending, user) {
-        (None, other) => other,
-        (Some(skills), None) => Some(skills.into_handler().unwrap_or_else(|e| {
-            panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
-        })),
-        (Some(skills), Some(user_handler)) => {
-            let skills_handler = skills.into_handler().unwrap_or_else(|e| {
-                panic!("Skills::into_handler: {e}; use try_skills(...) for fallible registration")
+        (None, other) => (other, Vec::new()),
+        (Some(skills), user_handler) => {
+            // ONE artifact pass for both products. Calling `entries()` and then
+            // `into_handler()` here parsed every skill's YAML twice and
+            // SHA-256'd every SKILL.md and reference body twice per build.
+            let (skills_handler, entries, diagnostics) = skills.finalize().unwrap_or_else(|e| {
+                panic!("Skills: {e}; use try_skills(...) for fallible registration")
             });
-            Some(Arc::new(ComposedResources {
-                skills: skills_handler,
-                other: user_handler,
-            }))
+            crate::server::skills::log_skill_diagnostics(&diagnostics);
+            let resources = match user_handler {
+                None => skills_handler,
+                Some(other) => Arc::new(ComposedResources {
+                    skills: skills_handler,
+                    other,
+                }),
+            };
+            (Some(resources), entries)
         },
     }
 }
@@ -1210,6 +1683,157 @@ mod tests {
             .version("1.0.0")
             .build();
         assert!(result.is_ok());
+    }
+
+    // -- requestState key material (D-113-P) --------------------------------
+
+    /// COMPILE-LEVEL guard on the FIELD TYPES, not on behaviour.
+    ///
+    /// The whole D-113-P fix is invisible at run time: a builder that stores
+    /// bare `[u8; 32]` mints and verifies exactly like one that stores
+    /// [`SecretKey`](crate::server::request_state::SecretKey), so no behavioural
+    /// test can detect a silent revert. The type is the guard — reverting either
+    /// field to bare bytes makes the two `let` bindings below fail to compile.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    #[test]
+    fn request_state_key_field_is_the_zeroizing_type() {
+        use crate::server::request_state::SecretKey;
+        let builder = ServerCoreBuilder::new()
+            .with_request_state_key([0x11; 32])
+            .with_request_state_previous_keys(vec![[0x22; 32]]);
+
+        let key: &Option<SecretKey> = &builder.request_state_key;
+        let previous: &Vec<SecretKey> = &builder.request_state_previous_keys;
+
+        assert_eq!(key.as_deref(), Some(&[0x11u8; 32]));
+        assert_eq!(previous.len(), 1);
+        assert_eq!(**previous.first().expect("one previous key"), [0x22u8; 32]);
+    }
+
+    /// The real regression risk of the D-113-P type change is the PLUMBING, not
+    /// the scrubbing: a core configured with a key plus a rotated-out key must
+    /// still mint a token under the current key and verify it.
+    #[cfg(all(feature = "streamable-http", not(target_arch = "wasm32")))]
+    #[test]
+    fn a_core_with_zeroizing_key_fields_still_mints_and_verifies() {
+        use crate::server::request_state::{RequestBinding, Verdict};
+
+        const CURRENT: [u8; 32] = [0x11; 32];
+        const ROTATED: [u8; 32] = [0x22; 32];
+
+        let core = ServerCoreBuilder::new()
+            .name("t")
+            .version("1")
+            .with_supported_protocol_versions([
+                crate::types::ProtocolVersion("2026-07-28".to_string()),
+                crate::types::ProtocolVersion("2025-11-25".to_string()),
+            ])
+            .with_request_state_key(CURRENT)
+            .with_request_state_previous_keys(vec![ROTATED])
+            .build()
+            .expect("core builds");
+
+        let codec = core.request_state_codec().expect("a v2 core has a codec");
+        let params = serde_json::json!({ "name": "t", "arguments": { "a": 1 } });
+        let binding = RequestBinding::from_request("alice", "tools/call", &params)
+            .expect("a two-level fixture is far inside the canonical depth cap");
+        let token = codec
+            .mint(&serde_json::json!({ "step": 1 }), &binding, 0, None)
+            .expect("mint");
+        assert!(
+            matches!(codec.verify(&token, &binding), Verdict::Ok(_)),
+            "the zeroizing field type must not disturb the key plumbing"
+        );
+
+        // The rotated-out key reached the ACCEPTING set through the new
+        // by-reference `resolve_codec_at_build` argument.
+        let accepting = codec.accepting_key_ids();
+        assert!(accepting.contains(&crate::server::request_state::key_id_of(&ROTATED)));
+    }
+
+    #[test]
+    fn test_default_builder_is_v1_only_not_v2_opted_in() {
+        // No .with_supported_protocol_versions() call => v1-only default: the
+        // stored set EXCLUDES 2026-07-28 and is_v2_opted_in() is false (D-04).
+        let server = ServerCoreBuilder::new()
+            .name("test")
+            .version("1.0.0")
+            .build()
+            .unwrap();
+        assert!(!server.is_v2_opted_in());
+        assert!(!server
+            .supported_protocol_versions()
+            .iter()
+            .any(|v| v.as_str() == crate::types::protocol::PROTOCOL_VERSION_2026_07_28));
+    }
+
+    #[test]
+    fn test_dual_accept_list_flips_is_v2_opted_in() {
+        use crate::types::protocol::PROTOCOL_VERSION_2026_07_28;
+        use crate::types::ProtocolVersion;
+
+        let server = ServerCoreBuilder::new()
+            .name("test")
+            .version("1.0.0")
+            .with_supported_protocol_versions([
+                ProtocolVersion("2025-11-25".to_string()),
+                ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()),
+            ])
+            .build()
+            .unwrap();
+        assert!(server.is_v2_opted_in());
+    }
+
+    #[test]
+    fn test_v2_only_accept_list_stores_exactly_2026() {
+        use crate::types::protocol::PROTOCOL_VERSION_2026_07_28;
+        use crate::types::ProtocolVersion;
+
+        let server = ServerCoreBuilder::new()
+            .name("test")
+            .version("1.0.0")
+            .with_supported_protocol_versions([ProtocolVersion(
+                PROTOCOL_VERSION_2026_07_28.to_string(),
+            )])
+            .build()
+            .unwrap();
+        assert!(server.is_v2_opted_in());
+        assert_eq!(server.supported_protocol_versions().len(), 1);
+        assert_eq!(
+            server.supported_protocol_versions()[0].as_str(),
+            PROTOCOL_VERSION_2026_07_28
+        );
+    }
+
+    #[test]
+    fn test_empty_accept_list_falls_back_to_v1_only_default() {
+        use crate::types::ProtocolVersion;
+
+        let server = ServerCoreBuilder::new()
+            .name("test")
+            .version("1.0.0")
+            .with_supported_protocol_versions(std::iter::empty::<ProtocolVersion>())
+            .build()
+            .unwrap();
+        // Empty => v1-only default (safe fallback, never all-reject).
+        assert!(!server.is_v2_opted_in());
+        assert_eq!(server.supported_protocol_versions().len(), 4);
+    }
+
+    #[test]
+    fn test_with_extension_populates_capabilities_extensions() {
+        let server = ServerCoreBuilder::new()
+            .name("test")
+            .version("1.0.0")
+            .with_extension("io.modelcontextprotocol/foo", serde_json::json!({}))
+            .build()
+            .unwrap();
+        let ext = server
+            .capabilities()
+            .extensions
+            .as_ref()
+            .expect("with_extension populates the extensions map");
+        assert!(ext.contains_key("io.modelcontextprotocol/foo"));
     }
 
     #[test]
@@ -1868,12 +2492,21 @@ mod skills_builder_tests {
         // calling `.build()` (which moves the handler into ServerCore).
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let list = composed.list(None, extra()).await.unwrap();
         let uris: Vec<&str> = list.resources.iter().map(|r| r.uri.as_str()).collect();
         assert!(uris.contains(&"skill://a/SKILL.md"));
-        assert!(uris.contains(&"skill://index.json"));
+        // The synthesized discovery index was retired in Phase 125 plan 04.
+        // Asserting its ABSENCE — rather than deleting the line — keeps a
+        // reintroduction detectable from the composed-handler side, which is
+        // the surface a server author actually observes.
+        assert!(
+            !uris.contains(&"skill://index.json"),
+            "retired discovery index reappeared: {uris:?}"
+        );
         assert!(uris.contains(&"docs://handbook"));
 
         let res = composed.read("docs://handbook", extra()).await.unwrap();
@@ -1897,7 +2530,9 @@ mod skills_builder_tests {
         // the builder method call order. Verifies the same outcome.
         let pending = Some(Skills::new().add(Skill::new("a", "skill-a")));
         let user: Option<Arc<dyn ResourceHandler>> = Some(Arc::new(DocsHandler));
-        let composed = finalize_skills_resources(pending, user).expect("composed handler");
+        let composed = finalize_skills_resources(pending, user)
+            .0
+            .expect("composed handler");
 
         let res = composed.read("skill://a/SKILL.md", extra()).await.unwrap();
         match &res.contents[0] {
@@ -1960,6 +2595,7 @@ mod skills_builder_tests {
         // No skill calls — finalize should pass through user only.
         let final_handler =
             finalize_skills_resources(None, Some(Arc::new(B) as Arc<dyn ResourceHandler>))
+                .0
                 .expect("user handler preserved");
         let res = final_handler.read("test://uri", extra()).await.unwrap();
         match &res.contents[0] {

@@ -42,6 +42,58 @@ pub struct ClientCapabilities {
     /// Experimental capabilities
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<HashMap<String, serde_json::Value>>,
+
+    /// Extension capabilities — reverse-domain-keyed protocol extensions.
+    ///
+    /// This is the wire-correct home for declarations from the Extensions Track
+    /// of MCP (SEPs that ship as extensions rather than as core protocol
+    /// changes), and is the client-side twin of
+    /// [`ServerCapabilities::extensions`].
+    ///
+    /// Use `experimental` only for pre-SEP, pre-namespaced flags. New
+    /// extensions belong here.
+    ///
+    /// # On MCP 2026-07-28 this travels PER REQUEST, not in a handshake
+    ///
+    /// MCP 2026-07-28 is stateless and has no `initialize` handshake, so a v2
+    /// client's declaration rides inside **every** request's
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]` rather than being
+    /// exchanged once at connection setup. This field is therefore both:
+    ///
+    /// - the typed source that a client's per-request `_meta` emission
+    ///   serializes FROM, and
+    /// - the type that the server's already-resolved
+    ///   `ProtocolContext::client_capabilities` (resolved once at ingress)
+    ///   deserializes INTO.
+    ///
+    /// On MCP 2025-11-25 the same field travels once, inside the `initialize`
+    /// request's `capabilities`.
+    ///
+    /// # This is a DECLARATION, never an authorization
+    ///
+    /// The map is client-supplied, self-reported and trivially forgeable. It
+    /// says only what the client SUPPORTS — never who the caller IS. It may be
+    /// read to decide whether a capability may be served; it must never be read
+    /// as identity. Owner binding and every access decision read the
+    /// authenticated context (OAuth `sub` / the resolved principal), never this
+    /// map.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use pmcp::types::ClientCapabilities;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut caps = ClientCapabilities::default();
+    /// let mut ext = HashMap::new();
+    /// ext.insert(
+    ///     "io.modelcontextprotocol/tasks".to_string(),
+    ///     serde_json::json!({}),
+    /// );
+    /// caps.extensions = Some(ext);
+    /// ```
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Server capabilities advertised during initialization.
@@ -245,6 +297,114 @@ pub struct ClientTasksRequestCapability {
     pub elicitation: Option<Value>,
 }
 
+/// The reverse-DNS identifier of the MCP **tasks extension**:
+/// `io.modelcontextprotocol/tasks`.
+///
+/// This is the single canonical spelling of the key, used in BOTH directions of
+/// extension negotiation:
+///
+/// - **server → client**, in a `server/discover` response:
+///   `result.capabilities.extensions["io.modelcontextprotocol/tasks"]`
+/// - **client → server**, on every MCP 2026-07-28 request:
+///   `params._meta["io.modelcontextprotocol/clientCapabilities"].extensions["io.modelcontextprotocol/tasks"]`
+///
+/// The value under this key is always the empty object — see
+/// [`TasksExtensionCapability`].
+///
+/// Tasks moved OUT of the core MCP specification and into the Extensions Track,
+/// which is why the negotiation home is `extensions` and not the
+/// `capabilities.tasks` field that MCP 2025-11-25 uses.
+///
+/// # Provenance
+///
+/// Read from the vendored draft schema `schema/vendored/ext-tasks/schema.ts`
+/// (upstream `modelcontextprotocol/ext-tasks`, pinned commit
+/// `2c1425d9a288b9b1f489430fe1e00bb392b47e48`, 2026-07-15), whose final
+/// declaration is `export type TasksExtensionCapability = Record<string, never>`
+/// under the `@category tasks` annotation carrying this identifier. The local
+/// copy's digests and fetch record are in
+/// `schema/vendored/ext-tasks/PROVENANCE.md`.
+///
+/// **Two INDEPENDENT upstream artifacts agree on this exact spelling.** Besides
+/// the extension repository's own schema above, the CORE specification
+/// repository ships a capability example file
+/// `schema/draft/examples/ServerCapabilities/extensions-tasks.json` that is
+/// byte-for-byte `{"extensions":{"io.modelcontextprotocol/tasks":{}}}`. That
+/// second file lives in `modelcontextprotocol/modelcontextprotocol` and is
+/// deliberately NOT vendored here — it was read at `main` during research, so it
+/// is corroboration, not a pinned artifact.
+///
+/// # This value is PRE-FINAL
+///
+/// It is held under Phase 114's D-18 hold: at the time of writing neither
+/// repository had published a versioned (non-`draft`) schema directory, so every
+/// value read from the draft is provisional. Re-verify against
+/// `.planning/phases/114-tasks-extension-migration/114-SPEC-RECHECK.md` (verdict
+/// `PENDING`) before any TASK-0x requirement is flipped complete. A mismatch
+/// between this constant and the published schema is a phase-reopening event,
+/// not an advisory.
+pub const TASKS_EXTENSION_KEY: &str = "io.modelcontextprotocol/tasks";
+
+/// The tasks-extension capability value — an empty object on the wire.
+///
+/// This is the value that sits under [`TASKS_EXTENSION_KEY`] in an `extensions`
+/// map. It serializes as **exactly** `{}` and has no fields, because that is
+/// precisely what the vendored draft schema declares: presence of the key
+/// indicates support, and no extension-specific settings are defined. This type
+/// invents nothing ahead of the final schema.
+///
+/// # Why a named type rather than a bare `serde_json::json!({})`
+///
+/// The wire form is spec-literal today while the Rust type is
+/// *structure-ready*: because the struct is `#[non_exhaustive]` and is
+/// constructed through `Default`, a published schema can add a field here
+/// without a public-API break. One canonical type also means one canonical
+/// spelling of the value, in the same way [`TASKS_EXTENSION_KEY`] gives one
+/// canonical spelling of the key.
+///
+/// # Do NOT expect fields to arrive
+///
+/// Upstream types this as `Record<string, never>` — a type admitting **no**
+/// properties. That is a stronger statement than "empty for now": it declares
+/// that no settings exist. A future field is therefore *possible* but should not
+/// be expected, and if one is ever added it MUST be an `Option<_>` carrying
+/// `#[serde(skip_serializing_if = "Option::is_none")]`, so that a default value
+/// still serializes as `{}` and the wire form does not move.
+///
+/// Deserialization deliberately TOLERATES unknown keys (serde's default — there
+/// is intentionally no `deny_unknown_fields`), so a newer peer that starts
+/// sending a settings field cannot break an older pmcp build.
+///
+/// # Provenance
+///
+/// `schema/vendored/ext-tasks/schema.ts` at the commit recorded on
+/// [`TASKS_EXTENSION_KEY`]; the same D-18 hold applies.
+///
+/// # Examples
+///
+/// ```rust
+/// use pmcp::types::capabilities::{TasksExtensionCapability, TASKS_EXTENSION_KEY};
+/// use pmcp::types::ClientCapabilities;
+/// use std::collections::HashMap;
+///
+/// let mut ext = HashMap::new();
+/// ext.insert(
+///     TASKS_EXTENSION_KEY.to_string(),
+///     serde_json::to_value(TasksExtensionCapability::default()).unwrap(),
+/// );
+/// let mut caps = ClientCapabilities::default();
+/// caps.extensions = Some(ext);
+///
+/// assert_eq!(
+///     serde_json::to_string(&caps).unwrap(),
+///     r#"{"extensions":{"io.modelcontextprotocol/tasks":{}}}"#
+/// );
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "camelCase")]
+pub struct TasksExtensionCapability {}
+
 /// Roots capabilities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +485,11 @@ impl ClientCapabilities {
             roots: Some(RootsCapabilities { list_changed: true }),
             tasks: Some(ClientTasksCapability::default()),
             experimental: None,
+            // Deliberately NOT declaring any extension here: `full()` means
+            // "every CORE client feature", and declaring an Extensions-Track
+            // capability on its behalf would change the `initialize` bytes every
+            // existing caller sends. Extension declarations are opt-in.
+            extensions: None,
         }
     }
 
@@ -886,6 +1051,184 @@ mod tests {
         // Sanity: no unwanted casing variants.
         assert!(!s.contains("\"Extensions\""));
         assert!(!s.contains("\"extension\""));
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 114 plan 03 — client-side twins of the four Phase-112 locks
+    // above, plus the two locks on the tasks-extension key and value.
+    //
+    // The four tests above are UNCHANGED by design: the first of them
+    // (`default_serializes_without_extensions_key`, on `ServerCapabilities`)
+    // is D-02's byte lock on the v1 `initialize` RESPONSE, and later plans in
+    // this phase depend on it staying byte-identical. What follows never
+    // edits them; it mirrors them onto the request direction.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn client_default_serializes_without_extensions_key() {
+        // The client-side twin of `default_serializes_without_extensions_key`:
+        // a default `ClientCapabilities` must NOT emit `extensions` at all, so
+        // a v1 `initialize` REQUEST from an existing caller keeps its bytes.
+        let serialized = serde_json::to_string(&ClientCapabilities::default()).unwrap();
+
+        // Assert KEY ABSENCE on the serialized string, never a falsy value:
+        // `skip_serializing_if = "Option::is_none"` keeps `None` off the wire
+        // entirely, so an assertion that merely accepted `"extensions":null` or
+        // `"extensions":{}` would still pass on a future change that started
+        // emitting the key — which is exactly the regression this test exists
+        // to catch.
+        assert!(
+            !serialized.contains("extensions"),
+            "default ClientCapabilities must not serialize an `extensions` key \
+             at all (not even as null or {{}}); got: {serialized}"
+        );
+
+        // The whole default form is `{}` — every field is
+        // `Option<_> + skip_serializing_if`, and this is the v1 request shape.
+        assert_eq!(
+            serialized, "{}",
+            "default ClientCapabilities must serialize as exactly `{{}}`; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn client_extensions_round_trip_byte_equal() {
+        // serialize -> deserialize -> serialize must be BYTE-identical.
+        //
+        // The comparison is on raw strings, not on parsed `Value`s: this crate
+        // builds serde_json with `preserve_order`, so `Map` is an `IndexMap`
+        // whose `PartialEq` is order-INDEPENDENT and a structural assertion
+        // could not detect a key reorder.
+        let mut ext = HashMap::new();
+        ext.insert(TASKS_EXTENSION_KEY.to_string(), serde_json::json!({}));
+        let caps = ClientCapabilities {
+            extensions: Some(ext),
+            ..Default::default()
+        };
+
+        let first = serde_json::to_string(&caps).unwrap();
+        let round: ClientCapabilities = serde_json::from_str(&first).unwrap();
+        let second = serde_json::to_string(&round).unwrap();
+
+        assert_eq!(
+            first, second,
+            "ClientCapabilities.extensions must survive a round-trip byte-for-byte"
+        );
+        assert_eq!(
+            first, r#"{"extensions":{"io.modelcontextprotocol/tasks":{}}}"#,
+            "the wire form of a tasks-declaring client must match the spec's own \
+             example bytes; re-verify against schema/vendored/ext-tasks/schema.ts"
+        );
+        assert_eq!(
+            round.extensions.as_ref().unwrap().get(TASKS_EXTENSION_KEY),
+            Some(&serde_json::json!({})),
+            "round-tripped extensions value must equal the original"
+        );
+    }
+
+    #[test]
+    fn client_extensions_and_experimental_coexist() {
+        // Both maps are sibling fields; neither suppresses the other, and
+        // neither nests inside the other.
+        let mut exp = HashMap::new();
+        exp.insert("old-thing".to_string(), serde_json::json!({"v": 1}));
+        let mut ext = HashMap::new();
+        ext.insert(TASKS_EXTENSION_KEY.to_string(), serde_json::json!({}));
+        let caps = ClientCapabilities {
+            experimental: Some(exp),
+            extensions: Some(ext),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&caps).unwrap();
+        // (a) Both top-level keys present simultaneously.
+        assert!(json.get("experimental").is_some(), "experimental missing");
+        assert!(json.get("extensions").is_some(), "extensions missing");
+        // (b) Siblings, not nested.
+        assert!(
+            json["experimental"].get("extensions").is_none(),
+            "extensions must NOT be nested inside experimental"
+        );
+        assert!(
+            json["extensions"].get("experimental").is_none(),
+            "experimental must NOT be nested inside extensions"
+        );
+        // (c) Round-trip preserves both.
+        let round: ClientCapabilities = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            round.extensions.as_ref().unwrap().get(TASKS_EXTENSION_KEY),
+            Some(&serde_json::json!({}))
+        );
+        assert_eq!(
+            round.experimental.as_ref().unwrap().get("old-thing"),
+            Some(&serde_json::json!({"v": 1}))
+        );
+    }
+
+    #[test]
+    fn tasks_extension_capability_serializes_as_empty_object() {
+        // D-03: the value under `TASKS_EXTENSION_KEY` is EXACTLY `{}` — the
+        // exact string, not merely "an object".
+        let serialized = serde_json::to_string(&TasksExtensionCapability::default()).unwrap();
+        assert_eq!(
+            serialized, "{}",
+            "TasksExtensionCapability must serialize as exactly `{{}}` \
+             (schema/vendored/ext-tasks/schema.ts declares it \
+             `Record<string, never>`); got: {serialized}"
+        );
+
+        // And it deserializes back from that same `{}`.
+        let parsed: TasksExtensionCapability = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, TasksExtensionCapability::default());
+
+        // Tolerating an UNKNOWN key is DELIBERATE, not an oversight: there is
+        // intentionally no `deny_unknown_fields`, so if the final schema ever
+        // adds a settings field, a newer peer sending it cannot break an older
+        // pmcp build. Removing this tolerance would make that a hard error.
+        let with_future_field: TasksExtensionCapability =
+            serde_json::from_str(r#"{"someFutureSetting":true}"#).expect(
+                "TasksExtensionCapability must tolerate an unknown key so a future \
+                 upstream field cannot break an older client",
+            );
+        assert_eq!(with_future_field, TasksExtensionCapability::default());
+    }
+
+    #[test]
+    fn tasks_extension_key_is_the_reverse_dns_spelling() {
+        // One canonical spelling of the extension identifier. If this fails,
+        // the key was edited in source — re-verify it against
+        // `schema/vendored/ext-tasks/schema.ts` (pinned commit recorded in
+        // `schema/vendored/ext-tasks/PROVENANCE.md`) and against the D-18 hold
+        // in
+        // `.planning/phases/114-tasks-extension-migration/114-SPEC-RECHECK.md`
+        // before changing this test to match the code.
+        assert_eq!(
+            TASKS_EXTENSION_KEY, "io.modelcontextprotocol/tasks",
+            "TASKS_EXTENSION_KEY changed. This value is PRE-FINAL and held under \
+             Phase 114's D-18 hold: re-verify against \
+             schema/vendored/ext-tasks/schema.ts (see PROVENANCE.md for the \
+             pinned commit) and 114-SPEC-RECHECK.md. Do not `fix` this test to \
+             match the code — a mismatch with the published schema is a \
+             phase-reopening event."
+        );
+
+        // The key and the value together must compose the exact bytes the CORE
+        // spec's own capability example file carries.
+        let mut ext = HashMap::new();
+        ext.insert(
+            TASKS_EXTENSION_KEY.to_string(),
+            serde_json::to_value(TasksExtensionCapability::default()).unwrap(),
+        );
+        let caps = ServerCapabilities {
+            extensions: Some(ext),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&caps).unwrap(),
+            r#"{"extensions":{"io.modelcontextprotocol/tasks":{}}}"#,
+            "must match schema/draft/examples/ServerCapabilities/extensions-tasks.json \
+             byte-for-byte"
+        );
     }
 
     #[test]

@@ -13,8 +13,12 @@
 //! ```
 //!
 //! The pointable, full-surface equivalent (the config a user runs the binary
-//! against) ships alongside this file as `examples/london-tube.toml`:
-//! `pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml`.
+//! against) ships alongside this file as `examples/london-tube.toml`. Its
+//! `base_url` is a slot, not a baked literal, so BOTH variables must be set:
+//! ```sh
+//! TFL_BASE_URL=https://api.tfl.gov.uk TFL_APP_KEY=<your-key> \
+//!   pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
+//! ```
 
 use pmcp_openapi_server::{build_server, dispatch};
 use pmcp_server_toolkit::ServerConfig;

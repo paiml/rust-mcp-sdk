@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-code-mode"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -14,14 +14,28 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-pmcp = { version = ">=2.2.0", path = "../../" }
+# `default-features = false` + the one default feature this crate actually wants.
+#
+# WHY, and do NOT "simplify" this back to a bare `path` dep: `pmcp-code-mode` is
+# also a DEV-DEPENDENCY of `pmcp` itself (root Cargo.toml, for the s41 code-mode
+# example). Taking `pmcp`'s default feature set here therefore unifies
+# `default = ["logging", "v1-compat"]` back ON for every `cargo test` of `pmcp`
+# — including
+# `cargo test -p pmcp --test v2_client_carries_no_session_on_severed_build
+#  --no-default-features --features full-v2`, whose whole-file `cfg` then
+# compiles the file away and reports `0 tests, exit 0`: a severance proof that
+# silently proves nothing (plan 117-14). `v1-compat` is a marker feature this
+# crate uses no item from, so dropping it costs nothing here.
+pmcp = { version = ">=2.2.0", path = "../../", default-features = false, features = [
+    "logging",
+] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 hmac = "0.13"
 secrecy = "0.10"
 sha2 = "0.11"

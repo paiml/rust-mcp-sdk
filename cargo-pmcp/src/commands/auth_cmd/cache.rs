@@ -1,265 +1,276 @@
-//! Multi-server OAuth token cache for `cargo pmcp auth`.
+//! Thin adapters onto the SDK's credential store for `cargo pmcp auth`.
 //!
-//! Schema version 1: `{ schema_version: 1, entries: { "<normalized_url>": Entry } }`.
+//! # One machine, one credential store
 //!
-//! # Concurrency
-//! Writes are atomic per file via `tempfile::NamedTempFile::persist`; concurrent
-//! `auth login` from two terminals is last-writer-wins.
+//! This module used to be a SECOND, unrelated implementation of credential
+//! storage: its own record type, its own document format, its own reader and
+//! its own atomic writer, sitting beside the SDK's. A single machine therefore
+//! carried two credential stores with two formats and two sets of semantics.
 //!
-//! # Permissions (Unix)
-//! Parent dir (`~/.pmcp/`) is chmod'd to `0o700` on first write; cache file is
-//! chmod'd to `0o600` before the atomic rename.
+//! It no longer does. The record, the document format, the migration and the
+//! on-disk I/O all live in the SDK:
+//!
+//! - [`pmcp::shared::credential_store`] — the `(issuer, account, server)` key,
+//!   the record, the document format and the migration, all I/O-free.
+//! - [`pmcp::shared::credential_file`] — `FileCredentialStore`, the default
+//!   on-disk implementation, which performs a serialized read-modify-write per
+//!   mutation and writes `0o600` files into a `0o700` parent.
+//!
+//! What survives here is the FILE and its DATA — still
+//! `~/.pmcp/oauth-cache.json` — plus the handful of CLI-shaped adapters the five
+//! `auth` subcommands need. The migration is deliberately NOT reimplemented
+//! here: it lives in the SDK's pure parser, so a hosting platform and this CLI
+//! cannot diverge on what an existing login means.
+//!
+//! # The key is three-part, and the account is empty
+//!
+//! Every key this crate builds is `(issuer, "", normalized_server_url)`. The
+//! account is [`CLI_ACCOUNT_SCOPE`] — the empty string, the single-user CLI
+//! case. The SERVER component is what makes `auth logout <url>` mean "this
+//! server" rather than "everything issued by this authorization server", which
+//! matters as soon as two MCP servers share one authorization server.
+//!
+//! # This module compiles in the library target
+//!
+//! It is mounted into `cargo_pmcp`'s lib target via `#[path]` (see the crate
+//! root) so integration tests can reach the same adapters the binary uses. It
+//! must therefore never reference `crate::commands::*`.
 
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
-use url::Url;
+use pmcp::client::oauth::{Interactivity, OAuthConfig, OAuthHelper};
+use pmcp::shared::credential_store::{
+    CredentialKey, CredentialStore, CredentialStoreAdmin, StoredCredentials,
+};
+use pmcp::{default_credential_path, FileCredentialStore};
 
-/// Per-server token cache. Version 1 schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenCacheV1 {
-    /// Schema version. Readers reject any value != 1.
-    pub schema_version: u32,
-    /// Normalized-URL -> credential entry map. `BTreeMap` for deterministic JSON output.
-    pub entries: BTreeMap<String, TokenCacheEntry>,
-}
-
-/// One cached server's credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenCacheEntry {
-    /// Bearer access token. Sensitive — NEVER logged, never printed except by
-    /// `cargo pmcp auth token <url>`.
-    pub access_token: String,
-    /// Refresh token, if the IdP issued one. Not all IdPs return one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    /// Absolute expiration time (unix seconds).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-    /// Granted scopes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scopes: Vec<String>,
-    /// Effective OAuth issuer (caller-provided or OIDC-discovered).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<String>,
-    /// Effective client_id (DCR-issued or caller-provided).
-    pub client_id: String,
-}
-
-impl TokenCacheV1 {
-    /// Current on-disk schema version.
-    pub const CURRENT_VERSION: u32 = 1;
-
-    /// Construct an empty (zero-entry) cache at the current schema version.
-    pub fn empty() -> Self {
-        Self {
-            schema_version: Self::CURRENT_VERSION,
-            entries: BTreeMap::new(),
-        }
-    }
-
-    /// Read a cache file, returning `empty()` if the file does not exist.
-    /// Errors on malformed JSON or unsupported `schema_version`.
-    pub fn read(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
-                let v: Self = serde_json::from_str(&s).with_context(|| {
-                    format!("cache file corrupt — delete {} to reset", path.display())
-                })?;
-                if v.schema_version != Self::CURRENT_VERSION {
-                    anyhow::bail!(
-                        "cache schema_version {} unsupported (expected {}); upgrade cargo-pmcp",
-                        v.schema_version,
-                        Self::CURRENT_VERSION
-                    );
-                }
-                Ok(v)
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
-            Err(e) => Err(anyhow::anyhow!(
-                "failed to read cache file {}: {e}",
-                path.display()
-            )),
-        }
-    }
-
-    /// Atomic write: tempfile-in-same-dir -> chmod -> persist (rename).
-    ///
-    /// Cross-platform atomic on modern Linux + Windows per tempfile docs.
-    /// Concurrent writers are last-writer-wins (see module rustdoc).
-    pub fn write_atomic(&self, path: &Path) -> Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("cache path has no parent: {}", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create cache dir {}", parent.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-
-        let mut tmp = NamedTempFile::new_in(parent)?;
-        let json = serde_json::to_vec_pretty(self)?;
-        tmp.write_all(&json)?;
-        tmp.flush()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        tmp.persist(path)
-            .map_err(|e| anyhow::anyhow!("atomic rename failed: {e}"))?;
-        Ok(())
-    }
-}
-
-/// Returns `~/.pmcp/oauth-cache.json` (or `./.pmcp/oauth-cache.json` as a fallback).
-/// Distinct from the legacy SDK single-server cache at `~/.pmcp/oauth-tokens.json`.
-pub fn default_multi_cache_path() -> PathBuf {
-    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push(".pmcp");
-    p.push("oauth-cache.json");
-    p
-}
-
-/// Normalize an MCP server URL to a stable cache key.
+/// The SDK's MCP-server-URL normalizer, re-exported as the one this crate uses.
 ///
-/// `scheme://host[:port]` — lowercase host, strip path, strip trailing slash,
-/// strip default ports (80 for http, 443 for https).
-pub fn normalize_cache_key(mcp_server_url: &str) -> Result<String> {
-    let parsed = Url::parse(mcp_server_url)
-        .map_err(|e| anyhow::anyhow!("Invalid MCP server URL '{}': {e}", mcp_server_url))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("URL has no host: {mcp_server_url}"))?
-        .to_ascii_lowercase();
-    let mut base = format!("{}://{}", parsed.scheme(), host);
-    if let Some(port) = parsed.port() {
-        let is_default = (parsed.scheme() == "https" && port == 443)
-            || (parsed.scheme() == "http" && port == 80);
-        if !is_default {
-            base.push_str(&format!(":{}", port));
-        }
-    }
-    Ok(base)
-}
+/// This replaced a crate-local `normalize_cache_key` with identical behaviour
+/// (lowercase host, strip path, strip trailing slash, strip default ports); the
+/// idempotence property that made it safe moved into the SDK with it.
+pub use pmcp::shared::credential_store::normalize_server_key;
 
-/// Transparent refresh fires when the cached access_token is within this
-/// many seconds of expiry.
+/// The account component every credential this CLI stores is keyed under.
+///
+/// Empty on purpose: `cargo pmcp` is single-user, and the account scope exists
+/// for multi-tenant platform callers. Inventing an identity concept in the CLI
+/// would make its keys unreachable from the platform seam and vice versa.
+pub const CLI_ACCOUNT_SCOPE: &str = "";
+
+/// Transparent refresh fires when the stored access token is within this many
+/// seconds of expiry.
 pub const REFRESH_WINDOW_SECS: u64 = 60;
 
-/// Returns `true` when `entry.expires_at` is within `grace_secs` of now.
-/// Returns `false` when `expires_at` is `None` (treated as long-lived).
-pub fn is_near_expiry(entry: &TokenCacheEntry, grace_secs: u64) -> bool {
-    let Some(exp) = entry.expires_at else {
-        return false;
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    exp.saturating_sub(grace_secs) <= now
+/// The loopback port an `auth` subcommand nominally offers for a redirect.
+///
+/// The refresh path never binds it — it runs under
+/// [`Interactivity::RefreshOnly`], where the interactive tail is unreachable by
+/// construction — but `OAuthConfig` requires a value.
+const REFRESH_REDIRECT_PORT: u16 = 8080;
+
+/// Returns `~/.pmcp/oauth-cache.json` (or `./.pmcp/oauth-cache.json` as a
+/// fallback when the home directory cannot be resolved).
+///
+/// The same path [`pmcp::default_credential_path`] resolves, so the SDK and this
+/// CLI operate on ONE document. The fallback preserves this crate's
+/// pre-existing behaviour of degrading rather than failing outright.
+pub fn default_multi_cache_path() -> PathBuf {
+    default_credential_path().unwrap_or_else(|_| {
+        let mut path = PathBuf::from(".");
+        path.push(".pmcp");
+        path.push("oauth-cache.json");
+        path
+    })
 }
 
-/// Force-refresh the access_token for one cache entry and persist the result.
+/// Open the shared credential store at the default location.
 ///
-/// Returns the new access_token. Errors with an actionable message when
-/// `entry.refresh_token.is_none()`.
-pub async fn refresh_and_persist(
-    cache_path: &Path,
-    key: &str,
-    entry: &TokenCacheEntry,
+/// Construction touches no filesystem: only a read or a write does.
+pub fn open_store() -> Arc<FileCredentialStore> {
+    Arc::new(FileCredentialStore::new(default_multi_cache_path()))
+}
+
+/// Tell the operator about a migration the store performed while reading, and
+/// clear it so it is not repeated within this process.
+///
+/// A dropped entry is a FORCED RE-LOGIN, so it is named individually along with
+/// the command that fixes it. Both counts are reported, because "2 migrated"
+/// alone hides the fact that a third login was lost.
+///
+/// Everything goes to **stderr**: `auth token`'s stdout must stay exactly the
+/// token so `TOKEN=$(cargo pmcp auth token URL)` keeps working.
+pub async fn report_migration(store: &FileCredentialStore) -> Result<()> {
+    let Some(report) = store
+        .take_migration_report()
+        .await
+        .context("reading the credential store's migration report")?
+    else {
+        return Ok(());
+    };
+
+    if report.migrated() > 0 {
+        eprintln!(
+            "Migrated {} cached credential(s) from the previous cache format.",
+            report.migrated()
+        );
+    }
+    for dropped in report.dropped() {
+        eprintln!(
+            "warning: dropped cached credentials for {} — {}. \
+             Run `cargo pmcp auth login {}` to re-authenticate.",
+            dropped.server_key(),
+            dropped.reason(),
+            dropped.server_key()
+        );
+    }
+    if !report.dropped().is_empty() {
+        eprintln!(
+            "Dropped {} cached credential(s) that could not be migrated.",
+            report.dropped().len()
+        );
+    }
+    Ok(())
+}
+
+/// Returns `true` when the stored credentials expire within `grace_secs`.
+///
+/// Credentials with no recorded expiry are treated as long-lived, exactly as
+/// before this module was ported onto the SDK's store.
+///
+/// # What this gate buys after the port, and what it no longer buys
+///
+/// It decides whether to hand the request to [`refresh_through_sdk`] at all, so
+/// a token with plenty of life left still costs no network round-trip. It no
+/// longer forces a rotation: the SDK renews a token once it has EXPIRED and
+/// serves an unexpired one verbatim, so a credential inside this window is
+/// returned unchanged. That is a deliberate narrowing — the expiry decision now
+/// lives in one place instead of two — and it is why neither `auth token` nor
+/// `auth refresh` announces a refresh it has not observed.
+pub fn is_near_expiry(credentials: &StoredCredentials, grace_secs: u64) -> bool {
+    let Some(expires_at) = credentials.expires_at() else {
+        return false;
+    };
+    expires_at.saturating_sub(grace_secs) <= current_unix_secs()
+}
+
+/// Seconds since the Unix epoch, saturating to `0` on a clock set before 1970.
+pub fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Every key stored for `server_key`, in document order.
+pub async fn keys_for_server(
+    store: &FileCredentialStore,
+    server_key: &str,
+) -> Result<Vec<CredentialKey>> {
+    Ok(store
+        .list_keys()
+        .await
+        .context("listing stored credentials")?
+        .into_iter()
+        .filter(|key| key.server() == server_key)
+        .collect())
+}
+
+/// Resolve the credentials recorded for one MCP server.
+///
+/// The issuer comes from the store's own last-seen-issuer record, which is
+/// written in the same update as the credentials themselves, so the key can be
+/// rebuilt without a network round-trip. The `list_keys` fallback exists because
+/// a store written by something other than this CLI could hold credentials
+/// without that record, and a lookup that gave up there would report a login the
+/// operator can plainly see in `auth status` as missing.
+pub async fn load_for_server(
+    store: &FileCredentialStore,
+    server_key: &str,
+) -> Result<Option<(CredentialKey, StoredCredentials)>> {
+    let key = match store
+        .last_issuer(server_key)
+        .await
+        .context("reading the recorded authorization server")?
+    {
+        Some(issuer) => CredentialKey::new(issuer, CLI_ACCOUNT_SCOPE, server_key),
+        None => match keys_for_server(store, server_key).await?.into_iter().next() {
+            Some(key) => key,
+            None => return Ok(None),
+        },
+    };
+
+    let found = store
+        .load(&key)
+        .await
+        .context("reading the credential store")?;
+    Ok(found.map(|credentials| (key, credentials)))
+}
+
+/// Refresh `server_url`'s access token through the SDK's own refresh path and
+/// persist the result.
+///
+/// The SDK path is used rather than a second refresh implementation here so that
+/// this crate inherits its three properties for free: an authorization server
+/// that omits `refresh_token` no longer costs the stored one, a
+/// dynamically-registered client refreshes with the `client_id` the store holds
+/// rather than one this CLI never had, and the request carries exactly the
+/// GRANTED scope or none at all.
+///
+/// [`Interactivity::RefreshOnly`] means no browser is opened and no loopback
+/// listener is bound: `auth token` and `auth refresh` are scripting commands, and
+/// a five-minute wait on a callback nobody is watching is not an acceptable
+/// outcome for either.
+///
+/// # This is NOT a force-refresh, and callers must not describe it as one
+///
+/// The SDK serves a stored token that has not yet expired VERBATIM and spends a
+/// refresh only once it has. The implementation this replaced posted to the
+/// token endpoint unconditionally. Routing through the SDK is the plan's
+/// binding instruction — a second refresh implementation here is exactly the
+/// two-store divergence this port exists to end — so the force is genuinely
+/// gone, and every caller reports what it OBSERVED rather than what it asked
+/// for. Announcing a rotation that did not happen would be worse than the
+/// missing force: an operator diagnosing a stale token needs to know whether
+/// the authorization server was contacted at all.
+pub async fn refresh_through_sdk(
+    store: Arc<FileCredentialStore>,
+    server_url: &str,
+    issuer: &str,
 ) -> Result<String> {
-    let refresh_token = entry.refresh_token.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no refresh_token cached for {key} — run `cargo pmcp auth login {key}` to re-authenticate"
-        )
-    })?;
-    let issuer = entry.issuer.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cached entry for {key} has no issuer — run `cargo pmcp auth login {key}` to re-authenticate"
-        )
-    })?;
+    let config = OAuthConfig {
+        // The recorded issuer is the discovery SEED. Passing it preserves the
+        // behaviour of the implementation this replaced, which fetched the
+        // recorded issuer's discovery document directly rather than deriving an
+        // authorization server from the MCP base URL.
+        issuer: Some(issuer.to_string()),
+        mcp_server_url: Some(server_url.to_string()),
+        // Deliberately absent: the effective client id comes from the stored
+        // record, which is the only place a dynamically-registered one exists.
+        client_id: None,
+        client_name: None,
+        dcr_enabled: false,
+        scopes: Vec::new(),
+        // Persistence goes through the injected store below, never through a
+        // path in this config.
+        cache_file: None,
+        redirect_port: REFRESH_REDIRECT_PORT,
+    };
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("building refresh HTTP client")?;
-    let disc: serde_json::Value = http
-        .get(&discovery_url)
-        .send()
-        .await
-        .with_context(|| format!("discovery GET {discovery_url} failed"))?
-        .error_for_status()
-        .with_context(|| format!("discovery GET {discovery_url} returned error"))?
-        .json()
-        .await
-        .context("parsing discovery JSON")?;
-    let token_endpoint = disc
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("discovery missing token_endpoint"))?;
+    let credential_store: Arc<dyn CredentialStore> = store;
+    let helper = OAuthHelper::new(config)
+        .map_err(|e| anyhow::anyhow!("OAuth setup failed: {e}"))?
+        .with_credential_store(credential_store)
+        .with_account_scope(CLI_ACCOUNT_SCOPE)
+        .with_interactivity(Interactivity::RefreshOnly);
 
-    #[derive(Deserialize)]
-    struct TokenRsp {
-        access_token: String,
-        #[serde(default)]
-        refresh_token: Option<String>,
-        #[serde(default)]
-        expires_in: Option<u64>,
-    }
-    let form = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", entry.client_id.as_str()),
-    ];
-    let rsp: TokenRsp = http
-        .post(token_endpoint)
-        .form(&form)
-        .send()
+    helper
+        .get_access_token()
         .await
-        .context("refresh_token POST failed")?
-        .error_for_status()
-        .with_context(|| {
-            format!("refresh failed — run `cargo pmcp auth login {key}` to re-authenticate")
-        })?
-        .json()
-        .await
-        .context("parsing token response JSON")?;
-
-    // Persist the new token + rotated refresh_token (if IdP rotated it).
-    let mut cache = TokenCacheV1::read(cache_path)?;
-    let new_access_token = rsp.access_token.clone();
-    let mut updated = entry.clone();
-    updated.access_token = new_access_token.clone();
-    if let Some(new_rt) = rsp.refresh_token {
-        updated.refresh_token = Some(new_rt);
-    }
-    if let Some(ttl) = rsp.expires_in {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        updated.expires_at = Some(now + ttl);
-    }
-    cache.entries.insert(key.to_string(), updated);
-    cache.write_atomic(cache_path)?;
-
-    Ok(new_access_token)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 // =============================
@@ -270,137 +281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_lowercases_host_and_strips_path_and_trailing_slash() {
-        assert_eq!(
-            normalize_cache_key("HTTPS://MCP.Example.Com/").unwrap(),
-            "https://mcp.example.com"
-        );
-        assert_eq!(
-            normalize_cache_key("https://mcp.example.com:443/v1/api").unwrap(),
-            "https://mcp.example.com"
-        );
-        assert_eq!(
-            normalize_cache_key("http://example.com:80").unwrap(),
-            "http://example.com"
-        );
-        assert_eq!(
-            normalize_cache_key("http://localhost:8080/mcp").unwrap(),
-            "http://localhost:8080"
-        );
-    }
-
-    #[test]
-    fn normalize_errors_on_invalid_url() {
-        assert!(normalize_cache_key("not a url").is_err());
-    }
-
-    #[test]
-    fn read_missing_file_returns_empty_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("does-not-exist.json");
-        let c = TokenCacheV1::read(&p).unwrap();
-        assert_eq!(c.schema_version, 1);
-        assert!(c.entries.is_empty());
-    }
-
-    #[test]
-    fn read_rejects_wrong_schema_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("bad.json");
-        std::fs::write(&p, r#"{"schema_version":99,"entries":{}}"#).unwrap();
-        let err = TokenCacheV1::read(&p).unwrap_err();
-        assert!(format!("{err}").contains("unsupported"), "got {err}");
-    }
-
-    #[test]
-    fn write_then_read_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("cache.json");
-        let mut c = TokenCacheV1::empty();
-        c.entries.insert(
-            "https://mcp.example.com".into(),
-            TokenCacheEntry {
-                access_token: "at".into(),
-                refresh_token: Some("rt".into()),
-                expires_at: Some(9_999_999_999),
-                scopes: vec!["openid".into()],
-                issuer: Some("https://issuer.example".into()),
-                client_id: "cid".into(),
-            },
-        );
-        c.write_atomic(&p).unwrap();
-        let back = TokenCacheV1::read(&p).unwrap();
-        assert_eq!(back.entries.len(), 1);
-        assert_eq!(
-            back.entries
-                .get("https://mcp.example.com")
-                .unwrap()
-                .access_token,
-            "at"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_sets_0600_perms_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join(".pmcp").join("oauth-cache.json");
-        TokenCacheV1::empty().write_atomic(&p).unwrap();
-        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "cache file mode = {:o}", mode);
-    }
-
-    #[test]
-    fn is_near_expiry_true_within_60s() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let entry = TokenCacheEntry {
-            access_token: "at".into(),
-            refresh_token: None,
-            expires_at: Some(now + 30),
-            scopes: vec![],
-            issuer: None,
-            client_id: "c".into(),
-        };
-        assert!(is_near_expiry(&entry, 60));
-    }
-
-    #[test]
-    fn is_near_expiry_false_with_no_expiry() {
-        let entry = TokenCacheEntry {
-            access_token: "at".into(),
-            refresh_token: None,
-            expires_at: None,
-            scopes: vec![],
-            issuer: None,
-            client_id: "c".into(),
-        };
-        assert!(!is_near_expiry(&entry, 60));
-    }
-
-    #[tokio::test]
-    async fn refresh_errors_when_no_refresh_token() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("cache.json");
-        let entry = TokenCacheEntry {
-            access_token: "at".into(),
-            refresh_token: None,
-            expires_at: Some(0),
-            scopes: vec![],
-            issuer: Some("https://issuer.example".into()),
-            client_id: "c".into(),
-        };
-        let err = refresh_and_persist(&p, "https://x.example", &entry)
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("no refresh_token"), "got {err}");
-    }
-
-    #[test]
-    fn default_multi_cache_path_ends_in_oauth_cache_json() {
+    fn auth_cmd_default_path_ends_in_oauth_cache_json() {
         let p = default_multi_cache_path();
         let s = p.to_string_lossy();
         assert!(
@@ -408,62 +289,90 @@ mod tests {
             "got: {s}"
         );
     }
-}
 
-#[cfg(test)]
-mod proptests {
-    use super::*;
-    use proptest::prelude::*;
-    use proptest::test_runner::TestCaseError;
+    #[test]
+    fn auth_cmd_normalize_folds_slash_case_and_default_port() {
+        assert_eq!(
+            normalize_server_key("HTTPS://MCP.Example.Com/").unwrap(),
+            "https://mcp.example.com"
+        );
+        assert_eq!(
+            normalize_server_key("https://mcp.example.com:443/v1/api").unwrap(),
+            "https://mcp.example.com"
+        );
+        assert_eq!(
+            normalize_server_key("http://localhost:8080/mcp").unwrap(),
+            "http://localhost:8080"
+        );
+        assert!(normalize_server_key("not a url").is_err());
+    }
 
-    proptest! {
-        #[test]
-        fn normalize_round_trip_idempotent(
-            scheme in prop_oneof![Just("http"), Just("https")],
-            // Well-formed DNS hostnames only: each label starts with a letter and
-            // is alphanumeric. This deliberately excludes hyphens so the generator
-            // cannot emit IDNA-reserved R-LDH / ACE labels (e.g. `xn--…`), leading/
-            // trailing hyphens, or empty labels — inputs the URL normalizer rightly
-            // rejects as invalid domains. The property under test is round-trip
-            // idempotency over VALID server URLs, not IDNA validation.
-            host in "[a-z][a-z0-9]{0,10}(\\.[a-z][a-z0-9]{0,10}){0,2}\\.example",
-            port_opt in prop::option::of(1025u16..60000),
-            path in "/[a-z]{0,10}",
-        ) {
-            let port_part = port_opt.map(|p| format!(":{p}")).unwrap_or_default();
-            let raw = format!("{scheme}://{host}{port_part}{path}");
-            let n1 = normalize_cache_key(&raw)
-                .map_err(|e| TestCaseError::fail(format!("normalize raw failed: {e}")))?;
-            let n2 = normalize_cache_key(&n1)
-                .map_err(|e| TestCaseError::fail(format!("normalize n1 failed: {e}")))?;
-            prop_assert_eq!(n1, n2);
-        }
+    #[test]
+    fn auth_cmd_near_expiry_window_matches_the_documented_60_seconds() {
+        let now = current_unix_secs();
+        assert!(is_near_expiry(
+            &StoredCredentials::new("at", "c").with_expires_at(now + 30),
+            REFRESH_WINDOW_SECS
+        ));
+        assert!(!is_near_expiry(
+            &StoredCredentials::new("at", "c").with_expires_at(now + 3600),
+            REFRESH_WINDOW_SECS
+        ));
+        // No recorded expiry is treated as long-lived, not as "refresh now".
+        assert!(!is_near_expiry(
+            &StoredCredentials::new("at", "c"),
+            REFRESH_WINDOW_SECS
+        ));
+    }
 
-        #[test]
-        fn cache_serde_roundtrip(
-            access in "[a-zA-Z0-9._-]{8,40}",
-            has_refresh in any::<bool>(),
-            has_expiry in any::<bool>(),
-            n_scopes in 0usize..4,
-        ) {
-            let mut c = TokenCacheV1::empty();
-            c.entries.insert(
-                "https://x.example".into(),
-                TokenCacheEntry {
-                    access_token: access.clone(),
-                    refresh_token: has_refresh.then(|| "rt".to_string()),
-                    expires_at: has_expiry.then_some(1_234_567_890),
-                    scopes: (0..n_scopes).map(|i| format!("s{i}")).collect(),
-                    issuer: Some("https://issuer.example".into()),
-                    client_id: "cid".into(),
-                },
-            );
-            let s = serde_json::to_string(&c).unwrap();
-            let back: TokenCacheV1 = serde_json::from_str(&s).unwrap();
-            prop_assert_eq!(
-                back.entries.get("https://x.example").unwrap().access_token.clone(),
-                access
-            );
-        }
+    #[test]
+    fn auth_cmd_account_scope_is_empty_so_the_cli_invents_no_identity() {
+        assert_eq!(CLI_ACCOUNT_SCOPE, "");
+        let key = CredentialKey::new("https://as.example", CLI_ACCOUNT_SCOPE, "https://x.example");
+        assert_eq!(key.account(), "");
+        assert_eq!(key.issuer(), "https://as.example");
+        assert_eq!(key.server(), "https://x.example");
+    }
+
+    #[tokio::test]
+    async fn auth_cmd_load_for_server_resolves_through_the_recorded_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path().join("oauth-cache.json"));
+        let key = CredentialKey::new(
+            "https://as.example",
+            CLI_ACCOUNT_SCOPE,
+            "https://mcp.example",
+        );
+        store
+            .save_with_issuer(
+                &key,
+                &StoredCredentials::new("at", "cid"),
+                "https://mcp.example",
+                "https://as.example",
+            )
+            .await
+            .unwrap();
+
+        let (found_key, found) = load_for_server(&store, "https://mcp.example")
+            .await
+            .unwrap()
+            .expect("credentials present");
+        assert_eq!(found_key, key);
+        assert_eq!(found.access_token(), "at");
+
+        assert!(load_for_server(&store, "https://other.example")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_cmd_load_for_server_is_a_miss_on_a_store_that_was_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path().join("does-not-exist.json"));
+        assert!(load_for_server(&store, "https://mcp.example")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

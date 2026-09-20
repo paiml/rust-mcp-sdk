@@ -28,6 +28,8 @@ pub trait ToolHandler: Send + Sync {
         Ok(ListToolsResult {
             tools: vec![],
             next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
         })
     }
 

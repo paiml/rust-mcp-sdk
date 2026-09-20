@@ -50,6 +50,23 @@ use commands::GlobalFlags;
   cargo pmcp doctor                  Diagnose workspace health
   cargo pmcp completions zsh         Generate shell completions")]
 struct Cli {
+    /// Dump every HTTP request and response the SDK puts on the wire.
+    ///
+    /// Answers "what did we actually send?" — the first question when a
+    /// deployed server rejects something. Shows the request line, the headers
+    /// (including the v2 routing trio `MCP-Protocol-Version` / `Mcp-Method` /
+    /// `Mcp-Name`) and the body, plus the response status and headers.
+    ///
+    /// Credential and session headers are REDACTED: a wire dump is exactly the
+    /// artifact that ends up in a bug report or a CI artifact.
+    ///
+    /// A preset over the SDK's `pmcp::wire` tracing target, so the equivalent
+    /// without the flag is `RUST_LOG=pmcp::wire=debug`, and any
+    /// `tracing_subscriber` layer composes with it. Most useful with
+    /// `cargo pmcp test conformance` and the post-deploy verifiers.
+    #[arg(long, global = true)]
+    dump_wire: bool,
+
     /// Enable verbose output for debugging
     #[arg(long, short, global = true)]
     verbose: bool,
@@ -189,10 +206,50 @@ enum Commands {
         command: commands::team::TeamCommand,
     },
 
-    /// Inspect and capture portable AI-Package bundles
+    /// Move AI-Package bundles between a working layout, a local file, and pmcp.run
     ///
-    /// `package show` prints an AI-Package manifest; `package capture` captures
-    /// a bundle for a platform target selected by the capture-local `--target`.
+    /// The group spans THREE directions, in the vocabulary agreed with the pmcp.run
+    /// platform team on 2026-08-26 (D-09). It follows Docker's split deliberately —
+    /// `save`/`load` for the local file round trip, `push`/`pull` for the registry,
+    /// `import` for admitting something into the system — so a reader who has used a
+    /// container CLI already knows what the three directions mean:
+    ///
+    ///   LOCAL FILE      `save` writes a package out to one movable tar file, and
+    ///                   `load` reads one back into a working layout. `inspect`
+    ///                   reads a working layout in place. None touch the network.
+    ///
+    ///   PUBLISHED       `pull` fetches a published artifact from pmcp.run and
+    ///   ARTIFACT        installs it through the same verification `load` uses.
+    ///                   `show` fetches and renders a published WORKFLOW manifest;
+    ///                   `capture` submits a capture job that produces a package
+    ///                   platform-side. There is no upload direction — `push` and
+    ///                   `export` are retired (D-01), because `capture` already
+    ///                   does that job.
+    ///
+    ///   ENVIRONMENT     `import` ADMITS a package into an environment, and
+    ///                   `approve` records an approval for one. Both are
+    ///                   operations on the pmcp.run control plane, not on files.
+    ///
+    /// Eight verbs, three directions. `import`'s meaning is fixed across the CLI,
+    /// the pmcp.run API and its admin UI (D-03) — this preamble describes it, it
+    /// does not restate or narrow it.
+    //
+    // PLACEMENT: this is the variant's doc comment, which clap renders as
+    // `long_about` ABOVE the `Usage:` line — measured by executing the built
+    // binary. `#[command(after_long_help = "...")]`, used by `Dev` below, was the
+    // alternative and would render BELOW `Commands:`. The doc comment was chosen
+    // for two reasons: D-09 asks for a PREAMBLE, and a legend that frames the verb
+    // list should be read before it, not after; and the text it replaces was itself
+    // the `long_about` and was factually wrong (it claimed `show` prints an
+    // AI-Package manifest — it fetches a published WORKFLOW manifest — and it named
+    // two of the eight verbs). Splitting the correction across two attributes would
+    // have left a stale `long_about` above a correct legend below.
+    //
+    // `verbatim_doc_comment` is required: without it clap joins consecutive
+    // non-empty doc lines into one paragraph, which would collapse the three
+    // direction blocks into a single unreadable run-on. `verb_help.rs` asserts the
+    // three direction phrases are present in the rendered output.
+    #[command(verbatim_doc_comment)]
     Package {
         #[command(subcommand)]
         command: commands::package::PackageCommand,
@@ -450,6 +507,42 @@ enum AddCommands {
     },
 }
 
+/// Install the tracing subscriber that collects the SDK's wire events.
+///
+/// `cargo-pmcp` drives the SDK as a LIBRARY, so `pmcp::wire` events are emitted
+/// on every request it makes — but until this call nothing collected them, and a
+/// `--dump-wire` here would have printed nothing at all. That is the whole gap
+/// this closes: the same instrumentation `mcp-tester --dump-wire` surfaces is
+/// available to `cargo pmcp test conformance` and the post-deploy verifiers.
+///
+/// A preset, not a parallel logger: `RUST_LOG` wins when set, and the flag is
+/// ADDITIVE to it. With neither, no subscriber is installed and the SDK's
+/// `enabled()` guards keep every wire path from allocating.
+fn init_wire_tracing(dump_wire: bool) {
+    let wire_directive = format!("{}=debug", pmcp::shared::wire_trace::WIRE_TARGET);
+    let filter = match (std::env::var("RUST_LOG").is_ok(), dump_wire) {
+        // An explicit RUST_LOG is a deliberate choice; the flag adds to it.
+        (true, true) => tracing_subscriber::EnvFilter::from_default_env().add_directive(
+            wire_directive
+                .parse()
+                .expect("the wire directive is a compile-time constant"),
+        ),
+        (true, false) => tracing_subscriber::EnvFilter::from_default_env(),
+        // Wire frames ONLY: turning on `pmcp=debug` wholesale would bury the
+        // frames the user asked for under unrelated SDK output.
+        (false, true) => tracing_subscriber::EnvFilter::new(wire_directive),
+        // Nothing requested — install nothing, so there is no subscriber to pay
+        // for and the SDK's guards short-circuit.
+        (false, false) => return,
+    };
+    // `try_init`, not `init`: a subscriber may already be installed by an
+    // embedding process, and a diagnostic flag must never panic the CLI.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> Result<()> {
     // Handle cargo subcommand invocation
     // When called as `cargo pmcp`, cargo passes "pmcp" as the first argument
@@ -494,6 +587,10 @@ fn main() -> Result<()> {
     if effective_quiet {
         std::env::set_var("PMCP_QUIET", "1");
     }
+
+    // Install the wire-trace subscriber BEFORE any command runs, so a dump
+    // covers the whole invocation rather than starting mid-flight.
+    init_wire_tracing(cli.dump_wire);
 
     let global_flags = GlobalFlags {
         verbose: cli.verbose,

@@ -7,7 +7,12 @@
 # is excluded from the published crate via Cargo.toml `exclude = [..., "tests/"]`),
 # this file lives under examples/ and SHIPS with the published crate, so users can:
 #
-#   pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
+#   TFL_BASE_URL=https://api.tfl.gov.uk TFL_APP_KEY=<your-key> \
+#     pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
+#
+# BOTH variables are required. `base_url` is the `${TFL_BASE_URL}` slot (see
+# ENDPOINT IS A SLOT below), so the bare one-line form this comment used to show
+# now fails at startup with `UnresolvedBaseUrlRef { var: "TFL_BASE_URL" }`.
 #
 # It mirrors the enriched tests/fixtures/london-tube.toml surface: the same two
 # read-only TfL tools with full annotations, the same three [[resources]], and the
@@ -18,6 +23,23 @@
 # process env at provider-construction time; omitted when unset, since
 # `required = false`). The inline `token_secret` is a DEV-ONLY literal guarded by
 # `allow_inline_token_secret_for_dev = true` — NEVER set that flag in production.
+#
+# ENDPOINT IS A SLOT (Phase 120 / PKG-03 / D-04): `base_url` is the
+# `${TFL_BASE_URL}` placeholder, NOT a baked literal, so this config's package
+# digest is environment-INDEPENDENT — the same package moves between
+# environments and each one supplies its own endpoint. The endpoint the package
+# was tested against survives as the endpoint slot's `tested_value` (a public
+# URL) and in this comment, never on a `base_url` assignment. Point the binary
+# at this file with BOTH variables set:
+#
+#   TFL_BASE_URL=https://api.tfl.gov.uk TFL_APP_KEY=<your-key> \
+#     pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
+#
+# AUTH MODE IS DECLARED BUT BAKED (D-17): `[backend.auth] type` stays the
+# literal `"api_key"`. `AuthConfig` is `#[serde(tag = "type")]`, so
+# `type = "${AUTH_MODE}"` is an unparseable `unknown variant` — the auth-mode key
+# is exempt from the placeholder rule as STRUCTURAL. Its baked value IS the
+# default; deviation surfaces through slot classification, not a placeholder.
 
 [server]
 name = "london-tube"
@@ -25,11 +47,41 @@ version = "1.1.0"
 description = "London Underground line status + disruptions over the TfL API (pointable showcase config)."
 
 # =============================================================================
+# Config slots — what the TARGET environment must supply (PKG-03)
+# =============================================================================
+# Three slots: the endpoint, the api-key credential, and the auth mode. The
+# `kind` values are the toolkit's closed `ConfigSlotKind` vocabulary
+# (`endpoint` | `secret` | `auth_mode`) — an invented kind is a PARSE error
+# here, not a mismatch discovered two crates away at pack time.
+
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+# The endpoint this package was tested against — recorded as DATA rather than
+# baked into the file. A public URL, never a credential.
+tested_value = "https://api.tfl.gov.uk"
+
+[[config_slots]]
+key = "backend.auth.query_params.app_key"
+kind = "secret"
+name = "TFL_APP_KEY"
+# NO `tested_value`: identity-bearing slots structurally carry no value.
+
+[[config_slots]]
+key = "backend.auth.type"
+kind = "auth_mode"
+name = "backend-auth-mode"
+tested_value = "api_key"
+
+# =============================================================================
 # Backend — TfL API, api_key carried as a QUERY parameter (D-04 path)
 # =============================================================================
 
 [backend]
-base_url = "https://api.tfl.gov.uk"
+# Resolved from the process env at dispatch time. An unset or empty
+# `TFL_BASE_URL` is a typed error — never a literal `${...}` reaching the wire.
+base_url = "${TFL_BASE_URL}"
 
 [backend.auth]
 type = "api_key"

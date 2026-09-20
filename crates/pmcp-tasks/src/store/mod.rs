@@ -409,6 +409,190 @@ pub trait TaskStore: Send + Sync {
     /// This method is synchronous (not async) since it returns a reference
     /// to a configuration value that does not require I/O.
     fn config(&self) -> &StoreConfig;
+
+    // ---- v2 tasks extension: input delivery (additive, defaulted) ----
+    //
+    // Every method below is ADDITIVE WITH A DEFAULT, specifically so that
+    // out-of-tree `TaskStore` implementations keep compiling unchanged. Unlike
+    // the required methods above, omitting them is legal; the default then says
+    // so explicitly rather than silently succeeding.
+    //
+    // All five cross the `serde_json::Value` seam in both directions. This crate
+    // sits BELOW that seam: the typed `InputRequests` / `InputResponses` /
+    // `TaskInputDelivery` / `TaskInputSnapshot` shapes live in `pmcp` above it,
+    // and re-declaring them here would put the same wire contract in two places.
+
+    /// Delivers a client's `inputResponses` against the task's SERVER-recorded
+    /// `inputRequests`, scoped to `owner_id`.
+    ///
+    /// `responses` is a JSON object keyed by the server-assigned input key. The
+    /// return value is a JSON object with three members, mirroring `pmcp`'s
+    /// `TaskInputDelivery` field for field so the layer above can build the
+    /// typed value without a second read:
+    ///
+    /// | Key | Type | Meaning |
+    /// |-----|------|---------|
+    /// | `accepted` | `string[]` | Keys that were outstanding and unanswered, and whose responses this call persisted |
+    /// | `ignored`  | `string[]` | Keys that were NOT outstanding — never issued, already answered, or superseded |
+    /// | `complete` | `bool`     | Whether every outstanding request now has a response |
+    ///
+    /// # Partial delivery is legitimate
+    ///
+    /// A key that is not currently outstanding is IGNORED rather than turned
+    /// into an error, and a caller MAY deliver a subset of the outstanding keys.
+    /// A partial delivery persists its responses and the task REMAINS
+    /// [`TaskStatus::InputRequired`] until the rest arrive.
+    ///
+    /// # Bounds are NOT enforced here
+    ///
+    /// The four `inputResponses` denial-of-service bounds — entry COUNT, ONE
+    /// entry's serialized size, TOTAL serialized size, and one entry's nesting
+    /// DEPTH — are enforced above this seam at request ingress, before any
+    /// decode, so an oversized payload never reaches a store. An implementation
+    /// must not re-check them and must not mint limits of its own. (The fifth,
+    /// adjacent bound on the MRTR `requestState` continuation token does NOT
+    /// apply: a `tasks/update` carries no continuation token. Four, not five.)
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`TaskError::StoreError`]
+    /// ("store does not support task input delivery"). Overriding
+    /// implementations return:
+    ///
+    /// - [`TaskError::NotFound`] if no task with the given ID exists, or it
+    ///   belongs to a different owner (owner mismatch is indistinguishable from
+    ///   not found for security).
+    /// - [`TaskError::Expired`] if the task's TTL has elapsed.
+    /// - [`TaskError::InvalidTransition`] if the task is not awaiting input — a
+    ///   terminal or still-`working` task cannot be fed.
+    /// - [`TaskError::ConcurrentModification`] if another writer modified the
+    ///   task between this call's read and its write.
+    /// - [`TaskError::StoreError`] on backend failures, or if `responses` is not
+    ///   a JSON object.
+    async fn deliver_inputs(
+        &self,
+        _task_id: &str,
+        _owner_id: &str,
+        _responses: Value,
+    ) -> Result<Value, TaskError> {
+        Err(TaskError::StoreError(
+            "store does not support task input delivery".to_string(),
+        ))
+    }
+
+    /// Reads the task's input state — the server-recorded requests, the
+    /// delivered responses and the current status — scoped to `owner_id`.
+    ///
+    /// Returns a JSON object with `inputRequests`, `inputResponses` and
+    /// `status`. The *outstanding* (recorded-but-unanswered) subset is derived
+    /// above this seam from those two maps rather than duplicated here, so the
+    /// two layers cannot disagree about what "outstanding" means.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`TaskError::NotFound`] — a
+    /// store that records no input requests has no snapshot to return.
+    /// Overriding implementations return:
+    ///
+    /// - [`TaskError::NotFound`] if no task with the given ID exists, it belongs
+    ///   to a different owner, or it has no recorded input requests.
+    /// - [`TaskError::StoreError`] on backend failures.
+    async fn task_input_snapshot(
+        &self,
+        task_id: &str,
+        _owner_id: &str,
+    ) -> Result<Value, TaskError> {
+        Err(TaskError::NotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Records the inputs the server needs before this task can continue and
+    /// transitions it to [`TaskStatus::InputRequired`] in the SAME write, so a
+    /// task is never observable as `input_required` with nothing to answer.
+    ///
+    /// # `requests` is SERVER-AUTHORED
+    ///
+    /// `requests` MUST be authored by the server and MUST NOT be sourced from
+    /// anything a client sent. What is written here is the only trustworthy
+    /// record of which KIND was asked for under each key; letting a client
+    /// influence it would let the client choose how its own answer is typed.
+    ///
+    /// Returns the paused task as a JSON object.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`TaskError::StoreError`]
+    /// ("store does not support recording task input requests"). Overriding
+    /// implementations return:
+    ///
+    /// - [`TaskError::NotFound`] if no task with the given ID exists, or it
+    ///   belongs to a different owner.
+    /// - [`TaskError::Expired`] if the task's TTL has elapsed.
+    /// - [`TaskError::InvalidTransition`] if the task cannot move to
+    ///   [`TaskStatus::InputRequired`] — it is terminal, or it is already
+    ///   awaiting input.
+    /// - [`TaskError::ConcurrentModification`] on a CAS conflict.
+    /// - [`TaskError::StoreError`] on backend failures, if `requests` is not a
+    ///   JSON object, or if a key is already recorded (which would orphan or
+    ///   erase a response already delivered against it).
+    async fn record_input_requests(
+        &self,
+        _task_id: &str,
+        _owner_id: &str,
+        _requests: Value,
+    ) -> Result<Value, TaskError> {
+        Err(TaskError::StoreError(
+            "store does not support recording task input requests".to_string(),
+        ))
+    }
+
+    /// Persists the JSON-RPC error object for a failed task, scoped to
+    /// `owner_id`, so a v2 `tasks/get` can inline it.
+    ///
+    /// The value is the JSON-RPC error OBJECT (`code`/`message`/`data`) exactly
+    /// as it will appear on the wire, carried verbatim rather than re-typed.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`TaskError::StoreError`]
+    /// ("store does not support task errors"). Overriding implementations
+    /// return:
+    ///
+    /// - [`TaskError::NotFound`] if no task with the given ID exists, or it
+    ///   belongs to a different owner.
+    /// - [`TaskError::Expired`] if the task's TTL has elapsed.
+    /// - [`TaskError::ConcurrentModification`] on a CAS conflict.
+    /// - [`TaskError::StoreError`] on backend failures.
+    async fn set_error(
+        &self,
+        _task_id: &str,
+        _owner_id: &str,
+        _error: Value,
+    ) -> Result<(), TaskError> {
+        Err(TaskError::StoreError(
+            "store does not support task errors".to_string(),
+        ))
+    }
+
+    /// Retrieves the persisted JSON-RPC error object for a task, scoped to
+    /// `owner_id`.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always returns [`TaskError::NotFound`] — a
+    /// store that persists no errors has none to return. Overriding
+    /// implementations return:
+    ///
+    /// - [`TaskError::NotFound`] if no task with the given ID exists, it belongs
+    ///   to a different owner, or it recorded no error (it did not fail, or has
+    ///   not failed yet).
+    /// - [`TaskError::StoreError`] on backend failures.
+    async fn get_error(&self, task_id: &str, _owner_id: &str) -> Result<Value, TaskError> {
+        Err(TaskError::NotFound {
+            task_id: task_id.to_string(),
+        })
+    }
 }
 
 // ---- Blanket impl for GenericTaskStore<B> ----
@@ -487,6 +671,48 @@ impl<B: StorageBackend + 'static> TaskStore for generic::GenericTaskStore<B> {
 
     fn config(&self) -> &StoreConfig {
         self.config()
+    }
+
+    // The five input-delivery methods are forwarded here for the same reason as
+    // the eleven above: without a forwarding line the blanket impl would inherit
+    // the trait's not-supported DEFAULT, and every `Arc<dyn TaskStore>` built
+    // from a `GenericTaskStore` would report "store does not support task input
+    // delivery" while the inherent method right next to it worked.
+
+    async fn deliver_inputs(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        responses: Value,
+    ) -> Result<Value, TaskError> {
+        self.deliver_inputs(task_id, owner_id, responses).await
+    }
+
+    async fn task_input_snapshot(&self, task_id: &str, owner_id: &str) -> Result<Value, TaskError> {
+        self.task_input_snapshot(task_id, owner_id).await
+    }
+
+    async fn record_input_requests(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        requests: Value,
+    ) -> Result<Value, TaskError> {
+        self.record_input_requests(task_id, owner_id, requests)
+            .await
+    }
+
+    async fn set_error(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        error: Value,
+    ) -> Result<(), TaskError> {
+        self.set_error(task_id, owner_id, error).await
+    }
+
+    async fn get_error(&self, task_id: &str, owner_id: &str) -> Result<Value, TaskError> {
+        self.get_error(task_id, owner_id).await
     }
 }
 

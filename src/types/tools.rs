@@ -155,10 +155,15 @@ impl ToolExecution {
     /// Marking a tool with [`TaskSupport::Required`] and registering a
     /// [`TaskStore`](crate::server::task_store::TaskStore) on the server (via
     /// [`ServerCoreBuilder::task_store`](crate::server::builder::ServerCoreBuilder::task_store))
-    /// is how you expose a tool as an async MCP Task: the SDK then serves
-    /// `tasks/get`, `tasks/result`, `tasks/list`, and `tasks/cancel` typed from
-    /// the store. See `examples/s45_tool_as_task_lifecycle.rs` for the full
-    /// pattern.
+    /// is how you expose a tool as an async MCP Task: the SDK then serves the
+    /// `tasks/*` surface typed from the store. Which methods that is depends on
+    /// the negotiated era (Phase 114) — v1 (2025-11-25) serves `tasks/get`,
+    /// `tasks/result`, `tasks/list` and `tasks/cancel`; v2 (2026-07-28) serves
+    /// `tasks/get`, `tasks/update` and `tasks/cancel`, with `tasks/list` and
+    /// `tasks/result` retired to `-32601`. See
+    /// `examples/s45_tool_as_task_lifecycle.rs` (v1) and
+    /// `examples/s50_v2_tasks_server.rs` + `examples/s51_v2_tasks_agent.rs`
+    /// (v2) for the full pattern.
     ///
     /// A `Required` tool with no task backend makes the server's `build()`
     /// return an error (never a hollow `tasks` capability).
@@ -429,6 +434,73 @@ pub struct ListToolsResult {
     /// Pagination cursor for next page
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+
+    /// How long (in milliseconds) a client MAY cache this response — the
+    /// `2026-07-28` `CacheableResult.ttlMs` hint.
+    ///
+    /// `u64` is the MEASURED mapping: the vendored artifact declares
+    /// `$defs.CacheableResult.properties.ttlMs` as
+    /// `{"type": "integer", "minimum": 0}` (asserted by
+    /// `tests/v2_core_schema_facts.rs`), so integrality and non-negativity are
+    /// contract. The one residual is the absent upper bound — JSON Schema
+    /// `integer` is unbounded while `u64` is not — which at millisecond
+    /// resolution is roughly 584 million years and is an ACCEPTED risk.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`DEFAULT_TTL_MS`](crate::types::DEFAULT_TTL_MS)
+    /// (`0`, "immediately stale") — D-08.
+    ///
+    /// **v2 only.** On a `2025-11-25` wire the key is never emitted, and a
+    /// value set here is actively STRIPPED (D-11).
+    ///
+    /// **Why `Option` when the wire says REQUIRED (D-07).** The field is
+    /// required on the `2026-07-28` projection, but modelling it as `Option`
+    /// plus inject-on-v2 fails CLOSED (a missed path merely omits a hint),
+    /// whereas a non-`Option` field plus strip-on-v1 fails OPEN (a missed path
+    /// leaks a v2 key onto the v1 wire).
+    ///
+    /// Not to be confused with
+    /// [`TaskV2::ttl_ms`](crate::types::tasks::TaskV2::ttl_ms), which is a task
+    /// LIFETIME rather than a cache-freshness hint (D-10).
+    ///
+    /// **No builder by design.** `ListToolsResult` is built by the dispatcher
+    /// from the registered tool set, with no handler seam, so a builder method
+    /// here would be public API no server author can reach through normal
+    /// configuration — unlike `ListResourcesResult` and `ReadResourceResult`,
+    /// which a [`ResourceHandler`](crate::server::ResourceHandler) returns from
+    /// `list` and `read` and which therefore do carry builders. The field stays
+    /// `pub`, so a caller constructing the struct directly can still set it.
+    ///
+    /// (`ListResourceTemplatesResult` carries builders too, but is NOT
+    /// handler-reachable — see its own note. Two of the six cacheable results
+    /// are settable through a handler, not three; 115-10 corrected an earlier
+    /// version of this paragraph that said three.)
+    ///
+    /// Adding this field is additive rather than a major bump because this
+    /// struct is `#[non_exhaustive]`, so `cargo semver-checks`'
+    /// `constructible_struct_adds_field` does not fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+
+    /// The intended sharing scope of the cached response — the `2026-07-28`
+    /// `CacheableResult.cacheScope` hint.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`CacheScope::Private`](crate::types::CacheScope)
+    /// (D-08). Read [`CacheScope`](crate::types::CacheScope)'s `# Security`
+    /// section before setting `Public`: it authorizes a shared gateway to serve
+    /// this body across authorization contexts.
+    ///
+    /// **v2 only.** On a `2025-11-25` wire the key is never emitted, and a
+    /// value set here is actively STRIPPED (D-11).
+    ///
+    /// **Why `Option` when the wire says REQUIRED (D-07):** see
+    /// [`ttl_ms`](Self::ttl_ms).
+    ///
+    /// **No builder by design** — see [`ttl_ms`](Self::ttl_ms). Additive under
+    /// semver for the same `#[non_exhaustive]` reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<crate::types::caching::CacheScope>,
 }
 
 impl ListToolsResult {
@@ -437,6 +509,8 @@ impl ListToolsResult {
         Self {
             tools,
             next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
         }
     }
 
@@ -457,8 +531,22 @@ pub struct CallToolRequest {
     /// Tool arguments (must match input schema)
     #[serde(default)]
     pub arguments: Value,
-    /// Request metadata (e.g., progress token)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Request metadata (e.g., progress token, per-request protocol context).
+    ///
+    /// # Wire spelling
+    ///
+    /// The explicit `rename` is load-bearing: the struct-level
+    /// `#[serde(rename_all = "camelCase")]` above would otherwise rename this
+    /// FIELD to `meta`, which is not the MCP spelling. `alias = "meta"` keeps
+    /// ingress compatible with pmcp peers built before Phase 113, which emitted
+    /// the renamed spelling. See `src/types/protocol/mod.rs` §
+    /// `every_meta_bearing_request_uses_the_spec_spelling_and_accepts_the_legacy_alias`.
+    #[serde(
+        rename = "_meta",
+        alias = "meta",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     #[allow(clippy::pub_underscore_fields)] // _meta is part of MCP protocol spec
     pub _meta: Option<RequestMeta>,
     /// Task augmentation parameters (experimental MCP Tasks).
@@ -542,6 +630,41 @@ pub struct CallToolResult {
     /// - Game board state (chess position, game score)
     /// - Query results (database rows, search results)
     /// - Form data (user selections, validated input)
+    ///
+    /// # Era: what shape is allowed
+    ///
+    /// The 2026-07-28 schema declares this field as `structuredContent?: unknown`
+    /// — *"An optional JSON value that represents the structured result of the
+    /// tool call. This can be any JSON value (object, array, string, number, boolean, or null)
+    /// that conforms to the tool's `outputSchema` if one is defined."*
+    /// (`CallToolResult` in the vendored `schema/vendored/core-2026-07-28/schema.ts`.)
+    ///
+    /// The 2025-11-25 (v1) schema text was narrower on BOTH halves:
+    /// `structuredContent?: { [key: string]: unknown }`, and `outputSchema` was
+    /// *"Currently restricted to `type: "object"` at the root level"*. v2 lifts
+    /// both restrictions.
+    ///
+    /// [`CallToolResult::structured_value`](Self::structured_value) is the
+    /// constructor that names a non-object payload; use it rather than
+    /// [`structured`](Self::structured) so the choice is greppable at the call
+    /// site.
+    ///
+    /// # pmcp's v1 permissiveness is FROZEN here, not corrected
+    ///
+    /// This field has always been `Option<Value>`, and neither native dispatcher
+    /// (`ServerCore` in `src/server/core.rs`, the high-level `Server` in
+    /// `src/server/mod.rs`) shape-checks the handler's value on the way out — so
+    /// pmcp already emits non-object `structuredContent` on **v1** today, which is
+    /// more permissive than v1's own spec text allows. Phase 115 decision D-05
+    /// freezes v1 behaviour byte-identically, so that over-permissiveness is
+    /// FROZEN rather than fixed: tightening v1 to reject scalars would ITSELF be a
+    /// v1 wire change, and is forbidden. Do not add a shape guard here "for
+    /// correctness" — `tests/structured_tool_output.rs` fences the v1 half on both
+    /// dispatchers precisely so a later tightening fails loudly.
+    ///
+    /// `skip_serializing_if` distinguishes the two absences that matter:
+    /// `None` omits the key entirely, while `Some(Value::Null)` emits an explicit
+    /// `"structuredContent": null` — a value v2 permits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
 
@@ -606,7 +729,10 @@ impl CallToolResult {
     /// from handlers that own their [`CallToolResult`] envelope.
     ///
     /// Use [`structured_with_text`](Self::structured_with_text) when the
-    /// human-readable voice should differ from the raw serialization.
+    /// human-readable voice should differ from the raw serialization, and
+    /// [`structured_value`](Self::structured_value) when the payload is NOT an
+    /// object (a scalar, an array or `null`) — this constructor keeps its
+    /// object-shaped intent so every existing call site reads the same way.
     ///
     /// # Example
     ///
@@ -650,6 +776,77 @@ impl CallToolResult {
     /// ```
     pub fn structured_with_text(value: Value, text: impl Into<String>) -> Self {
         Self::new(vec![Content::text(text.into())]).with_structured_content(value)
+    }
+
+    /// Create a structured success result whose payload is NOT a JSON object —
+    /// the widening sibling of [`structured`](Self::structured).
+    ///
+    /// The body is identical to [`structured`](Self::structured); the two differ
+    /// only in what they SAY. Reaching for this name is the deliberate, greppable
+    /// record at the call site that the payload is a scalar, an array or `null`
+    /// rather than the object shape most tools return. [`structured`](Self::structured)
+    /// keeps its exact signature and its object-shaped intent, so every existing
+    /// call site compiles and behaves identically (Phase 115 decision D-06).
+    ///
+    /// # Era
+    ///
+    /// The 2026-07-28 schema declares `structuredContent?: unknown` — *"An
+    /// optional JSON value that represents the structured result of the tool call.
+    /// This can be any JSON value (object, array, string, number, boolean, or null)
+    /// that conforms to the tool's `outputSchema` if one is defined."*
+    /// The 2025-11-25 schema text restricted it to
+    /// `{ [key: string]: unknown }`. pmcp's v1 wire behaviour is FROZEN as-is
+    /// rather than tightened — see the note on
+    /// [`structured_content`](Self::structured_content).
+    ///
+    /// # A declared `outputSchema` still applies (D-04)
+    ///
+    /// Widening the payload does not weaken the contract: if the tool declares an
+    /// `outputSchema`, that schema must DESCRIBE the scalar. `{"type":
+    /// "integer"}` accepts `42`; an object-shaped schema such as
+    /// `{"type": "object", "required": ["n"]}` does not.
+    ///
+    /// "Does not accept" here means a `tracing` **warning is logged at emit
+    /// time** — `src/server/output_validation.rs` is warn-only on BOTH eras, so a
+    /// mismatch never turns the call into an error result and never adds a
+    /// production failure mode. The tool call still succeeds and the value still
+    /// reaches the wire.
+    ///
+    /// # `Some(null)` is not `None`
+    ///
+    /// A `null` payload is a PRESENT value: it serializes as an explicit
+    /// `"structuredContent": null`, whereas a result that never set the field
+    /// omits the key entirely.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pmcp::types::CallToolResult;
+    /// use serde_json::json;
+    ///
+    /// // A tool whose declared outputSchema is `{"type": "integer"}`.
+    /// let result = CallToolResult::structured_value(json!(42));
+    ///
+    /// assert!(!result.is_error);
+    /// assert_eq!(result.structured_content, Some(json!(42)));
+    ///
+    /// // The text voice carries the same value, for text-only clients.
+    /// let pmcp::types::Content::Text { text } = &result.content[0] else {
+    ///     unreachable!()
+    /// };
+    /// assert_eq!(text, "42");
+    ///
+    /// // A null payload is present, not absent.
+    /// let null_result = CallToolResult::structured_value(json!(null));
+    /// assert_eq!(null_result.structured_content, Some(json!(null)));
+    /// let wire = serde_json::to_string(&null_result).unwrap();
+    /// assert!(wire.contains(r#""structuredContent":null"#));
+    /// ```
+    pub fn structured_value(value: Value) -> Self {
+        // Delegates rather than restating `structured`'s body: the two are
+        // documented as behaviourally identical, and a copy would let that
+        // claim silently rot the first time one of them changed.
+        Self::structured(value)
     }
 
     /// Add structured content for both model and widget.

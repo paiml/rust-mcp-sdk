@@ -22,3 +22,14 @@ name = "tube_status"
 description = "Tube line status (single-call)"
 path = "/Line/Mode/tube/Status"
 method = "GET"
+
+# --- Config slots (PKG-03) -----------------------------------------------
+# Declared so this seed also packs: pmcp-package 0.3.1's CONFIG -> SLOT gate
+# refuses an addressable `${VAR}` / `env:VAR` reference no slot names. The
+# parser under fuzz stores these verbatim; `kind = "secret"` is identity-bearing
+# and structurally carries no `tested_value`.
+
+[[config_slots]]
+key = "backend.auth.query_params.app_key"
+kind = "secret"
+name = "TFL_APP_KEY"

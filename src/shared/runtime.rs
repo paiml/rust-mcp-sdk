@@ -205,13 +205,25 @@ pub mod channel {
     pub use tokio::sync::mpsc::*;
 }
 
+/// A minimal single-process channel standing in for `tokio::sync::mpsc` on
+/// wasm32, where the tokio implementation is unavailable.
+///
+/// This tier is deliberately simple: wasm32 targets run single-threaded under a
+/// host event loop, so the queue is guarded by a plain `std::sync::Mutex` rather
+/// than an async-aware primitive. It is NOT a drop-in replacement for the native
+/// channel — see [`Receiver::recv`] for the one behavioural difference that
+/// matters.
 #[cfg(target_arch = "wasm32")]
 pub mod channel {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::task::Waker;
 
-    /// Simple channel implementation for WASM
+    /// Create a bounded sender/receiver pair.
+    ///
+    /// `buffer` sizes the initial queue allocation; unlike the native channel
+    /// this tier does NOT block or apply backpressure once that many items are
+    /// queued.
     pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
         let shared = Arc::new(Mutex::new(ChannelState {
             queue: VecDeque::with_capacity(buffer),
@@ -227,17 +239,26 @@ pub mod channel {
         )
     }
 
+    #[derive(Debug)]
     struct ChannelState<T> {
         queue: VecDeque<T>,
         closed: bool,
         waker: Option<Waker>,
     }
 
+    /// The sending half of a wasm32 [`channel`].
+    #[derive(Debug)]
     pub struct Sender<T> {
         shared: Arc<Mutex<ChannelState<T>>>,
     }
 
     impl<T> Sender<T> {
+        /// Queue `value`, waking a parked receiver if there is one.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SendError`] carrying `value` back when the channel is
+        /// closed, so the caller does not lose the payload.
         pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
             let mut state = self.shared.lock().unwrap();
             if state.closed {
@@ -251,11 +272,18 @@ pub mod channel {
         }
     }
 
+    /// The receiving half of a wasm32 [`channel`].
+    #[derive(Debug)]
     pub struct Receiver<T> {
         shared: Arc<Mutex<ChannelState<T>>>,
     }
 
     impl<T> Receiver<T> {
+        /// Pop the next queued item.
+        ///
+        /// Returns `None` when the queue is momentarily empty as well as when
+        /// the channel is closed — this tier does NOT park the task and wait,
+        /// which is the one place it diverges from `tokio::sync::mpsc`.
         pub async fn recv(&mut self) -> Option<T> {
             // Simplified implementation - would need proper async polling
             let mut state = self.shared.lock().unwrap();
@@ -263,6 +291,9 @@ pub mod channel {
         }
     }
 
+    /// Returned by [`Sender::send`] on a closed channel, carrying the payload
+    /// back to the caller.
+    #[derive(Debug)]
     pub struct SendError<T>(pub T);
 }
 

@@ -33,9 +33,10 @@
 //! Owner mismatch on any operation returns [`TaskError::NotFound`] -- the
 //! store never reveals that a task exists for a different owner.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use serde_json::Value;
+use pmcp::server::task_store::partition_input_delivery;
+use serde_json::{json, Map, Value};
 
 use crate::domain::record::{validate_variables, TaskRecord};
 use crate::error::TaskError;
@@ -218,17 +219,7 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.version = versioned.version;
 
         // Defense in depth: verify owner_id even though key is scoped
-        if record.owner_id != owner_id {
-            tracing::warn!(
-                task_id = task_id,
-                expected_owner = owner_id,
-                actual_owner = record.owner_id,
-                "owner mismatch on task get (returning NotFound)"
-            );
-            return Err(TaskError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        Self::check_owner(&record, task_id, owner_id, "get")?;
 
         Ok(record)
     }
@@ -255,25 +246,10 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.version = versioned.version;
 
         // Owner isolation
-        if record.owner_id != owner_id {
-            tracing::warn!(
-                task_id = task_id,
-                expected_owner = owner_id,
-                actual_owner = record.owner_id,
-                "owner mismatch on task update_status (returning NotFound)"
-            );
-            return Err(TaskError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        Self::check_owner(&record, task_id, owner_id, "update_status")?;
 
         // Reject mutations on expired tasks
-        if record.is_expired() {
-            return Err(TaskError::Expired {
-                task_id: task_id.to_string(),
-                expired_at: record.expires_at.map(|e| e.to_rfc3339()),
-            });
-        }
+        Self::check_not_expired(&record, task_id)?;
 
         // Validate state machine transition
         record
@@ -284,8 +260,7 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         // Apply transition
         record.task.status = new_status;
         record.task.status_message = status_message;
-        record.task.last_updated_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::touch(&mut record);
 
         // CAS write
         let bytes = Self::serialize_record(&record)?;
@@ -320,25 +295,10 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.version = versioned.version;
 
         // Owner isolation
-        if record.owner_id != owner_id {
-            tracing::warn!(
-                task_id = task_id,
-                expected_owner = owner_id,
-                actual_owner = record.owner_id,
-                "owner mismatch on task set_variables (returning NotFound)"
-            );
-            return Err(TaskError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        Self::check_owner(&record, task_id, owner_id, "set_variables")?;
 
         // Reject mutations on expired tasks
-        if record.is_expired() {
-            return Err(TaskError::Expired {
-                task_id: task_id.to_string(),
-                expired_at: record.expires_at.map(|e| e.to_rfc3339()),
-            });
-        }
+        Self::check_not_expired(&record, task_id)?;
 
         // Validate incoming variables for depth bombs and long strings
         validate_variables(
@@ -371,8 +331,7 @@ impl<B: StorageBackend> GenericTaskStore<B> {
 
         // Commit the merged variables
         record.variables = merged;
-        record.task.last_updated_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::touch(&mut record);
 
         // CAS write
         let bytes = Self::serialize_record(&record)?;
@@ -404,29 +363,13 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.version = versioned.version;
 
         // Owner isolation
-        if record.owner_id != owner_id {
-            tracing::warn!(
-                task_id = task_id,
-                expected_owner = owner_id,
-                actual_owner = record.owner_id,
-                "owner mismatch on task set_result (returning NotFound)"
-            );
-            return Err(TaskError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        Self::check_owner(&record, task_id, owner_id, "set_result")?;
 
         // Reject mutations on expired tasks
-        if record.is_expired() {
-            return Err(TaskError::Expired {
-                task_id: task_id.to_string(),
-                expired_at: record.expires_at.map(|e| e.to_rfc3339()),
-            });
-        }
+        Self::check_not_expired(&record, task_id)?;
 
         record.result = Some(result);
-        record.task.last_updated_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::touch(&mut record);
 
         // CAS write
         let bytes = Self::serialize_record(&record)?;
@@ -481,25 +424,10 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.version = versioned.version;
 
         // Owner isolation
-        if record.owner_id != owner_id {
-            tracing::warn!(
-                task_id = task_id,
-                expected_owner = owner_id,
-                actual_owner = record.owner_id,
-                "owner mismatch on task complete_with_result (returning NotFound)"
-            );
-            return Err(TaskError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        Self::check_owner(&record, task_id, owner_id, "complete_with_result")?;
 
         // Reject mutations on expired tasks
-        if record.is_expired() {
-            return Err(TaskError::Expired {
-                task_id: task_id.to_string(),
-                expired_at: record.expires_at.map(|e| e.to_rfc3339()),
-            });
-        }
+        Self::check_not_expired(&record, task_id)?;
 
         // Validate state machine transition
         record.task.status.validate_transition(task_id, &status)?;
@@ -508,8 +436,7 @@ impl<B: StorageBackend> GenericTaskStore<B> {
         record.task.status = status;
         record.task.status_message = status_message;
         record.result = Some(result);
-        record.task.last_updated_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::touch(&mut record);
 
         // CAS write
         let bytes = Self::serialize_record(&record)?;
@@ -598,6 +525,377 @@ impl<B: StorageBackend> GenericTaskStore<B> {
             .map_err(|e| Self::map_storage_error(e, ""))
     }
 
+    // -----------------------------------------------------------------------
+    // Shared record guards
+    //
+    // Every domain operation above and below runs the same three steps against a
+    // freshly-read record: prove the owner, refuse an expired task, stamp the
+    // update time. They live here ONCE. The owner rule in particular is
+    // security-critical — six hand-inlined copies is six places for a `NotFound`
+    // to become something that reveals another owner's task exists.
+    // -----------------------------------------------------------------------
+
+    /// Owner isolation, defence in depth.
+    ///
+    /// The owner-prefixed key already makes another owner's record unreachable
+    /// (a wrong owner produces a different key, so the read misses). This second
+    /// check catches a record whose stored `ownerId` disagrees with the key it
+    /// was found under, and reports it as `NotFound` so the store never reveals
+    /// that a task exists for someone else.
+    ///
+    /// `op` names the calling operation and travels as a structured log field,
+    /// so one message text serves every call site without any of them drifting.
+    fn check_owner(
+        record: &TaskRecord,
+        task_id: &str,
+        owner_id: &str,
+        op: &str,
+    ) -> Result<(), TaskError> {
+        if record.owner_id == owner_id {
+            return Ok(());
+        }
+        tracing::warn!(
+            task_id = task_id,
+            expected_owner = owner_id,
+            actual_owner = record.owner_id,
+            operation = op,
+            "owner mismatch on task operation (returning NotFound)"
+        );
+        Err(TaskError::NotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Rejects mutations on an expired task, matching the existing write paths.
+    fn check_not_expired(record: &TaskRecord, task_id: &str) -> Result<(), TaskError> {
+        if record.is_expired() {
+            return Err(TaskError::Expired {
+                task_id: task_id.to_string(),
+                expired_at: record.expires_at.map(|e| e.to_rfc3339()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stamps `lastUpdatedAt` with the store's canonical millisecond-precision
+    /// RFC 3339 encoding.
+    fn touch(record: &mut TaskRecord) {
+        record.task.last_updated_at =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // v2 tasks extension: input delivery
+    //
+    // These live here, once, for the same reason every other domain operation
+    // does: `GenericTaskStore<B>` is the ONE implementation and the backends are
+    // dumb KV stores, so the in-memory, DynamoDB and Redis deployments share
+    // identical semantics with zero divergence. Each operation below is a single
+    // `put_if_version` compare-and-set. There is deliberately NO internal retry
+    // and NO mutex around the read-then-write: a mutex would be local to one
+    // process and would not prevent a lost update across two Lambda invocations
+    // or two server instances, which is exactly the failure the CAS primitive
+    // exists to prevent. A conflict propagates to the caller as
+    // `ConcurrentModification` — first writer wins, second writer is told.
+    // -----------------------------------------------------------------------
+
+    /// Interprets a seam value as a JSON object. `null` and an absent value both
+    /// mean "empty", which is what lets a pre-v2 record and an omitted parameter
+    /// read the same way.
+    fn as_object(value: Value, field: &str) -> Result<Map<String, Value>, TaskError> {
+        match value {
+            Value::Object(map) => Ok(map),
+            Value::Null => Ok(Map::new()),
+            other => Err(TaskError::StoreError(format!(
+                "{field} must be a JSON object, got {}",
+                json_type_name(&other)
+            ))),
+        }
+    }
+
+    /// Delivers a client's `inputResponses` against the task's server-recorded
+    /// `inputRequests`, in ONE compare-and-set write.
+    ///
+    /// The atomic unit is *(persist the accepted responses [+ transition to
+    /// `Working` iff the outstanding set is now complete])*: both mutations land
+    /// in the same `put_if_version`, guaranteeing atomicity, so a task can never
+    /// be observed as resumed with its answers missing, nor answered while still
+    /// paused. A PARTIAL delivery persists and the task stays `input_required`.
+    ///
+    /// Keys that are not currently outstanding — never issued, already answered,
+    /// or superseded — are IGNORED and reported, not turned into errors. An
+    /// already-answered key is never re-accepted, so a delivered response cannot
+    /// be replayed over.
+    ///
+    /// See [`TaskStore::deliver_inputs`](crate::store::TaskStore::deliver_inputs)
+    /// for the returned shape and for why the payload bounds are NOT checked here.
+    ///
+    /// # Errors
+    ///
+    /// See [`TaskStore::deliver_inputs`](crate::store::TaskStore::deliver_inputs).
+    pub async fn deliver_inputs(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        responses: Value,
+    ) -> Result<Value, TaskError> {
+        self.check_anonymous_access(owner_id)?;
+        let delivered = Self::as_object(responses, "inputResponses")?;
+
+        let key = make_key(owner_id, task_id);
+        let versioned = self
+            .backend
+            .get(&key)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+
+        let mut record = Self::deserialize_record(&versioned.data)?;
+        record.version = versioned.version;
+
+        Self::check_owner(&record, task_id, owner_id, "deliver_inputs")?;
+        Self::check_not_expired(&record, task_id)?;
+
+        // Only a task that is AWAITING input may be fed, and the check runs
+        // through the SHARED state machine rather than a hand-written match.
+        // The predicate is exact: a transition to `Working` is legal from
+        // `InputRequired` ALONE -- `Working -> Working` is rejected as a
+        // self-transition and every terminal state is rejected outright. One
+        // call to the transition validator therefore expresses the whole rule,
+        // with no second predicate that could drift away from it.
+        record
+            .task
+            .status
+            .validate_transition(task_id, &TaskStatus::Working)?;
+
+        let outstanding: BTreeSet<String> = record
+            .input_requests
+            .as_ref()
+            .map(|requests| requests.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // The accept/ignore/complete decision is the SHARED policy, imported from
+        // `pmcp` rather than restated here. It reads key sets only, never values,
+        // which is what lets this `serde_json`-shaped store and the typed in-crate
+        // `InMemoryTaskStore` run the SAME decision procedure — the two copies had
+        // already begun to drift before it was extracted. The closure's borrow of
+        // `input_responses` ends with the call, leaving the persistence loop free
+        // to take `&mut`.
+        let delivery = partition_input_delivery(
+            &outstanding,
+            |wanted| {
+                record
+                    .input_responses
+                    .as_ref()
+                    .is_some_and(|answered| answered.contains_key(wanted))
+            },
+            delivered.keys().cloned(),
+        );
+
+        // Persist ONLY the accepted values; the ignored ones are reported back
+        // and dropped.
+        for (delivered_key, response) in delivered {
+            if delivery.accepted.contains(&delivered_key) {
+                record
+                    .input_responses
+                    .get_or_insert_with(Map::new)
+                    .insert(delivered_key, response);
+            }
+        }
+
+        // The `accepted` guard means a delivery that changed nothing cannot
+        // resume a paused task: vacuous completeness would let a caller restart
+        // a task using only keys the server never issued.
+        if delivery.complete && !delivery.accepted.is_empty() {
+            record.task.status = TaskStatus::Working;
+        }
+        Self::touch(&mut record);
+
+        let bytes = Self::serialize_record(&record)?;
+        self.backend
+            .put_if_version(&key, &bytes, versioned.version)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+
+        Ok(json!({
+            "accepted": delivery.accepted,
+            "ignored": delivery.ignored,
+            "complete": delivery.complete,
+        }))
+    }
+
+    /// Reads this task's input state — server-recorded requests, delivered
+    /// responses and current status — owner-scoped.
+    ///
+    /// Delegates its read and its owner rule to [`Self::get`], so a mismatch
+    /// reports `NotFound` through exactly the same branch as every other read.
+    ///
+    /// # Errors
+    ///
+    /// See
+    /// [`TaskStore::task_input_snapshot`](crate::store::TaskStore::task_input_snapshot).
+    pub async fn task_input_snapshot(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+    ) -> Result<Value, TaskError> {
+        let record = self.get(task_id, owner_id).await?;
+
+        // No recorded requests means there is no input state to snapshot. This
+        // is deliberately NOT an empty snapshot: "the server never asked for
+        // anything" and "the server asked for nothing in particular" are
+        // different facts and the caller needs to tell them apart.
+        let requests = record
+            .input_requests
+            .clone()
+            .ok_or_else(|| TaskError::NotFound {
+                task_id: task_id.to_string(),
+            })?;
+
+        Ok(json!({
+            "inputRequests": requests,
+            "inputResponses": record.input_responses.clone().unwrap_or_default(),
+            "status": record.task.status,
+        }))
+    }
+
+    /// Records the SERVER-authored inputs this task needs and transitions it to
+    /// `InputRequired`, in ONE compare-and-set write.
+    ///
+    /// # Multiple rounds
+    ///
+    /// A second round is permitted, but only once the previous round has been
+    /// fully answered — the transition validator refuses while the task is still
+    /// `input_required`, because `InputRequired -> InputRequired` is a rejected
+    /// self-transition. New keys are MERGED into the recorded set; a key that is
+    /// already recorded is REFUSED rather than overwritten, since overwriting it
+    /// would orphan (or, on a superseding write, erase) the response already
+    /// delivered against it. The spec requires keys to be unique over a task's
+    /// lifetime, so a collision is a server bug, not a client-reachable state.
+    ///
+    /// This is the documented relaxation of the in-crate `pmcp`
+    /// `InMemoryTaskStore`, which records exactly one round per task and refuses
+    /// a second outright. That store is a dev/test store; this one backs
+    /// production deployments where a multi-round elicitation is ordinary.
+    ///
+    /// # Errors
+    ///
+    /// See
+    /// [`TaskStore::record_input_requests`](crate::store::TaskStore::record_input_requests).
+    pub async fn record_input_requests(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        requests: Value,
+    ) -> Result<Value, TaskError> {
+        self.check_anonymous_access(owner_id)?;
+        let new_requests = Self::as_object(requests, "inputRequests")?;
+
+        let key = make_key(owner_id, task_id);
+        let versioned = self
+            .backend
+            .get(&key)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+
+        let mut record = Self::deserialize_record(&versioned.data)?;
+        record.version = versioned.version;
+
+        Self::check_owner(&record, task_id, owner_id, "record_input_requests")?;
+        Self::check_not_expired(&record, task_id)?;
+
+        // The shared state machine IS the refusal for a terminal task and for a
+        // task that is already awaiting input; there is no second predicate.
+        record
+            .task
+            .status
+            .validate_transition(task_id, &TaskStatus::InputRequired)?;
+
+        if let Some(recorded) = record.input_requests.as_ref() {
+            if let Some(duplicate) = new_requests.keys().find(|k| recorded.contains_key(*k)) {
+                return Err(TaskError::StoreError(format!(
+                    "input request key '{duplicate}' is already recorded for task {task_id}; \
+                     keys must be unique over a task's lifetime"
+                )));
+            }
+        }
+
+        // Requests and transition land in the SAME write, so a task is never
+        // observable as `input_required` with nothing recorded to answer.
+        record
+            .input_requests
+            .get_or_insert_with(Map::new)
+            .extend(new_requests);
+        record.task.status = TaskStatus::InputRequired;
+        Self::touch(&mut record);
+
+        let bytes = Self::serialize_record(&record)?;
+        let new_version = self
+            .backend
+            .put_if_version(&key, &bytes, versioned.version)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+        record.version = new_version;
+
+        serde_json::to_value(record.to_wire_task_with_variables())
+            .map_err(|e| TaskError::StoreError(format!("failed to serialize task: {e}")))
+    }
+
+    /// Persists the JSON-RPC error object for a failed task, in ONE
+    /// compare-and-set write.
+    ///
+    /// The status is NOT changed here: a caller that is failing a task uses
+    /// [`Self::complete_with_result`] or [`Self::update_status`] for the
+    /// transition and this method for the error object, so the two concerns stay
+    /// independently callable.
+    ///
+    /// # Errors
+    ///
+    /// See [`TaskStore::set_error`](crate::store::TaskStore::set_error).
+    pub async fn set_error(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        error: Value,
+    ) -> Result<(), TaskError> {
+        let key = make_key(owner_id, task_id);
+        let versioned = self
+            .backend
+            .get(&key)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+
+        let mut record = Self::deserialize_record(&versioned.data)?;
+        record.version = versioned.version;
+
+        Self::check_owner(&record, task_id, owner_id, "set_error")?;
+        Self::check_not_expired(&record, task_id)?;
+
+        record.error = Some(error);
+        Self::touch(&mut record);
+
+        let bytes = Self::serialize_record(&record)?;
+        self.backend
+            .put_if_version(&key, &bytes, versioned.version)
+            .await
+            .map_err(|e| Self::map_storage_error(e, task_id))?;
+
+        Ok(())
+    }
+
+    /// Retrieves the persisted JSON-RPC error object for a task, owner-scoped.
+    ///
+    /// # Errors
+    ///
+    /// See [`TaskStore::get_error`](crate::store::TaskStore::get_error).
+    pub async fn get_error(&self, task_id: &str, owner_id: &str) -> Result<Value, TaskError> {
+        let record = self.get(task_id, owner_id).await?;
+
+        // A task that exists but recorded no error has none to return.
+        record.error.ok_or_else(|| TaskError::NotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
     /// Returns a reference to the store's configuration.
     pub fn config(&self) -> &StoreConfig {
         &self.config
@@ -606,6 +904,21 @@ impl<B: StorageBackend> GenericTaskStore<B> {
     /// Returns a reference to the underlying storage backend.
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+}
+
+/// Names a JSON value's type for a diagnostic message.
+///
+/// Only the TYPE is named, never the value: a rejected seam payload may carry
+/// client-supplied content and an error message is not the place to echo it.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 

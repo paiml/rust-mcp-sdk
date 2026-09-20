@@ -14,7 +14,7 @@ Practice the mechanical steps of adding Code Mode to a fresh server. You will co
 2. Add the dependencies from [Chapter 22](./ch22-code-mode.md) Step 1 to your `Cargo.toml`:
    - `pmcp = { version = "2.7.0", features = ["full"] }`
    - `pmcp-code-mode = "0.5.1"`
-   - `pmcp-code-mode-derive = "0.2.0"`
+   - `pmcp-code-mode-derive = "0.3.0"`
 3. Define a server struct with the four required fields:
    - `code_mode_config: CodeModeConfig`
    - `token_secret: TokenSecret`

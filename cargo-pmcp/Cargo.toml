@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.19.0"
+version = "0.24.3"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"
@@ -61,21 +61,35 @@ glob = "0.3"
 hdrhistogram = "7.5"
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-pmcp = { version = "2.9.0", path = "..", features = ["streamable-http", "oauth"] }
-mcp-tester = { version = "0.7.0", path = "../crates/mcp-tester" }
+# The pin names the minor that ships `CredentialStore` / `FileCredentialStore`
+# (Phase 116). `path` wins locally, but a published cargo-pmcp 0.19.0 claiming
+# compatibility with an older pmcp would not compile: `auth_cmd` resolves every
+# credential through that seam.
+pmcp = { version = "2.20.3", path = "..", features = ["streamable-http", "oauth"] }
+mcp-tester = { version = "0.8.0", path = "../crates/mcp-tester" }
+# Collects the SDK's `pmcp::wire` tracing target for `--dump-wire`. The SDK emits
+# those events unconditionally-but-guarded; without a subscriber installed here
+# they would go nowhere, which is exactly the gap `--dump-wire` closes.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 mcp-preview = { version = "0.3.1", path = "../crates/mcp-preview" }
-pmcp-workbook-compiler = { version = "0.1.0", path = "../crates/pmcp-workbook-compiler" }
+pmcp-workbook-compiler = { version = "0.1.3", path = "../crates/pmcp-workbook-compiler" }
 # Phase 110 agent/team/package verbs. Path wins locally; the version req applies
 # at publish (design §5: cargo-pmcp now publishes AFTER all three).
 # `openai-compat` enables the default `agent dev` completion source.
-pmcp-agent = { version = "0.1", path = "../crates/pmcp-agent", features = ["openai-compat"] }
+pmcp-agent = { version = "0.4", path = "../crates/pmcp-agent", features = ["openai-compat"] }
 # `runtime` = the in-process team-dev server set; `http` = the HTTP-first
 # `team dev --serve` path AND transitively enables `member-llm` (so `team dev
 # --llm` works with `http` alone — do NOT list `member-llm` explicitly).
-pmcp-team-servers = { version = "0.1", path = "../crates/pmcp-team-servers", features = ["runtime", "http"] }
-# Caret "0.1" exactly (CLI-04 / D-04b — a tripwire test in 110-05 asserts this
-# literal string; do NOT use `=0.1.0`).
-pmcp-package = { version = "0.1", path = "../crates/pmcp-package" }
+pmcp-team-servers = { version = "0.3", path = "../crates/pmcp-team-servers", features = ["runtime", "http"] }
+# Caret "0.3" exactly (CLI-04 / D-04b — `tests/pmcp_package_pin.rs` asserts this
+# literal string; do NOT use `=0.3.0` or a fully-qualified `0.3.0`). Moved off
+# the 0.1 line by the D-08/D-09 wire break in Phase 120, and off the 0.2 line by
+# Phase 122's four source-breaking attestation-carriage changes.
+pmcp-package = { version = "0.4", path = "../crates/pmcp-package" }
+# CFN-renderer extraction, Task 7: the pmcp_run deploy target synthesizes its
+# CloudFormation template via this pure renderer instead of `npx cdk synth`
+# whenever `deploy/lib/stack.ts` is unmodified from the regenerated scaffold.
+pmcp-cfn-renderer = { version = "0.3", path = "../crates/pmcp-cfn-renderer" }
 # The `agent new` scaffold builds a starter `AgentPackage` from the real struct
 # (guaranteeing the emitted agent.package.json round-trips); its `version` field
 # is a `semver::Version`, so cargo-pmcp needs semver directly (matches the
@@ -100,12 +114,34 @@ open = "5.0"                            # Browser launch
 chrono = "0.4"                          # Token expiry handling
 rpassword = "7.3"                       # Secret input (for other features)
 zip = "8.1"                             # Zip file creation for landing page deployment
+# Phase 123 (PKGX-02): the `package save`/`package load` artifact codec. An
+# uncompressed tar is the MOVABLE form of an OCI image layout (D-11); the layout
+# directory stays the working form. Deliberately added HERE and NOT to
+# `crates/pmcp-package/Cargo.toml` (D-12) so the format crate's allowlist and its
+# measured 90-package graph are untouched. Sits beside `zip`, the existing
+# archive-dependency precedent. Maintainership provenance was verified by a human
+# on 2026-08-26 before this line was written — see `123-01-SUMMARY.md`.
+tar = "0.4"
+# Named directly because `commands/package/artifact.rs` must NAME `MediaType`,
+# `Descriptor`, `ImageIndex` and `ImageManifest` in its own public types —
+# `pmcp-package` re-exports none of them, and `OciLayout::write_blob` REQUIRES a
+# `MediaType` per blob. Already resolved in the graph via `pmcp-package`, so this
+# adds no package; the version requirement matches that crate's own `0.10` so the
+# workspace unifies on one copy and the types cross the crate boundary.
+oci-spec = "0.10"
 
 # For schema discovery and code generation
 console = "0.16"                        # Terminal styling for schema commands
-tempfile = "3"                          # Atomic token cache writes (auth_cmd::cache)
+# 3.15 is the floor, not "3": `package load`'s transactional install persists its
+# staging directory with `TempDir::keep()`, which landed in 3.15 (the older
+# `into_path()` alias is deprecated). `path` deps hide this locally — the
+# requirement is what a published cargo-pmcp resolves against.
+tempfile = "3.15"                       # Temp dirs/files across scaffold + publishing paths
 thiserror = "2"                         # Error types for generated code
-url = "2"                               # URL normalization for cache keys
+# NOT for credential-cache keys any more: `auth_cmd` normalizes through
+# `pmcp::shared::credential_store::normalize_server_key`. Still used directly by
+# `commands::team::dev` for endpoint parsing.
+url = "2"
 
 # For secrets management
 secrecy = { version = "0.10", features = ["serde"] }  # Secure secret handling with zeroization
@@ -113,31 +149,46 @@ zeroize = "1"                           # Secure memory clearing
 rand = "0.10"                            # Random secret generation
 regex = "1"                             # Secret reference parsing
 
-# AWS Secrets Manager (optional, for AWS provider)
-# Why: default features enable `rustls` → aws-smithy-runtime/tls-rustls →
-# aws-smithy-http-client/legacy-rustls-ring → rustls 0.21 / rustls-webpki 0.101
-# (RUSTSEC-2026-0098/0099/0104). Opt into the modern `default-https-client`
-# path (rustls 0.23 via aws-lc-rs) instead.
-aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
+# AWS SDK. `aws-config` is a REQUIRED (non-optional) base dependency as of
+# Task 9 (CFN deploy engine): the `aws-lambda` deploy target's default,
+# unmodified-scaffold path now deploys via real `aws-sdk-sts`/`aws-sdk-s3`/
+# `aws-sdk-cloudformation` calls instead of `npx cdk deploy` — that is the
+# whole point of the engine (switch the target off Node/CDK entirely), so it
+# cannot be gated behind an opt-in feature the way `aws-sdk-secretsmanager`
+# (a separate, still-optional AWS Secrets Manager *provider*) is.
+# Why default-features=false: default features enable `rustls` →
+# aws-smithy-runtime/tls-rustls → aws-smithy-http-client/legacy-rustls-ring →
+# rustls 0.21 / rustls-webpki 0.101 (RUSTSEC-2026-0098/0099/0104). Opt into
+# the modern `default-https-client` path (rustls 0.23 via aws-lc-rs) instead.
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"], optional = true }
+# Task 9: account resolution (`GetCallerIdentity`), artifact upload + bucket
+# management, and stack create/update/describe/poll — see
+# `deployment/targets/aws_lambda/engine.rs`.
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # For security penetration testing
 serde-sarif = "0.8"
 governor = "0.10"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 mockito = "1"
 proptest = "1"
-serial_test = "3"
+serial_test = "4"
 assert_cmd = "2"
 predicates = "3"
 apollo-compiler = "1"
 
 [features]
 default = []
-aws-secrets = ["aws-config", "aws-sdk-secretsmanager"]
+# `aws-config` moved to an always-on base dependency (Task 9) — no longer
+# listed here since Cargo rejects a non-optional dependency named as an
+# implicit feature.
+aws-secrets = ["aws-sdk-secretsmanager"]
 # Gates the `capture_contract` internal dev binary (see its [[bin]] entry
 # above and its module doc) — a manual M2M-auth GraphQL introspection aid,
 # not intended for end-user installs.

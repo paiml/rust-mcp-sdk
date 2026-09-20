@@ -240,6 +240,575 @@ equations:
     - CreateMessageResult contains model response content
     lean_theorem: Theorems.SamplingDispatch
 
+  output_schema_draft_pin:
+    formula: |
+      validate: (era, outputSchema, structuredContent) -> Option<mismatch>
+        Era::V1 => jsonschema::validator_for(schema)                  (auto-detect; unchanged)
+        Era::V2 => draft202012::new(normalize_schema_dialect(schema)) (pinned)
+      normalize_schema_dialect(s)
+        = s                     when no string-valued $schema in any SCHEMA POSITION of s —
+                                the positions the `walk:` clause below defines — names a
+                                dialect other than DRAFT_2020_12 (the absent and the
+                                already-2020-12 documents are both this case)
+        = clone(s) with every such $schema := DRAFT_2020_12, otherwise
+        walk: a $schema key is a dialect declaration only when its value is a JSON string;
+              descend into every member value EXCEPT const / enum / default / examples,
+              which carry INSTANCE DATA rather than subschemas;
+              BUT the values of properties / patternProperties / $defs / definitions /
+              dependentSchemas / dependencies are maps from author-chosen names to
+              subschemas, so every one of those values is descended into unconditionally
+              and the data-only exclusion is NEVER applied to those maps' own keys — those
+              keys are names, not keywords;
+              and descend into every ELEMENT of an array-valued member, because a keyword whose
+              value is an array of subschemas (allOf / anyOf / oneOf / prefixItems) holds live
+              schema positions at every index — an array element has NO key, so the data-only
+              exclusion has nothing to test against and is never applied there
+              (115-20: stated as the general rule the code implements — descend into every array
+               element — rather than as an enumeration of the four keywords, because an
+               enumeration is a list that can drift and the shipped descent consults none)
+              (115-14: this clause previously specified the position-BLIND walk, under which
+              a $defs entry an author named `default` was visited by neither half.
+               115-16: the enumeration stood at FIVE keywords and omitted `dependencies`;
+               see the 115-16 COMPLETENESS CORRECTION on the POSTCONDITION invariant below)
+      cache_key = (Era, canonical_json_text(schema))
+      external $ref (http:// | https:// | file:// | relative under an http-scheme $id)
+        => compile error on BOTH eras, zero network and zero filesystem I/O
+
+      115-19 SCOPE CORRECTION on the equation head above.
+        The head previously stated an UNSCOPED TOTAL — a condition over every string-valued
+        $schema in s, at the root and at every depth, with no exclusion — five lines above the
+        `walk:` clause it introduces, which has always stated the scoped rule. No CORRECT
+        implementation can satisfy the unscoped form, and it is falsified by three documents:
+          {"const": {"$schema": "http://json-schema.org/draft-07/schema#"}}
+            — the payload is instance DATA and MUST survive; the shipped code handles this
+              correctly and is fenced doing so by
+              `normalize_schema_dialect_leaves_a_dollar_schema_that_is_data_alone`
+          {"properties": {"$schema": "http://json-schema.org/draft-07/schema#"}}
+            — a NAME bound to a non-schema; also handled correctly
+          {"dependencies": {"default": {"$id": ..., "$schema": "...draft-07...", ...}}}
+            — the one it handled INCORRECTLY, until 115-16 (115-REVIEW.md CR-01)
+        115-14 corrected the POSTCONDITION invariant and the name-position invariant and left
+        this head stale, which is why round-1 WR-01 was only HALF closed and round-3 WR-04
+        reported the same shape again — here and in three `contracts/binding.yaml` note heads.
+        An equation no correct implementation can satisfy cannot gate anything. The retracted
+        wording is deliberately NOT requoted here; it is preserved verbatim in
+        `115-REVIEW.md` WR-04 and in this file's git history.
+    domain: Declared outputSchema x emitted structuredContent x negotiated protocol era
+    codomain: Some(human-readable mismatch message) or None
+    invariants:
+    - >-
+      On Era::V2 the compiled validator enforces the schema's keywords even when the document
+      declares a legacy `$schema` (draft-04/06/07) — at the document root, OR on any
+      embedded schema resource below it. An embedded schema resource is a subschema carrying
+      its own `$id`; JSON Schema 2020-12 sanctions a `$schema` there and `jsonschema` 0.49.2
+      honours it. Such a resource is REACHED WHATEVER THE NAME of the `$defs` / `properties` /
+      `patternProperties` / `definitions` / `dependentSchemas` / `dependencies` entry it is
+      filed under: those keys are author-chosen names, never keywords, so the const / enum /
+      default / examples exclusion does not apply to them. EVERY such declaration is
+      normalized to the 2020-12 URI before compilation, never honoured and never used as a
+      vocabulary source.
+      Measured failure, before 115-14: the document whose only difference from the enforced
+      control was the NAME of its `$defs` entry — `$defs.default` instead of `$defs.Inner` —
+      measured `(v1, v2) = (Conforms, Conforms)` with nothing rewritten, against the control's
+      `(Conforms, Violates)` with `rewritten=true`. The name-position clause of this invariant
+      is what that measurement forced.
+      115-20 ARRAY-POSITION COMPLETION (`115-REVIEW.md` WR-03): such a resource is equally
+      reached at any INDEX of an array-valued `allOf` / `anyOf` / `oneOf` / `prefixItems`
+      member. This half needs no name clause and admits no collision shape — an array element
+      has no key for a `const` / `enum` / `default` / `examples` entry to collide with — which
+      is why, unlike the name-position clause above, it was NOT forced by a behavioural failure.
+      The shipped descent was already correct and unconditional; what was absent was every
+      fence around it. Deleting both `Value::Array` arms passed the ENTIRE suite, measured
+      twice independently, until 115-20 added
+      `v2_pin_rewrites_an_embedded_resource_at_every_spec_defined_array_position`, the
+      `normalization_cases()` array row, the widened property draw and corpus seed
+      `16_all_of_embedded_legacy`
+    - >-
+      On Era::V1 the verdict for any (schema, instance) pair is byte-identical to the
+      pre-Phase-115 verdict
+    - >-
+      The validator cache key is `(Era, canonical schema text)`, so one era's validator is never
+      served to the other
+    - >-
+      An external `$ref` (`http://`, `https://`, `file://`, or a relative ref under an
+      http-scheme `$id`) fails to COMPILE on both eras and performs zero network or filesystem I/O
+    - >-
+      `normalize_schema_dialect` is idempotent, and alters only `$schema` keys whose value is a
+      JSON string — at the root and at every depth. It never alters a `$schema` that is instance
+      DATA: a `properties` entry for an instance property literally named `$schema` (whose value
+      is a subschema, not a string), nor a `$schema` inside a `const` / `enum` / `default` /
+      `examples` payload
+    - >-
+      POSTCONDITION: after normalization no `$schema` string in any SCHEMA POSITION is anything
+      other than the Draft 2020-12 URI. SCHEMA POSITION means the root, plus every node
+      reachable by descending into every member value EXCEPT a `const` / `enum` / `default` /
+      `examples` payload — and the VALUES of a `properties` / `patternProperties` / `$defs` /
+      `definitions` / `dependentSchemas` / `dependencies` map are always schema positions,
+      regardless of the author-chosen name they appear under, and so is every ELEMENT of an
+      array-valued member (`allOf` / `anyOf` / `oneOf` / `prefixItems`), regardless of index. This is the checkable form of
+      "on v2 the pin wins unconditionally"; the prose form was untestable, and the root-only
+      normalizer satisfied the prose while measurably failing this. 115-14 SCOPE CORRECTION —
+      the invariant previously stated an UNSCOPED total over every `$schema` string in the
+      document, at the root and at every depth (the retracted wording is preserved verbatim in
+      `115-REVIEW.md` and in this file's git history rather than requoted here, so a grep for
+      the retracted claim finds only the record and not the contract) — a total that is false
+      in two independent ways and unsatisfiable by any CORRECT
+      implementation: (i) a `$schema` inside a `const` / `enum` / `default` / `examples`
+      payload is instance DATA and must SURVIVE (115-REVIEW WR-01; the shipped code correctly
+      leaves it alone and is fenced doing so by
+      `normalize_schema_dialect_leaves_a_dollar_schema_that_is_data_alone`), and (ii) the
+      position-blind walk never reached a subschema filed under a colliding author-chosen name.
+      Measured failures, kept as the record: before 115-12, with a legacy declaration on an
+      embedded schema resource, `(v1, v2)` was `(Violates, Conforms)` — v2 validating WEAKER
+      than v1 (115-VERIFICATION.md); before 115-14, `$defs.default` measured
+      `(Conforms, Conforms)` with `rewritten=false` against the control `$defs.Inner`'s
+      `(Conforms, Violates)` with `rewritten=true`. Asserted by
+      `output_validation::tests::normalize_schema_dialect_changes_only_dollar_schema_keys` over
+      every fixed case (which 115-14 extends with the `$defs.default` and `properties.examples`
+      cases) and by
+      `output_validation::tests::v2_pin_still_enforces_an_embedded_resource_named_like_a_data_keyword`,
+      which was OBSERVED to fail against the position-blind walkers before the fix landed. It is
+      re-stated in `fuzz_schema_draft_pin` by 115-13 — but note that a restatement of the same
+      RULE can only catch a detector/rewriter DISAGREEMENT, never a defect in the rule itself
+      (115-REVIEW WR-02); the independent instrument is the rename-invariance property 115-15
+      adds.
+      115-16 COMPLETENESS CORRECTION — the enumeration of subschema-map keywords in this
+      invariant, in the name-position invariant above and in the `walk:` clause stood at FIVE
+      and omitted `dependencies`: draft-04 / -06 / -07 and 2019-09's own
+      map-from-instance-property-NAME-to-subschema keyword, still declared (deprecated) by the
+      2020-12 meta-schema and still HONOURED by `jsonschema` 0.49.2 under the pin, which this
+      SDK's own `fuzz_support_tests` had already measured and recorded as `D-115-03-C`. The two
+      statements contradicted each other for two plans (115-REVIEW.md CR-01).
+      MEASURED: `dependencies.Inner` -> `rewritten=true` against `dependencies.default` ->
+      `rewritten=false`, so the legacy declaration survived on the second and
+      `compile_2020_12`'s `tracing::warn!` — the only D-02 diagnostic an author gets — silently
+      did not fire. BOTH names measure `(v1, v2) = (Violates, Violates)`, i.e. NO v2 verdict
+      flip is reproducible at this position on the pinned `jsonschema` 0.49.2.
+      That measurement is why the fence this invariant now rests on is STRUCTURAL rather than
+      BEHAVIOURAL, and it is the single most important sentence this contract carries forward:
+      a verdict assertion at this position would have PASSED against the defective code — a
+      fence that cannot fire, which is the failure mode this requirement shipped three times.
+      The structural observables are the `Cow` borrow/own decision (which is also exactly what
+      `compile_2020_12` branches on to emit its diagnostic) and the rewritten pointer
+      `/{container}/{name}/$schema == DRAFT_2020_12`.
+      DERIVATION, not a hand-kept list: the SIX keywords are the UNION, over the draft-04 /
+      draft-06 / draft-07 / 2019-09 / 2020-12 meta-schema documents `jsonschema` 0.49.2 ships
+      offline, of the keywords each meta-schema's own `.properties` map binds to an
+      OBJECT-typed schema whose `additionalProperties` references the meta-schema itself.
+      `$vocabulary` (boolean values) and `dependentRequired` (string-array values) are excluded
+      by that same criterion. `dependencies` was the only omission; the per-(file, keyword)
+      table and the one-command re-derivation are recorded in 115-16's SUMMARY.
+      FENCES this invariant now rests on, by name:
+      `output_validation::tests::v2_pin_rewrites_an_embedded_resource_in_every_spec_defined_subschema_map`
+      — gate-visible, iterating its OWN six-element container literal rather than the constant
+      whose incompleteness was the defect, and OBSERVED to fail on exactly the four
+      `dependencies` pairs and no other container before the entry landed — and
+      `keyword_list_mirrors`, the featureless source-text drift gate that holds all three
+      literal copies of the two keyword lists to each other AND to the derivation above.
+      BOUNDARY, stated because a contract that hides its own boundary is the pattern this
+      closure exists to end: the walk is a SUPERSET of what `jsonschema` honours WITHIN those
+      six positions, and is NOT a superset over author-invented containers. Measured residual:
+      `{"components": {"default": {...}}}` -> `rewritten=false`. A deny-list over an open
+      keyword space cannot be completed; the durable fix is the INVERSE walk (descend only into
+      positions the core and applicator vocabularies DEFINE as subschemas), which 115-14
+      declined because it would REDUCE what is normalized, including under vendor containers
+      that really do hold subschemas
+    - >-
+      Validation is warn-only on both eras: a mismatch never produces an error result and never
+      panics
+    preconditions:
+    - '`schema` and `value` are already-parsed `serde_json::Value`s'
+    - The negotiated era is captured before the protocol context is moved into the handler extra
+    postconditions:
+    - '`schema_mismatch` returns `Some(message)` on mismatch or invalid schema, `None` on conformance'
+    - The returned message names `outputSchema` when the schema itself failed to compile
+    lean_theorem: Theorems.OutputSchemaDraftPin
+
+  structured_content_shape:
+    formula: |
+      CallToolResult.structuredContent : Option<Value>
+        Era::V2 => Value is unconstrained: object | array | string | number | bool | null
+        Era::V1 => the wire is FROZEN, byte-identical to pre-Phase-115
+      structured(value: Value)       -> Self   (D-06: signature and behaviour unchanged)
+      structured_value(value: Value) -> Self   (D-06: the additive widening sibling)
+      declared outputSchema applies to EVERY shape (D-04); enforcement is warn-only
+    domain: Handler-produced JSON values bridged into CallToolResult.structuredContent
+    codomain: A CallToolResult whose structuredContent is any JSON value
+    invariants:
+    - >-
+      `structuredContent` accepts any JSON value — object, array, string, number, boolean or null
+    - >-
+      `Some(Value::Null)` serializes as `"structuredContent": null` and is NOT elided by
+      `skip_serializing_if = "Option::is_none"`
+    - >-
+      `CallToolResult::structured`'s signature and behaviour are unchanged; the widening is the
+      sibling constructor `structured_value`
+    - >-
+      A declared `outputSchema` still applies to a non-object payload (D-04); enforcement is
+      warn-only
+    - >-
+      pmcp's pre-existing v1 permissiveness is FROZEN, not corrected — tightening v1 would itself
+      be a v1 wire change (D-05)
+    preconditions:
+    - The tool handler produced a `serde_json::Value` of any shape
+    postconditions:
+    - '`structured_value(Value::Null)` serializes an explicit `"structuredContent": null`'
+    - Every pre-Phase-115 call site of `CallToolResult::structured` compiles and behaves unchanged
+    lean_theorem: Theorems.StructuredContentShape
+
+  result_caching_hints:
+    formula: |
+      project: (Value, Option<Era>, Cacheable) -> Value
+        Cacheable::No => identity                       (not a CacheableResult)
+        Some(Era::V2) => ensure(ttlMs, cacheScope)      (handler value wins, else defaults)
+        otherwise     => strip(ttlMs, cacheScope)       (v1, and a None protocol context)
+      defaults: ttlMs = 0, cacheScope = "private"
+      CacheableResult extenders = { DiscoverResult, ListToolsResult, ListResourcesResult,
+                                    ListResourceTemplatesResult, ReadResourceResult,
+                                    ListPromptsResult }
+    domain: Serialized result values x negotiated protocol era x cacheability classification
+    codomain: A result carrying both hints on v2 and neither on v1
+    invariants:
+    - >-
+      Exactly six result types are `CacheableResult`: `DiscoverResult`, `ListToolsResult`,
+      `ListResourcesResult`, `ListResourceTemplatesResult`, `ReadResourceResult`, `ListPromptsResult`
+    - >-
+      On Era::V2 a cacheable result carries both `ttlMs` and `cacheScope`; absent handler intent the
+      values are `0` and `"private"`
+    - >-
+      A handler-set hint survives the v2 projection unmodified
+    - >-
+      No v1 response carries `ttlMs` or `cacheScope`, EVEN WHEN a handler set them — the projection
+      strips on v1, and on a `None` protocol context, and on every dispatcher including
+      `WasmMcpServer`
+    - >-
+      `cacheScope` is the closed union `"public" | "private"`; an unknown value fails to deserialize
+    - >-
+      `cacheScope: "public"` states the response holds no user-specific data and that any client or
+      intermediary MAY cache it and serve it across authorization contexts; `"private"` confines
+      reuse to one authorization context and caches MUST NOT be shared between them
+    - >-
+      The default is `cacheScope: "private"` — `"public"` authorizes reuse
+      across authorization contexts and defaulting to it would be a cross-caller data leak
+    - >-
+      The hints are written in exactly ONE function; no result type projects independently (D-12)
+    preconditions:
+    - The result has already been serialized to a `serde_json::Value`
+    - The caller classified the originating request as `Cacheable::Yes` or `Cacheable::No`
+    postconditions:
+    - Every v2 response for one of the six CacheableResult types carries both `ttlMs` and `cacheScope`
+    - No v1 response carries either key; v1 bytes match the pre-change goldens
+    lean_theorem: Theorems.ResultCachingHints
+
+  # === OAuth Client Hardening (Phase 116) ===
+  # Authored in wave 1 (plan 116-01) BEFORE any src/ line of this phase was
+  # written, per CLAUDE.md § "Contract-First Development". Every invariant below
+  # is derived from the cited RFC / SEP clause, not transcribed back out of an
+  # implementation -- there is no implementation yet. The bindings for these three
+  # equations land in contracts/binding.yaml as `status: planned` and are flipped
+  # to `implemented` by plan 116-15 once each `function:` resolves to real source.
+
+  oauth_authorization_response_validation:
+    formula: |
+      validate_authorization_response: (raw_query, AuthorizationRequestRecord)
+                                       -> Result<authorization_code>
+
+        SECURITY_PARAMS = {state, iss, code, error, error_description}
+
+        |raw_query| > MAX_CALLBACK_QUERY_BYTES        => Err(Validation)
+                                                         (bound BEFORE any parse)
+        duplicate(k) for any k in SECURITY_PARAMS     => Err(Validation)
+                                                         (no "first wins")
+
+        FIXED evaluation order -- authenticity before actionability:
+          1. state : decode(state) absent or != record.state() => Err(StateMismatch)
+          2. iss   : rfc9207(iss, record)                      => Err(IssMismatch)
+          3. error : `error` present                           => Err(Authentication)
+          4. code  : `code` absent                             => Err(Validation)
+                     otherwise                                 => Ok(code)
+
+      rfc9207: (Option<iss>, expected_issuer, IssPresence) -> Result<()>
+        row 1  Some(i), i == expected  x  {Required, Optional}  -> Ok(())
+        row 2  Some(i), i != expected  x  {Required, Optional}  -> Err(IssMismatch)
+        row 3  None                    x  {Required}            -> Err(IssMismatch)
+        row 4  None                    x  {Optional}            -> Ok(())
+
+      comparison: byte-exact `==` over the percent-DECODED parameter value.
+        NO trailing-slash trimming, NO scheme/host case folding, NO default-port
+        elision, NO percent-encoding normalization, NO unicode normalization --
+        applied identically to `iss` and to `state`.
+
+      iss_presence_from: (env_override, builder, discovery_flag) -> IssPresence
+        Some(e), _,       _             -> e         (operator override wins)
+        None,    Some(b), _             -> b         (builder next)
+        None,    None,    Some(true)    -> Required  (AS advertised RFC 9207)
+        None,    None,    Some(false)   -> Optional
+        None,    None,    None          -> Optional  (no metadata at all)
+
+      parse_iss_env_value: &str -> Option<IssPresence>
+        "strict"  (trimmed, case-insensitive) -> Some(Required)
+        "lenient" (trimmed, case-insensitive) -> Some(Optional)
+        anything else                         -> None (the caller warns; never
+                                                 silently equivalent to unset)
+    domain: >-
+      Percent-encoded OAuth redirect-callback query strings, paired with the
+      AuthorizationRequestRecord retained from the authorization request
+    codomain: The authorization code, or a typed Error identity
+    invariants:
+    - >-
+      A present `iss` that differs from the record's expected issuer is rejected under EVERY
+      `IssPresence` value. RFC 9207 §2.4 makes a mismatching issuer identifier fatal regardless of
+      whether the AS advertised `authorization_response_iss_parameter_supported`; the leniency in
+      row 4 covers ABSENCE only, never disagreement
+    - >-
+      Under `IssPresence::Required`, an absent `iss` is rejected. RFC 9207 §3 makes the parameter
+      mandatory once the AS advertises support, so its absence in that era is itself the mix-up
+      signal the parameter exists to raise
+    - >-
+      Under `IssPresence::Optional`, an absent `iss` is accepted -- the ONLY leniency anywhere in
+      the table, and the reason the table has four rows rather than two
+    - >-
+      `Ok` implies the decoded `state` equalled the record's state. There is no path to a returned
+      authorization code that skipped the state comparison
+    - >-
+      No AS-supplied `error`, `error_description` or `error_uri` is surfaced when `state` or `iss`
+      failed. Those strings are attacker-influenceable on an unauthenticated response, so they are
+      actionable only AFTER the response has been bound to this client's own request
+    - >-
+      A duplicate occurrence of any of `state`, `iss`, `code`, `error` is rejected. A "first wins"
+      parse lets an attacker append a second copy of a security parameter that a differently-ordered
+      reader (a proxy, a log, a browser) resolves the other way
+    - >-
+      Comparison is byte-exact on the percent-decoded value. RFC 3986 §6.2.2-6.2.3 normalizations
+      (case folding, default-port elision, trailing slash, percent-encoding) are each an attacker
+      degree of freedom, so none is applied
+    - >-
+      The raw callback query is bounded by `MAX_CALLBACK_QUERY_BYTES` before parsing; it arrives on
+      a loopback socket from a peer this client has not yet authenticated
+    - >-
+      Rejection messages carry no byte of the offending input for the state and size cases -- a
+      state value is a capability, and an oversized query is unbounded attacker text
+    - >-
+      An unrecognized `PMCP_OAUTH_ISS_VALIDATION` value is NOT silently equivalent to unset:
+      `parse_iss_env_value` returns `None` so the call site can warn, keeping a typo from quietly
+      relaxing the policy the operator meant to tighten
+    preconditions:
+    - The record was created by this client when it built the authorization request
+    - The record's `state` was generated with a CSPRNG (`generate_state`)
+    postconditions:
+    - Every `Ok(code)` is bound to this client's own authorization request by both `state` and `iss`
+    - Every `Err` carries a typed identity (`is_state_mismatch` / `is_iss_mismatch`), not prose
+    lean_theorem: Theorems.OAuthAuthorizationResponseValidation
+
+  oauth_discovery_anchor:
+    formula: |
+      discovery_url_candidates: issuer -> Result<[Url]>       (SEP-2351 probe order)
+        issuer with a non-empty path P:
+          1. {origin}/.well-known/oauth-authorization-server{P}
+          2. {origin}/.well-known/openid-configuration{P}
+          3. {origin}{P}/.well-known/openid-configuration      (OIDC APPENDED form)
+        issuer with an empty path (with or without a trailing slash):
+          1. {origin}/.well-known/oauth-authorization-server
+          2. {origin}/.well-known/openid-configuration
+        origin = (scheme, host, effective port) of the issuer, preserved verbatim
+
+      validate_issuer_url: &str -> Result<Url>
+        scheme != https AND host not in {127.0.0.1, ::1, localhost}  => Err
+        userinfo present | query present | fragment present | no host => Err
+
+      issuer_matches_metadata: (issuer_used_to_build_url, document.issuer) -> bool
+        byte-exact `==`, no normalization                     (RFC 8414 §3.3)
+
+      classify_discovery_failure: DiscoveryFailure -> DiscoveryOutcome
+        NotFound                   -> Fallback   (try the next candidate)
+        HttpStatus(4xx != 404)     -> Fallback
+        InvalidJson                -> Fallback
+        HttpStatus(5xx)            -> Retry      (same candidate, backoff budget)
+        Transport                  -> Retry
+        IssuerMismatch             -> Terminal   (abort the whole probe)
+        BodyOverCap                -> Terminal
+        MalformedSecurityMetadata  -> Terminal
+
+      same_origin: (a, b) -> bool
+        scheme(a) == scheme(b) AND host(a) == host(b)
+          AND effective_port(a) == effective_port(b)          (path is not origin)
+    domain: Issuer identifier strings and the authorization-server metadata documents fetched for them
+    codomain: An ordered candidate URL list, and a fetch outcome that is either an anchored document or a classified failure
+    invariants:
+    - >-
+      The OIDC appended form `{issuer}/.well-known/openid-configuration` is present in EVERY
+      candidate list. It is today's only shipped behaviour and the only form measured to answer 200
+      for a path-carrying issuer, so a probe that replaced it rather than reordered around it would
+      be a regression, not a fix
+    - >-
+      Every candidate preserves the issuer's scheme, host and effective port. A candidate that
+      changed the origin would probe a different authority than the one the user named
+    - >-
+      Metadata never escapes the fetch boundary unless its `issuer` member string-equals the issuer
+      used to build the URL. RFC 8414 §3.3 makes this comparison the anchor that stops a
+      well-known document served by one authority from describing another
+    - >-
+      `IssuerMismatch`, `BodyOverCap` and `MalformedSecurityMetadata` are TERMINAL and never trigger
+      candidate fallback. Each is evidence about the AUTHORITY rather than about the URL shape, so
+      trying the next URL against the same authority would launder a security signal into a retry
+    - >-
+      `Retry` re-attempts the SAME candidate within a bounded budget and degrades to `Fallback` when
+      that budget is exhausted; it never advances the candidate index on its own
+    - >-
+      `validate_issuer_url` admits `http` only for loopback hosts, and rejects userinfo, query and
+      fragment. RFC 8414 §2 forbids query and fragment in an issuer identifier, and userinfo in an
+      https URL is a classic authority-spoofing device
+    - >-
+      A discovery redirect that leaves the issuer's origin is not followed silently; `same_origin`
+      is the predicate the fetch sites apply
+    preconditions:
+    - The issuer string came from configuration or from a protected-resource metadata document, not from an unauthenticated redirect
+    postconditions:
+    - A returned candidate list is non-empty, duplicate-free, and every element is an absolute URL
+    - A returned metadata document is anchored to the issuer that was probed
+    lean_theorem: Theorems.OAuthDiscoveryAnchor
+
+  oauth_credential_binding:
+    formula: |
+      CredentialKey = (issuer, account, server)               (SEP-2352, AUTH-03)
+        lookup(k) hits iff  issuer(k) == issuer(k')
+                       AND  account(k) == account(k')
+                       AND  server(k)  == server(k')
+
+      CREDENTIAL_SCHEMA_VERSION = 2
+
+      parse_credential_snapshot: &[u8] -> Result<(CredentialSnapshot, MigrationReport)>
+        schema_version == 2 => (snapshot, MigrationReport::noop)
+        schema_version == 1 =>
+          for each v1 entry (server_key -> record):
+            record.issuer == Some(iss) => insert(CredentialKey(iss, "", server_key),
+                                                 record)                     ; migrated += 1
+            record.issuer == None      => drop(DroppedEntry{server_key, reason}) ; dropped += 1
+        schema_version otherwise => Err naming BOTH the observed and the supported version
+        non-JSON | empty          => Err carrying no byte of the input
+
+      to_bytes: CredentialSnapshot -> Result<Vec<u8>>
+        emits "schema_version": 2 and is BYTE-STABLE across repeated serialization
+    domain: On-disk and platform-store credential snapshots, and the (issuer, account, server) lookups made against them
+    codomain: The credentials registered for exactly one (issuer, account, server) triple, plus a migration report
+    invariants:
+    - >-
+      A lookup differing in ANY of the three key components is a miss. Two MCP servers can share one
+      authorization server and one user account while holding different DCR registrations, different
+      client IDs and different granted scopes; under a narrower key one server's logout deletes the
+      other's credentials
+    - >-
+      Credentials are never re-keyed to an issuer that was not recorded with them. A v1 entry with no
+      `issuer` member is DROPPED with a reason rather than adopted under an inferred issuer, because
+      inferring one would bind a token to an authority that never minted it
+    - >-
+      The DCR-issued `client_id` lives in the same record as the credentials it belongs to. A client
+      identifier registered with one authority is not a property of the machine or of the user, and a
+      record that separated them could present one authority's client_id to another
+    - >-
+      The migration reports BOTH a migrated count and a dropped list. A silent migration cannot be
+      distinguished from a no-op, and a silently dropped credential looks to the user exactly like a
+      logout nobody performed
+    - >-
+      The `server` component is taken from the v1 map key, which already recorded the normalized
+      server URL -- this is what makes the widening a LOSSLESS migration rather than a lossy re-key
+    - >-
+      `to_bytes` is byte-stable for a given snapshot, so an unchanged store rewrites identical bytes
+      and a diff is evidence of a real change
+    - >-
+      `parse_credential_snapshot` is total over arbitrary bytes: it returns `Err`, never a panic, for
+      any input, and its error message contains no byte of that input
+    preconditions:
+    - The account component is opaque to the SDK and is stored and returned verbatim
+    postconditions:
+    - Every stored credential is addressable by exactly the triple it was saved under
+    - A schema-1 file is either migrated entry-by-entry or reported as dropped, never partially adopted
+    lean_theorem: Theorems.OAuthCredentialBinding
+
+  # Phase 118 D-13 / D-18 (CONF-01). This equation REPLACES the Phase-113 DRIFT-1
+  # rule that `Mcp-Name` must be PRESENT on every v2 request. That rule was
+  # deliberately stricter than the 2026-07-28 transport spec; the official
+  # `@modelcontextprotocol/conformance` suite emits the header only for
+  # name-bearing methods, so it rejected effectively the whole v2 scored set with
+  # HEADER_MISMATCH before dispatch. D-18 then widened the server's predicate from
+  # the MRTR-only `logical_name_key` to the COMBINED `name_bearing_key` -- the same
+  # table the client's `Mcp-Name` emitter resolves through -- so `tasks/get`,
+  # `tasks/update` and `tasks/cancel` are validated as well as emitted.
+  # Implemented by the private free functions `require_v2_headers`,
+  # `is_name_bearing_method`, `cross_check_method` and `cross_check_name` in
+  # src/server/streamable_http_server.rs. No binding.yaml entry accompanies this
+  # equation: `make comply-bindings-check` resolves only
+  # contracts/team-servers/binding.yaml against crates/pmcp-team-servers/src, and
+  # these are pub(crate)-invisible root-crate functions, so an entry would be a
+  # ghost binding.
+  v2_header_gate:
+    formula: |
+      gate: (HeaderMap, meta_is_v2, body_method, body_name) -> EnforceOk | Reject | Passthrough
+
+      name_bearing(m) := name_bearing_key(m) is Some            (the COMBINED table, D-18)
+        tools/call, prompts/get -> "name"
+        resources/read          -> "uri"
+        tasks/get, tasks/update, tasks/cancel -> "taskId"
+
+      era(headers, meta_is_v2):
+        (header != v2) && !meta_is_v2 => Passthrough             (a v1 request; gate does not apply)
+        (header == v2) != meta_is_v2  => Reject(HEADER_MISMATCH) (header/_meta disagreement)
+        (header == v2) && meta_is_v2  => enforce below
+
+      enforce(headers, body_method, body_name):
+        MCP-Protocol-Version absent  => Reject(HEADER_MISMATCH)
+        Mcp-Method           absent  => Reject(HEADER_MISMATCH)
+        Mcp-Method  != body_method   => Reject(HEADER_MISMATCH)
+        name_bearing(Mcp-Method):
+          Mcp-Name absent                              => Reject(HEADER_MISMATCH)
+          decode(Mcp-Name) is None                     => Reject(HEADER_MISMATCH)
+          decode(Mcp-Name) != body_name                => Reject(HEADER_MISMATCH)
+          otherwise                                    => EnforceOk(Mcp-Method, decode-input)
+        !name_bearing(Mcp-Method):
+          any Mcp-Name, or none                        => EnforceOk(Mcp-Method, "")
+
+      SANITIZATION: on a method that is not name-bearing the carried name is
+      String::new() whatever the client sent, because that pair is echoed back
+      outbound by apply_v2_outbound_headers.
+    domain: >-
+      Attacker-controlled HTTP header maps and raw JSON-RPC request bodies arriving at the
+      2026-07-28 POST endpoint, paired with the per-request resolved era signal
+    codomain: >-
+      Exactly one of EnforceOk (with the method and the carried routing name), Reject with
+      HEADER_MISMATCH, or Passthrough
+    invariants:
+    - >-
+      Mcp-Method and MCP-Protocol-Version are REQUIRED on every v2 request. D-13 relaxed exactly
+      one header and neither of these is it
+    - >-
+      Mcp-Name is required exactly when name_bearing_key(method) is Some -- no wider, no narrower.
+      The server's predicate and the client's emitter read the SAME table, so the two ends of the
+      cross-check cannot disagree about which methods carry a name (D-18)
+    - >-
+      When Mcp-Name is present on a name-bearing method its decoded value equals the body's routing
+      name at that method's params key; a value that opens the =?base64?...?= sentinel but does not
+      decode is a rejection, never a silent pass
+    - >-
+      When the method is not name-bearing the carried name is the EMPTY STRING regardless of what
+      arrived, so an unvalidated attacker-supplied value can neither branch downstream logic nor be
+      reflected in the response headers
+    - >-
+      The gate is TOTAL: it returns Reject, never a panic, for every header byte sequence
+      HeaderValue can represent and every raw request body byte sequence
+    - >-
+      A v1 request is Passthrough. The era decision is per-request, so relaxing the v2 rule changes
+      nothing about what a v1 caller sees
+    preconditions:
+    - The raw body has already been parsed once and the same parsed value feeds the era read, this
+      cross-check and the MRTR params read, so the three cannot disagree about what the body says
+    - Header values are read through the length-bounded bounded_header_str helper
+    postconditions:
+    - A v2 request for a non-name-bearing method with no Mcp-Name reaches dispatch
+    - A v2 request for any name-bearing method with a missing or disagreeing Mcp-Name is answered
+      HEADER_MISMATCH before dispatch
+    - The response's Mcp-Name is empty for every method with no routing name
+    lean_theorem: Theorems.V2HeaderGate
+
 proof_obligations:
 - type: state_machine
   property: Session lifecycle enforces initialization

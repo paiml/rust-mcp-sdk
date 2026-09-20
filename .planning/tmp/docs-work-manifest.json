@@ -1,0 +1,37 @@
+{
+  "scope": "workbook-server-gap (Phase 95 Shape A + Phase 96 Shape B). Scoped per user choice at queue-confirmation gate — NOT full canonical generation.",
+  "canonical_queue": [
+    {
+      "type": "readme",
+      "resolved_path": "README.md",
+      "mode": "supplement",
+      "preservation_mode": "supplement",
+      "wave": 1,
+      "status": "pending",
+      "note": "hand-written (no GSD marker) — surgical supplement only: workbook-server feature bullet, --kind list, crate table, Learn-more links. Done by orchestrator directly to avoid reshaping the hand-crafted README."
+    }
+  ],
+  "review_queue": [],
+  "gap_queue": [
+    {
+      "description": "crates/pmcp-workbook-server/README.md — Shape A crate README, mirror crates/pmcp-sql-server/README.md",
+      "output_path": "crates/pmcp-workbook-server/README.md",
+      "status": "pending"
+    },
+    {
+      "description": "pmcp-book chapter 12.12 — Config-Driven Workbook Servers",
+      "output_path": "pmcp-book/src/ch12-12-config-driven-workbook-servers.md",
+      "status": "pending"
+    },
+    {
+      "description": "pmcp-course chapter — Config-Driven Workbook Servers (part3-deployment)",
+      "output_path": "pmcp-course/src/part3-deployment/ch08-6-config-driven-workbook-server.md",
+      "status": "pending"
+    }
+  ],
+  "summary_edits": [
+    "pmcp-book/src/SUMMARY.md — register ch12.12",
+    "pmcp-course/src/SUMMARY.md — register workbook chapter"
+  ],
+  "created_at": "2026-06-15"
+}

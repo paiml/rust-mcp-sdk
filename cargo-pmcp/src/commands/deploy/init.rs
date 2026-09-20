@@ -1886,6 +1886,32 @@ export class McpServerStack extends cdk.Stack {{
     }
 }
 
+/// The `memorySize:` literal the `aws-lambda` scaffold writes into
+/// `deploy/lib/stack.ts` for the MCP function.
+///
+/// `render_stack_ts_for_deploy` has no sizing parameter — the literal is baked
+/// into the template text — so this const is a MIRROR, not the source. It
+/// exists so the deploy-time divergence warning
+/// (`deployment::config::sizing_divergence_warning`) can name the value the
+/// `npx cdk deploy` path will actually deploy, instead of hardcoding a second
+/// copy that could silently drift from the template.
+/// `scaffold_sizing_literals_match_the_rendered_template` is the tripwire that
+/// fails if the two ever disagree.
+///
+/// Threading the config value into the template instead was measured and
+/// REJECTED: `stack_routing::custom_stack_ts_reason` routes on a strict
+/// byte-match between the on-disk stack.ts and a fresh render, while
+/// `write_stack_ts_guarded` keeps the on-disk file frozen — so changing the
+/// template would make EVERY existing project (pristine scaffolds included)
+/// fail the byte-match, silently fall back to `npx cdk synth`, and be falsely
+/// tainted as hand-modified via `mcp:customStack`.
+pub(crate) const AWS_LAMBDA_SCAFFOLD_MEMORY_MB: u32 = 512;
+
+/// The `cdk.Duration.seconds(...)` literal the `aws-lambda` scaffold writes
+/// into `deploy/lib/stack.ts` for the MCP function. See
+/// [`AWS_LAMBDA_SCAFFOLD_MEMORY_MB`].
+pub(crate) const AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS: u32 = 30;
+
 /// Render `deploy/lib/stack.ts` for an already-loaded `DeployConfig`.
 ///
 /// Used by `cargo pmcp deploy` to regenerate the stack file from the user's
@@ -1930,6 +1956,36 @@ mod wave1_stack_ts_tests {
             oauth_options: OAuthOptions::default(),
             target_type: target_type.to_string(),
         }
+    }
+
+    /// Drift tripwire for [`AWS_LAMBDA_SCAFFOLD_MEMORY_MB`] /
+    /// [`AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS`].
+    ///
+    /// Those consts MIRROR literals baked into the stack.ts template text; the
+    /// deploy-time divergence warning quotes them as "what will actually be
+    /// deployed" on the `npx cdk deploy` path. If someone edits the template
+    /// literal without editing the const, the warning starts lying — this test
+    /// is the only thing that would notice.
+    #[test]
+    fn scaffold_sizing_literals_match_the_rendered_template() {
+        let ts = render_stack_ts_for_deploy(
+            "aws-lambda",
+            "demo-server",
+            &IamConfig::default(),
+            &crate::deployment::config::MetadataConfig::default(),
+        );
+        assert!(
+            ts.contains(&format!("memorySize: {AWS_LAMBDA_SCAFFOLD_MEMORY_MB},")),
+            "AWS_LAMBDA_SCAFFOLD_MEMORY_MB ({AWS_LAMBDA_SCAFFOLD_MEMORY_MB}) no longer matches the \
+             aws-lambda stack.ts template literal.\nGot:\n{ts}"
+        );
+        assert!(
+            ts.contains(&format!(
+                "timeout: cdk.Duration.seconds({AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS}),"
+            )),
+            "AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS ({AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS}) no longer \
+             matches the aws-lambda stack.ts template literal.\nGot:\n{ts}"
+        );
     }
 
     #[test]

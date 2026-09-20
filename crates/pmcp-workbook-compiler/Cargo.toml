@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-workbook-compiler"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -38,7 +38,7 @@ default = []
 # re-exports the runtime's shared model/IR/hash/changelog/finding/rounding types
 # (NEVER re-declares them) so the served loader and the compiler read ONE
 # definition of Manifest/ChangeClass/etc.
-pmcp-workbook-runtime = { version = "0.1.0", path = "../pmcp-workbook-runtime" }
+pmcp-workbook-runtime = { version = "0.2.0", path = "../pmcp-workbook-runtime" }
 # The dialect contract (WHITELIST/DialectRules/CandidateRole) the linter runs
 # against — re-exported here, never re-declared (the dialect crate's spec-binding
 # test would be defeated by a second WHITELIST copy).
@@ -98,7 +98,7 @@ tempfile = "3"
 # cached `<v>` results via `Formula::set_result` — the Plan 04 reconcile oracle.
 # Dev-only: the compiler never links a writer at runtime. Version mirrors the
 # runtime crate's pin (0.95, default-features off).
-rust_xlsxwriter = { version = "0.96", default-features = false }
+rust_xlsxwriter = { version = "0.99", default-features = false }
 # The CONSUMER contract: the direct toolkit loader round-trip test
 # (`emitted_bundle_loads_via_toolkit`) loads an emitted temp bundle through the
 # Phase 92 served loader. The `workbook` feature pulls the LocalDirSource + the

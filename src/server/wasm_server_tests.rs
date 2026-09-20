@@ -225,11 +225,15 @@ mod tests {
                     Ok(ListResourcesResult {
                         resources: vec![ResourceInfo::new("test://1", "Resource 1")],
                         next_cursor: Some("page2".to_string()),
+                        ttl_ms: None,
+                        cache_scope: None,
                     })
                 } else {
                     Ok(ListResourcesResult {
                         resources: vec![ResourceInfo::new("test://2", "Resource 2")],
                         next_cursor: None,
+                        ttl_ms: None,
+                        cache_scope: None,
                     })
                 }
             }

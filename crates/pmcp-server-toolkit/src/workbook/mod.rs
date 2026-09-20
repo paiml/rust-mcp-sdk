@@ -1,10 +1,12 @@
 //! Governed-Excel workbook served-tool module (Phase 92,
 //! `bundlesource-served-tool-toolkit-module`).
 //!
-//! This is the toolkit-side home for the served `calculate` / `explain` /
-//! `get_manifest` / `diff_version` / `render_workbook` / `verify_accuracy` tools
-//! that operate on a verified [`pmcp_workbook_runtime::WorkbookBundle`] (loaded
-//! fail-closed via the runtime's `BundleSource` + `BundleLoader`).
+//! This is the toolkit-side home for the served workbook tools that operate on
+//! a verified [`pmcp_workbook_runtime::WorkbookBundle`] (loaded fail-closed via
+//! the runtime's `BundleSource` + `BundleLoader`): ONE named compute tool per
+//! output Table (WBV2-04 — the generic single `calculate` is retired), plus the
+//! workbook-wide `explain` / `get_manifest` / `diff_version` / `render_workbook`
+//! / `verify_accuracy` tools.
 //!
 //! NOTE (Phase 100 Plan 01, non-releasable intermediate): the six-tool count is
 //! reflected here ahead of `verify_accuracy`'s handler, which is registered in

@@ -20,21 +20,45 @@
 // from here. The linter (Phase 93) layers on top of these.
 pub use pmcp_workbook_runtime::finding::{LintFinding, LintReport, Severity};
 
-/// The constrained-dialect function whitelist (DIA-05). 13 flat first-class
+/// The constrained-dialect function whitelist (DIA-05). 17 flat first-class
 /// names that the lighthouse workbook authors, so it lints clean as-authored.
 ///
 /// # D-05 decision (flat, no tiering)
 ///
-/// There is NO core/widened split: all 13 functions are first-class. The set was
+/// There is NO core/widened split: all 17 functions are first-class. The set was
 /// surfaced explicitly from what the lighthouse workbook authors — the dialect
 /// accepts exactly these names rather than (a) silently auto-widening the
 /// whitelist to whatever a workbook happens to use, or (b) refactoring a source
 /// workbook to avoid them. Widen deliberately; do not auto-widen; do not rewrite
 /// the source workbook. Removing any of these breaks the reference workbook's
 /// clean lint (D-07).
+///
+/// ## Deliberate widening, dialect 1.1 (2026-09-06)
+///
+/// `ROUNDDOWN`, `MAX`, `MIN` and `XLOOKUP` were added as a DELIBERATE widening —
+/// the four names a BA most often reaches for and previously got `#NAME?` from.
+/// This note lives here because this rustdoc is the place that says "widen
+/// deliberately", so every widening must leave its trace in it. `XLOOKUP` is
+/// accepted only in its narrow 3/4-argument EXACT form (spec §3.2); a
+/// `match_mode`/`search_mode` argument is a located parse-time rejection.
 pub const WHITELIST: &[&str] = &[
-    "IF", "VLOOKUP", "INDEX", "MATCH", "SUMIF", "SUM", "ROUNDUP", "CEILING", "IFERROR", "ISNUMBER",
-    "SEARCH", "ROUND", "TEXT",
+    "IF",
+    "VLOOKUP",
+    "INDEX",
+    "MATCH",
+    "SUMIF",
+    "SUM",
+    "ROUNDUP",
+    "CEILING",
+    "IFERROR",
+    "ISNUMBER",
+    "SEARCH",
+    "ROUND",
+    "TEXT",
+    "ROUNDDOWN",
+    "MAX",
+    "MIN",
+    "XLOOKUP",
 ];
 
 /// The baseline dialect version a workbook with NO `pmcp_dialect_version`
@@ -49,7 +73,7 @@ pub const BASELINE_DIALECT_VERSION: &str = "1.0";
 /// accepted; a different major OR a newer minor fails closed with a typed
 /// `CompileError`. Bound to the spec doc by the `dialect_version_spec` drift guard
 /// so the published contract and the enforced const can never drift.
-pub const SUPPORTED_DIALECT_VERSION: &str = "1.0";
+pub const SUPPORTED_DIALECT_VERSION: &str = "1.1";
 
 /// The fallback colour-role palette ARGBs (the lighthouse's known direct fills /
 /// fonts). A later synthesis phase MAY override the palette from the `0_Guide`
@@ -105,7 +129,7 @@ pub struct DialectRules {
 }
 
 impl Default for DialectRules {
-    /// The fallback rules: the 13-name [`WHITELIST`] + the hardcoded colour
+    /// The fallback rules: the 17-name [`WHITELIST`] + the hardcoded colour
     /// palette + the numbered sheet-layer prefixes. A later phase may override
     /// the palette from the `0_Guide` legend. So both the linter and synthesis
     /// construct rules from one place: `DialectRules::default()`.
@@ -178,7 +202,7 @@ mod tests {
     fn whitelist_canary_count_unique_uppercase() {
         assert_eq!(
             WHITELIST.len(),
-            13,
+            17,
             "deliberate widening must update this canary (D-05)"
         );
         let unique: std::collections::BTreeSet<_> = WHITELIST.iter().collect();
@@ -215,7 +239,7 @@ mod tests {
     #[test]
     fn default_constructs_and_exposes_whitelist_and_layering() {
         let rules = DialectRules::default();
-        assert_eq!(rules.whitelist().len(), 13);
+        assert_eq!(rules.whitelist().len(), 17);
         assert!(rules.sheet_layer_prefixes().contains(&"1_".to_string()));
     }
 

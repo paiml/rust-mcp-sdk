@@ -12,7 +12,7 @@
 //! - `ElicitInputBuilder` -> removed (construct `ElicitRequestParams` directly)
 //! - Method name: `elicitation/elicitInput` -> `elicitation/create`
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -21,7 +21,27 @@ use std::collections::HashMap;
 /// Supports two modes:
 /// - `form`: Server provides a JSON Schema subset; client renders a form
 /// - `url`: Server provides a URL for out-of-band user interaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # `mode` is optional on the wire (MCP 2026-07-28)
+///
+/// The v2 schema makes `ElicitRequestFormParams.mode` OPTIONAL — a conformant
+/// server may omit it entirely, in which case `form` is implied. `mode: "url"`
+/// stays REQUIRED. Only [`Deserialize`] is therefore hand-written:
+///
+/// - deserialization treats an ABSENT `mode` as `"form"` (v2 tolerance), and
+/// - serialization stays DERIVED from the serde internally-tagged `mode`
+///   discriminator, so the v1 wire bytes are unchanged (Phase-113 D-10) by
+///   construction rather than by test.
+///
+/// Deriving the egress half matters: with a hand-written `serialize`, adding a
+/// field to a variant compiles fine and silently drops it from the wire, and the
+/// camelCase key spellings live in two places at once. The draft spec is still
+/// moving, so that asymmetry would have been a live risk on the exact type MRTR
+/// carries inside `InputRequest::Elicitation`.
+///
+/// The public enum shape, its variants and its field names are untouched — this
+/// is a serde-only, semver-additive change.
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "mode")]
 pub enum ElicitRequestParams {
     /// Form-based elicitation with JSON Schema
@@ -43,6 +63,67 @@ pub enum ElicitRequestParams {
         /// URL the user should visit
         url: String,
     },
+}
+
+/// The `mode` value implied when a form elicitation omits the field.
+const ELICIT_MODE_FORM: &str = "form";
+
+/// The `mode` value a URL elicitation must carry explicitly.
+const ELICIT_MODE_URL: &str = "url";
+
+/// Serde-generated field handling for the `form` shape, so camelCase renaming and
+/// missing-required-field errors stay serde-produced rather than hand-rolled.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FormShape {
+    message: String,
+    requested_schema: Value,
+}
+
+/// Serde-generated field handling for the `url` shape.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlShape {
+    message: String,
+    elicitation_id: String,
+    url: String,
+}
+
+impl<'de> Deserialize<'de> for ElicitRequestParams {
+    /// Reads the OPTIONAL `mode` discriminator, defaulting an absent one to
+    /// `"form"`, then dispatches to a serde-derived shape struct.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        let mode = match raw.get("mode") {
+            None | Some(Value::Null) => ELICIT_MODE_FORM,
+            Some(Value::String(mode)) => mode.as_str(),
+            Some(_) => return Err(de::Error::custom("`mode` must be a string")),
+        };
+        match mode {
+            ELICIT_MODE_FORM => {
+                let shape = FormShape::deserialize(&raw).map_err(de::Error::custom)?;
+                Ok(Self::Form {
+                    message: shape.message,
+                    requested_schema: shape.requested_schema,
+                })
+            },
+            ELICIT_MODE_URL => {
+                let shape = UrlShape::deserialize(&raw).map_err(de::Error::custom)?;
+                Ok(Self::Url {
+                    message: shape.message,
+                    elicitation_id: shape.elicitation_id,
+                    url: shape.url,
+                })
+            },
+            other => Err(de::Error::unknown_variant(
+                other,
+                &[ELICIT_MODE_FORM, ELICIT_MODE_URL],
+            )),
+        }
+    }
 }
 
 /// Elicitation result returned by the client (MCP 2025-11-25).
@@ -149,6 +230,110 @@ mod tests {
             },
             ElicitRequestParams::Form { .. } => panic!("Expected Url variant"),
         }
+    }
+
+    #[test]
+    fn elicit_request_form_mode_is_optional() {
+        // The 2026-07-28 schema makes `ElicitRequestFormParams.mode` OPTIONAL
+        // (implicit form). A conformant server omits it, and the derived
+        // internally-tagged Deserialize used to reject that with
+        // "missing field `mode`" — breaking the client half of CLNT-02.
+        let params: ElicitRequestParams = serde_json::from_value(json!({
+            "message": "What is your name?",
+            "requestedSchema": { "type": "object" }
+        }))
+        .expect("a mode-less form elicitation must deserialize");
+        match params {
+            ElicitRequestParams::Form {
+                message,
+                requested_schema,
+            } => {
+                assert_eq!(message, "What is your name?");
+                assert_eq!(requested_schema["type"], "object");
+            },
+            ElicitRequestParams::Url { .. } => panic!("Expected Form variant"),
+        }
+    }
+
+    #[test]
+    fn elicit_request_explicit_form_mode_still_deserializes() {
+        let params: ElicitRequestParams = serde_json::from_value(json!({
+            "mode": "form",
+            "message": "hi",
+            "requestedSchema": {}
+        }))
+        .expect("an explicit form mode must still deserialize");
+        assert!(matches!(params, ElicitRequestParams::Form { .. }));
+    }
+
+    #[test]
+    fn elicit_request_url_mode_still_requires_its_fields() {
+        let params: ElicitRequestParams = serde_json::from_value(json!({
+            "mode": "url",
+            "message": "auth",
+            "elicitationId": "auth-1",
+            "url": "https://example.com"
+        }))
+        .expect("a complete url elicitation must deserialize");
+        assert!(matches!(params, ElicitRequestParams::Url { .. }));
+
+        // `mode: "url"` stays REQUIRED and so do its fields — a url elicitation
+        // missing `elicitationId` or `url` must NOT silently fall back to form.
+        assert!(serde_json::from_value::<ElicitRequestParams>(
+            json!({ "mode": "url", "message": "auth", "url": "https://example.com" })
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ElicitRequestParams>(
+            json!({ "mode": "url", "message": "auth", "elicitationId": "auth-1" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn elicit_request_rejects_an_unknown_mode() {
+        assert!(serde_json::from_value::<ElicitRequestParams>(json!({
+            "mode": "bogus",
+            "message": "hi",
+            "requestedSchema": {}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn elicit_request_rejects_a_non_string_mode() {
+        assert!(serde_json::from_value::<ElicitRequestParams>(json!({
+            "mode": 7,
+            "message": "hi",
+            "requestedSchema": {}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn elicit_request_form_still_serializes_the_mode_tag() {
+        // v1 byte compatibility (D-10): serialization is UNCHANGED — the enum must
+        // keep emitting `"mode":"form"` even though deserialization now tolerates
+        // its absence.
+        let params = ElicitRequestParams::Form {
+            message: "hi".to_string(),
+            requested_schema: json!({}),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["mode"], "form");
+        assert_eq!(value["message"], "hi");
+        assert!(value["requestedSchema"].is_object());
+        assert_eq!(
+            serde_json::to_string(&params).unwrap(),
+            r#"{"mode":"form","message":"hi","requestedSchema":{}}"#
+        );
+    }
+
+    #[test]
+    fn elicit_request_form_missing_required_fields_is_an_error() {
+        // A mode-less object that is not a valid form must still fail — the
+        // implicit-form default must not swallow malformed input.
+        assert!(serde_json::from_value::<ElicitRequestParams>(json!({ "message": "hi" })).is_err());
+        assert!(serde_json::from_value::<ElicitRequestParams>(json!({})).is_err());
     }
 
     #[test]

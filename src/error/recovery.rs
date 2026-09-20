@@ -480,6 +480,10 @@ pub trait RecoveryHandler: Send + Sync {
     async fn recover(&self, error_msg: &str) -> Result<serde_json::Value>;
 }
 
+/// Strategy for recovering from a transport or protocol error.
+///
+/// wasm32 mirror of the native trait; `?Send` because wasm futures are not
+/// `Send`.
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait RecoveryHandler {
@@ -750,6 +754,10 @@ pub trait HealthMonitor: Send + Sync {
     ) -> Result<Box<dyn Future<Output = RecoveryEvent> + Send + Unpin>>;
 }
 
+/// Reports component health to the recovery machinery.
+///
+/// wasm32 mirror of the native trait; `?Send` because wasm futures are not
+/// `Send`.
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait HealthMonitor {
@@ -826,6 +834,10 @@ impl RecoveryCoordinator {
         self.event_handlers.write().await.push(handler);
     }
 
+    /// Register a callback invoked for every [`RecoveryEvent`].
+    ///
+    /// wasm32 counterpart of the native method: the handler is not required to
+    /// be `Send`, since wasm32 runs single-threaded.
     #[cfg(target_arch = "wasm32")]
     pub async fn add_event_handler(&self, handler: Arc<dyn Fn(RecoveryEvent)>) {
         self.event_handlers.write().await.push(handler);

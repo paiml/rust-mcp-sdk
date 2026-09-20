@@ -23,6 +23,11 @@ where
     tokio::spawn(future);
 }
 
+/// Spawn `future` onto the host event loop.
+///
+/// On wasm32 there is no task handle to join: the future is handed to
+/// `wasm_bindgen_futures::spawn_local` and runs to completion detached, which is
+/// why this returns `()` rather than the native tier's `JoinHandle`.
 #[cfg(target_arch = "wasm32")]
 pub fn spawn<F>(future: F)
 where
@@ -65,6 +70,8 @@ pub async fn sleep(duration: std::time::Duration) {
 #[cfg(not(target_arch = "wasm32"))]
 pub type Mutex<T> = tokio::sync::Mutex<T>;
 
+/// Platform-independent `Mutex`. On wasm32 this is the `futures` async mutex,
+/// since tokio's synchronisation primitives are unavailable there.
 #[cfg(target_arch = "wasm32")]
 pub type Mutex<T> = futures::lock::Mutex<T>;
 
@@ -119,6 +126,7 @@ mod wasm_runtime {
 
     /// RwLock wrapper for WASM that uses Mutex internally
     /// Since WASM is single-threaded, we can use Mutex for both read and write
+    #[derive(Debug)]
     pub struct RwLock<T> {
         inner: Mutex<T>,
     }
@@ -147,6 +155,7 @@ mod wasm_runtime {
     }
 
     /// Read guard for WASM RwLock
+    #[derive(Debug)]
     pub struct RwLockReadGuard<'a, T> {
         guard: MutexGuard<'a, T>,
     }
@@ -160,6 +169,7 @@ mod wasm_runtime {
     }
 
     /// Write guard for WASM RwLock
+    #[derive(Debug)]
     pub struct RwLockWriteGuard<'a, T> {
         guard: MutexGuard<'a, T>,
     }
@@ -179,6 +189,7 @@ mod wasm_runtime {
     }
 
     /// Dummy JoinHandle for WASM (no real task spawning)
+    #[derive(Debug)]
     pub struct JoinHandle<T> {
         _phantom: std::marker::PhantomData<T>,
     }
@@ -192,6 +203,8 @@ mod wasm_runtime {
         }
     }
 
+    /// The error type of [`JoinHandle`]. Never produced: wasm32 has no joinable
+    /// tasks, so the handle simply never resolves.
     #[derive(Debug)]
     pub struct JoinError;
 

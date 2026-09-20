@@ -1,5 +1,12 @@
-# Only seed_* files are checked in as reference corpus. Auto-discovered
-# inputs from `cargo fuzz run` are local-only.
+# Only hand-written seed inputs are checked in as reference corpus.
+# Auto-discovered inputs from `cargo fuzz run` are local-only.
 *
 !.gitignore
 !seed_*.toml
+# Phase 120-02: a config-only (Shape A) server manifest carrying the new
+# server layer media types and NO top-level artifactType. The target
+# synthesizes structured manifests only by mutation, so this shape is
+# effectively unreachable without a seed. Listed by name rather than under
+# the `seed_*` glob because the phase plan and its acceptance criteria
+# reference this exact path.
+!config_only_manifest.json

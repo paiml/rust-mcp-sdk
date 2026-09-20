@@ -2,6 +2,12 @@
 name = "mcp-server-cloudflare-adapter"
 version = "0.1.0"
 edition = "2021"
+# Deploy adapter, never shipped to crates.io. This is the single opt-out
+# recognised by scripts/check-release-coverage.sh; without it this manifest
+# matches that gate's discovery RULE (its own [workspace] table below) while
+# lying outside its scanned scope, so the gate would report full coverage for a
+# crate it never checked.
+publish = false
 
 # Metadata for wasm-pack
 [package.metadata.wasm-pack]

@@ -11,6 +11,11 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 cargo-pmcp = { path = ".." }
 toml = "0.9"
+# `fuzz_package_artifact` re-derives each accepted blob's sha256 DIRECTLY rather
+# than through `pmcp_package::ManifestDigest`, so the invariant does not share an
+# implementation with the reader it is checking. A check that calls the same
+# helper as the code under test cannot notice that helper changing.
+sha2 = "0.10"
 
 # Prevent this from interfering with workspace
 [workspace]
@@ -68,6 +73,17 @@ bench = false
 [[bin]]
 name = "fuzz_package_kind"
 path = "fuzz_targets/fuzz_package_kind.rs"
+doc = false
+test = false
+bench = false
+
+# Phase 123-07 (PKGX-02): the untrusted artifact-tar boundary behind
+# `package load` / `package pull`, reached through the `package_artifact` lib
+# seam (`cargo-pmcp/src/lib.rs`) because `commands/package/artifact.rs` is
+# otherwise bin-only.
+[[bin]]
+name = "fuzz_package_artifact"
+path = "fuzz_targets/fuzz_package_artifact.rs"
 doc = false
 test = false
 bench = false

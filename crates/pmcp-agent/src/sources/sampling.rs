@@ -31,7 +31,7 @@ use crate::seams::{CompletionError, CompletionSource};
 /// [`create_message`](CompletionSource::create_message) to
 /// [`PeerHandle::sample_with_tools`]. Zero new dependencies.
 ///
-/// The peer is request-scoped, so the SamplingSource is typically constructed
+/// The peer is request-scoped, so the `SamplingSource` is typically constructed
 /// per tool invocation (the request-scoped factory that mints one per call
 /// lands in the 108-06 adapter).
 #[derive(Clone)]

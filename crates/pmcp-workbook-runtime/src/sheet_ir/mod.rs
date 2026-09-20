@@ -4,7 +4,7 @@
 //! range-capable [`eval_value::EvalValue`] (finding #4), the D-03/D-04
 //! [`eval_bridge`] (now over the PURE-RUST [`crate::scalar_eval`], Phase 11 Plan
 //! 05), the deterministic [`rounding`] helpers, the [`semantics`] bodies for all
-//! 13 whitelisted functions, and the topo-ordered [`executor`] SERVE-time
+//! 17 whitelisted functions, and the topo-ordered [`executor`] SERVE-time
 //! [`executor::run`].
 //!
 //! The `Cell`/`CellExpr` skeleton below is the per-cell IR unit the topo executor

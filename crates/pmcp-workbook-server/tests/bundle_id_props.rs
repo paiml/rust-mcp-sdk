@@ -86,7 +86,7 @@ fn matching_bundle_id_succeeds() {
     let server = build_server(&args_with_bundle_id(Some(GOLDEN_BUNDLE_ID.to_string())))
         .expect("matching --bundle-id must assemble a server");
     assert!(
-        server.get_tool("calculate").is_some(),
+        server.get_tool("calculate_tax").is_some(),
         "the matching-id server registers the workbook tools"
     );
 }
@@ -98,7 +98,7 @@ fn absent_bundle_id_succeeds() {
     let server = build_server(&args_with_bundle_id(None))
         .expect("absent --bundle-id must assemble a server");
     assert!(
-        server.get_tool("calculate").is_some(),
+        server.get_tool("calculate_tax").is_some(),
         "the no-assertion server registers the workbook tools"
     );
 }

@@ -1,0 +1,265 @@
+{
+  "tag": "v2.19.1",
+  "generated_from": ".planning/phases/124-release-publish-order/124-03-SUMMARY.md#task-3-decision--decided (plus ADDENDUM and ADDENDUM 2, and the Option A resolution)",
+  "generated_at": "2026-08-27",
+  "generated_by": "124-05 (Tasks 1-4)",
+  "expected_new": [
+    {
+      "crate": "pmcp",
+      "version": "2.19.1",
+      "manifest_path": "Cargo.toml",
+      "previously_published": "2.19.0",
+      "source": "authorised bump (plan 03 decision as amended)"
+    },
+    {
+      "crate": "pmcp-workbook-runtime",
+      "version": "0.2.0",
+      "manifest_path": "crates/pmcp-workbook-runtime/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "authorised bump (plan 03 decision as amended)"
+    },
+    {
+      "crate": "pmcp-code-mode-derive",
+      "version": "0.3.0",
+      "manifest_path": "crates/pmcp-code-mode-derive/Cargo.toml",
+      "previously_published": "0.2.0",
+      "source": "authorised bump (plan 03 decision as amended; axis corrected to minor at the pre-PR verification gate \u2014 emitted code requires pmcp-code-mode >=0.5.0, unconstrained by the manifest)"
+    },
+    {
+      "crate": "pmcp-workbook-compiler",
+      "version": "0.1.1",
+      "manifest_path": "crates/pmcp-workbook-compiler/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "authorised bump (plan 03 decision as amended)"
+    },
+    {
+      "crate": "pmcp-workbook-dialect",
+      "version": "0.1.1",
+      "manifest_path": "crates/pmcp-workbook-dialect/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "authorised bump (plan 03 decision as amended)"
+    },
+    {
+      "crate": "cargo-pmcp",
+      "version": "0.23.0",
+      "manifest_path": "cargo-pmcp/Cargo.toml",
+      "previously_published": "0.21.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-agent",
+      "version": "0.3.0",
+      "manifest_path": "crates/pmcp-agent/Cargo.toml",
+      "previously_published": "0.2.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-cfn-renderer",
+      "version": "0.2.0",
+      "manifest_path": "crates/pmcp-cfn-renderer/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-openapi-server",
+      "version": "0.1.1",
+      "manifest_path": "crates/pmcp-openapi-server/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-package",
+      "version": "0.3.0",
+      "manifest_path": "crates/pmcp-package/Cargo.toml",
+      "previously_published": "0.1.1",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-server-toolkit",
+      "version": "0.1.2",
+      "manifest_path": "crates/pmcp-server-toolkit/Cargo.toml",
+      "previously_published": "0.1.1",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-tasks",
+      "version": "0.1.1",
+      "manifest_path": "crates/pmcp-tasks/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-team-servers",
+      "version": "0.2.0",
+      "manifest_path": "crates/pmcp-team-servers/Cargo.toml",
+      "previously_published": "0.1.1",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    },
+    {
+      "crate": "pmcp-workbook-server",
+      "version": "0.1.1",
+      "manifest_path": "crates/pmcp-workbook-server/Cargo.toml",
+      "previously_published": "0.1.0",
+      "source": "already ahead of the registry before this phase; rides this tag as-is"
+    }
+  ],
+  "expected_skips": [
+    {
+      "crate": "mcp-tester",
+      "version": "0.8.0",
+      "reason": "clean (0.8.0 == 0.8.0, no source delta since v2.19.0). Deliberately NOT bumped: six crates pin it by version and FOUR publish BEFORE it (release.yml :263/:329/:344/:383 vs :401) carrying path+version dev-deps that Cargo retains in the published manifest; bumping without moving all four kills the release job at pmcp-server-toolkit."
+    },
+    {
+      "crate": "mcp-preview",
+      "version": "0.3.1",
+      "reason": "phantom delta is manifest-only (tower-http ^0.6 -> ^0.7). No source moved; the user chose to leave it, so the delta stays unshipped."
+    },
+    {
+      "crate": "pmcp-sql-server",
+      "version": "0.1.0",
+      "reason": "phantom delta is [dev-dependencies] only (mcp-tester 0.7.0 -> 0.8.0, rusqlite 0.39 -> 0.40). Does not affect the published library surface; the user chose to leave it."
+    },
+    {
+      "crate": "pmcp-widget-utils",
+      "version": "0.1.0",
+      "reason": "NOT a delta at all. The published 0.1.0 src/lib.rs is byte-identical to the in-tree file; the tag:v1.3 baseline is over-early (the fmt reflow landed in eb7e4bf1, earliest containing tag v1.11.0, whence the diff is empty). RESEARCH Pitfall 2 is REFUTED."
+    },
+    {
+      "crate": "pmcp-code-mode",
+      "version": "0.5.4",
+      "reason": "clean (tag:v2.19.0, empty delta)."
+    },
+    {
+      "crate": "pmcp-macros",
+      "version": "0.6.1",
+      "reason": "clean (tag:v2.7.0, empty delta)."
+    },
+    {
+      "crate": "pmcp-macros-support",
+      "version": "0.1.0",
+      "reason": "clean (tag:v2.4.0, empty delta)."
+    },
+    {
+      "crate": "pmcp-server",
+      "version": "0.2.4",
+      "reason": "clean (tag:v2.19.0, empty delta)."
+    },
+    {
+      "crate": "pmcp-toolkit-athena",
+      "version": "0.1.0",
+      "reason": "clean (tag:v2.9.0, empty delta)."
+    },
+    {
+      "crate": "pmcp-toolkit-mysql",
+      "version": "0.1.1",
+      "reason": "clean (tag:v2.9.2, empty delta)."
+    },
+    {
+      "crate": "pmcp-toolkit-postgres",
+      "version": "0.1.0",
+      "reason": "clean (tag:v2.9.0, empty delta)."
+    }
+  ],
+  "registry_baselines": [
+    {
+      "crate": "mcp-preview",
+      "published_version": "0.3.1",
+      "provenance": "tag:v2.7.0+confirmed (published manifest carries tower-http ^0.6)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "mcp-tester",
+      "published_version": "0.8.0",
+      "provenance": "tag:v2.19.0 (clean)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp",
+      "published_version": "2.19.0",
+      "provenance": "tag:v2.19.0+confirmed (published manifest carries jsonwebtoken 10.3)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-code-mode-derive",
+      "published_version": "0.2.0",
+      "provenance": "tag:v2.3.1+confirmed (published src/lib.rs:274 emits the sync validate_sql_query)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-sql-server",
+      "published_version": "0.1.0",
+      "provenance": "tag:v2.9.0+confirmed (published manifest carries dev-deps mcp-tester 0.7.0, rusqlite 0.39)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-widget-utils",
+      "published_version": "0.1.0",
+      "provenance": "tag:v1.3 UNCORROBORATED and REFUTED -- deliberately left uncorroborated so it renders as a bare tag",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-workbook-compiler",
+      "published_version": "0.1.0",
+      "provenance": "tag:v2.9.2+confirmed (published manifest carries umya-spreadsheet ^3.0)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-workbook-dialect",
+      "published_version": "0.1.0",
+      "provenance": "clean in the sweep; bumped as an authorised consequence of the runtime 0.2.0 move, not because of a source delta",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    },
+    {
+      "crate": "pmcp-workbook-runtime",
+      "published_version": "0.1.0",
+      "provenance": "tag:v2.9.2+confirmed (published .crate has no src/reconcile.rs, no RenderMode)",
+      "measured_at": "2026-08-27 (make release-sweep, crates.io API)"
+    }
+  ],
+  "authorised_exceptions": [
+    "mcp-tester is NOT bumped. Decided at plan 03's blocking-human checkpoint, option (a). It is clean (0.8.0 == 0.8.0). Four of its six in-repo pin sites publish BEFORE it and carry retained path+version dev-deps, so a bump without moving all four kills the release job at pmcp-server-toolkit (release.yml :263).",
+    "crates/mcp-tester and cargo-pmcp are NOT bumped on account of pmcp 2.19.0 -> 2.19.1. Both pin pmcp = \"2.19.0\" and ^2.19.0 already admits 2.19.1. CLAUDE.md's Version Bump Rules carry this caret exception explicitly, and it covers PATCH bumps only.",
+    "pmcp-workbook-dialect 0.1.0 -> 0.1.1 is a PURE RE-PIN release with no source change. It is authorised (Option A) because pmcp-workbook-runtime 0.1.0 -> 0.2.0 is semver-incompatible, so its ^0.1.0 requirement is forced to move, and a changed published artifact needs a new version.",
+    "pmcp-workbook-compiler's and pmcp-workbook-dialect's runtime pins move ONLY because Cargo forces them (0 new-symbol uses each, measured against a pmcp-server-toolkit positive control with 3 imports / 10 qualified refs). pmcp-server-toolkit's two pins move on CODE grounds.",
+    "pmcp-package ships 0.3.0 AS-IS. The D-04 audit found 0 added non-doc, non-blank lines in both source files touched since 6430afae, so no emitter moves and none of its four consumers needs a consequence bump.",
+    "pmcp-code-mode-derive ships 0.3.0, NOT the 0.2.1 plan 03 authorised. The axis was corrected at the pre-PR verification gate on 2026-08-27. semver-checks still cannot check it (proc-macro, no library target, exit 101), so it was resolved by hand: the published 0.2.0 .crate differs from in-tree by exactly one code line -- the emitted call moves from validate_sql_query to validate_sql_query_async(...).await. That method is ABSENT from pmcp-code-mode 0.4.0 and present from 0.5.0, and the derive declares no RUNTIME dependency on pmcp-code-mode (its dev-dependency is stripped from the published manifest), so nothing constrains the pairing. A 0.2.1 patch would have been taken AUTOMATICALLY by every ^0.2 user and broken their build. Users of 0.3.0 must be on pmcp-code-mode >= 0.5.0. This is the third axis error this phase caught, and the second that prose reasoning got wrong.",
+    "mcp-preview, pmcp-sql-server and pmcp-widget-utils are left unbumped by explicit decision; for the first two the delta stays unshipped indefinitely, and for the third there is no delta to ship."
+  ],
+  "semver_verdicts": [
+    {
+      "crate": "pmcp",
+      "move": "2.19.0 -> 2.19.1",
+      "tool_exit": 0,
+      "classification": "patch change",
+      "detail": "223 checks: 223 pass, 30 skip; 'no semver update required'"
+    },
+    {
+      "crate": "pmcp-workbook-runtime",
+      "move": "0.1.0 -> 0.2.0",
+      "tool_exit": 0,
+      "classification": "major change",
+      "detail": "0.1.1 was REFUTED at exit 100: function_parameter_count_changed, render_xlsx 2 -> 3 params at src/render/mod.rs:270"
+    },
+    {
+      "crate": "pmcp-workbook-compiler",
+      "move": "0.1.0 -> 0.1.1",
+      "tool_exit": 0,
+      "classification": "minor change",
+      "detail": "no semver update required"
+    },
+    {
+      "crate": "pmcp-workbook-dialect",
+      "move": "0.1.0 -> 0.1.1",
+      "tool_exit": 0,
+      "classification": "minor change",
+      "detail": "no semver update required"
+    },
+    {
+      "crate": "pmcp-code-mode-derive",
+      "move": "0.2.0 -> 0.3.0",
+      "tool_exit": 101,
+      "classification": "RESOLVED BY MANUAL DIFF (tool still cannot check it)",
+      "detail": "proc-macro, no library target -- semver-checks cannot compare an API surface (exit 101). Resolved instead by diffing the published 0.2.0 .crate against in-tree: exactly one code line differs, the emitted call validate_sql_query -> validate_sql_query_async(...).await. validate_sql_query_async is ABSENT from pmcp-code-mode 0.4.0 and present from 0.5.0; the derive declares NO runtime dependency on pmcp-code-mode (only a dev-dependency, which is stripped from the published manifest), so the incompatible pairing is unconstrained. A 0.2.1 patch would have been taken automatically by ^0.2 users and broken their build. Axis corrected to minor (0.3.0) at the pre-PR verification gate."
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"schema_version":1,"client_id":"c-1","application_type":"native","entries":{"https://mcp.example":{"access_token":"at","issuer":"https://as.example","client_id":"cid"}}}

@@ -77,6 +77,35 @@ pub enum ToolkitError {
     #[error("config validation failed: {0}")]
     Validation(#[from] ConfigValidationError),
 
+    /// `[backend].base_url` holds a `${VAR}` / `env:VAR` reference that could
+    /// not be resolved: the named environment variable is unset, or is set to
+    /// an empty / whitespace-only value.
+    ///
+    /// Filed HERE and NOT under [`ConfigValidationError`] deliberately (Phase
+    /// 120 Plan 04, cross-AI review LOW). `ConfigValidationError` is the
+    /// semantic validation surfaced by
+    /// [`crate::config::ServerConfig::validate`] — i.e. PARSE time. This lookup
+    /// happens at DISPATCH time, long after `validate()` returned `Ok` (the
+    /// literal `"${TFL_BASE_URL}"` is non-empty, so the emptiness rule passes).
+    /// Filing a runtime lookup failure under parse-time validation would make
+    /// that enum's own documentation false and would let a caller matching
+    /// `ToolkitError::Validation(..)` believe the config was malformed.
+    ///
+    /// # Security (T-120-17)
+    ///
+    /// The message names the FIELD and the environment-variable NAME only. It
+    /// MUST NOT echo a resolved URL, the config's contents, or any credential
+    /// substring.
+    #[error(
+        "[backend].base_url references environment variable '{var}', which is \
+         unset or empty (set it to the REST API root URL)"
+    )]
+    UnresolvedBaseUrlRef {
+        /// The environment-variable name the `base_url` reference points at.
+        /// Never the resolved value.
+        var: String,
+    },
+
     /// A governed-Excel workbook bundle failed to load + integrity-verify at
     /// boot (Phase 92, WBSV-08 fail-closed). Wraps a
     /// [`pmcp_workbook_runtime::BundleLoadError`] — a source read failure, a
@@ -159,4 +188,71 @@ pub enum ConfigValidationError {
          e.g. \"https://api.example.com\")"
     )]
     EmptyBackendBaseUrl,
+    /// `[backend].base_url` is REFERENCE-shaped but does not name exactly one
+    /// environment variable — the empty `${}` form, or a multi-placeholder
+    /// composition like `"${SCHEME}://${HOST}"`. The grammar
+    /// ([`crate::env_ref::parse_env_ref`]) resolves one whole-value `${VAR}` /
+    /// `env:VAR` reference; it does not interpolate inside a larger string, so
+    /// no environment could ever satisfy such a value. Without this check the
+    /// config loads cleanly and every boot fails with an
+    /// `UnresolvedBaseUrlRef` naming an empty variable.
+    #[error(
+        "[backend].base_url is a malformed environment reference; a reference must be \
+         exactly one `${{VAR}}` or `env:VAR` naming a single variable — inline \
+         compositions like \"${{SCHEME}}://${{HOST}}\" cannot be resolved by any \
+         environment, so compose the full URL in ONE variable instead"
+    )]
+    MalformedBackendBaseUrlRef,
+    /// A `[backend.auth]` credential field is REFERENCE-shaped but does not name
+    /// exactly one environment variable — the empty `${}` form, a
+    /// multi-placeholder composition like `"${SCHEME}://${HOST}"`, or a
+    /// non-portable name like `"${TFL-APP-KEY}"` (a `${...}` name must match
+    /// `[A-Za-z0-9_]+`; `env:VAR` remains the escape hatch for exotic names).
+    /// The `String` is the offending field path within `[backend.auth]` — e.g.
+    /// `"token"`, `"password"`, `"query_params.app_key"`.
+    ///
+    /// This is the credential sibling of [`Self::MalformedBackendBaseUrlRef`],
+    /// and it exists because the two paths resolve UNSET references differently
+    /// on purpose: a credential resolves an unset variable to the empty string
+    /// so an optional credential is OMITTED. A MALFORMED reference is not an
+    /// unset variable — no environment can ever satisfy it — so applying the
+    /// omission rule to it silently sent every backend request UNAUTHENTICATED,
+    /// with no error and no log line. Refusing it at load time turns that into
+    /// an actionable, field-naming failure before the server ever boots.
+    ///
+    /// The message names the FIELD only and deliberately never echoes the
+    /// configured value: a malformed value is by definition not a resolvable
+    /// reference, so it may well be a mistyped literal secret.
+    #[error(
+        "[backend.auth].{0} is a malformed environment reference; a reference must be \
+         exactly one `${{VAR}}` (name matching [A-Za-z0-9_]+) or `env:VAR` naming a single \
+         variable — no environment can satisfy this value, so the credential would be \
+         silently omitted and every backend request sent unauthenticated"
+    )]
+    MalformedBackendAuthRef(String),
+    /// Per Phase 120 Plan 04 (PKG-03): a `[[config_slots]]` entry at `index`
+    /// has an empty / whitespace-only `key` or `name`. A slot declaration whose
+    /// key names no config path — or whose name names no environment variable —
+    /// claims coverage it cannot deliver, and the package side would compare
+    /// against an empty string.
+    ///
+    /// The sibling "unrecognized `kind`" check is NOT here: `kind` is the
+    /// closed [`crate::config::ConfigSlotKind`] enum, so serde rejects an
+    /// unknown discriminator at PARSE time (naming the accepted set) before
+    /// `validate()` is ever called.
+    #[error("[[config_slots]] entry at index {0} has an empty key or name")]
+    EmptyConfigSlotField(usize),
+    /// A `[[config_slots]]` entry at `index` is `kind = "secret"` but carries a
+    /// `tested_value`. Identity-bearing slots structurally carry no value — the
+    /// `tested_value` field on a secret declaration is the one place a REAL
+    /// credential could sit in a config that is served but never packed (the
+    /// pack-time agreement gate only runs on packaging), so the rule is
+    /// enforced at validation time rather than trusted as prose. The message
+    /// deliberately does not echo the value.
+    #[error(
+        "[[config_slots]] entry at index {0} is kind = \"secret\" but carries a tested_value; \
+         identity-bearing slots record no value — remove it (a credential must never sit in \
+         the config file)"
+    )]
+    SecretSlotCarriesTestedValue(usize),
 }

@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-workbook-dialect"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -22,6 +22,6 @@ path = "src/lib.rs"
 # version + path together — SDK workspace-internal dep convention. The dialect
 # crate layers the contract (WHITELIST/DialectRules) on top of the runtime's
 # finding types, which it re-exports (D-03).
-pmcp-workbook-runtime = { version = "0.1.0", path = "../pmcp-workbook-runtime" }
+pmcp-workbook-runtime = { version = "0.2.0", path = "../pmcp-workbook-runtime" }
 # NOTE: no `serde` — the lighthouse rules.rs types (DialectRules / CandidateRole /
 # WHITELIST) carry no serde derives and need none this phase.

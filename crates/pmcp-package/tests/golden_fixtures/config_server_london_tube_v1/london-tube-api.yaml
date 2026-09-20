@@ -1,0 +1,55 @@
+# =============================================================================
+# london-tube-api.yaml — minimal OpenAPI 3.0 spec for the london-tube fixture
+# =============================================================================
+#
+# PROVENANCE: hand-authored 2026-05-29 to cover EXACTLY the operations the
+# `london-tube.toml` tools call (the reference pmcp-run london-tube instance ships
+# only a config, not a vendored spec; this minimal spec is the toolkit two-input
+# model's second input, CF-8). Covers:
+#   - GET /Line/Mode/tube/Status        (get-tube-status single-call tool)
+#   - GET /Line/{lineId}/Disruption     (the per-line call the script tool makes)
+#
+# Kept intentionally small + offline-deterministic. Parsed via
+# `OpenApiSchema::parse` in the fixture-validity test (no network).
+openapi: 3.0.0
+info:
+  title: Transport for London (TfL) — Line API (london-tube parity subset)
+  version: "1.0.0"
+  description: Minimal subset of the TfL API covering the london-tube fixture tools.
+servers:
+  - url: https://api.tfl.gov.uk
+paths:
+  /Line/Mode/tube/Status:
+    get:
+      operationId: getTubeStatus
+      summary: Get the current status of all London Underground lines.
+      parameters:
+        - name: app_key
+          in: query
+          required: false
+          description: TfL API key.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: An array of line-status objects.
+  /Line/{lineId}/Disruption:
+    get:
+      operationId: getLineDisruption
+      summary: Get the current disruption detail for a specific tube line.
+      parameters:
+        - name: lineId
+          in: path
+          required: true
+          description: The London Underground line id (e.g. 'victoria').
+          schema:
+            type: string
+        - name: app_key
+          in: query
+          required: false
+          description: TfL API key.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Disruption detail for the line.

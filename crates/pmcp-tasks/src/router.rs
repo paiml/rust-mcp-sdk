@@ -97,6 +97,27 @@ impl TaskRouterImpl {
     }
 }
 
+/// Wire parameters of a `tasks/update` request, as they arrive across the
+/// `serde_json::Value` seam.
+///
+/// The two names are the ones the tasks extension schema specifies:
+/// `taskId` (required) and `inputResponses` -- **not** `inputs`, which is the
+/// name an earlier research pass reported and which the schema does not use.
+///
+/// `inputResponses` carries `#[serde(default)]` so an omitted member is an empty
+/// delivery rather than a hard parse failure. It is deliberately NOT bounds- or
+/// kind-checked here: both happen above this seam, at request ingress, before
+/// any decode.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskUpdateParams {
+    /// The task receiving the inputs.
+    task_id: String,
+    /// The client's answers, keyed by the server-assigned input key.
+    #[serde(default)]
+    input_responses: Value,
+}
+
 /// Converts a [`TaskError`] into a [`pmcp::error::Error`] using the error code
 /// from the task error and its display message.
 #[allow(clippy::needless_pass_by_value)] // Used in .map_err() which passes by value
@@ -274,6 +295,49 @@ impl TaskRouter for TaskRouterImpl {
         let wire_task = record.to_wire_task_with_variables();
         serde_json::to_value(wire_task)
             .map_err(|e| PmcpError::internal(format!("failed to serialize CancelTaskResult: {e}")))
+    }
+
+    /// Handle `tasks/update` request.
+    ///
+    /// Delivers the client's `inputResponses` to a task that is awaiting input,
+    /// through the store's single compare-and-set delivery -- so this path
+    /// reaches the `DynamoDB` and Redis backends exactly as it reaches the
+    /// in-memory one, with no per-backend code.
+    ///
+    /// # The owner comes from the ARGUMENT, never from `params`
+    ///
+    /// `owner_id` has ALREADY been resolved by the caller through the v2
+    /// identity table. Re-deriving it here from client-supplied `params` would
+    /// be an insecure direct object reference -- a caller could name someone
+    /// else's owner and reach their task -- which is precisely what the
+    /// owner-prefixed storage key and the resolved-owner argument exist to
+    /// prevent.
+    ///
+    /// [`resolve_owner_id`] is deliberately NOT used on this path either. Its
+    /// chain is `subject -> client_id -> session_id -> "local"`, and a
+    /// session-id fallback is forbidden on v2: v2 is stateless and has no
+    /// session to trust. The decision was made once, above this seam.
+    ///
+    /// # Errors
+    ///
+    /// - Invalid params (`-32602`) if `params` is not a `tasks/update` shape, if
+    ///   the task does not exist under this owner, if it has expired, or if it
+    ///   is not awaiting input (a terminal or still-`working` task cannot be
+    ///   fed).
+    /// - Internal error (`-32603`) on a concurrent-modification conflict or a
+    ///   backend failure.
+    async fn handle_tasks_update(&self, params: Value, owner_id: &str) -> PmcpResult<Value> {
+        let update_params: TaskUpdateParams = serde_json::from_value(params)
+            .map_err(|e| PmcpError::invalid_params(format!("invalid tasks/update params: {e}")))?;
+
+        self.store
+            .deliver_inputs(
+                &update_params.task_id,
+                owner_id,
+                update_params.input_responses,
+            )
+            .await
+            .map_err(task_error_to_pmcp)
     }
 
     /// Resolve owner ID from authentication context fields.

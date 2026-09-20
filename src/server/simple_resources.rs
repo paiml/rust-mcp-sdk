@@ -35,12 +35,7 @@ impl StaticResource {
             name,
             description: None,
             mime_type: Some("text/plain".to_string()),
-            content: Content::Resource {
-                uri,
-                text: Some(content.into()),
-                mime_type: Some("text/plain".to_string()),
-                meta: None,
-            },
+            content: Content::resource_with_text(uri, content, "text/plain"),
         }
     }
 
@@ -55,12 +50,16 @@ impl StaticResource {
             name,
             description: None,
             mime_type: Some(mime_type.clone()),
-            content: Content::Resource {
+            // NOTE: this encodes the image into `text`, not `blob`, which is what
+            // this constructor did before `blob` existed. Preserved deliberately —
+            // moving it to `Content::resource_with_blob` would change the wire
+            // output for every existing caller and is a compatibility decision,
+            // not a cleanup. See the phase 118.1 /simplify review (F2).
+            content: Content::resource_with_text(
                 uri,
-                text: Some(base64::prelude::BASE64_STANDARD.encode(data)),
-                mime_type: Some(mime_type),
-                meta: None,
-            },
+                base64::prelude::BASE64_STANDARD.encode(data),
+                mime_type,
+            ),
         }
     }
 
@@ -321,6 +320,9 @@ impl ResourceHandler for ResourceCollection {
         if let Some(resource) = self.resources.get(uri) {
             return Ok(ReadResourceResult {
                 contents: vec![resource.content.clone()],
+                _meta: None,
+                ttl_ms: None,
+                cache_scope: None,
             });
         }
 
@@ -347,9 +349,14 @@ impl ResourceHandler for ResourceCollection {
                 contents: vec![Content::Resource {
                     uri: contents.uri.clone(),
                     text: contents.text.clone(),
+                    blob: None,
                     mime_type: Some(contents.mime_type.clone()),
+                    annotations: None,
                     meta,
                 }],
+                _meta: None,
+                ttl_ms: None,
+                cache_scope: None,
             });
         }
 
@@ -374,6 +381,8 @@ impl ResourceHandler for ResourceCollection {
         Ok(ListResourcesResult {
             resources: self.list(),
             next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
         })
     }
 }

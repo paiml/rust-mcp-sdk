@@ -14,9 +14,9 @@ pub mod workflow;
 pub use agent::AgentPackage;
 pub use server::{
     AssetsSection, AuthDcrSection, AuthScopesSection, AuthSection, AwsSection, BinaryRef,
-    CedarPolicy, CedarPolicySet, CompositionSection, DeployDescriptor, GcpSection, IamSection,
-    IamStatement, LayoutSection, MetadataSection, ObservabilityAlarmsSection, ObservabilitySection,
-    ServerPackage, ServerSection, TargetSection, ToolMetadata,
+    CedarPolicy, CedarPolicySet, CognitoSection, CompositionSection, DeployDescriptor, GcpSection,
+    IamSection, IamStatement, LayoutSection, MetadataSection, ObservabilityAlarmsSection,
+    ObservabilitySection, ServerPackage, ServerSection, TargetSection, ToolMetadata,
 };
 pub use team::{HumanRole, TeamLimits, TeamMember, TeamPackage, TeamRole};
 pub use workflow::{Provenance, WorkflowManifest, REGISTRY_NAMESPACE_PATTERN};

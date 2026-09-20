@@ -40,6 +40,10 @@
 - [Chapter 12.12: OpenAPI over Microsoft Graph (Contoso M365)](openapi-graph-m365.md)
 - [Chapter 12.13: Config-Driven Workbook Servers (cargo pmcp)](ch12-13-config-driven-workbook-servers.md)
 - [Chapter 12.14: Workbook Table Authoring — Your Excel Process as an MCP Tool](workbook-table-authoring.md)
+- [Chapter 12.15: Agents as MCP Clients](ch12-15-agents-as-mcp-clients.md)
+  - [Sampling & Hosting](ch17-04-sampling-hosting.md)
+- [Chapter 12.16: Agent Teams](ch12-16-agent-teams.md)
+- [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md)
 
 ## Part IV: Real-World Applications
 
@@ -54,7 +58,6 @@
   - [Multiple Parallel Clients](ch17-01-parallel-clients.md)
   - [Structured Output Schemas](ch17-02-structured-output.md)
   - [Tool with Sampling](ch17-03-sampling-tools.md)
-  - [Sampling & Hosting](ch17-04-sampling-hosting.md)
 - [Chapter 18: Design Patterns](ch18-patterns.md)
 - [Chapter 19: Integration Patterns](ch19-integration.md)
 

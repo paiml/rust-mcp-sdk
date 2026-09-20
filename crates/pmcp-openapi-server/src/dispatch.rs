@@ -69,6 +69,23 @@ pub enum DispatchError {
     /// unparseable `base_url`). The wrapped error does NOT echo the URL.
     #[error("backend connector construction failed: {0}")]
     Connector(#[source] HttpConnectorError),
+
+    /// `[backend].base_url` holds a `${VAR}` / `env:VAR` reference that could
+    /// not be resolved from the process environment (the variable is unset, or
+    /// set to an empty / whitespace-only value).
+    ///
+    /// Without this the literal `${...}` would be handed to the connector and
+    /// every outgoing request would target a nonsense URL — `validate()` cannot
+    /// catch it, because the placeholder string is non-empty and passes the
+    /// parse-time emptiness rule (T-120-16).
+    ///
+    /// # Security (T-120-17)
+    ///
+    /// `Display` names the FIELD and the environment-variable NAME only. It
+    /// does NOT echo a resolved URL or any credential substring — the wrapped
+    /// toolkit error carries the variable name and nothing else.
+    #[error("backend base_url reference could not be resolved: {0}")]
+    UnresolvedBaseUrl(#[source] pmcp_server_toolkit::ToolkitError),
 }
 
 /// Select and construct the `(HttpConnector, HttpCodeExecutor)` pair for the
@@ -94,6 +111,8 @@ pub enum DispatchError {
 ///
 /// - [`DispatchError::MissingBackend`] when `[backend]` is absent.
 /// - [`DispatchError::Auth`] when the auth provider cannot be built.
+/// - [`DispatchError::UnresolvedBaseUrl`] when `base_url` holds a `${VAR}` /
+///   `env:VAR` reference whose environment variable is unset or empty.
 /// - [`DispatchError::Connector`] when the single-call connector cannot be built
 ///   (e.g. an unparseable `base_url`).
 pub async fn dispatch(
@@ -115,14 +134,23 @@ pub async fn dispatch(
     // single connection pool serves the whole binary.
     let client = reqwest::Client::new();
 
+    // Endpoint resolution (Phase 120 / PKG-03): `base_url` may be a `${VAR}` /
+    // `env:VAR` reference the target environment fills, so resolve it ONCE here
+    // and thread the RESOLVED value into both constructors. Reading
+    // `backend.base_url` directly would send the literal `${...}` to the wire.
+    // Still lazy — this is an environment lookup, not a network call (CF-2).
+    let base_url = backend
+        .resolved_base_url()
+        .map_err(DispatchError::UnresolvedBaseUrl)?;
+
     // Single-call connector (Plan 03). LAZY: parses base_url, no network.
-    let connector = HttpClient::new(client.clone(), backend.base_url.clone(), auth.clone())
+    let connector = HttpClient::new(client.clone(), base_url.clone(), auth.clone())
         .map_err(DispatchError::Connector)?;
     let connector: Arc<dyn HttpConnector> = Arc::new(connector);
 
     // Code-Mode / script-tool execution surface (Plan 04). The SAME client +
     // base_url + auth — D-02 (one engine feeds tools + code-mode).
-    let http_exec = HttpCodeExecutor::new(client, backend.base_url.clone(), auth);
+    let http_exec = HttpCodeExecutor::new(client, base_url, auth);
 
     Ok((connector, http_exec))
 }
@@ -131,6 +159,41 @@ pub async fn dispatch(
 mod tests {
     use super::{dispatch, DispatchError};
     use pmcp_server_toolkit::config::ServerConfig;
+
+    /// RAII guard: set (or remove) an env var, restore the prior value on drop
+    /// — including when an assertion panics mid-test. A trailing `remove_var`
+    /// line is skipped on panic and leaks the variable into every later test
+    /// in the binary; the toolkit's `tests/support::EnvVarGuard` exists for the
+    /// same reason (this crate's unit tests cannot reach that module, so the
+    /// minimal twin lives here). Each test uses a UNIQUE variable name, which
+    /// is what stands in for a lock.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(old) => std::env::set_var(self.key, old),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     /// A london-tube-shaped config with a `[backend]` block (base_url + no auth).
     fn cfg_with_backend() -> ServerConfig {
@@ -189,6 +252,71 @@ version = "0.1.0"
         );
     }
 
+    /// PKG-03 / T-120-16: a `${VAR}` endpoint whose variable is UNSET must be a
+    /// dispatch ERROR, never a server that boots pointed at the literal
+    /// `${...}`. `validate()` cannot catch this — the placeholder is non-empty.
+    #[tokio::test]
+    async fn dispatch_unresolved_base_url_reference_is_an_error() {
+        // A uniquely-named variable so this test cannot collide with a sibling.
+        const VAR: &str = "PMCP_OPENAPI_DISPATCH_UNSET_BASE_URL_TEST";
+        let _guard = EnvVarGuard::unset(VAR);
+
+        let toml = format!(
+            r#"
+[server]
+name = "tube"
+version = "0.1.0"
+
+[backend]
+base_url = "${{{VAR}}}"
+"#
+        );
+        let cfg = ServerConfig::from_toml_strict_validated(&toml)
+            .expect("a ${{VAR}} base_url parses and VALIDATES — it is non-empty");
+        let err = dispatch(&cfg)
+            .await
+            .err()
+            .expect("an unset ${VAR} base_url must fail dispatch");
+        assert!(
+            matches!(err, DispatchError::UnresolvedBaseUrl(_)),
+            "unset endpoint reference yields UnresolvedBaseUrl, got {err:?}"
+        );
+        // The rendered error names the variable so an operator can act on it.
+        assert!(
+            err.to_string().contains(VAR),
+            "the error must name the environment variable: {err}"
+        );
+    }
+
+    /// PKG-03: a RESOLVED `${VAR}` endpoint dispatches normally — the resolved
+    /// value, not the placeholder, reaches the connector.
+    #[tokio::test]
+    async fn dispatch_resolves_a_set_base_url_reference() {
+        const VAR: &str = "PMCP_OPENAPI_DISPATCH_SET_BASE_URL_TEST";
+        // Guard, not a bare set_var: restoration must survive a failing assert,
+        // or the variable leaks into every later test in this binary.
+        let _guard = EnvVarGuard::set(VAR, "http://127.0.0.1:9999");
+
+        let toml = format!(
+            r#"
+[server]
+name = "tube"
+version = "0.1.0"
+
+[backend]
+base_url = "${{{VAR}}}"
+"#
+        );
+        let cfg = ServerConfig::from_toml_strict_validated(&toml).expect("parse");
+        let result = dispatch(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "a resolvable ${{VAR}} endpoint dispatches: {:?}",
+            result.err()
+        );
+        // The guard restores VAR on drop — panic-safe, unlike a trailing remove_var.
+    }
+
     #[test]
     fn dispatch_error_display_redacts_backend_and_secrets() {
         // Pitfall 5 / T-90-06-01: no DispatchError Display may echo the backend
@@ -204,6 +332,13 @@ version = "0.1.0"
             DispatchError::Connector(pmcp_server_toolkit::http::HttpConnectorError::Backend(
                 "invalid base URL".to_string(),
             )),
+            // T-120-17: the new endpoint-resolution variant is held to the SAME
+            // rule — it may name the env var and the field, never the URL.
+            DispatchError::UnresolvedBaseUrl(
+                pmcp_server_toolkit::ToolkitError::UnresolvedBaseUrlRef {
+                    var: "TFL_BASE_URL".to_string(),
+                },
+            ),
         ];
         for err in &errors {
             let rendered = format!("{err}");

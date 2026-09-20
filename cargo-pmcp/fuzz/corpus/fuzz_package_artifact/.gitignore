@@ -1,0 +1,34 @@
+# Only hand-written seed inputs are checked in as reference corpus.
+# Auto-discovered inputs from `cargo fuzz run` are local-only.
+*
+!.gitignore
+
+# Phase 123-07 (PKGX-02): this target's seeds are DELIBERATELY not checked in.
+#
+# The two inputs that make invariant 2 ("every blob's content hashes to its own
+# key") reachable are derived from plan 04's golden corpus at
+# `crates/pmcp-package/tests/golden_fixtures/artifact_tar_v1/conformant.tar`.
+# Checking copies in here would give that fixture a second source of truth,
+# which is exactly the drift hazard `artifact_tar_v1/README.md` exists to
+# prevent — a copy can only ever agree with whatever produced it.
+#
+# Regenerate them instead (run from the repository root):
+#
+#   mkdir -p cargo-pmcp/fuzz/corpus/fuzz_package_artifact
+#   cp crates/pmcp-package/tests/golden_fixtures/artifact_tar_v1/conformant.tar \
+#      cargo-pmcp/fuzz/corpus/fuzz_package_artifact/seed_conformant.tar
+#   python3 - <<'PY'
+#   src = "crates/pmcp-package/tests/golden_fixtures/artifact_tar_v1/conformant.tar"
+#   dst = "cargo-pmcp/fuzz/corpus/fuzz_package_artifact/seed_layer_byte_flipped.tar"
+#   b = bytearray(open(src, "rb").read())
+#   # 4608 is the data offset of the 44-byte envelope LAYER blob
+#   # (blobs/sha256/74e664...). Flipping one byte there leaves the entry LENGTH
+#   # unchanged, so the descriptor size check still passes and the archive is
+#   # refused for exactly one reason: the blob no longer hashes to its own name.
+#   b[4618] ^= 0x01
+#   open(dst, "wb").write(bytes(b))
+#   PY
+#
+# Arbitrary bytes will not stumble onto a well-framed OCI layout inside a
+# bounded campaign, so without these seeds the three invariants are asserted
+# over an input set that never reaches them.

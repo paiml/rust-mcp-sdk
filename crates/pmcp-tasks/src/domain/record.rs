@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::types::task::{Task, TaskStatus};
@@ -38,8 +38,20 @@ use crate::types::task::{Task, TaskStatus};
 /// assert_eq!(record.owner_id, "session-abc");
 /// assert!(record.expires_at.is_some());
 /// ```
+///
+/// # Source compatibility
+///
+/// This type is `#[non_exhaustive]`. Fields are added to it as the protocol
+/// grows (the v2 tasks extension added `input_requests`, `input_responses` and
+/// `error`), and every such addition would otherwise be a source break for any
+/// downstream crate that built a `TaskRecord` with a struct literal. Construct
+/// it through [`TaskRecord::new`] and mutate the fields you need; that route is
+/// stable across field additions. `#[serde(default)]` on the added fields keeps
+/// the PERSISTED representation compatible in the other direction — a record
+/// written by a pre-v2 build still deserializes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TaskRecord {
     /// The wire-format task (serialized as-is for MCP responses).
     pub task: Task,
@@ -62,6 +74,41 @@ pub struct TaskRecord {
     /// does not expire (unlimited TTL). Serialized as ISO 8601 via
     /// chrono's serde support.
     pub expires_at: Option<DateTime<Utc>>,
+
+    /// The inputs the SERVER asked the client for, keyed by the
+    /// server-assigned key. Written only by
+    /// [`GenericTaskStore::record_input_requests`](crate::store::generic::GenericTaskStore::record_input_requests),
+    /// never from anything a client sent: this is the only trustworthy record
+    /// of which KIND was asked for under each key, and a kind-directed decode
+    /// of the client's answers reads it back. If a client could influence it, a
+    /// client could choose how its own answer is typed.
+    ///
+    /// `None` and `Some(empty)` are distinct: `None` means the server has never
+    /// asked for anything, `Some(empty)` means it recorded a round that asked
+    /// for nothing.
+    ///
+    /// Absent in records written before the v2 tasks extension landed, so it
+    /// carries `#[serde(default)]` (absent means empty) and is omitted from the
+    /// serialized bytes while untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<Map<String, Value>>,
+
+    /// The responses delivered against [`Self::input_requests`], keyed
+    /// identically. Absent until the first delivery.
+    ///
+    /// Absent in records written before the v2 tasks extension landed; see
+    /// [`Self::input_requests`] for the compatibility rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_responses: Option<Map<String, Value>>,
+
+    /// The JSON-RPC error object (`code`/`message`/`data`) for a `failed` task,
+    /// carried verbatim as a `Value` so it can be inlined on a v2 `tasks/get`
+    /// without being re-typed and re-serialized on the way through.
+    ///
+    /// Absent in records written before the v2 tasks extension landed; see
+    /// [`Self::input_requests`] for the compatibility rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
 
     /// Monotonic version for CAS operations. Not part of the serialized
     /// record -- managed by the storage backend.
@@ -131,6 +178,9 @@ impl TaskRecord {
             result: None,
             request_method,
             expires_at,
+            input_requests: None,
+            input_responses: None,
+            error: None,
             version: 0,
         }
     }

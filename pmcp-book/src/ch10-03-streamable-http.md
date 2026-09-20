@@ -1,5 +1,7 @@
 # Chapter 10.3: Streamable HTTP (Server + Client)
 
+> **Note on vocabulary**: **v1** means the MCP protocol revision `2025-11-25` and **v2** means `2026-07-28`. These are *protocol eras*, not crate versions — the crate is always written with its name attached ("pmcp 2.18"), so a bare "2.18" can never be mistaken for a protocol revision. One pmcp binary speaks both, negotiated per request. Unless a passage says otherwise, this chapter describes the **v1** behaviour: the stateless/stateful choice below is a build-time configuration, whereas v2 statelessness is a per-request property of the era itself. For the v2 story see [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](ch12-17-migrating-to-mcp-2026-07-28.md#for-servers).
+
 Streamable HTTP is PMCP’s preferred transport for servers. It combines JSON requests with Server‑Sent Events (SSE) for notifications, supports both stateless and stateful operation, and uses a single endpoint with content negotiation via the `Accept` header.
 
 ## Why Streamable HTTP?
@@ -70,7 +72,7 @@ let http = StreamableHttpServer::with_config(addr, server, cfg);
 ## Protocol Details
 
 Headers enforced by the server:
-- `mcp-protocol-version`: Protocol version (e.g., `2025-11-25`)
+- `mcp-protocol-version`: Protocol version — `2025-11-25` (v1) or `2026-07-28` (v2)
 - `Accept`: Must include `application/json` or `text/event-stream`
 - `mcp-session-id`: Present in stateful mode
 - `Last-Event-Id`: For SSE resumption

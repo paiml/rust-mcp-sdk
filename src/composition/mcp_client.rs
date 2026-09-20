@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
-use crate::shared::streamable_http::{StreamableHttpTransport, StreamableHttpTransportConfig};
+use crate::shared::streamable_http::{
+    StreamableHttpTransport, StreamableHttpTransportConfigBuilder,
+};
 use crate::types::ClientCapabilities;
 use crate::Client;
 
@@ -144,20 +146,22 @@ impl McpFoundationClient {
             CompositionError::Configuration(format!("Invalid URL for {}: {}", server_id, e))
         })?;
 
-        // Build transport configuration
-        let mut transport_config = StreamableHttpTransportConfig {
-            url,
-            extra_headers: endpoint
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            auth_provider: None,
-            session_id: None,
-            enable_json_response: endpoint.enable_json_response,
-            on_resumption_token: None,
-            http_middleware_chain: None,
-        };
+        // Build transport configuration.
+        //
+        // Through the BUILDER rather than a struct literal: `session_id` and
+        // `on_resumption_token` exist only behind `v1-compat` (plan 117-14), and
+        // a literal naming them would not compile on a `full-v2` build — which
+        // includes `composition`. The builder leaves both at their default and
+        // names neither, so this call site compiles on both feature sets with no
+        // `#[cfg]` of its own.
+        let mut builder = StreamableHttpTransportConfigBuilder::new(url);
+        for (name, value) in &endpoint.headers {
+            builder = builder.with_header(name.clone(), value.clone());
+        }
+        if endpoint.enable_json_response {
+            builder = builder.enable_json_response();
+        }
+        let mut transport_config = builder.build();
 
         // Add auth header if configured
         if let Some(token) = &endpoint.auth_token {
@@ -271,13 +275,19 @@ impl FoundationClient for McpFoundationClient {
                 crate::types::Content::Resource {
                     uri,
                     text,
+                    blob,
                     mime_type,
                     ..
                 } => Ok(ResourceContent {
                     uri: uri.clone(),
                     mime_type: mime_type.clone(),
                     text: text.clone(),
-                    blob: None,
+                    // PROPAGATED, not dropped: `ResourceContent` has a `blob`
+                    // field for exactly this, and `Content::Resource` gained one
+                    // in 2.19.0 (G-2). Hardcoding `None` here would make a relayed
+                    // binary resource arrive empty — a data-loss defect that still
+                    // compiles and that no wire golden would catch.
+                    blob: blob.clone(),
                 }),
                 crate::types::Content::Image { data, mime_type } => Ok(ResourceContent {
                     uri: uri.to_string(),
@@ -358,6 +368,7 @@ impl FoundationClient for McpFoundationClient {
                     crate::types::Content::Resource {
                         uri,
                         text,
+                        blob,
                         mime_type,
                         ..
                     } => PromptContent::Resource {
@@ -365,7 +376,11 @@ impl FoundationClient for McpFoundationClient {
                             uri,
                             mime_type,
                             text,
-                            blob: None,
+                            // PROPAGATED for the same reason as the
+                            // `resources/read` relay above: an embedded BINARY
+                            // resource in a prompt message would otherwise lose
+                            // its payload while still type-checking.
+                            blob,
                         },
                     },
                     crate::types::Content::Audio { .. }

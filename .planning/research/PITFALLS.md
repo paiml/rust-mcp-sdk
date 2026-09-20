@@ -1,322 +1,327 @@
 # Pitfalls Research
 
-**Domain:** Excel-as-Configuration → MCP-server compiler — extraction + generalization of the TowelRads `quote-pricing` lighthouse (workbook-compiler/workbook-runtime) into the PMCP SDK (milestone v2.3)
-**Researched:** 2026-06-09
-**Confidence:** HIGH (grounded in the lighthouse source — `14-REVIEW.md` CR-01/CR-02/WR-01 findings, `provenance/gate.rs` inline Pitfall-2 docs, the `just purity-check` recipe, `change_class/mod.rs`, `reconcile/classifier.rs`, `lib.rs build_reference_manifest`; the RFC §5 known-gap list)
+**Domain:** Dual-version protocol support (MCP 2025-11-25 + 2026-07-28 "v2") in an existing, published Rust SDK (pmcp 2.17.0) with downstream consumers
+**Researched:** 2026-07-22
+**Confidence:** MEDIUM (spec is RC as of research date, finalizes 2026-07-28 — 6 days out; core code claims verified by grep, spec-behavior claims from RC blog + secondary sources + internal impact memory)
 
-> Scope note: these are pitfalls **specific to extracting and generalizing THIS proven-but-lighthouse-bound system** into a reusable SDK toolkit. They are not generic Rust advice. Every flagged RFC §5 gap is covered with a verifiable fix, the two trap-class pitfalls (purity-boundary, umya provenance) carry concrete gate designs, and each pitfall maps to a v2.3 phase.
-
----
+> Scope note: these are pitfalls specific to *adding a second protocol version to THIS codebase*, not generic MCP advice. Each maps to one of the six planned phases (impact memory `project_mcp_spec_2026_07_28_impact`): (1) version plumbing, (2) stateless HTTP + multi-round-trip elicitation, (3) Tasks migration, (4) JSON Schema 2020-12 + caching, (5) auth SEPs, (6) conformance.
 
 ## Critical Pitfalls
 
-### Pitfall 1: Purity-boundary erosion — the Excel reader (umya) leaks into the served-binary tree
+### Pitfall 1: Flipping `LATEST_PROTOCOL_VERSION` to `2026-07-28`
 
 **What goes wrong:**
-The whole value proposition is "compile, don't interpret": the served MCP binary evaluates a pre-compiled IR with a pure-Rust scalar evaluator and **never parses Excel at runtime**. During extraction the lighthouse's hard boundary — `umya-spreadsheet` (the reader/parser) lives ONLY in `workbook-compiler`, never in `workbook-runtime` or the served crate — can silently erode. Three concrete leak vectors:
-
-1. **A shared SDK crate pulls umya.** If the SDK puts model types (`Manifest`, `CellRole`, `CellMap`, `executable.ir.json` deserialization) in a crate that *also* re-exports an ingest helper, or if `pmcp-server-toolkit` gains a `compile-workbook` convenience module behind a non-default feature, Cargo feature unification can pull umya into the served binary the moment any sibling crate in the same build enables it.
-2. **Transitive dep via the writer.** Phase 12 deliberately links the writer-only `rust_xlsxwriter` into the runtime (the `render_workbook` tool returns a computed `.xlsx`). A writer is NOT a reader, but `rust_xlsxwriter` pulls `zip` — so a naive "ban zip" gate would false-positive, and a naive "allow zip" gate could let umya's own transitive `zip`/`quick-xml` slip through unnoticed.
-3. **Workspace feature unification.** In a single `cargo build` of the whole workspace, enabling a `compiler` feature on a dev-dependency unifies features across the graph; the served crate's dependency tree can acquire umya even though its own `Cargo.toml` never names it.
+`src/types/protocol/version.rs` hardcodes `LATEST_PROTOCOL_VERSION = "2025-11-25"` and `negotiate_protocol_version()` **returns `LATEST` for any unrecognized client version**. If v2 support is added by bumping this constant, every unknown/legacy client silently gets negotiated to `2026-07-28` semantics (stateless, no `initialize`, tasks reshaped), breaking the exact backward-compat the dual-version stack is supposed to preserve. Downstream code that reads `LATEST_PROTOCOL_VERSION` as "the version I speak" (cargo-pmcp scaffolds, book/course badges, test fixtures asserting `"2025-11-25"`, the doctest at `src/lib.rs:255` `assert_eq!(LATEST_PROTOCOL_VERSION, "2025-11-25")`) drifts or hard-fails.
 
 **Why it happens:**
-The lighthouse boundary is enforced by a *bespoke `just purity-check` recipe* (grep + `cargo tree`), not by the type system or Cargo itself. Extraction tends to drop the bespoke recipe ("we'll add CI later") or generalize crate layout in a way that re-merges reader and runtime. The reader/writer asymmetry (`zip` permitted for the writer, banned for the reader) is subtle and easy to get wrong.
-
-**How to avoid — concrete gate design (port and harden the lighthouse `just purity-check`):**
-The lighthouse recipe is the proven template. Port it verbatim, then generalize the crate names and add positive assertions:
-
-- **Negative cargo-tree assertions** (per served-tree crate `pmcp-workbook-runtime`, `pmcp-server-toolkit` with the workbook module, and the scaffolded server):
-  - `cargo tree -p <served-crate> | grep -Ei 'umya|calamine|quick-xml'` must find NOTHING (reader/parser stack banned).
-  - **Permit `zip`** for the runtime (writer container) but ban the reader's XML parser (`quick-xml`) — this is the exact reader-vs-writer line the lighthouse draws (`justfile:77-84`).
-- **Positive assertion:** `cargo tree -p pmcp-workbook-runtime | grep -qi 'rust_xlsxwriter'` MUST succeed — proves the writer IS wired and the gate is actually testing the right crate (a deleted dependency must not silently make the negative gate vacuously pass).
-- **Value-path token grep:** grep each runtime evaluator source file's value path (everything before its `#[cfg(test)]` block) for forbidden tokens (`umya`, `std::fs`, `async`, `tokio`, `.unwrap(`, `.expect(`). Test modules are excluded (they legitimately read fixtures).
-- **Compiler enforcement backstop:** keep the crate-level `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` on runtime value paths — the recipe is the cheap first line, the deny is the compiler enforcement.
-- **Run it in CI on every PR**, not just locally, and run it per-feature-combination (`--no-default-features`, `--features full`) so feature unification cannot hide a leak. This is the gate that keeps "compile-not-interpret" honest.
-
-**Warning signs:**
-- `cargo tree -p <served-crate>` output grows after a "harmless refactor" that moved a type into a shared crate.
-- A new `[features]` entry on the runtime or toolkit crate that gates a compiler helper.
-- CI for the purity gate is green but only runs the default feature set.
-- `Cargo.lock` churn touching `umya`/`quick-xml`/`calamine` lines for a runtime-only change.
-
-**Phase to address:**
-The very FIRST extraction phase (port `pmcp-workbook-runtime`, per RFC §7 "smallest cut that proves the boundary"). The purity gate must land WITH the runtime crate, before the compiler is ported, so the boundary is defended from day one. Re-verified in the phase that introduces the `pmcp-server-toolkit` workbook module and again in the scaffold phase.
-
----
-
-### Pitfall 2: The umya fabricated-provenance trap — SDK tooling that mutates workbooks stamps fake Excel identity and falsely passes the freshness gate
-
-**What goes wrong:**
-The Phase-8 oracle-staleness gate (`provenance/gate.rs`) is the single most security-load-bearing component: it decides whether a workbook's cached cell values are a *trusted oracle* (real Excel computed them) or *stale/untrusted candidates*. It accepts only if the conjunction holds: `calcMode == "auto"` ∧ `!fullCalcOnLoad` ∧ `calcId != 0` ∧ no missing formula cache ∧ `<Application>` starts with "Microsoft Excel". **`umya-spreadsheet` 3.0.0 hard-codes `<Application>Microsoft Excel</Application>` and a non-zero `calcId` (122211) on every save.** So any workbook that umya has round-tripped — a test fixture, a programmatically-mutated workbook, anything written by the SDK's own tooling — **passes the freshness gate on fabricated Excel identity**, even though no real Excel ever recalculated it. The gate would admit garbage cached values as a trusted oracle.
-
-**Why it happens:**
-umya is the natural choice for *both* reading and writing `.xlsx` in Rust, so it is tempting to use it to author test fixtures or to build a "renderer" that mutates a workbook. The fabrication is invisible — the saved file genuinely contains the Excel identity strings, so the gate's check is true. The lighthouse already hit this and documented it inline (`gate.rs:1-19, 82-94`: "NEVER a umya-round-tripped copy, which FABRICATES `calcId=122211` + 'Microsoft Excel'").
-
-**How to avoid — concrete provenance design:**
-1. **The gate reads ORIGINAL on-disk bytes via a quarantined raw reader, never a umya copy.** The lighthouse's `read_calc_pr` / `read_app_props` (`provenance/raw_parts.rs`) parse the raw OOXML zip parts directly from `std::fs::read(path)?` of the file the BA supplied — they do NOT round-trip through umya's object model. Port this contract: **the gate's input is `&[u8]` of the original file, and the API makes it impossible to pass a re-serialized workbook.** Document this as the load-bearing invariant.
-2. **Distinct provenance class for SDK-authored workbooks.** If the SDK programmatically mutates a workbook (the renderer's `render_workbook`, or any fixture authoring like the lighthouse `author_lighthouse_dv.rs` bin), it must NOT then feed that file to the freshness gate as a trusted oracle. Tag SDK-authored output with a distinct provenance marker (e.g. an `OracleProvenance.authoring_app = "pmcp-workbook-compiler"` class) and make the gate REFUSE it — fabricated Excel identity from umya must be classified as `oracle/non-excel-app`, not accepted. The renderer (Phase 12) deliberately uses the writer-only `rust_xlsxwriter`, NOT umya, partly to avoid this; preserve that choice.
-3. **Anchored identity, not substring.** The gate must require `<Application>` to START with "Microsoft Excel" (trimmed), not `.contains` — the lighthouse fixed a `.contains` hole (`gate.rs:248-252`, WR-03 in Phase 8) where "Not Microsoft Excel" / "FauxMicrosoft Excelerator" passed.
-4. **Fail-closed defaults.** A raw-reader failure (malformed/oversize/missing OOXML part) must produce an `oracle/*` `Severity::Error` refusal with `stale = true`, never a panic or a silent default that fabricates passing values (`gate.rs:103-119, 317-333`).
-
-**How it interacts with the Phase-8 oracle-staleness gate:**
-The gate is *objective-metadata-only* — it proves real-Excel recalc *provenance*, it does NOT prove semantic agreement between a cached `<v>` and its `<f>` (that is Phase 10 penny-reconciliation). The fabrication trap defeats the provenance proof specifically. If umya-authored fixtures pass the gate, the penny-reconciliation in Phase 10 would then "reconcile" against fabricated oracle values — a green pipeline built on a lie. **The two gates are independent layers and the provenance layer must not be bypassable by the SDK's own writer.**
-
-**Warning signs:**
-- Any test fixture authored by writing a workbook with umya and then ingesting it as a "real" oracle.
-- The renderer or any tooling depending on umya's write path (it should use `rust_xlsxwriter`).
-- The gate accepting a workbook whose `authoring_app` was set by SDK code.
-- A `calcId` of exactly `122211` (umya's hard-coded value) in any accepted `OracleProvenance`.
-
-**Phase to address:**
-The Phase-8-equivalent (trusted-oracle ingest + staleness gate) extraction phase. The renderer extraction phase (Phase-12-equivalent) must re-confirm the writer is `rust_xlsxwriter` (not umya) and that rendered output is never re-ingested as an oracle. Add a regression test: author a workbook with umya, assert the gate REFUSES it with `oracle/non-excel-app` (or the new SDK-author class).
-
----
-
-### Pitfall 3: Generalizing the manifest — hardcoded `build_reference_manifest` does not survive a second workbook
-
-**What goes wrong:**
-The lighthouse's `build_reference_manifest` (`lib.rs:524-606`) **inlines the ufh-quote workbook's entire schema as literal Rust**: the `heat_source` enum input with `allowed_values: ["heat_pump","boiler"]`, the four cost input cells (`7_Quote!C9/C10/...`), the margin constant (`2_Constants!Margin`), the supply-total output (`7_Quote!C11`), plus their dtypes/units/meanings/cells. Worse, the `mk_role` helper *hardcodes `Dtype::Number`* and the enum input is a hand-written `CellRole` exception (`lib.rs:573-585`). If this is copied as-is and a second, different workbook is compiled, the served tool schema would describe ufh-quote's inputs regardless of the actual workbook — the generalization is a no-op. Everything (dtype, role, units, allowed_values, tiers) must be **synthesized from the workbook + ratified manifest**, with zero per-workbook Rust.
-
-**Why it happens:**
-The lighthouse was a single-workbook proof; hardcoding the reference manifest was the fastest path to a green golden-reconcile and let the schema-projection layer be developed against a known shape. The hardcoding is load-bearing for the lighthouse's tests (`build_reference_manifest` is called by `renderer_equivalence_layout_and_cell_map` and the emit path, `lib.rs:351, 678`), so it is not obviously "debt" until you try to compile a different workbook.
-
-**What breaks when a second workbook is compiled (the generalization stressors):**
-- **dtype inference must generalize** beyond `Dtype::Number` — a Text/enum input, a date, a boolean must all be inferred from the cell's value + DV, not assumed Number (the `mk_role` Number hardcode breaks immediately).
-- **role projection** (Input/Constant/Output/Formula) must come entirely from the colour/Guide/header synthesis + BA ratification, not a literal cell list.
-- **`allowed_values`** must be synthesized from the workbook's data-validation lists (Phase-14 inline-literal resolution), not a hand-written exception.
-- **tiers** (`InputTier`) must be assigned by `ratify_tiers` per inferred dtype/role — and must handle enum inputs correctly (see Pitfall 5 / WR-01).
-- **units/meaning** must come from the two-layer metadata model (named ranges + hidden `_Manifest` sheet), not literals.
+"Latest = newest we support" feels right, and the fallback-to-LATEST branch makes the bump look harmless in unit tests. The negotiation function's failure mode (return LATEST) is the opposite of what stateless v2 needs (a conservative default to v1).
 
 **How to avoid:**
-Delete `build_reference_manifest` from the served/emit path entirely. The served tool schema must be projected from the bundle's `manifest.json` at runtime (`schema.rs` style projection), and the manifest must be produced solely by the synth pipeline (`manifest/synth.rs`) over the ingested workbook. Keep an equivalent ONLY as a *test* fixture that asserts the synthesized manifest for the reference workbook equals the expected shape (anti-drift), never on the production path.
+Add `2026-07-28` to `SUPPORTED_PROTOCOL_VERSIONS` but **keep `LATEST_PROTOCOL_VERSION = "2025-11-25"` and make v2 opt-in** (builder method / feature flag / explicit lifecycle), exactly as the official Rust SDK does with `serve_with_lifecycle` + `ProtocolVersion::V_2026_07_28` (opt-in, not default) and TypeScript does with explicit `createMcpHandler` opt-in. Change the negotiation fallback for the *stateless header path* to default to v1 when no `MCP-Protocol-Version` header is present. Update the `SUPPORTED_PROTOCOL_VERSIONS.len()` doctest/tests deliberately (they will break — that's the tripwire working).
 
 **Warning signs:**
-- Any `CellRole` constructed with literal cell addresses (`"7_Quote!C9"`) outside a test.
-- `Dtype::Number` appearing as a default/hardcode in a manifest builder.
-- The served schema for a freshly-compiled second workbook still mentions ufh-quote inputs.
-- A workbook ID (`ufh-quote`, `"7_Quote"`, `"1_Inputs"`) hardcoded in non-test Rust.
+Existing 2025-11-25 integration tests start expecting `server/discover` instead of `initialize`; the `latest_version_is_2025_11_25` unit test needs "fixing"; downstream crates fail to compile against a fixture asserting the old string.
 
-**Phase to address:**
-The manifest-synth extraction phase (Phase-7/11-equivalent) plus the generic-served-tool phase. Verification: compile TWO different workbooks (the reference + a deliberately-different second fixture, e.g. a simple margin calculator) and assert each server's `get_manifest` / `tools/list` schema reflects ITS OWN inputs with zero shared Rust. This second-workbook test is the single most important generalization gate.
+**Phase to address:** Phase 1 (version plumbing) — the very first design decision.
 
 ---
 
-### Pitfall 4: Change-class governance correctness gaps (CR-01 demotion asymmetry, CR-02 version overwrite) — silent auto-promote of breaking changes + baseline destruction
+### Pitfall 2: Two negotiation mechanisms colliding (echo-back vs per-request header)
 
 **What goes wrong:**
-Two Critical findings from the lighthouse `14-REVIEW.md` that MUST be fixed during extraction (RFC §5):
-
-- **CR-01 (demotion asymmetry):** `classify_cell_roles` (`change_class/mod.rs:165-234`) only inspects the *current* cell's role for cells present in both manifests. Promotions are caught (non-input→input, non-assumption→assumption), but **demotions escape classification entirely**:
-  - `Input → Constant/Formula`: a flip *away* from `Role::Input` emits no class (the `Role::Constant | Role::Formula => {}` arm, `mod.rs:217`) — an input is silently dropped from the served schema with NO `InputSchema` change. The Phase-14 enum-domain check (`allowed_values` change) is *also* bypassed by this route.
-  - Assumption → non-assumption (yellow-assumption `source` edited): `is_assumption(cur)` is false, falls into the `Constant | Formula => {}` arm, removed-keys loop skips it (key still exists) → **zero classes → `effective_policy(&[]) == HotReload` → auto-promotes with no BA review**, defeating the D-09 `NeverAutoPromote` hard rule.
-  Result: a breaking schema change (dropping a required input, re-classifying an assumption) **auto-promotes silently**. The numeric gate does not catch it when the computed value is unchanged.
-
-- **CR-02 (version overwrite / baseline destruction):** `gate_and_promote` computes `next_version = bump_patch(prev.version)` for the changelog `to_version` but **never sets `candidate.version`** (it stays the hardcoded `"1.0.0"` from `build_candidate_model`). `write_candidate_bundle` then writes to `{name}@{candidate.version}` = the SAME `@1.0.0/` directory just used as the baseline. Consequences, all visible in the committed lighthouse bundle:
-  - `BUNDLE.lock` says `1.0.0` while `evidence/changelog.json` says `1.0.0 → 1.0.1` — `diff_version` reports a transition the bundle's own provenance contradicts.
-  - The prior baseline's `manifest.json`/`executable.ir.json` are **overwritten and destroyed** every promotion — the audit baseline the changelog `from_version` references no longer exists (data loss).
-  - The on-disk version never advances, so `find_prior_bundle_dir` re-discovers `1.0.0` and re-bumps to `1.0.1` forever; the semver-greatest baseline selection can never engage.
-  - Compounding bug WR-04: the approval fingerprint anchors on `prev.version` (a label) not the bundle content hash, and with CR-02 the label never changes — so cross-baseline no-inherit protection is inert.
-
-**Why they're dangerous:**
-This is the *governance* heart of the system — the whole point is that a BA edit becomes a *gated* compile/promote cycle, never a live reinterpretation. CR-01 means a breaking change can ship to agents with no human approval. CR-02 means the audit trail (which the `--accept`/approver/effective-date flow exists to produce) is destroyed on write — you cannot prove what the prior version was, and version provenance is internally inconsistent. Both undermine the trust model that justifies exposing BA spreadsheets to agents at all.
-
-**How to verify the fix:**
-- **CR-01 fix:** classify from BOTH sides in the present-in-both branch — assumption involvement on either side is an `Assumption` class; a role flip *away from* `Input`/`Output` is an `InputSchema`/`OutputSchema` class (the review gives the exact patch, `14-REVIEW.md:63-86`). **Symmetric classification tests:** assert `assumption→constant`, `input→constant`, `output→formula`, and `enum-drop + role-flip` EACH produce a non-empty change class that routes to `BlockUntilAccept`/`NeverAutoPromote`, never `HotReload`. Property test: for any pair (A,B) of manifests, `classify(A→B)` and `classify(B→A)` produce the same *cardinality* of schema-axis classes (symmetry invariant).
-- **CR-02 fix:** set `candidate.version = next_version` and `candidate.changelog.to_version = next_version` before `write_candidate_bundle`, so promotion writes a NEW `{name}@{next_version}/` directory and the prior baseline survives. **Version-store integration tests:** promote twice and assert (a) two distinct on-disk version directories exist, (b) the prior baseline's `manifest.json` is byte-identical before/after the second promote (not overwritten), (c) `BUNDLE.lock` version == `changelog.to_version` (internal consistency), (d) `diff_version` reports a real `N → N+1` transition matching the directories on disk. Also fix WR-04: anchor the approval fingerprint on the prior bundle's `BUNDLE.lock` `combined` content hash, not the version label.
-
-**Warning signs:**
-- A promote that succeeds with no BA `--accept` after a role/source edit.
-- `BUNDLE.lock` version ≠ `changelog.to_version` in any emitted bundle.
-- The bundles directory never grows a second `@x.y.z` folder across promotions.
-- A change-class test suite that only tests promotions, not demotions.
-
-**Phase to address:**
-The promote-gate / change-class extraction phase (Phase-13-equivalent) and the bundle-store generalization phase. CR-02 specifically must be fixed *before* generalizing the bundle store (RFC §5) — the bundle-store abstraction (`BundleSource` trait) assumes versioned, immutable, non-overwriting directories. These are not "port then fix later"; they must be redesigned in the port.
-
----
-
-### Pitfall 5: Enum-input tiering (WR-01) — `ratify_tiers` seeds an out-of-enum empty string on the default path
-
-**What goes wrong:**
-`ratify_tiers` maps every untiered `Role::Input` to `InputTier::Variable` with a dtype-derived default (`Dtype::Text → CellValue::Text("")`). For an enum input (`allowed_values: Some([...])`), this stamps `tier: {variable, default: Text("")}` — and `validate_input` step 1 seeds the cell to `""` on **every call** where the input is absent. `""` is not a member of the enum, and the membership gate is **present-only** (`input.rs:224-227` checks supplied inputs via `value.as_str()`, not seeded defaults), so the system seeds an *illegal out-of-enum value* into the evaluator on the default path. In the lighthouse this is numerically inert today (the `heat_source` enum cell `1_Inputs!C6` isn't wired into the IR), but the moment an enum input is wired into a computation, every default-path call computes from an illegal value — a plausible-but-wrong result with no error.
+Today negotiation is one-shot at `initialize` (`negotiate_protocol_version` echoes the highest common version, stored on the session). v2 has **no `initialize`** — protocol version arrives on a required `MCP-Protocol-Version` header *per request*, with clientInfo/caps in per-request `_meta`. If both systems run without a clear precedence rule, a request can be dispatched under v1 assumptions (session-stored version) while carrying v2 headers, or vice versa. Handlers then read the wrong protocol context.
 
 **Why it happens:**
-`ratify_tiers` was written before enum inputs existed (Phase 14 added them); the tiering logic predates the `allowed_values` axis and was never made enum-aware. The locked test `served_manifest_advertises_optional_heat_source_enum` passes because it runs against the PRE-emission `build_reference_manifest`, not the post-`ratify_tiers` committed manifest — a test/production skew that hides the bug (`14-REVIEW.md:106-110`).
-
-**How to avoid / verify the fix:**
-Make `ratify_tiers` **skip tiering for inputs carrying `allowed_values`** (leave them untiered/optional, so an absent enum input never seeds anything), OR default them to the FIRST enum member (a guaranteed-legal value). The review prefers skip. **Verification test:** load the COMMITTED `manifest.json` (post-emission, not the pre-emission builder) and assert: any `Role::Input` with `allowed_values: Some(vs)` has either `tier: None` OR a default that is a member of `vs`. Property test: for any synthesized manifest, no seeded default is ever outside its cell's `allowed_values`.
-
-**Warning signs:**
-- Any default value `Text("")` on an input that also has `allowed_values`.
-- Enum-membership tests that run against a pre-emission manifest builder instead of the committed bundle.
-- A "present-only" gate paired with auto-seeded defaults (the two must agree on the default).
-
-**Phase to address:**
-The manifest-synth / tiering extraction phase (Phase-14-equivalent), co-located with the enum-input work. Verify against the committed bundle, not the in-memory builder.
-
----
-
-### Pitfall 6: Determinism / penny-reconciliation regressions when generalizing the formula DAG + evaluator to arbitrary workbooks
-
-**What goes wrong:**
-The lighthouse reconciles the golden quote to ±£0.01 against the oracle, and its reconcile classifier (`reconcile/classifier.rs`) is sophisticated: it **forbids the naive `delta.abs() < X` tolerance heuristic** (an explicit grep gate asserts `delta.abs()` never appears in the file, `classifier.rs:19-21`) and instead anchors acceptance on *operand-anchored rounding boundaries* — a divergence is only acceptable if the deciding cell is a rounding op (`ROUND`/`ROUNDUP`/`CEILING`), its operand sits within `BOUNDARY_EPSILON = 1e-6` of the rounding boundary, AND the divergence is ≤ one rounding step (`classifier.rs:281-292`). Generalizing the formula parser/DAG to *arbitrary* workbooks exposes Excel-semantics edge cases the single golden workbook never hit:
-
-- **Excel float quirks:** Excel uses IEEE-754 f64 but displays 15 significant digits and has its own rounding rules (round-half-away-from-zero, not banker's rounding) — a generalized evaluator must replicate `excel_round`/`excel_ceiling`/`excel_floor` (`workbook_runtime::sheet_ir::rounding`) exactly, not Rust's `f64::round` (which differs at .5 / is half-to-even in some paths).
-- **Excel date serial / 1900 leap-year bug:** Excel treats 1900 as a leap year (serial 60 = the non-existent Feb 29 1900). Any date arithmetic in a generalized workbook hits this.
-- **Empty-cell coercion:** an empty cell coerces to 0 in arithmetic but to "" in concatenation — getting this wrong yields plausible-but-wrong results.
-- **Error propagation:** `#DIV/0!`, `#N/A`, `#VALUE!` propagate through formulas; a generalized evaluator must model Excel error values, not panic or produce NaN→0.
-- **Order-of-operations / implicit intersection / type coercion** edge cases the one golden workbook never exercised.
-
-**Why it happens:**
-A single golden workbook reconciling to the penny gives false confidence that the formula semantics are general. Excel's quirks are numerous and the lighthouse only had to be correct for ONE formula DAG. The temptation is to use a generic float tolerance to "absorb" divergences — exactly the anti-pattern the lighthouse explicitly forbids, because a tolerance band hides real semantic errors.
+The session-stored negotiated version and the per-request header are two sources of truth. Retrofitting v2 tends to bolt the header check onto the existing session path rather than making per-request the authority.
 
 **How to avoid:**
-- **Keep the operand-anchored rounding model, never a blanket tolerance.** Port the `reconcile/classifier.rs` discipline and its grep gate (`delta.abs()` must not appear). A divergence is either explained by a *specific* rounding-boundary mechanism or it is a reconciliation FAILURE.
-- **Port `workbook-runtime::sheet_ir::rounding` exactly** (`excel_round`/`excel_ceiling`/`excel_floor`) and unit-test against Excel-produced values, not Rust stdlib rounding.
-- **Whitelist-only function set** (the dialect's `DIA-05` whitelist): a generalized parser must REFUSE functions outside the compilable subset with a precise reason code, not silently mis-evaluate. Generalization MUST NOT expand the whitelist implicitly.
-- **Per-workbook penny-reconciliation is mandatory in the pipeline** — every compile reconciles the compiled DAG against the workbook's own cached oracle values; a divergence outside the rounding model blocks the bundle. This makes the oracle the test, per workbook, automatically.
-- **Build a fixture corpus of Excel-quirk workbooks** (dates spanning 1900, empty-cell coercion, division errors, half-rounding boundaries) and reconcile each — generalization confidence comes from breadth of fixtures, not the single golden case.
+Make the dispatch path compute an explicit `ProtocolContext` per request: (v2) header + `_meta` clientInfo → authoritative; (v1) fall back to session-negotiated version. Never let a session-stored version override an explicit per-request header. Thread this context through `RequestHandlerExtra` so handlers branch on a resolved value, not on ambient session state.
 
 **Warning signs:**
-- `delta.abs() < epsilon` or any blanket tolerance appearing in reconcile code.
-- Rust `f64::round` / `.round()` used instead of the `excel_round` helper.
-- A second workbook reconciles "close enough" rather than exactly within the rounding model.
-- NaN, `inf`, or a silent `0` appearing where Excel would show `#DIV/0!`.
+Handlers calling `session.protocol_version()` on a request that has no session (stateless); intermittent behavior differences between the first request and subsequent requests on the same connection.
 
-**Phase to address:**
-The formula-parser / DAG-compile / reconcile extraction phases (Phase-9/10-equivalent). The Excel-quirk fixture corpus is a generalization-specific addition that the lighthouse did not need; it belongs in the reconcile phase and is the primary generalization verification.
+**Phase to address:** Phase 1 (plumbing) and Phase 2 (stateless HTTP).
 
 ---
 
-### Pitfall 7: Governance / security gaps when exposing BA-edited spreadsheets to agents
+### Pitfall 3: Session-identity assumptions leaking across the stateless boundary (the pmcp.run discovery-cache id bug is a preview)
 
 **What goes wrong:**
-The system deliberately exposes business-analyst-authored spreadsheets to agents. Several abuse/bypass vectors must be closed during generalization:
-
-- **Cell-content injection:** a BA (or anyone who edits the workbook) can put arbitrary strings in cells — `meaning`, `unit`, `name`, enum values, error messages. These flow into the served tool schema (`description`, `enum`) and into structured error `allowed` repair fields, which an agent's LLM reads. Untrusted-looking content (prompt-injection payloads in a cell comment or a DV list) could reach the model. The dialect's whitelist-only ingest mitigates formula injection, but *string metadata* is a softer surface.
-- **Enum-membership runtime gate bypass (WR-05):** `validate_input` only runs the dtype + enum gate `if let Some(role) = manifest.cells.find(...)` (`input.rs:110-113`). If a `cell_map` input entry's `seed_coord` has no matching manifest `CellRole` (the two are separate embedded files that can skew across a partial regeneration), the supplied value seeds the evaluator with **no dtype check and no enum gate** — fail-open, the exact NaN→plausible-wrong-quote path the gate exists to close. Must fail CLOSED: a cell_map entry with no manifest role is an internal-consistency ERROR.
-- **Numeric-enum fail-open (WR-02):** a numeric-dtyped enum (`"1,2,3"` DV on a Number cell) produces `{"type":"number","enum":["1","2","3"]}` — no JSON number satisfies a string enum (schema fail-closed) while the membership gate runs only via `value.as_str()` and silently no-ops for numbers (runtime fail-OPEN). The two halves disagree. Only attach `allowed_values` for Text-dtype inputs, or reject non-string values on any enum input.
-- **`--accept` approval flow skippable:** the gated approval (`--accept --approver --effective-date`) is the human-in-the-loop that authorizes a breaking change. If CR-01 lets a breaking change escape classification (auto-`HotReload`), the approval is never even requested — the gate is *skippable by omission*. The approval flow's integrity depends entirely on the change classifier being complete (Pitfall 4).
+v2 removes `Mcp-Session-Id`. pmcp has session assumptions baked into `src/shared/{session,streamable_http,event_store}.rs` and downstream (`pmcp-run/amplify/.../mcp-proxy-rust`). The **known, documented** pmcp.run discovery-cache bug (`pmcp_run_proxy_discovery_cache_id_bug`) is exactly this failure class: state keyed/correlated by session identity replays a stale JSON-RPC `id`, producing `invalid type: string, expected i64`. Under stateless v2, *every* per-request identity that used to come from the session (owner binding, event-store resumption, caches, request→response `id` correlation) loses its anchor. Any code that keys state by session id will mis-correlate or leak across callers.
 
 **Why it happens:**
-The threat model shifts when generalizing from a single trusted lighthouse workbook (authored by the project's own BA) to *any project's* workbook (authored by arbitrary BAs, potentially from less-trusted sources). Fail-open validation paths and string-metadata passthrough that were acceptable for one trusted workbook become attack surface at scale.
+Session id was a convenient, always-present correlation key. Stateless mode removes it silently — code compiles and mostly works until two callers with different id shapes share a keyspace.
 
 **How to avoid:**
-- **Fail-closed everywhere in the served validation path:** a missing manifest role for a supplied input is an error (WR-05 fix — `.ok_or(...)` not `if let Some`), a non-string value on an enum input is rejected (WR-02 fix), a mismatched cell_map/manifest is rejected.
-- **Treat cell-string metadata as untrusted:** length-cap and sanitize `meaning`/`unit`/`name`/enum strings before they enter tool schemas; do not let raw cell text become tool `description` without bounds. Document that BA-authored strings reach the agent.
-- **The change classifier must be complete (Pitfall 4 CR-01 fix)** so the `--accept` flow can never be skipped by an unclassified change. Symmetric classification is a *security* property, not just correctness.
-- **Bind approvals to content hashes** (WR-04 fix), not version labels, so an approval cannot be inherited across different bundle contents that share a version string.
-- **Present-only gate + safe defaults must agree** (Pitfall 5 / WR-01) so no default seeds an out-of-domain value.
+Audit every session-keyed store/cache before enabling v2. Enforce the invariant *response `id` MUST equal request `id`, always re-derived from the live request* (never replayed from cache) — this holds in both versions and is the root fix for the known proxy bug. In v2 mode, derive caller identity from per-request `_meta` clientInfo / OAuth `sub`, not session id. Type response ids as untagged `RequestId` (String|Number), not `i64`, as defense-in-depth.
 
 **Warning signs:**
-- Any `if let Some(role) = ...` validation that silently skips when the role is absent (should be `.ok_or(...)` fail-closed).
-- Raw cell strings reaching `tools/list` schema `description` without length/charset bounds.
-- An enum gate that only fires for `value.as_str()`.
-- An approval record keyed on a version label rather than a content hash.
+`expected i64` / id-mismatch errors; discovery methods (`tools/list`, `resources/list`) failing while `initialize`/`server/discover` succeeds; per-server intermittency on a 5-minute (cache-TTL) cadence.
 
-**Phase to address:**
-The generic-served-tool / input-validation extraction phase (Phase-14-equivalent input.rs/schema.rs) for the fail-closed fixes; the change-class phase for the `--accept`-skippability fix (shared with Pitfall 4). String-metadata sanitization is a generalization-specific hardening that should be a named task in the served-tool phase.
+**Phase to address:** Phase 2 (stateless streamable-HTTP). Add a regression test reproducing the discovery-cache id class.
 
 ---
+
+### Pitfall 4: Tasks owner-binding collapses when `session_id` disappears
+
+**What goes wrong:**
+`pmcp-tasks` resolves task ownership via `resolve_owner_id(subject, client_id, session_id)` (`crates/pmcp-tasks/src/security.rs:150`, `router.rs:289`) — **session id is the last-resort fallback**, and there's a test `router.resolve_owner(None, None, Some("session-1"))` proving unauthenticated servers rely on it. In stateless v2, `session_id` is gone. Owner binding then collapses to `subject`/`client_id` only; for a task server without OAuth, every request resolves to the *same* (or `None`) owner → tasks become cross-owner readable or un-ownable. This is a **security regression**, and it hits published consumers (pmcp.run's 3 hand-rolled task servers, DynamoDB/Redis-backed stores).
+
+**Why it happens:**
+The session-id fallback was a pragmatic "works without auth" convenience in v1.0. It's invisible in tests that always pass a session id.
+
+**How to avoid:**
+For v2, replace the session-id fallback with a per-request stable client identity from `_meta` clientInfo (or require OAuth `sub` and fail closed if absent). Keep the v1 session-id path intact for v1 clients. Add a security test: stateless request with no OAuth and no session must NOT resolve two different callers to the same owner.
+
+**Warning signs:**
+Two anonymous stateless clients seeing each other's tasks; `resolve_owner(None, None, None)` returning a usable owner; owner-isolation security tests only covering the session-id case.
+
+**Phase to address:** Phase 3 (Tasks extension migration).
+
+---
+
+### Pitfall 5: Reshaping the Tasks API in place breaks published `pmcp-tasks` + `tasks/list` consumers
+
+**What goes wrong:**
+v2 **removes `tasks/list`** (implemented at `crates/pmcp-tasks/src/constants.rs` `METHOD_TASKS_LIST`), **adds `tasks/update`**, and moves to server-directed task creation. If the `TaskRouter` drops `tasks/list` when v2 is negotiated but the change is done in-place on the shared router, v1 clients still calling `tasks/list` get "method not found." Conversely the `-32002` "task not completed / pending" code (FROZEN with locking tests at `src/server/core.rs:1145`, `task_dispatch_tests.rs`) may be affected by the v2 error-code changes (see Pitfall 6).
+
+**Why it happens:**
+The router is version-agnostic (`serde_json::Value` boundary), so it's tempting to mutate one dispatch table for both versions.
+
+**How to avoid:**
+Keep `tasks/list` served for v1-negotiated requests; gate its removal on the resolved protocol context. Add `tasks/update` and server-directed creation as additive methods. Because `pmcp-tasks` is a separate crate with independent semver, the v2 reshape can be a **major bump of `pmcp-tasks`** without forcing a `pmcp` major (see Pitfall 8) — but only if core `pmcp` keeps the `TaskRouter` trait boundary stable. Document the migration for pmcp.run's three task servers before publishing.
+
+**Warning signs:**
+v1 conformance fixtures for `tasks/list` failing; the frozen `-32002` tests needing edits; pmcp.run task servers erroring on `tasks/list`.
+
+**Phase to address:** Phase 3 (Tasks migration).
+
+---
+
+### Pitfall 6: The `-32002` → `-32602` error-code change collides with standard JSON-RPC `InvalidParams`
+
+**What goes wrong:**
+The impact memory records a v2 error-code rename `-32002` → `-32602`. But in THIS codebase `-32602` is already `InvalidParams` (`src/types/protocol/mod.rs:135 InvalidParams = -32602`), and `-32002` is the **FROZEN** "task not completed / pending" code with explicit locking tests (`pending_tasks_result_preserves_minus_32002`). If v2 remaps the task-pending signal onto `-32602`, task-pending becomes **indistinguishable from invalid-params** on the wire — clients (and pmcp's own `wait_for_task`) that branch on the code will treat a still-running task as a client error, or vice versa.
+
+**Why it happens:**
+Blindly applying a changelog "rename" without noticing the target code is already occupied by a semantically different, standardized error.
+
+**How to avoid:**
+**Verify this against the authoritative changelog** (`modelcontextprotocol.io/specification/draft/changelog`) before touching frozen codes — the memory claim is a secondary-source paraphrase and may misstate direction or scope. If the spec genuinely reuses `-32602`, branch error interpretation on the negotiated protocol version so the frozen v1 `-32002` semantics are preserved and v2's `-32602` is disambiguated by context. Do NOT silently change the frozen constant.
+
+**Warning signs:**
+`wait_for_task` treating a pending task as a hard error; the `-32002` freeze tests being "updated" without a spec citation; a single code carrying two meanings.
+
+**Phase to address:** Phase 1 (error-code plumbing) with a Phase 3 (Tasks) cross-check. **Flagged: needs changelog verification — LOW confidence on the exact rename.**
+
+---
+
+### Pitfall 7: JSON Schema 2020-12 — `structuredContent = any JSON value` breaks the 2.15 object-shaped bridge
+
+**What goes wrong:**
+The v2.15 structured-output bridge (`src/server/output_validation.rs`, dispatcher dual-emit) assumes `structuredContent` is an **object** derived from an object `outputSchema`. v2 + JSON Schema 2020-12 permits `structuredContent` to be **any JSON value** (scalar, array, null). Cached validators built with `jsonschema::validator_for` (dep `jsonschema = "0.46"`) auto-detect the `$schema` dialect from the document — a tool declaring an older draft (`draft-07`/`2019-09`) while the client expects 2020-12 will validate under the wrong dialect (2020-12 renamed `items`→`prefixItems`, added `$dynamicRef`, changed `$recursiveRef`), so schemas silently mis-validate. A scalar `structuredContent` may be rejected by object-assuming validation or mis-wrapped by the dispatcher.
+
+**Why it happens:**
+The 2.15 bridge was designed against object outputSchemas (the only shape `#[mcp_tool]`/`TypedToolWithOutput` derived). "Any JSON value" and dialect-strictness are new degrees of freedom.
+
+**How to avoid:**
+Confirm `jsonschema` 0.46 is invoked with the 2020-12 draft explicitly for v2 tools (don't rely on `$schema` auto-detect). Loosen the dispatcher/validation to accept non-object `structuredContent`. Add property tests over scalar/array/null structured content. Keep v1 object-only behavior for v1-negotiated tools.
+
+**Warning signs:**
+Valid scalar/array tool outputs rejected as "schema violation"; validation passing on malformed 2020-12 schemas (wrong dialect); `prefixItems`/`$dynamicRef` keywords ignored.
+
+**Phase to address:** Phase 4 (JSON Schema 2020-12 + caching).
+
+---
+
+### Pitfall 8: Sleepwalking into a `pmcp` 3.0 when the milestone is meant to be additive
+
+**What goes wrong:**
+The dual-version stack is *intended* to be additive (stays 2.x minor per CLAUDE.md release rules: new features = minor, breaking = major). It quietly becomes a **breaking 3.0** the moment you: flip `LATEST_PROTOCOL_VERSION` (Pitfall 1 — changes `negotiate` output = behavioral break), remove `tasks/list` from core dispatch unconditionally, change the serde shape of any public type (e.g., putting per-request clientInfo into `RequestHandlerExtra` by changing an existing field's type), change owner-binding fallback signatures, or change default server behavior to stateless.
+
+**Why it happens:**
+Each individual change feels small; the cumulative default-behavior shift is a major break. During a 2.x window there's pressure to "just make it work."
+
+**How to avoid:**
+Adopt the isolation pattern that already worked for `pmcp-tasks`: v2 behind opt-in builder methods + a feature flag, all new types additive, existing public types unchanged, `LATEST` pinned. `pmcp-tasks` itself MAY take a major bump (separate crate) without forcing core `pmcp` major. Write down the "what forces 3.0" list at phase start and treat any item on it as a milestone-level decision, not an implementation detail.
+
+**Warning signs:**
+`cargo public-api` / semver-checks flagging removed or changed items; existing downstream crates (toolkit, agent, team-servers) needing code changes to compile against the new `pmcp`; default `Server::run` behavior changing for existing users.
+
+**Phase to address:** Phase 1 (set the additive constraint); re-checked every phase.
+
+---
+
+### Pitfall 9: Building hard against the RC while the final spec is days away
+
+**What goes wrong:**
+Research date is 2026-07-22; the spec **finalizes 2026-07-28**. The RC is feature-complete but the SDK-betas post explicitly warns "Public APIs may still change between the beta and the stable releases, so pin exact versions." Hard-coding RC-only quirks (exact header casing, provisional `requestState` shape for multi-round-trip elicitation, `InputRequiredResult` fields, `ttlMs`/`cacheScope` hint names) risks a rewrite when final lands.
+
+**Why it happens:**
+Eagerness to ship against the RC; assuming "release candidate" means frozen.
+
+**How to avoid:**
+Sequence the milestone so wire-exact details (Phase 2 elicitation `requestState`, Phase 4 caching hints, Phase 5 auth SEP specifics) land **after** 2026-07-28 final publication; do the version-plumbing scaffolding (Phase 1) first since it's the most stable. Diff the final changelog (`modelcontextprotocol.io/specification/draft/changelog`) against the RC before coding wire formats. Cross-reference the official Rust SDK's `ProtocolVersion::V_2026_07_28` constant/lifecycle once it stabilizes rather than inventing your own wire assumptions.
+
+**Warning signs:**
+Wire fixtures citing the RC blog rather than the final spec; the official SDK betas changing field names between beta and stable.
+
+**Phase to address:** Milestone sequencing decision; concentrated in Phases 2, 4, 5.
+
+---
+
+### Pitfall 10: Breaking existing OAuth deployments with unconditional auth hardening
+
+**What goes wrong:**
+v2's six auth-hardening SEPs (RFC 9207 `iss` validation on authorization responses, DCR `application_type`) fail **closed** if enforced unconditionally. Existing pmcp OAuth deployments — Lambda `oauth_passthrough`, the Graph/M365 read-only example, load-testing OAuth (v1.5), the DNS-rebinding `AllowedOrigins::any()` proxy config — may not emit `iss` or set `application_type`, and would suddenly be rejected.
+
+**Why it happens:**
+Security SEPs are written as "MUST validate," and it's natural to gate them on nothing.
+
+**How to avoid:**
+Gate hardening on the negotiated protocol version: v2 clients get strict `iss`/DCR validation; v1 stays lenient. Provide a migration path and clear errors. Preserve the documented `stateless()` + `AllowedOrigins::any()` proxy exception (feedback memory `feedback_lambda_dns_rebinding`).
+
+**Warning signs:**
+Existing OAuth integration/e2e tests failing with `invalid issuer` / DCR errors; Lambda proxy deployments 401-ing after upgrade.
+
+**Phase to address:** Phase 5 (auth SEPs).
+
+---
+
+### Pitfall 11: Conformance-suite integration masked by feature-flag unification
+
+**What goes wrong:**
+The Phase-109 conformance harness (in-memory + HTTP `ConformanceTarget`, fixture schema v2) is the intended alignment point. Two documented traps recur: (a) `cargo test --all-features` masks feature-flag gaps because the dev-dependency `pmcp` `full` feature unifies flags (Phase 109 gotcha — the `pmcp/http` gap that only surfaced under a dev-dep-free `--all-features`/publish build); (b) the in-memory `DuplexTransport` target **cannot** exercise the stateless HTTP header path (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, session-id absence), so header/statelessness conformance must run against the HTTP target only. Additionally the official conformance suite may itself be RC-versioned and change before final.
+
+**Why it happens:**
+`--all-features` green feels like proof; in-memory transport is the easy default for conformance fixtures.
+
+**How to avoid:**
+Verify v2 conformance with a **dev-dependency-free** build (absolute rustup `cargo build --all-features`), not just `cargo test`. Route all header/session-absence assertions through the HTTP `ConformanceTarget`. Pin the official conformance suite to a specific commit and re-pin after the 2026-07-28 final. Keep v1 conformance fixtures running alongside v2 (dual-version = dual conformance).
+
+**Warning signs:**
+Conformance passing under `cargo test --all-features` but failing on a fresh publish build; header tests "passing" against in-memory transport that never sends headers.
+
+**Phase to address:** Phase 6 (conformance).
+
+---
+
+### Pitfall 12: Deleting/breaking deprecated Roots/Sampling/Logging too early
+
+**What goes wrong:**
+v2 marks Roots, Sampling, Logging **deprecated but advisory-only** — they MUST keep working in v2 and every spec version published within 12 months. pmcp shipped `sampling/createMessage` (with tools/tool_choice), `roots/list`, and the client host surface in v2.16 (Phase 106), and `pmcp-agent`'s provider-direct design depends on them as compat-window features. Removing or breaking these to "clean up for v2" strands `pmcp-agent`, `pmcp-team-servers`, and any client relying on sampling/roots.
+
+**Why it happens:**
+"Deprecated" reads as "remove now" instead of "annotate, keep for 12 months."
+
+**How to avoid:**
+Zero removal work this milestone (matches PROJECT.md non-goal). Add deprecation annotations only; keep full runtime behavior. Validate `pmcp-agent` sampling-with-tools and `list_roots` still work under v2 negotiation.
+
+**Warning signs:**
+`#[deprecated]` on sampling/roots types turning into `#[cfg(not(v2))]` gating; agent/team examples failing under v2.
+
+**Phase to address:** Phase 1 (annotate-only policy); verified in Phase 6.
 
 ## Technical Debt Patterns
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Hardcode the reference manifest in Rust (`build_reference_manifest`) | Fast green golden-reconcile for one workbook | Generalization is a no-op; second workbook served wrong schema | Only as a TEST fixture, never on the emit/served path |
-| Use umya to author test fixtures, then ingest them as oracles | One library for read+write | Fabricated Excel provenance silently passes the freshness gate | Never — author fixtures with a non-umya writer or use real Excel-saved `.xlsx` |
-| `delta.abs() < epsilon` blanket reconciliation tolerance | Absorbs float noise quickly | Hides real semantic divergence; un-auditable | Never — use the operand-anchored rounding model |
-| Port the `just purity-check` recipe "later" | Faster initial extraction | Reader leaks into served binary undetected | Never — the gate lands WITH the runtime crate |
-| Classify only promotions, not demotions (CR-01) | Simpler classifier | Breaking changes auto-promote with no approval | Never — symmetric classification is a security property |
-| Pin `candidate.version` while bumping changelog (CR-02) | Stable bundle path | Baseline destroyed on every promote; provenance inconsistent | Never — version must advance and prior baseline must survive |
-| Anchor approvals on version label, not content hash (WR-04) | One fewer field to thread | Approvals inherit across different contents sharing a version | Never — anchor on `BUNDLE.lock` combined hash |
-| `if let Some(role)` skip-when-absent validation (WR-05) | Tolerant of artifact skew | Fail-open: unchecked value seeds the evaluator | Never on a served value path — fail closed |
+| Flip `LATEST_PROTOCOL_VERSION` to 2026-07-28 to "turn on" v2 | v2 works instantly in demos | Silent v2 for legacy clients; forces `pmcp` 3.0; downstream fixture drift | **Never** during dual-version window |
+| One shared dispatch table mutated for both versions | Less code | v1 methods (`tasks/list`) vanish for v1 clients; hard to reason about | Never — branch on resolved protocol context |
+| Enforce auth SEPs unconditionally | Spec-compliant, simple | Breaks all existing OAuth deployments at once | Only if every deployment is known-v2 |
+| Reuse in-memory conformance target for header tests | Fast to write | False-green on statelessness/header conformance | For non-transport semantic tests only |
+| Pin task ownership to session-id fallback in v2 | Auth-free servers keep working | Cross-owner task leakage when session-id is gone | Never in v2 mode |
+| Build wire formats against RC blog | Start early | Rewrite when 2026-07-28 final differs | Scaffolding only, not wire-exact fields |
 
 ## Integration Gotchas
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| `umya-spreadsheet` (reader) | Letting it into the runtime/served tree; using its writer for fixtures | Quarantine in the compiler only; raw-bytes provenance read; never round-trip a workbook through it before the freshness gate |
-| `rust_xlsxwriter` (writer) | Banning `zip` to keep readers out also bans the writer's container | Permit `zip`, ban only the reader/parser stack (`quick-xml`/`umya`/`calamine`); positively assert the writer IS present |
-| Cargo feature unification (workspace) | A compiler feature on a sibling crate pulls umya into the served binary via unification | Run the purity gate per feature-combination in CI; keep compiler helpers out of any crate the served binary depends on |
-| Bundle store (`BundleSource` trait) | Treating versioned dirs as mutable/overwritable (CR-02) | Versioned, immutable, append-only directories; never overwrite a published `@x.y.z` |
-| Embedded vs local-dir bundles | Schema/IR skew across a partial regeneration | Content-hash the bundle (`BUNDLE.lock combined`); fail closed on cell_map/manifest mismatch |
+| pmcp.run mcp-proxy-rust (discovery cache) | Replay cached JSON-RPC envelope incl. `id` | Re-write `id` to live request id on every cache hit; cache only `result` |
+| `pmcp-tasks` (published, DynamoDB/Redis) | Remove `tasks/list` / change owner binding in place | Additive `tasks/update`; version-gated `tasks/list`; per-request identity for ownership; major-bump the crate, not core `pmcp` |
+| cargo-pmcp scaffolds | Hardcoded protocol/version strings drift silently | Extend the existing `emitted_pmcp_version_matches_workspace_pin`-style tripwire to cover protocol-version strings |
+| `jsonschema` 0.46 validators | Rely on `$schema` auto-detect for dialect | Invoke 2020-12 draft explicitly for v2 tools |
+| Official Rust SDK (rmcp) interop | Invent own v2 wire assumptions | Cross-check `ProtocolVersion::V_2026_07_28` + `serve_with_lifecycle` opt-in model |
+| Book/course/README protocol badges | Badge still says 2025-11-25 (or wrongly flipped) | Show dual-version; keep 2025-11-25 as default, 2026-07-28 as opt-in |
 
 ## Performance Traps
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Re-reading the bundle from disk on every tool call | Latency per `calculate` | Load + validate the bundle once at server start; serve from in-memory IR | High request rate / large bundles |
-| Re-projecting the JSON schema per request | CPU on `tools/list` | Project schema once at load, cache it | Frequent schema introspection |
-| Large `Err` payloads (rich repair fields) cloned per validation failure | Memory churn on bad input | Acceptable per the lighthouse design (MTS-05 "allowed-values live in the error"); box the large variant if it dominates | Very high invalid-input rate |
+| Per-request `_meta` clientInfo re-parsing on every stateless call | Higher per-request CPU vs one-shot `initialize` | Cache parsed clientInfo by a stable per-request key, not by session | High-QPS stateless serverless (Lambda) |
+| Rebuilding JSON Schema validators per request | Validation latency spikes | Keep the existing cached-validator map; key by schema hash, dialect-aware | Many distinct outputSchemas under load |
+| Discovery responses re-computed without caching in stateless mode | `tools/list` latency at scale | Cache `result` (not envelope) with `ttlMs`/`cacheScope` hints, re-wrap with live id | Large tool catalogs, many clients |
 
 ## Security Mistakes
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Fail-open input validation when manifest role absent (WR-05) | Unchecked value seeds evaluator → plausible-wrong result | Fail closed: missing role = internal-consistency error |
-| Numeric-dtype enum (WR-02) | Schema fail-closed, runtime fail-open — disagreement | Attach `allowed_values` only for Text dtype; reject non-string on enum inputs |
-| Trusting umya-fabricated Excel provenance | Untrusted cached values admitted as a trusted oracle | Read provenance from original bytes; refuse SDK-authored / umya-round-tripped workbooks |
-| Breaking change escaping classification (CR-01) | Auto-promote to agents with no human approval | Symmetric (promotion + demotion) classification |
-| Raw BA cell strings reaching tool schema descriptions | Prompt-injection content reaches the agent's model | Length-cap + sanitize cell metadata before it enters schemas |
-| Approval inherited across baselines (WR-04) | An approval authorizes content it never reviewed | Bind approval fingerprint to bundle content hash |
+| Session-id owner fallback under stateless v2 | Cross-owner task read/leak | Per-request OAuth `sub`/clientInfo identity; fail closed if absent |
+| Unconditional `iss`/DCR hardening | Breaks existing deployments (availability) OR skipping it (spoofing) | Version-gate hardening; strict for v2, lenient for v1 |
+| Reusing `-32602` for task-pending | Task-pending indistinguishable from InvalidParams; wrong client branching | Verify changelog; disambiguate by protocol version; don't touch frozen `-32002` v1 semantics |
+| Trusting per-request `_meta` clientInfo without validation | Client-supplied identity spoofing (no handshake to anchor it) | Bind identity to OAuth token, not just `_meta` self-report |
+| Dropping DNS-rebinding origin checks when going stateless | Rebinding attacks on proxy deployments | Keep documented `AllowedOrigins::any()` exception only for known proxy topology |
 
 ## UX Pitfalls
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| Single-workbook assumptions (bundle ID `ufh-quote`, corpus paths, justfile recipes hardcoded) | A second project cannot use the tooling | Project-level `pmcp.toml` mapping workbooks → bundle IDs; generalize CLI args |
-| Rejecting named-range-backed DV lists with an opaque error | BA does not know why their enum was ignored | Precise reason codes (the lighthouse already does this for the deferred named-range case); document the extension seam |
-| Misleading reason codes (IN-01: `not_inline_literal` for an empty literal) | BA hunts for a nonexistent range source | Distinct reason per case (`empty_literal`, `multiple_dvs`, `non_text_dtype`) |
-| `--accept` flow buried | BA does not know a change needs approval | Clear gate output stating the change class and the exact `--accept --approver --effective-date` command to run |
+| Silent version switch (no way to know which version negotiated) | Confusing behavior differences, hard to debug | Expose resolved protocol version on `RequestHandlerExtra` + logs |
+| Docs show only one version | Users can't tell what's opt-in | Three-shapes docs (README + book + course) showing dual-version + `cargo pmcp` on-ramp (Phase 111 folded in) |
+| Cryptic "method not found" on v1 `tasks/list` after upgrade | Broken task servers with no migration hint | Clear error naming the version mismatch + migration link |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **Manifest generalization:** Compile a SECOND, different workbook and verify its served schema reflects ITS inputs — not ufh-quote's. (Often missing: only the reference workbook is ever compiled.)
-- [ ] **Purity gate:** Run `cargo tree` per feature-combination, not just defaults — verify umya/quick-xml absent AND `rust_xlsxwriter` present. (Often missing: positive writer assertion; per-feature runs.)
-- [ ] **Provenance trap:** Author a workbook with umya, assert the freshness gate REFUSES it. (Often missing: no negative test for fabricated identity.)
-- [ ] **Change-class symmetry:** Test demotions (`input→constant`, `assumption→constant`, `output→formula`) each produce a class. (Often missing: only promotions tested.)
-- [ ] **Version store:** Promote twice, assert two on-disk version dirs and the prior baseline survives byte-identical. (Often missing: only one promote ever run.)
-- [ ] **Enum tiering:** Assert the COMMITTED manifest (not the in-memory builder) seeds no out-of-enum default. (Often missing: tests run against pre-emission builder.)
-- [ ] **Reconcile:** Grep that `delta.abs()` / blanket tolerance never appears; reconcile an Excel-quirk fixture corpus (dates, errors, empty cells). (Often missing: only the golden case.)
-- [ ] **Fail-closed validation:** No `if let Some(role)` skip on the served value path. (Often missing: skew-tolerant code that fails open.)
+- [ ] **Version negotiation:** Often missing the stateless header path — verify a request with no session and only `MCP-Protocol-Version` header resolves correctly, and that a *missing* header defaults to v1
+- [ ] **Backward compat:** Often missing v1 regression — verify all 2025-11-25 conformance fixtures still pass with v2 enabled
+- [ ] **Tasks ownership:** Often missing the no-session case — verify two anonymous stateless callers get distinct owners (or fail closed)
+- [ ] **structuredContent:** Often missing non-object shapes — verify scalar/array/null validate and emit under 2020-12
+- [ ] **Auth hardening:** Often missing the v1 leniency path — verify an existing OAuth deployment without `iss` still connects as v1
+- [ ] **Error codes:** Often missing the frozen-`-32002` cross-check — verify `wait_for_task` still distinguishes pending from invalid-params
+- [ ] **Conformance:** Often false-green under `cargo test --all-features` — verify with dev-dep-free publish build + HTTP transport target
+- [ ] **Deprecated capabilities:** Often over-removed — verify sampling/roots/logging still work at runtime under v2
+- [ ] **Downstream crates:** Often only pmcp tested — verify toolkit/agent/team-servers/cargo-pmcp compile + pass against the new pmcp
+- [ ] **Semver:** Often an accidental break — run `cargo semver-checks`/`cargo public-api` to confirm it's a minor, not a 3.0
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Reader leaked into served binary | MEDIUM | Add the missing `cargo tree` gate; move the offending type/helper out of the shared crate; re-verify per feature |
-| umya provenance trap shipped | HIGH | Audit every accepted bundle for `calcId=122211` / SDK authoring_app; re-ingest oracles from original Excel-saved files; quarantine umya to compiler |
-| Hardcoded manifest shipped to generalized server | HIGH | Re-derive manifest from synth pipeline; add the second-workbook test; re-emit all bundles |
-| CR-02 baseline destroyed | HIGH (data loss) | Reconstruct prior baseline from git/evidence; fix version write; re-emit with correct version dirs |
-| CR-01 breaking change auto-promoted | HIGH | Symmetric-classify fix; re-audit promotion history for unapproved schema changes; require re-approval |
-| WR-01 out-of-enum default shipped | LOW (if enum unwired) / HIGH (if wired) | Skip tiering for enum inputs; re-emit; assert committed manifest invariant |
+| `LATEST` flipped, legacy clients broken | MEDIUM | Revert constant; move v2 to opt-in builder; patch release; fix drifted fixtures |
+| Task owner leak under stateless | HIGH | Emergency patch: fail closed when no OAuth+no session; audit stores for cross-owner reads; notify pmcp.run |
+| `-32602`/`-32002` collision shipped | MEDIUM | Version-gate error interpretation; restore frozen v1 semantics; add disambiguation test |
+| structuredContent scalar rejected | LOW | Loosen validation to any-JSON for v2; add property tests |
+| Auth hardening broke deployments | MEDIUM | Version-gate hardening; ship lenient-v1 path; document migration |
+| Accidental 3.0 break shipped | HIGH | Yank/patch; re-isolate v2 behind opt-in; restore public types; re-run semver-checks |
 
 ## Pitfall-to-Phase Mapping
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| 1. Purity-boundary erosion (umya leak) | Phase: port `pmcp-workbook-runtime` (FIRST cut) | `cargo tree` per-feature: reader stack absent, `rust_xlsxwriter` present; value-path token grep clean |
-| 2. umya fabricated-provenance trap | Phase: trusted-oracle ingest + staleness gate (Phase-8 equiv); re-confirmed in renderer phase (Phase-12 equiv) | umya-authored workbook is REFUSED (`oracle/non-excel-app`); provenance read from original bytes; renderer uses `rust_xlsxwriter` not umya |
-| 3. Hardcoded manifest generalization | Phase: manifest-synth + generic-served-tool (Phase-7/11 equiv) | Compile two different workbooks; each server's schema reflects its own inputs; zero per-workbook Rust |
-| 4. CR-01 demotion asymmetry + CR-02 version overwrite | Phase: promote-gate / change-class + bundle-store (Phase-13 equiv) | Symmetric classification tests; promote-twice integration test (two dirs, baseline survives, lock==changelog) |
-| 5. WR-01 enum-input tiering | Phase: manifest-synth / tiering (Phase-14 equiv) | Committed-manifest invariant: no out-of-enum seeded default |
-| 6. Determinism / penny-reconciliation | Phase: formula-parse / DAG-compile / reconcile (Phase-9/10 equiv) | Per-workbook penny-reconcile; Excel-quirk fixture corpus; `delta.abs()` grep gate; `excel_round` parity tests |
-| 7. Governance / security (WR-05, WR-02, injection, skippable `--accept`) | Phase: generic-served-tool / input validation (Phase-14 equiv) + change-class phase | Fail-closed validation tests; numeric-enum rejection; cell-string sanitization; classifier completeness gates the approval flow |
-| Single-workbook assumptions (`pmcp.toml`) | Phase: CLI + project-config | A second project compiles via `pmcp.toml` workbook→bundle mapping with no lighthouse paths |
+| 1. Flip `LATEST` | Phase 1 | `LATEST_PROTOCOL_VERSION` unchanged; v2 opt-in; `latest_version_is_2025_11_25` test intact |
+| 2. Dual negotiation collision | Phase 1 + 2 | Per-request `ProtocolContext` authoritative; missing header → v1 |
+| 3. Session-identity leak | Phase 2 | Discovery-cache id regression test; response id == request id invariant |
+| 4. Tasks owner collapse | Phase 3 | No-session owner-isolation security test |
+| 5. Tasks API in-place reshape | Phase 3 | v1 `tasks/list` fixtures pass; `pmcp-tasks` major-bumped separately |
+| 6. `-32002`/`-32602` collision | Phase 1 + 3 | Changelog-verified; `wait_for_task` pending-vs-invalid test |
+| 7. structuredContent any-JSON | Phase 4 | Scalar/array/null property tests; explicit 2020-12 dialect |
+| 8. Accidental 3.0 | Every phase | `cargo semver-checks` green as minor |
+| 9. RC vs final drift | Sequencing (2,4,5 after final) | Wire fixtures cite final changelog, not RC blog |
+| 10. Auth hardening breakage | Phase 5 | Existing OAuth e2e passes as v1; strict for v2 |
+| 11. Conformance false-green | Phase 6 | Dev-dep-free build + HTTP target; dual-version fixtures |
+| 12. Over-removing deprecated caps | Phase 1 (policy) + 6 | Sampling/roots/logging runtime tests under v2 |
 
 ## Sources
 
-- `towelrads-quote-pricing/.planning/phases/14-*/14-REVIEW.md` — CR-01, CR-02, WR-01..WR-05, IN-01..IN-04 findings (HIGH — independent goal-backward review of the lighthouse) [primary source for Pitfalls 4, 5, 7]
-- `crates/workbook-compiler/src/provenance/gate.rs` — inline "Pitfall 2" docs, the D-01∧D-07 freshness conjunction, anchored-identity check (`gate.rs:248-252`), fail-closed paths (HIGH) [primary source for Pitfall 2]
-- `justfile` `purity-check` recipe (`justfile:54-92`) — the proven reader-vs-writer cargo-tree + value-path-grep gate design (HIGH) [primary source for Pitfall 1]
-- `crates/workbook-compiler/src/change_class/mod.rs:165-234` — `classify_cell_roles` demotion hole (HIGH) [Pitfall 4 CR-01]
-- `crates/workbook-compiler/src/lib.rs:524-606` — `build_reference_manifest` hardcoded schema, `mk_role` Dtype::Number hardcode (HIGH) [Pitfall 3]
-- `crates/workbook-compiler/src/reconcile/classifier.rs:19-21, 281-292` — operand-anchored rounding model, the forbidden-`delta.abs()` discipline, `BOUNDARY_EPSILON` (HIGH) [Pitfall 6]
-- `crates/quote-pricing-server/src/workbook/input.rs:110-113, 224-227` — present-only enum-membership gate, fail-open `if let Some(role)` (HIGH) [Pitfall 7 WR-05]
-- RFC `docs/sdk-issue-excel-workbook-compiler-extraction.md` §5 known generalization gaps (HIGH — the explicit do-not-copy list)
-- `docs/workbook-dialect-spec.md` — whitelist-only function set (DIA-05), refuse-set (DIA-02), named-range deferral (HIGH) [Pitfall 6 whitelist, UX named-range]
+- MCP RC blog (2026-07-28 release candidate) — https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/ (feature-complete RC, only breaking change = deprecated caps; advisory-only deprecation)
+- MCP SDK betas post — https://blog.modelcontextprotocol.io/posts/sdk-betas-2026-07-28/ ("pin exact versions; public APIs may still change"; Python answers `initialize` alongside `server/discover`; TS/Go opt-in; client fallback to `initialize`)
+- Official Rust SDK (rmcp) — https://github.com/modelcontextprotocol/rust-sdk and Issue #212 (stateless streamable HTTP still open; `serve_with_lifecycle` + `ProtocolVersion::V_2026_07_28` opt-in exists) — https://github.com/modelcontextprotocol/rust-sdk/issues/212
+- 4sysops overview — https://4sysops.com/archives/2026-07-28-model-context-protocol-mcp-stateless-multi-round-trip-routable-headers-authorization-hardening/
+- Internal memory `project_mcp_spec_2026_07_28_impact` — repo-grounded impact map
+- Internal memory `pmcp_run_proxy_discovery_cache_id_bug` — the session-statelessness collision preview
+- Internal memory `project_structured_output_release` — v2.15 bridge assumptions + scaffold-pin tripwire
+- Codebase grep (verified 2026-07-22): `src/types/protocol/version.rs`, `src/types/protocol/mod.rs:135` (`InvalidParams = -32602`), `src/server/core.rs:1145`/`task_dispatch_tests.rs` (frozen `-32002`), `crates/pmcp-tasks/src/security.rs:150`/`router.rs:289` (session-id owner fallback), `Cargo.toml:124` (`jsonschema = "0.46"`), `src/server/output_validation.rs`
 
 ---
-*Pitfalls research for: Excel-as-Configuration MCP-server compiler extraction + generalization (PMCP v2.3)*
-*Researched: 2026-06-09*
+*Pitfalls research for: MCP 2026-07-28 dual-version support in pmcp Rust SDK*
+*Researched: 2026-07-22*

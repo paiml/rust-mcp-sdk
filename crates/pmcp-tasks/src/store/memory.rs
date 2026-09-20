@@ -229,8 +229,10 @@ impl StorageBackend for InMemoryBackend {
 /// Thread-safe in-memory task store using [`GenericTaskStore`] with [`InMemoryBackend`].
 ///
 /// This is a thin wrapper that preserves the existing builder API while
-/// delegating all domain logic to `GenericTaskStore`. Implements all 11
-/// [`TaskStore`] methods via forwarding calls to the inner store.
+/// delegating all domain logic to `GenericTaskStore`. Every [`TaskStore`]
+/// method is implemented as a forwarding call to the inner store -- including
+/// the input-delivery methods that carry a default, where a missing forwarding
+/// line would compile and then silently report "not supported".
 ///
 /// # Construction
 ///
@@ -420,6 +422,54 @@ impl TaskStore for InMemoryTaskStore {
 
     fn config(&self) -> &StoreConfig {
         self.inner.config()
+    }
+
+    // The five input-delivery methods are delegated for the same reason as the
+    // eleven above, and this is the site most easily forgotten: they are the
+    // only `TaskStore` methods with a DEFAULT body, so omitting a delegation
+    // line here does not fail to compile -- it silently inherits "store does not
+    // support task input delivery", and every memory-backed deployment reports
+    // that while the identical DynamoDB and Redis paths work. `tests/input_delivery.rs`
+    // makes that structural: it reads this block and the trait at runtime and
+    // fails when a trait method has no delegation line.
+
+    async fn deliver_inputs(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        responses: Value,
+    ) -> Result<Value, TaskError> {
+        self.inner
+            .deliver_inputs(task_id, owner_id, responses)
+            .await
+    }
+
+    async fn task_input_snapshot(&self, task_id: &str, owner_id: &str) -> Result<Value, TaskError> {
+        self.inner.task_input_snapshot(task_id, owner_id).await
+    }
+
+    async fn record_input_requests(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        requests: Value,
+    ) -> Result<Value, TaskError> {
+        self.inner
+            .record_input_requests(task_id, owner_id, requests)
+            .await
+    }
+
+    async fn set_error(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        error: Value,
+    ) -> Result<(), TaskError> {
+        self.inner.set_error(task_id, owner_id, error).await
+    }
+
+    async fn get_error(&self, task_id: &str, owner_id: &str) -> Result<Value, TaskError> {
+        self.inner.get_error(task_id, owner_id).await
     }
 }
 

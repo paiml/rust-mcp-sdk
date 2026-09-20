@@ -133,6 +133,7 @@ mod tests {
             component_type,
             version: semver::Version::parse(version).unwrap(),
             digest: ManifestDigest::from_bytes(format!("{name}:{component_type:?}").as_bytes()),
+            resolved_from: None,
         })
     }
 
@@ -154,12 +155,10 @@ mod tests {
     }
 
     fn sample_slot() -> ConfigSlot {
-        ConfigSlot {
-            slot: crate::slot::SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "anthropic".to_string(),
-            },
-        }
+        ConfigSlot::new(crate::slot::SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "anthropic".to_string(),
+        })
     }
 
     #[test]

@@ -14,17 +14,21 @@ fn content_strategy() -> impl Strategy<Value = Content> {
         // Text content
         "[a-zA-Z0-9 .,!?-]+".prop_map(|text| { Content::text(text) }),
         // Resource content
+        // `Content::Resource` is `#[non_exhaustive]` as of pmcp 2.19.0, so an
+        // external crate builds it through the constructors. Both arms of the spec
+        // payload union (schema.ts:1734-1748) are generated so the round-trip
+        // property covers G-2's `blob` as well as `text`.
         (
             "file://[a-zA-Z0-9./]+",
-            prop::option::of("[a-zA-Z0-9 .,!?-]+"),
-            prop::option::of("text/[a-zA-Z0-9-+]+")
+            "[a-zA-Z0-9 .,!?-]+",
+            "text/[a-zA-Z0-9-+]+",
+            prop::bool::ANY
         )
-            .prop_map(|(uri, text, mime_type)| {
-                Content::Resource {
-                    uri,
-                    text,
-                    mime_type,
-                    meta: None,
+            .prop_map(|(uri, body, mime_type, binary)| {
+                if binary {
+                    Content::resource_with_blob(uri, body, mime_type)
+                } else {
+                    Content::resource_with_text(uri, body, mime_type)
                 }
             })
     ]
@@ -91,11 +95,14 @@ mod toolresult_properties {
                     (Content::Text { text: t1 }, Content::Text { text: t2 }) => {
                         prop_assert_eq!(t1, t2);
                     }
-                    (Content::Resource { uri: uri1, mime_type: mime1, text: text1, .. },
-                     Content::Resource { uri: uri2, mime_type: mime2, text: text2, .. }) => {
+                    (Content::Resource { uri: uri1, mime_type: mime1, text: text1, blob: blob1, .. },
+                     Content::Resource { uri: uri2, mime_type: mime2, text: text2, blob: blob2, .. }) => {
                         prop_assert_eq!(uri1, uri2);
                         prop_assert_eq!(mime1, mime2);
                         prop_assert_eq!(text1, text2);
+                        // Added with G-2: a `blob` that survives serialization but
+                        // not this assertion would be an unmeasured round trip.
+                        prop_assert_eq!(blob1, blob2);
                     }
                     _ => {
                         // Mixed content types should not occur in well-formed test data

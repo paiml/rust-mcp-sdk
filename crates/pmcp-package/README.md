@@ -48,17 +48,30 @@ that is not a well-formed `sha256:<64-hex>` cannot enter a typed manifest.
 `pmcp-package` follows a strict serialization-stability policy so that packages
 produced by one tool version can always be read by another:
 
-- **`0.1.x` is digest- and serialization-stable.** The serialized shape of every
-  package kind is frozen across all `0.1.x` releases.
+- **`0.2.x` is digest- and serialization-stable.** The serialized shape of every
+  package kind is frozen across all `0.2.x` releases.
 - This freeze is **mechanically enforced** by golden-fixture tests that pin the
   expected canonical digest of representative packages (see
   `tests/digest_stability.rs`). Any change that would alter a serialized shape —
   a renamed/added/removed field, a changed default, a different canonical byte
   sequence — breaks these tests.
-- **Any serialized-shape change bumps the minor version to `0.2.0`.** A
-  wire-breaking change is never shipped as a `0.1.x` patch. Consumers can
-  therefore depend on `pmcp-package = "0.1"` (caret) and trust that reads and
-  digests stay stable for the life of the `0.1` line.
+- **Any serialized-shape change bumps the minor version.** A wire-breaking
+  change is never shipped as a patch. Consumers can therefore depend on
+  `pmcp-package = "0.2"` (caret) and trust that reads and digests stay stable
+  for the life of the `0.2` line.
+
+### The `0.1` -> `0.2` break
+
+`0.2.0` is a deliberate wire break, not a compatible addition. `ServerPackage`
+lost its `binary_ref` field: which binary a package names is now a LAYER
+(embedded bootstrap bytes OR a binary reference, exactly one of the two), so it
+is one fact in one place rather than a struct field able to disagree with a
+layer. `pack_server`/`unpack_server` changed signature to match, and a
+config-only server — one whose entire identity is its config file plus a
+referenced runtime binary — became representable for the first time.
+
+There is **no `0.1.x` reader in `0.2.x`**: a package written by `0.1.x` is not
+read by this line.
 
 The human-readable policy above is exactly what the pinned-digest golden-fixture
 tests enforce in code.

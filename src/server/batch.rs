@@ -29,7 +29,7 @@ impl Server {
                             id: req.id.clone(),
                             payload: crate::types::jsonrpc::ResponsePayload::Error(
                                 crate::types::jsonrpc::JSONRPCError {
-                                    code: -32700,
+                                    code: crate::types::protocol::error_codes::PARSE_ERROR,
                                     message: format!("Parse error: {}", e),
                                     data: None,
                                 },

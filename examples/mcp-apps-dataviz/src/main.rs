@@ -256,12 +256,13 @@ impl ResourceHandler for DataVizResources {
             let html = self.widget_dir.read_widget(widget_name);
             let transformed = self.adapter.transform(uri, widget_name, &html);
 
-            Ok(ReadResourceResult::new(vec![Content::Resource {
-                    uri: uri.to_string(),
-                    text: Some(transformed.content),
-                    mime_type: Some(ExtendedUIMimeType::HtmlMcpApp.to_string()),
-                    meta: None,
-                }]))
+            // `Content::Resource` is `#[non_exhaustive]` as of pmcp 2.19.0
+            // (Phase 118.1, G-1/G-2), so it is built through the constructors.
+            Ok(ReadResourceResult::new(vec![Content::resource_with_text(
+                uri,
+                transformed.content,
+                ExtendedUIMimeType::HtmlMcpApp.to_string(),
+            )]))
         } else {
             Err(pmcp::Error::protocol(
                 pmcp::ErrorCode::METHOD_NOT_FOUND,
@@ -338,6 +339,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         on_session_initialized: None,
         on_session_closed: None,
         http_middleware: None,
+        // PRE-EXISTING breakage, not introduced by Phase 118.1: this literal has
+        // been missing `allowed_origins` / `max_request_bytes` since those fields
+        // were added, and this crate is workspace-EXCLUDED so no gate caught it.
+        // Filled from `Default` so the crate compiles and the Content fix above
+        // can actually be proven.
+        ..Default::default()
     };
 
     let http_server = StreamableHttpServer::with_config(addr, server, config);

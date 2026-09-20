@@ -1,0 +1,137 @@
+# portability-v1.graphql — pmcp.run package-portability contract (SDL subset)
+# Version:  v1 — PROPOSED, NOT RATIFIED
+#
+# STATUS: SDK-PROPOSED. NOT PLATFORM-EXPORTED. AWAITING RATIFICATION.
+#
+# THE ASK: docs/design/package-portability-pmcp-run-handoff.md §5.1
+# ("`getPackageArtifact` — authenticated artifact egress") states exactly what we are
+# asking the platform for and why it is first. Read it before reading this schema.
+#
+# This file was written by the SDK side. No introspection export produced it, and the
+# pmcp.run platform team has not yet implemented or ratified it. NOTHING IN IT IS
+# AUTHORITATIVE UNTIL THEY DO. It deliberately carries no provenance lines — no source
+# line naming a live API, no export-date line naming an introspection run — because it
+# has none, and imitating one would be a lie about who owns it.
+#
+# OWNERSHIP: contrast its sibling `capture-v1.graphql`, which WAS exported from the live
+# pmcp.run AppSync API on 2026-07-20 and whose CONTENTS the platform owns — when the
+# capture schema changes, the platform re-exports and PRs an update there, and the SDK's
+# blocking test forces cargo-pmcp to follow in the same PR. This file inverts that
+# relationship, exactly as `attestation-v1.graphql` does: the SDK owns it only because
+# nobody else has claimed it, and the moment the platform implements or counter-proposes,
+# its export replaces this proposal wholesale.
+#
+# WHAT THE BLOCKING TEST CAN AND CANNOT PROVE:
+# `cargo-pmcp/tests/package_portability_contract.rs` validates the CLI's operation string
+# against THIS file with apollo-compiler, offline. Because both halves are SDK-written, it
+# pins SDK-INTERNAL agreement today — the operation string and the proposed schema cannot
+# drift apart, and a change to one forces a change to the other in the same PR. It cannot
+# detect drift from a platform that has not spoken, and no reader should mistake a green
+# build for platform agreement.
+#
+#   AND THE WINDOW IS LONGER THAN `capture-v1` WOULD SUGGEST. Per the pmcp.run team's
+#   2026-08-26 correction, a real cross-boundary drift net arrives with IMPLEMENTATION,
+#   not with ratification: a ratified-but-unimplemented operation still has no live
+#   schema to export, so there is still nothing on the other side of the boundary for
+#   this test to be pinned against. `attestation-v1.graphql` could not have said this —
+#   the platform said it after that file was written. Until `getPackageArtifact` is
+#   IMPLEMENTED and its SDL exported, every green run of the blocking test means only
+#   that the SDK agrees with itself.
+#
+# SCOPE (D-02): `getPackageArtifact` ONLY. Both omissions are DECISIONS, not oversights:
+#
+#   There is NO upload / `push` operation. `export` and `push` were RETIRED (D-01):
+#   `capture` already produces packages platform-side, so an SDK-initiated upload path
+#   would be a second, competing way to create the same artifact. The SDK moves packages
+#   OUT (`pull`) and around locally (`save` / `load`); it does not put them IN.
+#
+#   There is NO `import` operation here. `import` is the PLATFORM's (D-03) — it is
+#   `submitImport` / `getImportStatus` on the AppSync API with the `ImportJob` /
+#   `ApprovedPackage` / `InstalledPackage` / `PackageBinding` models behind it, already
+#   contracted elsewhere and live on dev. Restating it here would fork a shipped contract.
+#
+#   Proposing the minimum for a contract we do not own means the platform ratifies ONE
+#   operation, not three.
+#
+# NO ENUMS: every field below is String! — do NOT tidy any of them into a GraphQL enum.
+# An enum makes any later schema-versus-schema diff (this proposal vs. the platform's
+# eventual export) show permanent drift. This is the same discipline `capture-v1.graphql`
+# records for its `status` fields and `attestation-v1.graphql` for its `verdict`, kept
+# deliberately identical so a future platform export can be diffed against this proposal
+# without normalization.
+#
+# ROOT TYPE: `Query`, not `Mutation` — egress is a READ. The platform resolves a reference
+# the caller already holds, authorizes it, and answers with a location; nothing is created
+# or mutated. (The audit ROW recording issuance is a side effect of answering, not a
+# mutation of the package.) If ratification moves it to `Mutation`, that is a contract
+# change, and the blocking test will demand the CLI's operation follow it in the same PR.
+
+type Query {
+  # reference: the package to egress.
+  #
+  #   OPEN QUESTION TO THE PLATFORM: what is the accepted reference GRAMMAR? §5.1 says
+  #   "resolves `name@version` (or a raw digest)". Is `name@version` exactly the form the
+  #   CLI's own reference splitter already produces, and is a bare `sha256:...` digest
+  #   accepted in the same argument, or does a digest need its own spelling? Typed
+  #   `String!` rather than `ID!` because the SDK is not asserting that this is a platform
+  #   identifier — `capture-v1.graphql`'s `getPackageCaptureStatus(id: ID!)` is an ID
+  #   because it names a capture job the platform minted; a package reference is a name
+  #   the CALLER composes.
+  #
+  #   Authorization is scoped to the caller's org, the same scoping as `show` (§5.1).
+  getPackageArtifact(reference: String!): GetPackageArtifactReturnType
+}
+
+type GetPackageArtifactReturnType {
+  # payloadDigest: the digest the SDK compares its locally re-derived value against.
+  #
+  #   OPEN QUESTION TO THE PLATFORM, AND THE MOST EXPENSIVE ONE TO GUESS: is this the OCI
+  #   MANIFEST digest — the value `unpack_*` independently re-derives from the unpacked
+  #   layout — or a digest over the transported TAR BYTES? THE SDK CURRENTLY ASSUMES THE
+  #   FORMER. Getting it backwards makes the client compare two unrelated values and
+  #   report every honest artifact as corrupt.
+  #
+  #   We ask because this exact conflation has already been corrected once in this family:
+  #   `attestation-v1.graphql`'s `subjectPayloadDigest` became `subjectManifestDigest` on
+  #   2026-08-26 after the platform pointed out that `payload_digest` and
+  #   `oci_manifest_digest` are two DISTINCT values on their side — their `publish.rs`
+  #   returns both as separate fields — and that conflating them had already cost them a
+  #   live production bug (import pulled by payload digest, ECR indexes by OCI-manifest
+  #   digest, "image not found"). The name `payloadDigest` here is §5.1's own spelling,
+  #   reproduced verbatim rather than "corrected" by the SDK, precisely so the platform
+  #   answers rather than inherits our guess.
+  #
+  #   Whichever answer arrives, the SDK re-verifies EVERY blob digest locally after
+  #   unpacking regardless (§5.1: "transport is never trusted"), so this field is a
+  #   cross-check, never the sole basis for trusting the bytes.
+  payloadDigest: String!
+
+  # downloadUrl: the short-lived presigned URL for a tar of `index.json` + `blobs/`.
+  #
+  #   OPEN QUESTION TO THE PLATFORM: is this fetched with a PLAIN UNAUTHENTICATED GET,
+  #   and can you confirm the pmcp.run `Authorization` token must NOT be attached to it?
+  #   Attaching it would send a pmcp.run credential to a DIFFERENT ORIGIN (the object
+  #   store), which is a disclosure event; and §5.1 already calls the presigned URL "a
+  #   bearer token" in its own right, which is why the audit row records ISSUANCE rather
+  #   than download. The SDK assumes: fetch it bare, never log it, never persist it.
+  #
+  #   OPEN QUESTION ABOUT THE BYTES BEHIND IT: is the tar UNCOMPRESSED? §5.1 says "a tar
+  #   of `index.json` + `blobs/`" and names no compression, so the SDK reads it as an
+  #   uncompressed tar. If the platform gzips, `pull` refuses every real artifact and the
+  #   SDK's own `save` produces a shape the platform cannot read — this is the single
+  #   highest-value thing on this page to confirm.
+  #
+  #   AND ABOUT ITS ENTRY INVENTORY: does the platform's reader TOLERATE an `oci-layout`
+  #   marker entry alongside `index.json` and `blobs/`? The SDK EMITS that marker (it is
+  #   part of the OCI image-layout it writes) and ACCEPTS-BUT-IGNORES it on read. If the
+  #   platform's untar is strict about its entry inventory, an extra entry is a refusal,
+  #   and we would rather learn that here than from a failed round trip.
+  downloadUrl: String!
+
+  # expiresAt: when the presigned URL stops working (RFC 3339 per this family's
+  #   convention — String, matching `capture-v1.graphql`'s `createdAt` / `updatedAt` and
+  #   `attestation-v1.graphql`'s `verifiedAt` discipline). §5.1 proposes a short expiry
+  #   (~5 min); the exact value is the platform's compliance surface to set, and the SDK
+  #   treats this as opaque text it does not parse in this phase.
+  expiresAt: String!
+}

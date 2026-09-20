@@ -15,6 +15,12 @@
 use super::config::JwtValidatorConfig;
 use super::traits::{AuthContext, ClaimMappings, TokenValidator};
 use crate::error::{Error, ErrorCode, Result};
+// Gated to match its ONLY use site, not the module. `mod jwt`/`mod jwt_validator`
+// compile under `http-client`, but the reqwest body-cap read lives inside a
+// `jwt-auth` + non-wasm arm, so an `http-client`-without-`jwt-auth` build (and
+// every wasm32 build) left this import unused and `-D warnings` made it fatal.
+#[cfg(all(not(target_arch = "wasm32"), feature = "jwt-auth"))]
+use crate::shared::http_body_cap::{collect_reqwest_body_within_cap, DEFAULT_AUTH_RESPONSE_BYTES};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -184,9 +190,12 @@ impl JwtValidator {
                 )));
             }
 
-            let jwks: JwksResponse = response
-                .json()
-                .await
+            // The JWKS body is chosen by the identity provider, so it is peer-supplied
+            // bytes: read it under the same cap as every other auth-surface read
+            // (D-15/AUTH-03) rather than letting `.json()` buffer without limit.
+            let body =
+                collect_reqwest_body_within_cap(response, DEFAULT_AUTH_RESPONSE_BYTES).await?;
+            let jwks: JwksResponse = serde_json::from_slice(&body)
                 .map_err(|e| Error::internal(format!("Failed to parse JWKS: {}", e)))?;
 
             let mut keys = HashMap::new();

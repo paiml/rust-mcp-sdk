@@ -1,8 +1,19 @@
+// Why: this example demonstrates `OptimizedSseTransport`, which is deprecated
+// on purpose (plan 113.1-03, D-01) but still ships in 2.x. A shipped example
+// for a shipped transport is not wrong, and this is its only compile-check
+// consumer. Rewriting it onto `StreamableHttpTransport` is a Phase 119 docs
+// item, deliberately not done here.
+#![allow(deprecated)]
+
 //! Optimized SSE Transport Example
 //!
 //! PMCP-4002: Demonstrates optimized SSE transport with advanced features
 //!
-//! Run with: cargo run --example 28_sse_optimized --features sse
+//! **DEPRECATED** — `OptimizedSseTransport` is retained for 2.x compatibility
+//! only. For new code use `StreamableHttpTransport`, which bounds every
+//! peer-controlled read and carries a configurable cap.
+//!
+//! Run with: cargo run --example t03_sse_optimized --features sse
 
 use pmcp::shared::{OptimizedSseConfig, OptimizedSseTransport, Transport, TransportMessage};
 use std::time::Duration;

@@ -14,19 +14,35 @@
 //!   * `shutdown`   — closing the transport makes `run()` return without hanging.
 //!   * `with_tools` — (Task 3) end-to-end `sample_with_tools` carrying a
 //!     `ToolUse` block, added alongside the Task 2 `WithTools` surface.
+//!   * `elicit`     — (Phase 118.1 plan 09, D-07) a tool that awaits
+//!     `extra.peer().elicit()` receives the host's `ElicitResult` intact, and a
+//!     `Decline` arrives as a decline rather than as an empty approval.
+//!
+//! # Why `elicit` is proved HERE, on the in-process loop, and not over HTTP
+//!
+//! 118-07 MEASURED the peer handle to be PRESENT under `Server::run()` and
+//! ABSENT only under `StreamableHttpServer`. Proving `elicit` on the stock loop
+//! therefore separates two questions that would otherwise be confounded: does
+//! the elicit METHOD work, and does the HTTP TRANSPORT carry a peer at all.
+//! Plan 10 wires the transport; if its HTTP twin of these cases fails, this file
+//! is the baseline that says the transport is the cause.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 #[path = "common/duplex.rs"]
 mod duplex;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use pmcp::client::host::{HostSamplingHandler, HostSamplingHandlerWithTools};
+use pmcp::client::host::{
+    HostElicitationHandler, HostSamplingHandler, HostSamplingHandlerWithTools,
+};
 use pmcp::shared::{Transport, TransportMessage};
+use pmcp::types::elicitation::{ElicitAction, ElicitRequestParams, ElicitResult};
 use pmcp::types::sampling::{
     CreateMessageParams, CreateMessageResult, CreateMessageResultWithTools, SamplingMessage,
     SamplingMessageContent,
@@ -52,6 +68,50 @@ impl HostSamplingHandler for CannedSampling {
             Content::text("ok"),
             self.model.clone(),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host elicitation handler answering one prompt with accept and one with decline.
+// ---------------------------------------------------------------------------
+
+/// The two prompts [`CannedElicitation`] branches on.
+///
+/// `ElicitTool` takes its message from its tool arguments, so ONE registered
+/// tool drives both outcomes and each test below names the branch it exercises
+/// rather than relying on argument order.
+const ELICIT_ACCEPT_MESSAGE: &str = "which environment?";
+const ELICIT_DECLINE_MESSAGE: &str = "may I deploy to production?";
+
+/// The field the accept branch collects, asserted on by the accept test.
+const ELICIT_ACCEPT_ENV: &str = "staging";
+
+struct CannedElicitation;
+
+#[async_trait]
+impl HostElicitationHandler for CannedElicitation {
+    async fn handle_elicitation(&self, params: ElicitRequestParams) -> Result<ElicitResult> {
+        let ElicitRequestParams::Form { message, .. } = &params else {
+            panic!("fixture only drives the form shape, got {params:?}");
+        };
+        // A decline returns `content: None`, and that is the shape that matters
+        // for D-07: the refusal must reach the tool AS a decline — not as an
+        // `Err`, and not as an accept carrying an empty form. A server that
+        // reads a refusal as approval is precisely the spoofing failure the
+        // plan's threat model calls out (T-118.1-09-01).
+        if message == ELICIT_DECLINE_MESSAGE {
+            return Ok(ElicitResult {
+                action: ElicitAction::Decline,
+                content: None,
+            });
+        }
+        Ok(ElicitResult {
+            action: ElicitAction::Accept,
+            content: Some(HashMap::from([(
+                "env".to_string(),
+                json!(ELICIT_ACCEPT_ENV),
+            )])),
+        })
     }
 }
 
@@ -121,6 +181,42 @@ impl ToolHandler for SamplerWithToolsTool {
     }
 }
 
+/// Tool that awaits `extra.peer().elicit()` and echoes the action the host
+/// returned plus the field it collected (D-07 end-to-end proof).
+///
+/// The `message` is taken from the tool arguments so ONE tool can drive both the
+/// accept and the decline case — the host handler branches on it.
+struct ElicitTool;
+
+#[async_trait]
+impl ToolHandler for ElicitTool {
+    async fn handle(&self, args: Value, extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        let peer = extra.peer().expect("peer must be attached").clone();
+        let message = args
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(ELICIT_ACCEPT_MESSAGE)
+            .to_string();
+        let answer = peer
+            .elicit(ElicitRequestParams::Form {
+                message,
+                requested_schema: json!({
+                    "type": "object",
+                    "properties": { "env": { "type": "string" } },
+                    "required": ["env"],
+                }),
+            })
+            .await?;
+        let env = answer
+            .content
+            .as_ref()
+            .and_then(|c| c.get("env"))
+            .and_then(Value::as_str)
+            .unwrap_or("<none>");
+        Ok(json!(format!("elicit:{:?}:{env}", answer.action)))
+    }
+}
+
 /// Trivial tool that returns immediately (no peer round-trip). Used to prove a
 /// second request is drained + processed while another handler is parked.
 struct FastTool;
@@ -139,6 +235,7 @@ fn build_server() -> Server {
         .tool("sampler", SamplerTool)
         .tool("roots", RootsTool)
         .tool("sampler_with_tools", SamplerWithToolsTool)
+        .tool("elicit", ElicitTool)
         .tool("fast", FastTool)
         .build()
         .expect("server builds")
@@ -444,6 +541,96 @@ async fn in_tool_sample_with_tools_preserves_tool_use_end_to_end() {
         result_text(&result).contains("tooluse:search#call-42"),
         "tool_use block (name + id) must survive end-to-end: {}",
         result_text(&result)
+    );
+
+    drop(client);
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// (f) In-tool peer.elicit() completes on the stock loop — accept and decline.
+//
+// The pair is the point. An `elicit` that could only ever report success would
+// satisfy a single accept-only test while being useless (and dangerous) for the
+// case the method exists to serve, so the decline branch is asserted as
+// specifically as the accept branch.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_tool_elicit_accept_completes_on_stock_loop() {
+    let (client_t, server_t) = duplex::DuplexTransport::pair();
+    let server = build_server();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_t).await;
+    });
+
+    let mut client = ClientBuilder::new(client_t)
+        .on_elicitation(CannedElicitation)
+        .build();
+    client
+        .initialize(ClientCapabilities::default())
+        .await
+        .expect("initialize");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_tool(
+            "elicit".to_string(),
+            json!({ "message": ELICIT_ACCEPT_MESSAGE }),
+        ),
+    )
+    .await
+    .expect("call must not hang")
+    .expect("tools/call succeeds");
+
+    // Both halves matter: the ACTION the host chose survived the round trip,
+    // and so did the CONTENT it collected. Asserting only the action would pass
+    // against an `elicit` that dropped the form fields on the floor.
+    assert!(
+        result_text(&result).contains(&format!("elicit:Accept:{ELICIT_ACCEPT_ENV}")),
+        "tool must observe the host's accept and its collected field: {}",
+        result_text(&result)
+    );
+
+    drop(client);
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn in_tool_elicit_decline_reaches_the_tool_as_a_decline() {
+    let (client_t, server_t) = duplex::DuplexTransport::pair();
+    let server = build_server();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_t).await;
+    });
+
+    let mut client = ClientBuilder::new(client_t)
+        .on_elicitation(CannedElicitation)
+        .build();
+    client
+        .initialize(ClientCapabilities::default())
+        .await
+        .expect("initialize");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_tool(
+            "elicit".to_string(),
+            json!({ "message": ELICIT_DECLINE_MESSAGE }),
+        ),
+    )
+    .await
+    .expect("call must not hang")
+    .expect("a declined elicitation is a successful round trip, not a tools/call error");
+
+    let text = result_text(&result);
+    assert!(
+        text.contains("elicit:Decline:<none>"),
+        "a decline must arrive as a decline carrying no form content: {text}"
+    );
+    assert!(
+        !text.contains("Accept"),
+        "a decline must never be observable as an accept: {text}"
     );
 
     drop(client);

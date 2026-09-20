@@ -134,6 +134,8 @@ mod tests {
             Ok(ListResourcesResult {
                 resources: self.resources.clone(),
                 next_cursor: None,
+                ttl_ms: None,
+                cache_scope: None,
             })
         }
     }

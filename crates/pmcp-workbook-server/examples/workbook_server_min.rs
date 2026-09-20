@@ -31,12 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // build_server runs the fail-closed boot integrity gate; a successful return
-    // means the synthetic golden bundle verified and all five tools registered.
+    // means the synthetic golden bundle verified and its tools registered — one
+    // named compute tool per output Table (WBV2-04) plus the four meta tools.
     let server = build_server(&args)?;
     println!(
         "pmcp-workbook-server example: built a server from the synthetic golden \
-         'tax-calc@1.1.0' bundle (calculate present: {})",
-        server.get_tool("calculate").is_some()
+         'tax-calc@1.1.0' bundle (calculate_tax present: {})",
+        server.get_tool("calculate_tax").is_some()
     );
     let _ = server; // a real binary would `run_serving(&args).await?` then serve.
     Ok(())

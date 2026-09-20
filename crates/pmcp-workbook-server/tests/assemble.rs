@@ -3,11 +3,12 @@
 //!
 //! Builds a [`pmcp::Server`] from the committed synthetic golden bundle
 //! (`tax-calc@1.1.0`) through the real `build_server` path the binary uses and
-//! asserts the assembled IN-PROCESS surface: all five workbook tools
-//! (`calculate` / `explain` / `get_manifest` / `diff_version` /
-//! `render_workbook`) are registered via the VERIFIED-stable
+//! asserts the assembled IN-PROCESS surface via the VERIFIED-stable
 //! [`pmcp::Server::get_tool`] inspection API (the same one
-//! `pmcp-sql-server`'s `tests/assemble.rs` uses).
+//! `pmcp-sql-server`'s `tests/assemble.rs` uses): WBV2-04's ONE named compute
+//! tool per output Table (`calculate_tax` / `estimate_refund` for this bundle)
+//! plus the four workbook-wide meta tools (`explain` / `get_manifest` /
+//! `diff_version` / `render_workbook`).
 //!
 //! The `workbook://` render resource's LIVE wire surface (`resources/list`) is
 //! additionally asserted in `parity_workbook.rs` — the two tests together cover
@@ -24,14 +25,23 @@ use std::path::PathBuf;
 
 use pmcp_workbook_server::{build_server, Args};
 
-/// The five served workbook tools every golden-bundle server must register.
+/// The served workbook tools the golden bundle must register: WBV2-04 fans out
+/// ONE named compute tool per output Table (`Calculate_Tax` +
+/// `Estimate_Refund`), and the four meta tools are workbook-wide. The generic
+/// single `calculate` is RETIRED — see [`RETIRED_TOOL`].
 const WORKBOOK_TOOLS: &[&str] = &[
-    "calculate",
+    "calculate_tax",
+    "estimate_refund",
     "explain",
     "get_manifest",
     "diff_version",
     "render_workbook",
 ];
+
+/// The pre-WBV2-04 generic compute tool. Asserted ABSENT: this crate's tests
+/// kept expecting it for the whole life of the fan-out change, so its absence
+/// is pinned rather than merely implied by the list above.
+const RETIRED_TOOL: &str = "calculate";
 
 /// Path to the committed synthetic golden bundle (read-only; reuse, do NOT
 /// regenerate — D-05). Resolved from `CARGO_MANIFEST_DIR` so the test is
@@ -50,7 +60,7 @@ fn golden_args() -> Args {
 }
 
 #[test]
-fn build_server_from_golden_registers_all_five_tools() {
+fn build_server_from_golden_registers_the_per_table_and_meta_tools() {
     let server = build_server(&golden_args()).expect("golden bundle assembles a server");
 
     for name in WORKBOOK_TOOLS {
@@ -59,6 +69,11 @@ fn build_server_from_golden_registers_all_five_tools() {
             "built server must expose the '{name}' workbook tool"
         );
     }
+
+    assert!(
+        server.get_tool(RETIRED_TOOL).is_none(),
+        "the retired generic '{RETIRED_TOOL}' tool must not come back"
+    );
 }
 
 #[test]
@@ -70,7 +85,7 @@ fn build_server_with_matching_bundle_id_succeeds() {
     };
     let server = build_server(&args).expect("matching --bundle-id assembles a server");
     assert!(
-        server.get_tool("calculate").is_some(),
+        server.get_tool("calculate_tax").is_some(),
         "the matching-id server still registers the workbook tools"
     );
 }

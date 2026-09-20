@@ -72,6 +72,93 @@ pub enum PackageError {
     /// `oci-layout`, missing `index.json`, missing referenced blob, etc.).
     #[error("OCI layout error: {reason}")]
     Layout { reason: String },
+
+    /// A server config declared or supplied a config slot that violates the
+    /// package's slot contract (an undeclared key, a missing required key, a
+    /// key whose shape does not match its declared slot type).
+    ///
+    /// `key` names the offending config KEY and `reason` describes the
+    /// violation. Neither ever carries the key's VALUE — a config slot may
+    /// name a secret, and an error message is the wrong place for one.
+    #[error("config slot violation on '{key}': {reason}")]
+    ConfigSlotViolation { key: String, reason: String },
+
+    /// An attestation's subject digest does not name the package it was being
+    /// packed into: the supplied subject differs from the would-be UNATTESTED
+    /// manifest digest of the very package under construction.
+    ///
+    /// Returned by `pack_server` BEFORE its first blob write, which is what
+    /// makes "an attestation attached to the wrong package" unrepresentable in
+    /// a produced layout rather than merely reported afterwards.
+    ///
+    /// Distinct from [`PackageError::DigestMismatch`] on purpose, and the two
+    /// must never be merged: a digest mismatch means the BYTES are corrupt,
+    /// while a subject mismatch means the bytes are fine and the CLAIM is
+    /// wrong.
+    ///
+    /// `supplied` and `computed` are both `sha256:<hex>` digest strings, and
+    /// this variant carries nothing else. It never carries attestation payload
+    /// bytes, an issuer, or any other attestation material — the same rule
+    /// [`PackageError::ConfigSlotViolation`]'s rustdoc sets for this crate,
+    /// applied to a payload that is opaque platform-owned data this crate has
+    /// deliberately never parsed.
+    ///
+    /// # Version consequence
+    ///
+    /// `PackageError` is NOT `#[non_exhaustive]`, so adding this variant is a
+    /// breaking change for every downstream `match` over it. Plan 122-08 owns
+    /// the version number that names that break; this crate publishes nothing
+    /// on its own account.
+    #[error(
+        "attestation subject mismatch: the attestation names {supplied}, but this package's \
+         unattested manifest digest is {computed}"
+    )]
+    AttestationSubjectMismatch {
+        /// The `sha256:<hex>` subject the caller supplied with the attestation.
+        supplied: String,
+        /// The `sha256:<hex>` unattested manifest digest actually computed for
+        /// the package being packed.
+        computed: String,
+    },
+
+    /// An attestation's annotation value cannot survive this crate's canonical
+    /// JSON form, so packing it would produce a manifest no JSON parser can
+    /// read back.
+    ///
+    /// Canonical JSON (OLPC/TUF, which `olpc-cjson` implements and this crate's
+    /// `canonicalize` uses) escapes ONLY `"` and `\`. A C0 control character
+    /// (U+0000–U+001F) in any string it emits is written LITERALLY, and RFC 8259
+    /// forbids an unescaped control character inside a JSON string — so the
+    /// manifest bytes would be invalid JSON. The package would pack cleanly and
+    /// then fail to unpack, here and in every other OCI tool.
+    ///
+    /// Refused BEFORE the first blob write, for the same reason
+    /// [`PackageError::AttestationSubjectMismatch`] is: an unreadable package is
+    /// worse to produce and diagnose later than to refuse now. Attestation
+    /// annotation values arrive from the issuing platform rather than from this
+    /// repo, which is precisely why they are validated rather than trusted.
+    ///
+    /// `annotation` names the offending annotation KEY and `reason` describes
+    /// the offending code point and where it sits. Neither ever carries the
+    /// annotation's VALUE — the same rule
+    /// [`PackageError::ConfigSlotViolation`] sets, applied to untrusted input
+    /// that may be arbitrarily long or itself hostile to a terminal.
+    ///
+    /// # Version consequence
+    ///
+    /// `PackageError` is NOT `#[non_exhaustive]`, so adding this variant is a
+    /// breaking change for every downstream `match` over it. Plan 122-08 owns
+    /// the version number that names that break, together with the sibling
+    /// break [`PackageError::AttestationSubjectMismatch`] introduced.
+    #[error("attestation annotation '{annotation}' is not representable: {reason}")]
+    AttestationAnnotationInvalid {
+        /// The annotation KEY whose value was refused, e.g.
+        /// `run.pmcp.attestation.issuer`.
+        annotation: String,
+        /// What is wrong with the value, naming the code point and its byte
+        /// offset but never reproducing the value itself.
+        reason: String,
+    },
 }
 
 #[cfg(test)]

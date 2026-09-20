@@ -88,6 +88,23 @@ description = "Customer invoices and billing"
 name = "InvoiceLine"
 description = "Individual line items on invoices"
 
+# =============================================================================
+# Config slots — what the TARGET environment must supply (PKG-03)
+# =============================================================================
+# Every `${VAR}` / `env:VAR` reference at an addressable key needs a declaration
+# here, or `pmcp-package`'s CONFIG -> SLOT gate refuses to pack this config
+# (pmcp-package 0.3.1). The slot list is what tells a target environment what it
+# has to fill; an undeclared reference means a package that installs cleanly and
+# then cannot start.
+#
+# `kind = "secret"` is identity-bearing, so it structurally carries NO
+# `tested_value` — the toolkit's own `validate()` rejects one.
+
+[[config_slots]]
+key = "code_mode.token_secret"
+kind = "secret"
+name = "CODE_MODE_SECRET"
+
 [code_mode]
 # Enable Code Mode for this server - handles ~80% of operations
 enabled = true

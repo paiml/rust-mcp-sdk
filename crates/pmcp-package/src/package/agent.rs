@@ -81,12 +81,10 @@ mod tests {
             name: "triage-agent".to_string(),
             version: semver::Version::parse("1.0.0").unwrap(),
             instructions: "You triage incoming support tickets.".to_string(),
-            llm: ConfigSlot {
-                slot: SlotType::LlmProvider {
-                    name: "primary-llm".to_string(),
-                    tested_value: "anthropic".to_string(),
-                },
-            },
+            llm: ConfigSlot::new(SlotType::LlmProvider {
+                name: "primary-llm".to_string(),
+                tested_value: "anthropic".to_string(),
+            }),
             max_tokens: 4096,
             max_iterations: 25,
             connectors: vec![ComponentRef::Range {
@@ -99,12 +97,10 @@ mod tests {
             output_schema: Some(serde_json::json!({ "type": "object" })),
             importance: Some("HIGH".to_string()),
             finalizer_role: Some("formatter".to_string()),
-            budget_defaults: vec![ConfigSlot {
-                slot: SlotType::BudgetOverride {
-                    name: "monthly-cap".to_string(),
-                    tested_value: "1000".to_string(),
-                },
-            }],
+            budget_defaults: vec![ConfigSlot::new(SlotType::BudgetOverride {
+                name: "monthly-cap".to_string(),
+                tested_value: "1000".to_string(),
+            })],
         }
     }
 

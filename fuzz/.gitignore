@@ -1,4 +1,60 @@
 target
-corpus
 artifacts
 coverage
+
+# Fuzz corpora are GENERATED data — libFuzzer writes every newly-discovered unit
+# into the corpus directory — so they stay out of the repo by default.
+corpus/*
+
+# EXCEPTION (Phase 115-09, SCHM-01): the hand-written SEED corpus for
+# `fuzz_schema_draft_pin`. Its input format is length-prefixed precisely so seeds
+# can be written by hand and committed; without them the target overwhelmingly
+# explores inputs where neither half parses as JSON and degenerates into a
+# JSON-parser fuzz that never reaches schema COMPILATION (threat T-115-41).
+# Replaying the committed seeds is an acceptance criterion of `115-09-PLAN.md`.
+#
+# Only the README and the numbered seed files are tracked; anything else in that
+# directory is a unit libFuzzer discovered at runtime and stays ignored, so a
+# local fuzzing session never dirties the working tree.
+!corpus/fuzz_schema_draft_pin/
+corpus/fuzz_schema_draft_pin/*
+!corpus/fuzz_schema_draft_pin/README.md
+!corpus/fuzz_schema_draft_pin/[0-9][0-9]_*
+
+# EXCEPTION (Phase 116-08, AUTH-01/AUTH-03): the hand-written SEED corpus for
+# `oauth_authorization_response`. The accept path requires a callback query whose
+# `state` reproduces a fixed 15-byte token EXACTLY, so random bytes essentially
+# never reach it and the target degenerates into a no-panic check that can never
+# evaluate its Ok-side invariants (threat T-116-29).
+#
+# MEASURED, not reasoned: with four deliberate breaks applied to
+# `src/shared/oauth_validation.rs` at once, a 200000-run campaign from an EMPTY
+# corpus found ZERO of them, while six of these seeds crash the same binary
+# immediately. The seeds ARE the fence.
+#
+# Only the README and the `seed_*` files are tracked; anything else in that
+# directory is a unit libFuzzer discovered at runtime and stays ignored, so a
+# local fuzzing session never dirties the working tree.
+!corpus/oauth_authorization_response/
+corpus/oauth_authorization_response/*
+!corpus/oauth_authorization_response/README.md
+!corpus/oauth_authorization_response/seed_*
+
+# EXCEPTION (Phase 116-08, AUTH-02/AUTH-03): the hand-written SEED corpus for
+# `oauth_credential_and_dcr`. The credential document, the DCR response and the
+# `redirect_uris` vector are all STRUCTURED inputs — a schema-1 document needs a
+# `schema_version`, an `entries` object and a per-entry `access_token` and
+# `client_id` before it parses at all — so random bytes degenerate into a JSON
+# tokenizer fuzz that never reaches the migration, the round trip or the
+# `application_type` accessor.
+#
+# MEASURED, not reasoned: with five deliberate breaks applied across
+# `credential_store.rs`, `oauth_validation.rs` and `provider.rs` at once, a
+# 200000-run campaign from an EMPTY corpus found ZERO of them, while these seeds
+# caught all five with a clean per-seed partition.
+#
+# Only the README and the `seed_*` files are tracked.
+!corpus/oauth_credential_and_dcr/
+corpus/oauth_credential_and_dcr/*
+!corpus/oauth_credential_and_dcr/README.md
+!corpus/oauth_credential_and_dcr/seed_*

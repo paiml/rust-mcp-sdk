@@ -618,6 +618,27 @@ impl<T: Transport + Clone + Send + Sync + 'static> std::fmt::Debug for PooledTra
     }
 }
 
+// Why: this is the ONE wrapping `impl Transport for ...` in the tree, so it is
+// the one place where `Transport::shared_sender`'s default `None` could be
+// SILENTLY inherited rather than decided (Phase 118.2, plan 23). The decision is
+// to keep the default, and the reason is structural rather than incidental:
+// `send` does not speak to any single inner transport. `ConnectionPool::
+// send_message` load-balances a CONNECTION per send and then hands the message
+// to that connection's mpsc channel; a per-connection worker task, owning its
+// own clone of the inner transport, performs the actual I/O. There is therefore
+// no inner transport whose handle would be correct for a future send, and
+// forwarding one would silently pin every shared send to whichever connection
+// happened to be chosen when the handle was taken — defeating the pool.
+//
+// NAMED RESIDUAL, with an owner in plan 24's ledger rather than left implicit: a
+// consumer who pools a `StreamableHttpTransport` keeps the exclusive `&mut`
+// path. That is materially narrower than the wedge plan 23 closes, because
+// `send_to_connection` awaits an mpsc push rather than the peer's response
+// HEAD — a stalled peer does not hold the consumer's transport guard through
+// this wrapper. It is not ZERO: with the connection's channel full (capacity
+// 100) the push blocks until the worker drains, and the worker is itself blocked
+// on the stalled peer, so sustained traffic against a silent peer can still
+// serialise a client over a pooled transport.
 #[async_trait]
 impl<T: Transport + Clone + Send + Sync + 'static> Transport for PooledTransport<T> {
     async fn send(&mut self, message: TransportMessage) -> Result<()> {

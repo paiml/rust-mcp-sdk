@@ -38,12 +38,7 @@ impl ResourceHandler for MyResources {
     ) -> pmcp::Result<ReadResourceResult> {
         match uri {
             "myapp://config" => Ok(ReadResourceResult::new(vec![
-                Content::Resource {
-                    uri: uri.to_string(),
-                    text: Some(r#"{"debug": false}"#.to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    meta: None,
-                },
+                Content::resource_with_text(uri, r#"{"debug": false}"#, "application/json"),
             ])),
             _ => Err(pmcp::Error::not_found(uri)),
         }
@@ -65,7 +60,14 @@ For compile-time embedded content, use `include_str!`:
 const DOCS: &str = include_str!("../content/guide.md");
 ```
 
-Then return it in `read()` as `Content::Resource { text: Some(DOCS.to_string()), .. }`.
+Then return it in `read()` as
+`Content::resource_with_text(uri, DOCS, "text/markdown")`.
+
+`Content::Resource` is `#[non_exhaustive]` as of pmcp 2.19.0, so it is built
+through `Content::resource_with_text` / `Content::resource_with_blob` (plus the
+`.with_annotations(..)` / `.with_meta(..)` builders) rather than a struct
+literal, and matched with a `..` rest pattern. Binary content goes through
+`resource_with_blob`, which emits the spec's `BlobResourceContents`.
 
 ## URI Patterns
 

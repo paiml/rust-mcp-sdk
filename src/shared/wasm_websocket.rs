@@ -31,6 +31,9 @@ use web_sys::{ErrorEvent, MessageEvent, WebSocket};
 pub struct WasmWebSocketTransport {
     ws: WebSocket,
     rx: mpsc::UnboundedReceiver<TransportMessage>,
+    // Held to keep the channel open for the `on_message` closure below, which
+    // clones it; never read through this field directly.
+    #[allow(dead_code)]
     tx: mpsc::UnboundedSender<TransportMessage>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(ErrorEvent)>,

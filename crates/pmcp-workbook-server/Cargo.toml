@@ -1,10 +1,10 @@
 [package]
 name = "pmcp-workbook-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
-description = "Shape A pure-config workbook MCP server binary — point it at a compiled bundle dir and serve five workbook tools with no Rust required"
+description = "Shape A pure-config workbook MCP server binary — point it at a compiled bundle dir and serve its governed-Excel workbook tools with no Rust required"
 keywords = ["mcp", "workbook", "config-driven", "toolkit", "excel"]
 categories = ["development-tools", "command-line-utilities"]
 
@@ -55,7 +55,7 @@ thiserror = "2"
 # path via the mcp-tester library. Mirrors pmcp-sql-server's parity_chinook
 # harness. mcp-tester is a [dev-dependencies] test harness, never a runtime dep,
 # so it does NOT enter the published crate's dependency tree.
-mcp-tester = { version = "0.7.0", path = "../mcp-tester" }
+mcp-tester = { version = "0.8.0", path = "../mcp-tester" }
 tempfile = "3"
 # Why: the property test in bundle_id_props.rs uses proptest to generate
 # arbitrary --bundle-id strings and assert the fail-closed mismatch invariant.

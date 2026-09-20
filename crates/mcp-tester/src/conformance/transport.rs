@@ -92,7 +92,7 @@ fn transport_skip_for_non_http(transport: &TransportType) -> Option<TestResult> 
 /// Build the shared `reqwest::Client` honouring the tester's TLS posture and
 /// timeout budget. The probe-level `tokio::time::timeout` shield is a separate
 /// hard upper bound — see `raw_probe_with_headers`.
-fn build_probe_client(tester: &ServerTester) -> Result<Client, String> {
+pub(crate) fn build_probe_client(tester: &ServerTester) -> Result<Client, String> {
     let overall_timeout = std::cmp::min(tester.timeout(), PROBE_RECEIVE_TIMEOUT);
     let mut builder = reqwest::ClientBuilder::new().timeout(overall_timeout);
     if tester.insecure() {

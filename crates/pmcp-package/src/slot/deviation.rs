@@ -15,16 +15,34 @@ pub struct Deviation {
 }
 
 /// Compare a tested slot against a proposed slot. Returns `Some(Deviation)` only when BOTH
-/// are the same behavior-relevant variant (`LlmProvider`/`LlmProvider` or
-/// `BudgetOverride`/`BudgetOverride`) with equal name but differing `tested_value`;
+/// are the same BEHAVIOR-RELEVANT variant, with equal name but differing `tested_value`;
 /// otherwise (identity-bearing kinds, mismatched kinds/names, or equal values) returns
 /// `None`.
 ///
-/// Gated through `classification::classify` so the identity-bearing short-circuit is
-/// explicit and testable (bindings supply identity, never behavior). A detected
-/// deviation is a *value* the caller decides to surface/acknowledge, not a hard error —
-/// contrast with `aggregate`'s `SlotConflict`, which IS a hard error because a silent
-/// discard there would mask the same kind of behavioral change at capture time.
+/// # Which slots are behavior-relevant is decided by `classify`, not by this function
+///
+/// This function contains no variant list. Behavior-relevance is delegated entirely to
+/// [`crate::slot::classification::classify`], which derives the family from a
+/// single predicate — a variant is behavior-relevant iff it carries a `tested_value` — so
+/// `classify` and [`SlotType::tested_value`] cannot drift apart when a variant is added.
+/// **As of Phase 120 that set includes the `Endpoint` and `AuthMode` variants alongside
+/// `LlmProvider` and `BudgetOverride`**, so an endpoint change firing a deviation is the
+/// designed behavior rather than a surprise. Do not re-read this doc as an enumeration of
+/// the variants that fire: adding a `tested_value`-carrying variant extends the set without
+/// touching this file.
+///
+/// # It can never name a credential — that is `required_slots`' job
+///
+/// Identity-bearing slots short-circuit to `None` before any value is examined, because a
+/// binding supplies identity, never behavior. A `Secret` therefore has no representable
+/// "proposed value" to differ from, and this function is structurally incapable of naming
+/// one. Consequently it is NOT the enumerator of what a target environment must supply:
+/// [`required_slots`](crate::slot::required::required_slots) is, and it deliberately DOES
+/// enumerate the credential.
+///
+/// A detected deviation is a *value* the caller decides to surface/acknowledge, not a hard
+/// error — contrast with `aggregate`'s `SlotConflict`, which IS a hard error because a
+/// silent discard there would mask the same kind of behavioral change at capture time.
 pub fn detect_deviation(tested: &SlotType, proposed: &SlotType) -> Option<Deviation> {
     if classify(tested) != SlotClass::BehaviorRelevant
         || classify(proposed) != SlotClass::BehaviorRelevant

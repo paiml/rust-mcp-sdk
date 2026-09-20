@@ -179,6 +179,9 @@
 - [Skills: Agent Workflow Instructions](./part8-advanced/ch23-skills.md)
   - [Chapter 23 Exercises](./part8-advanced/ch23-exercises.md)
 
+- [Agents & Teams: Deploy-Anywhere Agent Loops](./part8-advanced/ch24-agents-and-teams.md)
+  - [Chapter 24 Exercises](./part8-advanced/ch24-exercises.md)
+
 ---
 
 # Appendices

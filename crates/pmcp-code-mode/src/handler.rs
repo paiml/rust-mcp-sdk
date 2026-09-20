@@ -8,7 +8,7 @@
 //! - **Standard tool definitions**: Consistent `validate_code` and `execute_code` tools
 //! - **Response formatting**: Consistent JSON responses across server types
 
-use pmcp::types::ToolInfo;
+use pmcp::types::{ToolAnnotations, ToolInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -314,9 +314,30 @@ impl CodeModeToolBuilder {
         vec![self.build_validate_tool(), self.build_execute_tool()]
     }
 
-    /// Build the validate_code tool definition.
+    /// The annotations for `validate_code`, and ONLY for `validate_code`: a pure
+    /// static analysis that touches no external state and can be retried freely.
+    ///
+    /// **Do not hand these to [`Self::build_execute_tool`].** They were shared by
+    /// both tools briefly and that was wrong in the one direction that matters:
+    /// `readOnlyHint`/`destructiveHint` are the hints a host reads to decide
+    /// whether a call needs human confirmation, so declaring them on a tool that
+    /// EXECUTES caller-supplied code tells every host it may auto-approve
+    /// arbitrary execution. The claim was only ever true for apps whose declared
+    /// op surface is all reads (`OperationEntry { category: "read" }`, and for
+    /// GraphQL `allow_mutations = false`), and nothing enforces that — so the
+    /// truthful answer for `execute_code` is to declare NOTHING and let the MCP
+    /// defaults (`readOnlyHint = false`, `destructiveHint = true`) stand until
+    /// the hints can be DERIVED per app.
+    fn safe_read_annotations() -> ToolAnnotations {
+        ToolAnnotations::new()
+            .with_read_only(true)
+            .with_destructive(false)
+            .with_open_world(false)
+            .with_idempotent(true)
+    }
+
     pub fn build_validate_tool(&self) -> ToolInfo {
-        ToolInfo::new(
+        ToolInfo::with_annotations(
             "validate_code",
             Some(
                 "Validates code and returns a business-language explanation with an approval token. \
@@ -347,10 +368,26 @@ impl CodeModeToolBuilder {
                 },
                 "required": ["code"]
             }),
+            Self::safe_read_annotations(),
         )
     }
 
     /// Build the execute_code tool definition.
+    ///
+    /// Deliberately carries NO annotations. `readOnlyHint`/`destructiveHint` are
+    /// the hints a host reads to decide whether a call needs human confirmation,
+    /// and this tool runs caller-supplied code against the app's op surface — a
+    /// hardcoded "read-only, non-destructive, idempotent" would be a false safety
+    /// claim for any app that exposes a single mutating op, and nothing here
+    /// enforces that it does not.
+    ///
+    /// The durable fix is to DERIVE the hints rather than hardcode them, and the
+    /// pieces already converge: `OperationRegistry::lookup_category` (config.rs),
+    /// the `ValidationPipeline` the generated handler already owns at its
+    /// `metadata()` call site (pmcp-code-mode-derive), and the per-script fold
+    /// precedent in javascript.rs (`is_read_only`); the full Cedar/AVP design
+    /// layers on policy_annotations.rs. Until then the MCP defaults
+    /// (`readOnlyHint = false`, `destructiveHint = true`) are the honest answer.
     pub fn build_execute_tool(&self) -> ToolInfo {
         ToolInfo::new(
             "execute_code",

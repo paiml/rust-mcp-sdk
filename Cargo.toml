@@ -1,6 +1,6 @@
 [package]
 name = "pmcp"
-version = "2.17.0"
+version = "2.20.4"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "High-quality Rust SDK for Model Context Protocol (MCP) with full TypeScript SDK compatibility"
@@ -43,10 +43,74 @@ exclude = [
     # above (crates.io size limit), so shipping this test would break a
     # downstream `cargo test` on the published crate — keep it out too.
     "tests/team_contracts_conformance.rs",
+    # Same reason: reads contracts/binding.yaml and
+    # contracts/mcp-protocol-sdk-v1.yaml at runtime and panics when they are
+    # absent, which is exactly what a published-crate `cargo test` would hit.
+    "tests/phase115_contract_bindings.rs",
+    # Same reason once more: the keyword-list drift gate reads
+    # fuzz/fuzz_targets/fuzz_schema_draft_pin.rs at runtime to compare the third
+    # restated copy of SUBSCHEMA_MAP_KEYWORDS, and `fuzz/` is excluded above.
+    # Shipping it would make `cargo test` panic on the published crate.
+    "tests/keyword_list_mirrors.rs",
+    # The pinned @modelcontextprotocol/conformance suite (Node manifest, lockfile
+    # and .npmrc) is CI tooling, never crate content — measured: without this entry
+    # `cargo package --list` shipped all three files. 115-REVIEW.md CR-01 is the
+    # precedent for what a stray CI-only artifact costs downstream.
+    # tests/ci_conformance_gate_wiring.rs reads all three of
+    # conformance/package.json, conformance/package-lock.json and
+    # conformance/README.md at runtime — the first two to reconcile the suite
+    # version pin across the manifest and the lockfile `npm ci` installs from, the
+    # third for that pin's prose and the two-pin reconciliation. Shipping the
+    # reader while excluding the paths it reads would make `cargo test` panic on
+    # the published crate — the same disposition as
+    # tests/team_contracts_conformance.rs above. The two entries must never be
+    # split: ship both or exclude both.
+    # The other two in-tree dispositions were rejected here on purpose.
+    # tests/ci_severance_gate_wiring.rs SHIPS because everything it reads
+    # (.github/workflows/ci.yml, scripts/run-severance-proofs.sh) also ships, so
+    # consistency — not exclusion — is what keeps it honest; that option is closed
+    # here because conformance/ cannot ship. tests/v2_conformance_pin.rs SHIPS while
+    # reading the EXCLUDED .planning/ tree because it returns early on a missing
+    # path, and that tolerance is deliberate there (the pin degrades to a no-op
+    # downstream) but WRONG for the conformance reader, whose whole job is to fail
+    # when the wiring is absent — a reader that silently skips is exactly the
+    # vacuous gate Phase 118 exists to prevent.
+    "conformance/",
+    "tests/ci_conformance_gate_wiring.rs",
     # GSD phase planning (6.3MB) and presentation decks (5.6MB) — workspace
     # scaffolding, not crate content. Also blew the 10MB limit during v2.2.0.
     ".planning/",
     "presentations/",
+    # Why: the D-03 disclosure tripwire reads BOTH .planning/WINDOWS.md and
+    # pmcp-book/src/ch12-17-migrating-to-mcp-2026-07-28.md at runtime, and both
+    # trees are excluded above. THIS ENTRY IS LOAD-BEARING, and the reason is
+    # precise: the test keeps the tolerant absent-tree guard (it returns early
+    # rather than panicking, so a sparse checkout is not a false red). Downstream,
+    # BOTH trees are absent, so a shipped copy would take that early return and
+    # PASS SILENTLY — the vacuous green this gate exists to prevent. Excluding it
+    # is what removes that path; the in-file guard does not, and cannot.
+    #
+    # (Contrast, stated accurately because an earlier version of this note got it
+    # backwards: tests/ci_conformance_gate_wiring.rs panics on a missing input, so
+    # shipped it would fail LOUDLY, and its exclusion prevents a downstream red
+    # rather than a downstream false green. tests/v2_conformance_pin.rs takes the
+    # tolerant shape deliberately, since a pin degrading to a no-op downstream is
+    # acceptable. This file takes the tolerant shape but is NOT tolerant of a
+    # vacuous pass — hence exclusion, not a shape change.)
+    #
+    # This entry and the two paths it reads must never be split: exclude all three
+    # or ship all three. That invariant is prose only — nothing enforces it.
+    "tests/windows_disclosure_tripwire.rs",
+    # Same disposition as the four readers above, for a different missing input:
+    # two of this file's three legs run example binaries owned by
+    # `crates/pmcp-agent` and `crates/pmcp-team-servers`, and those directories
+    # carry their own Cargo.toml so cargo never packages them into `pmcp`. The
+    # leg FAILS rather than skips when a binary is absent — deliberately — so a
+    # shipped copy would panic under a downstream `cargo test` on the published
+    # crate with a binary it has no way to build. Its sibling
+    # tests/docs06_v2_examples_run.rs SHIPS, because every example it runs is a
+    # ROOT `examples/` target that does ship and that `cargo test` builds.
+    "tests/docs04_examples_run.rs",
 ]
 
 [dependencies]
@@ -83,8 +147,15 @@ http-body-util = "0.1"
 
 # OAuth dependencies
 sha2 = "0.11"
-base64 = "0.22"
-jsonwebtoken = { version = "10.3", optional = true }
+base64 = "0.23"
+jsonwebtoken = { version = "11.0", optional = true }
+
+# SEP-2640 Skills frontmatter extraction (feature `skills`, D-04).
+# Consumer: src/server/skills/mod.rs `parse_frontmatter_value` — the ONE crate-private
+# function that touches this crate, so swapping to a maintained fork later is a
+# one-file change. Version matches the dev-dep below and crates/mcp-tester, so no
+# new package enters the graph (already resolved at 0.9.34+deprecated).
+serde_yaml = { version = "0.9", optional = true }
 
 # Cross-target CSPRNG for the wasm-safe PKCE helper (src/shared/pkce.rs).
 # HIGH-1: must be a NORMAL [dependencies] entry so the ungated pkce module links
@@ -107,7 +178,7 @@ rand = { version = "0.10", optional = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"], optional = true }
 
 # Transport dependencies (optional, feature-gated)
-tokio-tungstenite = { version = "0.29", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
 hyper = { version = "1.6", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "server-auto", "client-legacy"], optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "native-tokio"], optional = true }
@@ -115,13 +186,38 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 axum = { version = "0.8.5", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.7", features = ["cors", "set-header"], optional = true }
+# Already in the dependency tree transitively via `rustls`'s `ring` feature; promoted to an
+# explicit optional dep so `pmcp`'s own production code can `use ring::aead;` for the v2
+# `requestState` AEAD token (D-14, native-only — deliberately NOT reachable from wasm32).
+ring = { version = "0.17", optional = true }
+# Already in the dependency tree transitively via the rustls crypto chain; promoted to an
+# explicit optional dep so `src/server/request_state.rs` can scrub the decoded key buffer
+# (the accepted mitigation for threat T-113-05). Default features are deliberately LEFT ON:
+# `default = ["alloc"]`, and the `Zeroize` impls for `Vec<u8>`/`String` live behind `alloc`.
+# The `derive` feature is deliberately NOT enabled — it would pull `zeroize_derive` into
+# `pmcp`'s own dependency tree.
+zeroize = { version = "1.8", optional = true }
 
 # File watching dependencies (optional, feature-gated)
 notify = { version = "8.2", optional = true }
 glob-match = { version = "0.2", optional = true }
 
 # Validation (optional, feature-gated)
-jsonschema = { version = "0.46", optional = true, default-features = false }
+#
+# Why "0.49" and not the "0.48" SCHM-01's literal wording names (Phase 115 Plan 03,
+# recorded deviation): 0.49.2 is the latest release (2026-07-27) and 0.49.0 is purely
+# ADDITIVE over 0.48 (`options_for`, `meta::validate_for`, one `multipleOf` correctness
+# fix, no breaking change), while 0.48.0-0.48.2 carry the packaging defects that
+# 0.48.3/0.48.4/0.48.5 exist to fix. A caret "0.49" also cannot drift into 0.50.
+# An exact `= 0.49.2` pin was deliberately DECLINED: `pmcp` is a published library, and
+# an `=` requirement forces every downstream consumer onto exactly that patch, turning
+# any future `jsonschema` security patch into a breaking change for them.
+#
+# `optional` and `default-features = false` are LOAD-BEARING and must survive verbatim:
+# jsonschema's defaults are ["resolve-http", "resolve-file", "tls-aws-lc-rs"], which pull
+# reqwest + rustls, break the wasm build, and turn an external `$ref` from a hard error
+# into a live network fetch (SEP-2106).
+jsonschema = { version = "0.49", optional = true, default-features = false }
 garde = { version = "0.23", optional = true }
 
 # SIMD support (optional)
@@ -157,6 +253,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 insta = { version = "1.43", features = ["json", "redactions"] }
 mockito = "1.5.0"
 tokio-util = { version = "0.7", features = ["rt"] }
+serde_yaml = "0.9"  # Consumer: tests/ci_severance_gate_wiring.rs (parses .github/workflows/ci.yml). Version matches crates/mcp-tester/Cargo.toml:26, so no new package enters the graph.
 
 # For examples
 clap = { version = "4.5", features = ["derive"] }
@@ -164,18 +261,61 @@ env_logger = "0.11"
 dashmap = "6.1"  # Already in main deps but needed for examples
 pmcp-macros = { version = "0.6.1", path = "pmcp-macros" }  # For macro examples (s23_mcp_tool_macro)
 pmcp-code-mode = { version = "0.5.3", path = "crates/pmcp-code-mode" }  # For code mode example (s41)
-pmcp-code-mode-derive = { version = "0.2.0", path = "crates/pmcp-code-mode-derive" }  # For code mode example (s41)
+pmcp-code-mode-derive = { version = "0.3.0", path = "crates/pmcp-code-mode-derive" }  # For code mode example (s41)
+# For the CLNT-03 agent example (s53_v2_agent_client): the era-aware connector
+# factory lives behind pmcp-agent's non-default `url-connector` feature.
+#
+# PATH-ONLY, deliberately, unlike the three entries above. `crates/pmcp-agent` is
+# at 0.2.0 (bumped by plan 117-07) and 0.2.0 is not on crates.io yet, while
+# `.github/workflows/release.yml` publishes `pmcp` (line 198) long BEFORE
+# `pmcp-agent` (line 489). A `version` key here would therefore make every
+# `cargo publish -p pmcp` fail on an unresolvable dev-dependency. Cargo strips
+# path-only dev-deps at publish time, and the `[[example]]` below carries
+# `required-features` that `default` does not satisfy, so the publish VERIFY
+# build skips the example rather than failing on the stripped dep.
+pmcp-agent = { path = "crates/pmcp-agent", features = ["url-connector"] }  # For the agent example (s53_v2_agent_client)
 
 [features]
-default = ["logging"]
-full = ["websocket", "http", "streamable-http", "sse", "validation", "resource-watcher", "rayon", "schema-generation", "jwt-auth", "composition", "mcp-apps", "http-client", "logging", "macros", "testing"]
+default = ["logging", "v1-compat"]
+full = ["websocket", "http", "streamable-http", "sse", "validation", "resource-watcher", "rayon", "schema-generation", "jwt-auth", "composition", "mcp-apps", "http-client", "logging", "macros", "testing", "v1-compat"]
+# The SMPL-01 severance PROOF set: exactly what `full` has, EXCEPT `v1-compat`.
+#
+# `--no-default-features` alone proves nothing here, because `default = ["logging"]`
+# — it would strip `http`/`streamable-http` too and "prove" v1 is severable by
+# never compiling the transport at all. Hence a parallel positive list.
+#
+# `full` and `full-v2` are two enumerated lists that can DRIFT: a feature added to
+# `full` and forgotten here silently SHRINKS the severance proof. That drift is a
+# test failure — tests/v1_severability_tripwire.rs DERIVES both lists from THIS
+# file at test time rather than re-enumerating them.
+#
+# An inverted `v2-only` feature was REJECTED (D-02): cargo features are additive
+# and cannot be subtracted, so any crate anywhere in the dependency graph enabling
+# a negative feature would silently strip v1 for every other consumer.
+full-v2 = ["websocket", "http", "streamable-http", "sse", "validation", "resource-watcher", "rayon", "schema-generation", "jwt-auth", "composition", "mcp-apps", "http-client", "logging", "macros", "testing"]
+# MCP 2025-11-25 compatibility layer: the initialize/session lifecycle and SSE
+# resumability (`Last-Event-ID` + event store). SSE framing/parsing itself is
+# SHARED with v2 and is deliberately NOT gated.
+#
+# Default-on, so no existing consumer changes behavior. Building WITHOUT it —
+# `cargo build -p pmcp --no-default-features --features full-v2` — is the SMPL-01
+# severance proof. Actually REMOVING it is SMPL-F1 / pmcp 3.0, gated on public
+# client adoption of v2; see docs/v1-sunset-policy.md for the (date-free) policy.
+#
+# Dependency-free marker feature: do NOT add it to any other feature's list.
+v1-compat = []
 composition = ["streamable-http"]
 # MCP Apps Extension - Interactive UI support for ChatGPT Apps, MCP-UI, and standard MCP hosts
 mcp-apps = []
 # SEP-2640 Skills support — Agent Skills as `ResourceHandler`-served resources
-# plus a parallel prompt fallback. See `src/server/skills.rs` (gated module).
+# plus a parallel prompt fallback. See `src/server/skills/mod.rs` (gated module).
 # Opt-in: NOT in `default`, NOT in `full`. Plan 80-02 fills the module.
-skills = []
+# `dep:serde_yaml` (Phase 125, D-04): verbatim frontmatter extraction for the
+# `skills/list` entry manifests. Deliberately NOT added to `full` / `full-v2` —
+# both are enumerated lists whose drift is asserted by
+# `tests/v1_severability_tripwire.rs`, and D-09 wires coverage through a dedicated
+# `make test-skills` leg instead.
+skills = ["dep:serde_yaml"]
 jwt-auth = ["http-client", "dep:jsonwebtoken"]
 http-client = ["dep:reqwest"]
 logging = ["dep:tracing-subscriber"]
@@ -183,7 +323,7 @@ oauth = ["http-client", "dep:webbrowser", "dep:dirs", "dep:rand"]
 sse = ["http-client", "dep:bytes"]
 websocket = ["dep:tokio-tungstenite"]
 http = ["dep:hyper", "dep:hyper-util", "dep:bytes"]
-streamable-http = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls", "dep:futures-util", "dep:bytes", "dep:axum", "dep:tower", "dep:tower-http"]
+streamable-http = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls", "dep:futures-util", "dep:bytes", "dep:axum", "dep:tower", "dep:tower-http", "dep:ring", "dep:zeroize"]
 validation = ["dep:jsonschema", "dep:garde"]
 resource-watcher = ["dep:notify", "dep:glob-match"]
 schema-generation = ["dep:schemars"]
@@ -202,6 +342,11 @@ progress_example = []
 unstable = []
 simd = []
 rayon = ["dep:rayon"]
+
+# Internal test/fuzz support surface. NOT stable API, and deliberately absent
+# from BOTH `default` and `full` so `cargo public-api` never sees the seam on the
+# shipped surface. Only `fuzz/` enables it (see fuzz/Cargo.toml).
+fuzzing = []
 
 # Testing support
 test-helpers = []
@@ -360,7 +505,12 @@ required-features = ["streamable-http"]
 [[example]]
 name = "t06_streamable_http_client"
 path = "examples/t06_streamable_http_client.rs"
-required-features = ["streamable-http"]
+# `v1-compat`: this example's stated subject is "Session management when
+# connecting to stateful servers" — it reads `transport.session_id()` in three
+# places, and that accessor does not exist on a `full-v2` build (Phase 117).
+# Declared here rather than `#![cfg]`-ing the file, because an example whose
+# `fn main` is cfg'd away fails to link rather than being skipped.
+required-features = ["streamable-http", "v1-compat"]
 
 [[example]]
 name = "t02_websocket_server_enhanced"
@@ -560,6 +710,13 @@ name = "c10_client_skills"
 path = "examples/c10_client_skills.rs"
 required-features = ["skills", "full"]
 
+# Phase 126 (D-16): the workflow -> skill PROJECTION sibling of s44. `s45` is
+# taken by `s45_tool_as_task_lifecycle` below, hence `s56`.
+[[example]]
+name = "s56_workflow_skill_projection"
+path = "examples/s56_workflow_skill_projection.rs"
+required-features = ["skills", "full"]
+
 [[example]]
 name = "s45_tool_as_task_lifecycle"
 path = "examples/s45_tool_as_task_lifecycle.rs"
@@ -575,11 +732,117 @@ name = "s47_task_augmented_result"
 path = "examples/s47_task_augmented_result.rs"
 required-features = ["full"]
 
+# Phase 113 (MCP 2026-07-28): the stateless multi-round-trip-elicitation pair.
+# `s47_v2_stateless_mrtr` is the SERVER, `s48_v2_mrtr_client` the CLIENT that
+# fulfils it automatically; run the server first.
+#
+# NOTE on the numbering: `s47_task_augmented_result` and `s48_durable_poll_decision`
+# already occupy the s47/s48 slots. Cargo example NAMES are unique so both pairs
+# build and run, but the `sNN_` sequence is no longer a bijection. Renaming these
+# two to the next free slots is deferred: their paths are pinned by the Phase-113
+# plan's artifact contract, and a rename would break the phase's acceptance
+# record. See `.planning/phases/113-.../113-11-SUMMARY.md`.
+[[example]]
+name = "s47_v2_stateless_mrtr"
+path = "examples/s47_v2_stateless_mrtr.rs"
+required-features = ["streamable-http", "testing"]
+
+[[example]]
+name = "s48_v2_mrtr_client"
+path = "examples/s48_v2_mrtr_client.rs"
+required-features = ["streamable-http", "http-client"]
+
+# Phase 113-13 (HTTP-04): the `subscriptions/listen` CLIENT stream. Unlike the
+# s47/s48 pair this one is SELF-CONTAINED — it starts its own v2 server on an
+# ephemeral loopback port — so it needs no companion process. The `sNN_`
+# sequence is already not a bijection (see the note above); `s49_sampling_host`
+# occupies the other `s49` slot.
+[[example]]
+name = "s49_v2_subscriptions_client"
+path = "examples/s49_v2_subscriptions_client.rs"
+required-features = ["streamable-http", "http-client"]
+
+# Phase 115-09 (SCHM-02 + SCHM-03): the `2026-07-28` caching hints (`ttlMs` /
+# `cacheScope`), their SDK defaults, the v1 era gate that strips them, and
+# NON-OBJECT `structuredContent`. Self-contained: it starts its own v2-opted-in
+# server on an ephemeral loopback port, asserts all four behaviours and exits.
+#
+# `testing` joins the two transport features because the example reads the
+# reserved `_meta` key spellings from `pmcp::testing` (`META_PROTOCOL_VERSION`
+# and friends) rather than hand-copying wire strings that could drift. It is
+# folded into `full`, which is what the documented run command uses.
+[[example]]
+name = "s52_v2_caching_hints"
+path = "examples/s52_v2_caching_hints.rs"
+required-features = ["streamable-http", "http-client", "testing"]
+
+# Phase 117-10 (CLNT-03): the `pmcp-agent` connector against BOTH eras — the v2
+# happy path against the paired `s47_v2_stateless_mrtr` server, the v1 fallback
+# against a v1-only server it starts in-process, and unreachable-host error
+# propagation. Needs the `pmcp-agent` dev-dependency declared above for
+# `UrlConnectorClientFactory`.
+#
+# NUMBERING, derived from what is on disk rather than from the sequence: `s47`
+# and `s48` are each occupied twice, `s49` is occupied twice
+# (`s49_sampling_host` + `s49_v2_subscriptions_client`), and `s50`/`s51`/`s52`
+# all exist — so `s53` is the next free slot. See the bijection note above the
+# `s47_v2_stateless_mrtr` block.
+#
+# `testing` is deliberately ABSENT (unlike `s52`): this example reads no
+# reserved `_meta` key spelling of its own — the connector factory owns every
+# wire detail — so the two transport features are the whole requirement.
+[[example]]
+name = "s53_v2_agent_client"
+path = "examples/s53_v2_agent_client.rs"
+required-features = ["streamable-http", "http-client"]
+
+# Phase 118 (CONF-01): the dual-version conformance TARGET. The official
+# `@modelcontextprotocol/conformance` suite (pinned in `conformance/`) is run
+# against ONE instance of this server twice — once with `--requirements
+# 2025-11-25` and once with `--requirements 2026-07-28` — which is what makes
+# "one pmcp binary serves both eras" a measured claim rather than an assertion.
+# Phase 119's DOCS-06 cites this example as the runnable v2 server.
+#
+# Its tool / resource / prompt names are DICTATED by that suite, not chosen:
+# renaming one silently breaks the scenario that consumes it.
+#
+# NUMBERING: `s54` is the next free slot — `s47`/`s48`/`s49` are each occupied
+# twice and `s50`/`s51`/`s52`/`s53` all exist. See the bijection note above the
+# `s47_v2_stateless_mrtr` block.
+#
+# `testing` joins `streamable-http` for the same reason `s52` needs it: the
+# example reads the reserved `_meta` key spellings from `pmcp::testing`
+# (`META_PROTOCOL_VERSION`) rather than hand-copying wire strings that could
+# drift. Both are folded into `full`, which is what the documented run command
+# uses. Without this entry the example would carry no required-feature guard and
+# a default-feature `cargo run --example` would fail to compile.
+[[example]]
+name = "s54_v2_dual_conformance"
+path = "examples/s54_v2_dual_conformance.rs"
+required-features = ["streamable-http", "testing"]
+
+# The `extra.log(..)` ALWAYS-requirement example (Phase 118.2, CONF-10).
+#
+# NO `required-features`, and that is the point rather than an omission:
+# `RequestHandlerExtra::log` / `log_with_data` / `with_log_sink` /
+# `with_log_level` are all on the DEFAULT surface, so `cargo run --example
+# s55_handler_logging` with no flags must work. Adding a guard here would hide
+# a future regression that pushed the emitter behind a feature. `s43` (the
+# handler-scoped example this one is modelled on) carries none for the same
+# reason.
+#
+# It is declared explicitly even though `autoexamples` would discover it, so
+# that the manifest — not the directory listing — is the record of which
+# examples exist and what each one needs.
+[[example]]
+name = "s55_handler_logging"
+path = "examples/s55_handler_logging.rs"
+
 [[bench]]
 name = "comprehensive_benchmarks"
 harness = false
 [workspace]
-members = ["pmcp-macros", "crates/pmcp-macros-support", "crates/mcp-tester", "crates/mcp-preview", "crates/pmcp-server", "crates/pmcp-server/pmcp-server-lambda", "crates/pmcp-tasks", "crates/pmcp-agent", "crates/mcp-e2e-tests", "crates/pmcp-widget-utils", "crates/pmcp-code-mode", "crates/pmcp-code-mode-derive", "crates/pmcp-server-toolkit", "crates/pmcp-toolkit-postgres", "crates/pmcp-toolkit-mysql", "crates/pmcp-toolkit-athena", "crates/pmcp-sql-server", "crates/pmcp-team-servers", "crates/pmcp-workbook-server", "crates/pmcp-openapi-server", "crates/pmcp-workbook-runtime", "crates/pmcp-workbook-dialect", "crates/pmcp-workbook-compiler", "examples/25-oauth-basic", "examples/test-basic", "cargo-pmcp"]
+members = ["pmcp-macros", "crates/pmcp-macros-support", "crates/mcp-tester", "crates/mcp-preview", "crates/pmcp-server", "crates/pmcp-server/pmcp-server-lambda", "crates/pmcp-tasks", "crates/pmcp-agent", "crates/pmcp-cfn-renderer", "crates/mcp-e2e-tests", "crates/pmcp-widget-utils", "crates/pmcp-code-mode", "crates/pmcp-code-mode-derive", "crates/pmcp-server-toolkit", "crates/pmcp-toolkit-postgres", "crates/pmcp-toolkit-mysql", "crates/pmcp-toolkit-athena", "crates/pmcp-sql-server", "crates/pmcp-team-servers", "crates/pmcp-workbook-server", "crates/pmcp-openapi-server", "crates/pmcp-workbook-runtime", "crates/pmcp-workbook-dialect", "crates/pmcp-workbook-compiler", "examples/25-oauth-basic", "examples/test-basic", "cargo-pmcp"]
 # WASM examples and standalone examples are excluded from regular workspace tests.
 # crates/pmcp-package is workspace-excluded (it declares its own [workspace] table);
 # it must be listed here so pmcp-agent's path dependency on it does not trip
@@ -602,6 +865,14 @@ features = [
     "sse",
     "streamable-http",
     "validation",
+    # EXPLICIT, not inherited. `v1-compat` is a member of `default` and this block
+    # does NOT set `no-default-features = true`, so docs.rs would document the
+    # v1-gated surface either way — today. As of plan 117-06 that surface is real
+    # (`crate::shared::event_store` and the `v1` paired module), so if anyone ever
+    # adds `no-default-features = true` here it would vanish from docs.rs with no
+    # error and no warning. Naming it makes the coverage a statement rather than a
+    # side effect. Closes deferred item D-117-01-A.
+    "v1-compat",
     "websocket",
 ]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

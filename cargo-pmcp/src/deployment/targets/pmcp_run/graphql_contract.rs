@@ -16,8 +16,24 @@
 //!
 //! `graphql.rs` re-exports these same consts via `super::graphql_contract::*`
 //! so there is exactly one source of truth for both operations.
+//!
+//! Phase 122 added a second, PARKED contract to this leaf: the
+//! `verifyAttestation` operation (`VERIFY_ATTESTATION_QUERY`) plus its pure,
+//! IO-free request builder and response decoder. No shipped code path sends
+//! that operation — the backend does not exist yet — but the client half is
+//! production code with its own offline unit tests, so unparking the live leg
+//! in `tests/package_attestation_contract.rs` is deleting a gate rather than
+//! writing a client.
+//!
+//! DEPENDENCY DISCIPLINE (the reason this file exists): it may depend on
+//! `anyhow`, `serde_json` and `base64` — all leaf, all already `cargo-pmcp`
+//! dependencies — and on NOTHING heavier. Adding `reqwest`, `oauth2` or
+//! `crate::commands::*` here would drag the bin-only auth/deploy tree into the
+//! lib target and break every `tests/` consumer at once.
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::Value;
 
 /// The exact `submitPackageCapture` operation the CLI sends. Shared with the
@@ -58,6 +74,393 @@ pub const GET_PACKAGE_CAPTURE_STATUS_QUERY: &str = r#"
             }
         }
     "#;
+
+// ============================================================================
+// pmcp.run attestation verification (Phase 122 plan 04 — PARKED live leg)
+// ============================================================================
+
+/// The HTTP header NAME every pmcp.run GraphQL request authenticates with.
+///
+/// Extracted so there is exactly ONE spelling in the tree. It is consumed by
+/// the shipped client (`graphql.rs`'s `execute_graphql_at`) AND by the parked
+/// live-verification leg in `tests/package_attestation_contract.rs`, so the two
+/// cannot drift into different auth shapes.
+///
+/// MEASURED, and deliberately NOT "fixed": the VALUE sent under this header is
+/// the RAW access token with **no `Bearer ` prefix**. That is what pmcp.run's
+/// AppSync endpoint expects — `graphql.rs` has shipped it this way since the
+/// capture verbs landed. Prefixing it with `Bearer ` would break every
+/// authenticated call the CLI makes.
+pub const GRAPHQL_AUTH_HEADER: &str = "Authorization";
+
+/// The GraphQL variable name carrying the base64-encoded attestation payload.
+/// Must equal the `verifyAttestation` argument name in
+/// `contracts/pmcp-run/attestation-v1.graphql`, character for character.
+#[allow(dead_code)]
+const VAR_ATTESTATION_PAYLOAD: &str = "attestationPayloadBase64";
+
+/// The GraphQL variable name carrying the locally re-derived subject digest.
+/// Must equal the `verifyAttestation` argument name in the vendored SDL,
+/// character for character.
+///
+/// The value is the OCI **manifest** digest the package would have with no
+/// attestation layer — NOT a payload digest. The wire name said
+/// `subjectPayloadDigest` until 2026-08-26, when the pmcp.run team's review of
+/// the proposal pointed out that `payload_digest` and `oci_manifest_digest` are
+/// two distinct values on their side, and that conflating them had already cost
+/// them a live bug. Renamed before ratification. See the argument's comment in
+/// `contracts/pmcp-run/attestation-v1.graphql` for the full reasoning.
+#[allow(dead_code)]
+const VAR_SUBJECT_DIGEST: &str = "subjectManifestDigest";
+
+/// The exact `verifyAttestation` operation a pmcp.run attestation-verification
+/// client would send, validated offline against the SDK-PROPOSED vendored SDL
+/// (`contracts/pmcp-run/attestation-v1.graphql`) by
+/// `tests/package_attestation_contract.rs`.
+///
+/// It lives in this narrow leaf for the same reason the two capture constants
+/// do: so that offline blocking contract test can reach the REAL runtime
+/// operation string without pulling `pmcp_run`'s auth/deploy/reqwest tree into
+/// the `cargo-pmcp` lib target.
+///
+/// **This operation is NOT sent by any shipped code path in this phase.** It
+/// exists so the contract is written down and validated now; its only caller is
+/// the `#[ignore]`d, triple-env-gated live leg in
+/// `tests/package_attestation_contract.rs`, which is parked on a pmcp.run
+/// backend that does not exist yet. Do not hunt for a production call site —
+/// there is none — and do not delete this as dead code: removing it deletes the
+/// SDK's half of a contract it is asking the platform to ratify.
+#[allow(dead_code)]
+pub const VERIFY_ATTESTATION_QUERY: &str = r#"
+        query VerifyAttestation(
+            $attestationPayloadBase64: String!,
+            $subjectManifestDigest: String!
+        ) {
+            verifyAttestation(
+                attestationPayloadBase64: $attestationPayloadBase64,
+                subjectManifestDigest: $subjectManifestDigest
+            ) {
+                verdict
+                verifiedIdentity
+                verifiedAt
+            }
+        }
+    "#;
+
+/// The platform's decoded answer to [`VERIFY_ATTESTATION_QUERY`].
+///
+/// Every field is `String`, mirroring the vendored SDL's no-enum discipline: a
+/// GraphQL enum (or a Rust enum mapped onto one) would make any later
+/// schema-versus-schema diff show permanent drift, and the verdict vocabulary
+/// is the platform's to define at ratification, not the SDK's to guess.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyAttestationOutcome {
+    /// The platform's verdict, treated as opaque text by this phase.
+    pub verdict: String,
+    /// The identity the platform verified the signature AGAINST — the whole
+    /// reason the call has to be remote (the SDK holds no keys).
+    pub verified_identity: String,
+    /// When the platform performed the verification (RFC 3339 per the SDL).
+    pub verified_at: String,
+}
+
+/// Build the exact HTTP request body the CLI would POST for
+/// [`VERIFY_ATTESTATION_QUERY`]: `{"query": ..., "variables": {...}}`.
+///
+/// PURE and IO-free — no network, no auth, no environment reads. It exists as
+/// PRODUCTION code (rather than as a hand-written JSON literal inside the
+/// parked test) so that unparking the live leg is deleting a gate, never
+/// writing a client.
+///
+/// `attestation_payload` is the VERBATIM bytes of the package's
+/// `application/vnd.pmcp.attestation.v1` layer. They are base64-encoded with
+/// the STANDARD alphabet (RFC 4648 §4, with padding) because GraphQL has no
+/// bytes scalar — the encoding is stated in the vendored SDL's argument comment
+/// too, so the platform is not left guessing. The bytes are never
+/// re-serialized or canonicalized: that would change the bytes the platform
+/// signed.
+///
+/// `subject_digest` is the `sha256:...` payload digest the SDK re-derived
+/// LOCALLY, supplied so the platform answers about the artifact in hand rather
+/// than about whatever the attestation claims as its own subject.
+///
+/// # Errors
+///
+/// Returns `Err` when either input is empty. An empty payload or an empty
+/// subject digest is a caller bug, and sending it would ask the platform to
+/// verify nothing while looking like a successful round-trip.
+#[allow(dead_code)]
+pub fn verify_attestation_request_body(
+    attestation_payload: &[u8],
+    subject_digest: &str,
+) -> Result<Value> {
+    if attestation_payload.is_empty() {
+        anyhow::bail!(
+            "refusing to build a verifyAttestation request for an EMPTY attestation payload"
+        );
+    }
+    if subject_digest.trim().is_empty() {
+        anyhow::bail!("refusing to build a verifyAttestation request with an EMPTY subject digest");
+    }
+
+    let mut variables = serde_json::Map::new();
+    variables.insert(
+        VAR_ATTESTATION_PAYLOAD.to_string(),
+        Value::String(STANDARD.encode(attestation_payload)),
+    );
+    variables.insert(
+        VAR_SUBJECT_DIGEST.to_string(),
+        Value::String(subject_digest.to_string()),
+    );
+
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "query".to_string(),
+        Value::String(VERIFY_ATTESTATION_QUERY.to_string()),
+    );
+    body.insert("variables".to_string(), Value::Object(variables));
+
+    Ok(Value::Object(body))
+}
+
+/// The envelope prologue every single-payload decoder in this leaf shares:
+/// refuse a GraphQL `errors` array, locate `data.<operation>`, and refuse a
+/// null payload. `null_meaning` completes the sentence "which the SDK must not
+/// read as ___", so each caller keeps its own operator-facing wording while the
+/// three probes exist once.
+///
+/// Sibling of [`required_response_str`], which was parameterized by operation
+/// for the same reason: this leaf now decodes more than one operation.
+#[allow(dead_code)]
+fn required_response_payload<'a>(
+    body: &'a Value,
+    operation: &str,
+    null_meaning: &str,
+) -> Result<&'a Value> {
+    if let Some(first) = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+    {
+        let message = first
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("<error entry carried no message>");
+        anyhow::bail!("{operation} returned a GraphQL error: {message}");
+    }
+
+    let payload = body
+        .get("data")
+        .and_then(|data| data.get(operation))
+        .with_context(|| format!("{operation} response has no `data.{operation}` field"))?;
+
+    if payload.is_null() {
+        anyhow::bail!(
+            "{operation} returned null with no GraphQL errors — the platform answered \
+             nothing, which the SDK must not read as {null_meaning}"
+        );
+    }
+
+    Ok(payload)
+}
+
+/// Decode a `verifyAttestation` GraphQL response body into a typed
+/// [`VerifyAttestationOutcome`].
+///
+/// PURE and IO-free — it takes an already-parsed `serde_json::Value`, so the
+/// parked live leg is a thin transport wrapper rather than a place where new
+/// decoding logic gets written at unpark time.
+///
+/// A GraphQL `errors` array is surfaced as `Err` naming the FIRST error's
+/// message. It is never silently swallowed into a default outcome: a
+/// server-side verification error that decoded to an empty verdict would be
+/// indistinguishable from a pass at the call site.
+///
+/// # Errors
+///
+/// Returns `Err` when the body carries a GraphQL `errors` array, when
+/// `data.verifyAttestation` is absent or null, or when any field the SDL
+/// declares non-null is missing or is not a string.
+#[allow(dead_code)]
+pub fn decode_verify_attestation_response(body: &Value) -> Result<VerifyAttestationOutcome> {
+    let payload = required_response_payload(body, "verifyAttestation", "a pass")?;
+
+    Ok(VerifyAttestationOutcome {
+        verdict: required_response_str(payload, "verifyAttestation", "verdict")?,
+        verified_identity: required_response_str(payload, "verifyAttestation", "verifiedIdentity")?,
+        verified_at: required_response_str(payload, "verifyAttestation", "verifiedAt")?,
+    })
+}
+
+/// Read a field the vendored SDL declares as `String!`, failing loudly when it
+/// is absent or not a string.
+///
+/// `operation` names the GraphQL operation in the error message. It is a
+/// parameter rather than a hardcoded literal because this leaf now decodes more
+/// than one operation, and an error that named the wrong one would send a
+/// reader to the wrong contract file.
+#[allow(dead_code)]
+fn required_response_str(payload: &Value, operation: &str, key: &str) -> Result<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .with_context(|| {
+            format!(
+                "{operation} response is missing the non-null `{key}` field \
+                 (or it is not a string)"
+            )
+        })
+}
+
+// ============================================================================
+// pmcp.run package-artifact egress (Phase 123 plan 02 — PARKED live leg)
+// ============================================================================
+
+/// The GraphQL variable name carrying the package reference to egress. Must
+/// equal the `getPackageArtifact` argument name in
+/// `contracts/pmcp-run/portability-v1.graphql`, character for character.
+///
+/// The accepted reference GRAMMAR is an OPEN QUESTION to the platform — see
+/// that argument's comment in the vendored SDL. The SDK sends what its own
+/// reference splitter produces (`name@version`) and does not reshape it.
+#[allow(dead_code)]
+const VAR_PACKAGE_REFERENCE: &str = "reference";
+
+/// The exact `getPackageArtifact` operation a pmcp.run artifact-egress client
+/// would send, validated offline against the SDK-PROPOSED vendored SDL
+/// (`contracts/pmcp-run/portability-v1.graphql`) by
+/// `tests/package_portability_contract.rs`.
+///
+/// It lives in this narrow leaf for the same reason the capture and attestation
+/// constants do: so that offline blocking contract test can reach the REAL
+/// runtime operation string without pulling `pmcp_run`'s auth/deploy/reqwest
+/// tree into the `cargo-pmcp` lib target. Do not "simplify" by moving the HTTP
+/// call in here — the transport belongs in `graphql.rs`, and this leaf's whole
+/// reason for existing is that it stays light enough for `tests/` to reach
+/// through the lib target.
+///
+/// **This operation is NOT sent by any shipped code path in this phase.** The
+/// backend does not implement `getPackageArtifact` yet. Its only callers until
+/// it does are plan 05's transport seam and the `#[ignore]`d, double-gated live
+/// leg in `tests/package_portability_contract.rs`. Do not hunt for a production
+/// call site — there is none — and do not delete this as dead code: removing it
+/// deletes the SDK's half of a contract it is asking the platform to ratify.
+#[allow(dead_code)]
+pub const GET_PACKAGE_ARTIFACT_QUERY: &str = r#"
+        query GetPackageArtifact($reference: String!) {
+            getPackageArtifact(reference: $reference) {
+                payloadDigest
+                downloadUrl
+                expiresAt
+            }
+        }
+    "#;
+
+/// The platform's decoded answer to [`GET_PACKAGE_ARTIFACT_QUERY`].
+///
+/// Every field is `String`, mirroring the vendored SDL's no-enum discipline: a
+/// GraphQL enum (or a Rust enum mapped onto one) would make any later
+/// schema-versus-schema diff show permanent drift.
+///
+/// # `download_url` is a BEARER CREDENTIAL
+///
+/// The handoff (§5.1) calls the presigned URL "a bearer token" in its own
+/// right, which is why the platform's audit row records ISSUANCE rather than
+/// download. Anything holding this value must therefore:
+///
+/// - never LOG it, never PERSIST it, and never include it in an error message;
+/// - never attach the pmcp.run `Authorization` header ([`GRAPHQL_AUTH_HEADER`])
+///   when fetching it — that would send a pmcp.run credential to a DIFFERENT
+///   origin, which is a disclosure event. It is fetched with a plain
+///   unauthenticated GET (an open question confirmed in the SDL's comment).
+///
+/// The instruction lives on the type so it travels with the value into plan
+/// 05's transport rather than being rediscovered at the call site.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetPackageArtifactOutcome {
+    /// The digest the SDK cross-checks its locally re-derived value against.
+    /// Whether it is the OCI manifest digest or a digest over the tar bytes is
+    /// an OPEN QUESTION to the platform (the SDK assumes the former) — see the
+    /// field's comment in the vendored SDL. Either way the SDK re-verifies
+    /// every blob digest locally after unpacking; transport is never trusted.
+    pub payload_digest: String,
+    /// The short-lived presigned URL for the artifact tar. A BEARER CREDENTIAL
+    /// — see this type's docs before doing anything with it.
+    pub download_url: String,
+    /// When the presigned URL stops working (RFC 3339 per the SDL). Treated as
+    /// opaque text by this phase.
+    pub expires_at: String,
+}
+
+/// Build the exact HTTP request body the CLI would POST for
+/// [`GET_PACKAGE_ARTIFACT_QUERY`]: `{"query": ..., "variables": {...}}`.
+///
+/// PURE and IO-free — no network, no auth, no environment reads. It exists as
+/// PRODUCTION code (rather than as a hand-written JSON literal inside the
+/// parked test) so that unparking the live leg is deleting a gate, never
+/// writing a client.
+///
+/// The reference travels as a VARIABLE and is never interpolated into the query
+/// string.
+///
+/// # Errors
+///
+/// Returns `Err` when `reference` is empty or whitespace-only. Sending one
+/// would ask the platform to resolve nothing while looking like a successful
+/// round trip.
+#[allow(dead_code)]
+pub fn get_package_artifact_request_body(reference: &str) -> Result<Value> {
+    if reference.trim().is_empty() {
+        anyhow::bail!("refusing to build a getPackageArtifact request for an EMPTY reference");
+    }
+
+    let mut variables = serde_json::Map::new();
+    variables.insert(
+        VAR_PACKAGE_REFERENCE.to_string(),
+        Value::String(reference.to_string()),
+    );
+
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "query".to_string(),
+        Value::String(GET_PACKAGE_ARTIFACT_QUERY.to_string()),
+    );
+    body.insert("variables".to_string(), Value::Object(variables));
+
+    Ok(Value::Object(body))
+}
+
+/// Decode a `getPackageArtifact` GraphQL response body into a typed
+/// [`GetPackageArtifactOutcome`].
+///
+/// PURE and IO-free — it takes an already-parsed `serde_json::Value`, so the
+/// parked live leg is a thin transport wrapper rather than a place where new
+/// decoding logic gets written at unpark time.
+///
+/// Four distinct failure causes get four distinct messages. A decoder that
+/// collapsed them would make every backend integration failure look identical:
+/// an authorization refusal, an unimplemented resolver, a renamed field and a
+/// retyped field are four different things to go fix.
+///
+/// # Errors
+///
+/// Returns `Err` when the body carries a GraphQL `errors` array (surfacing the
+/// FIRST message), when `data.getPackageArtifact` is absent, when it is null
+/// with no errors alongside it, or when any field the SDL declares non-null is
+/// missing or is not a string (naming the field).
+#[allow(dead_code)]
+pub fn decode_get_package_artifact_response(body: &Value) -> Result<GetPackageArtifactOutcome> {
+    let payload = required_response_payload(body, "getPackageArtifact", "an artifact location")?;
+
+    Ok(GetPackageArtifactOutcome {
+        payload_digest: required_response_str(payload, "getPackageArtifact", "payloadDigest")?,
+        download_url: required_response_str(payload, "getPackageArtifact", "downloadUrl")?,
+        expires_at: required_response_str(payload, "getPackageArtifact", "expiresAt")?,
+    })
+}
 
 // ============================================================================
 // Shared pure SDL extraction (moved from `src/bin/capture_contract.rs`)
@@ -464,5 +867,346 @@ mod tests {
         let content = "# header line 1\n# header line 2\n\ntype Mutation {\n  foo: String\n}\n";
         let body = strip_provenance_header(content);
         assert_eq!(body, "type Mutation {\n  foo: String\n}");
+    }
+
+    // ------------------------------------------------------------------
+    // verifyAttestation — the parked live leg's PRODUCTION request/response
+    // seam. These run offline under the default `cargo test -p cargo-pmcp
+    // --lib`; they are what let the ignored live leg be a thin transport
+    // wrapper rather than a place where new logic appears at unpark time.
+    // ------------------------------------------------------------------
+
+    fn sample_body() -> Value {
+        verify_attestation_request_body(b"{\"schemaVersion\":1}", "sha256:abc123")
+            .expect("non-empty inputs build a body")
+    }
+
+    /// The emitted variable KEYS must equal the SDL's declared argument names
+    /// character for character.
+    ///
+    /// This closes the chain body <-> query <-> SDL from the body end: the
+    /// query-versus-SDL half is proven separately, and with apollo-compiler
+    /// rather than string matching, by
+    /// `tests/package_attestation_contract.rs`.
+    #[test]
+    fn verify_attestation_request_body_variable_names_match_the_operation() {
+        let body = sample_body();
+        let variables = body
+            .get("variables")
+            .and_then(Value::as_object)
+            .expect("body carries a variables object");
+
+        let mut keys: Vec<&str> = variables.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["attestationPayloadBase64", "subjectManifestDigest"],
+            "emitted variable keys drifted from the SDL's argument names"
+        );
+
+        for key in keys {
+            assert!(
+                VERIFY_ATTESTATION_QUERY.contains(key),
+                "variable `{key}` is not declared by VERIFY_ATTESTATION_QUERY"
+            );
+        }
+
+        assert_eq!(
+            body.get("query").and_then(Value::as_str),
+            Some(VERIFY_ATTESTATION_QUERY),
+            "the body must carry the real runtime operation constant"
+        );
+    }
+
+    /// The payload must survive the round trip byte for byte — the platform
+    /// signed those exact bytes.
+    #[test]
+    fn verify_attestation_request_body_base64_encodes_the_payload_verbatim() {
+        // Deliberately NOT valid UTF-8: the attestation layer is opaque bytes
+        // to the SDK, which is precisely why it is base64-encoded for
+        // transport rather than inlined as a GraphQL string.
+        let raw: &[u8] = &[0x00, 0xff, 0x7b, 0x22, 0xfe];
+        let body = verify_attestation_request_body(raw, "sha256:deadbeef").unwrap();
+        let encoded = body["variables"]["attestationPayloadBase64"]
+            .as_str()
+            .expect("payload variable is a string");
+
+        assert_eq!(
+            STANDARD.decode(encoded).expect("standard alphabet, padded"),
+            raw,
+            "payload bytes must round-trip unchanged"
+        );
+        assert_eq!(
+            body["variables"]["subjectManifestDigest"].as_str(),
+            Some("sha256:deadbeef"),
+            "the subject digest is sent verbatim, never re-encoded"
+        );
+    }
+
+    #[test]
+    fn verify_attestation_request_body_rejects_empty_inputs() {
+        let empty_payload = verify_attestation_request_body(b"", "sha256:abc")
+            .expect_err("an empty payload must not produce a request");
+        assert!(
+            empty_payload
+                .to_string()
+                .contains("EMPTY attestation payload"),
+            "got: {empty_payload}"
+        );
+
+        let empty_digest = verify_attestation_request_body(b"payload", "   ")
+            .expect_err("a blank subject digest must not produce a request");
+        assert!(
+            empty_digest.to_string().contains("EMPTY subject digest"),
+            "got: {empty_digest}"
+        );
+    }
+
+    #[test]
+    fn decode_verify_attestation_response_reads_all_three_fields() {
+        let response = serde_json::json!({
+            "data": {
+                "verifyAttestation": {
+                    "verdict": "pass",
+                    "verifiedIdentity": "pmcp.run/attestation-signer",
+                    "verifiedAt": "2026-08-25T12:00:00Z",
+                }
+            }
+        });
+
+        let outcome = decode_verify_attestation_response(&response).expect("well-formed response");
+        assert_eq!(
+            outcome,
+            VerifyAttestationOutcome {
+                verdict: "pass".to_string(),
+                verified_identity: "pmcp.run/attestation-signer".to_string(),
+                verified_at: "2026-08-25T12:00:00Z".to_string(),
+            }
+        );
+    }
+
+    /// A GraphQL `errors` array must become an `Err` naming the FIRST error's
+    /// message — never a silently defaulted outcome, which at the call site is
+    /// indistinguishable from a pass.
+    #[test]
+    fn decode_verify_attestation_response_surfaces_first_graphql_error() {
+        let response = serde_json::json!({
+            "data": null,
+            "errors": [
+                { "message": "unknown attestation issuer" },
+                { "message": "a second message that must not be the one reported" },
+            ]
+        });
+
+        let err = decode_verify_attestation_response(&response)
+            .expect_err("a GraphQL errors array must not decode to an outcome");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("unknown attestation issuer"),
+            "the first error message must appear in Display: {rendered}"
+        );
+        assert!(
+            !rendered.contains("must not be the one reported"),
+            "only the FIRST error message is reported: {rendered}"
+        );
+    }
+
+    #[test]
+    fn decode_verify_attestation_response_rejects_null_and_missing_fields() {
+        let null_payload = serde_json::json!({ "data": { "verifyAttestation": null } });
+        let err = decode_verify_attestation_response(&null_payload)
+            .expect_err("a null payload with no errors must not read as a pass");
+        assert!(
+            err.to_string().contains("must not read as a pass"),
+            "got: {err}"
+        );
+
+        let missing_field = serde_json::json!({
+            "data": { "verifyAttestation": { "verdict": "pass", "verifiedAt": "2026-08-25T12:00:00Z" } }
+        });
+        let err = decode_verify_attestation_response(&missing_field)
+            .expect_err("a missing non-null field must fail");
+        assert!(err.to_string().contains("verifiedIdentity"), "got: {err}");
+    }
+
+    // ========================================================================
+    // pmcp.run package-artifact egress (Phase 123 plan 02 — PARKED live leg)
+    // ========================================================================
+
+    /// A well-formed `getPackageArtifact` response body, used by the decoder
+    /// tests below so each one mutates exactly the thing it is testing.
+    fn sample_artifact_response() -> Value {
+        serde_json::json!({
+            "data": {
+                "getPackageArtifact": {
+                    "payloadDigest": "sha256:0123456789abcdef",
+                    "downloadUrl": "https://example-object-store.invalid/pkg.tar?X-Amz-Signature=redacted",
+                    "expiresAt": "2026-08-26T12:05:00Z",
+                }
+            }
+        })
+    }
+
+    /// An empty reference must be refused BEFORE anything is built — sending
+    /// one asks the platform to resolve nothing while looking like a request.
+    #[test]
+    fn get_package_artifact_request_body_rejects_empty_reference() {
+        let empty = get_package_artifact_request_body("")
+            .expect_err("an empty reference must not produce a request");
+        assert!(
+            empty.to_string().contains("EMPTY reference"),
+            "the refusal must name what it refused: {empty}"
+        );
+
+        let blank = get_package_artifact_request_body("   \t ")
+            .expect_err("a whitespace-only reference must not produce a request");
+        assert!(
+            blank.to_string().contains("EMPTY reference"),
+            "the refusal must name what it refused: {blank}"
+        );
+    }
+
+    /// The body carries the REAL runtime operation constant plus exactly one
+    /// variable, and the reference is never interpolated into the query text.
+    #[test]
+    fn get_package_artifact_request_body_carries_query_and_variables() {
+        let body = get_package_artifact_request_body("london-tube@1.4.0")
+            .expect("a non-empty reference builds a request");
+
+        let object = body.as_object().expect("the body is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["query", "variables"],
+            "the body carries exactly `query` and `variables`"
+        );
+
+        assert_eq!(
+            body.get("query").and_then(Value::as_str),
+            Some(GET_PACKAGE_ARTIFACT_QUERY),
+            "the body must carry the real runtime operation constant"
+        );
+
+        let variables = body
+            .get("variables")
+            .and_then(Value::as_object)
+            .expect("body carries a variables object");
+        let var_keys: Vec<&str> = variables.keys().map(String::as_str).collect();
+        assert_eq!(
+            var_keys,
+            vec![VAR_PACKAGE_REFERENCE],
+            "exactly one variable, named as the SDL's argument is"
+        );
+        assert_eq!(
+            variables[VAR_PACKAGE_REFERENCE].as_str(),
+            Some("london-tube@1.4.0"),
+            "the reference travels as a variable, verbatim"
+        );
+        assert!(
+            !GET_PACKAGE_ARTIFACT_QUERY.contains("london-tube"),
+            "the reference must never be interpolated into the query string"
+        );
+    }
+
+    #[test]
+    fn decode_get_package_artifact_response_reads_all_three_fields() {
+        let outcome = decode_get_package_artifact_response(&sample_artifact_response())
+            .expect("well-formed response");
+        assert_eq!(
+            outcome,
+            GetPackageArtifactOutcome {
+                payload_digest: "sha256:0123456789abcdef".to_string(),
+                download_url:
+                    "https://example-object-store.invalid/pkg.tar?X-Amz-Signature=redacted"
+                        .to_string(),
+                expires_at: "2026-08-26T12:05:00Z".to_string(),
+            }
+        );
+    }
+
+    /// A null payload with no GraphQL errors is its OWN failure mode, and its
+    /// message must be distinguishable from a malformed-shape error — the
+    /// platform answered nothing, which the SDK must not read as
+    /// "an artifact location".
+    ///
+    /// That closing fragment is asserted, not just quoted here. Since
+    /// `required_response_payload` was extracted, the sentence is assembled from
+    /// a SHARED prologue plus a `null_meaning` argument supplied at the call
+    /// site, so "answered nothing" alone pins only the half that every decoder
+    /// gets for free. Without the second assertion this operation's half could
+    /// be changed to the sibling's ("a pass") — a live copy-paste risk the
+    /// moment a third caller is added — and the whole suite would stay green
+    /// while telling an operator the wrong thing about an artifact fetch.
+    #[test]
+    fn decode_get_package_artifact_response_rejects_null_payload() {
+        let null_payload = serde_json::json!({ "data": { "getPackageArtifact": null } });
+        let err = decode_get_package_artifact_response(&null_payload)
+            .expect_err("a null payload with no errors must not decode");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("answered nothing"),
+            "the null case has its own message: {rendered}"
+        );
+        assert!(
+            rendered.contains("must not read as an artifact location"),
+            "the operation's own null_meaning must survive the shared prologue: {rendered}"
+        );
+        assert!(
+            !rendered.contains("is missing the non-null"),
+            "the null case must not be reported as a missing-field error: {rendered}"
+        );
+    }
+
+    /// A GraphQL `errors` array surfaces the platform's FIRST message rather
+    /// than a generic parse failure — an authorization refusal and a malformed
+    /// body must not look identical at the call site.
+    #[test]
+    fn decode_get_package_artifact_response_surfaces_first_graphql_error() {
+        let response = serde_json::json!({
+            "data": null,
+            "errors": [
+                { "message": "package reference not visible to this org" },
+                { "message": "a second message that must not be the one reported" },
+            ]
+        });
+
+        let err = decode_get_package_artifact_response(&response)
+            .expect_err("a GraphQL errors array must not decode to an outcome");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("package reference not visible to this org"),
+            "the first error message must appear in Display: {rendered}"
+        );
+        assert!(
+            !rendered.contains("must not be the one reported"),
+            "only the FIRST error message is reported: {rendered}"
+        );
+    }
+
+    /// A missing field names WHICH field, and a wrong-typed field names it too
+    /// — four causes, four messages.
+    #[test]
+    fn decode_get_package_artifact_response_names_the_missing_field() {
+        let mut missing = sample_artifact_response();
+        missing["data"]["getPackageArtifact"]
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("downloadUrl");
+        let err = decode_get_package_artifact_response(&missing)
+            .expect_err("a missing non-null field must fail");
+        assert!(
+            err.to_string().contains("downloadUrl"),
+            "the error must name the missing field: {err}"
+        );
+
+        let mut wrong_type = sample_artifact_response();
+        wrong_type["data"]["getPackageArtifact"]["expiresAt"] = serde_json::json!(1_756_209_900);
+        let err = decode_get_package_artifact_response(&wrong_type)
+            .expect_err("a non-string value in a String! field must fail");
+        assert!(
+            err.to_string().contains("expiresAt"),
+            "the error must name the wrong-typed field: {err}"
+        );
     }
 }

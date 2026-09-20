@@ -1,283 +1,190 @@
-# Architecture Research: Excel-as-Configuration → MCP-server compiler (v2.3 extraction)
+# Architecture Research
 
-**Domain:** Compile-not-interpret workbook→MCP-server toolchain extracted into the PMCP SDK
-**Researched:** 2026-06-09
-**Overall confidence:** HIGH (direct read of the lighthouse crates + the SDK integration targets; mirrors a proven v0.5.0 reference impl)
+**Domain:** Dual-version (2025-11-25 + 2026-07-28) MCP protocol support inside the pmcp Rust SDK
+**Researched:** 2026-07-22
+**Confidence:** HIGH (integration points read directly from source; v2 wire semantics confirmed against the official RC changelog)
 
-## Executive Summary
+## Scope
 
-The v2.3 milestone extracts a working, penny-reconciled Excel-workbook compiler from the `towelrads-quote-pricing` lighthouse into the SDK as a new "governed Excel" CodeLanguage, slotting alongside the v2.2 SQL and OpenAPI toolkits. The lighthouse already enforces the load-bearing architectural invariant — **the Excel reader (`umya`) never enters the served-binary dependency tree** — via a two-crate split (`workbook-runtime` reader-free leaf, `workbook-compiler` umya-owning offline pipeline) that a `cargo-tree`-provable purity gate asserts. The SDK extraction mirrors this exactly into `pmcp-workbook-runtime` + `pmcp-workbook-compiler`.
+How the 2026-07-28 (v2) spec features integrate with pmcp's **existing** architecture, running both versions concurrently via per-request negotiation (no hard cutover). Every integration point below is grounded in the current code, not guessed. File/line references are to the tree at `pmcp 2.17.0`.
 
-The served-tool layer in the lighthouse (`quote-pricing-server/src/workbook/`) is **already ~95% workbook-agnostic** — its schema projection (`schema.rs`), input validation (`input.rs`), and tier enforcement all read from the embedded `Manifest`, not from per-workbook Rust. The single hardcoded seam is `build_reference_manifest` in `workbook-compiler/src/lib.rs`, which inlines the lighthouse's `heat_source` input as a Rust literal. The §5 generalization is therefore **narrower than it looks**: the served projection is reusable as-is; what must change is that the *compiler* must synthesize `manifest.json` purely from the workbook (it already has `manifest::synthesize` — the candidate synthesizer), and `build_reference_manifest` must be deleted in favor of a generic bundle-emit driver.
-
-Shape A is a thin `pmcp-workbook-server` binary that mirrors `pmcp-sql-server` exactly (lib `run`/`serve` + thin `main.rs` shim), differing only in that the "backend" is a `BundleSource` (where the compiled bundle is read from) rather than a SQL connector. Shape B is `cargo pmcp new --kind workbook-server`, a new arm in the existing `new.rs` `--kind` switch with a `templates::workbook_server` module mirroring `templates::sql_server`. The CLI gains `cargo pmcp compile-workbook`/`lint-workbook`/`emit-bundle` as new command modules under `cargo-pmcp/src/commands/`, each a thin shell over `pmcp-workbook-compiler` (which owns umya — so the **compiler is a dependency of cargo-pmcp**, never of the runtime/server). A project-level `pmcp.toml` maps workbook files → bundle IDs so the single-workbook lighthouse assumptions (`ufh-quote`, hardcoded paths) generalize.
-
-The recommended build order ports `pmcp-workbook-runtime` first (RFC §7 — smallest cut, zero reader deps, already serde/schemars-clean), then the served-tool toolkit module against it, then the compiler + CLI with the §5 generalization fixes (manifest-driven emit, CR-01/CR-02/WR-01, umya provenance), then the Shape-A binary and Shape-B scaffold last. Porting the runtime first proves the purity boundary before any umya code lands.
+Authoritative v2 wire semantics (RC changelog, https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/):
+- `initialize`/`initialized` handshake **removed** (SEP-2575); protocolVersion + clientInfo + capabilities move to per-request `_meta` (`io.modelcontextprotocol/clientInfo`). New `server/discover` fetches capabilities on demand.
+- `Mcp-Session-Id` **removed** (SEP-2567); state is application-minted handles passed as ordinary tool args.
+- Required Streamable-HTTP headers (SEP-2243): `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` — for body-free LB/gateway routing.
+- Tasks → extension: `tasks/list` **removed** (unscopable without sessions), `tasks/update` **added**, creation **server-directed**.
+- Elicitation: `InputRequiredResult` + `requestState` multi-round-trip replaces held-open SSE.
+- JSON Schema 2020-12; `structuredContent` may be **any JSON value** (not only object).
+- Error `-32002` → `-32602` (SEP-2164).
 
 ## Standard Architecture
 
-### System Overview — the two dependency spines
-
-The architecture is two non-overlapping dependency cones that meet only at the runtime leaf and the on-disk bundle contract:
+### System Overview — where a version signal enters and flows
 
 ```
-┌──────────────────────── OFFLINE (build-time, umya allowed) ──────────────────────────┐
-│                                                                                       │
-│   cargo-pmcp  (compile-workbook / lint-workbook / emit-bundle commands)               │
-│        │  depends                                                                     │
-│        ▼                                                                              │
-│   pmcp-workbook-compiler   ── owns umya, quick-xml, zip (Excel reader + provenance)   │
-│        │  ingest → lint → manifest synth → formula parse → DAG compile →              │
-│        │  penny-reconcile → artifact emit → promote-gate                              │
-│        ▼                                                                              │
-│   pmcp-workbook-runtime  ◄─── (re-exports IR/Manifest types so compiler compiles)     │
-│                                                                                       │
-└───────────────────────────────────────┬──────────────────────────────────────────-──┘
-                                         │  emits
-                                         ▼
-                          ┌───────────────────────────────┐
-                          │   compiled bundle (on disk)    │  ← THE CONTRACT
-                          │   manifest.json / executable   │     (compiler ↔ server)
-                          │   .ir.json / cell_map.json /   │
-                          │   layout.json / BUNDLE.lock /  │
-                          │   evidence/                    │
-                          └───────────────┬───────────────┘
-                                          │  loaded by BundleSource
-                                          ▼
-┌──────────────── SERVED (runtime, NO umya — purity-gated) ────────────────────────────┐
-│                                                                                       │
-│   pmcp-workbook-server  (Shape A binary)   OR   cargo pmcp new --kind workbook-server │
-│        │  depends                                    (Shape B scaffold)               │
-│        ▼                                                                              │
-│   pmcp-server-toolkit :: workbook module  (NEW — parallels sql/http modules)          │
-│        │  calculate / explain / get_manifest / diff_version / render_workbook         │
-│        │  schema projection + input validation, ALL manifest-driven                   │
-│        ▼                                                                              │
-│   pmcp-workbook-runtime  ── owned IR + deterministic executor + writer-only render    │
-│        │  depends                                                                     │
-│        ▼                                                                              │
-│   pmcp  (core SDK: ServerBuilder, ToolInfo, streamable-http)                          │
-│                                                                                       │
-└───────────────────────────────────────────────────────────────────────────────────-─┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  TRANSPORT INGRESS  (per-request era detection lives HERE)            │
+│  ┌────────────────────────┐   ┌──────────────────────────────────┐   │
+│  │ streamable_http_server │   │ stdio.rs / wasm_http.rs          │   │
+│  │  - MCP-Protocol-Version │   │  - v1: initialize handshake      │   │
+│  │  - Mcp-Method/Mcp-Name  │   │  - v2: _meta clientInfo+version  │   │
+│  │  - Mcp-Session-Id (v1)  │   │                                  │   │
+│  └──────────┬─────────────┘   └───────────────┬──────────────────┘   │
+│             │  builds ProtocolContext{era, version, clientInfo, caps} │
+├─────────────┼──────────────────────────────────┼─────────────────────┤
+│             ▼   (threaded next to auth_context) ▼                     │
+│  DISPATCH  ServerCore::handle_request_internal (core.rs:1118)         │
+│   ┌──────────────────────────────────────────────────────────────┐   │
+│   │ era-gate:  V1 → initialize/initialized + tasks/list allowed   │   │
+│   │            V2 → server/discover + tasks/update, no initialize  │   │
+│   │  error codes: V1 -32002  |  V2 -32602                          │   │
+│   └───────────────────────────┬──────────────────────────────────┘   │
+├───────────────────────────────┼──────────────────────────────────────┤
+│  HANDLER SURFACE                ▼                                      │
+│   RequestHandlerExtra{ request_meta, + client_info(), version() }     │
+│   TaskRouter (serde_json::Value seam) ── unchanged boundary           │
+├───────────────────────────────┼──────────────────────────────────────┤
+│  STORAGE (unchanged)            ▼                                      │
+│   GenericTaskStore ─ InMemory / DynamoDB / Redis                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-The purity invariant is the whole point of the split: a `cargo tree -p pmcp-workbook-server -i umya` (and `-i swc_ecma_parser`, `-i quick-xml`, `-i zip`) must return empty. This is a `just`/CI gate, mirroring the lighthouse's `just purity-check`.
+The one architectural idea that makes dual-version tractable: **detect era at ingress, carry it as an explicit `ProtocolContext` alongside `auth_context`, and era-gate a small number of decision points** — rather than forking the transport or the dispatcher.
 
-### Component Responsibilities
+### Component Responsibilities (new vs modified)
 
-| Component | Responsibility | Status | Mirrors / Source |
-|-----------|----------------|--------|------------------|
-| `pmcp-workbook-runtime` | Owned IR (`Expr`/`Cell`/`CellValue`/`Dag`), deterministic topo executor (`run`), pure-Rust scalar leaf eval (`eval_scalar`, replaces the SWC/JS kernel), manifest projection model (`Manifest`/`CellRole`/`Role`/`Dtype`/`InputTier`/`allowed_values`), bundle artifact model + integrity hash, writer-only render `LayoutDescriptor`, version-changelog model | NEW crate (lift) | `crates/workbook-runtime/src/lib.rs` (reader-free leaf) |
-| `pmcp-workbook-compiler` | Offline pipeline: ingest (umya→owned cell map), dialect lint, manifest **synthesis** (`synthesize` — colour+Guide+headers → candidate roles, BA-ratified), formula parse (Pratt over whitelist), DAG reconstruction + Kahn topo-sort, sheet-IR + Excel-semantics, penny reconciliation, provenance/freshness gate (quick-xml/zip part reader), artifact emission (the bundle), promote-time gate (numeric corpus + change-class router), compile-workbook driver | NEW crate (lift) | `crates/workbook-compiler/src/lib.rs` (umya isolated) |
-| `pmcp-server-toolkit :: workbook` (feature `workbook`) | The generic served-tool module: load a bundle via `BundleSource`, recompute integrity (fail-closed at boot), register `calculate`/`explain`/`get_manifest`/`diff_version`/`render_workbook` via `ServerBuilder`, project input/output schema from the manifest, tier-enforce overrides | NEW module in existing crate | lift `quote-pricing-server/src/workbook/` (schema/input/handler/diff_version/render_resource), already manifest-driven |
-| `BundleSource` trait | Abstract "where the compiled bundle bytes come from": `LocalDirSource` (read `bundles/<id>@<ver>/`) + `EmbeddedSource` (`include_bytes!`/`include_str!` baked at build for Lambda); S3/registry left as a documented seam | NEW trait | lighthouse hardcodes `include_str!`; this generalizes it |
-| `pmcp-workbook-server` (Shape A binary) | Thin `run`/`serve` lib + `main.rs` shim: parse CLI (`--bundle-dir`/`--bundle-id`/`--http`), construct a `BundleSource`, build the `pmcp::Server` from the toolkit `workbook` module, serve over streamable HTTP | NEW crate | mirrors `pmcp-sql-server/src/{lib,main,cli,assemble}.rs` exactly |
-| `cargo pmcp compile-workbook` / `lint-workbook` / `emit-bundle` | Thin command shells over `pmcp-workbook-compiler`; `compile-workbook` carries the gated `--accept --approver --effective-date` BA approval flow | NEW commands | mirrors `cargo-pmcp/src/commands/*.rs` thin-shell layout |
-| `cargo pmcp new --kind workbook-server` | Scaffold a single runnable crate (`Cargo.toml` + `main.rs` + `pmcp.toml` + a sample bundle dir) | NEW `--kind` arm | mirrors `new.rs::execute_sql_server` + `templates::sql_server` |
-| `pmcp.toml` (project config) | Map workbook source files → bundle IDs + versions; the home for compile/lint/emit defaults (bundles dir, corpus path) replacing lighthouse justfile literals | NEW config shape | replaces single-workbook `ufh-quote` / justfile assumptions |
-| Versioned dialect spec | SDK-owned `workbook-dialect-spec.md` + a `DialectRules` version constant; workbooks declare the dialect version they target | NEW SDK-owned doc | lighthouse `dialect::DialectRules` + `docs/workbook-dialect-spec.md` |
+| Component | File | Status | v2 Responsibility |
+|-----------|------|--------|-------------------|
+| `version.rs` negotiation | `src/types/protocol/version.rs` | **MODIFIED** | Add `"2026-07-28"` to `SUPPORTED_PROTOCOL_VERSIONS`; add `protocol_era(version) -> Era` classifier. `negotiate_protocol_version` unchanged in shape. |
+| `ProtocolContext` | new (`src/shared/` or `src/server/`) | **NEW** | Value object `{ era, negotiated_version, client_info, client_capabilities }` built at ingress, threaded through dispatch. |
+| `http_constants.rs` | `src/shared/http_constants.rs` | **MODIFIED** | Add `MCP_METHOD = "mcp-method"`, `MCP_NAME = "mcp-name"`. `MCP_SESSION_ID`/`MCP_PROTOCOL_VERSION` already present. |
+| streamable-HTTP server | `src/server/streamable_http_server.rs` | **MODIFIED** | Era-gate session resolution; enforce inbound v2 required headers; suppress `Mcp-Session-Id` on v2 responses. |
+| streamable-HTTP client | `src/shared/streamable_http.rs`, `wasm_http.rs` | **MODIFIED** | Emit `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` on v2 requests; stop expecting `Mcp-Session-Id`. |
+| `ServerCore` dispatch | `src/server/core.rs:1118` | **MODIFIED** | Era-gate the `initialize` arm, the not-initialized guard (`-32002`→`-32602`), and method-not-found; add `server/discover` + `tasks/update` arms. |
+| `RequestHandlerExtra` | `src/server/cancellation.rs:179`, `src/shared/cancellation.rs:50` | **MODIFIED** | Add typed `client_info()` / `protocol_version()` accessors over the existing `request_meta` field. |
+| `RequestMeta` | `src/types/protocol/mod.rs:315` | **REUSED as-is** | The Phase-109 `#[serde(flatten)] other` map already round-trips `io.modelcontextprotocol/clientInfo`. No type change needed. |
+| `ClientRequest` enum | `src/types/protocol/mod.rs:478` | **MODIFIED** | Add `ServerDiscover` and `TasksUpdate` variants (serde-tagged by method name). |
+| `TaskRouter` trait | `src/server/tasks.rs:24` | **MODIFIED (additive)** | Add `handle_tasks_update`; keep `handle_tasks_list` (v1-only routing). serde_json::Value seam preserved. |
+| `pmcp-tasks` router/store | `crates/pmcp-tasks/` | **MODIFIED (API reshape)** | Implement `tasks/update`, server-directed creation; storage backends untouched. |
+| structured-output bridge | `src/server/core.rs:689-703` | **MINOR** | Already emits `CallToolResult::structured(value)` for any `Value`. Add scalar branch to `summarize_structured_output`. |
+| schema validation | `src/server/output_validation.rs`, `schema_utils.rs` | **MODIFIED** | Accept JSON Schema 2020-12 keywords; validate non-object `structuredContent`. |
+| OAuth | `src/server/auth/` | **MODIFIED** | RFC 9207 `iss` validation, DCR `application_type` (the 6 auth SEPs). |
+| conformance harness | `crates/pmcp-team-servers` (Phase 109) | **EXTENDED** | Add v2 fixtures; run both eras through `ConformanceTarget`. |
 
-## The crate dependency graph (new vs modified)
+## Data Flow
+
+### v1 request (2025-11-25) — unchanged path
 
 ```
-pmcp (core, EXISTING)
-  └── pmcp-workbook-runtime (NEW)  ── reader-free leaf; depends only on pmcp + serde/schemars/sha2
-        ├── pmcp-workbook-compiler (NEW)  ── adds umya + quick-xml + zip (OFFLINE ONLY)
-        │     └── cargo-pmcp (MODIFIED)   ── depends compiler for compile/lint/emit commands
-        └── pmcp-server-toolkit (MODIFIED) ── new `workbook` module + `workbook` feature; depends runtime ONLY
-              └── pmcp-workbook-server (NEW) ── Shape A binary; depends toolkit[workbook] + runtime
+POST (Mcp-Session-Id, MCP-Protocol-Version: 2025-11-25)
+  → extract_session_and_protocol_headers()          [streamable_http_server.rs:895]
+  → is_initialize_request()? yes → process_init_session() mints session   [:468]
+  → ServerCore::handle_request_internal: Initialize arm → handle_initialize()  [core.rs:451]
+  → response emits Mcp-Session-Id + MCP-Protocol-Version                   [:1093/:1095]
 ```
 
-Critical edges to preserve:
-- **`pmcp-server-toolkit` depends on `pmcp-workbook-runtime` ONLY** — never on `pmcp-workbook-compiler`. This is the purity boundary expressed as a Cargo edge. The `workbook` module must be feature-gated (`workbook = ["dep:pmcp-workbook-runtime"]`) so the no-default-features toolkit build (and the SQL/OpenAPI consumers) never pull it.
-- **`cargo-pmcp` is the only consumer of `pmcp-workbook-compiler`** — umya lives entirely in the CLI/build path. `cargo-pmcp` is a dev tool, never a deployed server, so the purity boundary holds.
-- **`pmcp-workbook-compiler` re-exports types FROM `pmcp-workbook-runtime`** (the lighthouse does this — `workbook-compiler/src/lib.rs` lines 155–221 re-export `Expr`/`Dag`/`Manifest`/`ChangeClass`/`VersionChangelog` from `workbook_runtime`). This keeps the compiler's historical call sites compiling while the runtime owns the shared types the server deserializes.
+### v2 request (2026-07-28) — reuses the existing stateless branch
 
-### Workspace publish order (extending CLAUDE.md's v2.2 list)
-
-CLAUDE.md lists items 1–12. The workbook crates slot in by dependency depth: `pmcp-workbook-runtime` is a new leaf (depends only on `pmcp`), so it publishes right after `pmcp` and before the toolkit (whose new `workbook` module depends on it). The compiler depends on the runtime; the Shape-A binary depends on the toolkit + runtime; `cargo-pmcp` (already last) gains a dep on the compiler.
-
-Extended order (new entries marked **NEW**):
-
-1. `pmcp-widget-utils`
-2. `pmcp` (core SDK)
-2a. **`pmcp-workbook-runtime`** *(NEW — leaf after pmcp, before toolkit; the served binary's only workbook dep)*
-3. `pmcp-code-mode`
-4. `pmcp-code-mode-derive`
-5. `pmcp-server-toolkit` *(MODIFIED — now also depends on `pmcp-workbook-runtime` under the new `workbook` feature; must publish AFTER 2a)*
-6. `pmcp-toolkit-postgres`
-7. `pmcp-toolkit-mysql`
-8. `pmcp-toolkit-athena`
-8a. **`pmcp-workbook-compiler`** *(NEW — depends on `pmcp-workbook-runtime`; publish after 2a; no inter-dep with the connector crates or the SQL server)*
-9. `pmcp-sql-server`
-9a. **`pmcp-workbook-server`** *(NEW — Shape A binary; depends on `pmcp-server-toolkit[workbook]` + `pmcp-workbook-runtime`; must publish AFTER 5 and 2a; sibling to `pmcp-sql-server`, no inter-dep)*
-10. `mcp-tester`
-11. `mcp-preview`
-12. `cargo-pmcp` *(MODIFIED — gains a dependency edge on `pmcp-workbook-compiler`; already last, so it naturally publishes after 8a)*
-
-Rationale: the publish order is a topological sort of the dep graph. `pmcp-workbook-runtime` must precede everything that links it (toolkit, compiler, server). `pmcp-workbook-compiler` must precede `cargo-pmcp`. `pmcp-workbook-server` must follow the toolkit. None of the new crates have inter-dependencies with the SQL/OpenAPI connector cluster, so they interleave as shown.
-
-## The served-tool layer as a toolkit module
-
-### What it must implement (the interfaces)
-
-The lighthouse served layer registers tools via `pmcp::ServerBuilder::tool_arc` directly (it notes it does NOT import the server-toolkit, which "has no native-handler arm and is absent on the current SDK checkout"). In the SDK, this becomes a first-class toolkit module mirroring how `sql`/`http` expose a synthesizer:
-
-1. **A bundle-load + integrity entry point** — `WorkbookBundle::load(source: &dyn BundleSource, id: &str, version: &str) -> Result<WorkbookBundle, BundleLoadError>` that reads the 7 bundle members, parses the `Manifest`/IR/`CellMap`/`LayoutDescriptor`/`VersionChangelog`, recomputes the `BUNDLE.lock` `combined` hash-of-hashes from all members via the shared `workbook_runtime::{update_field, build_bundle_lock}`, and **fails closed at boot** on mismatch. The lighthouse panics; the SDK should return a typed error the Shape-A `run` surfaces as a non-zero exit (matching `pmcp-sql-server`'s `RunError::Serving`).
-
-2. **A builder-extension** mirroring `ServerBuilderExt::try_tools_from_config`. Proposed `ServerBuilderExt::try_workbook_from_bundle(builder, &WorkbookBundle) -> Result<ServerBuilder>` (feature-gated `workbook`). It registers the five tools:
-   - `calculate` — manifest-projected typed inputs, enum-gated, structured errors with an `allowed` repair field; recomputes via `run_executor`, returns `structuredContent`.
-   - `explain` — per-cell business-language lineage (renders the reconciliation annotation).
-   - `get_manifest` — the curated agent-facing manifest projection.
-   - `diff_version` — serves the embedded `VersionChangelog`.
-   - `render_workbook` — returns the computed `.xlsx` as a provenance-bound `workbook://` resource (writer-only `rust_xlsxwriter` — keeps the binary reader-free).
-
-3. **Schema projection (already manifest-driven, lift as-is).** `schema.rs::output_schema_for_manifest` iterates `manifest.cells`, projects each `Role::Output` cell's `dtype`/`unit`/`meaning` into a strict column-typed JSON Schema, and emits it as the mandatory `outputSchema`. This is the projection interface §4 needs — **it already exists and is generic.** The work is wiring it through the toolkit's `ToolInfo` synthesis (the toolkit synthesizes `ToolInfo` from `[[tools]]`; the workbook module synthesizes it from the manifest instead).
-
-4. **Input validation + tier enforcement (already manifest-driven, lift as-is).** `input.rs::validate_input` reads each `overrides` key, looks it up in the manifest, rejects strict constants (`is_strict_constant`), accepts variable/bounded-variable tiers, maps `inputs` keys through the `cell_map` to executor seed coords, and applies manifest defaults. Enum inputs surface as `{"enum":[...]}` from `allowed_values` with a present-only runtime membership gate.
-
-### Config shape vs the SQL toolkit
-
-The SQL toolkit is config-driven through `ServerConfig` (`[[tools]]` + `[database]`). The workbook module is **bundle-driven, not `[[tools]]`-driven** — the tool surface is projected entirely from `manifest.json`, so the served config is minimal: which bundle(s) to load and from where. This is the cleanest divergence from the SQL/OpenAPI shape and should be explicit: the workbook server's "config" is the `BundleSource` selection (bundle id + version + source kind), not a `[[tools]]` table. A workbook server can still carry the toolkit's auth/secrets/static-resources config; only the tool-synthesis arm differs.
-
-## The §4 manifest-driven generalization (concrete)
-
-The lighthouse's `build_reference_manifest` (workbook-compiler/src/lib.rs lines 524–606) **hand-constructs a `Manifest`** with the `heat_source` enum input as a literal `CellRole`. This is the one piece of per-workbook Rust. The fix:
-
-- **Delete `build_reference_manifest` + `emit_reference_bundle` + `renderer_equivalence_governed`** (all the `ufh-quote`-literal functions). Replace with a generic `compile_workbook(workbook_path, bundles_dir, …)` driver that:
-  1. `ingest`s the real `.xlsx` (umya).
-  2. Runs `manifest::synthesize` (the candidate synthesizer that already exists — colour + Guide + headers → candidate `CellRole`s with `role`/`dtype`/`unit`/`meaning`/`allowed_values`).
-  3. Requires BA `ratify` (the ratification stamp already exists).
-  4. Builds the DAG + reconciles against the oracle (cached cell values).
-  5. Emits via the existing `emit_bundle` (`build_candidate_model`/`write_candidate_bundle` already take the manifest as a parameter — **only their callers hardcode `ufh-quote`**).
-- **The projection interface is the `Manifest` itself.** `Role`/`Dtype`/`unit`/`allowed_values` flow from `synthesize` → `manifest.json` → the served `schema.rs`/`input.rs`. No Rust per workbook anywhere. `role` drives input/output/constant classification; `dtype` drives the JSON Schema primitive; `unit`/`meaning` drive the self-describing labels; `allowed_values` drives the enum gate.
-
-This is why §5 is narrower than it appears: the **served projection is already generic**; only the **compiler's emit driver** hardcodes the lighthouse. The generalization is "route `synthesize`'s output into `emit_bundle` instead of a hand-built manifest."
-
-## BundleSource trait design
-
-```rust
-/// Where a compiled workbook bundle's bytes come from. The served path depends
-/// ONLY on this trait + the runtime — never on the compiler/umya.
-pub trait BundleSource: Send + Sync {
-    /// Read a single named member (e.g. "manifest.json", "executable.ir.json",
-    /// "evidence/changelog.json") of the bundle `<id>@<version>`.
-    fn read_member(&self, id: &str, version: &str, member: &str)
-        -> Result<Vec<u8>, BundleSourceError>;
-    /// Enumerate available `(id, version)` pairs (multi-bundle servers + diff_version).
-    fn list(&self) -> Result<Vec<(String, String)>, BundleSourceError>;
-}
+```
+POST (MCP-Protocol-Version: 2026-07-28, Mcp-Method, Mcp-Name; NO Mcp-Session-Id)
+  → validate_headers(): v2 requires the three headers (400 if missing)
+  → protocol_era(header) = V2  → BUILD ProtocolContext
+  → era-gate: SKIP process_init_session (treat as stateless regardless of session_id_generator)
+  → ProtocolContext threaded next to auth_context into handle_request()
+  → dispatch: tools/call reads _meta clientInfo → RequestHandlerExtra.client_info()
+  → response: echo MCP-Protocol-Version: 2026-07-28, emit NO Mcp-Session-Id
 ```
 
-- **`LocalDirSource { root: PathBuf }`** — reads `root/<id>@<version>/<member>` from disk. The dev/test default; the Shape-A binary's `--bundle-dir` points at it.
-- **`EmbeddedSource`** — baked at build via `include_bytes!`/`include_str!` (the lighthouse pattern, `workbook/mod.rs` lines 55–120). For Lambda/deploy where the bundle ships *inside* the binary. The scaffold's generated `main.rs` uses this so the deployed server has no filesystem dependency. Note the contrast with `pmcp-server-toolkit`'s SQL path (`demo_db_path()` + `pmcp::assets::load_string` resolve a writable `/tmp` DB + read-only assets under `/var/task/assets`): the workbook bundle is read-only, so it can be baked straight into the *binary* via `EmbeddedSource` with no `/var/task/assets` round-trip.
-- **S3/registry seam** — `S3BundleSource`/`RegistryBundleSource` are documented but deferred; the trait's `read_member`/`list` shape is the seam (an S3 impl is `GetObject` per member, a registry impl is an HTTP fetch + cache). No runtime change needed to add them.
+### Key insight per sub-question
 
-Integrity is computed by the *loader over the source*, not by the source — `WorkbookBundle::load` reads all members through the `BundleSource`, then runs the shared `build_bundle_lock` fold and compares to the embedded `BUNDLE.lock`. So any source (local/embedded/S3) gets the same fail-closed boot check.
+**(a) Where negotiation lives.** Today it is *split and implicit*: the pure `negotiate_protocol_version()` fn is called at three handler sites (core.rs:457, mod.rs:1262, wasm_server.rs:127), and the transport separately validates the `MCP-Protocol-Version` header against `SUPPORTED_PROTOCOL_VERSIONS` (streamable_http_server.rs:671). For dual-version this must become *explicit and single-point*: **resolve era at transport ingress** (the header/handshake signal only exists there) and **carry the result into dispatch** as `ProtocolContext`. ServerCore keeps its `initialize` arm for v1 clients; v2 clients never send `initialize`, so the arm is simply never hit for them — no removal, pure era-gating. This is why "initialize removed in v2 but still works for v1" needs zero conditional inside `handle_initialize`; the branch just isn't reached under V2.
 
-## CLI integration (cargo-pmcp)
+**(b) Session bifurcation without forking the transport.** The transport *already* bifurcates: `StreamableHttpServerConfig::stateless()` (streamable_http_server.rs:249) sets `session_id_generator: None`, and `process_init_session`/`validate_non_init_session` (:468/:512) branch on `session_id_generator.is_some()`. **v2 maps directly onto the existing stateless branch.** The change is one era gate *before* session resolution: `if ctx.era == V2 { skip session entirely } else { existing stateful/stateless config path }`. `SessionInfo{ initialized, protocol_version }` (:266) stays for v1; v2 creates no `SessionInfo`. `compute_outbound_protocol_version` (:944) already returns the right value; the only new rule is "do not insert `Mcp-Session-Id` when era == V2". No fork — both eras share `handle_post_fast_path`/`handle_post_with_middleware`.
 
-The existing `cargo-pmcp/src/commands/` modules are thin shells (each `<cmd>.rs` parses clap args and delegates). Add three sibling modules mirroring that layout:
+**(c) `_meta` clientInfo → `RequestHandlerExtra`.** The plumbing already exists end-to-end: `req._meta` (a `RequestMeta` whose Phase-109 `#[serde(flatten)] other` map catches `io.modelcontextprotocol/*` keys, mod.rs:333-345) is serialized to `Value` and passed via `.with_request_meta()` into `RequestHandlerExtra.request_meta` (core.rs:514-518). So v2's `io.modelcontextprotocol/clientInfo` *already round-trips into handlers today* for `tools/call`. Three gaps: (1) it is a raw buried `Value` — add typed `extra.client_info()` / `extra.protocol_version()` accessors; (2) only `tools/call` threads `_meta` — `get_prompt`/`read_resource`/etc. need the same `.with_request_meta()` wiring for v2 (they receive per-request clientInfo too); (3) capability-gated code reads `client_capabilities` cached at `initialize` (core.rs:454) — v2 has no initialize, so a v2 path must populate/read capabilities from per-request `_meta`. The `ProtocolContext` carries `client_capabilities` to close (3).
 
-- **`commands/compile_workbook.rs`** — `cargo pmcp compile-workbook <workbook.xlsx> [--bundles-dir DIR] [--bundle-id ID] [--accept --approver NAME --effective-date DATE]`. Delegates to `pmcp_workbook_compiler::compile_workbook` (the build-candidate → gate → write driver). The `--accept` flow records the BA approval into the corpus exactly as the lighthouse `gate::accept::accept` does. **Recommendation (RFC §6 OQ-3 / brief §11 OD-2):** keep `--accept` in the CLI, not in `deploy` — the lighthouse proves it as a reviewable artifact (`bundles/corpus/<id>/cases.json`), and the gate's BA review is its own reviewable step ("distinct compile-workbook step feeding deploy").
-- **`commands/lint_workbook.rs`** — `cargo pmcp lint-workbook <workbook.xlsx>`. Delegates to the compiler's `lint`/`LintReport`; exits non-zero on `report.has_errors()`. The fast feedback loop before a full compile.
-- **`commands/emit_bundle.rs`** — `cargo pmcp emit-bundle [--bundle-id ID]`. Regenerates a bundle (the generalized `emit_bundle` driver) for an already-ratified workbook; the analog of `just emit-bundle`.
+**(d) pmcp-tasks migration.** The `serde_json::Value` seam of `TaskRouter` (tasks.rs:24) is the load-bearing insulation — it lets the API reshape without touching `pmcp` core types or the storage backends (`GenericTaskStore` + DynamoDB/Redis are domain-object stores, untouched). Reshape: (i) add `handle_tasks_update` to the trait + `METHOD_TASKS_UPDATE` (constants.rs) + `ClientRequest::TasksUpdate`; (ii) **keep** `handle_tasks_list` on the trait but era-gate routing so v2 never dispatches `tasks/list` (task_dispatch.rs `route_tasks_endpoint`); (iii) server-directed creation reuses the existing `tool_requires_task` hook (tasks.rs:78) — extend it so the router can elect task creation without a client-supplied `task` field. **Owner-binding pitfall:** `resolve_owner(subject, client_id, session_id)` (tasks.rs:67) prefers subject then client_id then session_id. v2 has no session_id → unauthenticated v2 servers lose per-caller task isolation. Flag: v2 task servers should require OAuth (subject) or an app-minted handle.
 
-These register in `cargo-pmcp/src/main.rs`'s clap subcommand dispatch. Because they pull `pmcp-workbook-compiler` (umya), they are the **only** umya entry point in the SDK product surface.
+**(e) Required headers.** Split by direction. **Server-inbound** (streamable_http_server.rs `validate_headers`): for V2, require `MCP-Protocol-Version=2026-07-28`, `Mcp-Method`, `Mcp-Name`; 400 on absence; optionally cross-check header method/name vs body. **Client-outbound** (src/shared/streamable_http.rs + wasm_http.rs): emit the three headers on every v2 request. Add `MCP_METHOD`/`MCP_NAME` to http_constants.rs. These headers duplicate body fields deliberately (body-free routing), so they are derivable at send time from the JSON-RPC method + tool name.
 
-### Project-level `pmcp.toml`
+**(f) `server/discover`.** Maps onto the existing registry-authoritative capability derivation (Phase 106). `ServerCore.capabilities` (core.rs:210) is already computed; `handle_initialize` returns `InitializeResult{ capabilities, server_info, ... }` (core.rs:459). Add a `handle_discover()` that returns the *same* capability projection **without** the handshake side effects (does not set `initialized`, does not cache client caps). Low complexity — a read-only view of state that already exists.
 
-The lighthouse hardcodes `ufh-quote`, the bundles dir, and the corpus path in justfile recipes. Generalize into a project-root `pmcp.toml`:
+**(g) Structured-output bridge + JSON Schema 2020-12.** The emit path is *already* value-agnostic: core.rs:703 calls `CallToolResult::structured(value)` where `value: serde_json::Value`, so non-object `structuredContent` already flows to the wire. Real work is in validation: `output_validation.rs`/`schema_utils.rs` must accept 2020-12 keywords (`$ref`/`$defs`, `oneOf`/`anyOf`/`allOf`, conditionals) and validate top-level non-object schemas. Also `summarize_structured_output` (core.rs:1329) matches only `Array`/`Object` — add a scalar branch. `ttlMs`/`cacheScope` are additive optional fields on the result envelope.
 
-```toml
-[workbook]
-bundles_dir = "bundles"          # where compiled bundles land / are read
-corpus_dir  = "bundles/corpus"   # golden corpus + approval records
+**(h) Build order** — see dependency ordering below.
 
-[[workbook.workbooks]]
-source    = "docs/ufh-quote.xlsx"  # the BA-authored workbook
-bundle_id = "ufh-quote"            # → bundles/ufh-quote@<ver>/
-dialect   = "1.0"                  # the SDK-owned dialect version it targets
+## Suggested Build Order (dependency-driven)
+
+```
+(1) Version plumbing spine  ──►  (2) Stateless HTTP + elicitation
+      │  │  │                          │
+      │  │  └──►  (3) server/discover ──┤ (parallel w/ 2)
+      │  └─────►  (4) Tasks extension  ─┤ (needs era + owner-from-_meta)
+      └────────►  (5) JSON Schema 2020-12 + structured bridge (mostly independent)
+                  (6) Auth SEPs (fully independent)
+                          └──────────►  (7) Conformance (validates all, last)
 ```
 
-`compile-workbook`/`lint-workbook`/`emit-bundle` read `pmcp.toml` to resolve `source → bundle_id`, killing the single-workbook assumption. The Shape-A binary reads the same `[workbook]` table (or CLI flags) to know which bundle id/version to serve.
+1. **Version plumbing spine (foundation, blocks 2/3/4).** Extend `version.rs` (add `2026-07-28`, `protocol_era`), add `MCP_METHOD`/`MCP_NAME` constants, define `ProtocolContext`, thread era+clientInfo through `handle_request` and into `RequestHandlerExtra` (typed accessors), add `ServerDiscover`+`TasksUpdate` enum variants (types only), era-gate the `-32002`→`-32602` error path. Nothing else can be era-aware until this lands. **Depends on:** nothing.
+2. **Stateless streamable-HTTP.** Era-gate session resolution (v2 → existing stateless branch), inbound v2 header enforcement + outbound emission (no session id for v2), client-side header emission, multi-round-trip elicitation (`InputRequiredResult`/`requestState`). **Depends on:** (1).
+3. **`server/discover` handler + v2 capability capture from `_meta`.** **Depends on:** (1). Parallelizable with (2).
+4. **Tasks extension migration.** Era-gated routing (drop `tasks/list` for v2, add `tasks/update`, server-directed creation), owner-binding without session. **Depends on:** (1); loosely on (2) for statelessness semantics.
+5. **JSON Schema 2020-12 + structured bridge + caching hints.** Largely independent; only touches (1) for era-gating validation strictness. Parallelizable with (2)-(4).
+6. **Auth-hardening SEPs** (RFC 9207 `iss`, DCR `application_type`). Fully independent; parallelizable.
+7. **Conformance** against the official suite; extend the Phase-109 harness to run both eras. **Depends on:** all above; runs last.
 
-## Patterns to Follow
+## Architectural Patterns
 
-### Pattern: lib `run`/`serve` + thin `main.rs` shim (Shape A)
-**What:** Put all assembly/serving logic in the binary crate's `lib.rs` (`run`, `run_serving`, `serve`, `build_server`, `load`), keep `main.rs` a ~10-line `#[tokio::main]` shim that parses clap `Args` and calls `run`. **Why:** keeps server construction unit-testable without spawning a process. **Source:** `pmcp-sql-server/src/{lib,main}.rs` — replicate field-for-field, swapping `dispatch(SqlConnector)` for `load(BundleSource)`.
+### Pattern 1: Era detection at ingress, era-gating at decision points
+**What:** Resolve `ProtocolEra` once where the version signal exists (HTTP header / stdio handshake / `_meta`) and thread it as an explicit value; gate the handful of divergent decisions (session, initialize vs discover, tasks/list vs tasks/update, error code) on it.
+**When:** Any dual-protocol coexistence.
+**Trade-offs:** One new value threaded through call sites vs. avoiding a full transport/dispatcher fork. Strongly favors gating — the divergent surface is small (~6 gates).
 
-### Pattern: feature-gated toolkit module mirroring `sql`/`http`
-**What:** Add `#[cfg(feature = "workbook")] pub mod workbook;` to `pmcp-server-toolkit/src/lib.rs`, with crate-root re-exports of the headline types (`WorkbookBundle`, `BundleSource`, `LocalDirSource`, `EmbeddedSource`, `try_workbook_from_bundle`). **Why:** matches the `#[cfg(feature = "http")] pub mod http;` precedent so no-default-features and SQL-only builds never link the runtime. **Source:** `pmcp-server-toolkit/src/lib.rs` lines 43–44.
+### Pattern 2: `serde_json::Value` trait seam as a version firewall
+**What:** `TaskRouter`'s `Value` boundary lets the Tasks *wire API* reshape (list→update, server-directed creation) while `pmcp` core types and storage backends stay put.
+**When:** Extension whose spec is still moving. Already proven by the v1.0→v2.x Tasks evolution.
+**Trade-offs:** Loses compile-time typing at the seam; buys total decoupling and lets the DynamoDB/Redis investment survive a breaking wire change untouched.
 
-### Pattern: re-export shared types from the runtime leaf
-**What:** The compiler re-exports `Expr`/`Dag`/`Manifest`/`ChangeClass`/`VersionChangelog` from the runtime crate so its public surface and call sites compile against historical names. **Why:** the served binary deserializes these types, so they MUST live in the reader-free crate; the compiler borrows them upward. **Source:** `workbook-compiler/src/lib.rs` lines 155–221.
+### Pattern 3: Flattened namespaced `_meta` as the v2 transport for out-of-band context
+**What:** The Phase-109 `RequestMeta.other` flatten map is exactly the shape v2 uses for `io.modelcontextprotocol/clientInfo`, capabilities, and W3C trace keys.
+**When:** Already the mechanism; v2 just adds reserved keys. Add typed accessors, not new types.
+**Trade-offs:** Stringly-typed keys; but zero new protocol types and byte-identical v1 serialization (empty map emits nothing).
 
-### Pattern: cargo-tree purity gate
-**What:** A `just purity-check` / CI step asserting `cargo tree -p pmcp-workbook-server -i umya` (and `-i quick-xml -i zip -i swc_ecma_parser`) is empty. **Why:** the entire compile-not-interpret security story rests on the reader never reaching prod; make it mechanically provable, not a convention. **Source:** lighthouse `just purity-check`.
+## Anti-Patterns
 
-## Anti-Patterns to Avoid
+### Anti-Pattern 1: Forking the transport into v1 and v2 servers
+**What people do:** Stand up a parallel `streamable_http_server_v2.rs`.
+**Why it's wrong:** Doubles the DNS-rebinding/auth/middleware/SSE surface and guarantees drift; the two eras differ only in session handling and headers.
+**Instead:** Era-gate `process_init_session` and header emission inside the *existing* handlers. v2 == the existing stateless branch.
 
-### Anti-Pattern: copying `build_reference_manifest` / hand-built manifests
-**What:** Porting the `ufh-quote`-literal `build_reference_manifest`/`emit_reference_bundle` as the bundle-emit path. **Why bad:** it is the single hardcoded seam the whole §5 generalization exists to kill; copying it forks per-workbook Rust into the SDK. **Instead:** route `manifest::synthesize` (already present) → `ratify` → the generic `emit_bundle`.
+### Anti-Pattern 2: Deleting the `initialize` arm / `tasks/list` to "modernize"
+**What people do:** Remove v1 code paths because v2 dropped them.
+**Why it's wrong:** Breaks the dual-version contract — v1 clients (Claude Code, Cursor on older versions) still handshake and still call `tasks/list`.
+**Instead:** Keep them; era-gate so V2 requests never reach them.
 
-### Anti-Pattern: letting the toolkit depend on the compiler
-**What:** Adding `pmcp-workbook-compiler` to `pmcp-server-toolkit`'s deps "for convenience" (e.g. to re-synthesize a manifest at boot). **Why bad:** drags umya/quick-xml/zip into every served binary, breaking the purity invariant and the security message. **Instead:** the server only ever *reads* a pre-compiled bundle via `BundleSource`; synthesis is build-time only.
+### Anti-Pattern 3: Assuming v2 statelessness gives task owner isolation for free
+**What people do:** Ship v2 task servers without auth, relying on old session-based owner binding.
+**Why it's wrong:** No `Mcp-Session-Id` in v2 → `resolve_owner` falls through to a shared/`"local"` owner → cross-caller task leakage.
+**Instead:** Require OAuth subject or an app-minted handle for v2 task servers; document the precedence.
 
-### Anti-Pattern: trusting umya-fabricated Excel provenance (§5 caveat)
-**What:** Treating a umya-authored/round-tripped workbook as a fresh real-Excel recalc. **Why bad:** umya 3.0.0 hard-codes `<Application>Microsoft Excel</Application>` + `calcId` on every save, so a umya-written workbook passes the Phase-8 freshness gate on **fabricated** identity. **Instead:** any SDK tooling that programmatically mutates a workbook must mark a distinct provenance class (or use a different writer); the freshness gate must not treat umya identity as proof of recalc.
+## Integration Points
 
-### Anti-Pattern: copying the CR-01/CR-02/WR-01 promote-path debt
-**What:** Lifting the promote path as-is. **Why bad:** CR-02 (promotion computes `next_version` but writes back into the same `@1.0.0` dir, overwriting the baseline), CR-01 (demotion-direction change-class changes escape classification and auto-promote), WR-01 (`ratify_tiers` gives enum inputs a `Variable{default:""}` tier, seeding an out-of-enum empty string). **Instead:** fix at extraction — write to the computed `next_version` dir, make the change-class classifier symmetric, skip tiering for enum inputs. These §5 fixes slot into the compiler/promote-gate phase (Phase C).
+### Internal Boundaries
 
-## Data-flow changes vs the lighthouse
-
-| Flow | Lighthouse | SDK extraction |
-|------|-----------|----------------|
-| Bundle origin | `include_str!` of in-crate `bundles/ufh-quote@1.0.0/` | `BundleSource` (local-dir dev / embedded deploy / S3 seam) |
-| Manifest origin | hand-built `build_reference_manifest` | `manifest::synthesize` → `ratify` → `emit_bundle` (manifest-driven) |
-| Bundle identity | hardcoded `ufh-quote` / justfile literals | `pmcp.toml` `[[workbook.workbooks]]` source→bundle_id map |
-| Served tool reg | direct `ServerBuilder::tool_arc` in the server crate | toolkit `workbook` module `try_workbook_from_bundle` |
-| Compile entry | `cargo run -p workbook-compiler -- compile-workbook …` | `cargo pmcp compile-workbook …` (thin shell over compiler) |
-| Integrity boot check | panic on hash mismatch | typed `BundleLoadError` → `RunError` → non-zero exit (matches sql-server) |
-
-## Suggested PHASE BUILD ORDER
-
-Respects the purity boundary (runtime before any umya code) and the dependency cone (runtime → toolkit module → compiler → CLI → Shape A/B). Directly answers RFC §7: **yes, port the runtime first even within a full-extraction milestone** — it is the smallest cut that proves the boundary, has zero reader deps, and unblocks every downstream consumer.
-
-1. **Phase A — Port `pmcp-workbook-runtime`** (RFC §7 first cut). Lift the reader-free leaf: IR types, `run` executor, `eval_scalar`, manifest projection model (`Manifest`/`CellRole`/`Role`/`Dtype`/`InputTier`/`allowed_values`), bundle artifact model + integrity hashing, render `LayoutDescriptor`, changelog model. Establish the `cargo-tree` purity gate. Publish `pmcp-workbook-runtime` (slot 2a). *Dependency: pmcp only. Proves the boundary before any umya lands.*
-
-2. **Phase B — `BundleSource` + served-tool toolkit module.** Add the `workbook` feature + `pub mod workbook` to `pmcp-server-toolkit`. Define `BundleSource` (+ `LocalDirSource`, `EmbeddedSource`). Lift the served layer (`schema.rs`/`input.rs`/`handler.rs`/`diff_version.rs`/`render_resource.rs` — already manifest-driven), wired through `try_workbook_from_bundle` + boot integrity. *Dependency: Phase A. The schema/input projection comes over nearly unchanged because it already reads the manifest.*
-
-3. **Phase C — `pmcp-workbook-compiler` + the §5 generalization fixes.** Lift the offline pipeline (ingest/dialect/manifest-synth/formula/dag/sheet_ir/reconcile/provenance/artifact/gate/change_class). **Do the §5 fixes here, not after:** (a) delete `build_reference_manifest`/`emit_reference_bundle`, replace with a generic `compile_workbook` routing `synthesize`→`ratify`→`emit_bundle` (the manifest-driven kill); (b) CR-02 — write to the computed `next_version` dir; (c) CR-01 — symmetric change-class classifier; (d) WR-01 — skip tiering for enum inputs; (e) umya fabricated-provenance — distinct provenance class. Publish the compiler (slot 8a). *Dependency: Phase A (re-exports runtime types). The fixes belong in the phase that owns the code they fix.*
-
-4. **Phase D — `cargo pmcp compile-workbook` / `lint-workbook` / `emit-bundle` + `pmcp.toml`.** Add the three command modules + the `--accept` BA approval flow + the project-level `pmcp.toml` (workbooks→bundle IDs) resolving the single-workbook assumption. *Dependency: Phase C (the compiler). `pmcp.toml` lands here because the CLI is its first consumer.*
-
-5. **Phase E — Shape A binary `pmcp-workbook-server`.** Mirror `pmcp-sql-server`: lib `run`/`serve` + thin `main.rs`, CLI (`--bundle-dir`/`--bundle-id`/`--http`), construct a `BundleSource`, build the server from the toolkit `workbook` module. Publish (slot 9a). *Dependency: Phase B (toolkit module) + the `BundleSource` impls.*
-
-6. **Phase F — Shape B scaffold `cargo pmcp new --kind workbook-server` + dialect spec.** Add the `--kind workbook-server` arm to `new.rs` + a `templates::workbook_server` (Cargo.toml + `main.rs` using `EmbeddedSource` + a sample `pmcp.toml` + a sample bundle). Publish the SDK-owned versioned `workbook-dialect-spec.md`. *Dependency: Phase E (the scaffold's generated `main.rs` targets the Shape-A wiring).*
-
-**Ordering rationale:** A→B is the runtime-then-server cut (purity proven before umya). C is intentionally after B so the served contract (what the bundle must contain for `calculate`/`explain`/etc.) is locked before the compiler is generalized to emit it — the bundle is the contract, and you freeze the consumer's needs before re-cutting the producer. D/E/F are the DX surfaces over the now-stable runtime+compiler. The §5 fixes concentrate in C (compiler-owned: manifest-driven emit, CR-01/CR-02/WR-01, umya provenance) and D (`pmcp.toml`, single-workbook generalization) — each fix lands in the phase that owns its code.
-
-## Scalability / Evolution Considerations
-
-| Concern | At 1 workbook (lighthouse parity) | At N workbooks (one server) | At a bundle registry |
-|---------|-----------------------------------|------------------------------|----------------------|
-| Bundle delivery | `EmbeddedSource` (baked in binary) | `LocalDirSource` over a bundles dir; `pmcp.toml` lists all | `RegistryBundleSource` (deferred seam) |
-| Tool naming | flat `calculate`/`explain`/… | namespaced per bundle id (`ufh-quote.calculate`) — design registration to prefix | registry resolves id→bundle |
-| Integrity | boot fold over embedded members | per-bundle fold on load | signature/registry-attested |
-| Versioning | single `@1.0.0` | `diff_version` across versions present in source | registry version negotiation |
-
-Named-range-backed validation lists and the S3/registry bundle store are deferred by design (documented seams), consistent with the milestone scope.
+| Boundary | Communication | v2 consideration |
+|----------|---------------|------------------|
+| transport ↔ ServerCore | `handle_request(id, request, auth_context)` (core.rs:1172/1391) | Add `ProtocolContext` param (or fold into extra) — the single new thread through the seam. |
+| ServerCore ↔ handlers | `RequestHandlerExtra` | New `client_info()`/`protocol_version()` accessors; ensure all methods thread `_meta`, not just `tools/call`. |
+| pmcp ↔ pmcp-tasks | `TaskRouter` (`Value`) | Additive `handle_tasks_update`; era-gated `tasks/list`. |
+| pmcp-tasks ↔ storage | `GenericTaskStore`/`StorageBackend` | Unchanged. |
+| server ↔ client transports | HTTP headers | New `Mcp-Method`/`Mcp-Name`; conditional `Mcp-Session-Id`. |
 
 ## Sources
 
-- `crates/workbook-runtime/src/lib.rs` (lighthouse) — reader-free leaf, the `pmcp-workbook-runtime` lift target — HIGH
-- `crates/workbook-compiler/src/lib.rs` (lighthouse) — umya pipeline + the hardcoded `build_reference_manifest` (lines 524–606) — HIGH
-- `crates/quote-pricing-server/src/workbook/{mod,schema,input}.rs` (lighthouse) — the already-manifest-driven served layer — HIGH
-- `crates/pmcp-server-toolkit/src/lib.rs` + `Cargo.toml` (SDK) — the `#[cfg(feature="http")] pub mod http` precedent + feature-gating pattern — HIGH
-- `crates/pmcp-sql-server/src/{lib,main}.rs` + `Cargo.toml` (SDK) — the Shape-A lib/`run`/`serve` + thin-shim + `RunError` pattern to mirror — HIGH
-- `cargo-pmcp/src/commands/new.rs` + `templates/sql_server.rs` (SDK) — the `--kind` switch + scaffold-template pattern — HIGH
-- `docs/sdk-issue-excel-workbook-compiler-extraction.md` (RFC §5/§6/§7) — generalization gaps, open questions, runtime-first recommendation — HIGH
-- `docs/Excel-as-Configuration-Architecture-Brief.md` — two-surface model, reuse-vs-new, promote-gate philosophy — HIGH
-- `CLAUDE.md` Release & Publish Workflow — the v2.2 publish order extended above — HIGH
+- Existing code (read directly): `src/types/protocol/version.rs`, `src/types/protocol/mod.rs` (RequestMeta:315, ClientRequest:478), `src/server/core.rs` (dispatch:1118, initialize:451, structured bridge:686-703), `src/server/streamable_http_server.rs` (session/header handling:249,468,895,944,1222), `src/server/tasks.rs` (TaskRouter:24), `src/server/task_dispatch.rs`, `src/shared/http_constants.rs`, `src/server/cancellation.rs:179`, `crates/pmcp-tasks/src/constants.rs` — HIGH
+- MCP 2026-07-28 Release Candidate changelog: https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/ — HIGH
+- Project memory `project_mcp_spec_2026_07_28_impact.md` (repo-grepped impact map) — HIGH
+
+---
+*Architecture research for: dual-version MCP protocol support in pmcp*
+*Researched: 2026-07-22*

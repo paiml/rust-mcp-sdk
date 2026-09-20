@@ -158,6 +158,16 @@ version = "0.1.0"
 [backend]
 base_url = "https://api.example.com"
 
+# Every `${ENV_VAR}` / `env:VAR` reference needs a `[[config_slots]]` entry
+# naming its key. That list is what tells a target environment what it must
+# supply, and `cargo pmcp package save` REFUSES a config that defers a value
+# nothing declares (pmcp-package 0.3.1). `kind = "secret"` is identity-bearing,
+# so it carries no `tested_value`.
+[[config_slots]]
+key = "code_mode.token_secret"
+kind = "secret"
+name = "CODE_MODE_SECRET"
+
 [code_mode]
 enabled = true
 # Use a "${ENV_VAR}" reference — resolved at wiring time. Never inline a real secret.

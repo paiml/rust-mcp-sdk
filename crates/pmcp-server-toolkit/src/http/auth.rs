@@ -32,6 +32,11 @@
 //! `pmcp_server_toolkit::http::auth::AuthConfig` rather than redefining it.
 
 use super::HttpConnectorError;
+// The `${VAR}` / `env:VAR` grammar lives in the backend-neutral `crate::env_ref`
+// module, NOT here: this module is `#[cfg(feature = "http")]`, so a chokepoint
+// defined here would exist only in `http` builds while `[backend].base_url`
+// resolution and `token_secret` need the same grammar in every build.
+use crate::env_ref::parse_env_ref;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -143,6 +148,92 @@ pub enum AuthConfig {
 }
 
 impl AuthConfig {
+    /// The first credential field whose configured value is REFERENCE-shaped but
+    /// names no settable environment variable, as a field path within
+    /// `[backend.auth]` (e.g. `"token"`, `"password"`, `"query_params.app_key"`).
+    /// `None` when every credential field is a plain literal or a well-formed
+    /// single reference.
+    ///
+    /// # Why this exists
+    ///
+    /// [`crate::env_ref::parse_env_ref`] maps every unsettable brace form — the
+    /// empty `${}`, a composition like `${A}://${B}`, and a non-portable name
+    /// like `${TFL-APP-KEY}` — to the EMPTY name. [`resolve_secret_ref`] then
+    /// resolves the empty name to the empty string, and the empty string is the
+    /// credential path's "omit this credential" signal: [`expand_api_key_map`]
+    /// DROPS the entry and the bearer / basic / oauth2 arms of
+    /// [`create_auth_provider`] collapse to [`NoAuth`]. So a malformed reference
+    /// produced a server that booted fine and sent every backend request
+    /// UNAUTHENTICATED, with no error and no log line.
+    ///
+    /// That omission rule is correct for an UNSET variable — an optional
+    /// credential the target environment chose not to supply — and it is
+    /// deliberately kept. A MALFORMED reference is a different thing: it is a
+    /// mistake in the config file that no environment could ever satisfy, so it
+    /// gets the refusal `[backend].base_url` already gets
+    /// ([`crate::error::ConfigValidationError::MalformedBackendBaseUrlRef`]).
+    ///
+    /// The returned path names the FIELD only, never the value: a malformed
+    /// value is by definition not a resolvable reference, so it may well be a
+    /// mistyped literal secret that must not reach a log.
+    ///
+    /// # Determinism
+    ///
+    /// `query_params` / `headers` are [`HashMap`]s, so the offending entry is
+    /// selected by `min` over the keys rather than by iteration order — an
+    /// error message that named a different field run to run would be unusable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pmcp_server_toolkit::http::auth::AuthConfig;
+    ///
+    /// // A dash is not a portably settable variable name.
+    /// let bad = AuthConfig::Bearer { token: "${TFL-APP-KEY}".into(), required: true };
+    /// assert_eq!(bad.malformed_env_ref_field().as_deref(), Some("token"));
+    ///
+    /// // A well-formed reference and a plain literal are both fine.
+    /// let good = AuthConfig::Bearer { token: "${TFL_APP_KEY}".into(), required: true };
+    /// assert_eq!(good.malformed_env_ref_field(), None);
+    /// ```
+    #[must_use]
+    pub fn malformed_env_ref_field(&self) -> Option<String> {
+        // A malformed reference is exactly `Some("")`: reference-SHAPED (so it
+        // must never ship as a literal) but naming nothing settable.
+        fn scalar(label: &str, value: &str) -> Option<String> {
+            (parse_env_ref(value) == Some("")).then(|| label.to_string())
+        }
+        fn entry(label: &str, map: &HashMap<String, String>) -> Option<String> {
+            map.iter()
+                .filter(|(_, v)| parse_env_ref(v) == Some(""))
+                .map(|(k, _)| k)
+                .min()
+                .map(|k| format!("{label}.{k}"))
+        }
+
+        match self {
+            // No credential fields to check.
+            Self::None | Self::OAuthPassthrough { .. } => None,
+            Self::ApiKey {
+                query_params,
+                headers,
+                ..
+            } => entry("query_params", query_params).or_else(|| entry("headers", headers)),
+            Self::Bearer { token, .. } => scalar("token", token),
+            Self::Basic {
+                username, password, ..
+            } => scalar("username", username).or_else(|| scalar("password", password)),
+            // `token_url` is deliberately absent: it is an endpoint used
+            // verbatim, not routed through `resolve_secret_ref`, so it cannot
+            // be silently omitted the way a credential can.
+            Self::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                ..
+            } => scalar("client_id", client_id).or_else(|| scalar("client_secret", client_secret)),
+        }
+    }
+
     /// Whether this configuration requires authentication to succeed.
     #[must_use]
     pub fn is_required(&self) -> bool {
@@ -474,39 +565,6 @@ impl HttpAuthProvider for OAuthPassthroughAuth {
     }
 }
 
-/// Build a STATIC auth provider from `cfg`, shared as `Arc<dyn HttpAuthProvider>`.
-///
-/// For [`AuthConfig::OAuthPassthrough`], use [`create_passthrough_auth_provider`]
-/// instead — without a token this returns a [`MissingTokenAuth`] (if required) or
-/// [`NoAuth`], since the per-request token is not yet known at startup.
-///
-/// # Errors
-///
-/// This constructor never fails today (returns `Ok`) — the fallible signature is
-/// reserved so a future variant requiring construction-time validation can error
-/// without a breaking change.
-/// The single brace/env-ref parse core shared by EVERY credential-resolution
-/// path (api_key, bearer token, basic password, oauth2 client_secret).
-///
-/// Returns `Some(var_name)` when `raw` is a secret REFERENCE — either the
-/// `"env:VAR"` or the `"${VAR}"` form — and `None` for a plain literal (which the
-/// caller uses verbatim). A malformed brace reference (e.g. `"${}"`) is treated
-/// as a reference to an empty name, i.e. `Some("")`, so the caller resolves it to
-/// the empty string (omission) rather than shipping the literal `${}`.
-///
-/// This consolidates the two brace parsers that previously existed (the inline
-/// `${`-strip in the old api_key resolver here and `expand_braced_var` in
-/// `crate::code_mode`): all credential resolution now flows through this one
-/// chokepoint so the env-ref discipline cannot drift per-variant.
-fn parse_env_ref(raw: &str) -> Option<&str> {
-    if let Some(v) = raw.strip_prefix("env:") {
-        Some(v)
-    } else {
-        // `${...}` → the inner name (possibly empty for the malformed `${}` form).
-        raw.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
-    }
-}
-
 /// Resolve a single credential value, expanding a `${VAR}` or `env:VAR` reference
 /// from the process environment — the ONE chokepoint applied to every credential
 /// field (api_key, bearer `token`, basic `password`, oauth2 `client_secret`) as
@@ -526,16 +584,34 @@ fn parse_env_ref(raw: &str) -> Option<&str> {
 ///   collapses the provider to no-auth — the correct failure mode, NOT shipping
 ///   the literal `${...}`).
 /// - A plain literal (no `${...}` / `env:` prefix) is returned verbatim.
-/// - A malformed reference (e.g. `"${}"`) resolves to an empty string.
+/// - A malformed reference (e.g. `"${}"`) resolves to an empty string — but see
+///   below: it is REFUSED before it ever reaches this function.
 ///
 /// No error path: an unresolvable reference yields an empty string (omission),
 /// never a panic and never the literal `${...}` reaching the wire.
+///
+/// # Omission applies to UNSET variables, not to malformed references
+///
+/// The empty-string-means-omit rule is the right answer for an optional
+/// credential whose variable the target environment did not supply. It is the
+/// WRONG answer for a MALFORMED reference — `${}`, `${A}://${B}`, `${WITH-DASH}`
+/// — because no environment could ever supply those, so "omit" means every
+/// backend request silently goes out unauthenticated.
+///
+/// [`AuthConfig::malformed_env_ref_field`] therefore rejects that shape at two
+/// points upstream of here: [`crate::config::ServerConfig::validate`] at load
+/// time and [`create_auth_provider`] at provider-build time. The empty-name arm
+/// below is retained as a total-function fallback for direct callers, not as
+/// the operative policy.
 fn resolve_secret_ref(raw: &str) -> String {
     match parse_env_ref(raw) {
         // Plain literal — used verbatim.
         None => raw.to_string(),
-        // Malformed reference (e.g. `"${}"`) → empty (omitted).
-        Some(name) if name.is_empty() => String::new(),
+        // Malformed reference (e.g. `"${}"`) → empty. Refused upstream by
+        // `AuthConfig::malformed_env_ref_field`; kept here so the function stays
+        // total. Spelled `Some("")` to match the sibling endpoint arm in
+        // `crate::config::BackendSection::resolved_base_url`.
+        Some("") => String::new(),
         Some(name) => std::env::var(name)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -554,9 +630,38 @@ fn expand_api_key_map(map: &HashMap<String, String>) -> HashMap<String, String> 
         .collect()
 }
 
+/// Build a STATIC auth provider from `cfg`, shared as `Arc<dyn HttpAuthProvider>`.
+///
+/// For [`AuthConfig::OAuthPassthrough`], use [`create_passthrough_auth_provider`]
+/// instead — without a token this returns a [`MissingTokenAuth`] (if required) or
+/// [`NoAuth`], since the per-request token is not yet known at startup.
+///
+/// # Errors
+///
+/// Returns [`HttpConnectorError::Auth`] when a credential field is a MALFORMED
+/// environment reference (see [`AuthConfig::malformed_env_ref_field`]). This is
+/// the construction-time validation the fallible signature was reserved for: a
+/// malformed reference used to resolve to the empty string and be OMITTED,
+/// which silently produced an unauthenticated client.
+///
+/// An UNSET or empty variable is NOT an error — that remains the deliberate
+/// omission policy (the provider collapses to [`NoAuth`]).
 pub fn create_auth_provider(
     cfg: &AuthConfig,
 ) -> Result<Arc<dyn HttpAuthProvider>, HttpConnectorError> {
+    // Refuse malformed references BEFORE resolution, so a value no environment
+    // could ever satisfy fails loudly here instead of being silently omitted by
+    // the empty-string path below. `ServerConfig::validate` catches the same
+    // defect at load time; this guard also covers an `AuthConfig` built in code
+    // or loaded by a path that skips validation.
+    if let Some(field) = cfg.malformed_env_ref_field() {
+        return Err(HttpConnectorError::Auth(format!(
+            "[backend.auth].{field} is a malformed environment reference; a reference must be \
+             exactly one `${{VAR}}` (name matching [A-Za-z0-9_]+) or `env:VAR` naming a single \
+             variable. The value is not echoed here because a malformed reference is often a \
+             mistyped literal secret."
+        )));
+    }
     let provider: Arc<dyn HttpAuthProvider> = match cfg {
         AuthConfig::None => Arc::new(NoAuth),
         AuthConfig::ApiKey {
@@ -1008,13 +1113,199 @@ token = "abc"
         assert_eq!(resolve_secret_ref("${}"), "");
     }
 
+    // NOTE: `test_parse_env_ref_distinguishes_literal_from_reference` moved with
+    // the function to `crate::env_ref` (Phase 120 Plan 04 Task 2) — the grammar
+    // is now defined and tested in one backend-neutral place. The resolution
+    // POLICY tests (empty-on-unset, omission) stay here, because that policy is
+    // credential-specific and deliberately differs from `base_url`'s.
+
+    // -------------------------------------------------------------------------
+    // A MALFORMED reference is REFUSED, never silently omitted.
+    //
+    // The unset-variable policy tested above (resolve to empty -> omit) is
+    // deliberate and unchanged. A MALFORMED reference is a different defect:
+    // `${}`, a composition like `${A}://${B}`, and a non-portable name like
+    // `${TFL-APP-KEY}` all parse to the empty name, and no environment can ever
+    // satisfy any of them. Omitting those silently sends an UNAUTHENTICATED
+    // request with no error and no log line, so they get the same refusal
+    // `[backend].base_url` already gets.
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn test_parse_env_ref_distinguishes_literal_from_reference() {
-        assert_eq!(parse_env_ref("env:FOO"), Some("FOO"));
-        assert_eq!(parse_env_ref("${FOO}"), Some("FOO"));
-        assert_eq!(parse_env_ref("${}"), Some("")); // malformed-but-a-reference
-        assert_eq!(parse_env_ref("plain"), None);
-        assert_eq!(parse_env_ref("${FOO"), None); // unterminated → literal
+    fn create_auth_provider_refuses_malformed_bearer_token_ref() {
+        let cfg = AuthConfig::Bearer {
+            token: "${TFL-APP-KEY}".to_string(),
+            required: true,
+        };
+        // `Arc<dyn HttpAuthProvider>` is not `Debug`, so `expect_err` is unavailable.
+        let Err(err) = create_auth_provider(&cfg) else {
+            panic!("a malformed ref must not build a provider");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("token"), "the error names the field: {msg}");
+        assert!(
+            !msg.contains("TFL-APP-KEY"),
+            "the error must not echo the configured value: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_auth_provider_refuses_malformed_api_key_map_value() {
+        // The map path is the worst shape: `expand_api_key_map` DROPS an entry
+        // that resolves to empty, so the request went out with the query
+        // parameter simply absent.
+        let cfg = AuthConfig::ApiKey {
+            query_params: [("app_key".to_string(), "${TFL-APP-KEY}".to_string())]
+                .into_iter()
+                .collect(),
+            headers: HashMap::new(),
+            required: true,
+        };
+        let Err(err) = create_auth_provider(&cfg) else {
+            panic!("a malformed ref must not build a provider");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("query_params.app_key"),
+            "the error names the offending map entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_auth_provider_refuses_malformed_composition_in_every_variant() {
+        // Each credential-bearing variant routes through the same guard.
+        let composed = "${A}://${B}".to_string();
+        let variants = [
+            AuthConfig::Bearer {
+                token: composed.clone(),
+                required: false,
+            },
+            AuthConfig::Basic {
+                username: "user".to_string(),
+                password: composed.clone(),
+                required: false,
+            },
+            AuthConfig::OAuth2ClientCredentials {
+                token_url: "https://example.com/token".to_string(),
+                client_id: "id".to_string(),
+                client_secret: composed.clone(),
+                scopes: vec![],
+                required: false,
+            },
+            AuthConfig::ApiKey {
+                query_params: HashMap::new(),
+                headers: [("X-Api-Key".to_string(), composed)].into_iter().collect(),
+                required: false,
+            },
+        ];
+        for cfg in variants {
+            assert!(
+                create_auth_provider(&cfg).is_err(),
+                "every credential-bearing variant refuses a malformed ref: {cfg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_api_key_report_is_deterministic_across_map_orderings() {
+        // `query_params` / `headers` are `HashMap`s, so a naive `.find()` would
+        // name a DIFFERENT field run to run when more than one entry is
+        // malformed — an error message that changes under the reader's feet.
+        for _ in 0..20 {
+            let cfg = AuthConfig::ApiKey {
+                query_params: [
+                    ("zeta".to_string(), "${}".to_string()),
+                    ("alpha".to_string(), "${}".to_string()),
+                    ("mid".to_string(), "${}".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                headers: HashMap::new(),
+                required: true,
+            };
+            let Err(err) = create_auth_provider(&cfg) else {
+                panic!("malformed refs are refused");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("query_params.alpha"),
+                "the lexicographically first offender is reported every time: {msg}"
+            );
+        }
+    }
+
+    mod malformed_ref_properties {
+        use super::super::{create_auth_provider, AuthConfig};
+        use crate::env_ref::is_valid_env_var_name;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// PROPERTY (CLAUDE.md ALWAYS): the credential guard is EXACTLY the
+            /// grammar's malformed set — a braced credential is refused if and
+            /// only if its interior is not a name an environment could be told
+            /// to set. Pinning the guard to `is_valid_env_var_name` rather than
+            /// to a hand-listed set of bad shapes is what keeps it from drifting
+            /// away from `parse_env_ref` and re-opening the silent-omission
+            /// hole for some shape nobody enumerated.
+            #[test]
+            fn braced_credential_is_refused_exactly_when_its_name_is_unsettable(
+                interior in "\\PC{0,64}"
+            ) {
+                let cfg = AuthConfig::Bearer {
+                    token: format!("${{{interior}}}"),
+                    required: true,
+                };
+                let settable = is_valid_env_var_name(&interior);
+                prop_assert_eq!(cfg.malformed_env_ref_field().is_some(), !settable);
+                prop_assert_eq!(create_auth_provider(&cfg).is_err(), !settable);
+            }
+
+            /// PROPERTY: the guard NEVER refuses a plain literal. A password is
+            /// arbitrary bytes and frequently contains `$`, `{` or `}`; refusing
+            /// one would turn this fix into an outage of its own.
+            #[test]
+            fn plain_literal_credentials_are_never_refused(raw in "\\PC{0,64}") {
+                prop_assume!(!raw.starts_with("env:") && !raw.starts_with("${"));
+                let cfg = AuthConfig::Basic {
+                    username: "svc".to_string(),
+                    password: raw,
+                    required: true,
+                };
+                prop_assert!(cfg.malformed_env_ref_field().is_none());
+                prop_assert!(create_auth_provider(&cfg).is_ok());
+            }
+
+            /// PROPERTY/FUZZ: the guard is total — arbitrary credential text
+            /// yields a verdict, never a panic. Config loading must not unwind
+            /// on adversarial input.
+            #[test]
+            fn guard_never_panics_on_arbitrary_credential_text(raw in "\\PC{0,256}") {
+                let cfg = AuthConfig::Bearer { token: raw, required: true };
+                let _ = cfg.malformed_env_ref_field();
+                let _ = create_auth_provider(&cfg);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unset_wellformed_ref_still_collapses_to_no_auth() {
+        // REGRESSION GUARD for the fix above: refusing MALFORMED references must
+        // not disturb the deliberate UNSET-variable policy. An optional
+        // credential whose variable simply is not exported is still omitted.
+        let var = "PMCP_TEST_UNSET_POLICY_UNCHANGED";
+        std::env::remove_var(var);
+        let cfg = AuthConfig::Bearer {
+            token: format!("${{{var}}}"),
+            required: false,
+        };
+        let auth = create_auth_provider(&cfg).expect("a well-formed ref still builds a provider");
+        let mut headers = HeaderMap::new();
+        let mut query = HashMap::new();
+        auth.apply(&mut headers, &mut query, None).await.unwrap();
+        assert!(
+            !headers.contains_key(reqwest::header::AUTHORIZATION),
+            "an unset optional credential is omitted, not refused"
+        );
     }
 
     #[tokio::test]

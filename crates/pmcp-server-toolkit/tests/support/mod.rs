@@ -37,3 +37,66 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+/// RAII guard that sets a process environment variable and RESTORES its prior
+/// value on drop — including when the test body panics.
+///
+/// [`env_lock`] and this guard solve two DIFFERENT problems and must be held
+/// together, not one instead of the other:
+///
+/// - `env_lock()` prevents CONCURRENT tests in one binary from interleaving
+///   their `set_var`/`remove_var` calls.
+/// - `EnvVarGuard` prevents SEQUENTIAL leakage: without it, a test that sets
+///   `TFL_BASE_URL` leaves it set for every later test in the same binary, so a
+///   later test silently inherits a value it never asked for and may pass for
+///   the wrong reason.
+///
+/// Restoration happens in `Drop`, which is what makes it survive a panicking
+/// test body — the case a manual cleanup line at the end of a test always
+/// misses.
+///
+/// # Example
+///
+/// ```ignore
+/// let _lock = support::env_lock();
+/// let _guard = support::EnvVarGuard::set("TFL_BASE_URL", "http://127.0.0.1:9999");
+/// // ... assertions ...
+/// // TFL_BASE_URL is restored to its prior value (or unset) here.
+/// ```
+pub struct EnvVarGuard {
+    key: String,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    /// Capture `key`'s current value, then set it to `value`. The captured
+    /// value is restored on drop.
+    pub fn set(key: &str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    /// Capture `key`'s current value, then REMOVE it. The captured value is
+    /// restored on drop — the "prove the unset path" companion to [`Self::set`].
+    pub fn unset(key: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(old) => std::env::set_var(&self.key, old),
+            None => std::env::remove_var(&self.key),
+        }
+    }
+}

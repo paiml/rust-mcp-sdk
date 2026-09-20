@@ -299,6 +299,18 @@ pub struct TokenResponse {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// The wire key OIDC Dynamic Client Registration uses for the application type (SEP-837).
+///
+/// Every read and write of that parameter in this module — [`DcrRequest::application_type`],
+/// [`DcrRequest::set_application_type`] and [`DcrResponse::application_type`] — routes through
+/// this one literal, so the reader and the writer cannot drift apart and no duplicate
+/// `application_type` key can ever reach the wire.
+///
+/// It is exported precisely so a caller who insists on writing [`DcrRequest::extra`] by hand
+/// cannot misspell the key. See [`DcrRequest::set_application_type`] for the precedence rule
+/// that governs mixing the accessors with raw map writes.
+pub const DCR_APPLICATION_TYPE_KEY: &str = "application_type";
+
 /// Dynamic Client Registration request (RFC 7591).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcrRequest {
@@ -350,6 +362,103 @@ pub struct DcrRequest {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+impl DcrRequest {
+    /// Read the OIDC `application_type` registration parameter (SEP-837).
+    ///
+    /// The value lives in the `#[serde(flatten)]` [`extra`](Self::extra) map under
+    /// [`DCR_APPLICATION_TYPE_KEY`], so it round-trips through serialize/deserialize and
+    /// lands as a **top-level** `"application_type"` key on the wire — byte-identical to
+    /// what a declared serde field would emit, and reachable without a struct-literal
+    /// change at any of this type's construction sites.
+    ///
+    /// Returns `None` when the parameter is absent **and** when the carrier holds a
+    /// non-string JSON value: a deserialized registration request is untrusted input, so
+    /// the accessor projects a JSON string or nothing at all. It never stringifies a
+    /// number, an array or an object, and it never panics.
+    ///
+    /// See [`set_application_type`](Self::set_application_type) for the precedence rule
+    /// when the accessor and a raw [`extra`](Self::extra) write are mixed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pmcp::server::auth::provider::DcrRequest;
+    ///
+    /// let request: DcrRequest = serde_json::from_value(serde_json::json!({
+    ///     "redirect_uris": ["http://127.0.0.1:8080/callback"],
+    ///     "application_type": "native"
+    /// }))?;
+    /// assert_eq!(request.application_type(), Some("native"));
+    ///
+    /// // A non-string value is refused rather than coerced.
+    /// let hostile: DcrRequest = serde_json::from_value(serde_json::json!({
+    ///     "redirect_uris": ["http://127.0.0.1:8080/callback"],
+    ///     "application_type": 42
+    /// }))?;
+    /// assert_eq!(hostile.application_type(), None);
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
+    #[must_use]
+    pub fn application_type(&self) -> Option<&str> {
+        self.extra
+            .get(DCR_APPLICATION_TYPE_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Set the OIDC `application_type` registration parameter (SEP-837).
+    ///
+    /// # Values
+    ///
+    /// SEP-837 defines two. `"native"` covers desktop applications, mobile apps, CLI tools
+    /// and locally-hosted web applications accessed via `localhost`; `"web"` covers remote
+    /// browser-based applications served from a non-local host. **Omitting the parameter
+    /// defaults to `web` under OIDC, which can conflict with native-style redirect URIs**;
+    /// non-OIDC authorization servers safely ignore it.
+    ///
+    /// The value is deliberately **not** validated here: the spec permits an authorization
+    /// server to define further values, and this setter is also the override path for a
+    /// derived one.
+    ///
+    /// # Precedence
+    ///
+    /// This setter and a hand-written `extra.insert("application_type", …)` address the
+    /// **same single map entry**. There is therefore no "typed versus raw" duality and no
+    /// way to emit two `application_type` keys on the wire: **last write wins**, whichever
+    /// route the write arrived through. Prefer this accessor; a caller who insists on
+    /// writing the key directly should use [`DCR_APPLICATION_TYPE_KEY`] so it cannot be
+    /// misspelled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pmcp::server::auth::provider::{DcrRequest, DCR_APPLICATION_TYPE_KEY};
+    ///
+    /// let mut request: DcrRequest = serde_json::from_value(serde_json::json!({
+    ///     "redirect_uris": ["http://127.0.0.1:8080/callback"]
+    /// }))?;
+    /// request.set_application_type("native");
+    /// assert_eq!(request.application_type(), Some("native"));
+    ///
+    /// // The flattened carrier puts it at the top level, not under an `extra` object.
+    /// let wire = serde_json::to_value(&request)?;
+    /// assert_eq!(wire["application_type"], serde_json::json!("native"));
+    ///
+    /// // Last write wins, and the raw route addresses the very same entry.
+    /// request
+    ///     .extra
+    ///     .insert(DCR_APPLICATION_TYPE_KEY.to_string(), serde_json::json!("web"));
+    /// assert_eq!(request.application_type(), Some("web"));
+    /// assert_eq!(request.extra.len(), 1);
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
+    pub fn set_application_type(&mut self, value: impl Into<String>) {
+        self.extra.insert(
+            DCR_APPLICATION_TYPE_KEY.to_string(),
+            serde_json::Value::String(value.into()),
+        );
+    }
+}
+
 /// Dynamic Client Registration response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcrResponse {
@@ -379,6 +488,46 @@ pub struct DcrResponse {
     /// Additional response data (echoed from request).
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl DcrResponse {
+    /// Read the `application_type` the authorization server echoed back (SEP-837).
+    ///
+    /// Read-only by design: RFC 7591 § 3.2.1 explicitly permits the authorization server to
+    /// modify any requested client metadata, so this value is the server's answer, not the
+    /// client's request. Mutating it locally would misrepresent what was registered, which
+    /// is why there is deliberately no setter here — the request-side counterpart is
+    /// [`DcrRequest::set_application_type`].
+    ///
+    /// Returns `None` when the server omitted the parameter **and** when it echoed a
+    /// non-string JSON value. The whole response is attacker-influenced input, so the
+    /// accessor projects a JSON string or nothing at all: no stringification, no unwrap and
+    /// no panic, even over bytes that arrived from an untrusted registration endpoint.
+    ///
+    /// The same single-entry, last-write-wins rule documented on
+    /// [`DcrRequest::set_application_type`] governs [`extra`](Self::extra) here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pmcp::server::auth::provider::DcrResponse;
+    ///
+    /// let echoed: DcrResponse =
+    ///     serde_json::from_str(r#"{"client_id":"c-1","application_type":"native"}"#)?;
+    /// assert_eq!(echoed.application_type(), Some("native"));
+    ///
+    /// // A server that stays silent, and a server that answers with a non-string, are
+    /// // both reported as "no application type" rather than as a failure.
+    /// let silent: DcrResponse = serde_json::from_str(r#"{"client_id":"c-1"}"#)?;
+    /// assert_eq!(silent.application_type(), None);
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
+    #[must_use]
+    pub fn application_type(&self) -> Option<&str> {
+        self.extra
+            .get(DCR_APPLICATION_TYPE_KEY)
+            .and_then(serde_json::Value::as_str)
+    }
 }
 
 /// Error from identity provider operations.
@@ -1008,6 +1157,185 @@ mod tests {
         let response: DcrResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.client_id, "public_client_123");
         assert!(response.client_secret.is_none());
+    }
+
+    // =========================================================================
+    // application_type Accessor Tests (SEP-837 / AUTH-02)
+    //
+    // These pin the D-09 contract: `application_type` is carried by the
+    // `#[serde(flatten)] extra` map through inherent accessors, never by a new
+    // public field, so `cargo semver-checks`' `constructible_struct_adds_field`
+    // (a MAJOR finding) is never triggered.
+    // =========================================================================
+
+    /// A `DcrRequest` built without touching `extra` advertises no application type.
+    #[test]
+    fn test_dcr_request_application_type_absent_by_default() {
+        let request = minimal_dcr_request();
+        assert_eq!(request.application_type(), None);
+    }
+
+    /// The setter is readable through the getter — the pair addresses one map entry.
+    #[test]
+    fn test_dcr_request_set_application_type_is_readable() {
+        let mut request = minimal_dcr_request();
+        request.set_application_type("native");
+        assert_eq!(request.application_type(), Some("native"));
+    }
+
+    /// The flatten carrier emits a TOP-LEVEL key, byte-identical to a real serde field.
+    #[test]
+    fn test_dcr_request_application_type_serializes_at_top_level() {
+        let mut request = minimal_dcr_request();
+        request.set_application_type("native");
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["application_type"], serde_json::json!("native"));
+        assert!(
+            value.get("extra").is_none(),
+            "the carrier must not surface as a nested `extra` object"
+        );
+
+        // Exactly one occurrence on the wire — no typed/raw duality is possible.
+        let text = serde_json::to_string(&request).unwrap();
+        assert_eq!(text.matches("\"application_type\"").count(), 1);
+    }
+
+    /// Serialize then deserialize preserves the value, as a real field would.
+    #[test]
+    fn test_dcr_request_application_type_survives_round_trip() {
+        let mut request = minimal_dcr_request();
+        request.set_application_type("web");
+
+        let text = serde_json::to_string(&request).unwrap();
+        let back: DcrRequest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.application_type(), Some("web"));
+    }
+
+    /// Collision order A: a hand-written raw key, then the setter — last write wins.
+    #[test]
+    fn test_dcr_request_application_type_raw_then_setter_last_write_wins() {
+        let mut request = minimal_dcr_request();
+        request.extra.insert(
+            DCR_APPLICATION_TYPE_KEY.to_string(),
+            serde_json::json!("web"),
+        );
+        request.set_application_type("native");
+
+        assert_eq!(request.application_type(), Some("native"));
+        assert_eq!(request.extra.len(), 1, "one key, never two");
+        let text = serde_json::to_string(&request).unwrap();
+        assert_eq!(text.matches("\"application_type\"").count(), 1);
+        assert!(!text.contains("\"web\""));
+    }
+
+    /// Collision order B: the setter, then a hand-written raw key — same rule, stated symmetrically.
+    #[test]
+    fn test_dcr_request_application_type_setter_then_raw_last_write_wins() {
+        let mut request = minimal_dcr_request();
+        request.set_application_type("native");
+        request.extra.insert(
+            DCR_APPLICATION_TYPE_KEY.to_string(),
+            serde_json::json!("web"),
+        );
+
+        assert_eq!(request.application_type(), Some("web"));
+        assert_eq!(request.extra.len(), 1, "one key, never two");
+        let text = serde_json::to_string(&request).unwrap();
+        assert_eq!(text.matches("\"application_type\"").count(), 1);
+        assert!(!text.contains("\"native\""));
+    }
+
+    /// A non-string JSON value projects to `None` rather than panicking or stringifying.
+    #[test]
+    fn test_dcr_request_application_type_non_string_value_is_none() {
+        for hostile in [
+            serde_json::json!(42),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["native"]),
+            serde_json::json!({ "value": "native" }),
+        ] {
+            let mut request = minimal_dcr_request();
+            request
+                .extra
+                .insert(DCR_APPLICATION_TYPE_KEY.to_string(), hostile.clone());
+            assert_eq!(
+                request.application_type(),
+                None,
+                "non-string value {hostile} must project to None"
+            );
+        }
+    }
+
+    /// The response accessor reads the AS's echo, and reports absence as `None`.
+    #[test]
+    fn test_dcr_response_application_type_reads_the_echo() {
+        let echoed: DcrResponse =
+            serde_json::from_str(r#"{"client_id":"client_123","application_type":"native"}"#)
+                .unwrap();
+        assert_eq!(echoed.application_type(), Some("native"));
+
+        let silent: DcrResponse = serde_json::from_str(r#"{"client_id":"client_123"}"#).unwrap();
+        assert_eq!(silent.application_type(), None);
+    }
+
+    /// Arbitrary bytes reach the response accessor without a panic — `Err` or `None`, never abort.
+    /// 116-08 fuzzes this same pair; this test pins three shapes by hand.
+    #[test]
+    fn test_dcr_response_application_type_from_malformed_bytes_never_panics() {
+        for malformed in [
+            &b"null"[..],
+            &b"[\"application_type\"]"[..],
+            &br#"{"application_type": {"a":1}}"#[..],
+            &b"\xff\xfe not json at all"[..],
+            &b""[..],
+        ] {
+            // A refusal (`Err`) is an acceptable outcome here; a panic is not. Only the
+            // parsed-successfully branch carries an assertion.
+            if let Ok(response) = serde_json::from_slice::<DcrResponse>(malformed) {
+                assert_eq!(response.application_type(), None);
+            }
+        }
+
+        // A well-formed response whose echoed value is an object still yields None.
+        let objectish: DcrResponse =
+            serde_json::from_slice(br#"{"client_id":"c","application_type":{"a":1}}"#).unwrap();
+        assert_eq!(objectish.application_type(), None);
+    }
+
+    /// Reader and writer share ONE literal, so the wire key cannot drift between them.
+    #[test]
+    fn test_dcr_application_type_key_is_the_single_wire_literal() {
+        assert_eq!(DCR_APPLICATION_TYPE_KEY, "application_type");
+
+        let mut request = minimal_dcr_request();
+        request.set_application_type("native");
+        assert_eq!(
+            request
+                .extra
+                .get(DCR_APPLICATION_TYPE_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("native")
+        );
+    }
+
+    /// Shared fixture: the smallest legal `DcrRequest`, with an untouched carrier.
+    fn minimal_dcr_request() -> DcrRequest {
+        DcrRequest {
+            redirect_uris: vec!["http://127.0.0.1:8080/callback".to_string()],
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
+            contacts: vec![],
+            token_endpoint_auth_method: None,
+            grant_types: vec![],
+            response_types: vec![],
+            scope: None,
+            software_id: None,
+            software_version: None,
+            extra: HashMap::new(),
+        }
     }
 
     // =========================================================================

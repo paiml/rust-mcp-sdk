@@ -43,6 +43,22 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dependencies inside this workspace are EXEMPT from the wildcard ban.
+#
+# Root `Cargo.toml`'s `[dev-dependencies] pmcp-agent` is deliberately PATH-ONLY
+# with no `version` key, and that comment explains why at length: `pmcp-agent`
+# is at 0.2.0, 0.2.0 is not on crates.io, and `release.yml` publishes `pmcp`
+# long BEFORE `pmcp-agent` — so a `version` key there would make every
+# `cargo publish -p pmcp` fail on an unresolvable dev-dependency. Cargo strips
+# path-only dev-deps at publish time, which is what makes the path-only form
+# correct rather than sloppy.
+#
+# Without this setting cargo-deny reads that entry as `pmcp-agent = "*"` and
+# fails the `bans` check, so the two requirements are in direct conflict and
+# `wildcards = "deny"` alone cannot be satisfied. This narrows the ban to
+# REGISTRY dependencies, which is where a wildcard is actually dangerous; a
+# path dep resolves within the workspace and has no version-resolution risk.
+allow-wildcard-paths = true
 highlight = "all"
 skip = [
     # Allow multiple getrandom versions (v0.2 from ring/rustls, v0.4 direct)

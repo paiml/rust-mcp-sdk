@@ -18,6 +18,9 @@
 //!    `app_key=dummy` query param (proving the api_key query-param auth AND that
 //!    `${TFL_APP_KEY}` resolved to `dummy`, never the literal `${...}`), then
 //!    replays `london-tube-scenarios.yaml` through `mcp-tester`, gating per-step.
+//!    The fixture is copied VERBATIM and pointed at wiremock through the
+//!    `${TFL_BASE_URL}` endpoint slot (PKG-03) — the same mechanism a real
+//!    deployment uses — rather than by string-replacing a baked `base_url`.
 //! 3. `parity_live_tfl` (`#[ignore]`) — the same scenarios against the REAL
 //!    `https://api.tfl.gov.uk`, double-gated on `PMCP_OPENAPI_LIVE_TEST=1` +
 //!    a real `TFL_APP_KEY`.
@@ -33,44 +36,14 @@ use mcp_tester::{ScenarioExecutor, ServerTester, TestScenario};
 use pmcp_openapi_server::{run_serving, Args};
 use pmcp_server_toolkit::http::OpenApiSchema;
 use pmcp_server_toolkit::ServerConfig;
-use serde_json::json;
-use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
-/// Absolute path to the vendored fixtures directory.
-fn fixtures_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
+mod common;
 
-/// Absolute path to the published `examples/` directory (ships with the crate;
-/// `tests/` is excluded from the tarball but `examples/` is NOT — Cargo.toml:14).
-fn examples_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")
-}
-
-/// The Code Mode showcase surface that BOTH the enriched fixture and the
-/// pointable example must ship (P901-FIXTURE / P901-EXAMPLE): the three context
-/// resource URIs + the `start_code_mode` prompt. Asserting it in one place keeps
-/// the two configs from drifting apart on the showcase surface. `label` names the
-/// config under test so a failure points at the right file.
-fn assert_london_tube_code_mode_surface(cfg: &ServerConfig, label: &str) {
-    let resource_uris: Vec<&str> = cfg.resources.iter().map(|r| r.uri.as_str()).collect();
-    for uri in [
-        "docs://london-tube/schema",
-        "docs://london-tube/examples",
-        "code-mode://learnings",
-    ] {
-        assert!(
-            resource_uris.contains(&uri),
-            "{label} ships the {uri} resource: {resource_uris:?}"
-        );
-    }
-    assert!(
-        cfg.prompts.iter().any(|p| p.name == "start_code_mode"),
-        "{label} ships the start_code_mode prompt: {:?}",
-        cfg.prompts.iter().map(|p| &p.name).collect::<Vec<_>>()
-    );
-}
+use common::{
+    assert_london_tube_code_mode_surface, assert_london_tube_config_slots, examples_dir,
+    fixtures_dir, mount_london_tube, tfl_env_lock, DUMMY_APP_KEY,
+};
 
 /// P901-EXAMPLE smoke: the user-pointable `examples/london-tube.toml` (the config
 /// a user runs via `pmcp-openapi-server --config <path>`) parses + validates
@@ -92,6 +65,9 @@ fn pointable_example_config_parses_and_validates() {
         config_text.contains("${TFL_APP_KEY}"),
         "pointable example keeps the ${{TFL_APP_KEY}} placeholder (no real key)"
     );
+    // PKG-03: the same three declared slots + the ${TFL_BASE_URL} endpoint
+    // placeholder as the fixture — the two copies move together.
+    assert_london_tube_config_slots(&cfg, &config_text, "pointable example");
 }
 
 /// Fixture-validity (Task 1): the vendored config + spec parse, and the expected
@@ -121,6 +97,10 @@ fn london_tube_fixture() {
     // (1a/1b) The enriched showcase ships all three Code Mode context resources
     // and the start_code_mode prompt (shared surface — see helper).
     assert_london_tube_code_mode_surface(&cfg, "enriched fixture");
+
+    // (1a') PKG-03: the three declared config slots + the ${TFL_BASE_URL}
+    // endpoint placeholder. A future edit that drops the block fails HERE.
+    assert_london_tube_config_slots(&cfg, &config_text, "enriched fixture");
 
     // (1c) cost_hint VALUE check: get-tube-status parses to the allowed "low" value
     // (not a mere presence check — proves the cost_hint enum string parsed).
@@ -179,51 +159,6 @@ fn london_tube_fixture() {
     );
 }
 
-/// The dummy api key the parity test resolves `${TFL_APP_KEY}` to. The wiremock
-/// backend REQUIRES `app_key=dummy` on every request — proving BOTH the api_key
-/// query-param outgoing-auth path (D-04) AND that `${TFL_APP_KEY}` was RESOLVED
-/// (not sent as the literal `${...}`, T-90-07-04).
-const DUMMY_APP_KEY: &str = "dummy";
-
-/// Mount the london-tube backend responses on the wiremock server, REQUIRING the
-/// `app_key=dummy` query param on every matcher (the secret-expansion + api_key
-/// query-param proof). Victoria is disrupted (statusSeverity 6 < 10), Central is
-/// healthy (10); the per-line `/Line/victoria/Disruption` returns "Severe delays".
-async fn mount_london_tube(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/Line/Mode/tube/Status"))
-        .and(query_param("app_key", DUMMY_APP_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "id": "victoria", "name": "Victoria", "lineStatuses": [ { "statusSeverity": 6, "statusSeverityDescription": "Severe Delays" } ] },
-            { "id": "central", "name": "Central", "lineStatuses": [ { "statusSeverity": 10, "statusSeverityDescription": "Good Service" } ] }
-        ])))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/Line/victoria/Disruption"))
-        .and(query_param("app_key", DUMMY_APP_KEY))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "category": "RealTime",
-            "description": "Severe delays due to an earlier signal failure."
-        })))
-        .mount(server)
-        .await;
-}
-
-/// Build a temp `london-tube.toml` from the vendored fixture with its
-/// `[backend] base_url` overridden to point at the wiremock server. String
-/// replacement keeps the rest of the fixture (auth, tools, code_mode) byte-identical.
-fn temp_config_pointing_at(backend_url: &str) -> String {
-    const REFERENCE_BASE_URL: &str = r#"base_url = "https://api.tfl.gov.uk""#;
-    let reference = std::fs::read_to_string(fixtures_dir().join("london-tube.toml"))
-        .expect("read london-tube.toml");
-    assert!(
-        reference.contains(REFERENCE_BASE_URL),
-        "london-tube.toml must contain the base_url line to override"
-    );
-    reference.replace(REFERENCE_BASE_URL, &format!("base_url = \"{backend_url}\""))
-}
-
 /// OAPI-08 / D-04 — the binding parity assertion, OFFLINE via wiremock.
 ///
 /// Drives the REAL binary pipeline ([`run_serving`]) against a wiremock backend
@@ -232,21 +167,43 @@ fn temp_config_pointing_at(backend_url: &str) -> String {
 /// matchers + the post-replay request inspection prove the api_key query-param
 /// auth AND the `${TFL_APP_KEY}` → `app_key=dummy` secret expansion (never the
 /// literal `${...}`).
+// Why (clippy::await_holding_lock): holding the guard across the awaits is the
+// POINT of `tfl_env_lock`, not an oversight. `TFL_BASE_URL`/`TFL_APP_KEY` are
+// read once, at assembly time, inside the awaited `run_serving` — so the lock
+// must still be held when that await completes, or a concurrent test's
+// `set_var` could land in between and this "offline" replay would silently
+// target live TfL. An async-aware mutex would not help: the hazard is the
+// process-global environment, and these tests are run `--test-threads=1`
+// precisely so the guard is uncontended. This lint predates Phase 121 (verified
+// against the pre-lift file, which emits the identical warning) and is
+// unreachable by `make lint`, which lints only the root `pmcp` package.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn london_tube_parity_through_real_binary_path() {
+    // Serialize with parity_live_tfl — both mutate the same process-global
+    // variables, and assembly-time resolution must see THIS test's values.
+    let _env_lock = tfl_env_lock();
+
     // The fixture's `${TFL_APP_KEY}` resolves from the process env at auth
     // provider construction time — set it BEFORE spawning the server.
     std::env::set_var("TFL_APP_KEY", DUMMY_APP_KEY);
 
     // (1) Stand up the wiremock backend with app_key=dummy-gated matchers.
     let backend = MockServer::start().await;
-    mount_london_tube(&backend).await;
+    mount_london_tube(&backend, DUMMY_APP_KEY).await;
 
-    // (2) Temp config: the vendored london-tube.toml with base_url → wiremock.
+    // (2) Point the fixture at wiremock through the ENDPOINT SLOT (PKG-03), not
+    // through string surgery over a baked literal. `base_url` is
+    // `${TFL_BASE_URL}` in the committed fixture, so the config is copied
+    // VERBATIM and the environment supplies the endpoint — exactly the
+    // mechanism a real deployment uses. Both variables resolve at dispatch
+    // time, so both must be set before `run_serving` assembles the server.
+    std::env::set_var("TFL_BASE_URL", backend.uri());
+
     let tmp = tempfile::tempdir().expect("create tempdir");
     let config_path = tmp.path().join("london-tube.toml");
-    std::fs::write(&config_path, temp_config_pointing_at(&backend.uri()))
-        .expect("write temp london-tube.toml");
+    std::fs::copy(fixtures_dir().join("london-tube.toml"), &config_path)
+        .expect("copy london-tube.toml");
 
     // (3) The REAL binary path: programmatic Args → run_serving (NO --spec; the
     // reference instance ships none — D-03 curated path). Ephemeral loopback port.
@@ -360,9 +317,19 @@ async fn london_tube_parity_through_real_binary_path() {
 ///   cargo test -p pmcp-openapi-server --test parity_replay parity_live_tfl \
 ///   -- --ignored --test-threads=1
 /// ```
+// Why (clippy::await_holding_lock): same rationale as the offline twin above —
+// the guard must outlive the awaited `run_serving` assembly, and these tests
+// are single-threaded by construction. Pre-existing; not introduced by the
+// Phase 121 D-02 helper lift.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 #[ignore = "live network — requires PMCP_OPENAPI_LIVE_TEST=1 + a real TFL_APP_KEY"]
 async fn parity_live_tfl() {
+    // Serialize with the offline parity test — see TFL_ENV_LOCK. Taken BEFORE
+    // the gates below so even the skip paths cannot interleave with a
+    // concurrent offline run's env reads.
+    let _env_lock = tfl_env_lock();
+
     // Double-gate: even when run with --ignored, bail unless explicitly enabled
     // AND a real key is present (never hit the live API by accident).
     if std::env::var("PMCP_OPENAPI_LIVE_TEST").ok().as_deref() != Some("1") {
@@ -378,7 +345,12 @@ async fn parity_live_tfl() {
         return;
     }
 
-    // Use the vendored fixture VERBATIM — base_url stays https://api.tfl.gov.uk.
+    // Use the vendored fixture VERBATIM. Its `base_url` is the
+    // `${TFL_BASE_URL}` endpoint slot (PKG-03), so the LIVE path supplies the
+    // real TfL endpoint through the environment — the same mechanism the
+    // offline replay uses to supply wiremock's.
+    std::env::set_var("TFL_BASE_URL", "https://api.tfl.gov.uk");
+
     let tmp = tempfile::tempdir().expect("create tempdir");
     let config_path = tmp.path().join("london-tube.toml");
     std::fs::copy(fixtures_dir().join("london-tube.toml"), &config_path)

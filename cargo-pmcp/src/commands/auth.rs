@@ -13,36 +13,36 @@ use pmcp::client::oauth::{default_cache_path, OAuthConfig, OAuthHelper};
 use pmcp::client::oauth_middleware::{BearerToken, OAuthClientMiddleware};
 
 use super::auth_cmd::cache::{
-    default_multi_cache_path, is_near_expiry, normalize_cache_key, refresh_and_persist,
-    TokenCacheV1, REFRESH_WINDOW_SECS,
+    is_near_expiry, load_for_server, normalize_server_key, open_store, refresh_through_sdk,
+    REFRESH_WINDOW_SECS,
 };
 use super::flags::AuthMethod;
 
-/// Look up an access_token in the multi-server cache for `mcp_server_url`.
+/// Look up an access token for `mcp_server_url` in the shared credential store.
 ///
-/// Transparently refreshes when within [`REFRESH_WINDOW_SECS`] of expiry.
+/// Transparently refreshes through the SDK when within [`REFRESH_WINDOW_SECS`]
+/// of expiry.
 ///
 /// Returns `Ok(None)` when:
-/// - the cache file does not exist, OR
-/// - the normalized URL is not present in the cache.
+/// - the credential file does not exist, OR
+/// - nothing is stored for the normalized URL.
 async fn try_cache_token(mcp_server_url: &str) -> Result<Option<String>> {
-    let cache_path = default_multi_cache_path();
-    // If cache file does not exist, the default read returns empty cache.
-    let cache = TokenCacheV1::read(&cache_path)?;
-    let key = normalize_cache_key(mcp_server_url)?;
-    let Some(entry) = cache.entries.get(&key).cloned() else {
+    let store = open_store();
+    let key = normalize_server_key(mcp_server_url)?;
+    // A missing credential file reads as an empty store, not as an error.
+    let Some((credential_key, credentials)) = load_for_server(&store, &key).await? else {
         return Ok(None);
     };
 
-    if is_near_expiry(&entry, REFRESH_WINDOW_SECS) {
-        let refreshed = refresh_and_persist(&cache_path, &key, &entry)
+    if is_near_expiry(&credentials, REFRESH_WINDOW_SECS) {
+        let refreshed = refresh_through_sdk(store.clone(), mcp_server_url, credential_key.issuer())
             .await
             .map_err(|e| anyhow::anyhow!(
                 "cached token for {key} expired and refresh failed: {e}\nRun `cargo pmcp auth login {key}` to re-authenticate."
             ))?;
         Ok(Some(refreshed))
     } else {
-        Ok(Some(entry.access_token))
+        Ok(Some(credentials.access_token().to_string()))
     }
 }
 

@@ -107,8 +107,13 @@ pub enum TaskPollDecision {
     /// The classifier carries the terminal [`TaskStatus`] by value (it is
     /// `Copy`) but deliberately does NOT carry the final
     /// [`CallToolResult`](crate::types::CallToolResult): to retrieve the
-    /// result the caller still issues a **separate `tasks/result`** call
-    /// (D-06/D-16). This keeps classification a pure, I/O-free decision.
+    /// result the caller issues a **second call** (D-06/D-16). This keeps
+    /// classification a pure, I/O-free decision.
+    ///
+    /// Which second call is ERA-DEPENDENT: on v1 (2025-11-25) it is
+    /// `tasks/result`; on v2 (2026-07-28) that method is retired and the
+    /// terminal `tasks/get` already inlines `result` / `error` on the
+    /// [`TaskDetailV2`] body, so the follow-up is another `tasks/get`.
     Terminal {
         /// The terminal status that ended the task.
         status: TaskStatus,
@@ -192,6 +197,18 @@ pub fn resolve_poll_interval(caller_override: Option<u64>, hint: Option<u64>) ->
 }
 
 /// A task resource representing an in-progress or completed operation.
+///
+/// # This is the **v1 (2025-11-25)** wire shape
+///
+/// `Task` is the storage-and-v1-wire type. The v2 (2026-07-28)
+/// `io.modelcontextprotocol/tasks` extension renames two of its fields
+/// (`ttl` → `ttlMs`, `pollInterval` → `pollIntervalMs`) and makes `ttlMs`
+/// required-and-nullable, so it has its own projection type: [`TaskV2`],
+/// produced by [`TaskV2::from_v1`] — the ONLY site where those renames happen.
+/// The richer per-status v2 variants live on [`TaskDetailV2`].
+///
+/// Serializing a `Task` onto a v2 response is a schema-invalid answer. Project
+/// it first.
 ///
 /// # Backward Compatibility
 ///
@@ -331,7 +348,9 @@ impl Task {
     ///   [`TaskStatus::Cancelled`] → [`TaskPollDecision::Terminal`] carrying the
     ///   terminal status. The final
     ///   [`CallToolResult`](crate::types::CallToolResult) is NOT fetched here —
-    ///   the caller issues a separate `tasks/result` call (D-06/D-16).
+    ///   the caller issues a separate call (D-06/D-16): `tasks/result` on v1,
+    ///   and on v2 a `tasks/get`, which inlines the result (`tasks/result` is
+    ///   retired there).
     ///
     /// # Examples
     ///
@@ -478,7 +497,14 @@ impl TaskMetadata {
     }
 }
 
-/// Result of creating a task.
+/// Result of creating a task — the **v1 (2025-11-25)** wire shape.
+///
+/// v1 NESTS the task under a `task` key. The v2 `CreateTaskResult` is FLAT
+/// (`Result & Task`) and carries the discriminator `resultType: "task"`;
+/// nothing constructs this struct on the v2 path. The v2 body is projected
+/// through [`TaskV2`] and emitted by
+/// `pmcp::server::task_dispatch`'s `v2_create_result_value` (inventory rows
+/// 16-17, plans 114-11 / 114-12).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "camelCase")]
@@ -510,7 +536,14 @@ pub struct GetTaskRequest {
     pub task_id: String,
 }
 
-/// Get task result.
+/// Get task result — the **v1 (2025-11-25)** wire shape.
+///
+/// v1 NESTS the task under a `task` key and carries no result or error body.
+/// The v2 `GetTaskResult` is FLAT (`Result & DetailedTask`) with
+/// `resultType: "complete"`, and it INLINES the terminal `result` / `error` and
+/// the outstanding `inputRequests` — which is why v2 needs no `tasks/result`.
+/// That shape is [`TaskDetailV2`] over a [`TaskV2`] (inventory rows 18, 21-24,
+/// plan 114-11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "camelCase")]
@@ -543,7 +576,13 @@ pub struct ListTasksRequest {
     pub cursor: Option<String>,
 }
 
-/// List tasks result.
+/// List tasks result — **v1-only (2025-11-25)**.
+///
+/// There is no v2 counterpart and no projection type: `tasks/list` is ABSENT
+/// from the `io.modelcontextprotocol/tasks` extension and answers `-32601` on a
+/// v2-negotiated request (inventory row 37, plan 114-08). The removal is a
+/// SECURITY improvement — with no enumeration primitive a server cannot leak
+/// the existence of one caller's tasks to another. Kept unchanged for v1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "camelCase")]
@@ -589,7 +628,14 @@ pub struct CancelTaskRequest {
     pub result: Option<serde_json::Value>,
 }
 
-/// Cancel task result.
+/// Cancel task result — the **v1 (2025-11-25)** wire shape.
+///
+/// v1 echoes the cancelled task back under a `task` key. The v2
+/// `CancelTaskResult` is an **empty acknowledgement** — `Result` only, with
+/// `resultType: "complete"` and NO task body — because v2 cancellation is
+/// cooperative and eventually consistent, so echoing a status would assert a
+/// synchrony the server does not have. Poll [`TaskDetailV2`] via `tasks/get` to
+/// observe the transition (inventory row 20, plan 114-11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "camelCase")]
@@ -602,6 +648,457 @@ impl CancelTaskResult {
     /// Create a cancel task result.
     pub fn new(task: Task) -> Self {
         Self { task }
+    }
+}
+
+// ===========================================================================
+// v2 (2026-07-28) tasks-extension projection types — ADDITIVE ONLY.
+//
+// Nothing above this line changes. `Task`, `CreateTaskResult`, `GetTaskResult`
+// and `CancelTaskResult` are the shapes every tasks server already emits on the
+// 2025-11-25 wire, and a serde-level rename or re-nesting on any of them would
+// move those bytes for ALL of them — the D-02 lock `tests/v1_tasks_golden.rs`
+// pins. The v2 shapes therefore live in SEPARATE types, projected above the
+// `serde_json::Value` seam in `server::task_dispatch`, and the two eras never
+// share a serde attribute.
+//
+// The v2 union is also not expressible as one flat struct: the extension models
+// the detailed task as five status-discriminated variants with PER-VARIANT
+// required fields (`result` on `completed`, `error` on `failed`,
+// `inputRequests` on `input_required`), which `Option` + `skip_serializing_if`
+// can only approximate.
+// ===========================================================================
+
+/// The commit of the vendored tasks-extension artifact every v2 wire name in
+/// this module is read from.
+///
+/// Recorded as a constant rather than only in prose so a re-vendoring at the
+/// D-18 schema gate has a compile-visible thing to update. The digests live in
+/// `schema/vendored/ext-tasks/PROVENANCE.md`.
+pub const EXT_TASKS_SCHEMA_COMMIT: &str = "2c1425d9a288b9b1f489430fe1e00bb392b47e48";
+
+/// The flat v2 `Task` payload of the MCP tasks extension (2026-07-28).
+///
+/// # Provenance
+///
+/// Every field name here was read from the vendored artifact
+/// `schema/vendored/ext-tasks/schema.ts` (`interface Task`, lines 46-92) at
+/// [`EXT_TASKS_SCHEMA_COMMIT`], never from research prose. The governing
+/// wire-value inventory is
+/// `.planning/phases/114-tasks-extension-migration/114-SPEC-RECHECK.md`
+/// rows 4-10 — that document is the authority if it and this rustdoc ever
+/// disagree.
+///
+/// # Required fields: FIVE, not four
+///
+/// `schema.json` `$defs.Task.required` is
+/// `["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"]`. `ttlMs` is
+/// **required and nullable**; "optional because it can be null" is the wrong
+/// reading and produces a schema-invalid response. Only `pollIntervalMs` and
+/// `statusMessage` are genuinely optional.
+///
+/// # Relationship to the v1 [`Task`]
+///
+/// This is a PROJECTION of it, built by [`TaskV2::from_v1`], not a replacement:
+/// `ttl` becomes `ttlMs` and `poll_interval` becomes `pollIntervalMs`. Those two
+/// are RENAMES on the wire, not merely re-nestings, which is why they carry
+/// their own per-field provenance notes below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "camelCase")]
+pub struct TaskV2 {
+    /// The task identifier. **Required.** (`schema.ts:50`)
+    pub task_id: String,
+    /// Current task status. **Required.** (`schema.ts:55`)
+    ///
+    /// Serialized by the SAME [`TaskStatus`] the v1 wire uses — the two eras'
+    /// five status strings are name-identical, so there is no conversion table
+    /// to drift, only a locking tripwire in `tests/v2_tasks_shapes.rs`.
+    pub status: TaskStatus,
+    /// Optional human-readable message describing the current task state.
+    /// (`schema.ts:57-66`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    /// ISO 8601 creation timestamp. **Required.** (`schema.ts:71`)
+    pub created_at: String,
+    /// ISO 8601 last-updated timestamp. **Required.** (`schema.ts:76`)
+    pub last_updated_at: String,
+    /// Time-to-live from creation in integer milliseconds, `null` for unlimited.
+    ///
+    /// **RENAMED from the v1 `ttl`** — inventory row 8. It is **required AND
+    /// nullable** (`schema.ts:79-84`, `$defs.Task.required[4]`), so it is
+    /// deliberately modelled WITHOUT `skip_serializing_if`: `None` must
+    /// serialize as `"ttlMs":null` (present), never be omitted. This is the same
+    /// treatment [`Task::ttl`] already documents, for the same reason.
+    ///
+    /// **Not a cache hint (D-10).** This `ttlMs` is a task LIFETIME — how long
+    /// the server retains this task record. It shares its spec name with the
+    /// `ttlMs` of [`crate::types::caching`], which is a cache-FRESHNESS hint on
+    /// the six `CacheableResult` list/read responses. The two are unrelated and
+    /// the modules deliberately never import each other; copying a long task
+    /// lifetime into a cache hint would tell clients that stale data is fresh.
+    pub ttl_ms: Option<u64>,
+    /// Suggested polling interval in integer milliseconds.
+    ///
+    /// **RENAMED from the v1 `pollInterval`** — inventory row 9. Genuinely
+    /// OPTIONAL: it is absent from every per-variant `required` array
+    /// (`schema.ts:86-91`), so it carries `skip_serializing_if` and a `None`
+    /// omits the key entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// Full operator-facing diagnostic detail (step ids, URLs, internal error
+    /// text) for this task.
+    ///
+    /// **PMCP EXTENSION — not an MCP-spec field (D-17).** Carried through from
+    /// [`Task::diagnostic_detail`] verbatim in argument: the extension's `Task`
+    /// has no `deny_unknown_fields` equivalent in practice, so a consumer that
+    /// does not know this key simply ignores the extra `diagnosticDetail` on the
+    /// wire — additive and non-breaking. Producers MUST redact secrets/tokens
+    /// before setting it. When absent (`None`) it is skip-serialized, so a
+    /// projection that never sets it is byte-identical to one from before this
+    /// field existed.
+    ///
+    /// **Future migration note:** if/when the extension grows a `_meta` slot on
+    /// `Task` (mirroring [`RELATED_TASK_META_KEY`]), this field is a candidate to
+    /// migrate under that slot instead of a top-level key, to keep the projected
+    /// `Task` spec-pure. Until then this is the pragmatic wire slot — and note
+    /// that the generated `schema.json` marks the `Task` subschema
+    /// `additionalProperties: false`, which is a `ts-to-zod` artifact of the
+    /// `allOf` composition (it would also reject the `_meta` the same result is
+    /// required to carry), not a signal to drop this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_detail: Option<String>,
+}
+
+impl TaskV2 {
+    /// Project a v1 [`Task`] onto the v2 wire shape.
+    ///
+    /// This is the ONLY place the two renames happen (`ttl` -> `ttlMs`,
+    /// `poll_interval` -> `pollIntervalMs`), so a store that grows another field
+    /// has exactly one function to teach.
+    pub fn from_v1(task: &Task) -> Self {
+        Self {
+            task_id: task.task_id.clone(),
+            status: task.status,
+            status_message: task.status_message.clone(),
+            created_at: task.created_at.clone(),
+            last_updated_at: task.last_updated_at.clone(),
+            ttl_ms: task.ttl,
+            poll_interval_ms: task.poll_interval,
+            diagnostic_detail: task.diagnostic_detail.clone(),
+        }
+    }
+
+    /// Project this v2 wire shape back onto the v1 [`Task`] — the exact inverse
+    /// of [`from_v1`](Self::from_v1) (Phase 114, plan 19).
+    ///
+    /// It lives HERE, immediately beside its inverse, for the reason
+    /// [`from_v1`](Self::from_v1) states: the two renames (`ttl` <-> `ttlMs`,
+    /// `pollInterval` <-> `pollIntervalMs`) must have exactly ONE definition. The
+    /// v2 CLIENT needs the backwards direction so [`Client::tasks_get`](crate::Client::tasks_get)
+    /// can keep returning a `Task` — a public signature that cannot change — from
+    /// a flat v2 payload, and doing that remap inside the client would have been
+    /// the second copy of this table.
+    ///
+    /// # Round-trip
+    ///
+    /// `TaskV2::from_v1(&t).to_v1()` is field-for-field `t`: every field of
+    /// [`Task`] has a counterpart here, so nothing is dropped in either
+    /// direction. A unit test pins that.
+    pub fn to_v1(&self) -> Task {
+        Task {
+            task_id: self.task_id.clone(),
+            status: self.status,
+            ttl: self.ttl_ms,
+            created_at: self.created_at.clone(),
+            last_updated_at: self.last_updated_at.clone(),
+            poll_interval: self.poll_interval_ms,
+            status_message: self.status_message.clone(),
+            diagnostic_detail: self.diagnostic_detail.clone(),
+        }
+    }
+
+    /// Create a minimal projection with the five required fields set.
+    ///
+    /// Timestamps and `ttlMs` are taken explicitly because all three are
+    /// REQUIRED on the wire — there is no honest default for them.
+    pub fn new(
+        task_id: impl Into<String>,
+        status: TaskStatus,
+        created_at: impl Into<String>,
+        last_updated_at: impl Into<String>,
+        ttl_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status,
+            status_message: None,
+            created_at: created_at.into(),
+            last_updated_at: last_updated_at.into(),
+            ttl_ms,
+            poll_interval_ms: None,
+            diagnostic_detail: None,
+        }
+    }
+}
+
+/// The status-discriminated detail of a v2 `DetailedTask`.
+///
+/// One variant per [`TaskStatus`], each carrying exactly the field its schema
+/// variant marks required:
+///
+/// | Variant | Schema `$defs` | Extra required field |
+/// |---|---|---|
+/// | [`Working`](Self::Working) | `WorkingTask` | *(none)* |
+/// | [`InputRequired`](Self::InputRequired) | `InputRequiredTask` | `inputRequests` |
+/// | [`Completed`](Self::Completed) | `CompletedTask` | `result` |
+/// | [`Failed`](Self::Failed) | `FailedTask` | `error` |
+/// | [`Cancelled`](Self::Cancelled) | `CancelledTask` | *(none)* |
+///
+/// Expressing the union as an enum is what makes the per-variant requirement
+/// STRUCTURAL: a `completed` projection cannot be built without a `result`, a
+/// `failed` one without an `error`, an `input_required` one without
+/// `inputRequests` — there is no constructor that takes fewer fields.
+///
+/// # Deliberately NOT `#[non_exhaustive]`
+///
+/// The union is closed by construction: it has exactly one variant per
+/// [`TaskStatus`], and `TaskStatus` is itself deliberately exhaustive (D-15). A
+/// sixth variant here could only follow a sixth status, which is a wire-breaking
+/// change on both types at once — so a wildcard arm downstream would hide the
+/// drift rather than absorb it. `tests/v2_tasks_shapes.rs` locks the five status
+/// strings against the vendored schema by SET EQUALITY for the same reason.
+///
+/// # No `PartialEq`
+///
+/// [`InputRequest`](crate::types::mrtr::InputRequest) does not implement it (its
+/// payloads are the elicitation/sampling param structs, which do not either), so
+/// deriving it here would mean widening two other modules' public API for a
+/// convenience this type does not need. Compare projections by their wire object
+/// instead — which is the comparison that actually matters for a wire type.
+#[derive(Debug, Clone)]
+pub enum TaskDetailV2 {
+    /// `WorkingTask` — the task is running. No extra required field.
+    Working,
+    /// `InputRequiredTask` — the task is paused awaiting client input.
+    InputRequired {
+        /// The server-to-client requests that must be fulfilled, keyed by the
+        /// server-assigned key. A **top-level** key of the `tasks/get` result on
+        /// v2 (inventory row 23), not a nested one.
+        input_requests: crate::types::mrtr::InputRequests,
+    },
+    /// `CompletedTask` — the task finished successfully.
+    Completed {
+        /// The final result, whose structure matches the result type of the
+        /// originating request (for a `tools/call` task, a `CallToolResult`).
+        /// Modelled as a `Map` rather than a `Value` because the schema types it
+        /// `{ [key: string]: unknown }` — an OBJECT.
+        result: serde_json::Map<String, serde_json::Value>,
+    },
+    /// `FailedTask` — the task failed with a JSON-RPC error.
+    ///
+    /// Reserved for JSON-RPC protocol errors. A tool that ran to completion and
+    /// returned `isError: true` is `completed`, with the error detail inside
+    /// `result` — the two look identical from a "the tool failed" mindset and are
+    /// opposite on the wire.
+    Failed {
+        /// The JSON-RPC error object (`code`/`message`/`data`) that ended the
+        /// task. An OBJECT, per the schema.
+        error: serde_json::Map<String, serde_json::Value>,
+    },
+    /// `CancelledTask` — the task was cancelled. No extra required field.
+    Cancelled,
+}
+
+impl TaskDetailV2 {
+    /// The [`TaskStatus`] this variant IS.
+    ///
+    /// The mapping is total and has no wildcard arm, so a status added to either
+    /// type without the other fails to compile.
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Self::Working => TaskStatus::Working,
+            Self::InputRequired { .. } => TaskStatus::InputRequired,
+            Self::Completed { .. } => TaskStatus::Completed,
+            Self::Failed { .. } => TaskStatus::Failed,
+            Self::Cancelled => TaskStatus::Cancelled,
+        }
+    }
+
+    /// The wire key this variant contributes to the flattened result, if any.
+    pub fn wire_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Working | Self::Cancelled => None,
+            Self::InputRequired { .. } => Some(DETAIL_KEY_INPUT_REQUESTS),
+            Self::Completed { .. } => Some(DETAIL_KEY_RESULT),
+            Self::Failed { .. } => Some(DETAIL_KEY_ERROR),
+        }
+    }
+}
+
+/// The `inputRequests` wire key of `InputRequiredTask`.
+///
+/// Spelled once here and read by name everywhere else. It is deliberately the
+/// SAME string the reserved-result-field registry owns
+/// (`crate::types::mrtr::INPUT_REQUESTS_KEY`), and the equality is asserted by a
+/// unit test rather than left to a reader to notice.
+pub const DETAIL_KEY_INPUT_REQUESTS: &str = "inputRequests";
+/// The `result` wire key of `CompletedTask`.
+pub const DETAIL_KEY_RESULT: &str = "result";
+/// The `error` wire key of `FailedTask`.
+pub const DETAIL_KEY_ERROR: &str = "error";
+
+/// The v2 `DetailedTask` — a flat [`TaskV2`] plus its status-specific detail.
+///
+/// This is the body of a v2 `tasks/get` result (`GetTaskResult = Result &
+/// DetailedTask`, `schema.ts:252-259`), and `$defs.GetTaskResult` in the vendored
+/// `schema.json` is a **flat `allOf`**, NOT a `{"task": …}` wrapper — verified
+/// on disk rather than quoted. v1's `GetTaskResult` DOES wrap under `task`; the
+/// two eras genuinely differ, and that difference is what this type exists to
+/// express.
+///
+/// # Why the fields are private
+///
+/// [`TaskV2::status`] and the detail variant both encode the status, and a
+/// response whose `status` disagrees with its inlined detail is exactly the
+/// schema-invalid shape this type exists to prevent. [`DetailedTaskV2::new`] is
+/// the only constructor and it makes the DETAIL authoritative, overwriting the
+/// base's status. Private fields are what make that impossible to bypass.
+///
+/// No `PartialEq` — see [`TaskDetailV2`]'s note; compare
+/// [`to_wire_object`](Self::to_wire_object) outputs instead.
+#[derive(Debug, Clone)]
+pub struct DetailedTaskV2 {
+    base: TaskV2,
+    detail: TaskDetailV2,
+}
+
+impl DetailedTaskV2 {
+    /// Pair a flat task payload with its status detail.
+    ///
+    /// The DETAIL is authoritative: `base.status` is overwritten with
+    /// [`TaskDetailV2::status`], so the emitted `status` and the emitted
+    /// `result`/`error`/`inputRequests` can never disagree.
+    pub fn new(base: TaskV2, detail: TaskDetailV2) -> Self {
+        let mut base = base;
+        base.status = detail.status();
+        Self { base, detail }
+    }
+
+    /// The flat task payload.
+    pub fn task(&self) -> &TaskV2 {
+        &self.base
+    }
+
+    /// The status-specific detail.
+    pub fn detail(&self) -> &TaskDetailV2 {
+        &self.detail
+    }
+
+    /// Serialize to the FLAT wire object: the five required `Task` fields, the
+    /// optional ones actually set, and the variant's own required key last.
+    ///
+    /// Built by hand rather than by `#[serde(flatten)]` + `#[serde(untagged)]`
+    /// so the key set is decided by code a reader can follow, and so the
+    /// `ttlMs: null` (present) / `pollIntervalMs` (omitted) asymmetry survives
+    /// the flatten serializer.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: [`TaskV2`] is a plain struct of `String`/`u64`/`Option`
+    /// fields, so its `Serialize` impl cannot fail and cannot produce a
+    /// non-object. The fallback returns an empty map rather than unwrapping.
+    pub fn to_wire_object(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut object = match serde_json::to_value(&self.base) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        match &self.detail {
+            TaskDetailV2::Working | TaskDetailV2::Cancelled => {},
+            TaskDetailV2::InputRequired { input_requests } => {
+                object.insert(
+                    DETAIL_KEY_INPUT_REQUESTS.to_string(),
+                    serde_json::to_value(input_requests)
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+                );
+            },
+            TaskDetailV2::Completed { result } => {
+                object.insert(
+                    DETAIL_KEY_RESULT.to_string(),
+                    serde_json::Value::Object(result.clone()),
+                );
+            },
+            TaskDetailV2::Failed { error } => {
+                object.insert(
+                    DETAIL_KEY_ERROR.to_string(),
+                    serde_json::Value::Object(error.clone()),
+                );
+            },
+        }
+        object
+    }
+
+    /// Decode a flat wire object back into a `DetailedTaskV2`, STATUS-DIRECTED.
+    ///
+    /// The status is read first and it decides which key is required — the same
+    /// discipline [`InputResponse::decode_for`](crate::types::mrtr::InputResponse::decode_for)
+    /// applies to `inputResponses`, and the reason is the same: an untagged
+    /// best-effort decode would silently accept a `completed` task with no
+    /// `result` by falling back to a variant that fits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the base `Task` fields are missing
+    /// or mistyped, or when the status's required detail key is absent or is not
+    /// an object.
+    pub fn from_wire_value(value: &serde_json::Value) -> Result<Self, String> {
+        let base: TaskV2 = serde_json::from_value(value.clone())
+            .map_err(|e| format!("not a v2 Task payload: {e}"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "a DetailedTask must be a JSON object".to_string())?;
+        let required_object = |key: &str| -> Result<serde_json::Map<String, _>, String> {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .ok_or_else(|| format!("a {} task requires an object `{key}`", base.status))
+        };
+        let detail = match base.status {
+            TaskStatus::Working => TaskDetailV2::Working,
+            TaskStatus::Cancelled => TaskDetailV2::Cancelled,
+            TaskStatus::Completed => TaskDetailV2::Completed {
+                result: required_object(DETAIL_KEY_RESULT)?,
+            },
+            TaskStatus::Failed => TaskDetailV2::Failed {
+                error: required_object(DETAIL_KEY_ERROR)?,
+            },
+            TaskStatus::InputRequired => TaskDetailV2::InputRequired {
+                input_requests: object
+                    .get(DETAIL_KEY_INPUT_REQUESTS)
+                    .ok_or_else(|| {
+                        format!("an input_required task requires `{DETAIL_KEY_INPUT_REQUESTS}`")
+                    })
+                    .and_then(|v| {
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| format!("malformed `{DETAIL_KEY_INPUT_REQUESTS}`: {e}"))
+                    })?,
+            },
+        };
+        Ok(Self::new(base, detail))
+    }
+}
+
+impl Serialize for DetailedTaskV2 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_wire_object().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DetailedTaskV2 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_wire_value(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1007,5 +1504,378 @@ mod tests {
         ) {
             proptest::prop_assert!(resolve_poll_interval(caller, hint) >= MIN_POLL_MS);
         }
+    }
+}
+
+/// Unit locks for the v2 projection types (114-11, TASK-04).
+///
+/// The `required` key sets are read from the VENDORED schema at compile time
+/// rather than restated, so a re-vendoring at the D-18 gate moves these
+/// assertions automatically instead of leaving them asserting yesterday's
+/// contract.
+#[cfg(test)]
+mod v2_projection_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// The vendored tasks-extension JSON Schema, embedded at compile time.
+    const EXT_TASKS_SCHEMA_JSON: &str = include_str!("../../schema/vendored/ext-tasks/schema.json");
+
+    /// The `required` array of a `$defs` entry, as a sorted `Vec<String>`.
+    fn schema_required(def: &str) -> Vec<String> {
+        let schema: Value =
+            serde_json::from_str(EXT_TASKS_SCHEMA_JSON).expect("vendored schema parses");
+        let mut required: Vec<String> = schema["$defs"][def]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("$defs.{def}.required is an array"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("a required entry is a string")
+                    .to_string()
+            })
+            .collect();
+        required.sort();
+        required
+    }
+
+    fn sorted_keys(object: &serde_json::Map<String, Value>) -> Vec<String> {
+        let mut keys: Vec<String> = object.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// A minimal projection with only the five required fields populated.
+    fn minimal(status: TaskStatus) -> TaskV2 {
+        TaskV2::new(
+            "t-1",
+            status,
+            "2026-07-28T00:00:00Z",
+            "2026-07-28T00:00:01Z",
+            Some(60_000),
+        )
+    }
+
+    fn requests() -> crate::types::mrtr::InputRequests {
+        let mut map = crate::types::mrtr::InputRequests::new();
+        map.insert(
+            "roots".to_string(),
+            crate::types::mrtr::InputRequest::ListRoots,
+        );
+        map
+    }
+
+    #[test]
+    fn v2_projection_uses_the_renamed_ttl_ms_and_poll_interval_ms_keys() {
+        let mut task = minimal(TaskStatus::Working);
+        task.poll_interval_ms = Some(2500);
+        let raw = serde_json::to_string(&task).expect("serializes");
+        assert!(
+            raw.contains("\"ttlMs\":60000"),
+            "the v2 projection must spell `ttlMs`, got {raw}"
+        );
+        assert!(
+            raw.contains("\"pollIntervalMs\":2500"),
+            "the v2 projection must spell `pollIntervalMs`, got {raw}"
+        );
+        // The v1 spellings must NOT appear: these are RENAMES, not additions.
+        assert!(!raw.contains("\"ttl\":"), "v1 `ttl` leaked into v2: {raw}");
+        assert!(
+            !raw.contains("\"pollInterval\":"),
+            "v1 `pollInterval` leaked into v2: {raw}"
+        );
+    }
+
+    #[test]
+    fn v2_projection_serializes_a_none_ttl_as_an_explicit_null() {
+        let task = TaskV2::new(
+            "t-1",
+            TaskStatus::Working,
+            "2026-07-28T00:00:00Z",
+            "2026-07-28T00:00:01Z",
+            None,
+        );
+        let raw = serde_json::to_string(&task).expect("serializes");
+        // `ttlMs` is REQUIRED and NULLABLE: present as null, never omitted.
+        assert!(
+            raw.contains("\"ttlMs\":null"),
+            "a None ttlMs must serialize as an explicit null, got {raw}"
+        );
+    }
+
+    #[test]
+    fn v2_projection_omits_a_none_poll_interval_ms_entirely() {
+        let task = minimal(TaskStatus::Working);
+        assert_eq!(task.poll_interval_ms, None);
+        let raw = serde_json::to_string(&task).expect("serializes");
+        assert!(
+            !raw.contains("pollIntervalMs"),
+            "a None pollIntervalMs is OPTIONAL and must be omitted, got {raw}"
+        );
+    }
+
+    /// `from_v1` and `to_v1` are exact inverses (Phase 114, plan 19).
+    ///
+    /// The v2 CLIENT decodes `tasks/get` and the flat create result through
+    /// `to_v1`, so a field this pair drops would silently vanish from a v2
+    /// caller's `Task`. Every field is compared by name — a `Task` that grew a
+    /// field without teaching BOTH directions fails here rather than in a user's
+    /// poll loop.
+    #[test]
+    fn v2_projection_round_trips_a_v1_task_field_for_field() {
+        let original = Task::new("task-round-trip", TaskStatus::InputRequired)
+            .with_timestamps("2026-07-28T00:00:00Z", "2026-07-28T00:00:09Z")
+            .with_ttl(60_000)
+            .with_poll_interval(250)
+            .with_status_message("waiting on you")
+            .with_diagnostic_detail("step 3 of 7");
+
+        let round_tripped = TaskV2::from_v1(&original).to_v1();
+
+        assert_eq!(round_tripped.task_id, original.task_id);
+        assert_eq!(round_tripped.status, original.status);
+        assert_eq!(round_tripped.ttl, original.ttl);
+        assert_eq!(round_tripped.created_at, original.created_at);
+        assert_eq!(round_tripped.last_updated_at, original.last_updated_at);
+        assert_eq!(round_tripped.poll_interval, original.poll_interval);
+        assert_eq!(round_tripped.status_message, original.status_message);
+        assert_eq!(round_tripped.diagnostic_detail, original.diagnostic_detail);
+        // Serialized equality catches a field the per-field list above forgot.
+        assert_eq!(
+            serde_json::to_value(&round_tripped).expect("serializes"),
+            serde_json::to_value(&original).expect("serializes"),
+        );
+    }
+
+    /// `to_v1` performs the two RENAMES, not a re-spelling of the v2 keys.
+    #[test]
+    fn to_v1_maps_ttl_ms_and_poll_interval_ms_onto_the_v1_names() {
+        let mut v2 = TaskV2::new(
+            "task-renames",
+            TaskStatus::Working,
+            "2026-07-28T00:00:00Z",
+            "2026-07-28T00:00:01Z",
+            Some(30_000),
+        );
+        v2.poll_interval_ms = Some(750);
+
+        let v1 = v2.to_v1();
+
+        assert_eq!(v1.ttl, Some(30_000), "ttlMs must land on ttl");
+        assert_eq!(
+            v1.poll_interval,
+            Some(750),
+            "pollIntervalMs must land on pollInterval"
+        );
+        let raw = serde_json::to_string(&v1).expect("serializes");
+        assert!(
+            !raw.contains("ttlMs") && !raw.contains("pollIntervalMs"),
+            "a v2 key spelling leaked onto the v1 Task: {raw}"
+        );
+    }
+
+    #[test]
+    fn v2_projection_working_key_set_equals_the_schema_required_set() {
+        let detailed = DetailedTaskV2::new(minimal(TaskStatus::Working), TaskDetailV2::Working);
+        let object = detailed.to_wire_object();
+        assert_eq!(
+            sorted_keys(&object),
+            schema_required("WorkingTask"),
+            "a minimal working projection must emit EXACTLY the schema's \
+             WorkingTask.required set — no optional key is set on this fixture"
+        );
+    }
+
+    #[test]
+    fn v2_projection_working_key_set_grows_only_by_the_optional_keys_actually_set() {
+        let mut base = minimal(TaskStatus::Working);
+        base.poll_interval_ms = Some(1000);
+        base.status_message = Some("still going".to_string());
+        let object = DetailedTaskV2::new(base, TaskDetailV2::Working).to_wire_object();
+        let mut expected = schema_required("WorkingTask");
+        expected.push("pollIntervalMs".to_string());
+        expected.push("statusMessage".to_string());
+        expected.sort();
+        assert_eq!(sorted_keys(&object), expected);
+    }
+
+    /// Each variant emits the schema's required set for ITS `$defs` entry.
+    ///
+    /// This is the per-variant requirement expressed as a wire assertion; the
+    /// TYPE-level half is that none of these variants can be constructed without
+    /// its payload — `TaskDetailV2::Completed {}` does not compile, which is why
+    /// there is no "completed projection with no result" test to write.
+    #[test]
+    fn v2_projection_each_variant_emits_its_schema_required_set() {
+        let cases: Vec<(&str, TaskDetailV2)> = vec![
+            ("WorkingTask", TaskDetailV2::Working),
+            ("CancelledTask", TaskDetailV2::Cancelled),
+            (
+                "InputRequiredTask",
+                TaskDetailV2::InputRequired {
+                    input_requests: requests(),
+                },
+            ),
+            (
+                "CompletedTask",
+                TaskDetailV2::Completed {
+                    result: json!({ "content": [] })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                },
+            ),
+            (
+                "FailedTask",
+                TaskDetailV2::Failed {
+                    error: json!({ "code": -32603, "message": "boom" })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                },
+            ),
+        ];
+        for (def, detail) in cases {
+            // The base's status is deliberately WRONG here; `new` must fix it.
+            let object = DetailedTaskV2::new(minimal(TaskStatus::Working), detail).to_wire_object();
+            assert_eq!(
+                sorted_keys(&object),
+                schema_required(def),
+                "{def} must emit exactly its schema-required key set"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_projection_detail_overrides_a_disagreeing_base_status() {
+        let detailed = DetailedTaskV2::new(
+            minimal(TaskStatus::Working),
+            TaskDetailV2::Failed {
+                error: json!({ "code": -32603 })
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            },
+        );
+        assert_eq!(detailed.task().status, TaskStatus::Failed);
+        assert_eq!(detailed.to_wire_object()["status"], json!("failed"));
+    }
+
+    #[test]
+    fn v2_projection_status_and_detail_agree_for_every_variant() {
+        for detail in [
+            TaskDetailV2::Working,
+            TaskDetailV2::Cancelled,
+            TaskDetailV2::InputRequired {
+                input_requests: requests(),
+            },
+            TaskDetailV2::Completed {
+                result: serde_json::Map::new(),
+            },
+            TaskDetailV2::Failed {
+                error: serde_json::Map::new(),
+            },
+        ] {
+            let expected = detail.status();
+            let object = DetailedTaskV2::new(minimal(TaskStatus::Working), detail).to_wire_object();
+            assert_eq!(
+                object["status"],
+                serde_json::to_value(expected).expect("status serializes")
+            );
+        }
+    }
+
+    #[test]
+    fn v2_projection_round_trips_through_from_wire_value() {
+        let original = DetailedTaskV2::new(
+            minimal(TaskStatus::Working),
+            TaskDetailV2::InputRequired {
+                input_requests: requests(),
+            },
+        );
+        let value = serde_json::to_value(&original).expect("serializes");
+        let decoded = DetailedTaskV2::from_wire_value(&value).expect("decodes");
+        // Compared on the WIRE OBJECT, which is the identity that matters for a
+        // wire type (and the only one available — see the `PartialEq` note).
+        assert_eq!(decoded.to_wire_object(), original.to_wire_object());
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serializes"),
+            serde_json::to_string(&original).expect("serializes"),
+            "a round trip must be byte-identical, not merely structurally equal"
+        );
+    }
+
+    /// The status-directed decode REFUSES a variant missing its required key —
+    /// the failure an untagged best-effort decode would swallow.
+    #[test]
+    fn v2_projection_decode_rejects_a_variant_missing_its_required_key() {
+        for (status, key) in [
+            ("completed", "result"),
+            ("failed", "error"),
+            ("input_required", "inputRequests"),
+        ] {
+            let value = json!({
+                "taskId": "t-1",
+                "status": status,
+                "createdAt": "2026-07-28T00:00:00Z",
+                "lastUpdatedAt": "2026-07-28T00:00:01Z",
+                "ttlMs": null,
+            });
+            let err = DetailedTaskV2::from_wire_value(&value)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("a {status} task carrying no {key} must be refused, not decoded")
+                });
+            assert!(
+                err.contains(key),
+                "the refusal must name the missing key `{key}`, got {err}"
+            );
+        }
+    }
+
+    /// The detail key the projection writes and the key the reserved-result-field
+    /// registry grants the tasks dispatch are ONE string.
+    ///
+    /// If they ever diverged, the projection would emit a key the egress strips
+    /// — the exact row-23 failure mode, re-introduced by a typo.
+    #[test]
+    fn v2_projection_input_requests_key_matches_the_reserved_registry_key() {
+        assert_eq!(
+            DETAIL_KEY_INPUT_REQUESTS,
+            crate::types::mrtr::INPUT_REQUESTS_KEY
+        );
+    }
+
+    #[test]
+    fn v2_projection_from_v1_renames_ttl_and_poll_interval_without_touching_v1() {
+        let v1 = Task::new("t-1", TaskStatus::Working)
+            .with_timestamps("2026-07-28T00:00:00Z", "2026-07-28T00:00:01Z")
+            .with_ttl(60_000)
+            .with_poll_interval(2500)
+            .with_status_message("running");
+        let projected = TaskV2::from_v1(&v1);
+        assert_eq!(projected.ttl_ms, Some(60_000));
+        assert_eq!(projected.poll_interval_ms, Some(2500));
+        assert_eq!(projected.task_id, "t-1");
+        assert_eq!(projected.status_message.as_deref(), Some("running"));
+
+        // The v1 type's OWN bytes are untouched by the projection existing.
+        let v1_raw = serde_json::to_string(&v1).expect("v1 serializes");
+        assert!(v1_raw.contains("\"ttl\":60000"), "{v1_raw}");
+        assert!(v1_raw.contains("\"pollInterval\":2500"), "{v1_raw}");
+        assert!(!v1_raw.contains("ttlMs"), "{v1_raw}");
+        assert!(!v1_raw.contains("pollIntervalMs"), "{v1_raw}");
+    }
+
+    #[test]
+    fn v2_projection_carries_the_pmcp_diagnostic_detail_extension() {
+        let v1 = Task::new("t-1", TaskStatus::Working)
+            .with_timestamps("2026-07-28T00:00:00Z", "2026-07-28T00:00:01Z")
+            .with_diagnostic_detail("step-3 timed out");
+        let raw = serde_json::to_string(&TaskV2::from_v1(&v1)).expect("serializes");
+        assert!(
+            raw.contains("\"diagnosticDetail\":\"step-3 timed out\""),
+            "{raw}"
+        );
     }
 }

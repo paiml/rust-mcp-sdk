@@ -65,7 +65,7 @@ These are the five mechanical steps that take an existing PMCP server and add Co
 [dependencies]
 pmcp = { version = "2.7.0", features = ["full"] }
 pmcp-code-mode = "0.5.1"
-pmcp-code-mode-derive = "0.2.0"
+pmcp-code-mode-derive = "0.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```

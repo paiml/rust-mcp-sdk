@@ -44,7 +44,7 @@ use std::path::PathBuf;
 #[command(
     name = "pmcp-workbook-server",
     version,
-    about = "Shape A pure-config workbook MCP server — point it at a compiled bundle dir and serve five workbook tools with no Rust required"
+    about = "Shape A pure-config workbook MCP server — point it at a compiled bundle dir and serve its governed-Excel workbook tools with no Rust required"
 )]
 pub struct Args {
     /// Path to the compiled `bundle@version` directory (e.g.

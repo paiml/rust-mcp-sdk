@@ -5,7 +5,1024 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.17.0] - Unreleased
+
+## [2.20.4] - 2026-09-19
+
+### Fixed — discovery refused a conformant Cognito document (RFC 8414 §2 optional fields)
+
+`OidcDiscoveryMetadata` declared five `Vec` fields with no `#[serde(default)]`
+and no `Option`, so serde treated all of them as required. Four are OPTIONAL or
+RECOMMENDED under RFC 8414 §2, and a conformant authorization server may omit
+them. Amazon Cognito omits exactly two — `grant_types_supported` and
+`code_challenge_methods_supported` — so discovery against a Cognito pool failed
+to parse a perfectly valid document.
+
+The symptom is misleading: serde reports the *closing brace* (a 976-byte
+document reported `line 1, column 664`-style positions at its final byte), which
+is the standard missing-required-field signature but reads like truncation. The
+SDK's own wrapper deliberately does not reproduce the parser's message, because
+a serde data error echoes the offending input — correct for secret hygiene, but
+it left only the column number to diagnose from.
+
+This was reachable only *because* 2.20.3 fixed `--oauth-issuer` (#368): with the
+flag finally reaching discovery, the client cleared the §3.3 anchor check and
+landed straight on this. The two defects are independent.
+
+Defaults follow the spec rather than being uniformly empty:
+
+| field | RFC 8414 §2 | default applied |
+|---|---|---|
+| `grant_types_supported` | OPTIONAL, default `["authorization_code","implicit"]` | `[AuthorizationCode]` — `GrantType` models no `Implicit` variant (deprecated by OAuth 2.1, unimplemented here) |
+| `token_endpoint_auth_methods_supported` | OPTIONAL, default `["client_secret_basic"]` | `["client_secret_basic"]` |
+| `scopes_supported` | RECOMMENDED, no default | empty |
+| `code_challenge_methods_supported` | OPTIONAL, no default | empty |
+| `response_types_supported` | **REQUIRED** | unchanged — still required |
+
+An empty default for `grant_types_supported` would have claimed the server
+supports no grant types at all, which is a different assertion than the spec's.
+Defaulting `code_challenge_methods_supported` to empty is safe because the
+client never gates on it — PKCE is unconditional in `client::oauth`, which
+always sends `code_challenge_method=S256`. Cognito supports S256 while omitting
+the advertisement.
+
+`tests/oauth_discovery_optional_fields.rs` fences both directions: a
+Cognito-shaped document omitting only OPTIONAL fields must parse, and a document
+missing the REQUIRED `issuer` must still be refused, so the relaxation cannot
+decay into a parser that accepts anything.
+
+Reported by the pmcp.run platform team and a tenant, against 2.20.3.
+
+## [2.20.3] - 2026-09-18
+
+### Fixed — `--oauth-issuer` was documented but inert (issue #368)
+
+`OAuthHelper::get_metadata_with_extras` tested `mcp_server_url` before
+`issuer`, and `cargo pmcp auth login` always sets the server URL (it is a
+required positional). An explicitly supplied issuer could therefore never
+change where discovery went, so the `--oauth-issuer` flag did nothing on the
+one verb whose help text advertised it — while the failure message told the
+operator to "provide `--oauth-issuer` explicitly". Precedence is now: an
+EXPLICIT issuer outranks a DERIVED one.
+
+This is **not** a relaxation of the RFC 8414 §3.3 / OIDC Discovery §4.3
+issuer-identity check. That comparison remains byte-exact and still runs on
+every document; only which value serves as the anchor changes. Two tests pin
+the security property: an explicit issuer that lies is still refused, and it
+does not fall back to the derived authorization server.
+
+The remediation text is corrected too. The old message pointed at
+`/.well-known/openid-configuration`, which the probe never requests —
+`IssuerMismatch` is classified `Terminal`, so the probe aborts first.
+
+Practical effect: for a deployment whose authorization server is a third party
+(Cognito, Auth0, Okta, Entra), an operator can now anchor discovery on the real
+issuer instead of the MCP server's own origin.
+
+### Fixed — 124 oauth tests were green by omission in the quality gate
+
+`oauth` is a member of neither `full` nor `full-v2`, and every test leg pinned
+`--features "full"`, so seven oauth test binaries compiled to empty binaries
+that printed `running 0 tests` and exited 0.
+
+Measured with `cargo test --test 'oauth_*'`:
+
+| features | tests |
+|---|---|
+| `full,oauth` | 13 binaries, 291 tests, 291 passed |
+| `full` | 167 tests |
+
+That is 124 dead tests across `oauth_credential_file` (29),
+`oauth_dcr_integration` (24), `oauth_iss_integration` (13),
+`oauth_issuer_precedence` (7), `oauth_refresh` (21), `oauth_state_csrf` (12)
+and `oauth_store_wiring` (18). `tests/oauth_issuer_precedence.rs` is the
+issuer-identity security fence, and its own header states that if it ever goes
+green by omission the fix has regressed into a security hole — it was green by
+omission from the day it was written.
+
+Closed by a `make test-oauth` leg chained into `make quality-gate`, plus a
+named CI step in the merge-blocking `quality-gate` job. The leg asserts a
+NONZERO test count, because a selector matching zero tests exits 0 and is
+indistinguishable from success. `oauth` is deliberately NOT added to `full`:
+it pulls `dep:webbrowser`/`dep:dirs`/`dep:rand`, which is exactly why the
+wasm32 purity fence excludes it.
+
+### Note on versioning
+
+`2.20.1` and `2.20.2` have CHANGELOG entries above but were never published —
+the manifest stayed at `2.20.0` and crates.io's newest `pmcp` is `2.20.0`. Those
+numbers are therefore not reused; this release is `2.20.3`, and publishing it
+also ships the `pmcp-workbook-compiler` work documented under `2.20.1` and
+`2.20.2`.
+## [2.20.2] - 2026-09-11
+
+### Fixed — Excel for Mac workbook provenance and builder dependency freshness
+
+The workbook compiler now recognizes the exact OOXML application identity
+`Microsoft Macintosh Excel` as a genuine Excel save when the existing positive
+`AppVersion` and `calcId` checks also pass. Matching remains fail-closed and is
+now exact for both supported identities, so prefix spoofs such as
+`Microsoft Excelerator` are rejected.
+
+The formula front-end now normalizes Excel's persisted `_xlfn.` future-function
+prefix before the parser's whitelist check and resolves documented
+`Table[Column]` references to sheet-qualified Table-body ranges. This closes the
+gap where a formula passed the dialect linter but failed later while building
+the IR. Formatting-only blank input cells retained by Excel below a resized
+Table are also ignored after the real Table/named-range declaration paths run;
+named blank inputs and populated unnamed inputs remain subject to the existing
+fail-closed rules.
+
+`pmcp-workbook-compiler` 0.1.2 → **0.1.3** and `cargo-pmcp` 0.24.1 →
+**0.24.2**. The CLI's compiler requirement now starts at 0.1.3 so a locked CLI
+installation cannot silently retain the pre-fix workbook compiler.
+
+## [2.20.1] - 2026-09-06
+
+### Fixed — `VLOOKUP` / `MATCH` silently returned a wrong number (workbook dialect)
+
+`MATCH(x, rng, 1)` and a bare `MATCH(x, rng)` — whose **Excel default is
+APPROXIMATE** — both evaluated as EXACT match and returned a wrong number **with
+no signal**. The same held for a bare `VLOOKUP(x, tbl, 2)` and for
+`VLOOKUP(x, tbl, 2, TRUE)`. The exact-match-only contract had been *documented*
+in the evaluator since the dialect shipped, but nothing checked it, so the
+mis-evaluation was invisible: no `#VALUE!`, no lint finding, just a wrong number
+propagating through every downstream formula.
+
+All four shapes are now refused at **two** layers:
+
+- **Parse time** (BA-facing): a new typed `formula::ParseError::UnsupportedCallShape`
+  carrying a literal repair, surfaced through the compiler's existing
+  `CompileError::Lint("parse {sheet}!{addr}: …")` wrapping, so the refusal names
+  the cell. The rendered messages are, verbatim:
+  - `` call to `VLOOKUP` has an unsupported shape: write VLOOKUP(key, table, col, FALSE) — the dialect supports EXACT match only ``
+  - `` call to `MATCH` has an unsupported shape: write MATCH(key, range, 0) — the dialect supports EXACT match only; Excel's default is approximate ``
+- **Eval time** (defense in depth): a typed `#VALUE!` from the evaluator.
+
+No workbook or fixture in this repository needed an edit — every
+`VLOOKUP`/`MATCH` call already authored the exact-match argument.
+
+### Added — four first-class workbook-dialect functions
+
+`ROUNDDOWN`, `MAX`, `MIN` and `XLOOKUP` join the constrained Excel dialect
+whitelist (13 names → 17), each with a real evaluator body, unit tests and
+proptest invariants:
+
+- `ROUNDDOWN` rounds toward zero, mirroring the existing `ROUNDUP` helper and
+  inheriting its bounded-`digits` guard.
+- `MAX`/`MIN` mirror `SUM`'s Excel scalar/range asymmetry exactly: a direct
+  scalar argument coerces, a range member that is text/bool/empty is ignored, an
+  error member propagates, and a range with no numeric member yields `0`.
+- `XLOOKUP` is accepted only in its narrow 3/4-argument EXACT form
+  (`XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])`).
+  `match_mode`/`search_mode` are refused, `return_array` must be single-column,
+  the arrays must be conformable, and a miss without `if_not_found` is `#N/A`.
+
+New runnable example: `cargo run -p pmcp-workbook-compiler --example dialect_widening_demo`.
+
+### Changed — workbook dialect version 1.0 → 1.1
+
+`SUPPORTED_DIALECT_VERSION` moves to `1.1`; `BASELINE_DIALECT_VERSION` stays at
+`1.0`, so every `1.0`-declaring and every undeclared workbook keeps compiling
+unchanged. The narrowing above rode a MINOR rather than a MAJOR bump
+deliberately; the reasoning is recorded in the published contract at
+`docs/workbook-dialect-spec.md` §7.6, not only here.
+
+### Release note — three PATCH bumps, and why NOT the minor bump this entry first claimed
+
+`pmcp-workbook-runtime` 0.2.0 → **0.2.1**, `pmcp-workbook-dialect` 0.1.1 →
+**0.1.2**, `pmcp-workbook-compiler` 0.1.1 → **0.1.2**.
+
+An earlier draft of this entry called for a *coordinated 0.x MINOR bump* on the
+grounds that a `0.x` minor is semver-incompatible and would drag
+`pmcp-workbook-compiler`'s `pmcp-workbook-dialect = "0.1.0"` pin
+(`crates/pmcp-workbook-compiler/Cargo.toml:45`) under CLAUDE.md item 13's
+move-as-one-set rule. **That was an axis error, and it was measured rather than
+argued away.** `cargo semver-checks check-release` against each crate's
+published crates.io baseline reports `no semver update required` for all three
+(196 checks pass, 0 fail, per crate). The new
+`formula::ParseError::UnsupportedCallShape` variant is free because `ParseError`
+is `#[non_exhaustive]`; everything else added is a new item or a `const` *value*
+change, neither of which is an API break.
+
+So the correct axis is PATCH, and CLAUDE.md's **caret exception** applies: `^0.2.0`
+already admits `0.2.1` and `^0.1.0` already admits `0.1.2`, so **no pin moves and
+no downstream crate is bumped** — not `pmcp-workbook-compiler`'s two pins, not
+`pmcp-server-toolkit`'s, not `cargo-pmcp`'s. Taking the minor axis would have
+cascaded a bug fix through the whole toolkit tree for no API reason.
+
+The BEHAVIOURAL narrowing (`VLOOKUP`/`MATCH` now refuse what they previously
+mis-evaluated) is signalled on the axis that actually governs it for workbook
+authors: the **dialect** version, 1.0 → 1.1, with the rationale published in
+`docs/workbook-dialect-spec.md` §7.6. Crate semver covers the Rust API; the
+dialect version covers the workbook contract. Refusing input that previously
+produced a *wrong answer* is a fix, not a capability withdrawal.
+
+The root `pmcp` crate is **not** bumped — no `pmcp` source changed, and bumping it
+would drag `cargo-pmcp`'s template drift-guard constants
+(`PMCP_VERSION` / `PMCP_VERSION_REQ`) with it for no reason. The `v2.20.1` tag is
+the release marker; `pmcp` 2.20.0 is already on crates.io and its publish step
+skips gracefully.
+
+## [2.20.0] - 2026-09-04
+
+### Removed — the synthesized `skill://index.json` discovery resource (feature `skills`)
+
+Every skills-enabled server used to auto-synthesize a discovery index: it was
+enumerated in `resources/list` as `skill://index.json` (mime `application/json`)
+and served by `resources/read`. **It is gone.** `resources/list` no longer
+carries that entry, so a host counting entries sees one fewer, and
+`resources/read skill://index.json` now answers `Skill resource not found`.
+
+Discovery moved to the two SEP-2640 methods below. A host that hard-coded or
+cached the index URI must switch to `skills/list`.
+
+### Added — the SEP-2640 `skills/list` and `skills/get` methods (feature `skills`)
+
+Servers that register a skill now declare the `io.modelcontextprotocol/skills`
+extension and answer both methods over streamable HTTP. Each entry carries the
+skill's frontmatter verbatim plus a `resources` manifest of `sha256:`-prefixed
+digests. `skills/list` results carry the base protocol's list-caching attributes
+on 2026-07-28 and neither attribute on 2025-11-25; `skills/get` claims neither on
+either era.
+
+Two limits on the reach, both deliberate and both recorded as deferrals:
+
+- **Streamable HTTP only.** The methods ride the crate-private internal-request
+  classifier, which no other transport consumes. Over **stdio** a `skills/list`
+  frame fails `parse_message` — and because the transport actor breaks its loop
+  on a receive error, that **tears the connection down** rather than answering
+  `-32601`. A stdio server that registers a skill still declares the extension,
+  so avoid advertising it to hosts that will call the methods until the
+  transport reach widens.
+- **No `ServerCore` route.** A `ServerCoreBuilder`-built server serves skills
+  through `resources/list` / `resources/read` but answers neither method.
+
+Also note a v1 wire change that reaches **every** streamable-HTTP server,
+including one compiled without `feature = "skills"`: `skills/list` and
+`skills/get` are now classified before the typed parse, so a 2025-11-25 client
+sending either gets `HTTP 200` with a `-32601` body and its original `id`, where
+it previously got `HTTP 400` with `-32700` and `id: null`.
+
+### Breaking (feature `skills`) — the SEP-2640 name-identity rule is now enforced
+
+`Skills::into_handler()` — and therefore `.build()` on both builders — now
+rejects a registry in which a skill's frontmatter `name` differs from the final
+segment of its URI path, and rejects a reference URI that collides with another
+skill's `SKILL.md` URI. Upstream detected duplicate SKILL.md URIs only.
+
+Because `resolved_path()` defaults to the constructor name, this bites hardest
+with `Skill::with_path(..)`: `Skill::new("refunds", body).with_path("acme/billing/policy")`
+where `body` opens `---\nname: refunds\n---` built and served on 2.19.x and now
+**panics at `.build()`**. Either align the frontmatter `name` with the final path
+segment, or register through `try_skills(..)` to get the failure as a `Result`.
+
+One caveat on `try_skills`: name identity is validated for the registry passed to
+that call only. Skills deposited by the infallible `.skill(..)` / `.skills(..)` /
+`.bootstrap_skill_and_prompt(..)` are name-checked at `.build()`, so a mixed
+chain can see `try_skills` return `Ok` and `.build()` still panic. Register
+everything through `try_skills` if you need the `Result`.
+
+### Changed — `feature = "skills"` now pulls in `serde_yaml`
+
+Frontmatter is parsed rather than scanned, so `skills` gained a `dep:serde_yaml`
+requirement. `skills` remains outside both `full` and `full-v2`.
+
+A skill whose SKILL.md carries no frontmatter block, or a malformed one, is
+EXCLUDED from `skills/list` (with a `mcp.skills` warn naming it) while staying
+readable via `resources/read`. Such a skill therefore appears in `resources/list`
+and answers `skills/get` with `-32602`.
+
+### Added — a `SequentialWorkflow` projects to a SEP-2640 skill
+
+`SequentialWorkflow::as_skill()` (feature `skills`) renders a workflow as an
+agentskills-legal `SKILL.md` body, so a server that already defines a workflow
+gets the skill surface for free:
+
+```rust
+let workflow = SequentialWorkflow::new("refund_flow", "Process a refund")
+    .step(WorkflowStep::new("fetch_order", ToolHandle::new("orders_get")));
+
+let skill = workflow.as_skill();      // name: "refund-flow"
+```
+
+The body is rendered from the workflow's own introspection surface, so the skill
+a host reads and the prompt a host runs are **one content rendered twice** — they
+cannot drift, because the SDK owns the renderer. The workflow name is normalized
+to the agentskills alphabet (`refund_flow` becomes `refund-flow`) and no URI path
+override is set, so the frontmatter `name` and the final segment of
+`skill://{name}/SKILL.md` agree by construction.
+
+`as_skill()` is infallible and never panics. When a workflow name normalizes to
+nothing legal it substitutes a deterministic `workflow-{8 hex}` slug; when the
+description is empty it substitutes a deterministic legal one. Both emit a
+`tracing::warn!` on the `mcp.skills` target.
+
+### Added — `SkillProjection`, the fallible, checking counterpart
+
+`SkillProjection::new(&workflow).with_tools(tools).build()` rejects what
+`as_skill()` resolves silently, and additionally runs a projection-time gate
+check. Both entry points call the same renderer, so the returned body is
+byte-identical to `as_skill()`'s for any workflow that builds at all — the
+difference is disposition, never bytes.
+
+**`build()` returns `Result<ProjectionOutput>`, not `Result<Skill>`.** This is a
+recorded deviation, made deliberately: the design called for both a fallible
+`build()` and structured warnings returned *from* `build()`, and a `Skill` cannot
+carry a warning vector. `#[non_exhaustive] pub struct ProjectionOutput { pub
+skill: Skill, pub warnings: Vec<ProjectionWarning> }` resolves that — named and
+self-documenting where a tuple is positional, and additive, so a later release
+can add a field without a breaking signature change. A consuming `into_parts()`
+returns both halves.
+
+**The gate warning.** When a tool map is supplied, a step that carries
+`with_guidance` prose whose tool is *annotated* side-effecting
+(`read_only_hint == Some(false)` or `destructive_hint == Some(true)`) produces a
+`ProjectionWarningKind::GuidanceOnSideEffectingStep`: server-side workflow
+execution runs every deterministic step regardless of the guidance, so guidance
+on such a step is a post-hoc judgment the executing surface will ignore. The
+trigger is purely structural — the prose is never analysed, so it cannot be
+paraphrased around. A guidance-bearing step whose tool carries no annotations
+reports `GateCheckUnverifiable` instead of guessing: MCP's literal annotation
+defaults would fire on essentially every existing workflow, and a warning that
+fires everywhere is a warning that gets muted.
+
+**These warnings have exactly one delivery channel: `build()`'s structured
+return, with annotations supplied through `with_tools`.** A bare `as_skill()`
+receives only a `&SequentialWorkflow`, and tool annotations live only on
+`pmcp::types::ToolInfo::annotations`, which nothing reachable from a workflow
+carries — so `as_skill()` cannot *compute* the warning; it is not that it
+declines to report it. If you expected `as_skill()` to warn about a destructive
+step and got silence, that is why.
+
+### Added — three new public methods opt a server into the projected prepend
+
+Off by default; all three are `skills`-gated. With the flag off, prompt
+transcripts are byte-identical to previous releases.
+
+- `WorkflowPromptHandler::with_projected_skill_prepend(bool)` — the
+  handler-level opt-in. With it on, the projected `SKILL.md` body becomes prompt
+  message `[0]`, ahead of the user-intent message, which stays at `[1]`. The body
+  is rendered once when the setter runs and cached, never re-rendered per
+  request.
+- `ServerCoreBuilder::with_workflow_skill_prepend(bool)`
+- `ServerBuilder::with_workflow_skill_prepend(bool)`
+
+The two builder setters are what make the anti-drift claim hold **per server**
+rather than merely per workflow value: before them the opt-in was reachable only
+by hand-constructing a `WorkflowPromptHandler`, so a server registering a
+workflow the normal way through `prompt_workflow` could not enable it at all.
+Each setter applies to workflows registered *after* the call, so place it before
+`prompt_workflow`:
+
+```rust
+Server::builder()
+    .with_workflow_skill_prepend(true)
+    .prompt_workflow(workflow)?
+```
+
+### The rendered markdown is NOT semver-stable
+
+The exact bytes `as_skill()` produces may change on any minor release. They are
+pinned by a golden test — `tests/golden/workflow_skill_projection.md` — so that
+no change is accidental, and **every change to them will be a CHANGELOG entry**,
+because the bytes become the `sha256` digest published in the skill's
+`skills/list` entry. A consumer that pinned that digest must re-pin: a digest
+mismatch is a fatal pre-loop revocation for such a consumer, not a warning. A
+silent render change would therefore be a supply-chain event, not a cosmetic one.
+
+Two consequences worth stating explicitly, because neither reads as a behaviour
+change at the call site:
+
+- **Constant key order is digest-significant.** A `DataSource::Constant` renders
+  through `serde_json`, which this crate builds with `preserve_order`, so object
+  keys emit in *construction* order. Reordering the keys of a `json!` literal in a
+  workflow definition changes the rendered body and therefore the published
+  digest. The keys are deliberately not sorted: the rendered constant documents
+  what the workflow will actually *send*, and a sorted render would make the
+  manual procedure disagree with the call it describes.
+- **Template-binding order is sorted, not insertion order.**
+  `WorkflowStep::template_bindings` returns a `HashMap`, whose iteration order is
+  randomized per instance; the renderer sorts through a `BTreeMap` so the bytes
+  are reproducible across processes and machines.
+
+### Fixed — `U+2028`/`U+2029` are now escaped in the projected frontmatter
+
+**This is a render change under the digest rule above.** The rendered bytes move
+for any workflow whose description or name contains LINE SEPARATOR (`U+2028`) or
+PARAGRAPH SEPARATOR (`U+2029`); a consumer that pinned such a skill's `sha256`
+must re-pin. `tests/golden/workflow_skill_projection.md` is unaffected — its
+fixture contains neither codepoint — so the golden did not move.
+
+The frontmatter encoder escaped `\\`, `"`, `\n`, `\r`, `\t` and then everything
+`char::is_control()` accepts. That predicate is exactly the Unicode `Cc`
+category, but the YAML the frontmatter is read back as is **YAML 1.1**, whose
+scanner counts *five* line breaks: `\r`, `\n`, `U+0085`, `U+2028` and `U+2029`.
+The last two are `Zl`/`Zp`, not `Cc`, so they were emitted raw, with two
+measured consequences:
+
+- **A skill could be silently dropped from `skills/list`.** When the text after
+  the separator began `--- ` or `... `, the parse failed on a document
+  indicator. That failure is *downgraded* to a diagnostic, so the frontmatter
+  became `None`, the name-identity check was skipped, and the server built and
+  served the `SKILL.md` over `resources/read` while the SEP-2640 discovery
+  surface silently omitted it.
+- **The published description could diverge from the served one.** Blanks
+  adjacent to the separator fold away, so `"a<LS>   b"` round-tripped as
+  `"a<LS>b"` — `frontmatter.description` no longer matched
+  `Skill::resolved_description()` or `SequentialWorkflow::description()`.
+
+Both are escaped as `\uNNNN`. Not `\xNN`: that escape consumes exactly two hex
+digits, so `\x2028` would decode as a space followed by the literal text `28`.
+`sanitize_for_log` shared the same `Cc`-only assumption and now replaces both
+with `U+FFFD` alongside the control characters, closing the same forged-log-record
+vector the function was added for.
+
+### Fixed — `U+FFFE`/`U+FFFF` are escaped too, closing the last gap in that table
+
+**A second render change under the digest rule above,** and the same class as
+the entry immediately preceding it: a consumer that pinned the `sha256` of a
+skill whose name or description contains either codepoint must re-pin. The
+golden fixture contains neither, so it did not move.
+
+The `U+2028`/`U+2029` fix reasoned about YAML 1.1's *line breaks*. It left the
+neighbouring question — YAML 1.1's *printable set* — unasked. `unsafe-libyaml`'s
+reader admits `U+E000..=U+FFFD` in the BMP and stops there, so the two BMP
+noncharacters are rejected outright as unacceptable characters. Neither is
+Unicode `Cc`, so the `is_control()` arm never reached them, and neither is a
+line separator, so the new arms did not either: they were emitted raw and the
+whole frontmatter block then failed to parse. The registry downgrades that
+failure to a diagnostic, so the skill was silently dropped from `skills/list`
+while `as_skill()` and `SkillProjection::build()` both still returned `Ok`.
+
+These two are the ONLY gap: every other non-printable BMP scalar is `Cc`,
+surrogates cannot exist in a `char`, and the supplementary noncharacters
+(`U+1FFFE` and friends) fall inside libyaml's 4-byte accept range.
+
+### Fixed — a whitespace-only workflow description now takes the fallback
+
+**A render change under the digest rule.** `SequentialWorkflow::new("x", "   ")`
+previously rendered `description: "   "` into the frontmatter and `#    ` as the
+body heading, and logged nothing.
+
+`SkillProjection::build()` rejected such a description on
+`description().trim().is_empty()`, but `resolve_description` and
+`project_with_notices` substituted the deterministic fallback only on the
+UNTRIMMED `is_empty()`. So the two disagreed for every all-whitespace string,
+and `build()`'s own rustdoc — which claims `as_skill()` substitutes a legal
+string "for the same input" — was false. Both now share one
+`description_is_absent()` predicate, and the substitution emits its notice.
+
+### Fixed — a frontmatter delimiter may carry trailing whitespace
+
+**Wire-visible: a skill that was silently dropped from `skills/list` now
+appears in it.** The opening and closing `---` were compared byte-exactly, with
+only a trailing `\r` stripped. A `SKILL.md` beginning `"--- \n"` — accepted by
+Jekyll, gray-matter and every mainstream frontmatter reader — was therefore
+reported as `FrontmatterAbsent`: the skill contributed no `skills/list` entry
+while `resources/read` continued to serve its body, and the operator was told to
+"add a `---`-delimited YAML block at the top of the file" that was already
+there. Precisely the misdiagnosis the four-way `FrontmatterParse` split exists
+to prevent. Both readers now share one `is_frontmatter_delimiter()` that
+`trim_end()`s.
+
+### Fixed — hand-authored skill descriptions are YAML-decoded before publication
+
+**Wire-visible: `resources/list` and `prompts/*` descriptions change for any
+skill whose frontmatter `description` is folded, literal or quoted.**
+`Skill::new`'s eager scan was a raw `strip_prefix("description: ")` with no YAML
+decoding, so `description: >` surfaced as the literal `">"` and
+`description: "Refund: fast path"` kept its quotes — while the `skills/list`
+entry built from the same block by `parse_frontmatter_value` carried the
+properly decoded string. Two surfaces of one skill disagreeing about its
+description. `projection.rs` already worked around this for the projected path
+with `.with_description(..)`; hand-authored skills had no such escape. The
+strict reader's value is now preferred, with the loose scanner retained as the
+fallback so nothing that resolves today stops resolving.
+
+### Fixed — `.capabilities(...)` no longer erases the skills extension
+
+Registering a skill and then calling `.capabilities(caps)` wholesale-replaced
+`ServerCapabilities`, dropping the `io.modelcontextprotocol/skills` extension
+that `.skill(...)` had inserted. The registry itself survived, so the server
+went on serving every skill over `resources/list` and `resources/read` while
+`skills/list` and `skills/get` both answered `-32601 "this server does not
+declare the io.modelcontextprotocol/skills extension"`. Reversing the two calls
+worked, making the surface silently order-dependent. Both build paths now
+re-apply the extension when a registry is pending.
+
+### Changed — skill resources ride the FIRST page of a paginated `resources/list`
+
+When a server registers skills alongside its own `.resources(...)` handler, the
+composed listing previously re-emitted every `skill://` URI on **every** page of
+that handler's pagination. Skills do not paginate — the skills handler ignores
+its cursor and returns them all in one page — so they are now appended only to
+the caller's first page, and the user handler's `next_cursor`, `ttl_ms` and
+`cache_scope` are preserved rather than discarded.
+
+The accepted cost, recorded because it is a real trade-off rather than a
+strict improvement: a user handler that *ignores* its cursor and returns its
+full vector every time yields no skills for a cursor-bearing request. A
+conforming client never sends such a handler a cursor (it never issues one), so
+this needs a replayed or stale cursor to reach. Distinguishing a paginating
+handler from a cursor-ignoring one is not possible through the `ResourceHandler`
+trait. Both halves of the decision are pinned by tests.
+
+### Fixed — `Skills::into_handler()` logs the diagnostics it computes
+
+`into_handler()` — the public, documented registration path — built every
+build-time `SkillDiagnostic` (`FrontmatterAbsent`, `FrontmatterInvalid`,
+`FrontmatterNotAMapping`, `FrontmatterNameNotAString`, `NameMismatch`) and then
+discarded them unlogged, making it the only one of the three build paths that
+never warned. A server author whose skill was silently excluded from
+`skills/list` heard nothing.
+
+### Fixed — skill diagnostics are sanitized before they reach a log sink
+
+`log_skill_diagnostics` wrote the author-controlled skill URI and the rendered
+diagnostic message raw, bypassing the `shared::log_sanitize` module added in
+this same release for exactly this purpose. A skill registered with a newline in
+its path — `Skill::new("a", body).with_path("a\n2026-01-01 ERROR ...")` — could
+forge a second record in any line-oriented log. The `uri` field and the message
+now both route through `sanitize_for_log`, matching the sibling emitter in
+`projection.rs`.
+
+## [2.19.3] - 2026-08-30
+
+**A carrier release, following the v2.19.2 and v2.19.1 precedent.** No `pmcp`
+source changed since 2.19.2 — `pmcp` moves 2.19.2 → 2.19.3 solely to mint the
+tag that carries `pmcp-package` 0.4.0 and four sibling crates to crates.io,
+because this repo tags on the `pmcp` version and a `v*` tag is the only path
+those crates have to the registry.
+
+The heading is the version, NOT `[Unreleased]`:
+`.github/workflows/release.yml`'s `create-release` job extracts notes with
+`awk 'index($0, "## [" ver "]") == 1'` and **exits 1** when no section matches
+the tag, *before* any publish step runs.
+
+`pmcp`'s patch bump needs no downstream pin changes — the caret exception.
+Every in-tree `pmcp` requirement is `^2.x` with x ≤ 19, and `^2.19.0` already
+admits 2.19.3, so no pin moves and no crate is bumped on `pmcp`'s account.
+
+### What this tag carries
+
+| Crate | From | To | Why |
+|---|---|---|---|
+| `pmcp-package` | 0.3.1 | **0.4.0** | `supplied_by` on config slots; source-breaking |
+| `pmcp-agent` | 0.3.0 | 0.4.0 | pins `pmcp-package` `^0.3` → `^0.4` |
+| `pmcp-team-servers` | 0.2.0 | 0.3.0 | pins `pmcp-package` and `pmcp-agent` |
+| `pmcp-cfn-renderer` | 0.2.0 | 0.3.0 | pins `pmcp-package` |
+| `pmcp-server-toolkit` | 0.1.2 | 0.1.3 | `supplied_by` on `ConfigSlotDecl` |
+| `cargo-pmcp` | 0.24.0 | 0.24.0 | unpublished; R1 folds into it |
+
+### Added — a config slot can declare WHO fills it
+
+A `[[config_slots]]` entry may now carry `supplied_by = "environment"` (the
+default), `"platform"` or `"runtime"`:
+
+```toml
+[[config_slots]]
+key = "backend.base_url"
+kind = "endpoint"
+name = "TFL_BASE_URL"
+tested_value = "https://api.tfl.gov.uk"
+supplied_by = "platform"
+```
+
+`cargo pmcp package save` carries the declaration into the package;
+`package load`/`pull` render such slots under a labelled **"Supplied by the host
+at deploy time"** section rather than demanding them of an operator. Absent
+means `environment`, so every config written before this release keeps its exact
+meaning.
+
+This is the "A generates, B verifies" severance in practice: the config document
+is the source of truth for who fills a slot, it travels inside the artifact, and
+a holder re-derives the split from the artifact alone.
+
+**Three crates had to move together.** `pmcp-package` refuses to pack a config
+carrying a field the SERVER would reject at boot, and the toolkit's
+`ConfigSlotDecl` is `#[serde(deny_unknown_fields)]`. Teaching only the packer
+would make every config using the field unpackable; teaching only the runtime
+would have the packer reject configs the server boots from happily. Each side
+now carries a test pinning the other.
+
+An unrecognized `supplied_by` VALUE is **refused**, never defaulted — silently
+reading it as `environment` would tell an operator to supply a value the
+platform actually injects, which is the confusion the field exists to remove.
+
+### Breaking — `pmcp-package` 0.4.0
+
+Measured with `cargo semver-checks check-release --baseline-version 0.3.1`:
+one major failure. `DeclaredConfigSlot` was externally constructible, so its new
+`supplied_by` field breaks struct literals. It is now `#[non_exhaustive]` — the
+same remedy `ConfigSlot` received after the `config_key` break — so the next
+field addition costs nothing. Consumers move `^0.3` → `^0.4`; all four in-tree
+consumers already have.
+
+`required_slots` no longer enumerates host- or runtime-supplied slots, and
+`validate_config_slot_agreement` now refuses a `supplied_by` disagreement
+between the config and the package.
+
+### Note on `pmcp-server-toolkit` 0.1.3
+
+Its `ConfigSlotDecl` field addition is the same class of source break, taken as
+a PATCH by deliberate decision rather than oversight. `^0.1.x` admits 0.1.3, so
+its seven consumer pins do not move and this release is five crates rather than
+about twelve. Justified by zero in-tree `ConfigSlotDecl` struct literals (it is
+a deserialization target) and no CI semver gate. Recorded here so a future
+releaser sees the reasoning.
+
+## [2.19.2] - 2026-08-28
+
+**A carrier release, following the v2.19.1 precedent.** No `pmcp` source changed
+since 2.19.1 — `pmcp` moves 2.19.1 → 2.19.2 solely to mint the tag that carries
+`pmcp-package` 0.3.1 to crates.io, because this repo tags on the `pmcp` version
+and a `v*` tag is the only path `pmcp-package` has to the registry.
+
+The heading is the version, NOT `[Unreleased]`, and that is load-bearing:
+`.github/workflows/release.yml`'s `create-release` job extracts notes with
+`awk 'index($0, "## [" ver "]") == 1'` and **exits 1** when no section matches
+the tag — "refusing to create a release with empty notes" — *before* any publish
+step runs. A tag pushed against an `[Unreleased]` heading aborts the whole
+release.
+
+`pmcp`'s patch bump needs no downstream pin changes: `crates/mcp-tester` and
+`cargo-pmcp` both pin `pmcp = "2.19.0"`, and `^2.19.0` admits 2.19.2 (the caret
+exception in CLAUDE.md's *Version Bump Rules*, same as at 2.19.1).
+
+### Fixed
+
+- **`pmcp-package` 0.3.0 → 0.3.1** — `pack_server`'s config-slot validation ran
+  only in the DECLARED-SLOT -> CONFIG direction. A server config referencing
+  environment variables that no `[[config_slots]]` entry declared therefore
+  packed at exit 0 and reported "no config slots — nothing to fill", producing a
+  package that installs cleanly into a new environment and then cannot
+  authenticate. A third gate, `validate_no_undeclared_env_refs`, closes the
+  CONFIG -> SLOT direction fail-closed. See
+  `crates/pmcp-package/CHANGELOG.md` for the gate's deliberate scope
+  boundaries, the gaps it does not close, and the migration.
+
+  **Version axis — read this before trusting the patch level.**
+  `cargo semver-checks` vs the published 0.3.0 reports 196/196 and "no semver
+  update required", and none of the four crates pinning `pmcp-package = "0.3"`
+  (`cargo-pmcp`, `pmcp-agent`, `pmcp-team-servers`, `pmcp-cfn-renderer`) needs a
+  pin change under the caret exception. But that tool measures the API surface
+  for BREAKING changes only — it never reports "you added a public item, so bump
+  minor" — and two facts sit outside what it can see. This release **adds**
+  public API (`validate_no_undeclared_env_refs`, re-exported from the crate
+  root), which this repo's own Version Bump Rules call a minor bump; and
+  `pack_server` now **refuses input it previously accepted**, which CLAUDE.md
+  item 15a treats as a contract change warranting minor. 0.3.0 *is* published, so
+  `^0.3` auto-resolves 0.3.1 and that refusal reaches users of an unchanged
+  `cargo-pmcp` 0.23.0 with no version signal. Choosing 0.3.1 over 0.4.0 avoids
+  moving four pins as one set; it is a deliberate trade, not a semver-checks
+  verdict.
+
+### Changed
+
+- **Config corpus migrated to declare its slots.** The new gate refuses a config
+  that defers a value nothing declares, and a repo sweep through the real
+  `cargo pmcp package save` path found **11 in-repo configs** in exactly that
+  shape. All now carry a `[[config_slots]]` block: the five reference fixtures
+  (`pmcp-server-toolkit/tests/fixtures/{reference,imdb,msr-vtt,open-images}-config.toml`
+  and `pmcp-sql-server/tests/fixtures/reference-config.toml`, each deferring
+  `code_mode.token_secret`) and the six `pmcp_server_toolkit_config_parser` fuzz
+  seeds. The fuzz-seed half is cosmetic — the gate never runs on a parser
+  corpus — and was migrated so a repo-wide sweep reads clean.
+- **Docs no longer teach a shape the SDK refuses.** `pmcp-sql-server/README.md`
+  and `pmcp-openapi-server/README.md` both showed
+  `token_secret = "${CODE_MODE_SECRET}"` with no declaration anywhere, and both
+  scaffold templates (`cargo-pmcp/src/templates/{sql,openapi}_server.rs`) told
+  the reader to replace the dev literal with `env:CODE_MODE_SECRET` — advice that
+  now leads straight into the refusal. All four show the declaration.
+
+  Note the out-of-box scaffold was never broken: it emits a dev-only *literal*
+  `token_secret`, which the gate does not touch. The break was one step later,
+  at the documented "productionize your config" move.
+
+- **`cargo-pmcp` 0.23.0 → 0.23.1** — carries the corrected scaffold templates and
+  the `PMCP_VERSION` move to 2.19.2. Without this bump the published 0.23.0 keeps
+  emitting the advice that leads into the refusal, so the fix would not reach
+  anyone.
+- **`pmcp-sql-server` 0.1.0 → 0.1.1 and `pmcp-openapi-server` 0.1.1 → 0.1.2** —
+  README-only, and bumped for exactly that reason: a README ships inside the
+  `.crate` and is what crates.io and docs.rs render. Left unbumped, the most
+  visible copy of the instructions would go on teaching a config shape the SDK
+  now refuses. Nothing pins either crate with a version requirement, so the bumps
+  are self-contained.
+
+## [2.19.1] - 2026-08-27
+
+**A release-hygiene release.** No `pmcp` source changed since 2.19.0 — this tag exists to
+ship a set of crate deltas that had landed under already-published version numbers and would
+otherwise never have reached crates.io, and to close the gaps in the release machinery that
+let that happen.
+
+### Fixed
+
+- **`pmcp` 2.19.1** — ships the in-tree `jsonwebtoken` requirement move (`10.3` → `11.0`) that
+  had landed under an already-published 2.19.0. No `pmcp` source moved: `git diff v2.19.0..HEAD
+  -- src/` is empty. The patch axis is verified rather than assumed — `cargo public-api
+  --simplified --all-features` enumerates 26,801 public API lines containing **zero**
+  `jsonwebtoken` occurrences (with 286 lines mentioning `jwt` as a positive control, so the
+  enumeration is not vacuous), and `cargo semver-checks check-release --baseline-version
+  2.19.0` classifies it a patch change with 223/223 checks passing.
+
+### Changed
+
+- **`pmcp-workbook-runtime` 0.1.0 → 0.2.0 (BREAKING)** — adds `pub mod reconcile` (reference
+  reconciliation: `reconcile_reference`, `seed_reference_inputs`, `ReconcileReport`,
+  `ToolReport`, `OutputRow`) and the `RenderMode` render control. **`render_xlsx` gained a
+  third parameter, `mode: RenderMode`** — a source-breaking change for any caller of the
+  published 0.1.0, which is why this takes the minor (breaking, on a 0.x line) axis rather
+  than a patch. Callers must pass `RenderMode::Filled` to preserve the previous behaviour;
+  `RenderMode::InputsOnly` writes bare formulas so Excel recomputes every output.
+- **`pmcp-workbook-compiler` 0.1.0 → 0.1.1** — pins `umya-spreadsheet` to `=3.0.0`. The
+  published 0.1.0 carried `^3.0`, so a cold resolve of it lands on 3.0.1, which forks
+  `Cargo.lock` onto a second `quick-xml` (0.37 → 0.41, failing the workspace purity gate) and
+  regresses a data-validation-list ingest test. Also re-pins `pmcp-workbook-runtime` to
+  `0.2.0`.
+- **`pmcp-workbook-dialect` 0.1.0 → 0.1.1** — re-pin release only: `pmcp-workbook-runtime`
+  moves to `0.2.0`. No source change.
+- **`pmcp-code-mode-derive` 0.2.0 → 0.3.0 (BREAKING)** — the `"sql"` arm of the derive now
+  emits `validate_sql_query_async(...).await` where the published 0.2.0 emitted the
+  synchronous `validate_sql_query(...)`. The macro's own input surface is unchanged, but the
+  **emitted code is part of its contract**: `validate_sql_query_async` does not exist in
+  `pmcp-code-mode` 0.4.x (it arrived in 0.5.0), and this crate declares no runtime dependency
+  on `pmcp-code-mode` — the pairing is unconstrained by the published manifest. A patch bump
+  would therefore have been taken automatically by anyone on `^0.2` and broken their build
+  with "no method named `validate_sql_query_async`". The minor axis stops that. **Users
+  upgrading to 0.3.0 must be on `pmcp-code-mode` >= 0.5.0.**
+- **`pmcp-server-toolkit`** — its `pmcp-workbook-runtime` requirement moves to `0.2.0`. This
+  is a correctness fix, not bookkeeping: `src/workbook/handler.rs` uses `RenderMode`,
+  `reconcile_reference` and `ReconcileReport`, none of which exist in the published 0.1.0,
+  while the manifest requested `^0.1.0`. Because `workbook` is not a default feature, a
+  publish-verification build would not have caught it.
+
+### Also riding this tag
+
+Crates whose versions were already ahead of the registry and ship as-is: `cargo-pmcp` 0.23.0,
+`pmcp-package` 0.3.0, `pmcp-agent` 0.3.0, `pmcp-team-servers` 0.2.0, `pmcp-cfn-renderer` 0.2.0,
+`pmcp-openapi-server` 0.1.1, `pmcp-server-toolkit` 0.1.2, `pmcp-workbook-server` 0.1.1,
+`pmcp-tasks` 0.1.1. Between them they carry the v2.6 AI-Package portability work from phases
+120–123: config-server packaging and the local pack/unpack round-trip, attestation carriage
+(with `cargo pmcp package inspect` rendering all three carriage states and exiting non-zero on
+a subject-digest mismatch), and the `package save` / `load` / `pull` verbs.
+
+### Release machinery
+
+- `scripts/check-release-coverage.sh` now discovers workspace-**excluded** publishable crates
+  by filesystem scan, closing the blind spot that had let `pmcp-tasks` go unpublished
+  unnoticed; coverage went from 24 to 25 crates, and the red direction is a permanent
+  self-test rather than a one-off demonstration.
+- The publish **order** for the `pmcp-package` cluster is machine-checked: its step must
+  precede `pmcp-cfn-renderer`, `pmcp-agent`, `pmcp-team-servers` and `cargo-pmcp`.
+- `make release-sweep` reports three-way version drift (in-tree vs crates.io vs source delta
+  since the publishing tag) across all 25 publishable crates. It is deliberately not part of
+  `quality-gate`. It is what found every crate delta listed above.
+- Both publish ledgers — `.github/workflows/release.yml`'s comments and CLAUDE.md's crate
+  list — were reconciled against the workflow's own steps and against the manifests.
+
+## [2.19.0] - 2026-08-20
+
+### ⚠ WIRE CHANGE — embedded resources now serialize as the spec's `EmbeddedResource`
+
+**This is a conformance FIX, and there is no opt-out escape hatch.** An embedded
+resource inside a tool result (`CallToolResult.content`) or a prompt message
+(`GetPromptResult.messages[].content`) now serializes as the shape the MCP
+schema declares:
+
+```json
+{ "type": "resource", "resource": { "uri": "…", "mimeType": "…", "text": "…" } }
+```
+
+Previously pmcp emitted a FLAT object with the payload hoisted to the top level:
+
+```json
+{ "type": "resource", "uri": "…", "text": "…", "mimeType": "…" }
+```
+
+The change applies to **both** 2025-11-25 and 2026-07-28 — the era decision is
+per request, and this is not an era-dependent shape.
+
+**Why there is no opt-out.** `EmbeddedResource.resource` is
+`TextResourceContents | BlobResourceContents` in every published version of the
+schema (`schema.ts:1734-1748`). The flat object matched no arm of that union, so
+every other MCP implementation rejected or misread pmcp's embedded resources.
+Reliance on the flat shape was reliance on a bug, and keeping a flag to reproduce
+it would keep pmcp emitting a shape no conformant peer can read.
+
+**What did NOT change: `ReadResourceResult.contents` stays FLAT.** That position
+is `ResourceContents[]` (`schema.ts:1514-1560`), which the spec declares flat and
+without a `type` discriminator, and which pmcp already emitted correctly. It
+gains `blob` and nothing else.
+
+### Added
+
+- `Content::Resource` gains **`blob`** — the `BlobResourceContents` arm
+  (`schema.ts:1548`), so a binary resource can finally be embedded and so
+  `resources/read` on a binary resource answers `{uri, mimeType, blob}`.
+- `Content::Resource` gains **`annotations`** — `EmbeddedResource.annotations`
+  (`schema.ts:1741`), emitted as a SIBLING of `resource`, never inside it.
+- `Content::resource_with_blob(uri, blob, mime_type)`, `Content::with_annotations`
+  and `Content::with_meta`. These are **mandatory, not convenient**: see the
+  `#[non_exhaustive]` note below.
+- `Content`'s reader is now TOLERANT: it accepts the nested spec shape **and**
+  the legacy flat shape, and emits only the nested one. This also fixes a
+  client-side defect — before this release a spec-conformant embedded resource
+  from any other SDK's server failed to parse at all with ``missing field `uri` ``.
+  The tolerance is a compatibility affordance for mixed-version fleets, not a
+  second supported wire format.
+- **`SharedSender`** — a new public trait, plus a defaulted
+  `Transport::shared_sender()` accessor that returns `None`. A transport that
+  implements it hands the client an OWNED send handle, so `Client` takes its
+  transport guard only long enough to ask for that handle, drops it, and only
+  then awaits the send. Additive: a transport that does not implement it keeps
+  the previous exclusive path. `StreamableHttpTransport` implements it;
+  `PooledTransport`, `HttpTransport` and `WasmHttpTransport` do not.
+- **`Era` / `protocol_era()` and the `V2_PROTOCOL_VERSIONS` table** — v2
+  membership now has ONE source of truth that both the era classifier and the
+  `MCP-Protocol-Version` echo read, so adding a future v2-generation version is
+  a single-table edit and cannot make the echo advertise the wrong spelling.
+
+### Changed
+
+- **`Content::Resource` is now `#[non_exhaustive]`.** Downstream crates construct
+  it through `Content::resource_with_text` / `Content::resource_with_blob` (plus
+  the `.with_annotations(..)` / `.with_meta(..)` builders) and match it with a
+  `..` rest pattern. This is deliberate and one-time: landing the attribute in
+  the same change as `blob` and `annotations` makes every FUTURE spec field on
+  this variant a minor version bump instead of a major one.
+- An embedded resource carrying neither `text` nor `blob` emits
+  `{"type":"resource","resource":{"uri":"…","text":""}}`. Both arms of the spec
+  union require content, so `text` is the default arm; an object carrying neither
+  key would match no arm at all.
+- A payload carrying BOTH `text` and `blob` inside `resource` is REJECTED on
+  input, because the spec type is an XOR.
+- **A stalled peer can no longer wedge a whole `Client`.** Client sends route
+  through an owned handle taken under a momentary guard that is released BEFORE
+  the round trip is awaited, so a peer that accepts a POST and never writes its
+  response head now blocks only its own call — not every other operation on that
+  client, `close()` included. Two disclosed exceptions remain: a POOLED
+  `StreamableHttpTransport` keeps the exclusive path, and `Client::open_event_stream`
+  still holds a read guard across the `subscriptions/listen` response head.
+- **Concurrent token vends on one transport are single-flighted.** Two paths that
+  were serialised only by accident are now serialised in their own right: the
+  `401` refresh (purge through retry BUILD), and — new in this release — the
+  ORDINARY vend while the credential cache is cold. Several concurrent first
+  requests on one cloned transport previously reached `AuthProvider::get_access_token`
+  once each; against a ROTATING refresh token the identity provider accepts one and
+  rejects the rest, and each rejection invalidates the token the winner cached, so
+  the transport's auth failed permanently before any `401` had occurred. NOTE the
+  limit: this holds only if your `AuthProvider` CACHES what `get_access_token`
+  returns. The trait states no caching contract and pmcp cannot enforce one —
+  against a non-caching provider the vends are serialised but still plural.
+- **Session-stream restarts are atomic.** Two overlapping restarts can no longer
+  leave an orphaned reader holding a live connection.
+
+### Fixed
+
+- **Docs: the v2 server track said the opposite of the code.** The README and the
+  migration guide both stated that servers need do nothing for v2 — that a server
+  built with default features "already answers both eras". The default accept-list
+  is v1-only BY DESIGN (`default_accept_list()` excludes `2026-07-28`, so no server
+  reaches the v2 era by accident), and v2 is reached only through
+  `ServerBuilder::with_supported_protocol_versions(..)`. A team following the guide
+  shipped a v1-only server and believed it was done, with the failure silent until
+  a v2 client arrived. Both documents now teach the opt-in, with the v1 version
+  listed ALONGSIDE v2. No code change: the docs were wrong, not the default.
+- **`pmcp-code-mode` no longer declares `execute_code` as a safe read.**
+  `readOnlyHint`/`destructiveHint` were shared with `validate_code`, telling every
+  host it could auto-approve execution of caller-supplied code. `execute_code` now
+  declares nothing and the MCP defaults (`readOnlyHint = false`,
+  `destructiveHint = true`) stand.
+
+### Deprecated
+
+- `Content::resource(uri)` — a URI-only value cannot be a spec-valid
+  `EmbeddedResource`; that is `ResourceLink`. Use `Content::resource_with_text` /
+  `Content::resource_with_blob` for embedded content, or `Content::resource_link`
+  for a reference. The body and the returned variant are unchanged; removal is
+  scheduled for the next major.
+
+### Migration
+
+- **Readers of pmcp tool results and prompt messages must read
+  `content.resource.uri` instead of `content.uri`** (and `content.resource.text`
+  / `content.resource.blob`). `content._meta` and `content.annotations` stay at
+  content level and are unmoved — the MCP Apps widget path that destructures
+  `{ uri, meta, .. }` at content level reads `_meta` there and is unaffected.
+- pmcp's own reader accepts BOTH shapes, so a mixed-version fleet keeps working
+  in the client direction while servers roll forward.
+- Rust callers who built `Content::Resource { .. }` with a struct literal switch
+  to `Content::resource_with_text` / `Content::resource_with_blob`; callers who
+  matched it exhaustively add a `..` rest pattern.
+- Readers of `ReadResourceResult.contents` change nothing, except that a binary
+  resource now actually carries its payload under `blob`.
+
+Phase 119's migration guide is written against this section.
+
+## [2.18.0] - 2026-08-16
+
+SEP-2352 credential storage and OAuth discovery hardening (Phase 116). `pmcp`
+gains a credential-storage seam addressed by `(issuer, account, server)`, and
+`cargo-pmcp` 0.19.0 drops its own parallel token cache onto it — one machine,
+one credential store, one format. Additive on the `pmcp` side; the two
+behaviour changes are called out below because both are visible to operators.
+
+### Added
+
+- `pmcp::shared::credential_store` (ungated, I/O-free): `CredentialKey`,
+  `StoredCredentials`, `CredentialSnapshot`, `parse_credential_snapshot`,
+  `normalize_server_key`, `MigrationReport` / `DroppedEntry`, the
+  `CredentialStore` platform seam and its `CredentialStoreAdmin` sibling, and
+  `InMemoryCredentialStore`.
+- `pmcp::shared::credential_file` (`oauth`, non-wasm): `FileCredentialStore` —
+  the default on-disk store, one serialized read-modify-write per mutation,
+  `0o600` files in a `0o700` parent — and `default_credential_path`.
+- `OAuthHelper::with_credential_store` / `with_account_scope` /
+  `with_interactivity`, and `Interactivity::RefreshOnly` for callers (scripts,
+  CI) that must never be handed a browser.
+
+### Fixed
+
+- **stdin EOF disabled stdout, dropping responses to requests the server had
+  already accepted** (#316). `StdioTransport` tracked both directions with a
+  single `closed` flag, so the moment stdin reached EOF the transport refused
+  to *write* as well — `stdio.rs:172` set the flag on read EOF and `send()` at
+  `:79` returned `ConnectionClosed` on that same flag. A client that writes
+  its requests and closes stdin — the ordinary shape for a batch or one-shot
+  invocation — is a client that has already handed the server work; those
+  responses were silently discarded, and from the client's side the server
+  looked like it had hung or answered nothing.
+
+  The flag is now split into `read_closed` and `write_closed`. EOF on stdin
+  closes the read side only; the write side latches shut on a real write error
+  or an explicit `close()`, so the server can still deliver what it owes.
+  Downstream impact, stated precisely: pmat worked around this with a
+  three-layer mitigation, the last layer of which exists *only* because of this
+  defect — it catches the response pmcp refuses to write and re-emits it
+  through `serialize_message` so the bytes match what the transport would have
+  produced. That layer can now be deleted. The other two layers address
+  separate races (a session ending while a consumed request is in flight, and
+  the actor's `select!` breaking without draining its outbound queue) and are
+  still needed.
+
+### Changed
+
+- **RFC 8414 §3.3: a trailing-slash issuer is now REFUSED when the
+  authorization server's discovery document declares a slash-free `issuer`**
+  (and vice versa). The specification requires the document's `issuer` to be
+  byte-identical to the value its metadata URL was built from, and this anchor
+  deliberately does **not** normalise — a lenient comparison is precisely what
+  the rule exists to prevent. The URL *derivation* still normalises a trailing
+  slash away, so the two halves of discovery disagree on purpose and a test
+  pins the disagreement. An operator who configures `https://as.example/pool/`
+  against a provider whose document declares `https://as.example/pool` now gets
+  a hard refusal naming BOTH values, where before they got a working provider;
+  configure the issuer exactly as the provider publishes it. Real providers are
+  unaffected: Auth0 declares its trailing slash, and Cognito, Google, Okta and
+  Entra all publish slash-free issuers. Affects `GenericOidcProvider`,
+  `CognitoProvider` and the client discovery path.
+- `cargo pmcp auth` (cargo-pmcp 0.19.0) stores credentials through
+  `FileCredentialStore`, at the same `~/.pmcp/oauth-cache.json` as before. An
+  existing login that recorded its issuer is migrated in place on the first
+  WRITE; a read-only command leaves the file byte-identical. An entry with no
+  recorded issuer cannot be re-keyed without guessing which authorization server
+  issued it, so it is dropped, named and counted, and that one server needs a
+  fresh `cargo pmcp auth login`.
+- `cargo pmcp auth refresh` renews an EXPIRED token instead of posting to the
+  token endpoint unconditionally, because the expiry decision now lives in the
+  SDK alone rather than in two implementations. It reports which of the two
+  happened rather than announcing a refresh it did not perform.
+- **`Mcp-Name` is now required on 2026-07-28 requests exactly where the method
+  carries a routing name** — `tools/call` / `prompts/get` (`params.name`),
+  `resources/read` (`params.uri`) and `tasks/get` / `tasks/update` /
+  `tasks/cancel` (`params.taskId`) — rather than on every v2 request (Phase 118
+  D-13, widened by D-18). This is one RELAXATION and one TIGHTENING, and both
+  are visible on the wire:
+  - **Relaxation.** A v2 request for a name-less method (`tools/list`, `ping`,
+    `server/discover`, `completion/complete`, `subscriptions/listen`, …) that
+    omits `Mcp-Name` is now SERVED; it was refused `-32020 HEADER_MISMATCH` at
+    HTTP 400 before dispatch. The old rule was the deliberately-stricter
+    Phase-113 DRIFT-1 adjudication, and it rejected effectively the entire
+    2026-07-28 scored set of the official `@modelcontextprotocol/conformance`
+    suite, which sends the header only for name-bearing methods. A value sent on
+    a name-less method is now accepted and DISCARDED, so it is neither branched
+    on nor reflected in the response headers.
+  - **Tightening.** A v2 `tasks/get` / `tasks/update` / `tasks/cancel` that
+    omits `Mcp-Name`, or whose `Mcp-Name` disagrees with `params.taskId`, is now
+    refused `-32020 HEADER_MISMATCH` before dispatch. Previously the server
+    neither required nor cross-checked it for those three methods while pmcp's
+    own client already emitted it — an emitter/validator asymmetry. **A
+    non-pmcp v2 client that sent an empty `Mcp-Name` for a `tasks/*` method must
+    now send the task id.** `pmcp::Client` over `StreamableHttpTransport` is
+    unaffected: it already derives the value from the request body.
+
+  `Mcp-Method` and `MCP-Protocol-Version` remain required on EVERY v2 request,
+  and the header/body cross-check is unchanged wherever a name exists. Nothing
+  about 2025-11-25 changes — the era decision is per request.
+
+## [2.17.0] - 2026-07-19
 
 Hosted-agent loop enablement (Phase 108). Three paired, fully **additive** core
 changes that let a tool handler call back into its client mid-request without

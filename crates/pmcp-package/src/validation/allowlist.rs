@@ -183,6 +183,7 @@ mod tests {
                 enabled: false,
                 provider: "none".to_string(),
                 callback_urls: vec![],
+                cognito: None,
                 dcr: Some(AuthDcrSection {
                     enabled: true,
                     public_client_patterns: vec!["claude".to_string()],

@@ -1,10 +1,17 @@
 //! Exportable, wire-level conformance runner (TEAM-06, D-17/D-19).
 //!
-//! Replays versioned **fixture schema v2** cases against a live MCP server
+//! Replays versioned **fixture format rev 2** cases against a live MCP server
 //! reached through a [`ConformanceTarget`] abstraction — either an in-memory
 //! [`pmcp::Client`] over a [`crate::DuplexTransport`] OR (behind the `http`
 //! feature) a [`pmcp::Client`] over an HTTP endpoint — so the platform can
 //! import this runner and point it at its own in-process OR remote servers.
+//!
+//! # `rev 2` is the fixture FORMAT, not the MCP era
+//!
+//! `rev 2` is the FIXTURE FORMAT revision. It has nothing to do with MCP era v2
+//! (`2026-07-28`); throughout this crate a bare `v2` means the ERA. The on-disk
+//! field is still spelled `schema_version: "2"` and is deliberately unchanged —
+//! renaming it would be a 33-file data diff for a naming win (Phase 118 D-08).
 //!
 //! # What "conformant" means here
 //!
@@ -42,10 +49,10 @@ use pmcp::types::protocol::RequestMeta;
 use pmcp::types::{CallToolResult, ToolInfo};
 
 // ===========================================================================
-// Fixture schema v2
+// Fixture format rev 2
 // ===========================================================================
 
-/// The kind of a v2 fixture case.
+/// The kind of a fixture case (format rev 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixtureKind {
@@ -129,7 +136,7 @@ pub struct Expect {
     pub tools_list_schema: Option<BTreeMap<String, Value>>,
 }
 
-/// A single fixture case (schema v2).
+/// A single fixture case (format rev 2).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Fixture {
     /// Must be `"2"`.

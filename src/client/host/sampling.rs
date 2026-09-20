@@ -229,7 +229,11 @@ mod tests {
             SamplingMessageContent::Image { .. }
         ));
         assert!(matches!(
-            lift_content_to_sampling(Content::resource("file:///x")),
+            lift_content_to_sampling(Content::resource_with_text(
+                "file:///x",
+                "body",
+                "text/plain"
+            )),
             SamplingMessageContent::Text { .. }
         ));
     }

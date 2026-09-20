@@ -1,0 +1,1084 @@
+{
+  "descriptor_toml": "[target]\ntype = \"aws-lambda\"\nversion = \"1.0.0\"\n\n[aws]\nregion = \"us-east-1\"\n\n[server]\nname = \"oauth-cognito-dcr-fixture\"\nmemory_mb = 512\ntimeout_seconds = 30\n\n[environment]\nRUST_LOG = \"info\"\n\n[secrets]\n\n[auth]\nenabled = true\nprovider = \"cognito\"\ncallback_urls = []\n\n[auth.cognito]\nuser_pool_name = \"oauth-cognito-dcr-fixture-users\"\nresource_server_id = \"mcp\"\nsocial_providers = []\nmfa = \"optional\"\naccess_token_ttl = \"1h\"\nrefresh_token_ttl = \"30d\"\n\n[auth.dcr]\nenabled = true\npublic_client_patterns = [\n    \"claude\",\n    \"desktop\",\n    \"cursor\",\n    \"mcp-inspector\",\n    \"chatgpt\",\n]\ndefault_scopes = [\n    \"openid\",\n    \"email\",\n    \"mcp/read\",\n]\nallowed_scopes = [\n    \"openid\",\n    \"email\",\n    \"profile\",\n    \"mcp/read\",\n    \"mcp/write\",\n]\n\n[auth.scopes.custom]\n\n[observability]\nlog_retention_days = 30\nenable_xray = true\ncreate_dashboard = true\n\n[observability.alarms]\nerror_threshold = 10\nlatency_threshold_ms = 5000\n\n[assets]\ninclude = []\nexclude = [\n    \"**/*.tmp\",\n    \"**/.DS_Store\",\n    \"**/Thumbs.db\",\n]\n\n[composition]\ntier = \"foundation\"\nallow_composition = true\ninternal_only = false",
+  "params": {
+    "account_id": "123456789012",
+    "region": "us-east-1",
+    "stack_name": "oauth-cognito-dcr-fixture-stack",
+    "artifact": {
+      "s3_bucket": "pmcp-deploy-123456789012-us-east-1",
+      "s3_key": "oauth-cognito-dcr-fixture/bootstrap.zip"
+    },
+    "environment": {
+      "RUST_LOG": "info"
+    },
+    "metadata": {
+      "version": "1.0.0",
+      "snapshot_baked": false
+    }
+  },
+  "normalized": {
+    "Description": "MCP Server: oauth-cognito-dcr-fixture",
+    "Outputs": {
+      "ApiUrl": {
+        "Description": "MCP Server API URL",
+        "Value": {
+          "Fn::GetAtt": [
+            "Api-0",
+            "ApiEndpoint"
+          ]
+        }
+      },
+      "ClientsTableName": {
+        "Description": "DynamoDB table for registered OAuth clients",
+        "Value": {
+          "Ref": "Table-0"
+        }
+      },
+      "DashboardUrl": {
+        "Description": "CloudWatch Console",
+        "Value": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1"
+      },
+      "OAuthDiscoveryUrl": {
+        "Description": "OAuth Discovery URL",
+        "Value": {
+          "Fn::Join": [
+            "",
+            [
+              {
+                "Fn::GetAtt": [
+                  "Api-0",
+                  "ApiEndpoint"
+                ]
+              },
+              "/.well-known/openid-configuration"
+            ]
+          ]
+        }
+      },
+      "UserPoolDomainUrl": {
+        "Description": "Cognito Hosted UI Domain",
+        "Value": "https://oauth-cognito-dcr-fixture-56789012.auth.us-east-1.amazoncognito.com"
+      },
+      "UserPoolId": {
+        "Description": "Cognito User Pool ID",
+        "Value": {
+          "Ref": "UserPool-0"
+        }
+      }
+    },
+    "Resources": {
+      "Api-0": {
+        "Properties": {
+          "CorsConfiguration": {
+            "AllowHeaders": [
+              "*"
+            ],
+            "AllowMethods": [
+              "GET",
+              "POST",
+              "OPTIONS"
+            ],
+            "AllowOrigins": [
+              "*"
+            ]
+          },
+          "Description": "MCP Server HTTP API with OAuth",
+          "Name": "oauth-cognito-dcr-fixture",
+          "ProtocolType": "HTTP",
+          "Tags": {
+            "component": "oauth",
+            "managed-by": "pmcp",
+            "project": "oauth-cognito-dcr-fixture",
+            "service": "oauth-cognito-dcr-fixture",
+            "target": "aws-lambda"
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Api"
+      },
+      "Authorizer-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "AuthorizerPayloadFormatVersion": "2.0",
+          "AuthorizerResultTtlInSeconds": 300,
+          "AuthorizerType": "REQUEST",
+          "AuthorizerUri": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/",
+                {
+                  "Fn::GetAtt": [
+                    "Function-2",
+                    "Arn"
+                  ]
+                },
+                "/invocations"
+              ]
+            ]
+          },
+          "EnableSimpleResponses": true,
+          "IdentitySource": [
+            "$request.header.Authorization"
+          ],
+          "Name": "oauth-cognito-dcr-fixture-authorizer"
+        },
+        "Type": "AWS::ApiGatewayV2::Authorizer"
+      },
+      "Function-0": {
+        "DependsOn": [
+          "Policy-0",
+          "Role-2"
+        ],
+        "Properties": {
+          "Architectures": [
+            "arm64"
+          ],
+          "Code": {
+            "S3Bucket": "<artifact>",
+            "S3Key": "<artifact>"
+          },
+          "Environment": {
+            "Variables": {
+              "COGNITO_REGION": "us-east-1",
+              "COGNITO_USER_POOL_ID": {
+                "Ref": "UserPool-0"
+              },
+              "DCR_TABLE_NAME": {
+                "Ref": "Table-0"
+              },
+              "RUST_LOG": "info"
+            }
+          },
+          "FunctionName": "oauth-cognito-dcr-fixture-oauth-proxy",
+          "Handler": "bootstrap",
+          "LoggingConfig": {
+            "LogFormat": "JSON"
+          },
+          "MemorySize": 256,
+          "Role": {
+            "Fn::GetAtt": [
+              "Role-2",
+              "Arn"
+            ]
+          },
+          "Runtime": "provided.al2023",
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ],
+          "Timeout": 30
+        },
+        "Type": "AWS::Lambda::Function"
+      },
+      "Function-1": {
+        "DependsOn": [
+          "Policy-1",
+          "Role-1"
+        ],
+        "Properties": {
+          "Architectures": [
+            "arm64"
+          ],
+          "Code": {
+            "S3Bucket": "<artifact>",
+            "S3Key": "<artifact>"
+          },
+          "Environment": {
+            "Variables": {
+              "COGNITO_REGION": "us-east-1",
+              "COGNITO_USER_POOL_ID": {
+                "Ref": "UserPool-0"
+              },
+              "RUST_LOG": "info"
+            }
+          },
+          "FunctionName": "oauth-cognito-dcr-fixture",
+          "Handler": "bootstrap",
+          "LoggingConfig": {
+            "LogFormat": "JSON"
+          },
+          "MemorySize": 512,
+          "Role": {
+            "Fn::GetAtt": [
+              "Role-1",
+              "Arn"
+            ]
+          },
+          "Runtime": "provided.al2023",
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ],
+          "Timeout": 30,
+          "TracingConfig": {
+            "Mode": "Active"
+          }
+        },
+        "Type": "AWS::Lambda::Function"
+      },
+      "Function-2": {
+        "DependsOn": [
+          "Role-0"
+        ],
+        "Properties": {
+          "Architectures": [
+            "arm64"
+          ],
+          "Code": {
+            "S3Bucket": "<artifact>",
+            "S3Key": "<artifact>"
+          },
+          "Environment": {
+            "Variables": {
+              "COGNITO_REGION": "us-east-1",
+              "COGNITO_USER_POOL_ID": {
+                "Ref": "UserPool-0"
+              },
+              "RUST_LOG": "info"
+            }
+          },
+          "FunctionName": "oauth-cognito-dcr-fixture-authorizer",
+          "Handler": "bootstrap",
+          "LoggingConfig": {
+            "LogFormat": "JSON"
+          },
+          "MemorySize": 256,
+          "Role": {
+            "Fn::GetAtt": [
+              "Role-0",
+              "Arn"
+            ]
+          },
+          "Runtime": "provided.al2023",
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ],
+          "Timeout": 10
+        },
+        "Type": "AWS::Lambda::Function"
+      },
+      "Integration-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "IntegrationType": "AWS_PROXY",
+          "IntegrationUri": {
+            "Fn::GetAtt": [
+              "Function-0",
+              "Arn"
+            ]
+          },
+          "PayloadFormatVersion": "2.0"
+        },
+        "Type": "AWS::ApiGatewayV2::Integration"
+      },
+      "Integration-1": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "IntegrationType": "AWS_PROXY",
+          "IntegrationUri": {
+            "Fn::GetAtt": [
+              "Function-1",
+              "Arn"
+            ]
+          },
+          "PayloadFormatVersion": "2.0"
+        },
+        "Type": "AWS::ApiGatewayV2::Integration"
+      },
+      "LogGroup-0": {
+        "Properties": {
+          "LogGroupName": {
+            "Fn::Join": [
+              "",
+              [
+                "/aws/lambda/",
+                {
+                  "Ref": "Function-0"
+                }
+              ]
+            ]
+          },
+          "RetentionInDays": 30,
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::Logs::LogGroup"
+      },
+      "LogGroup-1": {
+        "Properties": {
+          "LogGroupName": {
+            "Fn::Join": [
+              "",
+              [
+                "/aws/lambda/",
+                {
+                  "Ref": "Function-1"
+                }
+              ]
+            ]
+          },
+          "RetentionInDays": 30,
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::Logs::LogGroup"
+      },
+      "LogGroup-2": {
+        "Properties": {
+          "LogGroupName": {
+            "Fn::Join": [
+              "",
+              [
+                "/aws/lambda/",
+                {
+                  "Ref": "Function-2"
+                }
+              ]
+            ]
+          },
+          "RetentionInDays": 30,
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::Logs::LogGroup"
+      },
+      "Permission-0": {
+        "Properties": {
+          "Action": "lambda:InvokeFunction",
+          "FunctionName": {
+            "Fn::GetAtt": [
+              "Function-0",
+              "Arn"
+            ]
+          },
+          "Principal": "apigateway.amazonaws.com",
+          "SourceArn": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:execute-api:us-east-1:123456789012:",
+                {
+                  "Ref": "Api-0"
+                },
+                "/*/*"
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::Lambda::Permission"
+      },
+      "Permission-1": {
+        "Properties": {
+          "Action": "lambda:InvokeFunction",
+          "FunctionName": {
+            "Fn::GetAtt": [
+              "Function-1",
+              "Arn"
+            ]
+          },
+          "Principal": "apigateway.amazonaws.com",
+          "SourceArn": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:execute-api:us-east-1:123456789012:",
+                {
+                  "Ref": "Api-0"
+                },
+                "/*/*"
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::Lambda::Permission"
+      },
+      "Permission-2": {
+        "Properties": {
+          "Action": "lambda:InvokeFunction",
+          "FunctionName": {
+            "Fn::GetAtt": [
+              "Function-2",
+              "Arn"
+            ]
+          },
+          "Principal": "apigateway.amazonaws.com",
+          "SourceArn": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:execute-api:us-east-1:123456789012:",
+                {
+                  "Ref": "Api-0"
+                },
+                "/*/*"
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::Lambda::Permission"
+      },
+      "Policy-0": {
+        "Properties": {
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Action": [
+                  "dynamodb:BatchGetItem",
+                  "dynamodb:Query",
+                  "dynamodb:GetItem",
+                  "dynamodb:Scan",
+                  "dynamodb:ConditionCheckItem",
+                  "dynamodb:BatchWriteItem",
+                  "dynamodb:PutItem",
+                  "dynamodb:UpdateItem",
+                  "dynamodb:DeleteItem",
+                  "dynamodb:DescribeTable"
+                ],
+                "Effect": "Allow",
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "Table-0",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Action": [
+                  "dynamodb:GetRecords",
+                  "dynamodb:GetShardIterator"
+                ],
+                "Effect": "Allow",
+                "Resource": [
+                  {
+                    "Fn::GetAtt": [
+                      "Table-0",
+                      "Arn"
+                    ]
+                  }
+                ]
+              },
+              {
+                "Action": [
+                  "cognito-idp:CreateUserPoolClient",
+                  "cognito-idp:DescribeUserPoolClient",
+                  "cognito-idp:DeleteUserPoolClient",
+                  "cognito-idp:ListUserPoolClients"
+                ],
+                "Effect": "Allow",
+                "Resource": {
+                  "Fn::GetAtt": [
+                    "UserPool-0",
+                    "Arn"
+                  ]
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "PolicyName": "<policy-name>",
+          "Roles": [
+            {
+              "Ref": "Role-2"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Policy"
+      },
+      "Policy-1": {
+        "Properties": {
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Action": [
+                  "xray:PutTraceSegments",
+                  "xray:PutTelemetryRecords"
+                ],
+                "Effect": "Allow",
+                "Resource": "*"
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "PolicyName": "<policy-name>",
+          "Roles": [
+            {
+              "Ref": "Role-1"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Policy"
+      },
+      "Role-0": {
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                ]
+              ]
+            }
+          ],
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Role"
+      },
+      "Role-1": {
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                ]
+              ]
+            }
+          ],
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Role"
+      },
+      "Role-2": {
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                ]
+              ]
+            }
+          ],
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Role"
+      },
+      "Route-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "AuthorizationType": "CUSTOM",
+          "AuthorizerId": {
+            "Ref": "Authorizer-0"
+          },
+          "RouteKey": "POST /mcp",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-1"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-1": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "AuthorizationType": "CUSTOM",
+          "AuthorizerId": {
+            "Ref": "Authorizer-0"
+          },
+          "RouteKey": "POST /mcp/{proxy+}",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-1"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-2": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "GET /",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-1"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-3": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "GET /.well-known/{proxy+}",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-0"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-4": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "GET /oauth2/authorize",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-0"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-5": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "POST /oauth2/register",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-0"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Route-6": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "POST /oauth2/token",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-0"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Stage-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "AutoDeploy": true,
+          "StageName": "$default",
+          "Tags": {
+            "component": "oauth",
+            "managed-by": "pmcp",
+            "project": "oauth-cognito-dcr-fixture",
+            "service": "oauth-cognito-dcr-fixture",
+            "target": "aws-lambda"
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Stage"
+      },
+      "Table-0": {
+        "Properties": {
+          "AttributeDefinitions": [
+            {
+              "AttributeName": "client_id",
+              "AttributeType": "S"
+            }
+          ],
+          "BillingMode": "PAY_PER_REQUEST",
+          "KeySchema": [
+            {
+              "AttributeName": "client_id",
+              "KeyType": "HASH"
+            }
+          ],
+          "PointInTimeRecoverySpecification": {
+            "PointInTimeRecoveryEnabled": true
+          },
+          "TableName": "oauth-cognito-dcr-fixture-oauth-clients",
+          "Tags": [
+            {
+              "Key": "component",
+              "Value": "oauth"
+            },
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "oauth-cognito-dcr-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::DynamoDB::Table"
+      },
+      "UserPool-0": {
+        "Properties": {
+          "AccountRecoverySetting": {
+            "RecoveryMechanisms": [
+              {
+                "Name": "verified_email",
+                "Priority": 1
+              }
+            ]
+          },
+          "AdminCreateUserConfig": {
+            "AllowAdminCreateUserOnly": false
+          },
+          "AutoVerifiedAttributes": [
+            "email"
+          ],
+          "EmailVerificationMessage": "The verification code to your new account is {####}",
+          "EmailVerificationSubject": "Verify your new account",
+          "Policies": {
+            "PasswordPolicy": {
+              "MinimumLength": 8,
+              "RequireLowercase": true,
+              "RequireNumbers": true,
+              "RequireSymbols": false,
+              "RequireUppercase": false
+            }
+          },
+          "SmsVerificationMessage": "The verification code to your new account is {####}",
+          "UserPoolName": "oauth-cognito-dcr-fixture-users",
+          "UserPoolTags": {
+            "component": "oauth",
+            "managed-by": "pmcp",
+            "project": "oauth-cognito-dcr-fixture",
+            "service": "oauth-cognito-dcr-fixture",
+            "target": "aws-lambda"
+          },
+          "UsernameAttributes": [
+            "email"
+          ],
+          "VerificationMessageTemplate": {
+            "DefaultEmailOption": "CONFIRM_WITH_CODE",
+            "EmailMessage": "The verification code to your new account is {####}",
+            "EmailSubject": "Verify your new account",
+            "SmsMessage": "The verification code to your new account is {####}"
+          }
+        },
+        "Type": "AWS::Cognito::UserPool"
+      },
+      "UserPoolDomain-0": {
+        "DependsOn": [
+          "UserPool-0"
+        ],
+        "Properties": {
+          "Domain": "oauth-cognito-dcr-fixture-56789012",
+          "UserPoolId": {
+            "Ref": "UserPool-0"
+          }
+        },
+        "Type": "AWS::Cognito::UserPoolDomain"
+      },
+      "UserPoolResourceServer-0": {
+        "Properties": {
+          "Identifier": "mcp",
+          "Name": "mcp",
+          "Scopes": [
+            {
+              "ScopeDescription": "Read access to MCP tools and resources",
+              "ScopeName": "read"
+            },
+            {
+              "ScopeDescription": "Write access to MCP tools",
+              "ScopeName": "write"
+            }
+          ],
+          "UserPoolId": {
+            "Ref": "UserPool-0"
+          }
+        },
+        "Type": "AWS::Cognito::UserPoolResourceServer"
+      }
+    }
+  }
+}

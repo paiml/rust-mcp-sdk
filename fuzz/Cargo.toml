@@ -30,7 +30,34 @@ syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 [dependencies.pmcp]
 path = ".."
 default-features = false
-features = ["oauth"]
+# `streamable-http` gates `src/server/request_state.rs` (D-14 locks the MRTR AEAD
+# to native + that feature); `fuzzing` widens the module and exposes the
+# `fuzz_support::verify_bytes` seam. `fuzzing` is in neither `default` nor `full`,
+# so enabling it here adds nothing to the shipped public API.
+#
+# `validation` (Phase 115-09, SCHM-01) gates the `jsonschema` validator inside
+# `src/server/output_validation.rs`: without it `compile_for_era` does not exist
+# and `output_validation::fuzz_support` compiles to nothing, so
+# `fuzz_schema_draft_pin` would have no seam to reach. `fuzzing` widens the
+# MODULE, `validation` supplies its CONTENTS — both are required, which is why
+# the seam itself is gated `#[cfg(all(feature = "fuzzing", feature =
+# "validation"))]`.
+#
+# `skills` (Phase 125-05) gates `src/server/skills/` in its entirety: without
+# it `pmcp::server::skills` does not exist and `fuzz_skill_entry` has no seam to
+# reach. It needs no `fuzzing` companion — `Skill`, `Skills`, `SkillEntry` and
+# `SkillResourceRef` are all PUBLIC, so the target drives the same API a server
+# author does. `skills` is in neither `default` nor `full`, so enabling it here
+# adds nothing to the shipped public API of any other build.
+#
+# This list is ONE shared set: adding `skills` builds every fuzz binary in the
+# crate with it. That is accepted deliberately. The alternative — a dedicated
+# renamed dependency alias so only this target carries the feature — would fork
+# the manifest's structure for every future reader in order to shave compile
+# time off a nightly-only scheduled workflow that nobody waits on. The four
+# features above already sit under exactly this arrangement, each with its own
+# justification comment; `skills` joins them the same way.
+features = ["oauth", "streamable-http", "fuzzing", "validation", "skills"]
 
 [dependencies.pmcp-code-mode]
 path = "../crates/pmcp-code-mode"
@@ -39,6 +66,21 @@ features = ["openapi-code-mode"]
 
 [dependencies.mcp-tester]
 path = "../crates/mcp-tester"
+
+# Phase 118 (CONF-02): reaches
+# `pmcp_team_servers::conformance::era_diff::parse_baseline`.
+#
+# `default-features = false` plus ONLY `conformance` is deliberate. The crate's
+# default feature set attaches all four reference servers, and its `http`
+# feature pulls `pmcp/streamable-http` + `pmcp/http` + `member-llm`, which drags
+# reqwest and a native-only HTTP stack into a build that only ever hands a
+# `&str` to a YAML parser. `conformance` alone gives the parser and nothing
+# else, mirroring how `[dependencies.pmcp]` above narrows its own feature list
+# to exactly the seams its targets reach.
+[dependencies.pmcp-team-servers]
+path = "../crates/pmcp-team-servers"
+default-features = false
+features = ["conformance"]
 
 [[bin]]
 name = "protocol_parsing"
@@ -134,6 +176,185 @@ bench = false
 [[bin]]
 name = "pkce_helper"
 path = "fuzz_targets/pkce_helper.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trace_context_from_meta"
+path = "fuzz_targets/trace_context_from_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_request_state"
+path = "fuzz_targets/fuzz_request_state.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 113-13 (HTTP-04): the `subscriptions/listen` CLIENT frame decoder runs on
+# bytes supplied by a remote server, so it is fuzzed at that boundary.
+[[bin]]
+name = "subscription_listen_frames"
+path = "fuzz_targets/subscription_listen_frames.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 118.2-04 (CONF-09): the streamable-HTTP CLIENT's incremental SSE reader,
+# the sibling of the target above on the OTHER client stream. Both of its read
+# sites — the GET session stream and the POST response that answers
+# `text/event-stream` — decode bytes a remote server chose. Registration only:
+# this target adds NO dependency, reaching the decode sequence through the
+# `fuzzing`-gated `decode_sse_chunks_for_fuzz` seam.
+[[bin]]
+name = "streamable_sse_frames"
+path = "fuzz_targets/streamable_sse_frames.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 114-14 (TASK-02): the RAW `tasks/update` params boundary. `inputResponses`
+# is the ENTIRE request payload and its decode is the one place in the tasks
+# surface where guessing at overlapping result shapes is actively wrong (D-113-O),
+# so the untrusted bytes are fuzzed where they arrive. Registration only — this
+# target adds NO dependency; it reaches `task_dispatch::fuzz_support` through the
+# `fuzzing` feature already enabled on the `pmcp` dependency above.
+[[bin]]
+name = "fuzz_tasks_update"
+path = "fuzz_targets/fuzz_tasks_update.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 116-08 (AUTH-01 / AUTH-03): the authorization-response callback query and
+# the issuer identifier are BOTH fully attacker-controlled — a hostile
+# authorization server picks every byte of the callback URL, and a hostile
+# `mcp_server_url` picks every byte of the issuer that reaches the discovery URL
+# arithmetic. Registration only: this target adds NO dependency. Both entry points
+# live in the UNGATED pure tier `src/shared/oauth_validation.rs`, so it reaches
+# them through the `pmcp` dependency above with no feature flag at all.
+[[bin]]
+name = "oauth_authorization_response"
+path = "fuzz_targets/oauth_authorization_response.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 116-08 (AUTH-02 / AUTH-03): the credential document that reaches
+# `parse_credential_snapshot` comes off DISK before any authentication has
+# happened, so a corrupt or attacker-planted `~/.pmcp/oauth-cache.json` is
+# untrusted input with nothing in front of it; and a DCR response is bytes from a
+# registration endpoint the client has, by construction, not yet authenticated.
+# Registration only: this target adds NO dependency. All three entry points are
+# pure ungated functions reached through the `pmcp` dependency above.
+[[bin]]
+name = "oauth_credential_and_dcr"
+path = "fuzz_targets/oauth_credential_and_dcr.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 115-09 (SCHM-01): the era-branched `outputSchema` validation path. A tool
+# author's declared schema and a handler's emitted value are both arbitrary JSON,
+# and emit-time validation runs on every structured result — a panic there is a
+# remotely reachable unwind. Registration only: this target adds NO dependency, it
+# reaches `output_validation::fuzz_support` through the `fuzzing` + `validation`
+# features already enabled on the `pmcp` dependency above.
+[[bin]]
+name = "fuzz_schema_draft_pin"
+path = "fuzz_targets/fuzz_schema_draft_pin.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 117-08 (CLNT-04): the expected-difference baseline parser. The baseline
+# is reachable from a user-supplied path, so arbitrary file bytes flow into
+# `mcp_tester::era_diff::parse_baseline` — a panic there is a reachable unwind
+# (T-117-27). Registration only: this target adds NO dependency, it reaches the
+# parser through the `[dependencies.mcp-tester]` path entry already declared
+# above.
+[[bin]]
+name = "era_deltas_parser"
+path = "fuzz_targets/era_deltas_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 118 (CONF-02): the pmcp-team-servers sibling of the target above. The
+# same class of defect on a different crate's baseline — arbitrary file bytes
+# flow into `pmcp_team_servers::conformance::era_diff::parse_baseline` through
+# `era_diff::load_baseline`, and a panic there is a reachable unwind (T-118-10).
+# It reaches the parser through the `[dependencies.pmcp-team-servers]` path
+# entry declared above, which enables ONLY the `conformance` feature so this
+# build pulls no reqwest and no HTTP stack.
+[[bin]]
+name = "team_era_deltas_parser"
+path = "fuzz_targets/team_era_deltas_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 118.1-02 (CONF-04, D-03): the `Content` TOLERANT READER. When pmcp acts as
+# a client it deserializes whatever a server sends, so `Content`'s `Deserialize` is
+# an untrusted parse surface, and 118.1-03 is about to widen it to accept two
+# shapes — memory amplification via a hybrid flat/nested payload is the DoS
+# concern (T-118.1-02-02). Beyond no-panic the target asserts two invariants a
+# type-level check cannot reach: serialize/deserialize is a FIXED POINT, and a
+# flat legacy input re-emits as the NESTED spec shape.
+#
+# DELIBERATELY RED until 118.1-03: on the unfixed tree the nested spec shape does
+# not deserialize at all. Registration only — this target adds NO dependency, it
+# reaches `pmcp::types::Content` through the `[dependencies.pmcp]` path entry
+# already declared above, and it is absent from `fuzz.yml`'s fixed four-target
+# matrix, so no CI job runs it.
+[[bin]]
+name = "content_tolerant_reader"
+path = "fuzz_targets/content_tolerant_reader.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 125-05 (D-09, CLAUDE.md ALWAYS/FUZZ): SEP-2640 skill ENTRY SYNTHESIS. A
+# SKILL.md body is author-supplied untrusted input, and its YAML frontmatter is
+# the ONLY place in the skills surface where those bytes reach a third-party
+# parser (`serde_yaml` 0.9). Everything after it — the digest walk, the size
+# arithmetic, the name-identity rule — is arithmetic over whatever that parser
+# decided the bytes meant (T-125-19). It reaches the module through the `skills`
+# feature added to `[dependencies.pmcp]` above and needs no `fuzzing` seam: the
+# whole entry-synthesis API is public.
+#
+# UNLIKE the two targets above it, this one IS in `.github/workflows/fuzz.yml`'s
+# matrix, so it is EXECUTED on the daily schedule rather than merely registered.
+# `tests/skills_routing.rs::fuzz_skill_entry_is_registered_and_scheduled` fails
+# if this stanza, the source file, or that matrix row goes missing.
+[[bin]]
+name = "fuzz_skill_entry"
+path = "fuzz_targets/fuzz_skill_entry.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 126-03 (SC-4 sibling, CLAUDE.md ALWAYS/FUZZ): the WORKFLOW-TO-SKILL
+# PROJECTION. `SequentialWorkflow::as_skill()` is a PUBLIC, INFALLIBLE method, so
+# the only failure mode its signature leaves the renderer is a panic — and two of
+# its steps are arithmetic over author text (the 64-unit slug truncation and the
+# YAML double-quoted frontmatter encoder, whose output becomes a published sha256
+# under D-14). T-126-02.
+#
+# It reaches the projection through the `skills` feature already enabled on
+# `[dependencies.pmcp]` above and declares NO dependency of its own.
+#
+# Like `fuzz_skill_entry` and unlike the two targets above it, this one IS in
+# `.github/workflows/fuzz.yml`'s matrix, so it is EXECUTED on the daily schedule
+# rather than merely registered.
+# `tests/skills_routing.rs::fuzz_workflow_projection_is_registered_and_scheduled`
+# fails if this stanza, the source file, or that matrix row goes missing.
+[[bin]]
+name = "fuzz_workflow_projection"
+path = "fuzz_targets/fuzz_workflow_projection.rs"
 test = false
 doc = false
 bench = false

@@ -1,6 +1,8 @@
 //! Shape A/B: a streamable-HTTP MCP server that serves a governed-Excel workbook
-//! over all five workbook tools (`calculate`, `explain`, `get_manifest`,
-//! `diff_version`, `render_workbook`) plus the `workbook://` render resource.
+//! over ONE named compute tool per output Table (WBV2-04 — `calculate_tax` and
+//! `estimate_refund` for the `tax-calc` golden) plus the four workbook-wide meta
+//! tools (`explain`, `get_manifest`, `diff_version`, `render_workbook`) and the
+//! `workbook://` render resource.
 //!
 //! This is THE canonical wiring of [`WorkbookBuilderExt::try_with_workbook_bundle`]
 //! (D-09/D-12): a single chained call loads + integrity-verifies the bundle at

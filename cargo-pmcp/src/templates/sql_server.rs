@@ -157,7 +157,12 @@ enabled = true
 allow_writes = false
 require_limit = true
 max_limit = 1000
-# DEV ONLY — replace with a secrets ref (token_secret = "env:CODE_MODE_SECRET")
+# DEV ONLY — replace with a secrets ref (token_secret = "env:CODE_MODE_SECRET").
+# When you do, ALSO declare it, or `cargo pmcp package save` refuses the config:
+#   [[config_slots]]
+#   key = "code_mode.token_secret"
+#   kind = "secret"
+#   name = "CODE_MODE_SECRET"
 # for production. The deploy path (cargo pmcp deploy) substitutes a secrets ref
 # automatically. The inline literal below is rejected unless the dev flag is set.
 token_secret = "dev-only-insecure-secret-min-16-bytes"

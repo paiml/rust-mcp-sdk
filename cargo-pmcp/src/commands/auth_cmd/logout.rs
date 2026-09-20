@@ -1,41 +1,58 @@
-//! `cargo pmcp auth logout [<url> | --all]` — remove cached credentials.
+//! `cargo pmcp auth logout [<url> | --all]` — remove stored credentials.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;
+use pmcp::shared::credential_store::CredentialStoreAdmin;
 
-use crate::commands::auth_cmd::cache::{
-    default_multi_cache_path, normalize_cache_key, TokenCacheV1,
-};
+use crate::commands::auth_cmd::cache::{normalize_server_key, open_store, report_migration};
 use crate::commands::GlobalFlags;
 
-/// `cargo pmcp auth logout [<url> | --all]` — remove one entry or wipe the cache.
+/// `cargo pmcp auth logout [<url> | --all]` — remove one server or wipe the store.
 #[derive(Debug, Args)]
 pub struct LogoutArgs {
     /// URL of the MCP server to log out from (mutually exclusive with --all).
     #[arg(conflicts_with = "all")]
     pub url: Option<String>,
 
-    /// Log out from every cached server.
+    /// Log out from every stored server.
     #[arg(long)]
     pub all: bool,
 }
 
 /// Execute the `logout` subcommand.
 ///
-/// With no args: errors out. `--all` clears all entries; a positional URL removes one.
+/// With no args: errors out. `--all` clears every credential; a positional URL
+/// removes exactly that server's.
+///
+/// # Four load-bearing semantics
+///
+/// This is the only subcommand that DESTROYS credentials, so all four of its
+/// behaviours are pinned by tests asserting the exact message text:
+///
+/// 1. neither a URL nor `--all` is an error naming both options;
+/// 2. `--all` clears everything and reports the count;
+/// 3. a positional URL removes exactly that server — and only that server, even
+///    when a second server shares its authorization server, because
+///    `delete_by_server` operates on the key's SERVER component;
+/// 4. a URL with nothing stored is a friendly no-op, not an error.
+///
+/// All four are expressed through declared [`CredentialStoreAdmin`] methods.
+/// Nothing here reaches around the trait into the file, which is what stops the
+/// two-store divergence this port exists to end from quietly reappearing.
 pub async fn execute(args: LogoutArgs, global_flags: &GlobalFlags) -> Result<()> {
     if args.url.is_none() && !args.all {
         anyhow::bail!("specify a server URL or --all to log out of everything");
     }
 
-    let cache_path = default_multi_cache_path();
-    let mut cache = TokenCacheV1::read(&cache_path)?;
+    let store = open_store();
 
     if args.all {
-        let count = cache.entries.len();
-        cache.entries.clear();
-        cache.write_atomic(&cache_path)?;
+        let count = store
+            .clear_all()
+            .await
+            .context("clearing the credential store")?;
+        report_migration(&store).await?;
         if global_flags.should_output() {
             println!("Logged out of {} cached server(s).", count);
         }
@@ -43,22 +60,22 @@ pub async fn execute(args: LogoutArgs, global_flags: &GlobalFlags) -> Result<()>
     }
 
     let raw_url = args.url.as_deref().expect("url set (checked above)");
-    let key = normalize_cache_key(raw_url)?;
-    match cache.entries.remove(&key) {
-        Some(_) => {
-            cache.write_atomic(&cache_path)?;
-            if global_flags.should_output() {
-                println!("Logged out of {}.", key.bright_green());
-            }
-        },
-        None => {
-            if global_flags.should_output() {
-                println!(
-                    "No cached credentials for {} (nothing to do).",
-                    key.bright_yellow()
-                );
-            }
-        },
+    let key = normalize_server_key(raw_url)?;
+    let removed = store
+        .delete_by_server(&key)
+        .await
+        .with_context(|| format!("removing stored credentials for {key}"))?;
+    report_migration(&store).await?;
+
+    if global_flags.should_output() {
+        if removed > 0 {
+            println!("Logged out of {}.", key.bright_green());
+        } else {
+            println!(
+                "No cached credentials for {} (nothing to do).",
+                key.bright_yellow()
+            );
+        }
     }
     Ok(())
 }

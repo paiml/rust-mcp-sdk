@@ -2,6 +2,7 @@
 name = "oauth-basic"
 version = "0.1.0"
 edition = "2021"
+publish = false  # example crate, never published
 description = "OAuth authentication example for MCP servers using the Rust SDK"
 license = "MIT"
 repository = "https://github.com/anthropics/claude-code"

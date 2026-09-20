@@ -7,7 +7,9 @@
 
 use pmcp::server::streamable_http_server::StreamableHttpServer;
 use pmcp::server::workflow::{InternalPromptMessage, SequentialWorkflow};
-use pmcp::shared::streamable_http::{StreamableHttpTransport, StreamableHttpTransportConfig};
+use pmcp::shared::streamable_http::{
+    StreamableHttpTransport, StreamableHttpTransportConfigBuilder,
+};
 use pmcp::types::Role;
 use pmcp::{Client, ClientCapabilities, Result, Server};
 use std::net::SocketAddr;
@@ -78,16 +80,14 @@ async fn test_workflow_prompt_metadata_over_http() -> Result<()> {
     sleep(Duration::from_millis(500)).await;
 
     // Create client
-    let config = StreamableHttpTransportConfig {
-        url: Url::parse(&format!("http://{}", addr))
+    // Builder, not a struct literal: `session_id` / `on_resumption_token` are
+    // `v1-compat`-only, so a literal naming them breaks the `full-v2` build.
+    let config = StreamableHttpTransportConfigBuilder::new(
+        Url::parse(&format!("http://{}", addr))
             .map_err(|e| pmcp::Error::Internal(e.to_string()))?,
-        extra_headers: vec![],
-        auth_provider: None,
-        session_id: None,
-        enable_json_response: true,
-        on_resumption_token: None,
-        http_middleware_chain: None,
-    };
+    )
+    .enable_json_response()
+    .build();
     let transport = StreamableHttpTransport::new(config);
     let mut client = Client::new(transport);
 

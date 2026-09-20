@@ -1,0 +1,60 @@
+# env_ref_grammar_v1.tsv — the CONTRACT between the two independent
+# implementations of the `${VAR}` / `env:VAR` reference grammar:
+#
+#   * pmcp-server-toolkit  src/env_ref.rs::parse_env_ref   (the OWNER)
+#   * pmcp-package         src/oci/config_validation.rs::is_env_reference
+#
+# The grammar is duplicated by necessity — pmcp-package is the workspace-
+# excluded leaf crate and neither crate may depend on the other — so this file
+# is what keeps the duplication accountable. Both crates assert every row:
+# `pmcp-package/tests/config_server.rs` and
+# `pmcp-server-toolkit/tests/env_ref_grammar_parity.rs`.
+#
+# CHANGING A ROW IS A DELIBERATE GRAMMAR CHANGE. Both implementations must move
+# in the same commit, or one of the two parity tests fails — which is the whole
+# point. A row one side accepts and the other rejects is a config that packs
+# cleanly and then fails to resolve at boot (or the reverse), and that is
+# exactly the class of bug this table exists to make loud.
+#
+# Format: <input> TAB <accept|reject> TAB <parse_env_ref expectation>
+#
+#   column 1  the raw config value. The literal token `<EMPTY>` means the
+#             empty string (a TSV cannot carry an empty leading field).
+#   column 2  what pmcp-package's `is_env_reference` must answer.
+#   column 3  what the toolkit's `parse_env_ref` must return:
+#               a bare name  -> Some("<name>")
+#               <EMPTYNAME>  -> Some("")   (the malformed forms: a REFERENCE
+#                                           to an empty name, which the toolkit
+#                                           resolves to omission)
+#               empty        -> None       (a plain literal)
+#
+# The two columns differ in SHAPE, not in verdict: `parse_env_ref` answers
+# "does this name a variable?" while `is_env_reference` answers "may a package
+# defer this key to the environment?". An empty variable name is a reference
+# the runtime can act on (by omitting the value) but is NOT something a package
+# can ask a target environment to fill, so `${}` and `env:` are Some("") on one
+# side and `false` on the other. Encoded here rather than papered over.
+${TFL_BASE_URL}	accept	TFL_BASE_URL
+env:TFL_APP_KEY	accept	TFL_APP_KEY
+${A}	accept	A
+env:A	accept	A
+https://api.tfl.gov.uk	reject
+the price is $5 per call	reject
+${}	reject	<EMPTYNAME>
+env:	reject	<EMPTYNAME>
+${TFL_BASE_URL	reject
+${TFL_BASE_URL}-suffix	reject
+<EMPTY>	reject
+  ${TFL_BASE_URL}  	reject
+# --- Multi-placeholder compositions (grammar v2 tightening, 2026-08-23) ---
+# A brace reference names exactly ONE variable matching [A-Za-z0-9_]+. A
+# composition is reference-SHAPED, so the toolkit parses it as a MALFORMED
+# reference (empty name -> omission/error, never a literal on the wire),
+# and a package refuses it at pack with an error naming the defect. The
+# explicit `env:` form keeps its any-non-empty-remainder rule on BOTH sides:
+# the coherence rule below (a reject row must resolve to nothing) forbids a
+# value one side resolves and the other refuses.
+${TFL_SCHEME}://${TFL_HOST}	reject	<EMPTYNAME>
+${A}-${B}	reject	<EMPTYNAME>
+${TFL-HOST}	reject	<EMPTYNAME>
+env:FOO}BAR	accept	FOO}BAR

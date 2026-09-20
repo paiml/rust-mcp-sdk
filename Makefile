@@ -55,6 +55,14 @@ setup-full: setup setup-pre-commit
 	@echo "$(GREEN)🏭 Toyota Way development environment fully configured$(NC)"
 
 # WASM build targets
+#
+# `wasm-build` is CI-LOAD-BEARING as of Phase 116 (D-06): the `wasm32-purity`
+# job in .github/workflows/ci.yml invokes this exact target, and that job is
+# listed in the org-required `gate` aggregate's `needs:`. It fences the ungated
+# OAuth tier — src/shared/oauth_validation.rs and src/shared/credential_store.rs
+# must keep compiling with none of the `oauth` feature's native-only deps, on
+# host AND wasm32, or a Workers/Lambda platform loses the seam. Changing this
+# target's flags changes what CI enforces; do not narrow it.
 .PHONY: wasm-build
 wasm-build:
 	@echo "$(BLUE)Building for WASM target (wasm32-unknown-unknown)...$(NC)"
@@ -146,42 +154,68 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 	@echo "$(GREEN)✓ Code formatting OK$(NC)"
 
+# The ONE clippy policy, shared by `lint` and `lint-skills`.
+#
+# `lint-skills` used to carry a verbatim 33-line copy of this list, with a
+# comment saying it was `make lint`'s "verbatim: this leg exists to widen the
+# policy's REACH, not to give one module a softer policy" — and nothing enforced
+# the word "verbatim". The next `-A` added to `make lint` (this file already
+# records one such addition, the Rust-1.98 `unused_async_trait_impl` note below)
+# would silently have given the skills module a STRICTER policy than the rest of
+# the crate, the inverse of the stated intent, surfacing as a confusing CI-only
+# failure in a module nobody touched. One variable removes the class.
+#
+# The two targets now differ only in `--features` and `-p pmcp`, which is the
+# whole of the real difference between them.
+#
+# Note on `-A clippy::unused_async_trait_impl` at the end of this list: Rust
+# 1.98 split part of `unused_async` — already allowed here, deliberately —
+# into a sibling lint the old allow does not cover, and it fires on 9
+# pre-existing sites. THREE of them are `pub async fn` on the public API
+# (`CognitoProvider::new`, `NotificationDebouncer::start`,
+# `SessionMiddleware::process`), so de-asyncing them is a SEMVER BREAK for a
+# cosmetic lint; a fourth (`ProxyProvider::introspect_token`) is async by
+# design — its body says "this would make an HTTP request". Allowing it
+# restores the policy this list already encodes rather than weakening it.
+CLIPPY_POLICY := \
+	-D clippy::all \
+	-W clippy::pedantic \
+	-W clippy::nursery \
+	-W clippy::cargo \
+	-A clippy::module_name_repetitions \
+	-A clippy::must_use_candidate \
+	-A clippy::missing_errors_doc \
+	-A clippy::missing_const_for_fn \
+	-A clippy::return_self_not_must_use \
+	-A clippy::missing_fields_in_debug \
+	-A clippy::uninlined_format_args \
+	-A clippy::if_not_else \
+	-A clippy::result_large_err \
+	-A clippy::multiple_crate_versions \
+	-A clippy::implicit_hasher \
+	-A clippy::unused_async \
+	-A clippy::cast_lossless \
+	-A clippy::redundant_clone \
+	-A clippy::redundant_closure_for_method_calls \
+	-A clippy::significant_drop_tightening \
+	-A clippy::missing_panics_doc \
+	-A clippy::cast_possible_truncation \
+	-A clippy::cast_precision_loss \
+	-A clippy::option_if_let_else \
+	-A clippy::derive_partial_eq_without_eq \
+	-A clippy::redundant_else \
+	-A clippy::match_same_arms \
+	-A clippy::manual_string_new \
+	-A clippy::default_trait_access \
+	-A clippy::format_push_string \
+	-A clippy::too_many_lines \
+	-A clippy::cargo_common_metadata \
+	-A clippy::unused_async_trait_impl
+
 .PHONY: lint
 lint:
 	@echo "$(BLUE)Running clippy...$(NC)"
-	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- \
-		-D clippy::all \
-		-W clippy::pedantic \
-		-W clippy::nursery \
-		-W clippy::cargo \
-		-A clippy::module_name_repetitions \
-		-A clippy::must_use_candidate \
-		-A clippy::missing_errors_doc \
-		-A clippy::missing_const_for_fn \
-		-A clippy::return_self_not_must_use \
-		-A clippy::missing_fields_in_debug \
-		-A clippy::uninlined_format_args \
-		-A clippy::if_not_else \
-		-A clippy::result_large_err \
-		-A clippy::multiple_crate_versions \
-		-A clippy::implicit_hasher \
-		-A clippy::unused_async \
-		-A clippy::cast_lossless \
-		-A clippy::redundant_clone \
-		-A clippy::redundant_closure_for_method_calls \
-		-A clippy::significant_drop_tightening \
-		-A clippy::missing_panics_doc \
-		-A clippy::cast_possible_truncation \
-		-A clippy::cast_precision_loss \
-		-A clippy::option_if_let_else \
-		-A clippy::derive_partial_eq_without_eq \
-		-A clippy::redundant_else \
-		-A clippy::match_same_arms \
-		-A clippy::manual_string_new \
-		-A clippy::default_trait_access \
-		-A clippy::format_push_string \
-		-A clippy::too_many_lines \
-		-A clippy::cargo_common_metadata
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy --features "full" --lib --tests -- $(CLIPPY_POLICY)
 	@echo "$(BLUE)Checking examples...$(NC)"
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) check --features "full" --examples
 	@echo "$(GREEN)✓ No lint issues$(NC)"
@@ -218,6 +252,541 @@ test-unit:
 	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test --lib --features "full"
 	@echo "$(GREEN)✓ Unit tests passed$(NC)"
 
+# The GATE's reach beyond the root `pmcp` package.
+#
+# Every other target in `test-all` runs against the root package only — `--lib`,
+# `--doc`, `--test '*'` all resolve to `pmcp` because the workspace root IS a
+# package. `crates/mcp-tester` therefore had 338 tests across 12 binaries that
+# `make quality-gate` never executed, and `.github/workflows/ci.yml` records the
+# same hole from the CI side: `org-gate-checks.yml`'s `workspace-test` runs
+# `--lib --bins` (excluding `tests/`) and is absent from `gate.needs`.
+#
+# A pre-existing `dual_run` failure survived a full phase inside that hole. This
+# target closes it for the crate that demonstrated the cost, and because CI's
+# `quality-gate` job runs `make quality-gate` and IS in `gate.needs`, adding it
+# here makes it merge-blocking without promoting `workspace-test` — which
+# `ci.yml` D-15 deliberately keeps deferred, since that job carries unrelated
+# unreviewed scope.
+#
+# `mcp-tester` declares no `[features]`, so a bare `-p` run reaches every test;
+# there is no silent feature-gated subset like the one `scripts/run-era-matrix.sh`
+# documents for `pmcp-team-servers`.
+#
+# The count assertion is not ceremony. The failure this target exists to prevent
+# is "the gate does not reach this crate", and a run that selects zero tests
+# EXITS 0 — reproducing exactly that hole while looking green.
+.PHONY: test-tester
+test-tester:
+	@echo "$(BLUE)Running mcp-tester's own tests...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p mcp-tester 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ mcp-tester reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ mcp-tester tests passed ($$ran tests)$(NC)"
+
+# Why this exists, mirroring test-tester: `test-unit` runs `cargo test --lib
+# --features full` with no `-p`, so it reaches the ROOT crate only. cargo-pmcp's
+# tests were therefore covered by nothing in this gate — and cargo-pmcp is where
+# the SCAFFOLD-PIN TRIPWIRES live (templates/workbook_server.rs PMCP_VERSION,
+# templates/agent.rs PMCP_AGENT_VERSION), the tests whose whole job is to fire on
+# a version bump. A `chore: bump` commit passed this gate green and then failed
+# CI on exactly that tripwire; this target closes that hole.
+#
+# `--lib` AND `--bins`, because this leg once closed the hole one level short.
+# `cargo-pmcp/src/lib.rs` declares NO `mod commands`, so ALL of
+# `src/commands/**` (save, load, deploy, doctor, secret, package/*) compiles into
+# the BIN target. Measured 2026-08-29: `--lib` alone runs 524 tests and the bin
+# adds a further 927 that were reached by NOTHING. The vacuity guard below could
+# not catch it -- it fires only at ZERO, so this leg was green at 524 while
+# missing 927, the partial-blind-spot shape `test-server-toolkit`'s comment
+# describes in general terms.
+#
+# Two details, both measured rather than assumed:
+#   * TWO invocations, not one: `-- --test-threads=1` reaches every binary in an
+#     invocation, and only the BIN target has racers. Measured: lib 524 tests,
+#     5.06s parallel vs 7.58s serial; bin 927 tests, 4-9 failures every parallel
+#     run vs 4.66s clean serialized. Splitting keeps the lib leg parallel.
+#     The racers are wider than doctor alone -- configure/{list,show,workspace,
+#     resolver,use_cmd}.rs, deploy/mod.rs and doctor.rs make 20 process-global
+#     `set_current_dir` calls. Isolating them is a real refactor; serializing the
+#     bin leg is the right trade.
+#   * The PER-TARGET guard is the load-bearing half. A summed count answers "was
+#     the selection non-empty", NEVER "was it complete" -- which is why the
+#     `ran -eq 0` check stayed green at 524 while 927 tests were dark. It reuses
+#     `scripts/named-test-binary-count.awk` from `test-cargo-pmcp-integration`,
+#     whose own comment states the principle: a nonzero SUM proves the SELECTION
+#     ran, not that any particular binary ran. Drop `--bins` above and this now
+#     FAILS instead of passing.
+#   * `RUSTFLAGS=` is deliberate and matches `test-cargo-pmcp-integration`, which
+#     already empties it for the same crate. The bin has never been compiled
+#     under the `-D warnings` this Makefile sets, and it carries 13 pre-existing
+#     dead-code violations across pentest/, deployment/, secrets/, configure/ and
+#     commands/package/. Emptying RUSTFLAGS keeps this leg's posture identical to
+#     its sibling instead of making 927 tests hostage to a cleanup that needs a
+#     per-item judgement (scaffolding for pending work vs. genuinely dead).
+#     NOT this target's debt to pay: `make lint` carries no `-p`, so it resolves
+#     to the root `pmcp` and never lints cargo-pmcp's bin at all. The root cause
+#     is the dual-target layout (`main.rs` re-declares every module instead of
+#     consuming the lib), already recorded as a follow-up elsewhere in this file.
+#     Fix it there, not by turning a test target into a linter.
+.PHONY: test-cargo-pmcp
+test-cargo-pmcp:
+	@echo "$(BLUE)Running cargo-pmcp's own tests...$(NC)"
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --lib 2>&1; \
+	        RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --bins -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ cargo-pmcp reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	for t in src/lib.rs src/main.rs; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="$$t" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ unittest target '$$t' never RAN. If a --lib/--bins selector was dropped from this recipe that is the cause — it is exactly how 927 bin-target tests went dark while this leg reported green.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ unittest target '$$t' printed a target line but NO 'test result:' followed — truncated output. This gate refuses to pass on output it cannot read.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ unittest target '$$t' RAN but passed ZERO tests. The summed total ($$ran) stays nonzero from the other target, so the count guard above CANNOT catch this.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ unittest target '$$t' — extractor gave no usable reading ('$$n'). EMPTY means awk did not run: check scripts/named-test-binary-count.awk.$(NC)"; \
+			exit 1;; \
+		esac; \
+		echo "$(GREEN)  ✓ $$t ran ($$n passed)$(NC)"; \
+	done; \
+	echo "$(GREEN)✓ cargo-pmcp tests passed ($$ran tests)$(NC)"
+
+# The GATE's reach into `cargo-pmcp/tests/`, mirroring test-openapi-server.
+#
+# `test-cargo-pmcp` above closed the hole for cargo-pmcp's LIB target (the
+# scaffold-pin tripwires) and left `tests/` wide open. Nothing in this repo
+# executed that directory before Phase 122, measured four ways:
+#   - `make test-cargo-pmcp` is `cargo test -p cargo-pmcp --lib`, and `--lib`
+#     selects the library target only (Makefile:286).
+#   - `make test-integration` is `cargo test --test '*'` with NO `-p`, so it
+#     resolves to the root `pmcp` package.
+#   - CI's `test` job (`ci.yml`) is root-package scoped.
+#   - `org-gate-checks.yml`'s `workspace-test` runs `--lib --bins`, which
+#     excludes `tests/` entirely, and that job is NOT in `gate.needs`.
+# Measured readings before this target existed: `awk -f
+# scripts/named-test-binary-count.awk` reported -1 ("never RAN") for
+# package_capture_contract, package_inspect AND pmcp_package_pin under every
+# one of those candidate gates. `package_capture_contract.rs` is the model file
+# Phase 122's attestation contract test copies, and its own module docs claimed
+# it "runs in the normal cargo test workspace gate" — a measured-false claim
+# this target is what makes true.
+#
+# WHY THREE `--test` SELECTORS AND NOT A BARE `cargo test -p cargo-pmcp`:
+# cargo-pmcp's deploy/doctor integration suites are known to race without
+# serialization (4-7 nondeterministic failures parallel vs 856/0 serialized),
+# and this gate's job is a narrow, fast, reliable reach into the contract and
+# tripwire binaries. A flaky gate gets disabled; a scoped one stays on.
+# `-- --test-threads=1` is used for the same reason test-openapi-server does:
+# these binaries touch process-global state and must not run concurrently.
+#
+# The count assertion is not ceremony. The failure this target exists to
+# prevent is "the gate does not reach this crate", and a run that selects zero
+# tests EXITS 0 — reproducing exactly that hole while looking green.
+#
+# The named-binary assertion exists because a nonzero SUM proves the SELECTION
+# ran, not that any particular binary ran. A renamed file or a `tests/` entry
+# that silently stopped being a target leaves the total comfortably nonzero
+# while its own truths go unexecuted. The extraction lives in
+# `scripts/named-test-binary-count.awk` — one file, read by both this gate and
+# `test-openapi-server-guard-selftest` (declared as this target's prerequisite),
+# so the gate and the proof of the gate cannot drift.
+#
+# `REQUIRED_TEST_BINARIES` is APPEND-ONLY across Phase 122. Plan 122-04 made the
+# reserved append: `package_attestation_contract` was added to BOTH lists below
+# in the same commit that created `cargo-pmcp/tests/package_attestation_contract.rs`.
+# A name added BEFORE its binary exists turns this gate red for every commit in
+# between. Removing a name to quiet a red gate deletes the proof instead of
+# fixing it.
+#
+# `package_attestation_contract` carries three non-ignored tests plus one
+# `#[ignore]`d live leg parked on a pmcp.run backend that does not exist yet. The
+# non-ignored three are what keep its passed count nonzero — a binary whose every
+# test is ignored reports `0 passed` and trips the `0)` arm below. If a future
+# change parks the last non-ignored test in that file, this gate goes red BY
+# DESIGN; unpark or replace the test, do not relax the guard.
+#
+# `verb_help` (appended by Phase 123 plan 06, 2026-08-26) is the one append here
+# that was NOT a new file. `cargo-pmcp/tests/verb_help.rs` has existed since
+# Phase 110 and, measured on the date of that commit, was executed by NOTHING:
+# `grep -c 'verb_help' Makefile` returned 0, and the four candidate gates all
+# miss it — `make test-cargo-pmcp` is `--lib` (which excludes `tests/`
+# entirely), this target's `--test` selector list omitted it, its
+# `REQUIRED_TEST_BINARIES` omitted it, and `test-all` chains only those two
+# cargo-pmcp legs. It was registered in BOTH lists in the SAME commit that made
+# its `EXPECTED_VERBS` pin an exact-set assertion, because an exact-set pin in a
+# file no gate runs reads green forever — including after the drift it exists to
+# catch. The general lesson for the next person adding a `cargo-pmcp/tests/`
+# file: the default is NOT reached. Register it here or it does not run.
+#
+# PHASE 123 (PKGX-02) — FOUR NAMES, FOUR COMMITS, ON PURPOSE. Consolidated by
+# plan 07 (2026-08-26) so the record sits at the edit point rather than only in
+# four separate SUMMARYs. Each binary was registered in BOTH lists below by the
+# plan that CREATED it, in that plan's own commit:
+#
+#   - `package_save_load`            plan 123-01, wave 1  (5ba3a8b4)
+#   - `package_portability_contract` plan 123-02, wave 2  (bfea2a95), extended
+#                                    by plan 123-05 with the `pull` pipeline
+#   - `package_artifact_framing`     plan 123-04, wave 3  (e34c5354)
+#   - `verb_help`                    plan 123-06, wave 5  (2147fb96) — the
+#                                    pre-existing-but-ungated one, above
+#
+# The four arrived across FOUR commits rather than one deferred batch, and that
+# is the correct reading of the APPEND-ONLY rule, not an exception to it. The
+# hazard the rule guards against is a name landing BEFORE its binary — which
+# turns this gate red for every commit in between. A name landing WITH its
+# binary cannot produce that state, and it is exactly what plan 122-04 did (see
+# the paragraph above). Batching all four here instead would have left waves 1
+# through 5 running `make quality-gate` green WITHOUT the gate ever executing
+# that wave's own new tests — a false green of precisely the class this whole
+# comment block exists to prevent.
+#
+# STANDING INSTRUCTION, restated because this is where someone will be standing
+# when they are tempted: removing a name to quiet a red gate DELETES THE PROOF
+# instead of fixing the failure. Fix the binary, or explain in a commit message
+# why the proof is no longer owed.
+#
+# `package_portability_contract` carries the same ignored-test hazard as
+# `package_attestation_contract`: offline tests plus one `#[ignore]`d live leg
+# parked on a pmcp.run backend that does not exist yet. The OFFLINE tests are
+# what keep its passed count nonzero. If a future change parks the last
+# non-ignored test in that file, this gate goes red BY DESIGN — unpark or
+# replace it, do not relax the guard.
+#
+# MEASURED END STATE (plan 123-07, 2026-08-26), over the complete eight-binary
+# set with every binary present — the configuration in which the gate's real end
+# state is observable, and which no single creator plan could reach on its own:
+#   package_capture_contract 3, package_attestation_contract 3,
+#   package_inspect 12, pmcp_package_pin 1, package_save_load 36,
+#   package_portability_contract 22, package_artifact_framing 14, verb_help 4
+#   — 95 tests, exit 0.
+# Both negative controls were re-run over that complete set: dropping
+# `verb_help` from the `--test` selector list while leaving it in
+# `REQUIRED_TEST_BINARIES` produced the -1 "never RAN" verdict and exit 2 with
+# the summed total still a comfortable 91 (which is why the sum cannot catch
+# it); renaming `cargo-pmcp/tests/package_artifact_framing.rs` produced
+# `error: no test target named 'package_artifact_framing'` and exit 2 from cargo
+# itself, before any output reached the extractor.
+#
+# WHICH GUARD CATCHES WHICH FAILURE — measured, because the two are not
+# interchangeable and the distinction is easy to get backwards:
+#
+#   - A RENAMED OR DELETED test file is caught by CARGO ITSELF, not by the -1
+#     arm. Because this target names its binaries with explicit `--test`
+#     selectors, cargo refuses the whole invocation:
+#     `error: no test target named 'package_inspect' in 'cargo-pmcp' package`,
+#     exit 101, before any output reaches the extractor. MEASURED by renaming
+#     `cargo-pmcp/tests/package_inspect.rs` — the gate went red at cargo, which
+#     is a STRICTER failure than the -1 verdict (it cannot be misread).
+#   - The -1 arm catches the DRIFT class instead: a name present in
+#     `REQUIRED_TEST_BINARIES` but absent from the `--test` selector list above.
+#     That is exactly the append-only hazard this comment warns about, and it is
+#     live code, not defensive decoration — MEASURED by adding an unselected
+#     probe name to the list and observing the "never RAN" verdict and exit 1.
+#
+# Keeping both matters: the selectors make a deletion loud, and the -1 arm keeps
+# the two lists honest with each other.
+# RUSTFLAGS is pinned EMPTY here, deliberately, and the value must stay
+# explicit rather than inherited. Three facts combine into a gate whose
+# strictness otherwise depends on the caller's environment:
+#
+#  1. GNU make re-exports a variable that CAME FROM the environment using the
+#     MAKEFILE's value. `RUSTFLAGS = -D warnings` (line 11) is a plain make
+#     variable, so a developer shell (no RUSTFLAGS set) leaves recipes with an
+#     EMPTY RUSTFLAGS, while CI — which sets `RUSTFLAGS: ""` in ci.yml — turns
+#     it into an exported `-D warnings`. Measured both ways.
+#  2. `cargo test --test <name>` builds the crate's BIN as well, because an
+#     integration test may exec it. The sibling `test-cargo-pmcp` leg uses
+#     `--lib` and therefore never builds the bin at all.
+#  3. cargo-pmcp compiles the same modules into BOTH a lib (`lib.rs`, where
+#     `pub` means public API) and a bin (`main.rs`, where the same items are
+#     bin-private and anything `main` does not reach is dead code). So the bin
+#     reports ~14 dead-code/unused-import items across `pentest`, `deployment`,
+#     `secrets` and `commands` that are live API through the lib.
+#
+# Result before this pin: green locally, 15 errors in CI, from one Makefile.
+# This leg's job is to prove cargo-pmcp/tests/ is REACHED and reports a
+# nonzero count — not to lint the bin. Linting belongs in `make lint`, and
+# turning this into a bin linter would require blanket-allowing dead code in
+# `commands/`, which would hide real rot. Follow-up worth doing separately:
+# have main.rs consume the lib instead of re-declaring `mod` for each module.
+.PHONY: test-cargo-pmcp-integration
+test-cargo-pmcp-integration: test-openapi-server-guard-selftest
+	@echo "$(BLUE)Running cargo-pmcp's contract/inspect integration tests...$(NC)"
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --test package_capture_contract --test package_attestation_contract --test package_inspect --test pmcp_package_pin --test package_save_load --test package_portability_contract --test package_artifact_framing --test verb_help -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ cargo-pmcp integration tests reported 0 tests — the gate is not reaching cargo-pmcp/tests/$(NC)"; \
+		exit 1; \
+	fi; \
+	REQUIRED_TEST_BINARIES="package_capture_contract package_attestation_contract package_inspect pmcp_package_pin package_save_load package_portability_contract package_artifact_framing verb_help"; \
+	for b in $$REQUIRED_TEST_BINARIES; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ required test binary '$$b' never RAN — cargo printed no 'Running tests/$$b.rs' target line. Likeliest causes: the file was renamed, or that tests/ entry stopped being a target.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ required test binary '$$b' printed a target line but NO 'test result:' line followed it — truncated output or an aborted harness. This gate refuses to pass on output it cannot read.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ required test binary '$$b' RAN but passed ZERO tests. A #[cfg] gate turned false, an #[ignore] sweep landed, or the test module was renamed away. The summed total ($$ran) stays nonzero from the other selected binaries, so the count guard above CANNOT catch this. This is the contract net Phase 122 exists to keep running — restore the tests, do not relax this guard.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ required test binary '$$b' — the count extractor produced no usable reading ('$$n'). An EMPTY value means awk itself did not run: check that scripts/named-test-binary-count.awk exists and is readable. Failing rather than continuing on a reading this gate does not understand.$(NC)"; \
+			exit 1;; \
+		*) \
+			echo "$(GREEN)  ✓ $$b passed $$n tests$(NC)";; \
+		esac; \
+	done; \
+	echo "$(GREEN)✓ cargo-pmcp integration tests passed ($$ran tests)$(NC)"
+
+# The GATE's reach into `crates/pmcp-server-toolkit/tests/`, mirroring
+# test-tester / test-cargo-pmcp / test-openapi-server.
+#
+# Nothing in this repo executed that directory, measured three ways: `test-unit`
+# and `test-integration` carry no `-p` so they resolve to the root `pmcp`
+# package; CI's `test` job is root-scoped; and `org-gate-checks.yml`'s
+# `workspace-test` runs `--lib --bins`, which excludes `tests/` entirely.
+# `tests/env_ref_grammar_parity.rs` is the TOOLKIT HALF of the cross-crate
+# `${VAR}` grammar contract — only the `pmcp-package` half ran (via
+# `pmcp-package-gate`), so a change to `parse_env_ref` that diverged from the
+# shared table shipped green, which is precisely the "packs cleanly and then
+# fails to resolve at boot" divergence `env_ref_grammar_v1.tsv` exists to make
+# loud.
+#
+# `--features http` is REQUIRED, not decorative. The toolkit's `default` is
+# `["code-mode"]`, and `tests/base_url_expansion.rs` is `#![cfg(feature =
+# "http")]` — MEASURED: a default `cargo test -p pmcp-server-toolkit` compiles
+# it to `running 0 tests` and exits 0, so the whole file asserts nothing while
+# looking green. That is the same "a #[cfg] gate turned false" hole
+# `test-openapi-server`'s per-binary guard exists for, which is why the two
+# named binaries below are count-asserted individually rather than trusted to
+# the sum.
+.PHONY: test-server-toolkit
+test-server-toolkit:
+	@echo "$(BLUE)Running pmcp-server-toolkit's own tests...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-server-toolkit --features http -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ pmcp-server-toolkit reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion"; \
+	for b in $$REQUIRED_TEST_BINARIES; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ required test binary '$$b' never RAN — cargo printed no 'Running tests/$$b.rs' target line.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ required test binary '$$b' printed a target line but NO 'test result:' line followed it.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ required test binary '$$b' RAN but passed ZERO tests — a #[cfg] gate turned false (check that this target still passes every feature that file is gated on) or an #[ignore] sweep landed.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ required test binary '$$b' — the count extractor produced no usable reading ('$$n').$(NC)"; \
+			exit 1;; \
+		*) \
+			echo "$(GREEN)  ✓ $$b passed $$n tests$(NC)";; \
+		esac; \
+	done; \
+	echo "$(GREEN)✓ pmcp-server-toolkit tests passed ($$ran tests)$(NC)"
+
+# Proof that `test-openapi-server`'s per-binary count guard is SENSITIVE, not
+# merely present.
+#
+# Phase 121 review finding CR-02 was a guard that shipped with no demonstration
+# of its own sensitivity and nothing that re-proved it, so it stayed green for a
+# year over a check that could be satisfied by a compiler warning. Fixing only
+# the pattern would repeat that shape one level up. This target is the
+# re-proving.
+#
+# It feeds five synthetic cargo-output fixtures through
+# `scripts/named-test-binary-count.awk` — the SAME file the gate below reads,
+# not a copy of its logic. That single source is what makes a green self-test
+# evidence about the gate rather than evidence about a re-implementation that
+# has drifted from it.
+#
+# The fixtures are transcribed from real measured cargo output, including the
+# leading whitespace on the target line and the trailing fields of the result
+# line. No cargo, no network, no compilation: sub-second, so it can sit in front
+# of the gate on every run.
+#
+# The six cases, and what each one pins (comments cannot live inside the
+# recipe: its lines are backslash-joined into a single shell command, where a
+# `#` would swallow everything after it):
+#
+#   real            -> 8   the green control: a target line, then 8 passed.
+#   all_ignored     -> 0   THE CR-02 REGRESSION FIXTURE. Also the fixture a
+#                          `running N tests` check would WRONGLY PASS: an
+#                          all-#[ignore]d suite prints `running 1 test` while
+#                          passing nothing. Only the result line's passed count
+#                          reports 0 here.
+#   cfg_empty       -> 0   a `#![cfg]`-emptied file: `running 0 tests`.
+#   diagnostic_only -> -1  CR-02 POINT 2 — the shape the old substring check
+#                          ACCEPTED: a rustc diagnostic naming
+#                          `tests/roundtrip_e2e.rs`, plus an unrelated lib
+#                          unittests block, and no target line for the wanted
+#                          binary at all.
+#   truncated       -> -2  a target line with no result line after it.
+#   colorized       -> 8   THE CARGO_TERM_COLOR REGRESSION FIXTURE. `ci.yml`
+#                          sets `CARGO_TERM_COLOR: always` for the whole
+#                          workflow, and MEASURED real cargo output then reads
+#                          `\033[1m\033[92m     Running\033[0m tests/x.rs`, so
+#                          awk's $$1 is an escape sequence and the field
+#                          equality matches nothing — every required binary
+#                          reported -1 ("never RAN") and the gate failed on
+#                          every PR with a message blaming a renamed file. The
+#                          extractor strips ANSI before splitting; this fixture
+#                          is what keeps that true.
+.PHONY: test-openapi-server-guard-selftest
+test-openapi-server-guard-selftest:
+	@echo "$(BLUE)Self-testing the named-test-binary count extractor...$(NC)"
+	@fail=0; ran=0; \
+	WANT=tests/roundtrip_e2e.rs; \
+	RUN="     Running $$WANT (target/debug/deps/roundtrip_e2e-a4768583f5fb6f6b)"; \
+	ESC=$$(printf '\033'); \
+	RUN_COLORED="$${ESC}[1m$${ESC}[92m     Running$${ESC}[0m $$WANT (target/debug/deps/roundtrip_e2e-a4768583f5fb6f6b)"; \
+	check() { \
+		fixture="$$1"; expected="$$2"; shift 2; \
+		actual=$$(printf '%s\n' "$$@" | awk -v want="$$WANT" -f scripts/named-test-binary-count.awk); \
+		ran=$$((ran + 1)); \
+		if [ "$$actual" != "$$expected" ]; then \
+			echo "$(RED)✗ guard self-test fixture '$$fixture': expected $$expected, actual $$actual$(NC)"; \
+			fail=1; \
+		fi; \
+	}; \
+	check real 8 "$$RUN" '' 'running 8 tests' '' \
+		'test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s'; \
+	check all_ignored 0 "$$RUN" '' 'running 1 test' 'test roundtrip_smoke ... ignored' '' \
+		'test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s'; \
+	check cfg_empty 0 "$$RUN" '' 'running 0 tests' '' \
+		'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; \
+	check diagnostic_only -1 'warning: unused import: std::env' "   --> $$WANT:123:5" \
+		'     Running unittests src/lib.rs (target/debug/deps/pmcp_openapi_server-2f0a1c9d4b6e8a13)' \
+		'' 'running 14 tests' '' \
+		'test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s'; \
+	check truncated -2 "$$RUN" '' 'running 8 tests'; \
+	check colorized 8 "$$RUN_COLORED" '' 'running 8 tests' '' \
+		'test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s'; \
+	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
+	if [ "$$ran" -ne 6 ]; then \
+		echo "$(RED)✗ count extractor self-test executed $$ran fixtures, expected 6 — a fixture was lost$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ count extractor self-test passed ($$ran fixtures)$(NC)"
+
+# The GATE's reach into `crates/pmcp-openapi-server/tests/`, mirroring
+# test-tester and test-cargo-pmcp.
+#
+# Nothing in this repo executed that directory before Phase 121, measured three
+# ways: `test-integration` is `cargo test --test '*'` with NO `-p`, so it
+# resolves to the root `pmcp` package (Makefile:241-243); CI's `test` job is
+# root-scoped (ci.yml:733); and `org-gate-checks.yml`'s `workspace-test` runs
+# `--lib --bins`, which excludes `tests/` entirely (org-gate-checks.yml:73).
+# `parity_replay.rs` sat in that hole for its whole life, and PKG-04's
+# deliverable is a REGRESSION NET — a regression net that no gate runs is not a
+# regression net. Because CI's `quality-gate` job runs `make quality-gate` and
+# IS in `gate.needs`, chaining this into `test-all` makes it merge-blocking
+# without promoting `workspace-test`, which ci.yml D-15 deliberately defers.
+#
+# The count assertion is not ceremony. The failure this target exists to
+# prevent is "the gate does not reach this crate", and a run that selects zero
+# tests EXITS 0 — reproducing exactly that hole while looking green.
+#
+# The named-binary assertion exists because a nonzero SUM proves the PACKAGE
+# ran, not that any particular integration binary ran. `cargo test -p` also sums
+# unit, binary and doctest results, so a suite that stopped being compiled — a
+# renamed file, a `tests/` entry that silently stopped being a target — leaves
+# the total comfortably nonzero while its own truths go unexecuted.
+#
+# WHAT IT ACTUALLY CHECKS, precisely: for each name, the PASSED count (field 4)
+# of the FIRST `test result:` line that FOLLOWS that binary's
+# `Running tests/<name>.rs` target line. The extraction lives in
+# `scripts/named-test-binary-count.awk` — one file, read by both this gate and
+# `test-openapi-server-guard-selftest`, so the gate and the proof of the gate
+# cannot drift.
+#
+# Two things this does NOT do, both deliberate (phase 121 review finding CR-02,
+# which this replaced):
+#
+#   - It does NOT ask whether `tests/<name>.rs` appears somewhere in the output.
+#     Cargo prints that target line for binaries that execute nothing, and rustc
+#     repeats the path in every diagnostic for that file. This target sets no
+#     `-D warnings`, so a warning alone satisfied the old substring check.
+#   - It does NOT gate on the `running N tests` line. MEASURED here: a single
+#     `#[test] #[ignore]` binary prints `running 1 test` alongside
+#     `test result: ok. 0 passed; 0 failed; 1 ignored`. An ignore sweep would
+#     pass a nonzero-`running` check while executing nothing; only the passed
+#     count reports 0.
+#
+# `REQUIRED_TEST_BINARIES` is APPEND-ONLY across Phase 121: plan 121-02 Task 1
+# adds `roundtrip_e2e` when that binary first exists. A name added BEFORE its
+# binary exists turns this gate red for every commit in between. Removing a name
+# to quiet a red gate deletes the proof instead of fixing it.
+#
+# `-- --test-threads=1` is REQUIRED here and is the one deviation from both
+# precedents: this crate's tests mutate the process-global `TFL_BASE_URL` and
+# `TFL_APP_KEY` environment variables and bind ephemeral ports, so they cannot
+# run concurrently. `parity_replay.rs`'s own module doc already prescribes
+# single-threaded execution for exactly that reason.
+.PHONY: test-openapi-server
+test-openapi-server: test-openapi-server-guard-selftest
+	@echo "$(BLUE)Running pmcp-openapi-server's own tests...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-openapi-server -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ pmcp-openapi-server reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	REQUIRED_TEST_BINARIES="parity_replay pmcp_package_pin roundtrip_e2e"; \
+	for b in $$REQUIRED_TEST_BINARIES; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ required test binary '$$b' never RAN — cargo printed no 'Running tests/$$b.rs' target line. Likeliest causes: the file was renamed, or that tests/ entry stopped being a target.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ required test binary '$$b' printed a target line but NO 'test result:' line followed it — truncated output or an aborted harness. This gate refuses to pass on output it cannot read.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ required test binary '$$b' RAN but passed ZERO tests. A #[cfg] gate turned false, an #[ignore] sweep landed, or the test module was renamed away. The summed total ($$ran) stays nonzero from the other suites and the lib tests, so the count guard above CANNOT catch this. This is the regression net PKG-04 exists to keep running — restore the tests, do not relax this guard.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ required test binary '$$b' — the count extractor produced no usable reading ('$$n'). An EMPTY value means awk itself did not run: check that scripts/named-test-binary-count.awk exists and is readable. Failing rather than continuing on a reading this gate does not understand.$(NC)"; \
+			exit 1;; \
+		*) \
+			echo "$(GREEN)  ✓ $$b passed $$n tests$(NC)";; \
+		esac; \
+	done; \
+	echo "$(GREEN)✓ pmcp-openapi-server tests passed ($$ran tests)$(NC)"
+
 .PHONY: test-doc
 test-doc:
 	@echo "$(BLUE)Running doctests...$(NC)"
@@ -243,21 +812,73 @@ test-fuzz:
 	fi
 	@echo "$(GREEN)✓ Fuzz testing completed$(NC)"
 
+# Phase 119 (D-13/D-14) — BUILD every example, and FAIL when one does not
+# compile.
+#
+# This target IS chained into `quality-gate`, through `test-all`, and must stay
+# chained: `test-all` runs `test-examples` immediately before `test-integration`,
+# and that ordering is how the run tests (`tests/docs04_examples_run.rs`,
+# `tests/docs06_v2_examples_run.rs`, `tests/v2_sse_progress.rs` and the other
+# `spawn_example` legs) get example binaries that are not stale. Unchaining it
+# would leave those tests asserting against whatever happened to be in
+# `target/debug/examples` from an earlier session — the exact staleness defect
+# recorded at the Phase 118.1 Wave 10 merge.
+#
+# The recipe was previously NON-BLOCKING and the change to strict is deliberate.
+# The full rationale — the three defects in the old inline loop, the measured
+# pre-change baseline, and the list of example trees deliberately left outside
+# the gate — lives ONCE, in the header of `scripts/run-example-builds.sh`.
+# Do not restate it here; two copies in two languages drift.
+#
+# NOTE: examples are BUILT here, not run. They used to be un-run entirely; that
+# is no longer the whole truth — `tests/docs04_examples_run.rs` and
+# `tests/docs06_v2_examples_run.rs` do run several of them, under
+# `test-integration`, against the binaries this target produces.
+# The GATE's reach into `cargo-pmcp/examples/`, added by Phase 123 plan 07
+# alongside the example it gates — the same "register it in the commit that
+# creates it" discipline recorded at the APPEND-ONLY block near
+# `test-cargo-pmcp-integration`.
+#
+# MEASURED on the date this landed (2026-08-26), before the leg existed:
+# `cargo-pmcp/examples/` was compiled by NOTHING in `make quality-gate`.
+# Three ways, all read from this file and one script:
+#   - `scripts/run-example-builds.sh` covers exactly three trees (the root
+#     `pmcp` package, `pmcp-agent`, `pmcp-team-servers`) and its own header
+#     names `cargo-pmcp` under "ALSO NOT COVERED" — 87 examples built, none of
+#     them cargo-pmcp's.
+#   - `make build` is `cargo build --all-features` with no `-p` and no
+#     `--examples`, so it resolves to the root `pmcp` package's lib+bins.
+#   - `make lint` is `cargo clippy --features full --lib --tests`, also
+#     root-scoped, and `--lib --tests` excludes examples by construction.
+# So a new `cargo-pmcp` example — including the CLAUDE.md ALWAYS
+# `cargo run --example` deliverable for `package save`/`load` — could rot
+# without any gate noticing. That is the same shape as the `verb_help` hole
+# this phase closed one directory over: the default is NOT reached.
+#
+# RUSTFLAGS is pinned EMPTY here for the same three reasons spelled out at
+# `test-cargo-pmcp-integration`: make re-exports an environment-sourced
+# RUSTFLAGS using the MAKEFILE's value, so this recipe is warning-free locally
+# and `-D warnings` in CI. `cargo-pmcp/examples/deploy_stack_metadata.rs`
+# carries one PRE-EXISTING `unused_imports` warning (measured; not introduced
+# by this leg), which under an inherited `-D warnings` would turn this into a
+# red gate over rot it was never meant to lint. This leg's job is to prove the
+# examples are REACHED and COMPILE. Linting belongs in `make lint`; widening
+# that is a separate, deliberate decision.
+#
+# Scope is deliberately `-p cargo-pmcp` and not `--workspace --examples`.
+# `scripts/run-example-builds.sh`'s header records that the wider form "is
+# cheap to attempt but was not measured, so it is not claimed here"; this
+# narrower form WAS measured (exit 0) and is claimed. Widening further is a
+# separate change that must measure the other members first.
+.PHONY: build-cargo-pmcp-examples
+build-cargo-pmcp-examples:
+	@echo "$(BLUE)Building cargo-pmcp's examples...$(NC)"
+	@RUSTFLAGS= $(CARGO) build -p cargo-pmcp --examples
+	@echo "$(GREEN)✓ cargo-pmcp examples built$(NC)"
+
 .PHONY: test-examples
-test-examples:
-	@echo "$(BLUE)Running example tests (ALWAYS required for new features)...$(NC)"
-	@echo "$(YELLOW)Note: Examples are built but not run to avoid blocking on I/O$(NC)"
-	@for example in $$(ls examples/*.rs 2>/dev/null | sed 's/examples\///g' | sed 's/\.rs$$//g'); do \
-		echo "$(BLUE)Building example: $$example$(NC)"; \
-		if $(CARGO) build --example $$example --all-features 2>/dev/null; then \
-			echo "$(GREEN)✓ Example $$example built successfully$(NC)"; \
-		elif $(CARGO) build --example $$example --features "full" 2>/dev/null; then \
-			echo "$(GREEN)✓ Example $$example built successfully$(NC)"; \
-		else \
-			echo "$(YELLOW)⚠ Example $$example requires specific features (skipped)$(NC)"; \
-		fi; \
-	done
-	@echo "$(GREEN)✓ All examples processed successfully$(NC)"
+test-examples: build-cargo-pmcp-examples
+	./scripts/run-example-builds.sh
 
 # MCP Tester Integration
 .PHONY: build-tester
@@ -297,6 +918,505 @@ test-integration:
 	@echo "$(BLUE)Running integration tests...$(NC)"
 	RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test --test '*' --features "full"
 	@echo "$(GREEN)✓ Integration tests passed$(NC)"
+
+# The GATE's reach into `src/server/skills/` (Phase 125, 125-CONTEXT D-09).
+#
+# Same shape as the `test-cargo-pmcp` leg above -- the gate is green on what it
+# reaches, and the failures live in what it does not. MEASURED (125-RESEARCH.md
+# Pitfall 2, re-confirmed after every wave of phase 125): EVERY test leg in this
+# file pins `--features "full"`, and `skills` is a member of neither `full` nor
+# `full-v2`, so `make quality-gate` compiled and executed ZERO tests from this
+# module while four plans of new behaviour landed behind it. `make build` and
+# `make test-examples` compile the module; neither runs one of its tests.
+#
+# `skills` deliberately STAYS OUT of `full` and `full-v2`. Those two are
+# enumerated lists whose relationship `tests/v1_severability_tripwire.rs` derives
+# from `Cargo.toml` at test time and asserts; adding a member changes what the
+# severance proof covers. A dedicated leg is the honest fix, not a wider `full`.
+#
+# Why an explicit feature list and NOT `--all-features`: `--all-features` would
+# re-run a large share of what `test-all` already ran moments earlier in the same
+# gate, which buys no signal and lengthens every local gate run. The narrow list
+# is also the better failure signal -- when this leg stops compiling for want of
+# a feature, the missing feature is named right here in the recipe instead of
+# being hidden inside a blanket flag. The three companions of `skills` are
+# exactly what the selected test files' own `#![cfg]` headers require:
+#   streamable-http + http-client -> tests/skills_routing.rs:62-67, and the
+#                                    tests/common/v2.rs loopback harness it uses
+#   testing                       -> tests/common/duplex.rs, the ONE harness that
+#                                    accepts a `ServerCore` (routing tests 17/18)
+#
+# Why FOUR separately-captured selectors each with its OWN guard, and never one
+# summed total: a healthy selector reporting a hundred tests keeps a summed total
+# comfortably nonzero while a sibling silently matches nothing, so the aggregate
+# reports green over exactly the blind spot this leg exists to close. That is the
+# `--features "full"` false green above, reintroduced one level down.
+# `test-cargo-pmcp` learned this the expensive way (927 bin-target tests went
+# dark beneath a nonzero sum); this leg ships with the lesson already applied.
+#
+# What each selector holds up, i.e. what goes dark if its guard is removed:
+#   1  --lib skills                the whole in-module unit + proptest body
+#   2  --doc skills                the `entries()` doctest and the module-header
+#                                  mirror that `pmcp-book` copies byte for byte
+#   3  --test skills_integration   the resource-surface and byte-identity suite
+#   4  --test skills_routing       every wire proof, tripwire and routing guarantee
+#
+# `-- --test-threads=1` is CLAUDE.md-mandated and this workspace has recorded
+# real parallel-test races. `make test-unit` / `make test-integration` are NOT
+# usable here (they pin `--features "full"` and would report success having run
+# nothing from this module), and neither is a `cargo nextest -E 'test(...)'`
+# selector, which is a project-recorded false green: it can match zero tests and
+# still exit 0.
+#
+# The guards themselves live in `scripts/guarded-cargo-test.sh`, ONE copy driven
+# four times, because the four blocks that used to be expanded inline here
+# differed only in the label, the cargo arguments, the `want=` target and two
+# prose strings — and had already begun to drift. Read that script's header
+# before relaxing anything in it; `test-cargo-pmcp` above is the in-repo
+# precedent for the same collapse.
+SKILLS_FEATURES := skills,streamable-http,http-client,testing
+
+# The GATE's LINT reach into `src/server/skills/` — the other half of D-09.
+#
+# `make lint` pins `--features "full"` and `skills` is in neither `full` nor
+# `full-v2`, so the pedantic+nursery policy CLAUDE.md calls zero-tolerance never
+# compiled this module: ~2,300 new lines shipped unlinted. The module itself
+# records two consequences of that blind spot in its own comments (a
+# `clippy::needless_pass_by_value` that survived four plans, and a
+# `clippy::type_complexity` the alias exists to dodge). CI's
+# `clippy --all-targets --all-features -D warnings` does reach the file but
+# carries NO pedantic/nursery groups, which CLAUDE.md states outright is the
+# weaker form.
+#
+# The lint policy is `$(CLIPPY_POLICY)`, the SAME variable `make lint` uses, so
+# "verbatim" is now structural rather than a promise nobody checked: this leg
+# exists to widen the policy's REACH, not to give one module a softer (or, once
+# the copy drifted, a stricter) policy.
+#
+# The feature set is `full` PLUS `skills`, deliberately NOT `$(SKILLS_FEATURES)`.
+# `test-skills` uses the narrow set because the test files' own `#![cfg]` headers
+# name exactly those features; a LINT leg has the opposite requirement. Measured:
+# the narrow set drops `jwt-auth`, which compiles `CachedJwks`'s
+# `HashMap<String, ()>` fallback branch and trips `clippy::zero_sized_map_values`
+# in `src/server/auth/jwt.rs` — a finding about a feature combination nobody
+# ships, in a module this phase never touched. `full,skills` is the one-feature
+# delta from what `make lint` already lints, so every finding it reports is a
+# finding about the reach this leg exists to add.
+LINT_SKILLS_FEATURES := full,skills
+
+.PHONY: lint-skills
+lint-skills:
+	@echo "$(BLUE)Linting the skills module (features: $(LINT_SKILLS_FEATURES))...$(NC)"
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) clippy -p pmcp --features "$(LINT_SKILLS_FEATURES)" --lib --tests -- $(CLIPPY_POLICY)
+	@echo "$(GREEN)✓ No lint issues in the skills module$(NC)"
+
+# The environment every guarded test leg runs under — `test-skills` and
+# `test-oauth` both use it. `RUSTFLAGS=` is EMPTY on purpose: the file-level
+# `-D warnings` must not reach these builds, which `make lint` never compiled
+# (it pins `--features full`) and which therefore carry unreviewed warning debt
+# unrelated to any change under test. Lint policy stays `make lint`'s job.
+#
+# Shared rather than copied per leg: the two were character-identical, with the
+# second carrying a comment whose only content was "for the same reason the
+# first one does". One definition makes that coupling structural.
+GUARDED_TEST_ENV := RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE)
+
+.PHONY: test-skills
+test-skills:
+	@echo "$(BLUE)Running the skills module's tests (features: $(SKILLS_FEATURES))...$(NC)"
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 1 (--lib skills)" \
+		"src/lib.rs" \
+		"The entire in-module unit + proptest body is dark; a missing feature gate on '$(SKILLS_FEATURES)' is the likely cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --lib skills -- --test-threads=1
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 2 (--doc skills)" \
+		"Doc-tests pmcp" \
+		"The entries() doctest and the module-header mirror that pmcp-book copies byte for byte are unchecked." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --doc skills -- --test-threads=1
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 3 (--test skills_integration)" \
+		"tests/skills_integration.rs" \
+		"The resource-surface and byte-identity suite is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_integration -- --test-threads=1
+	@$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+		"selector 4 (--test skills_routing)" \
+		"tests/skills_routing.rs" \
+		"Every wire proof, tripwire and routing guarantee is dark; an emptied #![cfg] header is the classic cause." \
+		-- $(CARGO) test -p pmcp --features "$(SKILLS_FEATURES)" --test skills_routing -- --test-threads=1
+	@echo "$(GREEN)✓ skills module tests passed across all four selectors$(NC)"
+
+# Issue #368 — RUN the oauth-gated test files, which `--features "full"` cannot
+# reach.
+#
+# What it reaches that no other leg does: `oauth` is NOT a member of `full`
+# (`Cargo.toml:280` lists `full`, `:322` defines `oauth`), and every gate leg
+# pins `--features "full"` — `make test` (nextest), `test-unit`,
+# `test-integration` and `make lint`. Seven test files carry a file-level
+# `#![cfg(feature = "oauth")]`, so under the gate each compiles to an EMPTY
+# binary that prints `running 0 tests` and exits 0.
+#
+# Measured 2026-09-18 with `cargo test --test 'oauth_*'`:
+#   --features full,oauth  ->  13 binaries, 291 tests, 291 passed, 0 failed
+#   --features full        ->            167 tests
+# i.e. exactly 124 tests across these SEVEN binaries were dark:
+#   oauth_credential_file 29, oauth_dcr_integration 24, oauth_iss_integration 13,
+#   oauth_issuer_precedence 7, oauth_refresh 21, oauth_state_csrf 12,
+#   oauth_store_wiring 18.
+#
+# NOT redundant coverage. The other six `oauth_*` files — `oauth_application_type`
+# 14, `oauth_credential_store` 54, `oauth_discovery_urls` 38,
+# `oauth_discovery_validation` 19, `oauth_iss_validation` 27,
+# `oauth_provider_discovery` 15 — gate at a finer granularity than the file level
+# and ALREADY run under `full`. They are deliberately absent from the list below,
+# so this leg is the 124-test delta and nothing more. Do not "complete" the list
+# by adding them.
+#
+# Why it exists: `tests/oauth_issuer_precedence.rs` is the RFC 8414 §3.3
+# issuer-identity fence, and its own header states that if it ever goes
+# green-by-omission the fix has regressed into a security hole. It was
+# green-by-omission in the gate from the day it was written. Measured both ways
+# on that one file: `--features full` -> `running 0 tests`, exit 0;
+# `--features full,oauth` -> 7 passed.
+#
+# Native-only ON PURPOSE: `oauth` pulls `dep:webbrowser`/`dep:dirs`/`dep:rand`,
+# none of which build for wasm32.
+#
+# Do NOT "simplify" this by adding `oauth` to `full`. Two real blockers, neither
+# of which is the wasm32 fence — an earlier revision of this comment claimed the
+# fence was the reason, and that is measurably wrong: `wasm-build` is
+# `--no-default-features --features wasm` (see the target above), so `full`
+# never reaches the wasm32 build at all and would be unaffected. The actual
+# blockers are:
+#
+#   1. `tests/v1_severability_tripwire.rs:141` asserts `full` minus `full-v2` is
+#      EXACTLY `{v1-compat}`, in both directions, so `oauth` would have to be
+#      added to both feature sets or that tripwire goes red.
+#   2. `full` is published API. Downstream consumers who enable it would start
+#      pulling three new native-only dependencies, which is a breaking change
+#      for any wasm32 or minimal-dependency consumer.
+#
+# The nonzero-count assertion is the load-bearing part. A cargo selector that
+# matches zero tests EXITS 0, so without the guard this leg could itself go green
+# over nothing — the exact failure it exists to prevent. `guarded-cargo-test.sh`
+# refuses a zero count and also proves the named binary actually contributed.
+OAUTH_TEST_FEATURES := full,oauth
+
+# The seven binaries that contribute ZERO tests under `--features "full"`.
+OAUTH_DARK_TESTS := \
+	oauth_credential_file \
+	oauth_dcr_integration \
+	oauth_iss_integration \
+	oauth_issuer_precedence \
+	oauth_refresh \
+	oauth_state_csrf \
+	oauth_store_wiring
+
+.PHONY: test-oauth
+test-oauth:
+	@echo "$(BLUE)Running the oauth-gated tests (features: $(OAUTH_TEST_FEATURES))...$(NC)"
+	@for t in $(OAUTH_DARK_TESTS); do \
+		$(GUARDED_TEST_ENV) ./scripts/guarded-cargo-test.sh \
+			"--test $$t (features: $(OAUTH_TEST_FEATURES))" \
+			"tests/$$t.rs" \
+			"This file is #![cfg(feature = \"oauth\")]; under --features \"full\" it compiles to an empty binary that exits 0. An emptied or mis-spelled cfg header, or a dropped --features oauth, is the classic cause." \
+			-- $(CARGO) test -p pmcp --features "$(OAUTH_TEST_FEATURES)" --test "$$t" -- --test-threads=1 || exit 1; \
+	done
+	@echo "$(GREEN)✓ oauth-gated tests passed with non-zero counts across all seven binaries$(NC)"
+
+# Phase 117 (SMPL-01/02) — RUN the v1-severance proofs on the severed build.
+#
+# Deliberately NOT chained into `quality-gate`: it compiles every test target and
+# every example under a SECOND feature set, which roughly doubles the dev loop.
+# CI runs it on every PR from the `v1-severance` job (which is in `gate.needs`,
+# so it blocks merge); this target is the local spelling of the same command.
+#
+# The script's zero-count guard is the load-bearing part — see its header, and
+# `tests/ci_severance_gate_wiring.rs`, which pins both the script's contents and
+# its wiring into the blocking gate.
+.PHONY: test-severance
+test-severance:
+	@echo "$(BLUE)Running v1-severance proofs on --features full-v2...$(NC)"
+	./scripts/run-severance-proofs.sh
+	@echo "$(GREEN)✓ Severance proofs ran with non-zero test counts$(NC)"
+
+# Phase 118 (D-19) — no GSD verification command may mask the exit status of the
+# thing it verifies.
+#
+# What it proves: inside every `<verify>` / `<acceptance_criteria>` element of a
+# linted phase's plans, no line pipes a build/test invocation into another
+# command without `pipefail`, compares a pipeline's `$?` against a literal, or
+# suppresses a status with `|| true`. The cross-AI review found ten such sites in
+# phase 118 alone — one of which reported PASS precisely when `cargo package`
+# FAILED. See the script header for the full rationale and the quote-awareness
+# rule that keeps it usable.
+#
+# The linted set (`LINTED_PHASES` in the script) only GROWS: phases are added as
+# they are swept and never removed, so the historical plan corpus cannot make
+# this red for reasons unrelated to the change under test.
+#
+# UNLIKE `test-severance`, this IS chained into `quality-gate` (below) — it is
+# sub-second, pure text, and has no external prerequisite, so a plan defect fails
+# fast instead of after the multi-minute build steps.
+.PHONY: lint-plans
+lint-plans:
+	@echo "$(BLUE)Linting GSD plan verification commands (D-19)...$(NC)"
+	./scripts/lint-plan-verify-commands.sh
+	@echo "$(GREEN)✓ No verification command masks the status of what it verifies$(NC)"
+
+# Phase 124 (D-05) — the three-way release version-drift sweep: in-tree version
+# vs the crates.io-published version vs the source delta since the tag that
+# published that version.
+#
+# What it catches: a PHANTOM DELTA — a crate whose in-tree version EQUALS its
+# published version while its source has moved since. `release.yml` skips an
+# already-published version gracefully and silently, so such a crate does not
+# FAIL the release, it just never ships. Seven were carrying one when this
+# target was written.
+#
+# UNLIKE `lint-plans` above, `release-sweep` is deliberately NOT chained into
+# `quality-gate`. Two reasons, and both are about false red rather than cost:
+#   1. It needs NETWORK access to the crates.io API, which is the only valid
+#      published-version oracle (Cargo reports the in-tree path override), so
+#      in `quality-gate` it would fail offline for a reason unrelated to the
+#      change under test.
+#   2. A version delta is LEGITIMATE right up until a release. Every ordinary
+#      branch carries one by construction, so gating on it would make the gate
+#      red on essentially every branch — and a gate that is red for unrelated
+#      reasons is a gate people learn to ignore.
+# Run it from the release Pre-Flight Checklist, not from the dev loop.
+#
+# It still exits NON-ZERO on a failed probe, an unparseable registry body, an
+# unresolvable diff baseline or a never-published crate: that status reports
+# "did this sweep measure everything it claims to have measured", never "is
+# there a delta". See the script header, section 5.
+.PHONY: release-sweep
+release-sweep:
+	@echo "$(BLUE)Sweeping release version drift against crates.io (D-05)...$(NC)"
+	./scripts/release-version-sweep.sh
+	@echo "$(GREEN)✓ Every publishable crate measured against the registry$(NC)"
+
+# Fixture-driven self-test for the release-ledger coverage gate, mirroring
+# no-crypto-allowlist-guard-selftest and test-openapi-server-guard-selftest. It
+# is a declared PREREQUISITE of check-release-coverage below, so the gate's RED
+# direction is proven before the gate's green reading is trusted — the gate and
+# the proof of the gate cannot drift.
+#
+# Adaptation from both precedents: their logic lives in an extracted `awk` file
+# that can be fed inline fixtures. This gate's logic is not extracted, so each
+# fixture is instead a DOCTORED COPY of the real release.yml built in a
+# `mktemp -d` scratch directory, and the assertion is on EXIT STATUS plus (for
+# the red fixtures) the offending crate's name appearing in captured output —
+# never on full message text, so rewording the gate does not break its proof.
+#
+# Each fixture pins a distinct way the gate can pass vacuously:
+#
+#   intact                       -> 0   the gate still passes on good input; the
+#                                       extension introduced no false red.
+#   excluded_step_removed        -> !=0 THE HEADLINE BLIND SPOT. Before this
+#                                       phase the SAME input printed "all 24
+#                                       publishable workspace members have a
+#                                       publish step." and exited 0 (measured).
+#                                       This is the fixture that matters most.
+#   root_step_removed            -> !=0 the ORIGINAL half still works after the
+#                                       extension — the new loop did not break
+#                                       the member loop it shares state with.
+#   excluded_step_commented      -> !=0 COMMENT BLINDNESS. The comment-strip
+#                                       discipline must extend to the new
+#                                       --manifest-path matcher, so a
+#                                       commented-out step never counts as
+#                                       coverage.
+#   order_inverted               -> !=0 the D-10 order assertion is LIVE, not
+#                                       decorative: the step is present, so the
+#                                       coverage half passes and only the order
+#                                       half can catch it.
+#   workflow_absent              -> !=0 the pre-existing `[ -f "$$WORKFLOW" ]`
+#                                       guard survives the extension.
+#   synthetic_excluded_uncovered -> !=0 THE ONLY FIXTURE THAT PROVES DISCOVERY.
+#                                       Every other fixture doctors release.yml,
+#                                       so they prove only that the MATCHER
+#                                       works against today's repository layout.
+#                                       This one plants a previously-unknown
+#                                       workspace-excluded crate in a synthetic
+#                                       tree and runs against the INTACT
+#                                       workflow: the gate must find it by scan.
+#   prefix_shadow                -> !=0 the matcher's WORD BOUNDARY. Renaming
+#                                       `-p pmcp-agent` to `-p pmcp-agent-extra`
+#                                       must be reported as pmcp-agent missing.
+#                                       A boundary-less matcher resolves
+#                                       pmcp-agent to the -extra line and passes,
+#                                       silently reading the wrong step — the
+#                                       failure mode check-release-coverage.sh
+#                                       documents for the root loop.
+#
+# Every doctored fixture is checked to have ACTUALLY been doctored: the line
+# delta must equal the expected one AND the copy must differ from the source.
+# Without that, a future rename of a publish command would silently make a
+# "removed" fixture byte-identical to `intact`, and this target would go green
+# having proven nothing — the false-green class this repo has hit before.
+.PHONY: check-release-coverage-guard-selftest
+check-release-coverage-guard-selftest:
+	@echo "$(BLUE)Self-testing the release-ledger coverage gate (red direction)...$(NC)"
+	@fail=0; ran=0; \
+	SRC=.github/workflows/release.yml; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	doctored_ok() { \
+		fixture="$$1"; expected="$$2"; doctored="$$3"; \
+		before_lines=$$(wc -l < "$$SRC"); \
+		after_lines=$$(wc -l < "$$doctored"); \
+		d=$$((before_lines - after_lines)); \
+		if [ "$$d" -ne "$$expected" ]; then \
+			echo "$(RED)✗ coverage gate self-test fixture '$$fixture': doctoring changed the line count by $$d, expected $$expected — the fixture does not doctor what it claims$(NC)"; \
+			fail=1; \
+		fi; \
+		if cmp -s "$$SRC" "$$doctored"; then \
+			echo "$(RED)✗ coverage gate self-test fixture '$$fixture': the doctored copy is BYTE-IDENTICAL to the source — this fixture proves nothing$(NC)"; \
+			fail=1; \
+		fi; \
+	}; \
+	check() { \
+		fixture="$$1"; expected="$$2"; doctored="$$3"; needle="$$4"; cdir="$$5"; \
+		ran=$$((ran + 1)); \
+		actual=0; \
+		CRATES_DIR="$$cdir" ./scripts/check-release-coverage.sh "$$doctored" >"$$tmp/out" 2>&1 || actual=$$?; \
+		if [ "$$expected" = "0" ] && [ "$$actual" -ne 0 ]; then \
+			echo "$(RED)✗ coverage gate self-test fixture '$$fixture': expected exit 0, got $$actual$(NC)"; \
+			cat "$$tmp/out"; fail=1; return 0; \
+		fi; \
+		if [ "$$expected" != "0" ] && [ "$$actual" -eq 0 ]; then \
+			echo "$(RED)✗ coverage gate self-test fixture '$$fixture': expected NON-ZERO exit, got 0 — the gate passed input it must reject$(NC)"; \
+			cat "$$tmp/out"; fail=1; return 0; \
+		fi; \
+		if [ -n "$$needle" ] && ! grep -q "$$needle" "$$tmp/out"; then \
+			echo "$(RED)✗ coverage gate self-test fixture '$$fixture': failed for the wrong reason — output never names '$$needle'$(NC)"; \
+			cat "$$tmp/out"; fail=1; return 0; \
+		fi; \
+		return 0; \
+	}; \
+	PKG_STEP='cargo publish --manifest-path crates/pmcp-package/Cargo.toml'; \
+	cp "$$SRC" "$$tmp/intact.yml"; \
+	grep -v "$$PKG_STEP" "$$SRC" > "$$tmp/excluded_removed.yml"; \
+	doctored_ok excluded_step_removed 1 "$$tmp/excluded_removed.yml"; \
+	grep -v 'cargo publish -p pmcp-widget-utils' "$$SRC" > "$$tmp/root_removed.yml"; \
+	doctored_ok root_step_removed 1 "$$tmp/root_removed.yml"; \
+	sed 's|^\(.*'"$$PKG_STEP"'.*\)$$|#\1|' "$$SRC" > "$$tmp/excluded_commented.yml"; \
+	doctored_ok excluded_step_commented 0 "$$tmp/excluded_commented.yml"; \
+	grep -v "$$PKG_STEP" "$$SRC" > "$$tmp/order_inverted.yml"; \
+	grep "$$PKG_STEP" "$$SRC" >> "$$tmp/order_inverted.yml"; \
+	doctored_ok order_inverted 0 "$$tmp/order_inverted.yml"; \
+	sed 's|cargo publish -p pmcp-agent |cargo publish -p pmcp-agent-extra |' "$$SRC" > "$$tmp/prefix_shadow.yml"; \
+	doctored_ok prefix_shadow 0 "$$tmp/prefix_shadow.yml"; \
+	mkdir -p "$$tmp/crates/zz-synthetic/src"; \
+	: > "$$tmp/crates/zz-synthetic/src/lib.rs"; \
+	printf '%s\n' '[workspace]' '' '[package]' 'name = "zz-synthetic-uncovered"' 'version = "0.0.0"' 'edition = "2021"' > "$$tmp/crates/zz-synthetic/Cargo.toml"; \
+	check intact 0 "$$tmp/intact.yml" '' ''; \
+	check excluded_step_removed nonzero "$$tmp/excluded_removed.yml" 'pmcp-package' ''; \
+	check root_step_removed nonzero "$$tmp/root_removed.yml" 'pmcp-widget-utils' ''; \
+	check excluded_step_commented nonzero "$$tmp/excluded_commented.yml" 'pmcp-package' ''; \
+	check order_inverted nonzero "$$tmp/order_inverted.yml" 'pmcp-package' ''; \
+	check workflow_absent nonzero "$$tmp/does-not-exist.yml" '' ''; \
+	check synthetic_excluded_uncovered nonzero "$$tmp/intact.yml" 'zz-synthetic-uncovered' "$$tmp/crates"; \
+	check prefix_shadow nonzero "$$tmp/prefix_shadow.yml" 'pmcp-agent' ''; \
+	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
+	if [ "$$ran" -ne 8 ]; then \
+		echo "$(RED)✗ coverage gate self-test executed $$ran fixtures, expected 8 — a fixture was lost$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ release-coverage gate self-test passed ($$ran fixtures)$(NC)"
+
+# Release-ledger coverage: every publishable workspace member must have a
+# publish step in release.yml. Sub-second, chained into `quality-gate` below
+# and invoked by the CI quality-gate job so local and CI stay aligned.
+#
+# The self-test above is a PREREQUISITE, not a sibling: a gate whose red
+# direction is unproven is indistinguishable from a gate that always passes.
+.PHONY: check-release-coverage
+check-release-coverage: check-release-coverage-guard-selftest
+	@echo "$(BLUE)Checking release-ledger coverage...$(NC)"
+	./scripts/check-release-coverage.sh
+	@echo "$(GREEN)✓ Every publishable workspace member has a publish step$(NC)"
+
+# Phase 118 (CONF-01) — the OFFICIAL MCP conformance suite, both spec revisions,
+# against ONE dual-version example process.
+#
+# What it proves: the pinned @modelcontextprotocol/conformance CLI grades this
+# SDK at --requirements 2025-11-25 and 2026-07-28 from a single live server, and
+# the gates hold — the MRTR surface (every `input-required-result-*` scenario) is
+# entirely green, each run's total executed check count meets its hard-coded
+# floor, and the zero-check scenario sets match their committed lists EXACTLY in
+# both directions.
+#
+# It does NOT assert that either requirement set exits 0. Neither does today, and
+# the nine structural gaps that explain it are recorded in
+# .planning/phases/118-conformance-against-the-official-suite/118-CONFORMANCE-GAPS.md
+# (D-21). The script prints that declared non-conformance on every run. There is
+# no --expected-failures baseline and no allowlist of any shape
+# (conformance/README.md § 9).
+#
+# Deliberately NOT chained into `quality-gate`: it needs Node >= 22, an `npm ci`
+# against the pinned lockfile, and a live server on a bound TCP port, and a
+# successful invocation is 10-20 minutes. The dev loop should require none of
+# that. CONTRAST `lint-plans` above, which IS chained in precisely because it is
+# sub-second, pure text and prerequisite-free — that is the rule, and this target
+# is the exception that earns its way out.
+#
+# The BLOCKING enforcement lives in `.github/workflows/ci.yml`'s
+# `conformance-suite` job, which plan 118-09 wires into `gate.needs`, so a
+# failure is a red required check. This target is the local spelling of the same
+# command; a green run on a laptop is evidence, not a gate.
+#
+# `tests/ci_conformance_gate_wiring.rs` pins both the script's contents (its
+# REQUIREMENT_SETS, ZERO_CHECK_* lists and MIN_CHECKS_* floors) and its wiring
+# into that blocking gate.
+#
+# PMCP_REQUEST_STATE_KEY must be set in the environment (any 64-hex-character
+# NON-PRODUCTION value locally; the CI job supplies its own). The script fails
+# naming the variable — never its value — when it is missing.
+.PHONY: test-conformance
+test-conformance:
+	@echo "$(BLUE)Running the official MCP conformance suite (both revisions, one process)...$(NC)"
+	./scripts/run-conformance-suite.sh
+	@echo "$(GREEN)✓ CONF-01 gates passed (MRTR surface green, check floors met, zero-check sets exact)$(NC)"
+
+# Phase 118 (CONF-02 / CONF-03) — the era comparison, the baseline schema gate
+# and the v1 fixture regression guard, on a dev-dependency-free build.
+#
+# What it proves: `tests/era_matrix.rs` observes ONE era target under 2025-11-25
+# and then under 2026-07-28 over the SAME bound address and joins the two
+# observation maps against the checked-in `baselines/era-deltas.yaml`;
+# `tests/era_baseline.rs` gates that baseline's schema; `tests/conformance.rs`
+# replays the 33-case v1 fixture corpus against all four reference servers. Two
+# `RUSTFLAGS="-D warnings" cargo build` fences run FIRST — `--all-features` and
+# `--no-default-features --features conformance` — because `cargo test` sees this
+# crate's `pmcp = { features = ["full"] }` dev-dependency and unifies features
+# back on, so only `cargo build` can make the EXISTENCE claim. Every target is
+# guarded on a NONZERO reported test count.
+#
+# `era_matrix` and `era_baseline` are run with `--features http`. `http` is NOT
+# in the crate's default feature set and `tests/era_matrix.rs` is
+# `#![cfg(all(feature = "conformance", feature = "http"))]`, so omitting the flag
+# compiles it to nothing and prints `running 0 tests` while exiting 0. That
+# silent vacuity is the single most likely way for a future edit to switch this
+# whole gate off, which is why the flags live in the script's `MATRIX_TESTS`
+# array as data and why the zero-count guard names that cause first.
+#
+# Deliberately NOT chained into `quality-gate` — and this is the load-bearing
+# part: `quality-gate` is scoped to the ROOT `pmcp` package and does not reach
+# `crates/pmcp-team-servers/tests/` AT ALL. None of the above executes under it,
+# at any setting. That gap (RESEARCH Pitfall 4) is exactly why this target and
+# its CI job exist; the two build fences also compile the whole team-servers tree
+# under two extra feature sets, which the inner dev loop should not pay for.
+#
+# The BLOCKING enforcement lives in `.github/workflows/ci.yml`'s `era-matrix`
+# job, wired into `gate.needs` by plan 118-09.
+# `tests/ci_conformance_gate_wiring.rs` pins this script's contents and that
+# wiring.
+.PHONY: test-era-matrix
+test-era-matrix:
+	@echo "$(BLUE)Running the era matrix on a dev-dependency-free build...$(NC)"
+	./scripts/run-era-matrix.sh
+	@echo "$(GREEN)✓ CONF-02/CONF-03 targets ran with non-zero test counts$(NC)"
 
 # Feature flag verification for pmcp-tasks crate
 .PHONY: test-feature-flags
@@ -358,7 +1478,7 @@ test-playwright-ui:
 	@cd tests/playwright && npm run test:ui
 
 .PHONY: test-all
-test-all: test-unit test-doc test-property test-examples test-integration
+test-all: test-unit test-doc test-property test-examples test-integration test-tester test-cargo-pmcp test-cargo-pmcp-integration test-server-toolkit test-openapi-server
 	@echo "$(GREEN)✓ All test suites passed (ALWAYS requirements met)$(NC)"
 
 # ALWAYS Requirements Validation (for new features)
@@ -414,11 +1534,16 @@ doc-open: doc
 	@echo "$(BLUE)Opening API documentation...$(NC)"
 	$(CARGO) doc --all-features --no-deps --open
 
+# NOTE the `skills` member of the list below (Phase 125, D-09). This list is NOT
+# the `full` / `full-v2` enumerated pair -- it is local to this target and no
+# tripwire derives anything from it -- so extending it is safe, and without
+# `skills` the whole of `src/server/skills/` was invisible to the ONLY
+# zero-tolerance rustdoc check that runs locally.
 .PHONY: doc-check
 doc-check:
 	@echo "$(BLUE)Checking rustdoc warnings (zero-tolerance)...$(NC)"
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps \
-		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,simd,sse,streamable-http,validation,websocket
+		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,simd,skills,sse,streamable-http,validation,websocket,v1-compat
 	@echo "$(GREEN)✓ Zero rustdoc warnings$(NC)"
 
 # Book documentation
@@ -656,6 +1781,111 @@ purity-check:
 	done
 	@echo "$(GREEN)purity-check PASSED: reader-free (umya/calamine/quick-xml/swc_/pmcp-code-mode absent) + writer-present (rust_xlsxwriter, per-feature) + zip-permitted + cargo-deny-bans-clean$(NC)"
 
+# Phase 122 (D-12 / D-13, PKGX-01): the NO-CRYPTO boundary for `pmcp-package`.
+#
+# A SIBLING list of PURITY_CRATES, deliberately NOT a member of it. The
+# purity-check Layer 2 loop enforces that every PURITY_CRATES member's [bans]
+# list is BYTE-IDENTICAL ("must stay in lockstep"); those crates ban Excel
+# readers, and this is an entirely different boundary — an ALLOWLIST rather than
+# a deny list. Joining that group would immediately fail its parity check.
+#
+# What it gets from being a sibling: the same crate-local deny.toml shape, the
+# same `--manifest-path` scoping (the only mechanism that reaches a
+# workspace-EXCLUDED crate — `pmcp-package` carries its own [workspace] table),
+# the same WR-02 fail-closed guard, and the same quality-gate chaining.
+PURITY_NO_CRYPTO_CRATES := pmcp-package
+
+# Fixture-driven self-test for the [bans].allow entry counter, mirroring
+# test-openapi-server-guard-selftest. It is a declared PREREQUISITE of
+# no-crypto-check below, so the parser is proven BEFORE the gate trusts its
+# reading — the gate and the proof of the gate cannot drift.
+#
+# Each fixture pins a failure mode that a naive line-oriented check gets wrong:
+#
+#   empty_allow      -> 0   THE BYPASS. `grep 'allow = \['` also matches
+#                           `allow = []`, so the naive guard passes exactly when
+#                           it must fail. This is the fixture that matters most.
+#   multiline        -> 2   the ordinary shape of the real config.
+#   single_line      -> 1   `allow = [ { name = "x" } ]` closes on its opening
+#                           line; the opener must be counted before the depth
+#                           check or this reads 0.
+#   licenses_first   -> 1   SECTION SCOPING, FORWARDS. `[licenses]` carries its
+#                           own `allow = []` in every crate-local config in this
+#                           repo, so a file-wide count reads the wrong section.
+#   licenses_after   -> 1   SECTION SCOPING, BACKWARDS. A later `[licenses]`
+#                           stanza must not reset a count already taken.
+#   comment_decoy    -> 0   COMMENT BLINDNESS. deny.toml's header prose explains
+#                           this guard and writes `{ name = ... }` inline while
+#                           doing so; a comment-blind counter would count the
+#                           documentation and report a healthy allowlist for a
+#                           file that has no [bans].allow at all.
+.PHONY: no-crypto-allowlist-guard-selftest
+no-crypto-allowlist-guard-selftest:
+	@echo "$(BLUE)Self-testing the [bans].allow entry counter...$(NC)"
+	@fail=0; ran=0; \
+	check() { \
+		fixture="$$1"; expected="$$2"; shift 2; \
+		actual=$$(printf '%s\n' "$$@" | awk -f scripts/deny-allow-entry-count.awk); \
+		ran=$$((ran + 1)); \
+		if [ "$$actual" != "$$expected" ]; then \
+			echo "$(RED)✗ allowlist guard self-test fixture '$$fixture': expected $$expected, actual $$actual$(NC)"; \
+			fail=1; \
+		fi; \
+	}; \
+	check empty_allow 0 '[bans]' 'multiple-versions = "allow"' 'allow = []'; \
+	check multiline 2 '[bans]' 'allow = [' '  { name = "sha2" },' '  { name = "digest" },' ']'; \
+	check single_line 1 '[bans]' 'allow = [ { name = "sha2" } ]'; \
+	check licenses_first 1 '[licenses]' 'allow = []' '[bans]' 'allow = [ { name = "sha2" } ]'; \
+	check licenses_after 1 '[bans]' 'allow = [ { name = "sha2" } ]' '[licenses]' 'allow = []'; \
+	check comment_decoy 0 '# the allow list holds { name = "sha2" } entries' '[bans]' 'multiple-versions = "allow"'; \
+	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
+	if [ "$$ran" -ne 6 ]; then \
+		echo "$(RED)✗ allowlist guard self-test executed $$ran fixtures, expected 6 — a fixture was lost$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ allowlist entry-counter self-test passed ($$ran fixtures)$(NC)"
+
+# The no-crypto boundary gate (SC4). Machine-checked over the RESOLVED
+# dependency graph — which is the whole point, and is the reason the
+# `const + include_str! + assert` manifest tripwire pattern was rejected for
+# this job: it reads a committed manifest at COMPILE time and structurally
+# cannot see a transitive arrival, which is the realistic way a signing crate
+# would actually enter.
+#
+# NOTE there is deliberately NO parity loop here. purity-check runs one across
+# PURITY_CRATES to keep multiple crates' ban lists in lockstep; PURITY_NO_CRYPTO_CRATES
+# holds ONE crate, so that loop would compare a list to itself. A degenerate
+# check that always passes is worse than no check — it reads like coverage.
+# Add the parity loop if and when a second crate joins this list.
+.PHONY: no-crypto-check
+no-crypto-check: no-crypto-allowlist-guard-selftest
+	@echo "$(BLUE)no-crypto-check: pmcp-package must never gain a signing/crypto-protocol dependency$(NC)"
+	@set -euo pipefail; \
+	for crate in $(PURITY_NO_CRYPTO_CRATES); do \
+		test -f crates/$$crate/deny.toml || { \
+			echo "$(RED)✗ no-crypto-check FAILED: crates/$$crate/deny.toml missing. cargo-deny 0.18.3 does NOT fail on a missing --config path — it WARNs, falls back to the default empty-ban config and reports 'bans ok' VACUOUSLY (the WR-02 hazard). A deleted or renamed config must fail this gate, not silently disable it.$(NC)"; \
+			exit 1; \
+		}; \
+		status=0; n=$$(awk -f scripts/deny-allow-entry-count.awk crates/$$crate/deny.toml 2>&1) || status=$$?; \
+		if [ $$status -ne 0 ]; then \
+			echo "$(RED)✗ no-crypto-check FAILED: the allowlist entry counter errored for crates/$$crate/deny.toml [exit $$status] — failing closed rather than trusting a reading it could not produce.$(NC)"; \
+			printf '%s\n' "$$n"; \
+			exit 1; \
+		fi; \
+		case "$$n" in \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ no-crypto-check FAILED: the allowlist entry counter produced no usable reading ('$$n') for crates/$$crate/deny.toml. An EMPTY value means awk itself did not run: check that scripts/deny-allow-entry-count.awk exists and is readable. Failing rather than continuing on a reading this gate does not understand.$(NC)"; \
+			exit 1;; \
+		esac; \
+		if [ "$$n" -eq 0 ]; then \
+			echo "$(RED)✗ no-crypto-check FAILED: crates/$$crate/deny.toml has an EMPTY or ABSENT [bans].allow list (reading: 0). One of three things is true: there is no [bans] section, it has no allow array, or that array is empty. Any of them is fatal — cargo-deny reports success for an EMPTY allow list exactly as vacuously as for a missing config, and ONLY a NON-EMPTY allow makes this check deny-by-default. Restore the allowlist; do not relax this guard.$(NC)"; \
+			exit 1; \
+		fi; \
+		echo "$(GREEN)  ✓ crates/$$crate/deny.toml [bans].allow holds $$n entries (deny-by-default is active)$(NC)"; \
+		cargo deny --manifest-path crates/$$crate/Cargo.toml check --config deny.toml bans; \
+	done
+	@echo "$(GREEN)✓ no-crypto-check PASSED: $(PURITY_NO_CRYPTO_CRATES) resolved graph is allowlisted (hashing admitted, signing absent)$(NC)"
+
 # Standalone quality gate for the workspace-EXCLUDED `pmcp-package` crate.
 # `pmcp-package` has its own [workspace] table and is NOT a root workspace
 # member, so root `cargo fmt/clippy/test` IGNORE it. Every command that must
@@ -666,8 +1896,32 @@ pmcp-package-gate:
 	@echo "$(BLUE)🔍 pmcp-package standalone gate (workspace-excluded crate)$(NC)"
 	$(CARGO) fmt --manifest-path crates/pmcp-package/Cargo.toml --all -- --check
 	$(CARGO) clippy --manifest-path crates/pmcp-package/Cargo.toml --all-targets -- -D warnings
-	$(CARGO) test --manifest-path crates/pmcp-package/Cargo.toml
-	@echo "$(GREEN)✓ pmcp-package fmt/clippy/test OK$(NC)"
+# The count assertion mirrors test-tester/test-cargo-pmcp and closes the same
+# vacuity class plan 122-01 closed for `cargo-pmcp/tests/`: a `cargo test` run
+# that selects ZERO tests EXITS 0, so this leg could report green while
+# executing nothing at all -- reproducing "the gate does not reach this crate",
+# the exact hole this whole target exists to close, while looking like proof.
+	@out=$$($(CARGO) test --manifest-path crates/pmcp-package/Cargo.toml 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ pmcp-package reported 0 tests — the gate is not reaching this workspace-excluded crate$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ pmcp-package tests passed ($$ran tests)$(NC)"
+# RUN the example, do not merely compile it. The `cargo test` and `cargo clippy
+# --all-targets` legs above already COMPILE every example target, so a
+# compile-only check here would add nothing at all. What this step catches is a
+# runtime panic or a failed `assert_eq!` INSIDE the example -- and CLAUDE.md's
+# ALWAYS requirements ask for a working `cargo run --example`, not a compiling
+# one. `make test-examples` cannot cover this: it runs
+# scripts/run-example-builds.sh over the ROOT workspace, which never reaches
+# this workspace-EXCLUDED crate.
+	$(CARGO) run --manifest-path crates/pmcp-package/Cargo.toml --example attestation_carriage
+	$(CARGO) run --manifest-path crates/pmcp-package/Cargo.toml --example config_slot_gates
+	@echo "$(GREEN)✓ pmcp-package fmt/clippy/test/example OK$(NC)"
 
 .PHONY: quality-gate
 quality-gate:
@@ -676,10 +1930,36 @@ quality-gate:
 	@echo "$(YELLOW)        Zero Tolerance for Defects                      $(NC)"
 	@echo "$(YELLOW)═══════════════════════════════════════════════════════$(NC)"
 	@echo "$(BLUE)🏭 Jidoka: Stopping the line for quality verification$(NC)"
+	@$(MAKE) lint-plans
+	@$(MAKE) check-release-coverage
 	@$(MAKE) fmt-check
 	@$(MAKE) lint
+	# doc-check runs HERE because CI runs it and this gate did not: a branch
+	# carrying 24 rustdoc errors passed `make quality-gate` green and then failed
+	# CI at `Documenting pmcp`. Same shape as the test-cargo-pmcp leg -- the gate
+	# is green on what it reaches, and the failures live in what it does not.
+	@$(MAKE) doc-check
 	@$(MAKE) build
 	@$(MAKE) test-all
+	# test-skills runs HERE because `test-all` cannot: every one of its legs pins
+	# `--features "full"`, and `skills` is in neither `full` nor `full-v2`. Same
+	# framing as the doc-check leg above -- the gate is green on what it reaches,
+	# and until this leg existed the failures lived in what it did not. See the
+	# target's own header for why it uses four separately-guarded selectors.
+	@$(MAKE) test-skills
+	# lint-skills, for the identical reason one gate leg over: `make lint` also
+	# pins `--features "full"`, so the pedantic+nursery policy never compiled
+	# `src/server/skills/` at all.
+	@$(MAKE) lint-skills
+	# test-oauth runs HERE for the third instance of the identical shape: every
+	# `test-all` leg pins `--features "full"`, and `oauth` is in neither `full`
+	# nor `full-v2`, so SEVEN oauth test binaries (124 tests) compiled to empty
+	# binaries that printed `running 0 tests` and exited 0. One of them,
+	# `oauth_issuer_precedence`, is the RFC 8414 §3.3 issuer-identity security
+	# fence, and it was green-by-omission from the day it was written. See the
+	# target's own header for the measured 124/167/291 split and for why it must
+	# stay native-only.
+	@$(MAKE) test-oauth
 	@$(MAKE) pmcp-package-gate
 	@$(MAKE) audit
 	@$(MAKE) unused-deps
@@ -687,6 +1967,7 @@ quality-gate:
 	@$(MAKE) check-unwraps
 	@$(MAKE) validate-always
 	@$(MAKE) purity-check
+	@$(MAKE) no-crypto-check
 	@$(MAKE) comply
 	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
 	@echo "$(GREEN)        ✅ ALL TOYOTA WAY QUALITY CHECKS PASSED        $(NC)"
@@ -1091,6 +2372,8 @@ help:
 	@echo "  test-doc        - Run doctests"
 	@echo "  test-property   - Run property tests"
 	@echo "  test-all        - Run all tests"
+	@echo "  test-skills     - Run the skills module's tests (feature 'skills' is in neither full nor full-v2)"
+	@echo "  lint-skills     - Clippy the skills module under make lint's exact policy (same reach gap)"
 	@echo "  test-feature-flags - Verify pmcp-tasks feature flag combinations"
 	@echo "  coverage        - Generate coverage report"
 	@echo "  mutants         - Run mutation testing"

@@ -2,8 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use pmcp::{
-    CallToolRequest, CallToolResult, ClientCapabilities, Content, GetPromptResult,
-    ListResourcesResult, PromptMessage, ReadResourceResult, ResourceInfo, Role, ServerCapabilities,
+    CallToolRequest, CallToolResult, ClientCapabilities, CompleteRequest, CompleteResult, Content,
+    GetPromptResult, ListResourcesResult, PromptMessage, ReadResourceResult, ResourceInfo, Role,
+    ServerCapabilities,
 };
 use serde_json::{from_slice, from_value, Value};
 
@@ -18,6 +19,16 @@ fuzz_target!(|data: &[u8]| {
         let _ = from_value::<ListResourcesResult>(json.clone());
         let _ = from_value::<ReadResourceResult>(json.clone());
         let _ = from_value::<GetPromptResult>(json.clone());
+
+        // `completion/complete` (Phase 118.1-04, CONF-05 / G-4). Added because
+        // the claim "the existing serde surface already covers the request
+        // parse" was MEASURED FALSE: no fuzz target deserialized either of
+        // these before this line. `CompleteRequest` carries a peer-supplied
+        // internally-tagged `ref` (`ref/prompt` / `ref/resource`) whose params
+        // reach a registered completion provider, so it is exactly the shape a
+        // parse fence belongs on.
+        let _ = from_value::<CompleteRequest>(json.clone());
+        let _ = from_value::<CompleteResult>(json.clone());
 
         // Try parsing as capability types
         let _ = from_value::<ClientCapabilities>(json.clone());

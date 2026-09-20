@@ -31,11 +31,24 @@ jobs:
         # Extract the latest version's changelog
         VERSION="${{ steps.get_version.outputs.VERSION }}"
         VERSION_NO_V="${VERSION#v}"
-        CHANGELOG=$(awk -v ver="## \\[$VERSION_NO_V\\]" '
-          $0 ~ ver {p=1; next}
+        # Match the heading with index(), NOT a regex built from a -v value.
+        # awk applies string-literal escape processing to -v assignments, and
+        # `\[` is an UNDEFINED escape: BSD awk (measured) drops the backslash, so
+        # `ver` became `## [2.19.1]` and `$0 ~ ver` read `[2.19.1]` as a CHARACTER
+        # CLASS. `## [` never matched it, the extraction returned EMPTY, and the
+        # release was created with blank notes at exit 0 -- silently. Measured
+        # 2026-08-27 against v2.19.1, v2.19.0 and v2.18.0: 0 bytes for all three.
+        # Passing the bare version (no backslashes, so nothing to escape) and
+        # comparing with index() removes the hazard entirely.
+        CHANGELOG=$(awk -v ver="$VERSION_NO_V" '
+          index($0, "## [" ver "]") == 1 {p=1; next}
           /^## \[/ && p {exit}
           p {print}
         ' CHANGELOG.md)
+        if [ -z "$CHANGELOG" ]; then
+          echo "::error::CHANGELOG.md has no '## [$VERSION_NO_V]' section - refusing to create a release with empty notes" >&2
+          exit 1
+        fi
         echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
         echo "$CHANGELOG" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
@@ -80,25 +93,45 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
-    # Publish order: leaf dependencies first, then dependents.
+    # Publish order: leaf dependencies first, then dependents. This list is the
+    # prose mirror of the publish STEPS below it, and the STEPS are the authority
+    # — every recorded time the two disagreed, the steps were right. It is kept
+    # complete (one entry per step) on purpose: a partial list cannot be checked
+    # against the steps, and that is how its tail rotted unnoticed once already.
+    # scripts/check-release-coverage.sh machine-checks that every publishable
+    # workspace member has a step here, and that pmcp-package precedes its four
+    # in-repo consumers (D-10).
     # pmcp-widget-utils (no internal deps)
     # -> pmcp-macros-support (no internal deps; consumed by pmcp-macros)
     # -> pmcp-macros (depends on pmcp-macros-support)
     # -> pmcp-code-mode (depends on pmcp)
     # -> pmcp-code-mode-derive (depends on pmcp-code-mode)
     # -> pmcp (depends on widget-utils + macros)
+    # -> pmcp-workbook-runtime (depends on pmcp)
+    # -> pmcp-workbook-dialect (workbook leaf)
     # -> pmcp-server-toolkit (depends on pmcp + pmcp-code-mode)
     # -> pmcp-toolkit-postgres / -mysql / -athena (depend on the toolkit)
     # -> pmcp-sql-server (depends on toolkit + the three connectors)
-    # -> pmcp-openapi-server (depends on the toolkit)
+    # -> pmcp-openapi-server (depends on the toolkit; its pmcp-package dev-dep is
+    #    PATH-ONLY, with no version key, precisely because it publishes AHEAD of
+    #    pmcp-package — see CLAUDE.md item 9b before "fixing" it)
+    # -> pmcp-workbook-compiler (depends on the workbook tree)
+    # -> pmcp-workbook-server (depends on the toolkit's workbook + http features)
     # -> mcp-tester (depends on pmcp)
     # -> mcp-preview (depends on widget-utils)
-    # -> cargo-pmcp (depends on pmcp, mcp-tester, mcp-preview)
-    # -> pmcp-server (depends on pmcp, mcp-tester)
     # -> pmcp-package (standalone workspace-EXCLUDED leaf, published via
-    #    --manifest-path, NOT -p; has NO in-repo consumers yet, so it publishes
-    #    LAST — a failure in this experimental 0.x crate must not gate the core
-    #    SDK release. Move it earlier only once a shipped crate actually pins it.)
+    #    --manifest-path, NOT -p. It publishes HERE, ahead of its four in-repo
+    #    consumers, each of which pins it — see the cluster comment above its
+    #    step, and the authoritative ordering constraint under item 13 of
+    #    CLAUDE.md's Workspace Crates ledger.)
+    # -> pmcp-cfn-renderer (pins pmcp-package)
+    # -> pmcp-agent (pins pmcp + pmcp-package)
+    # -> pmcp-team-servers (pins pmcp + pmcp-agent + pmcp-package)
+    # -> cargo-pmcp (pins pmcp, mcp-tester, mcp-preview, pmcp-package,
+    #    pmcp-cfn-renderer, pmcp-agent, pmcp-team-servers)
+    # -> pmcp-server (depends on pmcp, mcp-tester)
+    # -> pmcp-tasks (depends on pmcp; nothing in this workspace depends on it,
+    #    so it publishes last — it is consumed out-of-repo)
 
     - name: Publish pmcp-widget-utils
       env:
@@ -423,15 +456,36 @@ jobs:
           fi
         }
 
-    # pmcp-package + pmcp-agent + pmcp-team-servers publish BEFORE cargo-pmcp:
-    # cargo-pmcp 0.18.0 (Phase 110) pins all three (`pmcp-agent = "0.1"`,
-    # `pmcp-team-servers = "0.1"`, `pmcp-package = "0.1"`), so they MUST already
-    # exist on crates.io or `cargo publish -p cargo-pmcp` fails with
-    # "no matching package named `pmcp-agent`". Dependency order among the three:
-    # pmcp-package (leaf) -> pmcp-agent (pins pmcp-package) -> pmcp-team-servers
-    # (pins pmcp-agent + pmcp-package). All are experimental 0.x, so each keeps
-    # the same "already exists"-tolerant guard — a failure here must not gate the
+    # THE CLUSTER ORDERING CONSTRAINT (D-09). Stated, not merely implied by the
+    # sequence of steps below:
+    #
+    #   pmcp-package publishes BEFORE pmcp-cfn-renderer, pmcp-agent, pmcp-team-servers and cargo-pmcp.
+    #
+    # All four of those crates declare a `pmcp-package` dependency carrying a
+    # version requirement, so pmcp-package must already exist on crates.io at a
+    # matching version or their publish fails with "no matching package named
+    # `...`". cargo-pmcp additionally pins pmcp-cfn-renderer, pmcp-agent and
+    # pmcp-team-servers, which is why it is last of the five.
+    #
+    # The requirement VALUES are deliberately not quoted here. Literals in
+    # comments have no guard, and the ones that used to sit on these lines had
+    # rotted by two minor versions before anyone noticed. The manifests are the
+    # source of truth for the values (crates/pmcp-cfn-renderer/Cargo.toml,
+    # crates/pmcp-agent/Cargo.toml, crates/pmcp-team-servers/Cargo.toml,
+    # cargo-pmcp/Cargo.toml); CLAUDE.md's Workspace Crates ledger carries the
+    # authoritative statement of this constraint under item 13.
+    #
+    # Dependency order among the four:
+    # pmcp-package (leaf) -> pmcp-cfn-renderer (pins pmcp-package) ->
+    # pmcp-agent (pins pmcp-package) -> pmcp-team-servers (pins pmcp-agent +
+    # pmcp-package). All are experimental 0.x, so each keeps the same
+    # "already exists"-tolerant guard — a failure here must not gate the
     # already-published core `pmcp` SDK.
+    #
+    # This ORDER is machine-checked: scripts/check-release-coverage.sh asserts
+    # pmcp-package's publish step precedes all four consumers' steps (D-10), so a
+    # prose-versus-workflow order bug of the kind PR #303 fixed is now a build
+    # failure rather than a discovery.
     #
     # pmcp-package is workspace-EXCLUDED (own [workspace] table), so it publishes
     # via --manifest-path, NOT `-p pmcp-package`.
@@ -451,6 +505,33 @@ jobs:
         }
 
     - name: Wait for crates.io to index pmcp-package
+      run: sleep 30
+
+    # pmcp-cfn-renderer (CFN-renderer extraction) publishes right after
+    # pmcp-package, its only internal dependency. It pins pmcp-package by
+    # version — read crates/pmcp-cfn-renderer/Cargo.toml for the current
+    # requirement rather than trusting a number quoted here, and see that
+    # crate's tests/goldens/README.md "Cross-crate publish coupling" section for
+    # why the coupling exists. It publishes BEFORE cargo-pmcp, which pins
+    # pmcp-cfn-renderer by version (it replaces `npx cdk synth`/`cdk deploy` for
+    # unmodified scaffolds on the pmcp-run and aws-lambda deploy targets).
+    # Experimental 0.x — a failure here must not gate the core SDK release.
+    - name: Publish pmcp-cfn-renderer
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: |
+        echo "Publishing pmcp-cfn-renderer..."
+        OUTPUT=$(cargo publish -p pmcp-cfn-renderer 2>&1) && echo "$OUTPUT" || {
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "already exists"; then
+            echo "pmcp-cfn-renderer already published, continuing..."
+          else
+            echo "::error::Failed to publish pmcp-cfn-renderer"
+            exit 1
+          fi
+        }
+
+    - name: Wait for crates.io to index pmcp-cfn-renderer
       run: sleep 30
 
     - name: Publish pmcp-agent
@@ -522,6 +603,33 @@ jobs:
           fi
         }
 
+    # pmcp-tasks: experimental 0.x leaf. Depends on `pmcp` only, and NOTHING in
+    # this workspace depends on it — so it publishes late, for the same reason
+    # pmcp-package does: a failure here must not abort the job before the core
+    # SDK and its dependents publish. It is consumed out-of-repo (pmcp-run's
+    # built-in servers pin it with `features = ["dynamodb"]`), which is why it
+    # must publish at all rather than staying a path-dep.
+    - name: Publish pmcp-tasks
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: |
+        echo "Publishing pmcp-tasks..."
+        OUTPUT=$(cargo publish -p pmcp-tasks 2>&1) && echo "$OUTPUT" || {
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "already exists"; then
+            echo "pmcp-tasks already published, continuing..."
+          else
+            echo "::error::Failed to publish pmcp-tasks"
+            exit 1
+          fi
+        }
+
+    # NOTE: pmcp-package is NOT published here. Its publish step moved UP the
+    # job (before pmcp-cfn-renderer/pmcp-agent/pmcp-team-servers/cargo-pmcp)
+    # when those crates started pinning it — a stale duplicate step used to sit
+    # here with a "has NO in-repo consumers yet" comment that had been false
+    # since Phase 108, re-running the publish a second time per release.
+
   publish-mcp:
     name: Publish to MCP Registry
     runs-on: ubuntu-latest
@@ -566,4 +674,39 @@ jobs:
     with:
       tag_name: ${{ needs.create-release.outputs.version }}
       package_name: pmcp-server
+    secrets: inherit
+
+  # Shape A pure-config connector binaries (CFN-renderer extraction, Task 10):
+  # `cargo pmcp deploy --target aws-lambda` on a `[metadata].server_type`
+  # project (ServerShape::BuiltIn — see
+  # cargo-pmcp/src/deployment/targets/aws_lambda/artifact.rs) fetches one of
+  # these three as a bare `<name>-<target-triple>` GitHub Release asset (same
+  # `.sha256` sidecar convention as mcp-tester/pmcp-server above). Before this
+  # job existed, none of the three were ever built by this workflow, so a
+  # real built-in deploy 404'd (T8/T10 gap, closed here).
+  build-pmcp-sql-server:
+    name: Build PMCP SQL Server Binaries
+    needs: create-release
+    uses: ./.github/workflows/release-binary.yml
+    with:
+      tag_name: ${{ needs.create-release.outputs.version }}
+      package_name: pmcp-sql-server
+    secrets: inherit
+
+  build-pmcp-workbook-server:
+    name: Build PMCP Workbook Server Binaries
+    needs: create-release
+    uses: ./.github/workflows/release-binary.yml
+    with:
+      tag_name: ${{ needs.create-release.outputs.version }}
+      package_name: pmcp-workbook-server
+    secrets: inherit
+
+  build-pmcp-openapi-server:
+    name: Build PMCP OpenAPI Server Binaries
+    needs: create-release
+    uses: ./.github/workflows/release-binary.yml
+    with:
+      tag_name: ${{ needs.create-release.outputs.version }}
+      package_name: pmcp-openapi-server
     secrets: inherit

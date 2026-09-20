@@ -251,12 +251,10 @@ mod tests {
             name: name.to_string(),
             version: semver::Version::parse("1.0.0").unwrap(),
             instructions: "You are a helpful team member. Be brief.".to_string(),
-            llm: ConfigSlot {
-                slot: SlotType::LlmProvider {
-                    name: "primary-llm".to_string(),
-                    tested_value: "test-model".to_string(),
-                },
-            },
+            llm: ConfigSlot::new(SlotType::LlmProvider {
+                name: "primary-llm".to_string(),
+                tested_value: "test-model".to_string(),
+            }),
             max_tokens: 4096,
             max_iterations: 5,
             connectors: vec![],

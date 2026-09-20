@@ -554,6 +554,15 @@ mod tool_handlers {
             #[cfg_attr(not(feature = "openapi-code-mode"), allow(unused_variables))]
             extra: &pmcp::RequestHandlerExtra,
         ) -> std::result::Result<serde_json::Value, pmcp_code_mode::ExecutionError> {
+            // Gated to match the ONE arm that needs it. Under `openapi-code-mode`
+            // the `PerRequestHttp` arm calls `.execute()` on a freshly built
+            // `JsCodeExecutor`, which resolves only through this trait. Without
+            // that feature the arm is cfg'd out and the `Static` arm resolves
+            // `.execute()` without the trait, leaving the import unused — a
+            // warning that becomes a hard error wherever `-D warnings` reaches
+            // this crate. Measured both ways: `--features http` warns,
+            // `--features http,openapi-code-mode` does not.
+            #[cfg(feature = "openapi-code-mode")]
             use pmcp_code_mode::CodeExecutor as _;
             match &self.source {
                 ExecSource::Static(executor) => executor.execute(code, variables).await,
@@ -1160,23 +1169,6 @@ fn map_auto_approve_levels(levels: &[String], cfg: &mut CodeModeConfig) {
     }
 }
 
-/// Extract `NAME` from a string of the exact shape `${NAME}`.
-///
-/// Returns `Some(name)` only when `raw` both starts with `${` and ends with `}`
-/// AND `name` is non-empty. A string that merely *contains* `${` (e.g. an
-/// Athena `output_location` substring, or a malformed `${` without a closing
-/// brace) returns `None`, so it falls through to the existing inline-secret
-/// handling (still rejected unless the dev flag is set). This is what scopes
-/// `${VAR}` expansion to `token_secret` only and preserves the R9 guarantee
-/// (REVIEW FIX #6).
-fn expand_braced_var(raw: &str) -> Option<&str> {
-    let inner = raw.strip_prefix("${")?.strip_suffix('}')?;
-    if inner.is_empty() {
-        return None;
-    }
-    Some(inner)
-}
-
 /// Per review R9: `token_secret` is `env:`- or `${VAR}`-only by default. Inline
 /// literals are REJECTED at config-validation time unless
 /// `allow_inline_token_secret_for_dev` is set. Returns the resolved bytes
@@ -1217,11 +1209,37 @@ fn resolve_token_secret(section: &CodeModeSection) -> Result<SecretValue> {
             "[code_mode] token_secret is required when code-mode is enabled".to_string(),
         )
     })?;
-    if let Some(var) = raw.strip_prefix("env:") {
-        return resolve_secret_env_var(var);
-    }
-    if let Some(var) = expand_braced_var(raw) {
-        return resolve_secret_env_var(var);
+    // Both reference forms (`env:VAR` and `${VAR}`) are parsed by the ONE
+    // toolkit-wide grammar chokepoint (Phase 120 Plan 04 Task 2). This module
+    // previously carried its own `expand_braced_var`; a second `${}` parser with
+    // slightly different edge cases is a latent security bug, so the grammar is
+    // now single-sourced and only the RESOLUTION policy stays local (error on
+    // unset, never a fall-back to a weak or empty secret — T-85-01-01).
+    //
+    // A string that merely *contains* `${` (e.g. an Athena `output_location`
+    // substring) is still NOT a reference — `parse_env_ref` requires the exact
+    // `${...}` shape — so it falls through to the inline-secret handling below
+    // and stays rejected unless the dev flag is set (R9 / REVIEW FIX #6).
+    match crate::env_ref::parse_env_ref(raw) {
+        // A MALFORMED reference: the empty `${}`, or a `${NAME}` whose NAME is
+        // not portably settable (`${MY-SECRET}`, `${a.b}`), or a
+        // multi-placeholder composition. The grammar maps all of them to the
+        // empty name, and `resolve_secret_env_var("")` would report
+        // `env var '' not set for token_secret` — a message that names neither
+        // what the operator wrote nor what to do about it. Say the actual thing
+        // instead, and point at the `env:` escape hatch, which keeps its
+        // any-non-empty-remainder rule precisely for exotic names.
+        Some("") => {
+            return Err(ToolkitError::CodeMode(
+                "[code_mode] token_secret is a malformed environment reference; a `${VAR}` \
+                 reference must name exactly ONE variable matching [A-Za-z0-9_]+ and nothing \
+                 else. For a name outside that set, use the `env:NAME` form, which accepts any \
+                 non-empty name. (The value is not echoed here.)"
+                    .to_string(),
+            ))
+        },
+        Some(var) => return resolve_secret_env_var(var),
+        None => {},
     }
     if section.allow_inline_token_secret_for_dev {
         tracing::warn!(

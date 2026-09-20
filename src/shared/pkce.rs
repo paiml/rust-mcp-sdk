@@ -62,7 +62,7 @@ const PKCE_RANDOM_BYTES: usize = 32;
 /// Centralises the single `getrandom::fill` call so both the verifier and the
 /// state generators share one CSPRNG source, and so a `getrandom::Error` is
 /// mapped to [`Error::internal`] in exactly one place (no `unwrap`/`expect`).
-fn random_bytes() -> Result<[u8; PKCE_RANDOM_BYTES]> {
+pub(crate) fn random_bytes() -> Result<[u8; PKCE_RANDOM_BYTES]> {
     let mut buf = [0u8; PKCE_RANDOM_BYTES];
     getrandom::fill(&mut buf)
         .map_err(|e| Error::internal(format!("CSPRNG (getrandom) failed: {e}")))?;

@@ -3,6 +3,8 @@
 //! This module contains the core protocol types including initialization,
 //! version negotiation, request routing, and completion types.
 
+pub mod context;
+pub mod error_codes;
 pub mod version;
 
 use crate::types::capabilities::{ClientCapabilities, ServerCapabilities};
@@ -11,10 +13,21 @@ use serde::{Deserialize, Serialize};
 // Re-export version constants and negotiation function.
 pub use version::*;
 
+// Re-export the additive protocol-context value types (Phase 112).
+pub use context::{ProtocolContext, TraceContext};
+
 // Re-export domain modules' types for backward compatibility.
 // Types that were previously in this file are now in their own modules
 // and re-exported via types/mod.rs. These re-exports preserve the
 // `crate::types::protocol::X` import paths used throughout the codebase.
+// `super::caching` is deliberately NOT globbed here. The rest of this list
+// exists for BACKWARD compatibility — those types used to live in this file, so
+// the `crate::types::protocol::X` paths predate the split. `types::caching` is
+// new in Phase 115 and has no such history: `types/mod.rs` re-exports exactly
+// its two public items (`CacheScope`, `DEFAULT_TTL_MS`) and documents that
+// narrowness on purpose, so a glob here would mint a SECOND public path
+// (`pmcp::types::protocol::CacheScope`) that nothing imports, and would also
+// pull the module's `pub(crate)` projector plumbing into `types::protocol`.
 pub use super::content::*;
 pub use super::notifications::*;
 pub use super::prompts::*;
@@ -561,6 +574,460 @@ pub enum Request {
     Server(Box<ServerRequest>),
 }
 
+/// Parameters for the v2 `server/discover` request (VERS-04, MCP 2026-07-28).
+///
+/// `server/discover` takes no required parameters today. This struct is
+/// `#[non_exhaustive]` so future spec-defined fields can be added without a
+/// breaking change. Adding a new public STRUCT is a non-breaking minor addition
+/// — it introduces no new variant to any exhaustive public enum.
+///
+/// # Routing
+///
+/// `server/discover` is deliberately NOT a variant of the public exhaustive
+/// [`ClientRequest`] / [`Request`] enums: adding one would break downstream
+/// exhaustive `match` arms in the workspace crates (a source-level break that
+/// `cargo-semver-checks` classifies as "minor" but that violates the milestone's
+/// hard 2.x-minor promise). Instead it is carried by the crate-private
+/// `InternalClientRequest` and routed by matching the raw method string via
+/// `classify_internal_method` BEFORE conversion into the public enum. Plan 05
+/// wires this classifier into the server request path so v2 `server/discover`
+/// reaches the era-gated handler while v1 / non-opted-in requests fall through
+/// to the existing `parse_request` → `method_not_found` → `-32601` (D-10).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "camelCase")]
+pub struct ServerDiscoverRequest {}
+
+impl ServerDiscoverRequest {
+    /// Create an empty `server/discover` request.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// The wire result of a v2 `server/discover` request (VERS-04, MCP 2026-07-28).
+///
+/// A read-only projection of the server's ALREADY-COMPUTED capabilities plus its
+/// implementation info. It reuses the existing [`ServerCapabilities`] /
+/// [`Implementation`] types — it does NOT invent a parallel capability model — and
+/// is produced ONLY through the server's isolated
+/// `discover_result_from_capabilities` conversion fn so a final-spec wire
+/// adjustment stays localized.
+///
+/// It is `#[non_exhaustive]` (spec-defined fields may be added without a break).
+///
+/// # Why it lives in `types::protocol` and not in the server
+///
+/// Phase 113 (CLNT-01) makes this the return type of
+/// [`Client::server_discover`](crate::Client::server_discover), and the pmcp
+/// `Client` compiles on `wasm32` where the whole `server::core` module is
+/// `cfg`-ed out. Keeping the shared wire type in the `cfg`-agnostic protocol
+/// module is what lets ONE type serve both ends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "camelCase")]
+pub struct ServerDiscoverResult {
+    /// The negotiated protocol version this projection was produced under.
+    pub protocol_version: String,
+    /// The server's already-computed capabilities (incl. the `extensions` map).
+    pub capabilities: crate::types::ServerCapabilities,
+    /// The server's self-reported implementation info.
+    ///
+    /// SELF-REPORTED and unverified — never derive authorization from it.
+    pub server_info: Implementation,
+
+    /// The protocol versions this server accepts — the REQUIRED
+    /// `2026-07-28` `DiscoverResult.supportedVersions` field.
+    ///
+    /// "MCP Protocol Versions this server supports. The client should choose a
+    /// version from this list for use in subsequent requests"
+    /// (`schema/vendored/core-2026-07-28/schema.ts:678-696`).
+    ///
+    /// # ONE accept list, read twice (Phase 118.1, G-7)
+    ///
+    /// This is the SAME list an unsupported-version rejection reports as
+    /// `error.data.supported`: both read the server's configured accept list
+    /// (`Server::supported_protocol_versions()`), which reaches the discover
+    /// projection through the `DiscoverSource` bundle rather than through a
+    /// second list assembled here. That is a structural requirement, not a
+    /// stylistic one — the official conformance suite's
+    /// `ServerUnsupportedVersionError` check asserts that every element of
+    /// `error.data.supported` also appears in this field, so two sources would
+    /// be two chances to disagree. `tests/v2_discover_supported_versions.rs`
+    /// fences the correlation against a SINGLE spawned server, where two
+    /// independent lists cannot both pass.
+    ///
+    /// # Why not `Option`, and why no `skip_serializing_if`
+    ///
+    /// The spec makes the field REQUIRED, and unlike [`ttl_ms`](Self::ttl_ms)
+    /// there is no "the handler expressed no preference" state to model: a
+    /// server always has an accept list. Omitting the key would fail the suite
+    /// outright, so it is emitted unconditionally.
+    ///
+    /// `#[serde(default)]` affects DESERIALIZATION only and is the repo's
+    /// tolerant-reader / strict-emitter rule (Phase 118.1 D-03) applied to the
+    /// client end: pmcp always EMITS the field, but
+    /// [`Client::server_discover`](crate::Client::server_discover) must not hard
+    /// fail against a peer that predates it or omits it.
+    ///
+    /// # Semver
+    ///
+    /// Adding this field is additive rather than a major bump because this
+    /// struct is `#[non_exhaustive]`, so `cargo semver-checks`'
+    /// `constructible_struct_adds_field` does not fire.
+    ///
+    /// That verdict is the OPPOSITE of the one plan 118.1-03 recorded for
+    /// `Content::Resource`, and the asymmetry is entirely explained by that one
+    /// attribute: `Content` is a public EXHAUSTIVE enum whose `Resource`
+    /// variant was not `#[non_exhaustive]`, so every representation of a new
+    /// spec field there was a major lint (`enum_struct_variant_field_added`)
+    /// and shipped as a documented one-time delta (D-15). Here the attribute
+    /// was already in place, so the same class of change costs nothing.
+    #[serde(default)]
+    pub supported_versions: Vec<String>,
+
+    /// How long (in milliseconds) a client MAY cache this response — the
+    /// `2026-07-28` `CacheableResult.ttlMs` hint.
+    ///
+    /// `u64` is the MEASURED mapping: the vendored artifact declares
+    /// `$defs.CacheableResult.properties.ttlMs` as
+    /// `{"type": "integer", "minimum": 0}` (asserted by
+    /// `tests/v2_core_schema_facts.rs`), so integrality and non-negativity are
+    /// contract. The one residual is the absent upper bound — JSON Schema
+    /// `integer` is unbounded while `u64` is not — which at millisecond
+    /// resolution is roughly 584 million years and is an ACCEPTED risk.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`DEFAULT_TTL_MS`](crate::types::DEFAULT_TTL_MS)
+    /// (`0`, "immediately stale") — D-08.
+    ///
+    /// **v2 only.** `server/discover` is itself a v2-only method, but the
+    /// projection rule is the same: a value set here is emitted only on the
+    /// `2026-07-28` wire and actively STRIPPED otherwise (D-11).
+    ///
+    /// **Why `Option` when the wire says REQUIRED (D-07).** The field is
+    /// required on the `2026-07-28` projection, but modelling it as `Option`
+    /// plus inject-on-v2 fails CLOSED (a missed path merely omits a hint),
+    /// whereas a non-`Option` field plus strip-on-v1 fails OPEN (a missed path
+    /// leaks a v2 key onto the v1 wire).
+    ///
+    /// Not to be confused with
+    /// [`TaskV2::ttl_ms`](crate::types::tasks::TaskV2::ttl_ms), which is a task
+    /// LIFETIME rather than a cache-freshness hint (D-10).
+    ///
+    /// **No builder by design.** This struct's only producer is the server's
+    /// `discover_result_from_capabilities` conversion, with no handler seam, so
+    /// a builder method here would be public API no server author can reach
+    /// through normal configuration — unlike `ListResourcesResult` and
+    /// `ReadResourceResult`, which a
+    /// [`ResourceHandler`](crate::server::ResourceHandler) returns from `list`
+    /// and `read` and which therefore do carry builders. The field stays `pub`,
+    /// so a caller constructing the struct directly can still set it.
+    ///
+    /// (`ListResourceTemplatesResult` carries builders too, but is NOT
+    /// handler-reachable — see its own note. Two of the six cacheable results
+    /// are settable through a handler, not three; 115-10 corrected an earlier
+    /// version of this paragraph that said three.)
+    ///
+    /// Adding this field is additive rather than a major bump because this
+    /// struct is `#[non_exhaustive]`, so `cargo semver-checks`'
+    /// `constructible_struct_adds_field` does not fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+
+    /// The intended sharing scope of the cached response — the `2026-07-28`
+    /// `CacheableResult.cacheScope` hint.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`CacheScope::Private`](crate::types::CacheScope)
+    /// (D-08). Read [`CacheScope`](crate::types::CacheScope)'s `# Security`
+    /// section before setting `Public`: a discover projection can be
+    /// authorization-filtered, in which case sharing it across authorization
+    /// contexts would disclose capabilities one caller may not hold.
+    ///
+    /// **v2 only** and **no builder by design** — see [`ttl_ms`](Self::ttl_ms).
+    /// Additive under semver for the same `#[non_exhaustive]` reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<crate::types::caching::CacheScope>,
+}
+
+/// Crate-private internal dispatch representation for methods that must be
+/// routable WITHOUT appearing in the public exhaustive [`ClientRequest`] /
+/// [`Request`] enums.
+///
+/// This enum is `pub(crate)`, so it is invisible to `cargo-semver-checks` /
+/// `cargo-public-api` and can grow variants freely without any public API or
+/// downstream exhaustive-match impact.
+// Consumed in production via `classify_internal_method` →
+// `IngressRequest::Internal` (the crate-private `parse_request_or_internal`
+// routing seam in `src/shared/protocol_helpers.rs`), which classifies
+// `server/discover` into this internal representation BEFORE the public-enum
+// conversion. On the HTTP transport the streamable-HTTP `HttpIngress::Discover`
+// classifier then routes it to `Server::handle_discover`, which era-gates it via
+// the shared `build_discover_response` projection.
+#[derive(Debug, Clone)]
+pub(crate) enum InternalClientRequest {
+    /// The v2 `server/discover` request (VERS-04).
+    ServerDiscover(ServerDiscoverRequest),
+    /// The v2 `tasks/update` request (Phase 114, TASK-02), carrying its **RAW**
+    /// `params` and NOTHING else.
+    ///
+    /// # Why it is here and NOT a [`ClientRequest`] variant
+    ///
+    /// MEASURED, not assumed: [`ClientRequest`] carries
+    /// `#[derive(Debug, Clone, Serialize, Deserialize)]` and
+    /// `#[serde(tag = "method", content = "params", rename_all = "camelCase")]`
+    /// with **no `#[non_exhaustive]`**. Adding a variant to a public exhaustive
+    /// enum is `enum_variant_added`, a semver-**MAJOR** break, and would fail this
+    /// milestone's hard 2.x-minor promise for a reason unrelated to the tasks
+    /// surface. `cargo semver-checks check-release` is what catches a regression;
+    /// `client_request_has_no_tasks_update_variant` in
+    /// `tests/v2_tasks_update_routing.rs` is the in-repo guard that fails with an
+    /// explanation rather than only failing CI.
+    ///
+    /// Adding `#[non_exhaustive]` to [`ClientRequest`] is NOT the escape hatch
+    /// either: that is itself a source break for every downstream exhaustive
+    /// `match`. This enum is `pub(crate)`, so it is invisible to
+    /// `cargo-semver-checks` / `cargo-public-api` and may grow freely.
+    ///
+    /// The `server/discover` precedent (the sibling variant above) established
+    /// exactly this route in Phase 112 and is followed here by name.
+    ///
+    /// # Why the params stay RAW, and why there is no id field
+    ///
+    /// RAW because [`classify_internal_method`] **must never reject a body**: a
+    /// malformed `params` has to become a structured `-32602` in the SERVED
+    /// branch — after the era gate, the backend gate, the client-declaration
+    /// `-32021` gate and the `-32003` auth refusal have all run (114-09's
+    /// documented order) — not a parse error before them. A classifier that
+    /// deserialized would hand an UNAUTHENTICATED caller a params error instead of
+    /// `-32003`, inverting that ordering guarantee.
+    ///
+    /// No request id: the classifier never receives one. `parse_request_or_internal`
+    /// reads `request.id` itself and returns it as the FIRST element of its
+    /// `(RequestId, IngressRequest)` tuple, so the routing site takes the id from
+    /// there — exactly as the `ServerDiscover` arm does. A field the classifier
+    /// cannot populate would either be a lie or force a signature change on the
+    /// shared classifier.
+    TasksUpdate {
+        /// The request's `params`, verbatim and undecoded (`Value::Null` when the
+        /// frame carried none).
+        params: serde_json::Value,
+    },
+    /// The SEP-2640 `skills/list` request (Phase 125), carrying its **RAW**
+    /// `params` and NOTHING else.
+    ///
+    /// # Why it is here and NOT a [`ClientRequest`] variant
+    ///
+    /// The same measurement the [`TasksUpdate`](Self::TasksUpdate) rustdoc above
+    /// records: [`ClientRequest`] is a public exhaustive enum with **no
+    /// `#[non_exhaustive]`**, so `enum_variant_added` is a semver-**MAJOR** break
+    /// and `#[non_exhaustive]` is itself a source break for every downstream
+    /// exhaustive `match`. This enum is `pub(crate)`, invisible to
+    /// `cargo-semver-checks` / `cargo-public-api`, and may grow freely. The
+    /// in-repo guard is `client_request_has_no_skills_variants` in
+    /// `tests/skills_routing.rs`.
+    ///
+    /// # Why the params stay RAW, and why there is no id field
+    ///
+    /// RAW because [`classify_internal_method`] **must never reject a body** — a
+    /// malformed `params` has to become a structured error in the SERVED branch,
+    /// after the header/auth pipeline, not a parse error before it. `skills/list`
+    /// takes only an optional `cursor` today and pmcp answers a single complete
+    /// page (D-11), so the value is currently unread; carrying it verbatim keeps
+    /// this variant shaped like its siblings and keeps the classifier body-blind.
+    ///
+    /// No request id: the classifier is never given one.
+    /// `parse_request_or_internal` reads `request.id` itself and returns it as the
+    /// FIRST element of its `(RequestId, IngressRequest)` tuple.
+    ///
+    /// # There is no era gate on this variant
+    ///
+    /// Unlike `server/discover`, `skills/list` carries no protocol-version gate:
+    /// it rides the base Resources primitive and answers on 2025-11-25 as well as
+    /// 2026-07-28. Only the `ttlMs` / `cacheScope` caching attributes on its
+    /// result are 2026-07-28-conditional (D-07).
+    SkillsList {
+        /// The request's `params`, verbatim and undecoded (`Value::Null` when the
+        /// frame carried none).
+        params: serde_json::Value,
+    },
+    /// The SEP-2640 `skills/get` request (Phase 125, plan 02), carrying its
+    /// **RAW** `params` and NOTHING else.
+    ///
+    /// # Why it is here and NOT a [`ClientRequest`] variant
+    ///
+    /// Identical to the [`SkillsList`](Self::SkillsList) sibling above, and for
+    /// the same measured reason: [`ClientRequest`] is a public exhaustive enum
+    /// with no `#[non_exhaustive]`, so `enum_variant_added` is a semver-**MAJOR**
+    /// break and `#[non_exhaustive]` is itself a source break for every downstream
+    /// exhaustive `match`. The in-repo guard is
+    /// `client_request_has_no_skills_variants` in `tests/skills_routing.rs`, which
+    /// scans for BOTH spellings.
+    ///
+    /// # Why the params stay RAW — and here it is load-bearing, not merely uniform
+    ///
+    /// `skills/get` is the FIRST method in this phase that actually READS its
+    /// params: the caller supplies a `uri` and the served branch looks it up. That
+    /// makes the raw-params discipline a security property rather than a
+    /// convention. A classifier that deserialized `{ uri: String }` here would
+    /// reject a malformed body BEFORE the header and auth pipeline had run, so an
+    /// UNAUTHENTICATED caller would receive `-32602` — a free parse of its own
+    /// chosen body — instead of the authentication refusal (T-125-07).
+    ///
+    /// The `uri` is therefore deserialized in `build_skills_get_response`, in the
+    /// served branch, and the ordering is asserted end to end by
+    /// `skills_get_auth_refusal_precedes_the_params_error` in
+    /// `tests/skills_routing.rs`. That test exists because this rustdoc is the
+    /// MECHANISM and not the proof: a future refactor that moved the parse up here
+    /// would leak the params error while every other test still passed.
+    ///
+    /// No request id: the classifier is never given one.
+    /// `parse_request_or_internal` reads `request.id` itself and returns it as the
+    /// FIRST element of its `(RequestId, IngressRequest)` tuple.
+    ///
+    /// # There is no era gate on this variant either
+    ///
+    /// Like `skills/list`, `skills/get` rides the base Resources primitive and
+    /// answers on 2025-11-25 as well as 2026-07-28. Unlike `skills/list`, its
+    /// result carries NEITHER caching attribute on either era — the draft leaves
+    /// the get-caching question open, so pmcp claims nothing (see
+    /// `build_skills_get_response`).
+    SkillsGet {
+        /// The request's `params`, verbatim and undecoded (`Value::Null` when the
+        /// frame carried none).
+        params: serde_json::Value,
+    },
+}
+
+/// The wire method string of the v2 `server/discover` request (VERS-04).
+///
+/// Single-sourced here so the classifier and the streamable-HTTP transport's
+/// header cross-check (which pins this method rather than reading it from the
+/// body) can never disagree on the spelling.
+pub(crate) const SERVER_DISCOVER_METHOD: &str = "server/discover";
+
+/// The wire method string of the v2 `tasks/update` request (Phase 114, TASK-02).
+///
+/// Single-sourced so the classifier, the streamable-HTTP ingress fast-reject and
+/// the routing-header table can never disagree on the spelling.
+///
+/// # This is a RE-EXPORT, deliberately — the plan asked for a new `const`
+///
+/// 114-13's action text said to declare a fresh
+/// `TASKS_UPDATE_METHOD: &str = "tasks/update"` beside [`SERVER_DISCOVER_METHOD`].
+/// That premise was false: the spelling ALREADY existed, at
+/// [`crate::types::mrtr::TASKS_UPDATE_METHOD`], as a row of
+/// `TASK_NAME_BEARING_METHODS` (Phase 114, DQ4). Minting a second constant with
+/// the same name and value is precisely the "two spellings that can disagree"
+/// failure the single-sourcing rustdoc on [`SERVER_DISCOVER_METHOD`] exists to
+/// prevent, so this re-exports the ONE definition instead.
+///
+/// MEASURED: after this change `src/` contains exactly ONE non-test
+/// `"tasks/update"` string literal — the definition at
+/// `src/types/mrtr.rs`. Every other occurrence is a doc comment or a
+/// `#[cfg(test)]` fixture.
+pub(crate) use crate::types::mrtr::TASKS_UPDATE_METHOD;
+
+/// The wire method string of the SEP-2640 `skills/list` request (Phase 125).
+///
+/// Single-sourced here — beside [`SERVER_DISCOVER_METHOD`] and for exactly the
+/// reason its rustdoc gives — so [`classify_internal_method`] and the
+/// streamable-HTTP ingress fast-reject in
+/// `src/server/streamable_http_server.rs` can never disagree on the spelling.
+/// MEASURED before minting: `src/`, `tests/` and `examples/` carried ZERO
+/// `"skills/list"` / `"skills/get"` string literals, so neither constant
+/// duplicates an existing definition.
+///
+/// The integration suite `tests/skills_routing.rs` restates both literals as
+/// file-level consts because a Rust integration test is its own crate and cannot
+/// reach a `pub(crate)` item; that restatement carries the same justification
+/// comment `tests/v2_tasks_update_routing.rs` uses for `tasks/update`.
+pub(crate) const SKILLS_LIST_METHOD: &str = "skills/list";
+
+/// The wire method string of the SEP-2640 `skills/get` request (Phase 125).
+///
+/// Minted in the same block, and under the same single-sourcing rationale, as
+/// [`SKILLS_LIST_METHOD`] above — the two spellings share one rustdoc so a later
+/// edit cannot update one and leave the other stale.
+///
+/// The `skills/get` ROUTE landed in plan 125-02, which added the
+/// [`InternalClientRequest::SkillsGet`] arm below and the matching
+/// streamable-HTTP ingress. Minting the constant here a wave EARLY was deliberate:
+/// splitting the mint across two waves would have meant a second edit to the
+/// rustdoc this constant shares with [`SKILLS_LIST_METHOD`], which is exactly the
+/// drift single-sourcing exists to prevent. The `#[allow(dead_code)]` that carried
+/// it through that wave is gone now that it has a reader.
+pub(crate) const SKILLS_GET_METHOD: &str = "skills/get";
+
+/// Classify a raw JSON-RPC method string into a crate-private internal request,
+/// if it is one of the internally-routed (non-public-enum) methods.
+///
+/// Returns `Some(InternalClientRequest::ServerDiscover(..))` for the exact
+/// method string [`SERVER_DISCOVER_METHOD`], `Some(InternalClientRequest::TasksUpdate { .. })`
+/// for [`TASKS_UPDATE_METHOD`], `Some(InternalClientRequest::SkillsList { .. })`
+/// for [`SKILLS_LIST_METHOD`], `Some(InternalClientRequest::SkillsGet { .. })` for
+/// [`SKILLS_GET_METHOD`], and `None` for every other method (which then
+/// flows through the normal public-enum dispatch path). Plan 05 calls this from
+/// the server request path BEFORE the public-enum conversion. Consumed in
+/// production by [`parse_request_or_internal`](crate::shared::protocol_helpers)
+/// (Plan 05).
+///
+/// # It does not, and must not, deserialize `params`
+///
+/// `params` is passed through verbatim into the variant. See
+/// [`InternalClientRequest::TasksUpdate`] for the ordering guarantee that depends
+/// on it.
+///
+/// The parameter's ARITY and TYPES are unchanged by Phase 114 — the second
+/// parameter was already `&serde_json::Value`, spelled `_params` because the
+/// `server/discover` arm ignores it. It is renamed to `params` here because the
+/// `tasks/update` arm READS it, and an underscore prefix that claims "unused" on a
+/// binding that is used is both a `clippy::pedantic` violation
+/// (`used_underscore_binding`) and the stale-marker failure class 113-29 recorded.
+/// No parameter was added, removed or retyped — in particular the classifier still
+/// does NOT receive the request id.
+pub(crate) fn classify_internal_method(
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<InternalClientRequest> {
+    match method {
+        SERVER_DISCOVER_METHOD => Some(InternalClientRequest::ServerDiscover(
+            ServerDiscoverRequest::new(),
+        )),
+        TASKS_UPDATE_METHOD => Some(InternalClientRequest::TasksUpdate {
+            params: params.clone(),
+        }),
+        SKILLS_LIST_METHOD => Some(InternalClientRequest::SkillsList {
+            params: params.clone(),
+        }),
+        SKILLS_GET_METHOD => Some(InternalClientRequest::SkillsGet {
+            params: params.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Is `method` one this crate routes internally rather than through the public
+/// [`ClientRequest`] enum?
+///
+/// Defined BY DELEGATION to [`classify_internal_method`] rather than by a
+/// second list of constants, because the transport-level fast-reject that
+/// consumes this was the one site in the internal-method pattern that failed
+/// SILENTLY when it fell out of step: a method missing from it returns `None`
+/// before reaching the exhaustive `match` that would have been a compile error,
+/// falls through to the public parse path, and answers `-32601` while every
+/// classifier unit test stays green (measured in 125-02 for `skills/get`).
+///
+/// Delegation makes that drift unconstructible — the predicate cannot disagree
+/// with the classifier because it *is* the classifier. `Value::Null` is passed
+/// for params since only the arm's existence is being asked about; a
+/// non-matching method still exits at the same `_ => None` it always did, so
+/// the per-request cost is unchanged.
+pub(crate) fn is_internally_routed(method: &str) -> bool {
+    classify_internal_method(method, &serde_json::Value::Null).is_some()
+}
+
 #[cfg(test)]
 #[allow(clippy::used_underscore_binding)]
 mod tests {
@@ -620,6 +1087,282 @@ mod tests {
         assert!(meta
             .other
             .contains_key("io.modelcontextprotocol/related-task"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The `_meta` wire-spelling contract (Phase-113 D-113-A / D-113-B).
+    //
+    // Every request type that carries a per-request `_meta` object MUST spell it
+    // `_meta` on the wire (the MCP spec spelling) and MUST also ACCEPT the legacy
+    // `meta` spelling pmcp emitted before this phase, so an older pmcp peer keeps
+    // interoperating on ingress. These tests are the binding guard for both
+    // halves.
+    // -----------------------------------------------------------------------
+
+    /// The reserved `_meta` payload every spelling test round-trips.
+    fn meta_probe() -> serde_json::Value {
+        serde_json::json!({ "ns/key": "v" })
+    }
+
+    /// `base` with `key` set to [`meta_probe`].
+    fn with_meta_key(base: &serde_json::Value, key: &str) -> serde_json::Value {
+        let mut out = base.clone();
+        out.as_object_mut()
+            .expect("base is an object")
+            .insert(key.to_string(), meta_probe());
+        out
+    }
+
+    /// Assert the full `_meta` wire contract for one request type, driven
+    /// entirely from JSON so the test never depends on a Rust field NAME.
+    ///
+    /// 1. EGRESS — a request carrying `_meta` re-serializes under the SPEC
+    ///    spelling `_meta`, never the camelCase-renamed `meta`.
+    /// 2. INGRESS (spec) — a spec-spelled `_meta` on the wire survives a
+    ///    deserialize → serialize round trip (i.e. it was actually READ, not
+    ///    silently dropped by an unknown-field skip).
+    /// 3. INGRESS (legacy) — the `meta` spelling pmcp emitted before Phase 113
+    ///    still deserializes, via `#[serde(alias = "meta")]`, and is re-emitted
+    ///    under the spec spelling.
+    fn assert_meta_spelling<T>(base: &serde_json::Value)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        for (label, incoming) in [
+            ("spec spelling `_meta`", with_meta_key(base, "_meta")),
+            ("legacy spelling `meta`", with_meta_key(base, "meta")),
+        ] {
+            let typed: T = serde_json::from_value(incoming.clone())
+                .unwrap_or_else(|e| panic!("{label} must deserialize ({incoming}): {e}"));
+            let wire = serde_json::to_value(&typed).expect("serializes");
+            assert_eq!(
+                wire.get("_meta"),
+                Some(&meta_probe()),
+                "{label}: the reserved object must be READ and re-emitted under \
+                 the spec spelling `_meta`; got {wire}"
+            );
+            assert!(
+                wire.get("meta").is_none(),
+                "{label}: the camelCase-renamed `meta` spelling must NOT be \
+                 emitted; got {wire}"
+            );
+        }
+    }
+
+    /// An absent `_meta` must emit NO key at all, so v1 wire bytes are unchanged
+    /// for every request that does not opt into the per-request signal.
+    fn assert_absent_meta_emits_no_key<T>(base: &serde_json::Value)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let typed: T = serde_json::from_value(base.clone()).expect("base deserializes");
+        let wire = serde_json::to_value(&typed).expect("serializes");
+        assert!(
+            wire.get("_meta").is_none() && wire.get("meta").is_none(),
+            "an absent _meta must emit neither spelling; got {wire}"
+        );
+    }
+
+    /// `(base params, type)` for every request type that carries a typed `_meta`.
+    ///
+    /// Deliberately just the three name/uri-bearing methods. The list-shaped
+    /// requests do NOT carry a typed `_meta` — adding a `pub` field to those
+    /// constructible `pub` structs is a MAJOR semver break, so the v2 era signal
+    /// for those methods is read from the RAW body at HTTP ingress instead
+    /// (Phase-113 D-113-B / D-113-D resolution).
+    macro_rules! for_each_meta_bearing_request {
+        ($assertion:ident) => {
+            $assertion::<super::super::tools::CallToolRequest>(
+                &serde_json::json!({ "name": "t", "arguments": {} }),
+            );
+            $assertion::<super::super::prompts::GetPromptRequest>(
+                &serde_json::json!({ "name": "p", "arguments": {} }),
+            );
+            $assertion::<super::super::resources::ReadResourceRequest>(
+                &serde_json::json!({ "uri": "mem://x" }),
+            );
+        };
+    }
+
+    #[test]
+    fn every_meta_bearing_request_uses_the_spec_spelling_and_accepts_the_legacy_alias() {
+        for_each_meta_bearing_request!(assert_meta_spelling);
+    }
+
+    #[test]
+    fn absent_meta_emits_no_key_on_any_request_type() {
+        for_each_meta_bearing_request!(assert_absent_meta_emits_no_key);
+    }
+
+    #[test]
+    fn server_discover_request_round_trips() {
+        // Empty-but-extensible struct serializes to `{}` and round-trips.
+        let req = ServerDiscoverRequest::new();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json, serde_json::json!({}));
+        let _back: ServerDiscoverRequest = serde_json::from_value(json).unwrap();
+        // Deserializing an object with unknown fields still succeeds (extensible).
+        let _back2: ServerDiscoverRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+    }
+
+    #[test]
+    fn classify_internal_method_routes_server_discover() {
+        // Exact "server/discover" → Some(ServerDiscover).
+        let out = classify_internal_method("server/discover", &serde_json::json!({}));
+        assert!(matches!(
+            out,
+            Some(InternalClientRequest::ServerDiscover(_))
+        ));
+
+        // Any other method → None (falls through to public-enum dispatch).
+        assert!(classify_internal_method("tools/list", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("initialize", &serde_json::json!({})).is_none());
+        // Near-miss method names are NOT matched.
+        assert!(classify_internal_method("server/discovery", &serde_json::json!({})).is_none());
+    }
+
+    /// `tasks/update` classifies as its own internal variant and carries its
+    /// params VERBATIM (Phase 114 plan 13, TASK-02).
+    ///
+    /// The verbatim half is the property. A classifier that decoded would turn a
+    /// malformed body into a parse error BEFORE the `-32003` auth refusal that
+    /// `TaskDispatch::route_tasks_update` places ahead of the params — so the
+    /// inputs below are deliberately not a well-formed `tasks/update` payload, and
+    /// the assertion is that they arrive unchanged rather than that they are
+    /// accepted.
+    #[test]
+    fn classify_internal_method_routes_tasks_update_with_raw_params() {
+        let garbage = serde_json::json!({ "taskId": 1, "inputResponses": "not-an-object" });
+        match classify_internal_method("tasks/update", &garbage) {
+            Some(InternalClientRequest::TasksUpdate { params }) => {
+                assert_eq!(params, garbage, "params must pass through undecoded");
+            },
+            other => panic!("tasks/update must classify as TasksUpdate, got {other:?}"),
+        }
+
+        // `Value::Null` (a frame with no params at all) is still classified — the
+        // classifier judges the METHOD, never the body.
+        assert!(matches!(
+            classify_internal_method("tasks/update", &serde_json::Value::Null),
+            Some(InternalClientRequest::TasksUpdate { .. })
+        ));
+
+        // Near-miss method names are NOT matched, and the three surviving v2
+        // `tasks/*` methods keep their public-enum route.
+        assert!(classify_internal_method("tasks/updates", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("tasks/get", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("tasks/cancel", &serde_json::json!({})).is_none());
+    }
+
+    /// `skills/list` classifies as its own internal variant and carries its
+    /// params VERBATIM (Phase 125, D-01).
+    ///
+    /// Same property as the `tasks/update` twin above, and it matters for the same
+    /// reason: the classifier judges the METHOD and never the body, so a malformed
+    /// `params` becomes a structured error in the SERVED branch — after the
+    /// header/auth pipeline — rather than a parse error ahead of it.
+    ///
+    /// The near-miss controls are what keep this from passing against a prefix
+    /// match: `skills/lists`, `skills/` and `skills` must all fall through to the
+    /// public-enum path.
+    #[test]
+    fn classify_internal_method_routes_skills_list_with_raw_params() {
+        let garbage = serde_json::json!({ "cursor": 17, "wat": [1, 2, 3] });
+        match classify_internal_method(SKILLS_LIST_METHOD, &garbage) {
+            Some(InternalClientRequest::SkillsList { params }) => {
+                assert_eq!(params, garbage, "params must pass through undecoded");
+            },
+            other => panic!("skills/list must classify as SkillsList, got {other:?}"),
+        }
+
+        // `Value::Null` (a frame with no params at all) is still classified.
+        assert!(matches!(
+            classify_internal_method(SKILLS_LIST_METHOD, &serde_json::Value::Null),
+            Some(InternalClientRequest::SkillsList { .. })
+        ));
+
+        // Near-miss method names are NOT matched.
+        assert!(classify_internal_method("skills/lists", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills/", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills", &serde_json::json!({})).is_none());
+
+        // `skills/get` is its OWN variant, never absorbed into this one. Plan
+        // 125-02 flipped the previous assertion here (which pinned the absent arm)
+        // into the sibling test below, so the change was to a documented fact
+        // rather than a silent discovery.
+        assert!(matches!(
+            classify_internal_method(SKILLS_GET_METHOD, &serde_json::json!({})),
+            Some(InternalClientRequest::SkillsGet { .. })
+        ));
+    }
+
+    /// `skills/get` classifies as its own internal variant and carries its params
+    /// VERBATIM (Phase 125, plan 02, D-06).
+    ///
+    /// **This is the one where the raw-params property has teeth.** `skills/get`
+    /// is the first method in this phase that READS its params, so a classifier
+    /// that deserialized `{ uri: String }` here would reject a malformed body
+    /// BEFORE the header and auth pipeline — handing an unauthenticated caller a
+    /// `-32602` instead of the authentication refusal (T-125-07). The garbage
+    /// fixture below is deliberately not a well-formed `skills/get` payload; it
+    /// must classify anyway.
+    ///
+    /// The wire-level half of the same property is
+    /// `skills_get_auth_refusal_precedes_the_params_error` in
+    /// `tests/skills_routing.rs`. This test proves the classifier is body-blind;
+    /// that one proves the ORDERING that body-blindness buys.
+    #[test]
+    fn classify_internal_method_routes_skills_get_with_raw_params() {
+        let garbage = serde_json::json!({ "uri": 17, "wat": [1, 2, 3] });
+        match classify_internal_method(SKILLS_GET_METHOD, &garbage) {
+            Some(InternalClientRequest::SkillsGet { params }) => {
+                assert_eq!(params, garbage, "params must pass through undecoded");
+            },
+            other => panic!("skills/get must classify as SkillsGet, got {other:?}"),
+        }
+
+        // A NON-OBJECT params value passes through untouched — the classifier does
+        // not even require an object, let alone the right keys.
+        let scalar = serde_json::json!("not-an-object");
+        match classify_internal_method(SKILLS_GET_METHOD, &scalar) {
+            Some(InternalClientRequest::SkillsGet { params }) => assert_eq!(params, scalar),
+            other => panic!("a non-object params body must still classify, got {other:?}"),
+        }
+
+        // `Value::Null` (a frame with no params at all) is still classified.
+        assert!(matches!(
+            classify_internal_method(SKILLS_GET_METHOD, &serde_json::Value::Null),
+            Some(InternalClientRequest::SkillsGet { .. })
+        ));
+
+        // Near-miss method names are NOT matched — the control that keeps this
+        // from passing against a prefix match.
+        assert!(classify_internal_method("skills/gets", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skills/get/", &serde_json::json!({})).is_none());
+        assert!(classify_internal_method("skill/get", &serde_json::json!({})).is_none());
+    }
+
+    /// The two SEP-2640 method spellings, pinned to their wire values.
+    ///
+    /// A constant whose value drifts from the wire is the one failure the
+    /// single-sourcing rustdoc on [`SKILLS_LIST_METHOD`] cannot prevent by
+    /// structure, so it is asserted.
+    #[test]
+    fn the_skills_method_spellings_are_the_wire_values() {
+        assert_eq!(SKILLS_LIST_METHOD, "skills/list");
+        assert_eq!(SKILLS_GET_METHOD, "skills/get");
+    }
+
+    /// The one spelling: [`TASKS_UPDATE_METHOD`] is the re-exported
+    /// `types::mrtr` constant, not a second literal.
+    #[test]
+    fn the_tasks_update_method_spelling_is_single_sourced() {
+        assert_eq!(TASKS_UPDATE_METHOD, "tasks/update");
+        assert_eq!(
+            TASKS_UPDATE_METHOD,
+            crate::types::mrtr::TASKS_UPDATE_METHOD,
+            "these must be the SAME item, not two constants that happen to agree"
+        );
     }
 
     #[test]

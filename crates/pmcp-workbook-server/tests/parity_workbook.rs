@@ -14,8 +14,8 @@
 //!    fail-closed boot gate → `build_server` → `StreamableHttpServer`),
 //! 3. polls `ServerTester::test_initialize()` with bounded backoff for
 //!    readiness,
-//! 4. FIRST asserts the FULL live wire surface — `tools/list` exposes all five
-//!    workbook tools AND `resources/list` exposes the `workbook://` render
+//! 4. FIRST asserts the FULL live wire surface — `tools/list` exposes every
+//!    workbook tool AND `resources/list` exposes the `workbook://` render
 //!    resource (Codex suggestion: assert the whole surface over the wire before
 //!    invoking) — proving the in-process surface (`tests/assemble.rs`) actually
 //!    reaches the wire,
@@ -35,15 +35,21 @@ use std::time::Duration;
 use mcp_tester::ServerTester;
 use pmcp_workbook_server::{run_serving, Args};
 
-/// The five served workbook tools every golden-bundle server must expose over
-/// the wire.
+/// The served workbook tools the golden bundle must expose over the wire:
+/// WBV2-04's ONE named compute tool per output Table (`Calculate_Tax` +
+/// `Estimate_Refund`) plus the four workbook-wide meta tools. The generic
+/// single `calculate` is retired and asserted ABSENT below.
 const WORKBOOK_TOOLS: &[&str] = &[
-    "calculate",
+    "calculate_tax",
+    "estimate_refund",
     "explain",
     "get_manifest",
     "diff_version",
     "render_workbook",
 ];
+
+/// The pre-WBV2-04 generic compute tool, asserted absent from `tools/list`.
+const RETIRED_TOOL: &str = "calculate";
 
 /// The listable `workbook://` render-resource scheme root (the stable handle
 /// `resources/list` advertises — concrete `workbook://render/<payload>` URIs
@@ -98,7 +104,7 @@ async fn workbook_reference_parity_through_real_binary_path() {
         "MCP initialize must succeed against the spawned server (readiness)"
     );
 
-    // (4a) LIVE tools/list — all five workbook tools must be visible over the
+    // (4a) LIVE tools/list — every workbook tool must be visible over the
     // wire BEFORE invoking any of them.
     let tools = tester
         .list_tools()
@@ -111,6 +117,11 @@ async fn workbook_reference_parity_through_real_binary_path() {
             "live tools/list must expose the '{expected}' workbook tool; saw {tool_names:?}"
         );
     }
+    assert!(
+        !tool_names.contains(&RETIRED_TOOL),
+        "the retired generic '{RETIRED_TOOL}' tool must not reappear on the wire; \
+         saw {tool_names:?}"
+    );
 
     // (4b) LIVE resources/list — the `workbook://` render resource must be
     // listable over the wire.

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "size": 2,
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.pmcp.mcp-server.binary-ref.v1+json",
+      "size": 142,
+      "digest": "sha256:1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014"
+    },
+    {
+      "mediaType": "application/vnd.pmcp.mcp-server.envelope.v1+json",
+      "size": 64,
+      "digest": "sha256:60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"
+    },
+    {
+      "mediaType": "application/vnd.pmcp.mcp-server.config.v1+toml",
+      "size": 213,
+      "digest": "sha256:fd61a03af4f77d870fc21e05e7e80678095c92d808cfb3b5c279ee04c74aca13"
+    },
+    {
+      "mediaType": "application/vnd.pmcp.mcp-server.openapi-spec.v1",
+      "size": 1024,
+      "digest": "sha256:d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35"
+    }
+  ]
+}

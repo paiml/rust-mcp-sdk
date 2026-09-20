@@ -58,12 +58,10 @@ fn demo_package() -> AgentPackage {
         name: "demo-agent".to_string(),
         version: semver::Version::new(1, 0, 0),
         instructions: "You are a concise research assistant.".to_string(),
-        llm: ConfigSlot {
-            slot: SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "demo-model".to_string(),
-            },
-        },
+        llm: ConfigSlot::new(SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "demo-model".to_string(),
+        }),
         max_tokens: 100_000,
         max_iterations: 5,
         connectors: vec![],

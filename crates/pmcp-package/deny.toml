@@ -1,0 +1,268 @@
+# Crate-local cargo-deny config — the NO-CRYPTO boundary for `pmcp-package`
+# (Phase 122, D-12 / D-13, requirement PKGX-01).
+#
+# ===========================================================================
+# What this enforces
+# ===========================================================================
+# `pmcp-package` carries pmcp.run-issued attestations but MUST NEVER verify
+# them. The SDK does not sign, does not hold keys, and performs no signature
+# check — the only offline verification it does is comparing an attestation's
+# claimed subject digest against the digest it independently re-derives. Real
+# verification against pmcp.run's identity is a signature check, and that is a
+# REMOTE call to the platform.
+#
+# `crates/pmcp-package/src/digest/verify.rs` is an INTEGRITY check and must stay
+# one. Integrity failure means the bytes are corrupt; subject mismatch means the
+# bytes are fine but the claim is wrong. Those are different verdicts and are
+# deliberately handled differently (D-03) — do not harmonize them, and do not
+# grow that module into a signature checker.
+#
+# ===========================================================================
+# Scope: how this file is invoked
+# ===========================================================================
+#   cargo deny --manifest-path crates/pmcp-package/Cargo.toml \
+#              check --config deny.toml bans
+#
+# NOTE the argument order: cargo-deny 0.18.3 accepts `--config` only AFTER the
+# `check` subcommand (a global `--config` is rejected with "unexpected
+# argument"), and resolves the path relative to the manifest directory. CI pins
+# cargo-deny to 0.18.3 (`.github/workflows/ci.yml`) for exactly this reason.
+#
+# `--manifest-path` scoping is the decisive property here. `pmcp-package` is
+# workspace-EXCLUDED — it carries its own `[workspace]` table and is NOT a root
+# member — so root `cargo fmt/clippy/test` do not reach it. cargo-deny resolves
+# the graph itself from the manifest, which also means
+# `crates/pmcp-package/Cargo.lock` being gitignored does not matter.
+#
+# The workspace-global deny.toml is NEVER touched by this file. This config
+# governs ONLY `[bans]`; advisories / licenses / sources are set to their most
+# permissive form below so `check bans` evaluates the ban policy and nothing
+# else. That mirrors `crates/pmcp-workbook-runtime/deny.toml`.
+#
+# ===========================================================================
+# Why an ALLOWLIST and not a denylist (D-13)
+# ===========================================================================
+# A non-empty `[bans].allow` list makes cargo-deny DENY BY DEFAULT: any crate in
+# the resolved graph that is not listed fails the check. That catches the
+# signing crate nobody thought to deny — including one whose name gives no hint
+# that it does signing — which a denylist cannot do by construction.
+#
+# The concrete, MEASURED reason it must be an allowlist rather than a
+# name-keyed denylist: this graph already legitimately contains crates literally
+# named `crypto-common` and `digest`. A denylist keyed on names like "crypto" or
+# "digest" would have false-positived on day one, and the predictable response
+# to a false-positiving gate is to weaken it.
+#
+# ===========================================================================
+# HASHING IS ADMITTED. SIGNING IS NOT. (D-13 — stated as reasoning, not left
+# implicit in which names happen to appear.)
+# ===========================================================================
+# The canonical manifest digest requires SHA-256, so a hash implementation is a
+# hard requirement of this crate, not an accident of its dependency tree. These
+# admitted crates are hash-function machinery and nothing more:
+#
+#   sha2            the SHA-256 implementation the canonical digest is built on
+#   digest          TRAIT crate for hash functions (Digest/Update/FixedOutput).
+#                   Despite the name it defines no signature or key type.
+#   crypto-common   TRAIT crate shared by digest and cipher crates (KeySizeUser,
+#                   BlockSizeUser). Again: traits, not a signing implementation.
+#   block-buffer    block-alignment buffering used by hash compression functions
+#   generic-array   const-generic array plumbing used by the above
+#   typenum         type-level integers backing generic-array's sizes
+#   cpufeatures     runtime CPU feature detection so sha2 can select its
+#                   SHA-NI / NEON accelerated path
+#
+# A hash is a one-way function over bytes. A signature binds bytes to an
+# IDENTITY via a key. This crate needs the first and must never acquire the
+# second. Concretely, the following classes must NEVER appear below: signature
+# implementations (ed25519-dalek, ring, p256, rsa, ecdsa), key handling or PKI
+# (pkcs8, x509-parser, spki), TLS/crypto protocol stacks (rustls, openssl,
+# native-tls), and envelope/attestation verification libraries (sigstore,
+# in-toto, dsse). If one appears in a cargo-deny `not-allowed` error, the answer
+# is to remove the dependency, NOT to add the name here.
+#
+# The `rand` family (rand, rand_chacha, rand_core, getrandom, ppv-lite86,
+# zerocopy, r-efi, wasip2, wit-bindgen) arrives via proptest/tempfile — test
+# tooling. Randomness is not signing; these are admitted as dev-tooling, and
+# their presence is precisely why `exclude-dev = false` below matters.
+#
+# ===========================================================================
+# WHAT THIS GATE CANNOT SEE (repo convention: a mechanism states its blind
+# spots — see cargo-pmcp/tests/pmcp_package_pin.rs for the same discipline)
+# ===========================================================================
+#  - It checks crate NAMES over the resolved graph. A signing capability added
+#    INSIDE an already-admitted crate — a new cargo feature on an existing
+#    dependency, or an upstream release that grows a `sign()` function — is
+#    completely invisible to it. Nothing here would fire.
+#  - It does not read source. A hand-rolled signature implementation written
+#    directly into `pmcp-package`'s own `src/` passes this gate untouched.
+#  - It checks the graph, not the call: an admitted crate that is present but
+#    unused reads identically to one that is used.
+#
+# Those gaps are real and are not closed by adding names. They are closed by
+# code review of this crate's own source and of any dependency bump.
+#
+# ===========================================================================
+# Maintaining the allowlist
+# ===========================================================================
+# This list was GENERATED from the actual resolved graph, never transcribed from
+# a design document:
+#
+#   cargo metadata --manifest-path crates/pmcp-package/Cargo.toml \
+#                  --format-version 1
+#
+# (Generated 2026-08-25: 91 unique package names. Planning documents recorded
+# "90" and "89" at various points; all were already stale when written, which is
+# the reason for the generate-don't-transcribe rule.)
+#
+# When the gate fails with `error[not-allowed]`, cargo-deny prints the FULL
+# dependency path for each offender — e.g.
+# `wit-bindgen <- wasip2 <- getrandom <- rand_core <- rand <- proptest <- (dev) pmcp-package`.
+# Read that path first. Every addition should arrive with its justification
+# already printed, and the friction of having to justify each new dependency IS
+# the feature — do not batch-regenerate this list to make a red gate green.
+
+[graph]
+# DEV-DEPENDENCIES ARE INCLUDED (the discretion item flagged in 122-CONTEXT.md).
+#
+# Chosen: `false` (include dev-deps; ~91 crates evaluated).
+# Rejected: `true` (exclude dev-deps; ~59 crates evaluated).
+#
+# Reasoning for the choice, recorded so a later reader does not flip it
+# silently: a dev-dependency IS an arrival path for a signing crate. The entire
+# point of an allowlist is catching the crate nobody thought of, and a gate that
+# stops looking at test tooling has a hole shaped exactly like `[dev-dependencies]
+# sigstore = "0.9"`. The cost of including them is that a `proptest` or
+# `tempfile` bump which moves a transitive name turns this gate red and requires
+# a one-line edit — and that edit is visible in review, which is where a new
+# dependency should be visible anyway.
+#
+# The rejected alternative is cheaper day to day and strictly weaker: excluding
+# dev-deps means the 30-odd test-tooling crates below stop being checked at all,
+# and a signing crate entering through that door is never seen.
+exclude-dev = false
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Permissive: license policy lives in the workspace-global deny.toml; this
+# crate-local file is bans-only. NOTE this stanza has its OWN `allow` key, and
+# it is deliberately empty — which is why the Makefile's non-empty-allowlist
+# guard (scripts/deny-allow-entry-count.awk) is SECTION-SCOPED to `[bans]`. A
+# naive grep for `{ name = ` or for `allow = [` anywhere in this file would read
+# this stanza and report a healthy allowlist while `[bans].allow` was empty.
+allow = []
+confidence-threshold = 0.0
+
+[sources]
+unknown-registry = "allow"
+unknown-git = "allow"
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+# A NON-EMPTY `allow` list is what makes this check deny-by-default. If this
+# array is ever emptied, cargo-deny reports "bans ok" just as vacuously as it
+# does for a missing config file — the gate would pass while checking nothing.
+# That exact bypass is guarded by `make no-crypto-check`, which counts the
+# entries below structurally before trusting the cargo-deny run.
+#
+# Entries use the `{ name = ... }` spelling (cargo-deny 0.18.3 accepts both
+# `name` and `crate`) to match the `{ name = ` idiom already used by the
+# purity-check parity grep at Makefile's Layer 2.
+allow = [
+  { name = "aho-corasick" },
+  { name = "autocfg" },
+  { name = "bit-set" },
+  { name = "bit-vec" },
+  { name = "bitflags" },
+  { name = "block-buffer" },
+  { name = "cfg-if" },
+  { name = "const_format" },
+  { name = "const_format_proc_macros" },
+  { name = "cpufeatures" },
+  { name = "crypto-common" },
+  { name = "darling" },
+  { name = "darling_core" },
+  { name = "darling_macro" },
+  { name = "derive_builder" },
+  { name = "derive_builder_core" },
+  { name = "derive_builder_macro" },
+  { name = "digest" },
+  { name = "equivalent" },
+  { name = "errno" },
+  { name = "fastrand" },
+  { name = "fnv" },
+  { name = "generic-array" },
+  { name = "getrandom" },
+  { name = "getset" },
+  { name = "hashbrown" },
+  { name = "heck" },
+  { name = "hex" },
+  { name = "ident_case" },
+  { name = "indexmap" },
+  { name = "itoa" },
+  { name = "konst" },
+  { name = "konst_macro_rules" },
+  { name = "libc" },
+  { name = "linux-raw-sys" },
+  { name = "memchr" },
+  { name = "num-traits" },
+  { name = "oci-spec" },
+  { name = "olpc-cjson" },
+  { name = "once_cell" },
+  { name = "pmcp-package" },
+  { name = "ppv-lite86" },
+  { name = "proc-macro2" },
+  { name = "proptest" },
+  { name = "quick-error" },
+  { name = "quote" },
+  { name = "r-efi" },
+  { name = "rand" },
+  { name = "rand_chacha" },
+  { name = "rand_core" },
+  { name = "rand_xorshift" },
+  { name = "regex" },
+  { name = "regex-automata" },
+  { name = "regex-syntax" },
+  { name = "rustix" },
+  { name = "rusty-fork" },
+  { name = "semver" },
+  { name = "serde" },
+  { name = "serde_core" },
+  { name = "serde_derive" },
+  { name = "serde_json" },
+  { name = "serde_spanned" },
+  { name = "sha2" },
+  { name = "strsim" },
+  { name = "strum" },
+  { name = "strum_macros" },
+  { name = "syn" },
+  { name = "tempfile" },
+  { name = "thiserror" },
+  { name = "thiserror-impl" },
+  { name = "tinyvec" },
+  { name = "tinyvec_macros" },
+  { name = "toml" },
+  { name = "toml_datetime" },
+  { name = "toml_parser" },
+  { name = "toml_writer" },
+  { name = "typenum" },
+  { name = "unarray" },
+  { name = "unicode-ident" },
+  { name = "unicode-normalization" },
+  { name = "unicode-xid" },
+  { name = "version_check" },
+  { name = "wait-timeout" },
+  { name = "wasip2" },
+  { name = "windows-link" },
+  { name = "windows-sys" },
+  { name = "winnow" },
+  { name = "wit-bindgen" },
+  { name = "zerocopy" },
+  { name = "zerocopy-derive" },
+  { name = "zmij" },
+]

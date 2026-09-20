@@ -369,6 +369,12 @@ fn compile_workbook_inner(
     // and reach the WBV2-04 per-Table fan-out (CR-01).
     promote_harvested_tables(&mut manifest, &map);
 
+    // Excel commonly persists formatting on the first empty row below a Table.
+    // A blue-font, value-less cell there is an OOXML style artifact, not an input.
+    // Drop it only after both naming paths had a chance to declare it: a named
+    // blank input remains real and is preserved.
+    remove_unnamed_blank_inputs(&mut manifest);
+
     // (3c) Refuse loudly if any input is left without a callable semantic key
     // (no `in_*` named range), or two inputs collide on one served key, or an
     // input's served key is empty/value-shaped. The reconcile/gate stages grade
@@ -622,7 +628,9 @@ fn build_ir_and_dag(
         for cell in &sheet.cells {
             let key = cell_key(&sheet.name, &cell.addr);
             if let Some(formula) = &cell.formula {
-                let expr = formula::parse(formula, &sheet.name, &cell.addr)
+                let expanded = formula::structured_ref::expand_structured_references(formula, map)
+                    .map_err(|e| CompileError::Lint(format!("structured reference {key}: {e}")))?;
+                let expr = formula::parse(&expanded, &sheet.name, &cell.addr)
                     .map_err(|e| CompileError::Lint(format!("parse {key}: {e}")))?;
                 parsed.push(dag::ParsedCell {
                     sheet: sheet.name.clone(),
@@ -948,6 +956,27 @@ fn cell_value_text(sheet: &ingest::SheetRecord, addr: &str) -> Option<String> {
         .and_then(|c| c.value.as_deref())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Remove cells that carry only the input colour style and no callable/data
+/// evidence. Excel retains such cells below resized Tables (for example a blank
+/// blue-font `B19` immediately after an `A3:D18` Inputs Table). Treating that
+/// formatting residue as a real input creates a phantom
+/// `manifest/input-no-semantic-key` failure.
+///
+/// This runs after named-range and Table promotion. Consequently a deliberately
+/// blank input with a semantic name is retained; only `Role::Input` cells with no
+/// name and no non-whitespace value are removed.
+fn remove_unnamed_blank_inputs(manifest: &mut Manifest) {
+    manifest.cells.retain(|role| {
+        let blank = role
+            .meaning
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true);
+        !(role.role == Role::Input && role.name.is_none() && blank)
+    });
 }
 
 /// Split an A1 address into `(column-letters, 1-based row)` — e.g. `"B11"` →
@@ -1760,6 +1789,43 @@ mod input_key_validation_tests {
             },
             other => panic!("expected CompileError::Lint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn formatting_only_blank_input_is_removed() {
+        let mut m = manifest(vec![
+            role("Data!B19", Role::Input, None, None),
+            role("Data!B18", Role::Input, Some("operations"), Some("300")),
+        ]);
+        remove_unnamed_blank_inputs(&mut m);
+        assert_eq!(m.cells.len(), 1);
+        assert_eq!(m.cells[0].cell, "Data!B18");
+    }
+
+    #[test]
+    fn deliberately_named_blank_input_is_preserved() {
+        let mut m = manifest(vec![role(
+            "Data!B19",
+            Role::Input,
+            Some("optional_note"),
+            None,
+        )]);
+        remove_unnamed_blank_inputs(&mut m);
+        assert_eq!(m.cells.len(), 1);
+        assert!(refuse_uncallable_inputs(&m).is_ok());
+    }
+
+    #[test]
+    fn unnamed_populated_input_still_fails_closed() {
+        let mut m = manifest(vec![role(
+            "Data!B19",
+            Role::Input,
+            None,
+            Some("unexpected value"),
+        )]);
+        remove_unnamed_blank_inputs(&mut m);
+        assert_eq!(m.cells.len(), 1);
+        assert!(refuse_uncallable_inputs(&m).is_err());
     }
 
     #[test]

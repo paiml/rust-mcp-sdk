@@ -1,203 +1,187 @@
-# Technology Stack — v2.3 Governed Excel (Workbook) CodeLanguage
+# Stack Research
 
-**Project:** PMCP SDK — extract the Excel-workbook → MCP-server compiler from the TowelRads `quote-pricing` lighthouse into two SDK crates (`pmcp-workbook-runtime` + `pmcp-workbook-compiler`) plus a `pmcp-server-toolkit` served-tool module.
-**Researched:** 2026-06-09
-**Scope:** ONLY the stack additions/changes for the NEW workbook capability. Existing SDK toolkit capabilities (auth, secrets, static handlers, `[[tools]]` synthesis, SQL/OpenAPI connectors, `pmcp-code-mode`) are the integration target and are NOT re-researched.
-**Overall confidence:** HIGH — every crate version was verified against crates.io on 2026-06-09; the lighthouse pins are already current; the SDK already vendors the serde/schemars/sha2/hex/jsonschema versions the lighthouse uses.
+**Domain:** Dual-version MCP SDK (Rust) — adding MCP spec 2026-07-28 (v2) support to pmcp 2.17.0 alongside the existing 2025-11-25 stack
+**Researched:** 2026-07-22
+**Confidence:** HIGH
 
----
+## Executive Bottom Line
 
-## Headline: there are almost no *new* third-party crates
+**This milestone needs essentially ZERO new runtime crate dependencies.** Every v2-spec
+feature maps to a crate pmcp already vendors, a hand-rolled logic/field change, or a
+CI-only (non-runtime) tool. The four investigated questions all resolve in favour of the
+minimal-dependency, wasm-clean posture the SDK already holds:
 
-The single most important stack finding: **the workbook capability adds exactly two non-trivial third-party crates** — `umya-spreadsheet` (reader, compiler-only) and `rust_xlsxwriter` (writer, runtime-only) — plus two low-level transitive-matching crates (`quick-xml`, `zip`) that exist only inside the compiler for quarantined provenance parsing. Everything else (serde, serde_json, schemars, sha2, hex, thiserror, chrono, jsonschema) is **already in the SDK workspace at the exact versions the lighthouse uses.** The formula parser, DAG, and `sheet_ir` Excel-semantics layer are **hand-rolled in the lighthouse** — there is no formula-engine crate to adopt, and adopting one would be a regression (see §3).
-
-This means the v2.3 stack risk is concentrated almost entirely in **one crate (`umya-spreadsheet`) and one boundary (the purity gate)**, not in a broad dependency expansion.
-
----
+| Question | Answer | New crate? |
+|----------|--------|------------|
+| (a) JSON Schema 2020-12 validation | `jsonschema` is **already a dependency** (0.46.1, behind `validation`, `default-features=false`). Bump to 0.48.x, pin draft explicitly. | **No** (version bump only) |
+| (b) Official conformance suite | It's a **TypeScript/Node.js** tool (`modelcontextprotocol/conformance`), driven in CI against a pmcp server binary / client command. CI/dev tool, not a Rust dependency. | **No** (Node toolchain in CI) |
+| (c) Required headers + session-id removal | `http_constants.rs` + the existing hyper/axum/tower stack already carry `Mcp-Session-Id`/`Mcp-Protocol-Version`. Add 3 header **constants** + negotiation logic. | **No** |
+| (d) RFC 9207 `iss` validation / DCR `application_type` | pmcp's OAuth is **hand-rolled** (`src/client/oauth.rs`, `src/server/auth/`), not the `oauth2`/`openidconnect` crates. Both SEPs are a query-param comparison + one serde field. | **No** — and actively AVOID adding an OAuth crate |
 
 ## Recommended Stack
 
-### Compiler crate (`pmcp-workbook-compiler`) — offline, build-time, reader-bearing
+### Core Technologies (all already present — changes noted)
 
-| Technology | Version | Purpose | Why |
-|------------|---------|---------|-----|
-| `umya-spreadsheet` | `3.0` (latest `3.0.0`, 2026-06-03) | Read `.xlsx`: cells, formulas, cached values, colours, named ranges, data-validation lists, `_Manifest` sheet | The ONE reader. Lighthouse already on `3.0.0`; it is the newest stable. Pure-Rust, no native deps. MUST be confined to this crate (purity rule §5). |
-| `quick-xml` | `0.37` (pin to umya's transitive lock, **not** current 0.40.1) | Quarantined provenance reader: parse raw `calcPr@calcId` + `<Application>` from `docProps/app.xml` to detect umya's fabricated identity (§1 caveat) | Pin must match umya's own `quick-xml` (lighthouse `Cargo.lock` = 0.37.5). Bumping to 0.40.1 forks the resolved tree and risks a second copy. Re-derive the pin from `cargo tree -p umya-spreadsheet -i quick-xml` at extraction time. |
-| `zip` | `8` (latest stable `8.6.0`; **avoid 9.0.0-preX**) | Quarantined `.xlsx` (ZIP container) part reader for the same provenance probe | Match umya's transitive `zip` (lighthouse lock = 8.6.0). `9.0.0` is pre-release only — do not adopt. |
-| `serde` | `1` (+ `derive`) | Model (de)serialization | Already workspace-standard. |
-| `serde_json` | `1` | Bundle artifact JSON I/O (`manifest.json`, `executable.ir.json`, `cell_map.json`, `BUNDLE.lock`) | Already workspace-standard. |
-| `schemars` | `1.0` (latest `1.2.1`) | `outputSchema` / manifest JSON-Schema projection | SDK already pins `schemars = "1.0"` behind `schema-generation`. Exact match. |
-| `sha2` | `0.11` | `workbook_hash` + bundle content hashes | Matches `pmcp-code-mode` pin exactly. |
-| `hex` | `0.4` | Hash hex encoding | Matches `pmcp-code-mode` pin exactly. |
-| `thiserror` | `2` | Compiler error enums | Lighthouse uses `1`; SDK toolkit crates (`pmcp-server-toolkit`, `pmcp-toolkit-postgres`) standardized on `thiserror = "2"`. **Use `2`** to match the SDK's current convention. |
-| `chrono` | `0.4` (`clock`, `serde`, `std`) | Effective-date / approval timestamps | Matches SDK root pin. |
-| `pmcp-workbook-runtime` | path | Re-exports the owned IR/model types; compiler builds them, runtime executes them | Same leaf pattern as lighthouse: compiler depends on runtime and re-exports its types so the served binary links ONLY the runtime. |
+| Technology | Current → Target | Purpose | Why Recommended |
+|------------|------------------|---------|-----------------|
+| `jsonschema` | **0.46.1 → 0.48.x** (`default-features = false`, behind `validation`) | Compile + validate `inputSchema`/`outputSchema` and `structuredContent` as full JSON Schema 2020-12 | Already vendored; supports Draft 2020-12; `default-features=false` **already disables HTTP+file `$ref` resolution**, which is exactly the SEP-2106 security mandate ("implementations MUST NOT auto-dereference external `$ref` URIs"). Wasm-clean in this config. No alternative crate is competitive in Rust. |
+| `serde` / `serde_json` | 1.0 (unchanged, `raw_value` + `preserve_order`) | New protocol types: `InputRequiredResult`, `resultType`, per-request `_meta` keys, `CacheableResult` (`ttlMs`/`cacheScope`), `server/discover` result, `tasks/update` | Already the protocol-type backbone; `preserve_order` matters for the new "deterministic `tools/list` order" caching guidance. `structuredContent = any JSON value` is just `serde_json::Value` — a **relaxation**, no new machinery. |
+| `hyper` / `hyper-util` / `axum` / `tower` / `tower-http` | unchanged (behind `streamable-http`) | Streamable-HTTP server/client: new required headers, stateless routing, `subscriptions/listen` POST stream | Already the transport stack. Header add/remove and the stateless code path are logic changes, not dependency changes. `tower-http`'s `set-header` feature (already enabled) covers server-side `serverInfo`/`ttlMs` response header stamping if desired. |
+| `jsonwebtoken` | 10.3 (unchanged, behind `jwt-auth`) | Server-side bearer/JWT validation | No change needed for the auth-hardening SEPs — they touch the **client authorization-code flow** and **registration request body**, not JWT verification. |
+| `http` | 1.1 (unchanged) | `HeaderName`/`HeaderValue` typing for the new headers | Already present; new header constants live in `src/shared/http_constants.rs`. |
 
-**Deliberately NOT in the compiler:** `pmcp-code-mode` with `js-runtime`. The lighthouse compiler pulled `pmcp-code-mode` (SWC JS kernel) as the offline calc engine. The SDK runtime already ships a **pure-Rust `scalar_eval`** leaf evaluator (`workbook-runtime/src/scalar_eval.rs`), and the served path uses it. Recommendation: **drop the SWC/`pmcp-code-mode` dependency from the SDK compiler** unless a concrete reconciliation gap requires the JS oracle. If retained for offline penny-reconciliation parity, gate it behind a non-default `js-oracle` feature so the default compiler build is SWC-free. This is a generalization decision for the roadmapper (LOW-MEDIUM confidence on whether the JS oracle is still load-bearing — verify against the lighthouse Phase-10 reconcile path during planning).
+### Supporting Libraries (already present — no additions)
 
-### Runtime crate (`pmcp-workbook-runtime`) — served-binary, reader-free, writer-only
+| Library | Version | Purpose | When to Use |
+|---------|---------|---------|-------------|
+| `url` | 2.5 | Parse the OAuth callback query string to extract + validate the `iss` param (RFC 9207 / SEP-2468) | Already used in `src/client/oauth.rs` callback parsing (line ~697); `iss` validation is an added comparison, not new code infrastructure |
+| `urlencoding` / `base64` / `sha2` | 2.1 / 0.22 / 0.11 | PKCE, `requestState` opaque-token encode/decode for MRTR (SEP-2322) | `requestState` is a server-encoded opaque blob echoed by the client — base64+serde_json is sufficient; no signing crate required for the reference impl |
+| `indexmap` | 2.10 | Deterministic `tools/list` ordering (minor change #3: "return tools in deterministic order for prompt-cache hits") | Already used for ordered maps; keeps list output stable across calls |
+| `garde` | 0.23 (behind `validation`) | Complements `jsonschema` for derive-style struct validation | Already paired with `jsonschema` in the `validation` feature; unchanged |
 
-| Technology | Version | Purpose | Why |
-|------------|---------|---------|-----|
-| `serde` | `1` (+ `derive`) | Owned IR + manifest model | Workspace-standard. |
-| `serde_json` | `1` | Deserialize bundle artifacts at serve time; emit `structuredContent` | Workspace-standard. |
-| `schemars` | `1.0` | `outputSchema` projection from the manifest model | Matches SDK. |
-| `thiserror` | `2` | Runtime error types | Match SDK convention. |
-| `sha2` | `0.11` | Bundle-artifact hash verification at load | Matches pin. |
-| `hex` | `0.4` | Hash encoding | Matches pin. |
-| `rust_xlsxwriter` | `0.95` (latest `0.95.0`, 2026-05-09), `default-features = false` | WRITER-ONLY `.xlsx` emitter for `render_workbook` (computed values → provenance-bound `workbook://` resource) | The single deliberate purity relaxation. A WRITER is not a READER. Pulls `zip` (deflate container) but no workbook parser. `default-features = false` drops chrono/serde extras the writer doesn't need. Author `jmcnamara`, MIT/Apache, clean audit. |
+### Development / CI Tools (ONE genuinely new tool — CI-only, not a crate)
 
-**Deliberately NOT in the runtime:** `umya-spreadsheet`, `quick-xml`, `pmcp-code-mode`, any SWC crate. These are the banned tokens the purity gate asserts absent (§5). `zip` IS permitted (it enters only via `rust_xlsxwriter`, as the deflate container — not a reader).
+| Tool | Purpose | Notes |
+|------|---------|-------|
+| **`@modelcontextprotocol/conformance`** (Node.js/TypeScript, from `github.com/modelcontextprotocol/conformance`) | The **official** cross-SDK conformance gate for SDK-tier certification. Drives a pmcp **server HTTP endpoint** (server mode) or a pmcp **client command** (client mode); passes scenario context via `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_CONTEXT` env vars; emits `checks.json` pass/fail + a `conformance-baseline.yml` for known-fails | **Node.js 20+ / LTS 22.x** must be available in CI. Invoke via the project's GitHub Action (`mode` + `url`/`command`). Scenarios are **TypeScript modules** in `src/scenarios/`, not YAML — you do **not** author them; you point the runner at pmcp. This is a `[dev]`/CI concern with **zero impact on the published crate or its dependency tree or wasm builds**. |
+| pmcp conformance server binary (new example) | A small pmcp HTTP server the suite can boot (dual-version: negotiates 2025-11-25 and 2026-07-28) | Ship as an `examples/` binary (or a `mcp-tester`/`cargo-pmcp` subcommand). Reuses the existing `streamable-http` stack; no new deps. |
+| Existing Rust wire-level conformance harness (Phase 109, `crates/pmcp-team-servers/src/conformance/runner.rs` + `crates/mcp-tester/src/conformance/`) | In-process/HTTP fixture replay (fixture schema v2) — **complements** the official suite for fast, offline, deterministic Rust-native checks | Keep and extend with v2 fixtures. It is NOT a substitute for the official Node suite (which is the tier gate), but it is the fast inner-loop gate. |
 
-### Served-tool layer — `pmcp-server-toolkit` module (no new deps)
+## Installation
 
-Mirror the SQL/OpenAPI pattern: the served-tool surface (`calculate` / `explain` / `get_manifest` / `diff_version` / `render_workbook`) becomes a **module inside `pmcp-server-toolkit`** gated behind a `workbook` feature, depending on `pmcp-workbook-runtime` only. No new third-party deps — it reuses the toolkit's existing `jsonschema = "0.46"` (input validation), `indexmap`, `serde`, `tracing`, and the `[[tools]]`/`ToolInfo` synthesis machinery. The `BundleSource` trait (local-dir + embedded impls) is pure SDK code over `std::fs` + `include_bytes!` — no crate needed.
+pmcp is a Rust workspace, not npm. Concretely:
 
----
+```toml
+# Root Cargo.toml — the ONLY dependency-line change this milestone requires:
+# jsonschema = { version = "0.46", optional = true, default-features = false }
+jsonschema = { version = "0.48", optional = true, default-features = false }
+#            ^^^^^^ bump 0.46 → 0.48 (Draft 2020-12 stable, same feature flags,
+#                   same wasm-clean default-features=false posture)
+```
 
-## Answers to the six specific questions
+```bash
+# CI only — the official conformance gate (NOT added to Cargo.toml):
+#   .github/workflows/*.yml
+#   - uses: actions/setup-node@v4  with node-version: 22
+#   - uses: modelcontextprotocol/conformance/action@main
+#     with: { mode: server, url: "http://127.0.0.1:PORT/mcp" }
+```
 
-### 1. `umya-spreadsheet` — version, fabricated-provenance caveat, isolate-vs-replace
+No `serde`, `hyper`, `axum`, `jsonwebtoken`, `url`, or auth-crate additions. New protocol
+types and header constants are net-new **source**, not net-new **dependencies**.
 
-- **Version:** current stable is **`3.0.0`** (released 2026-06-03). The lighthouse pin `"3.0"` already resolves to the newest release — no bump needed, no currency debt. HIGH confidence.
-- **Fabricated-provenance caveat (verified against RFC §5):** on EVERY save, umya hard-codes `<Application>Microsoft Excel</Application>` in `docProps/app.xml` and writes a `calcId` into `calcPr`. A umya-AUTHORED workbook therefore presents **fabricated Excel identity** and would pass a naïve "was this recalculated by real Excel?" freshness/staleness gate (the lighthouse Phase-8 provenance gate). Any SDK tooling that *programmatically mutates* a workbook (e.g. the one-shot DV-authoring path) inherits a workbook whose provenance lies.
-- **Isolate, do NOT replace.** umya is the only mature pure-Rust crate that reads the full surface the compiler needs (cells + cached values + formulas + colours + named ranges + data-validation + custom sheets). `calamine` reads cells/values but does **not** write and has weaker formula/named-range/validation coverage — it cannot replace umya for the compiler's authoring + full-fidelity-read needs. So:
-  - Keep umya confined to `pmcp-workbook-compiler` (the offline crate). The purity gate (§5) asserts it never enters the runtime/served tree.
-  - Handle the caveat at the **provenance layer, not the reader layer**: keep the lighthouse's quarantined `quick-xml`+`zip` probe that reads the RAW `calcPr@calcId` / `<Application>` bytes and classifies umya-authored workbooks into a **distinct provenance class** (so they cannot satisfy the "real-Excel recalc" oracle gate). The SDK must carry this forward as a first-class generalization, not a lighthouse wart — it is the only thing keeping the "compile, don't fabricate" guarantee honest.
-  - The reader MUST NEVER enter the served binary tree (purity rule, enforced by §5).
+## Per-Question Detail
 
-### 2. `rust_xlsxwriter` — version, why writer-only keeps the served binary reader-free
+### (a) JSON Schema 2020-12 — version bump, not a new crate
 
-- **Version:** current stable **`0.95.0`** (released 2026-05-09). Lighthouse pin `"0.95"` is current. HIGH confidence.
-- **Why writer-only matters:** `render_workbook` only ever *emits* a freshly-computed `.xlsx` from the runtime's already-evaluated cell values + the `layout.json` template. It never *parses* an `.xlsx`. A writer crate has no XML/ZIP *reader* in its public path — it pulls `zip` purely as the deflate *container* for output. So the served binary gains the ability to produce Excel output **without ever linking a workbook parser**, preserving the invariant that no untrusted/ambiguous `.xlsx` parsing logic exists on the hot serving path. The attack/complexity surface of "parse arbitrary spreadsheet" stays entirely offline in the compiler. `default-features = false` further trims the writer to the minimum (no chrono/serde extras). The `zip` token is the one explicitly-permitted exception in the runtime purity assertion precisely because it is writer-container, not reader-parser.
+- **Already present:** `jsonschema = { version = "0.46", optional = true, default-features = false }` behind the `validation` feature; used today in `src/server/output_validation.rs` via `jsonschema::validator_for(schema)`.
+- **Draft 2020-12 support:** confirmed for 0.48.x (latest is 0.48.5, published 2026-07-22). Bump 0.46 → 0.48.
+- **Security match (SEP-2106):** the spec mandates "implementations MUST NOT auto-dereference external `$ref` URIs." pmcp **already** sets `default-features = false`, which disables both HTTP and file `$ref` resolution by default (you'd have to opt into `resolve-http`/`resolve-file` to get network fetches). **No change needed — the current config is already compliant.**
+- **`structuredContent` = any JSON value:** a relaxation. Today's structured-output bridge (2.15) validates against `outputSchema`; under v2 `structuredContent` may be any JSON. This is a validation-loosening in `output_validation.rs`/`task_dispatch.rs`, not a crate change.
+- **Recommended code change:** replace `jsonschema::validator_for(schema)` (auto-detect draft from `$schema`) with an **explicit** pin so v2 tools behave predictably regardless of whether the tool author supplies `$schema`:
+  ```rust
+  jsonschema::options()
+      .with_draft(jsonschema::Draft::Draft202012)
+      .build(schema)
+  ```
+  (or `jsonschema::draft202012::new(schema)`). Explicit pinning also future-proofs against the crate changing its default-draft fallback.
+- **Composition-keyword resource bounds (SEP-2106):** the spec asks implementations to bound `oneOf`/`anyOf`/`allOf` nesting depth to prevent DoS. `jsonschema` compiles these fine; the *bound* is a pmcp-side pre-compile schema-depth/size check — **SDK logic, no crate.**
+- **Wasm:** `jsonschema` with `default-features = false` compiles on `wasm32-unknown-unknown` (confirmed). The `validation` feature is not in the default build, so the reqwest-free/wasm-clean default publish build is unaffected either way.
 
-### 3. Formula parsing / DAG — crates or hand-rolled? footprint?
+### (b) Official conformance suite — CI/dev tool (Node.js), not a Rust dependency
 
-**Hand-rolled. No external formula crate, and that is the correct choice.** Verified by reading the lighthouse sources:
-- `workbook-compiler/src/formula/{token.rs, parser.rs, rebase.rs}` — a custom tokenizer + recursive-descent/Pratt parser (~52KB) that validates function names against the dialect `WHITELIST` **at parse time** (an out-of-whitelist function is a parse-time rejection, not a silent accept). This whitelist-gated-at-parse-time behaviour is the core safety primitive of the "governed Excel" dialect — no off-the-shelf formula crate enforces a dialect whitelist, so adopting one would *lose* the security property.
-- `workbook-compiler/src/dag/{graph.rs, resolve.rs, topo.rs}` — DAG build + Kahn topological sort.
-- `workbook-runtime/src/{formula.rs, dag.rs, resolve.rs, scalar_eval.rs}` + `sheet_ir/{executor.rs, semantics.rs, eval_value.rs, rounding.rs}` — the owned serde/schemars-clean AST (`Expr`/`BinOp`/`UnOp`/`RangeRef`), the runtime DAG container + toposort, and a pure-Rust scalar leaf evaluator + Excel-semantics layer (rounding, error propagation).
-- **Footprint:** ZERO third-party formula/parser/DAG crates. The entire formula + DAG + semantics stack is owned Rust over `std::collections` + `serde`. `petgraph` is NOT used and should NOT be introduced (the owned `Dag` + Kahn's algorithm is ~200 LOC and keeps the runtime serde-clean and dependency-free).
-- **Recommendation:** lift the hand-rolled modules verbatim into the two SDK crates. Do NOT introduce `formualizer`, `xlformula_engine`, `petgraph`, or any formula crate. The dialect-whitelist-at-parse-time design is a feature, not debt. HIGH confidence.
+- **What it is:** `github.com/modelcontextprotocol/conformance` — a TypeScript/Node.js framework (≈98% TS). Scenarios are TypeScript modules in `src/scenarios/` implementing a `Scenario` interface (`start()`/`stop()`/`getChecks()`); a built-in registry covers initialize, tools, resources, prompts, and auth flows.
+- **How a Rust SDK runs against it:** the suite orchestrates. In **server mode** it connects as an MCP client to a running pmcp HTTP endpoint (URL passed as arg); in **client mode** it starts a test server and launches a pmcp client **command**. Scenario context arrives via `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_CONTEXT` env vars.
+- **What pmcp must provide:** (1) a runnable dual-version **server binary** exposing a Streamable-HTTP endpoint, and/or (2) a **client command**; (3) an optional `conformance-baseline.yml` recording known/allowed failures during the dual-version transition; (4) a CI job (their GitHub Action) with `mode` + `url`/`command`.
+- **Transports tested:** HTTP/URL-based server + command-based client. Aligns with pmcp's `streamable-http`.
+- **Tier significance:** per the RC post, a Standards-Track SEP can't reach Final until a matching scenario lands in the suite; Tier-1 SDKs must ship support within the validation window. Passing this suite is the external certification gate.
+- **Stack implication:** add **Node.js (LTS 22.x)** to the CI image and a conformance job. **No Rust crate, no runtime dep, no wasm impact.** Keep the Phase-109 Rust harness as the fast offline inner loop.
 
-### 4. serde / schemars / JSON-Schema for manifest + outputSchema
+### (c) HTTP-layer: required headers + session-id removal — constants + logic, no crate
 
-All already SDK-standard — **no version changes, no new crates:**
-- `serde = "1"` (+ `derive`), `serde_json = "1"` — workspace baseline (root Cargo.toml `serde = "1.0"`, `serde_json = "1.0"`).
-- `schemars = "1.0"` — the SDK already pins exactly this behind its `schema-generation` feature (root Cargo.toml:52). The lighthouse uses `schemars = "1.0"` with `preserve_order` + `chrono04`. Mirror those features where the manifest model needs ordered properties and chrono timestamps. Current stable is `1.2.1` (`"1.0"` resolves forward to it cleanly — semver-compatible).
-- `jsonschema = "0.46"` — for **runtime input validation** (enum-gated `calculate`, closed-enum membership checks). The toolkit ALREADY depends on `jsonschema = "0.46"` (behind `input-validation`), so the workbook served-tool module reuses it. No new dep.
-- **outputSchema projection** = `schemars`-derived `JsonSchema` on the runtime manifest model, emitted as the tool's `outputSchema`, feeding `structuredContent` — identical to the SDK's existing TypedToolWithOutput pattern. HIGH confidence.
+- **Already present:** `src/shared/http_constants.rs` defines `MCP_SESSION_ID = "mcp-session-id"` and `MCP_PROTOCOL_VERSION = "mcp-protocol-version"`; `src/shared/streamable_http.rs` already reads/writes both.
+- **Add (constants only):**
+  - `MCP_METHOD = "mcp-method"` and `MCP_NAME = "mcp-name"` (SEP-2243 required POST headers).
+  - `X_MCP_HEADER` prefix support (`x-mcp-header`) for custom headers from tool params (SEP-2243).
+  - Reject requests where header ↔ JSON-RPC body disagree (`HeaderMismatchError`, now `-32020`).
+- **Session-id removal (SEP-2567/SEP-2575):** a **negotiation code path**, not a dependency change. When the negotiated version is 2026-07-28: stop minting/reading `Mcp-Session-Id`, drop the `initialize`/`initialized` handshake, and require per-request `_meta` (`io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientCapabilities`, `io.modelcontextprotocol/clientInfo`). The existing `stateless()` mode is the natural home; the session machinery (`session.rs`, `event_store.rs`) stays for the 2025-11-25 path.
+- **`Last-Event-ID` / SSE resumability removal (SEP-2575):** delete the code path for v2; keep the `LAST_EVENT_ID` constant for v1. No dep change.
+- **`subscriptions/listen` (SEP-2575):** replaces the HTTP GET endpoint + `resources/subscribe`/`unsubscribe` with a single long-lived POST-response stream. Still hyper/axum SSE-style streaming — no new crate, a new route + handler.
+- **Stack implication:** the hyper/hyper-util/axum/tower/tower-http stack is unchanged. `tower-http`'s already-enabled `set-header` feature suffices for stamping response-side `_meta`/cache headers. **No new crate.**
 
-### 5. Purity-check mechanism — express as a Cargo/CI gate
+### (d) RFC 9207 `iss` validation + DCR `application_type` — hand-rolled, and AVOID OAuth crates
 
-The lighthouse uses a `just purity-check` recipe with two arms per boundary: (a) a **`cargo tree` token assertion** (FAIL if a forbidden crate appears in a crate's dependency graph), and (b) a value-path grep. The `cargo tree` arm is the load-bearing, link-level, provable boundary. Port it as follows, with a recommended **three-layer defense**:
-
-**Layer 1 — `cargo tree` assertion in CI + `just` (the proven mechanism; adopt as-is).**
-A CI step and a `just purity-check` recipe that runs, for each served-binary-tree crate, `cargo tree -p <crate> | grep -Ei '<banned tokens>'` and **fails on match.** Concretely for v2.3:
-- `cargo tree -p pmcp-workbook-runtime` must NOT contain `umya|quick-xml|pmcp-code-mode|swc_` (reader/JS banned). It MUST contain `rust_xlsxwriter` (positive assertion the renderer is wired). `zip` is PERMITTED (writer container).
-- `cargo tree -p pmcp-server-toolkit --features workbook` must NOT contain `umya|quick-xml|pmcp-code-mode|swc_`.
-- Any scaffolded `--kind workbook-server` binary's tree must NOT contain `umya|quick-xml`.
-This is the direct analogue of the lighthouse `quote-pricing-server` / `workbook-runtime` purity arms. It is the recommendation of record because it proves a **link boundary**, not a convention. The lighthouse even includes a POSITIVE assertion (`rust_xlsxwriter` IS present in `workbook-runtime`) — carry that forward so a silently-dropped renderer also fails the gate.
-
-**Layer 2 — `cargo-deny` `[bans]` as a redundant CI backstop (NEW, recommended addition).**
-Add a `deny.toml` `[bans]` section that denies `umya-spreadsheet`, `quick-xml`, and `pmcp-code-mode`/`swc_*` for the runtime/served crates. `cargo-deny` gives a declarative, auditable, machine-checkable ban that complements the grep-based `cargo tree` arm and is already a standard SDK CI tool family (the SDK runs `cargo audit`). This catches a leak even if someone edits the `just` recipe. (Note: `cargo-deny`'s native per-crate ban scoping is coarse; the `cargo tree`-per-crate arm remains the precise boundary, with `cargo-deny` as the declarative backstop.)
-
-**Layer 3 — feature-flag / crate-split structural boundary (the real enforcement).**
-The strongest guarantee is **architectural, not a check**: `umya` lives in `pmcp-workbook-compiler` and is NEVER a `[dependencies]` entry of `pmcp-workbook-runtime` or the toolkit `workbook` module. The compiler depends on the runtime (one-directional), re-exporting the runtime's owned types so call sites compile while the served binary links only the runtime. The gate (Layers 1–2) then merely *proves* the split was not accidentally broken. Mirror the lighthouse `[lib]`/`[[bin]]` split and the "compiler depends on runtime, runtime depends on neither" topology exactly.
-
-**Wire into the SDK's existing gate:** add the `cargo tree` arm + `cargo deny check bans` into the `quality-gate` CI job (the same job that runs PMAT/clippy), NOT into local `make quality-gate` if dev-loop speed matters (mirrors the D-27 doc-check decision). A dedicated `make purity-check` / `just purity-check` target lets developers run it on demand. HIGH confidence on the `cargo tree` mechanism; MEDIUM on the exact `cargo-deny` scoping ergonomics (verify `[bans]` per-crate scoping during planning).
-
-### 6. Version currency — verified 2026-06-09 against crates.io
-
-| Crate | Lighthouse pin | Current stable (crates.io) | Released | Status |
-|-------|----------------|----------------------------|----------|--------|
-| `umya-spreadsheet` | `3.0` | **3.0.0** | 2026-06-03 | Current — no bump |
-| `rust_xlsxwriter` | `0.95` | **0.95.0** | 2026-05-09 | Current — no bump |
-| `quick-xml` | `0.37` (pin to umya transitive) | 0.40.1 (2026-05-15) | — | **Keep 0.37** to match umya's lock; do NOT chase 0.40 |
-| `zip` | `8` | **8.6.0** | — | Current stable; `9.0.0-pre2` exists — AVOID pre-release |
-| `schemars` | `1.0` | 1.2.1 (2026-02-01) | — | `"1.0"` resolves forward; current |
-| `jsonschema` | (SDK `0.46`) | 0.46.x | — | Matches SDK toolkit pin |
-| `sha2` | `0.11` | 0.11.x | — | Matches `pmcp-code-mode` |
-| `hex` | `0.4` | 0.4.x | — | Matches `pmcp-code-mode` |
-
-No formula/DAG crate to verify — hand-rolled (§3).
-
----
+- **pmcp's auth is hand-rolled and transport-agnostic:** client flow in `src/client/oauth.rs` (discovery via `.well-known/openid-configuration` + `.well-known/oauth-authorization-server`, DCR, authorization-code + device-code, PKCE via `src/shared/pkce.rs`); server side in `src/server/auth/` (`oauth2.rs`, `jwt_validator.rs`, providers). The `oauth2` 5.0.0 crate in `Cargo.lock` is a **transitive** dependency of other tooling, **not** used by pmcp's auth.
+- **RFC 9207 / SEP-2468 (`iss` validation):** the callback handler in `src/client/oauth.rs` (~line 697) currently parses `code` + `state` from the redirect query but does **not** read `iss`. The change: extract the `iss` query param and, if present, string-compare it against the recorded/discovered issuer before redeeming the code; reject on mismatch. **Pure logic on `url::Url::query_pairs()` — no crate.**
+- **DCR `application_type` / SEP-837:** add an `application_type` field (default `"native"` for CLI/desktop redirect-to-localhost clients, `"web"` where applicable) to the client-registration request body constructed in `src/server/auth/oauth2.rs` (the `register_client` path / registration request struct). **One serde field — no crate.**
+- **Issuer-keyed credential binding (SEP-2352):** persist DCR credentials keyed by issuer identifier and re-register when the AS changes. This is a storage-key change in the credential cache (`dirs`-based store already exists behind `oauth`). **No crate.**
+- **DCR deprecation → Client ID Metadata Documents (PR #2858):** the spec now prefers CIMD over RFC 7591 DCR. This is additive discovery/registration logic (fetch a client-id metadata document by URL) — still `reqwest`/`serde_json` behind the existing `oauth` feature. **No new crate.**
+- **Why NOT add `oauth2` / `openidconnect` crates:** they would (1) duplicate/fight the existing hand-rolled, transport-agnostic flow; (2) pull `reqwest` and other **wasm-unfriendly** deps into a path pmcp keeps reqwest-free by default; (3) impose their own type system on protocol structs that must match the MCP schema exactly. The SEP changes are trivially additive to the existing code. **Recommend explicitly against.**
 
 ## Alternatives Considered
 
-| Category | Recommended | Alternative | Why Not |
-|----------|-------------|-------------|---------|
-| Excel reader | `umya-spreadsheet` 3.0 | `calamine` | calamine is read-only (no write/authoring), weaker named-range/data-validation/formula fidelity — cannot serve the compiler's full-surface read + DV-authoring needs |
-| Excel writer | `rust_xlsxwriter` 0.95 (writer-only) | umya for output too | Reusing umya for render would drag the READER into the served tree — violates the purity rule. A writer-only crate is the whole point |
-| Formula engine | hand-rolled (lift from lighthouse) | `formualizer` / `xlformula_engine` | No off-the-shelf engine enforces the dialect whitelist at parse time — adopting one loses the core safety property and adds a dependency |
-| DAG / toposort | owned `Dag` + Kahn's (lift) | `petgraph` | ~200 LOC owned container keeps the runtime serde-clean and zero-dep; petgraph would add weight for no gain |
-| Offline calc oracle | pure-Rust `scalar_eval` (already in runtime) | `pmcp-code-mode` SWC JS kernel | The runtime already replaced the JS kernel with a pure-Rust scalar evaluator; pulling SWC into the SDK compiler is heavy and likely unnecessary (verify the reconcile-parity need in planning) |
-| Provenance probe | quarantined `quick-xml`+`zip` raw-bytes read | Trust umya's metadata | umya FABRICATES `<Application>Microsoft Excel</Application>`+`calcId` — trusting its metadata defeats the freshness gate |
-| `thiserror` | `2` (match SDK) | `1` (lighthouse) | SDK toolkit crates standardized on `thiserror = "2"`; align to avoid two majors in-tree |
-| Purity enforcement | `cargo tree` assert + `cargo-deny` bans + crate split | grep-only (`just purity-check`) | grep-only is fragile; the `cargo tree` link assertion + declarative `cargo-deny` bans + structural crate split are layered and harder to silently break |
+| Recommended | Alternative | When to Use Alternative |
+|-------------|-------------|-------------------------|
+| Bump existing `jsonschema` 0.48 | `boon`, `valico`, hand-rolled validator | Never for this milestone. `jsonschema` is already vendored, supports 2020-12, is wasm-clean with `default-features=false`, and already satisfies the no-external-`$ref` mandate. Switching costs churn for zero gain. |
+| Official Node conformance suite in CI + keep Rust Phase-109 harness | Rust-only conformance (Phase-109 harness alone) | The Rust harness is the fast inner loop, but it is **not** the tier-certification gate. You need the official Node suite for Tier-1 status; run both. |
+| Hand-rolled `iss`/`application_type` additions | `oauth2` 5.x / `openidconnect` crates | Only if pmcp ever abandons its hand-rolled, wasm-clean, transport-agnostic auth design — not this milestone. These crates are reqwest-coupled and not wasm-default-clean. |
+| New header **constants** in `http_constants.rs` | A dedicated header-modeling crate | Never — `http` 1.1 + string constants is the established pattern; a new crate is overkill. |
 
----
+## What NOT to Use
 
-## Installation (anticipated Cargo.toml shape)
+| Avoid | Why | Use Instead |
+|-------|-----|-------------|
+| `oauth2` / `openidconnect` crates for the auth-hardening SEPs | Duplicates the hand-rolled flow; pulls `reqwest`; not wasm-default-clean; imposes non-MCP type shapes | Add `iss` comparison + `application_type` serde field to existing `src/client/oauth.rs` / `src/server/auth/oauth2.rs` |
+| Enabling `jsonschema` `resolve-http`/`resolve-file` features | Would auto-dereference external `$ref` URIs — a **direct SEP-2106 security violation** and a wasm-breaker | Keep `default-features = false` (current, compliant). Enforce composition-depth bounds in SDK code. |
+| A second/alternate JSON-Schema crate | Duplicate dependency, larger tree, no 2020-12 advantage over the incumbent | Bump the incumbent `jsonschema` to 0.48 |
+| Authoring the conformance suite scenarios in Rust/YAML | The official suite scenarios are TypeScript modules you don't author; you only provide the endpoint/command | Point the official Node runner at a pmcp server binary; use `conformance-baseline.yml` for transition-period known-fails |
+| Removing the 2025-11-25 session/event-store code | Milestone is **dual-version** (per-request negotiation, no hard cutover) | Gate v2 behavior on negotiated version; keep `session.rs`/`event_store.rs` for the v1 path |
 
-```toml
-# crates/pmcp-workbook-runtime/Cargo.toml  (served-binary leaf — reader-free)
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = "1.0"
-thiserror = "2"
-sha2 = "0.11"
-hex = "0.4"
-rust_xlsxwriter = { version = "0.95", default-features = false }  # WRITER-ONLY
+## Stack Patterns by Variant
 
-# crates/pmcp-workbook-compiler/Cargo.toml  (offline — reader-bearing)
-[dependencies]
-pmcp-workbook-runtime = { path = "../pmcp-workbook-runtime" }
-umya-spreadsheet = "3.0"            # the ONE reader — confined here
-quick-xml = "0.37"                  # pin to umya's transitive lock (re-derive via cargo tree)
-zip = "8"                           # pin to umya's transitive lock; NOT 9.0.0-pre
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = { version = "1.0", features = ["preserve_order", "chrono04"] }
-thiserror = "2"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sha2 = "0.11"
-hex = "0.4"
-# OPTIONAL, non-default — only if offline JS reconcile-oracle parity is still required:
-# pmcp-code-mode = { path = "../pmcp-code-mode", features = ["js-runtime"], optional = true }
+**If building the dual-version negotiation core (version plumbing phase):**
+- Add header constants (`MCP_METHOD`, `MCP_NAME`) + per-request `_meta` protocolVersion/clientCapabilities/clientInfo parsing + `server/discover` RPC.
+- No new deps; pure `serde_json` + `http` work. Error renumbering (`-32002`→`-32602`, and `-32001`/`-32003`/`-32004`→`-32020`/`-32021`/`-32022`) is a constants change.
 
-# crates/pmcp-server-toolkit/Cargo.toml  (add a feature + module — no new third-party deps)
-[features]
-workbook = ["dep:pmcp-workbook-runtime"]   # reuses existing jsonschema/indexmap/serde
-```
+**If building the JSON Schema 2020-12 phase:**
+- Bump `jsonschema` 0.46→0.48; pin `Draft::Draft202012` explicitly; loosen `structuredContent` to any JSON value; add composition-depth bound check. Keep `default-features=false`.
 
----
+**If building the conformance phase:**
+- Add Node.js LTS 22.x + the official Node suite to CI, plus a dual-version pmcp server example binary. Extend the Phase-109 Rust harness with v2 fixtures for the offline inner loop.
 
-## Confidence Assessment
+**If building the auth-hardening phase:**
+- Hand-roll `iss` validation in the callback parser, `application_type` in DCR, issuer-keyed credential storage, optional CIMD discovery. Zero new crates. All behind the existing `oauth` feature (already reqwest-gated / non-wasm).
 
-| Area | Confidence | Notes |
-|------|------------|-------|
-| umya / rust_xlsxwriter versions | HIGH | Verified crates.io 2026-06-09; both = lighthouse pins; both newest stable |
-| Hand-rolled formula/DAG (no crate) | HIGH | Read lighthouse `formula/`, `dag/`, `sheet_ir/` sources directly |
-| serde/schemars/jsonschema/sha2/hex reuse | HIGH | SDK root + toolkit Cargo.toml already pin identical versions |
-| quick-xml/zip transitive-pin strategy | MEDIUM-HIGH | Pin must be re-derived from umya's lock at extraction (`cargo tree -i`) |
-| `cargo tree` purity arm | HIGH | Proven in lighthouse justfile; link-level boundary |
-| `cargo-deny` ban scoping ergonomics | MEDIUM | Per-crate `[bans]` scoping is coarse — verify during planning |
-| Dropping SWC/pmcp-code-mode from compiler | LOW-MEDIUM | Depends on whether the JS oracle is still load-bearing for penny-reconcile parity — verify against lighthouse Phase-10 |
+## Version Compatibility
 
-## Gaps to Address (for roadmapper / planners)
+| Package A | Compatible With | Notes |
+|-----------|-----------------|-------|
+| `jsonschema@0.48` | `serde_json@1.0` | Validates `serde_json::Value` directly; drop-in for the current 0.46 call sites. API used (`options().with_draft().build()` / `validator_for`) is stable across 0.46→0.48. |
+| `jsonschema@0.48` (`default-features=false`) | `wasm32-unknown-unknown` | Compiles wasm-clean without default features (no external `$ref` resolvers). Matches pmcp's current gating. |
+| Official conformance suite (Node) | pmcp `streamable-http` server | Drives HTTP endpoint / client command via env-var scenario context; unrelated to the Rust dependency tree. Requires Node.js ≥20 (use LTS 22.x) in CI. |
+| `jsonwebtoken@10.3` | unchanged | Auth-hardening SEPs do not touch server-side JWT verification; no bump needed. |
 
-- Confirm whether the offline JS reconcile-oracle (`pmcp-code-mode`/SWC) is still required, or whether pure-Rust `scalar_eval` fully covers penny-reconciliation. If not required, drop it from the SDK compiler entirely; if required, gate behind a non-default `js-oracle` feature so the default build is SWC-free.
-- Re-derive the exact `quick-xml` and `zip` pins from `umya-spreadsheet 3.0.0`'s resolved lock at extraction time (avoid forking a second copy into the tree).
-- Decide `cargo-deny` `[bans]` scoping vs relying on the per-crate `cargo tree` arm as the precise boundary (cargo-deny as declarative backstop).
-- Confirm the `workbook` toolkit feature reuses the existing `jsonschema`/`indexmap` deps rather than introducing a parallel validator.
+## Wasm Compatibility Summary (per the SDK's wasm-clean constraint)
+
+| Change | Wasm impact |
+|--------|-------------|
+| `jsonschema` 0.46→0.48 (`default-features=false`, behind `validation`) | Wasm-clean; not in default build regardless |
+| New protocol types / header constants (`serde`, `http`) | Wasm-clean (these deps are already normal cross-target deps) |
+| Streamable-HTTP header/session changes (`hyper`/`axum`/`tower`) | Server-side, native-only (already `#[cfg(not(wasm32))]`); no new wasm surface |
+| OAuth `iss`/`application_type` (behind `oauth` feature) | `oauth` feature is already reqwest-gated and non-default/non-wasm; no change |
+| Node conformance suite | CI-only; zero wasm impact |
+
+**Net:** the default publish build stays reqwest-free and wasm-clean. The only dependency-line change (`jsonschema` bump) is feature-gated and already wasm-compatible in its configured form.
 
 ## Sources
 
-- crates.io API (verified 2026-06-09): umya-spreadsheet 3.0.0, rust_xlsxwriter 0.95.0, quick-xml 0.40.1, zip 8.6.0, schemars 1.2.1
-- Lighthouse `quote-pricing` Cargo.toml files (`workbook-compiler`, `workbook-runtime`, workspace) + `justfile` purity-check recipe
-- Lighthouse source: `workbook-compiler/src/formula/parser.rs`, `dag/`, `workbook-runtime/src/{formula,dag,scalar_eval}.rs`, `sheet_ir/`
-- SDK: root `Cargo.toml`, `crates/pmcp-server-toolkit/Cargo.toml`, `crates/pmcp-toolkit-postgres/Cargo.toml`, `crates/pmcp-code-mode/Cargo.toml`
-- Extraction RFC: `sdk-issue-excel-workbook-compiler-extraction.md` (§5 fabricated-provenance caveat)
+- https://modelcontextprotocol.io/specification/draft/changelog — authoritative 2026-07-28 change list (SEP-2567 sessionless, SEP-2575 stateless core/`server/discover`/`subscriptions/listen`, SEP-2663 Tasks extension, SEP-2322 MRTR/`InputRequiredResult`/`resultType`, SEP-2243 required headers/`x-mcp-header`, SEP-2549 `ttlMs`/`cacheScope`, SEP-2106 JSON Schema 2020-12/`$ref` bounds, SEP-2468 RFC 9207 `iss`, SEP-837 DCR `application_type`, SEP-2352 issuer-keyed creds, PR #2858 CIMD, error-code renumbering) — **HIGH**
+- https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/ — RC post: conformance-suite-as-gate, SDK tiering + validation window, stateless/MRTR/auth-hardening summary — **HIGH**
+- https://github.com/modelcontextprotocol/conformance — official conformance suite: TypeScript/Node, server-mode URL / client-mode command, `MCP_CONFORMANCE_*` env, `checks.json`, `conformance-baseline.yml` — **HIGH**
+- https://modelcontextprotocol.io/community/sdk-tiers — SDK tiering system context — **MEDIUM** (search-surfaced, corroborated by RC post)
+- https://docs.rs/jsonschema/0.48.5 + `cargo search jsonschema` — 0.48.5 latest (2026-07-22), Draft 2020-12 supported, `default-features=false` disables HTTP+file `$ref` resolution, wasm32 supported with default features off, explicit-draft via `options().with_draft(Draft::Draft202012)` / `draft202012::new` — **HIGH**
+- Local codebase inspection (root `Cargo.toml`; `src/shared/http_constants.rs`; `src/shared/streamable_http.rs`; `src/server/output_validation.rs`; `src/server/auth/oauth2.rs`; `src/client/oauth.rs`; `crates/pmcp-team-servers/src/conformance/runner.rs`; `crates/mcp-tester/src/conformance/`) — confirms `jsonschema` already vendored (`default-features=false`), headers already modeled, auth hand-rolled (not `oauth2`/`openidconnect`), Phase-109 Rust harness present — **HIGH**
+
+---
+*Stack research for: dual-version MCP 2026-07-28 (v2) support in the pmcp Rust SDK*
+*Researched: 2026-07-22*

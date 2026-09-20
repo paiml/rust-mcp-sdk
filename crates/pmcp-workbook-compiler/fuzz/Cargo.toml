@@ -41,6 +41,13 @@ test = false
 bench = false
 
 [[bin]]
+name = "structured_reference_expand"
+path = "fuzz_targets/structured_reference_expand.rs"
+doc = false
+test = false
+bench = false
+
+[[bin]]
 name = "dialect_version_parse"
 path = "fuzz_targets/dialect_version_parse.rs"
 doc = false

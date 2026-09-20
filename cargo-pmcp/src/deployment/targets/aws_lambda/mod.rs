@@ -1,4 +1,6 @@
+pub mod artifact;
 mod deploy;
+pub(crate) mod engine;
 pub mod init;
 
 use anyhow::{bail, Context, Result};
@@ -55,46 +57,31 @@ impl DeploymentTarget for AwsLambdaTarget {
     }
 
     async fn is_available(&self) -> Result<bool> {
-        // Check for required tools
-        let has_cdk = Command::new("npx")
-            .args(&["cdk", "--version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        let has_cargo_lambda = Command::new("cargo")
-            .args(&["lambda", "--version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        Ok(has_cdk && has_cargo_lambda)
+        // Task 8 (shape-aware artifact acquisition): the `npx cdk` probe is
+        // dropped unconditionally — the T7 CFN-renderer extraction replaced
+        // `cdk synth` on the normal path, and CDK was never required for a
+        // built-in (config-only) deploy in the first place. `cargo-lambda` is
+        // no longer a universal requirement either: it is a SHAPE-dependent
+        // tool (only custom-Rust projects need it), and this trait method
+        // has no `DeployConfig` to run `artifact::detect_shape` against — it
+        // is used for coarse target-listing before a project is even known
+        // (see `TargetRegistry::list_available`). The real, blocking probe
+        // happens once the shape IS known: `artifact::acquire_custom_rust_artifact`
+        // delegates to `build_lambda_binary` -> `BinaryBuilder::build()`,
+        // which already calls `ensure_cargo_lambda()` first and bails with
+        // an actionable install message. So `aws-lambda` is always
+        // structurally available; built-in servers need zero dev tooling at
+        // all, and custom-Rust servers get their cargo-lambda check later,
+        // where it can name the actual requirement instead of guessing.
+        Ok(true)
     }
 
     async fn prerequisites(&self) -> Vec<String> {
-        let mut missing = Vec::new();
-
-        // Check CDK
-        if !Command::new("npx")
-            .args(&["cdk", "--version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            missing.push("AWS CDK (install: npm install -g aws-cdk)".to_string());
-        }
-
-        // Check cargo-lambda
-        if !Command::new("cargo")
-            .args(&["lambda", "--version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            missing.push("cargo-lambda (install: cargo install cargo-lambda)".to_string());
-        }
-
-        missing
+        // See `is_available`'s doc comment: no universal prerequisite exists
+        // any more. Shape-dependent tooling (cargo-lambda, custom-Rust only)
+        // is checked once `artifact::detect_shape` resolves the project's
+        // shape, at build time.
+        Vec::new()
     }
 
     async fn init(&self, config: &DeployConfig) -> Result<()> {
@@ -102,20 +89,47 @@ impl DeploymentTarget for AwsLambdaTarget {
     }
 
     async fn build(&self, config: &DeployConfig) -> Result<BuildArtifact> {
-        build_lambda_binary(config).await
+        // Task 8: route through shape-aware acquisition. Built-in
+        // (config-only) projects fetch a prebuilt published binary with zero
+        // dev tooling; custom-Rust projects keep the existing cargo-lambda
+        // pipeline via `artifact::acquire_custom_rust_artifact`'s delegation
+        // to `build_lambda_binary` below — identical behavior to before this
+        // wiring, just always wrapped in a zip.
+        //
+        // Deliberate recompute (simplify-wave item 10): `deploy()`
+        // (`deploy.rs::try_render_and_deploy`) calls `detect_shape` again
+        // rather than this call's result being threaded through
+        // `BuildArtifact` — that enum is shared across every deploy target,
+        // so adding an `aws-lambda`-only shape field would ripple into all
+        // of them. Recomputing is cheap (two file-existence checks over an
+        // immutable `config`), so the duplication is intentional.
+        let shape = artifact::detect_shape(config)?;
+        let zip_path = artifact::acquire_artifact(&shape, config).await?;
+        let size = std::fs::metadata(&zip_path)
+            .with_context(|| format!("failed to stat {}", zip_path.display()))?
+            .len();
+        Ok(BuildArtifact::Binary {
+            path: zip_path.clone(),
+            size,
+            deployment_package: Some(zip_path),
+        })
     }
 
     async fn deploy(
         &self,
         config: &DeployConfig,
-        _artifact: BuildArtifact,
+        artifact: BuildArtifact,
     ) -> Result<DeploymentOutputs> {
-        // Thread developer-declared [environment] alongside resolved [secrets]
-        // through the same transient CDK-process-env path (fix for
-        // deploy-toml-inert-for-preserved-stack, FIX #2). `deploy_env_vars()`
-        // merges both maps (secrets win on collision); the stack.ts decides
-        // which keys it consumes via process.env.
-        deploy::deploy_aws_lambda(config, config.deploy_env_vars()).await
+        // Task 9 (CFN deploy engine): `artifact` (already acquired by
+        // `build()` above, via `artifact::acquire_artifact`) is now threaded
+        // through so the renderer+engine path can deploy it directly without
+        // a second (and, for a `ServerShape::BuiltIn` project, IMPOSSIBLE —
+        // no Cargo.toml to rebuild from) build. `deploy_env_vars()` (merged
+        // `[environment]` + resolved `[secrets]`, secrets win) is still
+        // threaded through for the legacy `DeployExecutor` fallback branch
+        // ONLY — see `deploy::deploy_aws_lambda`'s doc comment for why the
+        // renderer path does not use it.
+        deploy::deploy_aws_lambda(config, artifact, config.deploy_env_vars()).await
     }
 
     async fn destroy(&self, config: &DeployConfig, clean: bool) -> Result<()> {

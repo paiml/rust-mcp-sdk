@@ -12,19 +12,20 @@
 //!   SAME `manifest_digest()`/`canonicalize()` path as the other three package
 //!   types — proven directly by the agent stability test below.
 
-use pmcp_package::digest::{canonicalize, manifest_digest};
+use pmcp_package::digest::{canonicalize, manifest_digest, verify};
+use pmcp_package::error::PackageError;
 use pmcp_package::package::{AgentPackage, ServerPackage, TeamPackage, WorkflowManifest};
 use pmcp_package::reference::{ComponentRef, ComponentType};
 use pmcp_package::slot::{ConfigSlot, SlotType};
 use std::collections::BTreeMap;
-use std::path::Path;
 
+mod common;
+use common::{london_tube_spec_bytes, pack_london_tube, read_manifest_bytes};
+
+/// Read a checked-in golden fixture's raw bytes (delegates to the shared
+/// `common::fixture_bytes` so the path/panic logic lives once per crate).
 fn read_fixture(name: &str) -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("golden_fixtures")
-        .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read fixture {path:?}: {e}"))
+    common::fixture_bytes(name)
 }
 
 // --- Pinned wire-freeze digests (PRIMARY gate) -----------------------------
@@ -34,15 +35,24 @@ fn read_fixture(name: &str) -> Vec<u8> {
 // checked in. A change to ANY serialized field of a package kind — a removed
 // field (dropped on deserialize) or a defaulted-in new field — alters the
 // canonical bytes and therefore this digest, so the matching assertion below
-// FAILS CI. This is a real wire freeze for the 0.1.x line, NOT just
-// determinism: the day these must change is the day the format goes 0.2.0.
+// FAILS CI. This is a real wire freeze for the 0.2.x line, NOT just
+// determinism: the day these must change is the day the format breaks again.
+// Bump the version intentionally — do NOT silently repin.
+//
+// `EXPECTED_SERVER_DIGEST` moved once already, at the 0.1.x -> 0.2.0 break:
+// D-08 removed `ServerPackage.binary_ref` (which binary a package names is a
+// LAYER, not a struct field) and D-09 took that break deliberately rather than
+// carrying a dead field forward. That is the ONLY sanctioned reason this
+// constant has changed. The other three pinned constants below were untouched
+// by that break — their shapes did not change, so if any of them ever moves,
+// that is a real defect and not a repin.
 //
 // The `<kind>.canonical.json` snapshots asserted byte-equal via `canonicalize`
 // are the belt-and-suspenders second gate (catches a silent field add/remove
 // even in the theoretical case a digest were to collide).
 
 const EXPECTED_SERVER_DIGEST: &str =
-    "sha256:47de0265357cd4fe221c25d848fcc4414a037caf92b874995e03b75feef903a4";
+    "sha256:1d8a792e6f7dc7c4e965fdd65e246e7bca416a5adf8fdd9f1d2e7693273a9c77";
 const EXPECTED_WORKFLOW_DIGEST: &str =
     "sha256:ef8a7a08efd28f95128db481d5b8ba809516ef1097cbd8ded847ccf9de5aa7af";
 const EXPECTED_AGENT_DIGEST: &str =
@@ -77,7 +87,7 @@ fn server_fixture_digest_matches_pinned_wire_freeze_constant() {
     assert_eq!(
         manifest_digest(&server_fixture()).unwrap().as_str(),
         EXPECTED_SERVER_DIGEST,
-        "ServerPackage serialized shape changed — this is a wire-freeze break (bump 0.2.0 \
+        "ServerPackage serialized shape changed — this is a wire-freeze break (bump the version \
          intentionally, do not silently repin)"
     );
 }
@@ -87,7 +97,7 @@ fn workflow_fixture_digest_matches_pinned_wire_freeze_constant() {
     assert_eq!(
         manifest_digest(&workflow_fixture()).unwrap().as_str(),
         EXPECTED_WORKFLOW_DIGEST,
-        "WorkflowManifest serialized shape changed — wire-freeze break (bump 0.2.0 intentionally)"
+        "WorkflowManifest serialized shape changed — wire-freeze break (bump the version intentionally)"
     );
 }
 
@@ -96,7 +106,7 @@ fn agent_fixture_digest_matches_pinned_wire_freeze_constant() {
     assert_eq!(
         manifest_digest(&agent_fixture()).unwrap().as_str(),
         EXPECTED_AGENT_DIGEST,
-        "AgentPackage serialized shape changed — wire-freeze break (bump 0.2.0 intentionally)"
+        "AgentPackage serialized shape changed — wire-freeze break (bump the version intentionally)"
     );
 }
 
@@ -105,7 +115,7 @@ fn team_fixture_digest_matches_pinned_wire_freeze_constant() {
     assert_eq!(
         manifest_digest(&team_fixture()).unwrap().as_str(),
         EXPECTED_TEAM_DIGEST,
-        "TeamPackage serialized shape changed — wire-freeze break (bump 0.2.0 intentionally)"
+        "TeamPackage serialized shape changed — wire-freeze break (bump the version intentionally)"
     );
 }
 
@@ -144,6 +154,60 @@ fn team_canonical_bytes_match_checked_in_snapshot() {
         canonicalize(&team_fixture()).unwrap(),
         TEAM_CANONICAL,
         "TeamPackage canonical bytes diverged from the checked-in snapshot"
+    );
+}
+
+// --- D-10: `resolved_from` participates in package identity ----------------
+
+/// The four pinned constants above prove a `None` `resolved_from` moves
+/// NOTHING — they are computed over fixtures carrying no `resolved_from` key
+/// and they still match unmodified. This test proves the COMPLEMENT: recording
+/// the range a pin resolved changes the canonical bytes and therefore the
+/// manifest digest.
+///
+/// Both halves are needed. Without this one, `skip_serializing_if` would be
+/// indistinguishable from a field the digest path ignores entirely — and a
+/// "compatible" field that never reaches the digest is a field an attacker can
+/// strip or forge for free, which would make D-10's dev-to-prod signal
+/// unattestable.
+///
+/// `workflow.canonical.json` is the fixture used because it is the only
+/// canonical fixture holding `"kind":"pinned"` refs (three of them); `agent`
+/// and `team` hold ranges and `server` holds neither.
+#[test]
+fn recording_the_range_a_pin_resolved_changes_the_manifest_digest() {
+    let none_variant = workflow_fixture();
+    assert!(
+        none_variant.components.iter().any(ComponentRef::is_pinned),
+        "the workflow fixture must carry at least one pin or this test asserts nothing"
+    );
+
+    let none_digest = manifest_digest(&none_variant).unwrap();
+    assert_eq!(
+        none_digest.as_str(),
+        EXPECTED_WORKFLOW_DIGEST,
+        "a `None` resolved_from must emit no key, so the pinned wire-freeze constant must \
+         still match — this is what makes the assert_ne below attributable to the field \
+         rather than to some unrelated drift"
+    );
+
+    let mut some_variant = none_variant.clone();
+    let pin = some_variant
+        .components
+        .iter_mut()
+        .find_map(|component| match component {
+            ComponentRef::Pinned(pin) => Some(pin),
+            ComponentRef::Range { .. } => None,
+        })
+        .expect("asserted present above");
+    pin.resolved_from = Some(semver::VersionReq::parse("^1.2").unwrap());
+
+    let some_digest = manifest_digest(&some_variant).unwrap();
+    assert_ne!(
+        none_digest, some_digest,
+        "recording a resolved range MUST change package identity — a pin that declares it \
+         resolved `^1.2` is a different fact from a pin that declares nothing, and the \
+         digest is where that difference has to show up"
     );
 }
 
@@ -228,12 +292,10 @@ fn agent_package_digest_is_stable_across_100_computations_via_canonicalize() {
         name: "claims-triage-agent".to_string(),
         version: semver::Version::parse("1.2.0").unwrap(),
         instructions: "You triage incoming insurance claims.".to_string(),
-        llm: ConfigSlot {
-            slot: SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "anthropic".to_string(),
-            },
-        },
+        llm: ConfigSlot::new(SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "anthropic".to_string(),
+        }),
         max_tokens: 8192,
         max_iterations: 15,
         connectors: vec![ComponentRef::Range {
@@ -246,12 +308,10 @@ fn agent_package_digest_is_stable_across_100_computations_via_canonicalize() {
         output_schema: Some(serde_json::json!({ "type": "object" })),
         importance: Some("HIGH".to_string()),
         finalizer_role: Some("formatter".to_string()),
-        budget_defaults: vec![ConfigSlot {
-            slot: SlotType::BudgetOverride {
-                name: "monthly-cap".to_string(),
-                tested_value: "500".to_string(),
-            },
-        }],
+        budget_defaults: vec![ConfigSlot::new(SlotType::BudgetOverride {
+            name: "monthly-cap".to_string(),
+            tested_value: "500".to_string(),
+        })],
     };
 
     let first = manifest_digest(&package)
@@ -337,5 +397,109 @@ fn reordering_workflow_components_and_slots_via_new_yields_same_digest() {
     assert_eq!(
         digest_forward, digest_backward,
         "WorkflowManifest::new must sort deterministically regardless of input order"
+    );
+}
+
+// =========================================================================
+// Plan 120-05 Task 4 (D-12) — the PACKED-MANIFEST golden.
+//
+// The four constants above pin `manifest_digest(&struct)`, which is a
+// function of the STRUCT's serialized fields and is therefore BLIND to the
+// layer set, the layer order, the media-type strings and the layer
+// annotations. This one packs a real layout and pins what `finalize_pack`
+// RETURNS, which is the only value in the crate that moves when any of those
+// four change. That difference is the whole point of adding it.
+// =========================================================================
+
+/// The packed OCI manifest digest of the WITH-SPEC config-only london-tube
+/// package.
+///
+/// # What this constant is a function of — and what it is NOT
+///
+/// It is `sha256(canonical manifest bytes)`, i.e. a function of
+/// `{schemaVersion, mediaType, artifactType, the config descriptor, and per
+/// layer: mediaType + size + digest + annotations}`.
+///
+/// It is **NOT** a function of the package's name or version: the index
+/// descriptor's `name`/`version` annotations are applied AFTER `write_manifest`
+/// has already computed the manifest digest. So "proving" this golden moves by
+/// bumping the package version yields a FALSE GREEN — mutate a layer instead.
+///
+/// # Why the WITH-SPEC case (D-14)
+///
+/// The spec layer is optional. Pinning the without-spec shape would let the
+/// spec-less path quietly become the default while this test stayed green, so
+/// the pinned case carries the spec and a companion assertion below requires
+/// the without-spec digest to DIFFER.
+///
+/// Authored by the procedure the four struct goldens used: write the assertion
+/// with a placeholder, run once, copy `actual` out of the failure. Never
+/// computed through a second code path — `pack.rs` keeps one hash with one
+/// source of truth.
+const EXPECTED_CONFIG_SERVER_PACKED_MANIFEST_DIGEST: &str =
+    "sha256:5bd6bad19359c974d487e2754323c075a57c58559bac1619eb29d005882cf7e1";
+
+#[test]
+fn config_server_packed_manifest_digest_matches_pinned_constant() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, digest) = pack_london_tube(dir.path(), Some(&london_tube_spec_bytes()));
+    assert_eq!(
+        digest.as_str(),
+        EXPECTED_CONFIG_SERVER_PACKED_MANIFEST_DIGEST,
+        "the PACKED manifest digest of the with-spec config-only package changed. Unlike the \
+         four struct-level goldens, this one sees the layer SET, the layer ORDER, the \
+         media-type strings and the layer filename annotations — so one of those four moved, \
+         and a previously published CLI can no longer read this package. Bump the format \
+         version intentionally; do NOT silently repin."
+    );
+}
+
+#[test]
+fn the_with_spec_and_without_spec_packed_digests_differ() {
+    let with_dir = tempfile::tempdir().unwrap();
+    let (_, with_spec) = pack_london_tube(with_dir.path(), Some(&london_tube_spec_bytes()));
+    let without_dir = tempfile::tempdir().unwrap();
+    let (_, without_spec) = pack_london_tube(without_dir.path(), None);
+    assert_ne!(
+        with_spec, without_spec,
+        "the pinned golden must not be satisfiable by a package that dropped its spec layer — \
+         if these were equal, the spec-less shape could quietly become the default"
+    );
+}
+
+/// PKG-03 criterion 3: the spec is BAKED into the package, so one byte of it is
+/// a different package — and the stale digest is REJECTED against the new
+/// manifest's bytes.
+///
+/// Both halves are required. `assert_ne!` alone shows the digest moved but not
+/// that anything catches a stale one; the `verify` half is what makes tamper
+/// detection a property rather than an observation.
+#[test]
+fn one_flipped_spec_byte_moves_the_packed_digest_and_the_stale_one_is_rejected() {
+    let spec = london_tube_spec_bytes();
+    let mut mutated = spec.clone();
+    mutated[0] ^= 0x01;
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let (_, digest_a) = pack_london_tube(dir_a.path(), Some(&spec));
+    let dir_b = tempfile::tempdir().unwrap();
+    let (layout_b, digest_b) = pack_london_tube(dir_b.path(), Some(&mutated));
+
+    assert_ne!(
+        digest_a, digest_b,
+        "the OpenAPI spec is BAKED into the package: a one-byte change is a different package, \
+         never a slot a target environment fills in"
+    );
+
+    let manifest_bytes_b = read_manifest_bytes(&layout_b);
+    // Sanity: the NEW digest does verify against the NEW bytes, so the failure
+    // below is about staleness and not about reading the wrong blob.
+    verify(&digest_b, &manifest_bytes_b).expect("the fresh digest must verify against its bytes");
+
+    let err = verify(&digest_a, &manifest_bytes_b)
+        .expect_err("the stale digest must not verify against the new manifest");
+    assert!(
+        matches!(err, PackageError::DigestMismatch { .. }),
+        "expected DigestMismatch, got: {err}"
     );
 }

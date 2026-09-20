@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-openapi-server"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -44,7 +44,7 @@ pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
 # `ScriptToolHandler` + code-mode engine path (gated `openapi-code-mode` in
 # Plans 90-04/90-05) would compile out and the binary's script-tool/code-mode
 # wiring would break (RESEARCH Pitfall 4). The binary serves the full surface.
-pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", features = ["openapi-code-mode"] }
+pmcp-server-toolkit = { version = "0.1.2", path = "../pmcp-server-toolkit", features = ["openapi-code-mode"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
@@ -60,7 +60,7 @@ thiserror = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
-mcp-tester = { version = "0.7.0", path = "../mcp-tester" }
+mcp-tester = { version = "0.8.0", path = "../mcp-tester" }
 tempfile = "3"
 serde_json = "1"
 # Why: the SC-1 HTTP smoke test stands up a wiremock REST backend so the
@@ -70,3 +70,65 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Why (mirror pmcp-sql-server): the StreamableHttpTransportConfig `url` field is
 # a `url::Url`. Matches the workspace url = "2.5".
 url = "2.5"
+# Why (Phase 121 D-01): the PKG-04 round-trip E2E packs a `.pmcp` package in a
+# simulated environment A and unpacks it in a distinct environment B, so it needs
+# the AI-Package format crate. It lives here (not in `pmcp-package`) because this
+# crate's dev-deps already carry `mcp-tester`, `wiremock`, `tempfile` AND the
+# served binary itself.
+#
+# This entry is DELIBERATELY PATH-ONLY — do not add a version key (Phase 121
+# CR-01). Cargo strips a `[dev-dependencies]` entry from the published manifest
+# ONLY when it carries no version requirement; an entry that carries one is
+# retained, and `cargo publish` must then resolve it against crates.io at
+# manifest-prep time. `crates/pmcp-package` is workspace-EXCLUDED and publishes
+# from `.github/workflows/release.yml` via `--manifest-path`, FIVE publish steps
+# AFTER this crate (this crate publishes right after `pmcp-sql-server`;
+# `pmcp-package` publishes after `mcp-preview`) — so that lookup cannot
+# succeed, and the publish step's fallback (which tolerates only "already
+# exists") kills the whole release job. Measured: with a requirement present,
+# `cargo package --no-verify` on this manifest exits 101 with "failed to select
+# a version for the requirement" / "candidate versions found which didn't match:
+# 0.1.1, 0.1.0"; path-only, it exits 0 and the generated manifest in the produced
+# `.crate` contains no `pmcp-package` entry at all.
+#
+# The `exclude` list above does NOT save a versioned entry: the failure happens
+# while preparing the manifest, and excluding `tests/` removes the CONSUMERS of
+# this dev-dep, not the manifest entry itself.
+#
+# D-03's drift guarantee did not go away — it moved. `tests/pmcp_package_pin.rs`
+# now asserts (a) that this entry stays path-only, and (b) that
+# `crates/pmcp-package/Cargo.toml`'s own version field stays on the 0.3 line
+# (moved from 0.2 by Phase 122's four source-breaking attestation-carriage
+# changes), i.e. the crate this path dep actually resolves to. That is stronger
+# than asserting a requirement string, because a path dep never consults the
+# registry a requirement would have constrained.
+#
+# `crates/pmcp-package` is workspace-EXCLUDED, so this is a path dep into a
+# standalone workspace (precedents: `crates/pmcp-agent/Cargo.toml:18`,
+# `cargo-pmcp/Cargo.toml:87` — both in `[dependencies]`; this is the first in
+# `[dev-dependencies]`, and the first in-repo consumer placed BEFORE
+# `pmcp-package`'s own publish step).
+#
+# THE GENERAL RULE, of which `pmcp-package` was merely the first casualty: a
+# `[dev-dependencies]` entry carrying BOTH `path` and `version` is retained in
+# the published manifest and must resolve on crates.io at publish time. It is
+# therefore safe only while the named version is ALREADY published. This is not
+# a `pmcp-package` quirk. Four crates in this workspace still carry
+# `mcp-tester = { version = "0.8.0", path = ... }` while publishing BEFORE
+# `mcp-tester` itself: `pmcp-server-toolkit` (Cargo.toml:192), `pmcp-sql-server`
+# (:57), THIS crate (:63), and `pmcp-workbook-server` (:58). They are green only
+# because 0.8.0 is already on crates.io — the next `mcp-tester` minor bump
+# rewrites all four and the release job dies partway through, after earlier
+# crates have gone irreversibly to crates.io. See deferred item D12 for the
+# generic offline gate that would catch this class before a tag push.
+pmcp-package = { path = "../pmcp-package" }
+# Why (Phase 121 D-03): the pin tripwire parses THIS manifest with a real TOML
+# parser rather than grepping its text, so a reformat or a comment cannot fool it.
+# Pinned on the 1.x line because that is the ROOT-workspace line — root
+# `Cargo.toml:131` `toml = "1.0"`, `crates/pmcp-server-toolkit/Cargo.toml:27`
+# `toml = "1"`, `cargo-pmcp/Cargo.toml:53` `toml = "1.0"` — and this crate is a
+# root member. Deliberately NOT `pmcp-package`'s `0.8`: that crate is its own
+# standalone workspace, and adding a second major `toml` to the root graph to
+# match it would be a regression. The copied tripwire already compiles and passes
+# against `toml = "1.0"` in `cargo-pmcp`.
+toml = "1"

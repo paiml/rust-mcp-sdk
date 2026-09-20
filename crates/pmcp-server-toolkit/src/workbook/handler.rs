@@ -1,5 +1,7 @@
-//! The curated workbook tool handlers (WBSV-01/02/03/04): `calculate`,
-//! `explain`, `get_manifest`, `diff_version`.
+//! The curated workbook tool handlers (WBSV-01/02/03/04): the per-output-Table
+//! compute handler (WBV2-04 registers one NAMED tool per Table — the generic
+//! single `calculate` is retired), plus `explain`, `get_manifest`,
+//! `diff_version`.
 //!
 //! All are native [`pmcp::ToolHandler`] impls registered via `tool_arc` and
 //! [`pmcp::types::ToolInfo::with_ui`] (so the returned `Value` lands in

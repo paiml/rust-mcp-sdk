@@ -121,6 +121,9 @@ async fn main() -> Result<()> {
     // Step 3: Create HTTP server config (middleware retrieved from server)
     let config = StreamableHttpServerConfig {
         http_middleware: server.http_middleware(),
+        // v1-only as of Phase 117; gated per-field so the MIDDLEWARE this example
+        // is actually about keeps building on `--features full-v2`.
+        #[cfg(feature = "v1-compat")]
         session_id_generator: Some(Box::new(|| {
             format!("demo-session-{}", uuid::Uuid::new_v4())
         })),

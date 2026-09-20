@@ -1,4 +1,4 @@
-//! The range-capable value the 13 whitelisted-function bodies consume (finding #4).
+//! The range-capable value the 17 whitelisted-function bodies consume (finding #4).
 //!
 //! The scalar evaluator ([`super::scalar_eval`]) evaluates ONLY scalar leaf
 //! arithmetic — a single [`CellValue`] scalar per leaf. But the Excel-semantics

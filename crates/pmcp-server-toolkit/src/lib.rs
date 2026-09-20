@@ -29,6 +29,24 @@
 pub mod auth;
 pub mod builder_ext;
 pub mod config;
+
+/// The `${VAR}` / `env:VAR` reference grammar — the ONE parse chokepoint every
+/// env-reference path in the toolkit shares (credentials, `token_secret`, and
+/// `[backend].base_url`).
+///
+/// Deliberately carries NO `#[cfg(feature = ...)]` gate: the function used to
+/// live inside the feature-gated `http` module, which made "the toolkit's
+/// universal chokepoint" true only in `http` builds.
+///
+/// `pub` rather than `pub(crate)` (plan 120-05): the grammar is duplicated by
+/// necessity in `pmcp-package` — the workspace-excluded leaf crate, which
+/// neither may depend on this one nor be depended on by it — and the two
+/// implementations are held to a shared accept/reject table asserted from an
+/// INTEGRATION test in each crate. An integration test is an external consumer,
+/// so the reference implementation has to be reachable from outside the crate
+/// for that parity claim to be checkable at all.
+pub mod env_ref;
+
 pub mod error;
 pub mod prompts;
 pub mod resources;

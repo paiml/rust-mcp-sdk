@@ -96,6 +96,7 @@ mod tests {
             component_type: ComponentType::Agent,
             version: semver::Version::parse(version).unwrap(),
             digest: ManifestDigest::from_bytes(b"fixture"),
+            resolved_from: None,
         })
     }
 

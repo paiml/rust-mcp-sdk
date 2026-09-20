@@ -44,20 +44,16 @@ impl Drop for EnvGuard {
 }
 
 fn llm_slot(name: &str, tested: &str) -> ConfigSlot {
-    ConfigSlot {
-        slot: SlotType::LlmProvider {
-            name: name.to_string(),
-            tested_value: tested.to_string(),
-        },
-    }
+    ConfigSlot::new(SlotType::LlmProvider {
+        name: name.to_string(),
+        tested_value: tested.to_string(),
+    })
 }
 
 fn secret_slot(name: &str) -> ConfigSlot {
-    ConfigSlot {
-        slot: SlotType::Secret {
-            name: name.to_string(),
-        },
-    }
+    ConfigSlot::new(SlotType::Secret {
+        name: name.to_string(),
+    })
 }
 
 fn sample_agent() -> AgentPackage {

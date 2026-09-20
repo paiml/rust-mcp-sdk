@@ -337,7 +337,10 @@ impl From<crate::Error> for JSONRPCError {
                 message: message.clone(),
                 data: data.clone(),
             },
-            _ => Self::new(-32603, err.to_string()),
+            _ => Self::new(
+                crate::types::protocol::error_codes::INTERNAL_ERROR,
+                err.to_string(),
+            ),
         }
     }
 }

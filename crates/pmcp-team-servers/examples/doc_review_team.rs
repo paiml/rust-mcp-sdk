@@ -105,12 +105,10 @@ fn member_pkg(name: &str, instructions: &str) -> AgentPackage {
         instructions: instructions.to_string(),
         // Mandatory llm slot — resolved to its tested value, but never actually
         // used because the FixedSource override is injected.
-        llm: ConfigSlot {
-            slot: SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "doc-review-mock".to_string(),
-            },
-        },
+        llm: ConfigSlot::new(SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "doc-review-mock".to_string(),
+        }),
         max_tokens: 4096,
         max_iterations: 5,
         connectors: vec![],

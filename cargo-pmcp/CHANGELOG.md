@@ -5,6 +5,194 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-09-18
+
+### Fixed
+
+- **`--oauth-issuer` now takes effect on `auth login`** (issue #368). The flag
+  was documented and accepted but inert: the discovery path in `pmcp` tested
+  `mcp_server_url` before `issuer`, and `login.rs` always sets the server URL
+  (it is a required positional), so an explicit issuer could never change where
+  discovery went. The failure message meanwhile advised passing this very flag.
+  The functional fix is in `pmcp` 2.20.3; this crate now also prints the issuer
+  when it is set explicitly, so an operator can see the override took effect
+  rather than having to infer it.
+
+### Changed
+
+- **`PMCP_VERSION` 2.20.0 -> 2.20.3** (`src/templates/workbook_server.rs`), so a
+  scaffold pins the `pmcp` shipping at this tag. Caught by its own drift guard
+  (`emitted_pmcp_version_matches_workspace_pin`) rather than by review.
+  `PMCP_VERSION_REQ` (`src/templates/workspace.rs`) stays `"2.20"` — it is a
+  minor-level requirement and `2.20` already admits `2.20.3`.
+
+- **`pmcp` dependency pin 2.19.0 -> 2.20.3** (`Cargo.toml`). This is deliberately
+  tighter than the caret rule in the root `CLAUDE.md` requires: `^2.19.0` would
+  *permit* the fixed `pmcp` but not *require* it, so a stale lockfile could
+  install this version against a `pmcp` whose `--oauth-issuer` is still inert.
+  The flag's behaviour depends on the patch, so the requirement names it.
+
+## [0.24.1] - 2026-09-04
+
+### Changed
+
+- **`PMCP_VERSION` 2.19.3 -> 2.20.0** (`src/templates/workbook_server.rs`) and
+  **`PMCP_VERSION_REQ` "2.19" -> "2.20"** (`src/templates/workspace.rs`), so a
+  scaffold pins the `pmcp` shipping at this tag. Both were caught by their own
+  drift guards (`emitted_pmcp_version_matches_workspace_pin`,
+  `emitted_pmcp_requirement_matches_workspace_major_minor_line`) rather than by
+  review — the guards are the reason a `pmcp` bump cannot silently ship a stale
+  scaffold.
+
+  This crate is bumped rather than left alone because it is already published at
+  0.24.0: the release workflow skips a version that exists on crates.io, so the
+  scaffold change would otherwise never reach users. `cargo-pmcp` publishes well
+  after `pmcp` in the release order, so the emitted `pmcp = "2.20"` resolves by
+  the time this crate is published.
+
+## [0.24.0] - 2026-08-29
+
+### Added (R1, folded into this unreleased version)
+
+- **`package load`/`pull` render a *"Supplied by the host at deploy time"*
+  section.** Slots a config declares as `supplied_by = "platform"` or
+  `"runtime"` are excluded from *"Required slots"* — no operator fills them —
+  but are still shown, attributed, with their tested value. A slot nobody is
+  asked for and nothing displays is invisible, and a reader could not otherwise
+  tell "this package needs nothing here" from "this package never said".
+
+- **`package save` carries a declaration's `supplied_by` into the package.** The
+  config document is the source of truth for who fills a slot; the CLI does not
+  infer it.
+
+### Changed
+
+- `pmcp-package` pin moves `0.3` -> `0.4`, `pmcp-agent` `0.3` -> `0.4`,
+  `pmcp-team-servers` `0.2` -> `0.3`, `pmcp-cfn-renderer` `0.2` -> `0.3`. The
+  scaffold emitters `PMCP_PACKAGE_VERSION_REQ`, `PMCP_AGENT_VERSION` and
+  `TOOLKIT_VERSION` move with them; each has a drift test, and
+  `PMCP_AGENT_VERSION`/`TOOLKIT_VERSION` are invisible to the compiler because
+  they are emitted into scaffolded projects.
+
+### Added
+
+- **`package save` learns where the binary is.** Three mutually-exclusive inputs
+  — `--binary <path>` (embeds the bytes), `--binary-from <path>` (references,
+  digest derived from the file) and the existing `--binary-digest sha256:<hex>`
+  (references, digest supplied) — defaulting to `deploy/.build/bootstrap`, which
+  is where `cargo pmcp deploy` leaves the artifact it uploads. The common case is
+  now a bare `cargo pmcp package save`.
+
+  Deriving the digest from bytes removes the class of error where the digest and
+  the binary disagree because a human typed one of them. Before this, packing
+  meant hand-computing a `shasum` even though `deploy` had just produced the
+  exact bytes.
+
+  **Referencing remains the default.** A configuration server should name its
+  runtime rather than carry it, and a team package sharing one MCP server across
+  N agents would otherwise carry that binary N times. Embedding is opt-in.
+
+  The trade is documented in `--binary`'s long help: an embedded package's digest
+  moves on every rebuild, including a byte-identical-source rebuild on a
+  different toolchain, while a referenced one's does not.
+
+### Changed
+
+- **`--binary-digest` is no longer required.** Existing invocations are
+  unaffected; it is now one of three ways to answer the same question.
+
+## [0.23.1] - 2026-08-28
+
+Ships with `pmcp` 2.19.2 / `pmcp-package` 0.3.1 (tag `v2.19.2`). Scaffold-output
+change only — no CLI surface moved, so no consumer pin changes.
+
+### Changed
+
+- **`cargo pmcp new --kind sql-server|openapi-server` now teaches the declared
+  config shape.** `pmcp-package` 0.3.1 refuses to pack a config that defers a
+  value to the environment without a `[[config_slots]]` entry naming its key, and
+  both templates' own advice ("replace with a secrets ref
+  `token_secret = \"env:CODE_MODE_SECRET\"`") walked the reader straight into that
+  refusal. Both now show the matching `[[config_slots]]` declaration beside it.
+
+  The out-of-box scaffold was never broken: it emits a dev-only *literal*
+  `token_secret`, which the gate does not touch. The break was one step later, at
+  the documented "productionize your config" move.
+- **`PMCP_VERSION` 2.19.1 -> 2.19.2** (`src/templates/workbook_server.rs`), so a
+  workbook scaffold pins the `pmcp` shipping at this tag. Caught by its own
+  `emitted_pmcp_version_matches_workspace_pin` drift guard rather than by review
+  — the guard is the reason a `pmcp` bump cannot silently ship a stale scaffold.
+
+## [0.22.0] - Unreleased
+
+Phase 120 (config-server packaging). Re-pins onto the crates whose versions
+moved with it: `pmcp-package` 0.2, `pmcp-agent` 0.3, `pmcp-team-servers` 0.2,
+`pmcp-cfn-renderer` 0.2.
+
+### Changed (BREAKING for scaffolds)
+
+- `cargo pmcp agent new` emits `pmcp-agent = "0.3.0"` + `pmcp-package = "0.2"`.
+  A scaffold generated by 0.21.0 pins the 0.1-format package types and will not
+  compile against the new agent crate — regenerate it. (There are no consumers
+  of 0.1.x AI-Packages, so no migration shim is provided by design.)
+
+### Fixed
+
+- `cargo pmcp package inspect` recognizes all nine server layer media types
+  when detecting a package kind. Four typed sections — deploy-descriptor,
+  Cedar policy set, tool metadata, config slots — were missing, so a manifest
+  without an `artifactType` whose only recognizable layers were those sections
+  failed with "unknown package kind".
+
+## [0.21.0] - 2026-08-07
+
+Published as part of the `v2.19.0` release train (PR #299) without its own
+changelog entry at the time. See `git log v0.20.0..v2.19.0 -- cargo-pmcp/`
+for the change set (auth integration, agent/mcp-app templates, deploy).
+
+## [0.20.0] - 2026-07-22
+
+### Added
+
+- **Node/CDK dropped for standard scaffolds** — `cargo pmcp deploy` on the
+  `pmcp-run` and `aws-lambda` targets now synthesizes CloudFormation directly
+  via the new `pmcp-cfn-renderer` crate (a pure `DeployDescriptor ->
+  CloudFormation` renderer) instead of shelling out to `npx cdk synth`,
+  whenever `deploy/lib/stack.ts` is byte-identical to the regenerated
+  scaffold. The `aws-lambda` target goes further: it also **applies** the
+  rendered template directly against `aws-sdk-cloudformation` (create/update,
+  poll-to-terminal, `Outputs` → `deploy/outputs.json`), so a plain, HTTP-API,
+  or Cognito+DCR/OAuth `aws-lambda` deploy needs **no Node.js, npm, or CDK
+  installed at all**. A hand-modified `stack.ts` is detected and always falls
+  back to the legacy `cdk synth`/`cdk deploy` path unchanged (see the
+  `custom_stack` taint note below) — this is additive, not a breaking
+  removal of the CDK path.
+- **Zero-tooling built-in-server deploys** — an `aws-lambda` project that
+  declares `[metadata].server_type` (`sql-server`/`openapi-server`/
+  `workbook-server`) now fetches the matching prebuilt Shape A binary
+  (`pmcp-sql-server`/`pmcp-workbook-server`/`pmcp-openapi-server`) from
+  GitHub Releases instead of requiring a local Rust build, wraps it in a
+  Lambda-deployable zip with a generated `bootstrap` shim, and attaches the
+  AWS Lambda Web Adapter layer so the plain HTTP server can run under the
+  Lambda Runtime API unmodified. No `cargo lambda` / Rust toolchain required
+  for this path.
+- **Custom-stack `cdk` fallback with taint** — any project whose
+  `deploy/lib/stack.ts` no longer matches the regenerated scaffold
+  transparently falls back to the pre-existing `cdk synth`/`cdk deploy`
+  path (unchanged behavior) and is tainted (`McpMetadata::custom_stack`) so
+  downstream tooling/platform can see that a deploy took the custom path.
+  The CLI only warns and records this — it does not enforce any policy
+  based on the taint.
+
+### Notes
+
+- See `docs/runbooks/cfn-renderer-switch-gate.md` for the pre-production
+  real-deploy gate, the required pmcp.run platform-validator acceptance
+  check, and known operational gaps (unbounded stack-poll loop, no
+  `ROLLBACK_COMPLETE` auto-recovery, inline `TemplateBody` size headroom,
+  the pinned Lambda Web Adapter layer version, and more) before relying on
+  this path in production.
+
 ## [0.19.0] - 2026-07-20
 
 ### Added

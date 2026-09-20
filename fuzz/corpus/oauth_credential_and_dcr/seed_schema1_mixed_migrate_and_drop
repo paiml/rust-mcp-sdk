@@ -1,0 +1,1 @@
+{"schema_version":1,"entries":{"https://a.example":{"access_token":"a","issuer":"https://as.example","client_id":"c"},"https://b.example":{"access_token":"b","client_id":"c"}}}

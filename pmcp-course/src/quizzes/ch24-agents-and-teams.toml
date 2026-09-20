@@ -1,0 +1,133 @@
+# Quiz: Agents & Teams - Deploy-Anywhere Agent Loops
+
+id = "ch24-agents-and-teams"
+title = "Agents & Teams: Deploy-Anywhere Agent Loops"
+lesson_id = "ch24"
+pass_threshold = 0.7
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "What does the source-agnostic loop invariant guarantee about a `pmcp-agent` `AgentEngine`?"
+prompt.distractors = [
+    "The engine automatically retries against a second provider when the first one fails",
+    "The engine detects at runtime which completion source is fastest and selects it",
+    "The engine's completion source is fixed at compile time so the loop can be monomorphized",
+]
+answer.answer = "The same engine, driven by the same `ResolvedAgentConfig`, runs against any `CompletionSource` with no change to the decision loop"
+answer.position = 3
+context = """
+Where completions come from is a seam, not a dependency. The alternative -
+writing the loop against a concrete provider client and branching when a second
+provider appears - fails silently: each branch accrues its own retry policy,
+iteration accounting, and termination rule until the two paths are no longer the
+same agent. The `s50_standalone_vs_sampled` example runs ONE engine twice
+(standalone over a scripted source, then hosted through a real `pmcp::Client`)
+and its closing banner is asserted by `tests/docs04_examples_run.rs`.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900001"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "Why does the hosted-sampled shape need a `CompletionSourceFactory` rather than a `CompletionSource` handed in at construction time?"
+prompt.distractors = [
+    "Because `CompletionSource` is not `Send + Sync` and cannot cross an await point",
+    "Because the factory caches sources per model id to avoid re-authenticating on every call",
+    "Because `AgentServer` supports multiple providers simultaneously and the factory picks between them",
+]
+answer.answer = "Because the source is built from the CALLER's peer, and no peer exists until a request arrives - so construction must be deferred to request scope"
+answer.position = 3
+context = """
+`AgentServer` takes a `CompletionSourceFactory` and builds a request-scoped
+`SamplingSource` from `extra.peer()`. Standalone construction can take the source
+directly because the agent owns model access; hosted construction cannot, because
+the completions travel back through whoever invoked the agent. The deferral is
+what lets the SAME loop serve both shapes.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900002"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "An agent exposed through `AgentServer` ships with no model credential. Where do its completions come from?"
+prompt.distractors = [
+    "From a credential the agent package resolves out of `agent.package.json` at startup",
+    "From a shared credential held by the team-mcp reference server on the agent's behalf",
+    "From a cached completion store populated during an earlier standalone run",
+]
+answer.answer = "From the MCP host that invoked it, which answers the agent's `sampling/createMessage` requests using its own model access"
+answer.position = 3
+context = """
+This is the whole reason the hosted shape exists: you ship the behaviour, the host
+supplies the model. The agent is simultaneously an MCP server (it is a tool other
+clients call) and an MCP client (inside that tool it issues
+`sampling/createMessage` back to its caller). Holding both roles at once is the
+normal condition for a hosted agent, not an edge case.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900003"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "Which of the four reference servers owns the human-in-the-loop step in the doc-review team flow?"
+prompt.distractors = [
+    "team-fs - the human edits the draft directly in the shared workspace",
+    "team-mcp - the human is dispatched to like any other team member",
+    "mem-mcp - the verdict is stored as a memory and read back by the drafter",
+]
+answer.answer = "approval-mcp - a member asks for sign-off via `team_approval__ask_<role>` and the verdict is recorded separately via `resolve_approval`"
+answer.position = 3
+context = """
+Asking and answering are DISTINCT operations because the human replies on their own
+schedule; a single blocking call would model a human as a synchronous function.
+The human is a first-class participant with their own role and their own server,
+not a callback bolted onto an agent. The other three servers own the shared
+workspace (team-fs), durable team memory (mem-mcp), and agent-facing dispatch
+(team-mcp).
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900004"
+
+[[questions]]
+type = "ShortAnswer"
+prompt.prompt = "Which `cargo pmcp agent dev` source flag value runs the loop offline with no network and no API key? (Flag VALUE only.)"
+answer.answer = "fixed"
+answer.alternatives = ["fixed", "--source fixed"]
+context = """
+`--source fixed` runs a scripted, offline source through the lib-safe runner seam -
+the right choice for a first run and for tests. The default is `openai-compat`,
+which drives an OpenAI-compatible HTTP endpoint (defaulting to a local Ollama at
+`http://localhost:11434/v1`); `--source sampling` serves the agent over stdio and
+lets an MCP host supply the completions. Only `--source` changes between an offline
+run and a live-model run: the package does not, and neither does the loop.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900005"
+
+[[questions]]
+type = "ShortAnswer"
+prompt.prompt = "The `doc_review_team` example declares `required-features`. Which single Cargo feature must be enabled to build it? (Feature name only.)"
+answer.answer = "runtime"
+answer.alternatives = ["runtime", "--features runtime"]
+context = """
+`cargo run -p pmcp-team-servers --example doc_review_team --features runtime` is the
+minimal invocation, and it is the one the repository's automated run test builds and
+asserts against. Omitting the feature makes Cargo refuse to build the target at all
+rather than building a degraded one - feature-gating an example turns "this needs the
+runtime" into a compile-time fact instead of a runtime surprise.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900006"
+
+[[questions]]
+type = "MultipleChoice"
+prompt.prompt = "Why does `cargo run -p pmcp-agent --example s50_standalone_vs_sampled` carry `-p pmcp-agent` rather than being cited as `--example s50`?"
+prompt.distractors = [
+    "Because `-p` selects the feature set the example needs, which differs from the workspace default",
+    "Because examples in workspace member crates are not built unless their package is named on the command line at publish time",
+    "Because the root package would otherwise run the example under the wrong edition",
+]
+answer.answer = "Because the example lives in `crates/pmcp-agent/examples/` and the `s50` number is ALSO taken in the root `examples/` directory - a bare example number is ambiguous in this repository"
+answer.position = 3
+context = """
+The numbered example namespace genuinely collides across the root `examples/` tree and
+the per-crate `crates/*/examples/` trees, which is why this course always cites examples
+by their FULL runnable invocation rather than by number. This particular example needs no
+`--features` flag - it builds and runs under default features - so `-p` is the only
+non-obvious part of the command.
+"""
+id = "f24a1b2c-d3e4-5678-abcd-123456900007"

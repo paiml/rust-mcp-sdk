@@ -517,12 +517,10 @@ fn member_pkg(name: &str, instructions: &str) -> AgentPackage {
         name: name.to_string(),
         version: semver::Version::new(1, 0, 0),
         instructions: instructions.to_string(),
-        llm: ConfigSlot {
-            slot: SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "team-dev-mock".to_string(),
-            },
-        },
+        llm: ConfigSlot::new(SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "team-dev-mock".to_string(),
+        }),
         max_tokens: 4096,
         max_iterations: 5,
         connectors: vec![],

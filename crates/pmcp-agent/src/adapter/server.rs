@@ -281,8 +281,10 @@ async fn run_agent_tool(
         .get("run_id")
         .or_else(|| args.get("conversation_id"))
         .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
+        .map_or_else(
+            || format!("run-{}", uuid::Uuid::new_v4()),
+            ToString::to_string,
+        );
 
     // Seed the run: load prior history (resume) or start fresh, append the new
     // user turn, and reset the phase so the engine begins a fresh completion.
@@ -372,8 +374,8 @@ fn error_result(run_id: &str, message: &str) -> CallToolResult {
     result
 }
 
-/// Concatenate the text blocks of a turn into a single string (tool_use/other
-/// blocks are non-textual and skipped).
+/// Concatenate the text blocks of a turn into a single string (`tool_use` and
+/// other non-textual blocks are skipped).
 fn render_turn_text(turn: &crate::iteration::TurnMessage) -> String {
     let mut parts = Vec::new();
     for block in &turn.content {
@@ -395,12 +397,10 @@ mod tests {
             name: name.to_string(),
             version: semver::Version::parse("1.0.0").unwrap(),
             instructions: instructions.to_string(),
-            llm: ConfigSlot {
-                slot: SlotType::LlmProvider {
-                    name: "primary-llm".to_string(),
-                    tested_value: "test-model".to_string(),
-                },
-            },
+            llm: ConfigSlot::new(SlotType::LlmProvider {
+                name: "primary-llm".to_string(),
+                tested_value: "test-model".to_string(),
+            }),
             max_tokens: 4096,
             max_iterations: 10,
             connectors: vec![],

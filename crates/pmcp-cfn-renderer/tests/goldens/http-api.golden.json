@@ -1,0 +1,328 @@
+{
+  "descriptor_toml": "[target]\ntype = \"aws-lambda\"\nversion = \"1.0.0\"\n\n[aws]\nregion = \"us-east-1\"\n\n[server]\nname = \"http-api-fixture\"\nmemory_mb = 512\ntimeout_seconds = 30\n\n[environment]\nRUST_LOG = \"info\"\n\n[secrets]\n\n[auth]\nenabled = false\nprovider = \"none\"\ncallback_urls = []\n\n[auth.dcr]\nenabled = true\npublic_client_patterns = [\n    \"claude\",\n    \"desktop\",\n    \"cursor\",\n    \"mcp-inspector\",\n    \"chatgpt\",\n]\ndefault_scopes = [\n    \"openid\",\n    \"email\",\n    \"mcp/read\",\n]\nallowed_scopes = [\n    \"openid\",\n    \"email\",\n    \"profile\",\n    \"mcp/read\",\n    \"mcp/write\",\n]\n\n[auth.scopes.custom]\n\n[observability]\nlog_retention_days = 30\nenable_xray = true\ncreate_dashboard = true\n\n[observability.alarms]\nerror_threshold = 10\nlatency_threshold_ms = 5000\n\n[assets]\ninclude = []\nexclude = [\n    \"**/*.tmp\",\n    \"**/.DS_Store\",\n    \"**/Thumbs.db\",\n]\n\n[composition]\ntier = \"foundation\"\nallow_composition = true\ninternal_only = false",
+  "params": {
+    "account_id": "123456789012",
+    "region": "us-east-1",
+    "stack_name": "http-api-fixture-stack",
+    "artifact": {
+      "s3_bucket": "pmcp-deploy-123456789012-us-east-1",
+      "s3_key": "http-api-fixture/bootstrap.zip"
+    },
+    "environment": {
+      "RUST_LOG": "info"
+    },
+    "metadata": {
+      "version": "1.0.0",
+      "snapshot_baked": false
+    }
+  },
+  "normalized": {
+    "Description": "MCP Server: http-api-fixture",
+    "Outputs": {
+      "ApiUrl": {
+        "Description": "MCP Server API URL",
+        "Value": {
+          "Fn::GetAtt": [
+            "Api-0",
+            "ApiEndpoint"
+          ]
+        }
+      },
+      "DashboardUrl": {
+        "Description": "CloudWatch Console",
+        "Value": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1"
+      },
+      "LambdaArn": {
+        "Description": "MCP Server Lambda ARN",
+        "Value": {
+          "Fn::GetAtt": [
+            "Function-0",
+            "Arn"
+          ]
+        }
+      },
+      "McpRoleArn": {
+        "Description": "MCP Server Lambda execution role ARN (stable export for downstream stacks)",
+        "Export": {
+          "Name": "pmcp-http-api-fixture-McpRoleArn"
+        },
+        "Value": {
+          "Fn::GetAtt": [
+            "Role-0",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "Resources": {
+      "Api-0": {
+        "Properties": {
+          "CorsConfiguration": {
+            "AllowHeaders": [
+              "*"
+            ],
+            "AllowMethods": [
+              "GET",
+              "POST",
+              "OPTIONS"
+            ],
+            "AllowOrigins": [
+              "*"
+            ]
+          },
+          "Description": "MCP Server HTTP API",
+          "Name": "http-api-fixture",
+          "ProtocolType": "HTTP",
+          "Tags": {
+            "managed-by": "pmcp",
+            "project": "http-api-fixture",
+            "service": "http-api-fixture",
+            "target": "aws-lambda"
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Api"
+      },
+      "Function-0": {
+        "DependsOn": [
+          "Policy-0",
+          "Role-0"
+        ],
+        "Properties": {
+          "Architectures": [
+            "arm64"
+          ],
+          "Code": {
+            "S3Bucket": "<artifact>",
+            "S3Key": "<artifact>"
+          },
+          "Environment": {
+            "Variables": {
+              "RUST_LOG": "info"
+            }
+          },
+          "FunctionName": "http-api-fixture",
+          "Handler": "bootstrap",
+          "LoggingConfig": {
+            "LogFormat": "JSON"
+          },
+          "MemorySize": 512,
+          "Role": {
+            "Fn::GetAtt": [
+              "Role-0",
+              "Arn"
+            ]
+          },
+          "Runtime": "provided.al2023",
+          "Tags": [
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ],
+          "Timeout": 30,
+          "TracingConfig": {
+            "Mode": "Active"
+          }
+        },
+        "Type": "AWS::Lambda::Function"
+      },
+      "Integration-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "IntegrationType": "AWS_PROXY",
+          "IntegrationUri": {
+            "Fn::GetAtt": [
+              "Function-0",
+              "Arn"
+            ]
+          },
+          "PayloadFormatVersion": "2.0"
+        },
+        "Type": "AWS::ApiGatewayV2::Integration"
+      },
+      "LogGroup-0": {
+        "Properties": {
+          "LogGroupName": {
+            "Fn::Join": [
+              "",
+              [
+                "/aws/lambda/",
+                {
+                  "Ref": "Function-0"
+                }
+              ]
+            ]
+          },
+          "RetentionInDays": 30,
+          "Tags": [
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::Logs::LogGroup"
+      },
+      "Permission-0": {
+        "Properties": {
+          "Action": "lambda:InvokeFunction",
+          "FunctionName": {
+            "Fn::GetAtt": [
+              "Function-0",
+              "Arn"
+            ]
+          },
+          "Principal": "apigateway.amazonaws.com",
+          "SourceArn": {
+            "Fn::Join": [
+              "",
+              [
+                "arn:aws:execute-api:us-east-1:123456789012:",
+                {
+                  "Ref": "Api-0"
+                },
+                "/*/*"
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::Lambda::Permission"
+      },
+      "Policy-0": {
+        "Properties": {
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Action": [
+                  "xray:PutTraceSegments",
+                  "xray:PutTelemetryRecords"
+                ],
+                "Effect": "Allow",
+                "Resource": "*"
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "PolicyName": "<policy-name>",
+          "Roles": [
+            {
+              "Ref": "Role-0"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Policy"
+      },
+      "Role-0": {
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Statement": [
+              {
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                }
+              }
+            ],
+            "Version": "2012-10-17"
+          },
+          "ManagedPolicyArns": [
+            {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                ]
+              ]
+            }
+          ],
+          "Tags": [
+            {
+              "Key": "managed-by",
+              "Value": "pmcp"
+            },
+            {
+              "Key": "project",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "service",
+              "Value": "http-api-fixture"
+            },
+            {
+              "Key": "target",
+              "Value": "aws-lambda"
+            }
+          ]
+        },
+        "Type": "AWS::IAM::Role"
+      },
+      "Route-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "RouteKey": "POST /{proxy+}",
+          "Target": {
+            "Fn::Join": [
+              "",
+              [
+                "integrations/",
+                {
+                  "Ref": "Integration-0"
+                }
+              ]
+            ]
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Route"
+      },
+      "Stage-0": {
+        "Properties": {
+          "ApiId": {
+            "Ref": "Api-0"
+          },
+          "AutoDeploy": true,
+          "StageName": "$default",
+          "Tags": {
+            "managed-by": "pmcp",
+            "project": "http-api-fixture",
+            "service": "http-api-fixture",
+            "target": "aws-lambda"
+          }
+        },
+        "Type": "AWS::ApiGatewayV2::Stage"
+      }
+    }
+  }
+}

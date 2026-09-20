@@ -6,7 +6,15 @@
 //! - Authorization header propagation to server
 //! - Server-side token validation
 
-#![cfg(feature = "streamable-http")]
+// Phase 117 gated the v1 session-lifecycle and SSE-resumability public API
+// behind `v1-compat`, so this file — whose subject IS that API — does not
+// compile on `--no-default-features --features full-v2`. Gating it here is what
+// makes the aggregate `cargo test -p pmcp --no-default-features --features
+// full-v2` a green run rather than a hard build failure. On the severed build it
+// contributes zero tests, which is correct: there is no v1 to test. The severed
+// build's own coverage is the `tests/v2_*_on_severed_build.rs` family plus the
+// 1867 lib tests that now run there.
+#![cfg(all(feature = "streamable-http", feature = "v1-compat"))]
 
 use async_trait::async_trait;
 use pmcp::client::http_middleware::HttpMiddlewareChain;

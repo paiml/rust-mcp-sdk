@@ -103,12 +103,11 @@ impl pmcp::server::ResourceHandler for DocsResourceHandler {
         _extra: RequestHandlerExtra,
     ) -> pmcp::Result<ReadResourceResult> {
         match content_for_uri(uri) {
-            Some(text) => Ok(ReadResourceResult::new(vec![Content::Resource {
-                uri: uri.to_string(),
-                text: Some(text.to_string()),
-                mime_type: Some("text/markdown".to_string()),
-                meta: None,
-            }])),
+            Some(text) => Ok(ReadResourceResult::new(vec![Content::resource_with_text(
+                uri,
+                text,
+                "text/markdown",
+            )])),
             None => Err(pmcp::Error::not_found(format!(
                 "Unknown documentation resource: {uri}"
             ))),

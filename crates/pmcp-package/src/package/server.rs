@@ -81,11 +81,28 @@ pub struct AwsSection {
     pub region: String,
 }
 
-/// `[server]` — the deployed function's identity + sizing. `memory_mb` is
-/// `Option` because at least one tracked descriptor (`approval-mcp`) omits it
-/// (cargo-pmcp v0.x historically ignored the field, so it was commented out
-/// rather than set). The `memory`/`cpu`/`ingress`/`allow_unauthenticated`/
-/// `binary` fields are google-cloud-run-target-only extras (observed in
+/// `[server]` — the deployed function's identity + sizing.
+///
+/// `memory_mb` is `Option` because at least one tracked descriptor
+/// (`approval-mcp`) omits it: cargo-pmcp v0.x ignored the field entirely, so
+/// it was commented out rather than set. **That is no longer true, and the
+/// `Option` now carries meaning rather than just tolerance.** cargo-pmcp's
+/// pmcp-run deploy path rewrites `Properties.MemorySize` post-synth when the
+/// field is present, on both of its synth engines; `None` means "leave the
+/// engine's own default alone". The parallel field on cargo-pmcp's own
+/// `ServerConfig` was changed from a defaulted `u32` to an `Option<u32>` for
+/// exactly this reason — with a serde default, "omitted" and "explicitly 512"
+/// are indistinguishable, and materializing the 512 would silently resize
+/// every Lambda that never asked. See debug session
+/// `deploy-server-memory-timeout`.
+///
+/// Not every AWS path honors it: `pmcp-cfn-renderer` still pins memory to a
+/// module const, and cargo-pmcp's `aws-lambda` target has no post-render seam,
+/// so both print a divergence warning instead. `timeout_seconds` is required
+/// here (every tracked descriptor sets it) and IS threaded by the renderer.
+///
+/// The `memory`/`cpu`/`ingress`/`allow_unauthenticated`/`binary` fields are
+/// google-cloud-run-target-only extras (observed in
 /// `built-in/test-harness/oauth-external-google/.pmcp/deploy.toml`) — ignored
 /// by the pmcp-run (AWS Lambda) target but must round-trip losslessly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +122,32 @@ pub struct ServerSection {
     pub allow_unauthenticated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+}
+
+/// `[auth.cognito]` — Cognito-specific OAuth configuration, written by
+/// `cargo pmcp deploy init --oauth cognito` (`cargo-pmcp`'s
+/// `CognitoConfig`, `deployment/config.rs`). Not among the original 19
+/// tracked fixtures (none of them enable Cognito OAuth), but real —
+/// discovered by the `pmcp-cfn-renderer` Task 2 golden-generation script
+/// synthesizing a fresh `--oauth cognito` scaffold, whose emitted
+/// `.pmcp/deploy.toml` failed to parse before this section existed. Mirrors
+/// `CognitoConfig` field-for-field (including its defaults) so descriptors
+/// captured from either surface round-trip identically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CognitoSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_pool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_pool_name: Option<String>,
+    pub resource_server_id: String,
+    #[serde(default)]
+    pub social_providers: Vec<String>,
+    pub mfa: String,
+    pub access_token_ttl: String,
+    pub refresh_token_ttl: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// `[auth.dcr]` — dynamic client registration config. All fields but
@@ -144,6 +187,11 @@ pub struct AuthSection {
     pub provider: String,
     #[serde(default)]
     pub callback_urls: Vec<String>,
+    /// Cognito-specific config, present only when `provider = "cognito"`
+    /// AND the deploy is a local (non-`pmcp-run`) `aws-lambda` OAuth stack
+    /// — see [`CognitoSection`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognito: Option<CognitoSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dcr: Option<AuthDcrSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -321,11 +369,21 @@ pub struct ToolMetadata {
 // BinaryRef — a reference to the bootstrap blob, never the bytes themselves
 // ---------------------------------------------------------------------
 
-/// A reference to the server's bootstrap Lambda binary. The binary bytes
-/// are NEVER inlined here — `pack_server(package, bootstrap,
-/// layout)` takes the raw bytes as a SEPARATE argument and turns them into a
-/// content-addressed OCI layer; this type only carries the resulting digest
-/// (once packed — `None` beforehand) plus a descriptive media-type hint.
+/// A reference to the server's bootstrap binary — the WIRE payload of the
+/// `application/vnd.pmcp.mcp-server.binary-ref.v1+json` layer.
+///
+/// The binary bytes are NEVER inlined here: `pack_server` takes a
+/// [`BinaryMode`] as a SEPARATE argument and turns it into either an embedded
+/// bootstrap layer or a binary-ref layer carrying this struct. This type only
+/// carries a digest plus a descriptive media-type hint.
+///
+/// `digest` is `Option` for WIRE TOLERANCE only — a decoded layer can be
+/// missing it, and `unpack_server` rejects that case. The API-level
+/// [`BinaryMode::Referenced`] digest is non-optional, so callers of the
+/// packing API cannot express an unpinned binary at all.
+///
+/// [`BinaryMode`]: crate::oci::pack::BinaryMode
+/// [`BinaryMode::Referenced`]: crate::oci::pack::BinaryMode::Referenced
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,7 +403,6 @@ pub struct ServerPackage {
     /// Set at pack time — `None` before packing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<crate::digest::ManifestDigest>,
-    pub binary_ref: BinaryRef,
     pub deploy: DeployDescriptor,
     pub policies: CedarPolicySet,
     pub tools: Vec<ToolMetadata>,
@@ -388,6 +445,7 @@ mod tests {
                 enabled: false,
                 provider: "none".to_string(),
                 callback_urls: vec![],
+                cognito: None,
                 dcr: Some(AuthDcrSection {
                     enabled: true,
                     public_client_patterns: vec!["claude".to_string(), "desktop".to_string()],
@@ -489,6 +547,7 @@ mod tests {
                 enabled: false,
                 provider: "none".to_string(),
                 callback_urls: vec![],
+                cognito: None,
                 dcr: None,
                 groups: None,
                 scopes: None,
@@ -595,10 +654,6 @@ mod tests {
             name: "team-fs".to_string(),
             version: semver::Version::parse("1.0.0").unwrap(),
             digest: None,
-            binary_ref: BinaryRef {
-                digest: None,
-                media_type: "application/x-lambda-bootstrap; arch=arm64".to_string(),
-            },
             deploy: sample_deploy_descriptor(),
             policies: CedarPolicySet(vec![sample_cedar_policy()]),
             tools: vec![ToolMetadata {
@@ -614,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn server_package_binary_ref_carries_no_inline_bytes() {
+    fn binary_ref_carries_no_inline_bytes() {
         // Structural proof: BinaryRef's only fields are `digest` (a
         // ManifestDigest, itself a validated String newtype) and
         // `media_type` (a String) — there is no way to construct one
@@ -624,5 +679,24 @@ mod tests {
             media_type: "application/x-lambda-bootstrap".to_string(),
         };
         assert!(binary_ref.digest.is_some());
+    }
+
+    #[test]
+    fn server_package_has_no_binary_ref_field() {
+        // D-08: "which binary" is a LAYER, not a struct field, so the
+        // serialized ServerPackage must not carry a `binary_ref` key at all.
+        // A stale field here would be a second source of truth able to
+        // disagree with the package's actual binary layer.
+        let pkg = ServerPackage {
+            name: "team-fs".to_string(),
+            version: semver::Version::parse("1.0.0").unwrap(),
+            digest: None,
+            deploy: sample_deploy_descriptor(),
+            policies: CedarPolicySet(vec![]),
+            tools: vec![],
+            config_slots: vec![],
+        };
+        let json = serde_json::to_value(&pkg).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("binary_ref"));
     }
 }

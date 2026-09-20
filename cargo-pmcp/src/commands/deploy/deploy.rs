@@ -76,6 +76,28 @@ impl DeployExecutor {
         // IamConfig; the source of truth at deploy time is .pmcp/deploy.toml.
         self.regenerate_stack_ts(&config)?;
 
+        // `[server]` sizing divergence (debug session
+        // `deploy-server-memory-timeout`). This is the ONLY route to
+        // `npx cdk deploy` — reached both directly and via
+        // `targets::aws_lambda::deploy::deploy_legacy`'s fallback — and it
+        // uploads no template file, so unlike the pmcp-run target there is no
+        // post-synth seam to merge the declared sizing into. Stay quiet when
+        // the declaration already matches the scaffold literals (the pristine
+        // case), and say so loudly when it does not.
+        if let Some(warning) = crate::deployment::config::sizing_divergence_warning(
+            "aws-lambda `npx cdk deploy`",
+            (config.server.memory_mb, config.server.timeout_seconds),
+            (
+                Some(crate::commands::deploy::init::AWS_LAMBDA_SCAFFOLD_MEMORY_MB),
+                Some(crate::commands::deploy::init::AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS),
+            ),
+            "Edit deploy/lib/stack.ts's memorySize/timeout literals, or deploy to the pmcp-run \
+             target, which honors the declared sizing.",
+        ) {
+            eprintln!("{warning}");
+            println!();
+        }
+
         self.run_cdk_deploy(&config)?;
         println!();
 
@@ -117,9 +139,18 @@ impl DeployExecutor {
             // the preserved stack.ts means declared [iam]/[environment] are not
             // auto-applied, so the silent no-op never surfaces only as a
             // runtime 500.
+            // `sizing_inert`: TRUE whenever `[server]` sizing is declared. This
+            // path ends in `npx cdk deploy`, which uploads no template file, so
+            // there is no post-synth seam to inject `Properties.MemorySize`/
+            // `Timeout` through — the preserved stack.ts literals are
+            // authoritative and the declared values cannot be honored
+            // (debug session `deploy-server-memory-timeout`).
+            let sizing_inert =
+                config.server.memory_mb.is_some() || config.server.timeout_seconds.is_some();
             if let Some(warning) = crate::deployment::config::stack_ts_preserved_inert_warning(
                 config.iam.is_empty(),
                 config.environment.is_empty(),
+                sizing_inert,
             ) {
                 eprintln!("{warning}");
             }

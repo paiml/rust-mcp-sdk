@@ -95,19 +95,12 @@ pub trait SlotResolver: Send + Sync {
 /// Warn (and proceed) when a resolved value deviates from the slot's tested
 /// value (D-15). No-op for identity-bearing slots (they have no tested value).
 fn warn_if_deviates(tested: &SlotType, resolved: &str) {
-    // Build a proposed slot mirroring the tested variant but with the resolved
-    // value, then let `detect_deviation` decide (it returns `None` for
-    // identity-bearing kinds, so this is safe for every slot type).
-    let proposed = match tested {
-        SlotType::LlmProvider { name, .. } => SlotType::LlmProvider {
-            name: name.clone(),
-            tested_value: resolved.to_string(),
-        },
-        SlotType::BudgetOverride { name, .. } => SlotType::BudgetOverride {
-            name: name.clone(),
-            tested_value: resolved.to_string(),
-        },
-        _ => return,
+    // `SlotType::with_tested_value` owns the behavior-relevant/identity-bearing
+    // split — one exhaustive match in pmcp-package, next to `tested_value`, so a
+    // future variant cannot be routed to different families here and there.
+    // Identity-bearing slots return `None`: no tested value to deviate from.
+    let Some(proposed) = tested.with_tested_value(resolved) else {
+        return;
     };
     if let Some(dev) = detect_deviation(tested, &proposed) {
         tracing::warn!(
@@ -141,7 +134,9 @@ where
         // Behavior-relevant: a supplied override, else the tested default. Either
         // way the run proceeds; a differing value only warns.
         SlotType::LlmProvider { tested_value, .. }
-        | SlotType::BudgetOverride { tested_value, .. } => {
+        | SlotType::BudgetOverride { tested_value, .. }
+        | SlotType::Endpoint { tested_value, .. }
+        | SlotType::AuthMode { tested_value, .. } => {
             let value = lookup_plain(name).unwrap_or_else(|| tested_value.clone());
             warn_if_deviates(&slot.slot, &value);
             Ok(ResolvedValue::Plain(value))
@@ -328,8 +323,8 @@ pub async fn resolve_agent(
         clamp_u32(pkg.max_iterations),
     );
     config.tools = extract_tool_names(pkg.tool_selection.as_ref());
-    config.input_schema = pkg.input_schema.clone();
-    config.output_schema = pkg.output_schema.clone();
+    config.input_schema.clone_from(&pkg.input_schema);
+    config.output_schema.clone_from(&pkg.output_schema);
     config.endpoints = endpoints;
     Ok(config)
 }

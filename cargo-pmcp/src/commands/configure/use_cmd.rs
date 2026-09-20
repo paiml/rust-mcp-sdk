@@ -66,6 +66,13 @@ pub fn execute(args: UseArgs, gf: &GlobalFlags) -> Result<()> {
     std::fs::write(&marker, format!("{}\n", args.name))
         .with_context(|| format!("failed to write {}", marker.display()))?;
 
+    // A new/!changed target can point at a DIFFERENT deployment, and the discovery
+    // cache (~/.pmcp/pmcp-run-config.json) is keyed by api_url, so a stale entry for
+    // the previous target would otherwise survive until its 1-hour TTL. Best-effort:
+    // failing to clear a cache must not fail the command — the worst case is one
+    // stale lookup, which the retry in pmcp_run::graphql also covers.
+    let _ = crate::deployment::targets::pmcp_run::auth::clear_config_cache();
+
     eprintln!(
         "✓ active target for {} is now '{}'",
         workspace_root.display(),

@@ -8,9 +8,24 @@
 //! `contracts/pmcp-run/capture-v1.graphql`.
 //!
 //! This is a pure offline/static check: no network access, no pmcp.run
-//! credentials. It runs in the normal `cargo test` workspace gate, so any
-//! drift between the CLI's queries and the platform contract fails the SDK
-//! build immediately rather than surfacing at runtime against a live server.
+//! credentials.
+//!
+//! It is executed by the `test-cargo-pmcp-integration` Makefile target, which
+//! is chained into `test-all` and therefore into `make quality-gate`. That
+//! target does not merely run this file — it asserts a NONZERO passed count for
+//! this binary BY NAME, via `scripts/named-test-binary-count.awk`. So any drift
+//! between the CLI's queries and the platform contract fails the SDK build
+//! immediately rather than surfacing at runtime against a live server, and a
+//! future change that stops these tests from executing fails the build too.
+//!
+//! History, recorded because this file is the model that
+//! `tests/package_attestation_contract.rs` copies: until Phase 122 added that
+//! target, this binary was reachable by NO gate in this repo, and the module
+//! docs here claimed otherwise. `make test-cargo-pmcp` is
+//! `cargo test -p cargo-pmcp --lib`, which still does not select this file —
+//! `--lib` covers the library target only. Do not re-inherit the old claim
+//! that this "runs in the normal `cargo test` workspace gate"; name the target
+//! that actually runs it.
 
 use apollo_compiler::validation::Valid;
 use apollo_compiler::{ExecutableDocument, Schema};

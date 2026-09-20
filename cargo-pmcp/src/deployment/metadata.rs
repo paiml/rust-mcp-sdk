@@ -84,6 +84,19 @@ pub struct McpMetadata {
     /// (the Phase 98 backward-compat contract).
     #[serde(default, skip_serializing_if = "is_false")]
     pub snapshot_baked: bool,
+
+    /// Whether this deploy's `deploy/lib/stack.ts` is a hand-modified,
+    /// no-longer-scaffold file (Task 7, CFN-renderer extraction routing).
+    ///
+    /// Set by `targets::pmcp_run::deploy::synth_template` alongside
+    /// `server_type`/`snapshot_baked` when the on-disk stack.ts no longer
+    /// matches what `cargo pmcp` would itself regenerate — the same signal
+    /// that routes synth to the legacy `cdk synth` subprocess instead of the
+    /// pure `pmcp-cfn-renderer` crate. Drives the `mcp:customStack`
+    /// template/synth literal, conditionally emitted like `snapshotBaked` so
+    /// the untainted (default) path stays byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub custom_stack: bool,
 }
 
 /// Serde predicate: `true` when the bool is `false`.
@@ -728,6 +741,7 @@ impl McpMetadata {
             },
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         })
     }
 
@@ -788,6 +802,7 @@ impl McpMetadata {
                 },
                 available_operations: None,
                 snapshot_baked: false,
+                custom_stack: false,
             });
         }
 
@@ -809,6 +824,7 @@ impl McpMetadata {
             capabilities: ServerCapabilities::default(),
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         })
     }
 
@@ -842,6 +858,7 @@ impl McpMetadata {
             capabilities: ServerCapabilities::default(),
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         })
     }
 
@@ -888,6 +905,13 @@ impl McpMetadata {
             context.push(format!("-c 'mcp:snapshotBaked={}'", self.snapshot_baked));
         }
 
+        // Task 7 (CFN-renderer extraction): only emit mcp:customStack when
+        // the routing taint was set, mirroring mcp:snapshotBaked's
+        // conditional-emission/backward-compat pattern above.
+        if self.custom_stack {
+            context.push(format!("-c 'mcp:customStack={}'", self.custom_stack));
+        }
+
         // Serialize resources as JSON with single quotes for shell safety
         if let Ok(resources_json) = serde_json::to_string(&self.resources) {
             context.push(format!("-c 'mcp:resources={}'", resources_json));
@@ -903,8 +927,11 @@ impl McpMetadata {
 
     /// Convert metadata to CloudFormation-style metadata object.
     ///
-    /// This format is used in CloudFormation template Metadata section.
-    #[allow(dead_code)]
+    /// This format is used in CloudFormation template Metadata section — the
+    /// `pmcp_run` renderer path's `build_render_params` (T7 review fix)
+    /// consumes this directly via `cloudformation_metadata_from`, so this is
+    /// no longer dead code (the `#[allow(dead_code)]` this carried before
+    /// that wiring is removed).
     pub fn to_cloudformation_metadata(&self) -> serde_json::Value {
         let mut metadata = serde_json::json!({
             "mcp:version": self.version,
@@ -1072,6 +1099,7 @@ description = "A test tool"
             },
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         };
 
         let context = metadata.to_cdk_context();
@@ -1100,6 +1128,7 @@ description = "A test tool"
             capabilities: ServerCapabilities::default(),
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         };
 
         let cf_metadata = metadata.to_cloudformation_metadata();
@@ -1139,6 +1168,7 @@ version = "0.1.0"
             capabilities: ServerCapabilities::default(),
             available_operations: None,
             snapshot_baked: false,
+            custom_stack: false,
         }
     }
 
@@ -1184,6 +1214,28 @@ version = "0.1.0"
         assert!(
             on.iter().any(|c| c.contains("mcp:snapshotBaked=true")),
             "opted-in server must emit mcp:snapshotBaked=true"
+        );
+    }
+
+    /// Task 7 (CFN-renderer extraction): `to_cdk_context` emits
+    /// `mcp:customStack=true` when the routing taint is set and OMITS it
+    /// otherwise — the same conditional-emission/backward-compat pattern as
+    /// `mcp:snapshotBaked` above.
+    #[test]
+    fn to_cdk_context_custom_stack_is_conditional() {
+        let mut metadata = custom_metadata();
+
+        let off = metadata.to_cdk_context();
+        assert!(
+            !off.iter().any(|c| c.contains("mcp:customStack")),
+            "an untainted deploy must NOT emit mcp:customStack"
+        );
+
+        metadata.custom_stack = true;
+        let on = metadata.to_cdk_context();
+        assert!(
+            on.iter().any(|c| c.contains("mcp:customStack=true")),
+            "a tainted (hand-modified stack.ts) deploy must emit mcp:customStack=true"
         );
     }
 

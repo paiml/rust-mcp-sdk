@@ -439,6 +439,552 @@ bindings:
   status: implemented
   notes: TKIT-08 / D-10 / review R7 — fallible companion to `code_mode_from_config`. R9 enforcement fires here before `.build()` is reached.
 
+# === JSON Schema 2020-12 + Caching Hints (Phase 115) ===
+# Written in wave 1, BEFORE the implementation plans ran (CLAUDE.md § Contract-First
+# Development). Twelve of the thirteen entries landed as `status: planned` — the
+# functions did not exist yet — with `CallToolResult::structured` the exception, an
+# entry that exists today and records the D-06 freeze.
+#
+# 115-10 (wave 6) flipped ALL of them to `implemented` once every owning plan had
+# landed, verified each `signature:` against the shipped source, and added a
+# fourteenth binding for `compile_for_era`, which 115-03 delivered without a
+# contract entry (deferred item, ledger entry J). From that point the ghost-binding
+# check in tests/phase115_contract_bindings.rs is LOAD-BEARING over every entry:
+# a binding naming a symbol nobody wrote now fails the gate.
+#
+# 115-12 added a fifteenth and sixteenth — `first_legacy_dialect` and
+# `pin_dialect_in_place` — for the same reason `compile_for_era` was added: they ARE
+# the mechanism `normalize_schema_dialect` delegates to, and the safety property the
+# `output_schema_draft_pin` invariants assert is a property of their agreement.
+#
+# `planned` was never an exemption — tests/phase115_contract_bindings.rs scopes it to
+# exactly these three equations so it cannot become an escape hatch elsewhere. There
+# are now ZERO `planned` bindings in this file, which is the intended end state.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: warn_on_schema_mismatch
+  module_path: pmcp::server::output_validation
+  signature: 'pub(crate) fn warn_on_schema_mismatch(tool: &str, schema: &Value, value: &Value, era: Option<Era>)'
+  status: implemented
+  notes: >-
+    Written by 115-03 Task 2. Exists today with the same name but WITHOUT the trailing
+    `era` parameter; the plan threads the era through as the LAST parameter so the
+    no-feature arm stays a plain `let _ = (…);`. SCHM-01 / D-01.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: schema_mismatch
+  module_path: pmcp::server::output_validation
+  signature: 'pub(crate) fn schema_mismatch(schema: &Value, value: &Value, era: Option<Era>) -> Option<String>'
+  status: implemented
+  notes: >-
+    Written by 115-03 Task 2. `#[cfg(feature = "validation")]`. Returns `Some` on mismatch
+    AND on a schema that fails to compile — the message names `outputSchema` in the latter
+    case. Warn-only on both eras. SCHM-01 / D-01.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: cached_validator
+  module_path: pmcp::server::output_validation
+  signature: 'fn cached_validator(era: Option<Era>, schema: &Value) -> Result<std::sync::Arc<jsonschema::Validator>, std::sync::Arc<str>>'
+  status: implemented
+  notes: >-
+    Written by 115-03 Task 2. `#[cfg(feature = "validation")]`. The cache key becomes
+    `(Era, canonical schema text)` so one era's validator is never served to the other;
+    the Arc-cached, error-cached, poison-recovering shape is preserved. SCHM-01 / D-01.
+    115-10 SIGNATURE CORRECTION: 115-11 recorded the return type as
+    `Result<Arc<…>, Arc<str>>`; the shipped source writes both paths in full
+    (`std::sync::Arc`) because the `use` is function-local. Same types, different
+    spelling — recorded rather than silently rewritten (ledger entry F).
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: normalize_schema_dialect
+  module_path: pmcp::server::output_validation
+  signature: "fn normalize_schema_dialect(schema: &Value) -> std::borrow::Cow<'_, Value>"
+  status: implemented
+  notes: >-
+    Written by 115-03 Task 3(b). `#[cfg(feature = "validation")]`. Pure and idempotent:
+    `Cow::Borrowed` when no string-valued `$schema` in any SCHEMA POSITION of the document
+    names a dialect other than `DRAFT_2020_12`, otherwise a clone in which every such
+    `$schema` is overwritten with `DRAFT_2020_12`. SCHEMA POSITION is the scope the
+    equation's `walk:` clause defines: the root, plus every node reached by descending into
+    every member value EXCEPT a `const` / `enum` / `default` / `examples` payload, plus every
+    VALUE of a `properties` / `patternProperties` / `$defs` / `definitions` /
+    `dependentSchemas` / `dependencies` map whatever author-chosen name it is filed under,
+    plus every ELEMENT of an array-valued member (`allOf` / `anyOf` / `oneOf` / `prefixItems`)
+    whatever its index — 115-20, `115-REVIEW.md` WR-03.
+    Touches no other key, and never a `$schema` that is instance DATA (a `properties` entry
+    named `$schema`, or a `const` / `enum` / `default` / `examples` payload). SCHM-01 / D-02.
+    115-12 SCOPE CORRECTION: this note previously read "`Cow::Borrowed` when the ROOT `$schema`
+    is absent or already 2020-12 … Touches no other key and no nested `$schema`", describing a
+    root-only rewrite. `115-VERIFICATION.md` measured that scope as a validation BYPASS — a
+    legacy declaration on an embedded schema resource (a subschema carrying its own `$id`,
+    which 2020-12 sanctions and `jsonschema` 0.49.2 honours) survived the pin and resolved an
+    empty vocabulary set there, yielding `(v1, v2) = (Violates, Conforms)`, i.e. v2 validating
+    WEAKER than v1. 115-12 made the walk recursive; the `signature:` above is unchanged and
+    stays byte-identical to the source. See also `first_legacy_dialect` and
+    `pin_dialect_in_place` below.
+    115-14 POSITION CORRECTION: the note above described a walk that keyword-filtered the keys
+    of subschema MAPS. `115-VERIFICATION.md` measured that scope as a validation BYPASS —
+    `properties`, `patternProperties`, `$defs`, `definitions` and `dependentSchemas` map
+    author-chosen NAMES to subschemas, so an entry an author names `const` / `enum` /
+    `default` / `examples` was visited by neither half, and a legacy `$schema` on such an
+    `$id`-bearing embedded resource survived the pin: `$defs.default` measured
+    `(v1, v2) = (Conforms, Conforms)` with `rewritten=false` against the control
+    `$defs.Inner`'s `(Conforms, Violates)` with `rewritten=true`. The walk is now
+    position-aware (`SUBSCHEMA_MAP_KEYWORDS`); the `signature:` above is STILL unchanged and
+    still byte-identical to the source.
+    115-16 COMPLETENESS CORRECTION: the position-aware walk 115-14 landed enumerated FIVE
+    subschema-map keywords and omitted `dependencies` — draft-04 / -06 / -07 and 2019-09's own
+    map-from-instance-property-NAME-to-subschema keyword, still honoured by `jsonschema`
+    0.49.2 under the 2020-12 pin, as this SDK's own `fuzz_support_tests` had already recorded
+    (`D-115-03-C`). Measured: `dependencies.Inner` -> `rewritten=true` against
+    `dependencies.default` -> `rewritten=false`, so on the second this function returned
+    `Cow::Borrowed`, the legacy declaration survived and `compile_2020_12`'s `tracing::warn!`
+    did not fire. NO v2 verdict flip is reproducible at that position — both names measure
+    `(Violates, Violates)` on the pinned `jsonschema` — which is why the fence is STRUCTURAL
+    (the `Cow` borrow/own decision plus the rewritten pointer) rather than behavioural: a
+    verdict assertion would have PASSED against the defective code. The list is now the SIX
+    keywords DERIVED from the draft-04 / -06 / -07 / 2019-09 / 2020-12 meta-schemas rather
+    than hand-kept, and all three literal copies of it are held to that derivation by
+    `keyword_list_mirrors`. The `signature:` above is unchanged yet again.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: first_legacy_dialect
+  module_path: pmcp::server::output_validation
+  signature: "fn first_legacy_dialect(node: &Value) -> Option<&str>"
+  status: implemented
+  notes: >-
+    ADDED BY 115-12. `#[cfg(feature = "validation")]`. The DETECTOR half of the normalization:
+    returns the first `$schema` string in a SCHEMA POSITION — the scope the equation's `walk:`
+    clause defines, searched root-first — that is not already `DRAFT_2020_12`, or `None`. A
+    `$schema` inside a `const` / `enum` / `default` / `examples` payload is instance DATA and
+    is deliberately NOT reported; the VALUES of the six subschema-map keywords ARE reported,
+    whatever author-chosen name they are filed under, and so is every ELEMENT of an
+    array-valued member, whatever its index (115-20 — an array element has no key, so the
+    data-only exclusion has nothing to test against there). It is what makes
+    `normalize_schema_dialect`'s `Cow::Borrowed`
+    zero-allocation path decidable over the whole document rather than just the root, and it is
+    also the source of the `declared` value `compile_2020_12` names in its warning — reading the
+    root key there would report `<unknown>` for exactly the embedded-resource case the warning
+    exists to explain. Bound because it IS the mechanism, the same reason `compile_for_era` was
+    bound by 115-10 (ledger entry J). SCHM-01 / D-02.
+    115-14 POSITION CORRECTION: this note previously described a walk that tested the
+    data-only keyword list against EVERY object key, including the keys of subschema MAPS.
+    That scope was measured as a validation BYPASS by `115-VERIFICATION.md` — a `$defs`
+    entry whose author-chosen name collides with `const` / `enum` / `default` / `examples`
+    was never visited, so the detector reported `None` for a document that carried a legacy
+    declaration and `normalize_schema_dialect` returned `Cow::Borrowed` with nothing
+    rewritten and no `tracing::warn!` fired. The member dispatch now consults
+    `SUBSCHEMA_MAP_KEYWORDS` first and descends into every value of such a map regardless of
+    its name; see the `first_legacy_dialect_in_member` binding below, which is that dispatch
+    split out for CI's cognitive-complexity gate. The `signature:` above is unchanged and
+    stays byte-identical to the source.
+    115-16 COMPLETENESS CORRECTION: `SUBSCHEMA_MAP_KEYWORDS` stood at FIVE entries and omitted
+    `dependencies`, so this detector reported `None` for a document carrying a legacy
+    declaration on an `$id`-bearing embedded resource filed under a `dependencies` entry an
+    author had named `default` — the same category error 115-14 closed, one keyword over
+    (115-REVIEW.md CR-01). The sixth entry was established by DERIVATION over the draft-04 /
+    -06 / -07 / 2019-09 / 2020-12 meta-schemas, not by patching the reviewed case, and
+    `$vocabulary` and `dependentRequired` are excluded by that same criterion. The fence is
+    STRUCTURAL because no v2 verdict flip is reproducible at that position on the pinned
+    `jsonschema` 0.49.2.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: pin_dialect_in_place
+  module_path: pmcp::server::output_validation
+  signature: "fn pin_dialect_in_place(node: &mut Value)"
+  status: implemented
+  notes: >-
+    ADDED BY 115-12. `#[cfg(feature = "validation")]`. The REWRITER half: overwrites every
+    string-valued `$schema` in a SCHEMA POSITION with `DRAFT_2020_12`, in place, on the clone
+    `normalize_schema_dialect` already had to make — SCHEMA POSITION being the scope the
+    equation's `walk:` clause defines, so a `$schema` inside a `const` / `enum` / `default` /
+    `examples` payload is left alone as instance DATA while the VALUES of the six
+    subschema-map keywords are rewritten whatever name they are filed under, as is every
+    ELEMENT of an array-valued member whatever its index (115-20). It implements the
+    SAME traversal rule as
+    `first_legacy_dialect` — a string-valued `$schema` is a declaration, `const` / `enum` /
+    `default` / `examples` payloads are instance data and are never descended into — and a
+    disagreement between the two is a defect, because it produces a `Cow::Owned` that still
+    carries a legacy declaration while `compile_2020_12` announces the declaration as ignored.
+    The postcondition `first_legacy_dialect(&owned) == None` is what fences that, and it
+    replaces the `expect` the root-only body carried. SCHM-01 / D-02.
+    115-14 POSITION CORRECTION: the traversal rule this note recites was measured WRONG, not
+    merely the two halves' agreement on it. `115-VERIFICATION.md` reproduced a legacy
+    `$schema` surviving the pin on an `$id`-bearing embedded resource filed under a `$defs`
+    entry an author had NAMED `default` — the keys of a `properties` / `patternProperties` /
+    `$defs` / `definitions` / `dependentSchemas` map are author-chosen names, never keywords,
+    so the data-only exclusion must not be applied to them. The rewriter now mirrors the
+    corrected detector member-for-member (see `pin_dialect_in_member` below). Note the
+    consequence for the postcondition: because BOTH halves implement the same rule, a defect
+    IN the rule satisfies `first_legacy_dialect(&owned) == None` VACUOUSLY — measured, with
+    the pre-fix run reporting that postcondition as PASSING for the very documents that were
+    never rewritten. The `signature:` above is unchanged and stays byte-identical to the
+    source.
+    115-16 COMPLETENESS CORRECTION: the rule both halves recite was measured INCOMPLETE as
+    well as previously wrong — `SUBSCHEMA_MAP_KEYWORDS` omitted `dependencies`, so this
+    rewriter skipped an `$id`-bearing embedded resource filed under a `dependencies` entry
+    named `default` and `normalize_schema_dialect` returned `Cow::Borrowed`. The vacuity note
+    above applies with full force here: because both halves read the same constant, the
+    postcondition passed VACUOUSLY over exactly the documents that were never rewritten, and
+    every fence 115-15 added enumerated that same constant, so an omission FROM it was
+    invisible to all of them. That is why the 115-16 fence
+    (`v2_pin_rewrites_an_embedded_resource_in_every_spec_defined_subschema_map`) carries its
+    OWN six-element container literal, and why `keyword_list_mirrors` anchors the three
+    literal copies to the meta-schema derivation rather than to each other.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: first_legacy_dialect_in_member
+  module_path: pmcp::server::output_validation
+  signature: |-
+    fn first_legacy_dialect_in_member<'a>(
+        member_key: &str,
+        member_value: &'a Value,
+    ) -> Option<&'a str>
+  status: implemented
+  notes: >-
+    ADDED BY 115-14. `#[cfg(feature = "validation")]`. 115-14 POSITION CORRECTION, detector
+    half: the three-way decision on ONE object member's key — a `SUBSCHEMA_MAP_KEYWORDS` member
+    whose value is an object is a map of author-chosen names and every value is descended into;
+    a `DATA_ONLY_KEYWORDS` member is skipped; everything else (including a malformed subschema
+    map whose value is not an object) takes the ordinary walk. Mutually recursive with
+    `first_legacy_dialect`. Split out rather than inlined for a MEASURED reason: `pmat
+    quality-gate --fail-on-violation --checks complexity` (pmat 3.15.0, the PR-blocking CI gate)
+    reported 0 violations at the commit before 115-14 and, with the dispatch inline, 1 —
+    `pin_dialect_in_place` at cognitive 24 against a threshold of 23. Both halves were split so
+    they stay visibly mirror-image. The `signature:` above is a YAML block scalar, not the
+    file's usual one-line quoted form, because rustfmt wraps this declaration across four lines
+    at 100 columns; it is reproduced byte-for-byte from the shipped source rather than
+    normalized onto one line (ledger `D-115-F`). 115-14's plan text specified this signature
+    WITHOUT lifetimes, which does not compile — two input references and one borrowed output
+    make elision ambiguous. SCHM-01 / D-02.
+    115-16 COMPLETENESS CORRECTION: the `SUBSCHEMA_MAP_KEYWORDS` arm of this three-way
+    dispatch tested a FIVE-entry list that omitted `dependencies`, so a `dependencies` member
+    fell to the ordinary walk and its author-chosen keys were then tested against
+    `DATA_ONLY_KEYWORDS` — the category error this function exists to prevent. The list is now
+    the SIX keywords derived from the pinned meta-schemas; the dispatch shape, the mutual
+    recursion and the `signature:` above are all unchanged. The disjointness this dispatch
+    silently depends on — no key in BOTH lists — is now asserted by
+    `output_validation::tests::keyword_lists_are_disjoint` (115-REVIEW.md WR-05).
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: pin_dialect_in_member
+  module_path: pmcp::server::output_validation
+  signature: "fn pin_dialect_in_member(member_key: &str, member_value: &mut Value)"
+  status: implemented
+  notes: >-
+    ADDED BY 115-14. `#[cfg(feature = "validation")]`. 115-14 POSITION CORRECTION, rewriter
+    half: the mirror image of `first_legacy_dialect_in_member`, mutually recursive with
+    `pin_dialect_in_place`. It is the function the complexity measurement above was ABOUT — the
+    inline form of this dispatch is what put `pin_dialect_in_place` at cognitive 24. Bound for
+    the same reason 115-12 bound the two walkers and 115-10 bound `compile_for_era` (ledger
+    entry J): it IS the mechanism, and the safety property the `output_schema_draft_pin`
+    invariants assert is a property of these two halves implementing the identical rule.
+    SCHM-01 / D-02.
+    115-16 COMPLETENESS CORRECTION: this half read the same five-entry
+    `SUBSCHEMA_MAP_KEYWORDS` as its detector twin, so the omission of `dependencies` was
+    mirrored perfectly — which is precisely why "these two halves implement the identical
+    rule" is NOT evidence that the rule is right. The list is now the SIX keywords derived
+    from the pinned meta-schemas. Note also that this half is written as an `if`-chain testing
+    the KEY class first while the detector is a `match` guarding on the VALUE kind and the key
+    class together; they agree today only because the two lists are disjoint, which
+    `keyword_lists_are_disjoint` now asserts. Writing both dispatches in one shape is
+    115-REVIEW.md WR-05's remaining half and is booked unowned in `deferred-items.md`.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: compile_2020_12
+  module_path: pmcp::server::output_validation
+  signature: "fn compile_2020_12(schema: &Value) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>>"
+  status: implemented
+  notes: >-
+    Written by 115-03 Task 3(b). `#[cfg(feature = "validation")]`. Calls
+    `normalize_schema_dialect` then `jsonschema::draft202012::new`, warning when the
+    normalization actually rewrote a legacy declaration. Remote-ref resolution stays
+    disabled — an external `$ref` must fail to COMPILE with zero I/O. SCHM-01 / D-02, D-03.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: output_schema_draft_pin
+  function: compile_for_era
+  module_path: pmcp::server::output_validation
+  signature: "fn compile_for_era(era: Era, schema: &Value) -> Result<jsonschema::Validator, std::sync::Arc<str>>"
+  status: implemented
+  notes: >-
+    ADDED BY 115-10, not by wave 1 — 115-03 Task 2(c) mandated this uncached per-era
+    compile path but no binding was written for it, which 115-03 REPORTED as a deferred
+    item rather than absorbing (ledger entry J). It is the era BRANCH itself: `Era::V1`
+    is today's `jsonschema::validator_for` auto-detect VERBATIM (D-01's freeze, and the
+    only auto-detect entry point left in the module), `Era::V2` is `compile_2020_12`.
+    Split out of `cached_validator` so a fuzz or property target can compile arbitrary
+    generated schemas without growing the process-global cache — which is what makes
+    115-09's `fuzzing`-gated `SchemaVerdict` seam possible.
+    `#[cfg(feature = "validation")]`. SCHM-01 / D-01, D-02.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: structured_content_shape
+  function: CallToolResult::structured_value
+  module_path: pmcp::types::tools
+  signature: 'pub fn structured_value(value: Value) -> Self'
+  status: implemented
+  notes: >-
+    Written by 115-04 Task 2. The ADDITIVE widening sibling for non-object payloads —
+    array, string, number, boolean and null. `Some(Value::Null)` must serialize as an
+    explicit `"structuredContent": null`. SCHM-02 / D-06.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: structured_content_shape
+  function: CallToolResult::structured
+  module_path: pmcp::types::tools
+  signature: 'pub fn structured(value: Value) -> Self'
+  status: implemented
+  notes: >-
+    EXISTS TODAY (src/types/tools.rs:647) and is bound here to record the D-06 FREEZE: the
+    contract obligation on this function is that its signature and behaviour do NOT change
+    in Phase 115. The widening lands on the sibling `structured_value`, so every existing
+    call site keeps its object-shaped compile-time signal. Fenced by 115-04.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: CacheScope
+  module_path: pmcp::types::caching
+  signature: 'pub enum CacheScope { Public, Private }'
+  status: implemented
+  notes: >-
+    Written by 115-05 Task 1(a). The CLOSED union the published 2026-07-28 schema declares;
+    an unknown value must fail to deserialize. Its rustdoc carries the spec's security
+    semantics verbatim — `"public"` authorizes reuse across authorization contexts.
+    SCHM-03 / D-09.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: DEFAULT_TTL_MS
+  module_path: pmcp::types::caching
+  signature: 'pub const DEFAULT_TTL_MS: u64'
+  status: implemented
+  notes: >-
+    Written by 115-05 Task 1(b). Value `0` — "immediately stale, the client MAY re-fetch
+    every time", i.e. the default asserts nothing about cacheability. `u64` (not `f64`)
+    because 115-01 measured the vendored schema's `ttlMs` as
+    `{"type":"integer","minimum":0}`. SCHM-03 / D-08.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: Cacheable
+  module_path: pmcp::types::caching
+  signature: 'pub(crate) enum Cacheable { Yes, No }'
+  status: implemented
+  notes: >-
+    Written by 115-05 Task 1(c). The caller's classification, needed because the request is
+    already moved by the time the native chokepoint runs. Exactly six results extend
+    `CacheableResult` in the vendored schema (115-01 measured the set). SCHM-03 / D-07.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: project_caching_hints
+  module_path: pmcp::types::caching
+  signature: 'pub(crate) fn project_caching_hints(value: &mut serde_json::Value, era: Option<crate::types::protocol::Era>, cacheable: Cacheable)'
+  status: implemented
+  notes: >-
+    115-10 SIGNATURE CORRECTION: 115-11 recorded `&mut Value` / `Option<Era>`; the
+    shipped source writes both paths in FULL, deliberately — `src/types/caching.rs` is
+    cfg-free so the wasm32-only dispatcher can call it, and writing
+    `crate::types::protocol::Era` inline avoids a `use` that would have to survive both
+    cfg worlds. Same types, different spelling (ledger entry F).
+    Written by 115-05 Task 1(d). THE single projection point (D-12): `Cacheable::No` is the
+    identity, `Some(Era::V2)` ensures both keys without overwriting handler intent, and
+    every other input — v1 AND a `None` protocol context — STRIPS both. Deliberately
+    cfg-free so the wasm dispatcher can call it. SCHM-03 / D-11, D-12.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: inject_v2_result_envelope
+  module_path: pmcp::server::core
+  signature: 'pub(crate) fn inject_v2_result_envelope(response: &mut JSONRPCResponse, protocol_context: Option<&crate::types::protocol::ProtocolContext>, server_info: &Implementation, disposition: ResponseDisposition, owner: ReservedFieldOwner, cacheable: Cacheable)'
+  status: implemented
+  notes: >-
+    115-10 SIGNATURE CORRECTION: 115-11 recorded `Option<&ProtocolContext>`; the shipped
+    source writes `Option<&crate::types::protocol::ProtocolContext>` in full. Same type,
+    different spelling (ledger entry F). Every other parameter, including the trailing
+    `cacheable`, landed exactly as recorded.
+    EXISTS TODAY (src/server/core.rs:1561) but WITHOUT the trailing `cacheable` parameter,
+    and it early-returns on v1 — so 115-06 Task 1 both extends the signature and
+    restructures it so the strip arm runs on BOTH eras. `cacheable` has no default and
+    every call site names it, extending the `owner` doctrine. SCHM-03 / D-12.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: result_caching_hints
+  function: request_is_cacheable
+  module_path: pmcp::server::core
+  signature: 'pub(crate) fn request_is_cacheable(request: &Request) -> Cacheable'
+  status: implemented
+  notes: >-
+    Written by 115-06 Task 2. ONE shared classifier both native dispatchers call — never a
+    second copy in `src/server/mod.rs`. Returns `Yes` for exactly the five list/read client
+    requests and `No` for everything else, written so a NEW `ClientRequest` variant lands in
+    the fail-closed `No` arm. SCHM-03 / D-07.
+
+# === OAuth Client Hardening (Phase 116) ===
+# Authored by plan 116-01 (wave 1), BEFORE a single `src/` line of this phase was
+# written, discharging CLAUDE.md § "Contract-First Development". Every `signature:`
+# below is the DESIGNED interface taken from the owning plan's `<interfaces>` block
+# (116-02, 116-04, 116-05) — not a transcription of shipped code, because no code
+# exists yet. That is the whole point: the signature is committed before the body.
+#
+# All eight entries were authored `planned` (they are `implemented` as of 116-15 —
+# see HAND-OFF DISCHARGED below). Two gates read this file and both were
+# checked before the value was introduced:
+#   * `make comply` -> `comply-bindings-check` (Makefile:818-834) resolves `function:`
+#     values ONLY in contracts/team-servers/binding.yaml, so it is unaffected; and
+#     `pmat comply check --path .` is informational per CLAUDE.md D-07.
+#   * tests/phase115_contract_bindings.rs DOES read this file, and its test
+#     `phase115_contract_bindings_planned_entries_are_scoped_to_phase_115` confines
+#     `planned` to a named equation list. Its own failure message says a future phase
+#     needing contract-first `planned` bindings must "extend PHASE_115_EQUATIONS
+#     deliberately in this file — that edit is the conversation this test exists to
+#     force." 116-01 had that conversation: the failure was OBSERVED first, then the
+#     test grew a separate `PHASE_116_EQUATIONS` list so Phase 116's three equations
+#     are the ONLY additional equations on which `planned` is tolerated.
+#
+# HAND-OFF DISCHARGED 2026-08-07 by plan 116-15 (Task 2). All eight entries are now
+# `status: implemented`. Each `function:` was resolved against a real declaration
+# under src/ before the flip, and the ghost-binding check in
+# tests/phase115_contract_bindings.rs is load-bearing over them from here on.
+# Four `signature:` values were UPDATED to the shipped form rather than left to
+# absorb the divergence silently — a contract that quietly adopts whatever shipped
+# constrains nothing. The four, with the reason each moved:
+#   * iss_presence_from       — shipped carries #[must_use]; the designed value did not
+#   * issuer_matches_metadata — same, and for the same reason (a pure predicate whose
+#                               return value being dropped is always a bug)
+#   * discovery_url_candidates— Result<Vec<url::Url>> -> Result<Vec<Url>>; the module
+#                               imports `url::Url`, so this is path qualification only,
+#                               not a type change
+#   * CredentialKey::new      — designed as three `impl Into<String>` APIT parameters,
+#                               shipped as named generics with the identical bounds.
+#                               Same bounds, but the generic form admits turbofish, so
+#                               it is a strictly wider public API than APIT and the
+#                               contract must say which one it is.
+# The other four (validate_authorization_response, classify_discovery_failure,
+# derive_application_type, parse_credential_snapshot) shipped byte-identical to the
+# interface committed in wave 1, before their bodies existed.
+#
+# PHASE_116_EQUATIONS in tests/phase115_contract_bindings.rs is RETAINED, which is the
+# "or leave them with a written reason" branch of the original hand-off. The reason:
+# (a) PHASE_115_EQUATIONS is retained in that same file after 115-10 flipped every
+# Phase 115 binding, so retention is the established precedent and not an exception;
+# (b) the `phase_116_records >= 8` anti-vacuity floor is defined over that constant, so
+# deleting it would delete an assertion that this section still exists; and (c) that
+# constant's own doc comment already states the expected end state — "every entry here
+# is expected to carry ZERO `planned` bindings" — which is now true and measured: the
+# anchored entry grep (two leading spaces, then the status key set to that value) counts
+# 0 in this file. The UNANCHORED grep still counts 1, on the Phase 115 section comment at
+# the top of this file, which is prose about how Phase 115 worked and not an entry — a
+# distinction 116-BASELINES.md already drew when it recorded the wave-1 count with the
+# anchored form.
+#
+# NOTE, honoured: `CredentialKey::new` resolves through the shared `fn new` needle,
+# which is not unique to that type, so the resolver's word was not trusted. Verified by
+# hand at src/shared/credential_store.rs:152, inside `impl CredentialKey`.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_authorization_response_validation
+  function: validate_authorization_response
+  module_path: pmcp::shared::oauth_validation
+  signature: 'pub fn validate_authorization_response(raw_query: &str, record: &AuthorizationRequestRecord) -> Result<String>'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-01 (D-12). Written by 116-02 Task 2. THE fixed-order validator:
+    state, then iss, then the AS error, then the code. Returns the authorization code.
+    Ungated and wasm-clean — it lives in src/shared/ precisely so no feature flag can
+    make the check optional.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_authorization_response_validation
+  function: iss_presence_from
+  module_path: pmcp::shared::oauth_validation
+  signature: '#[must_use] pub fn iss_presence_from(env_override: Option<IssPresence>, builder: Option<IssPresence>, discovery_flag: Option<bool>) -> IssPresence'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-01 (D-04). Written by 116-02 Task 2. Precedence env > builder >
+    discovery flag. Takes an ALREADY-PARSED env override so an unrecognized value can
+    be warned about at the call site (116-09) instead of silently reading as unset.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_discovery_anchor
+  function: discovery_url_candidates
+  module_path: pmcp::shared::oauth_validation
+  signature: 'pub fn discovery_url_candidates(issuer: &str) -> Result<Vec<Url>>'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-01 + AUTH-03 (D-13, SEP-2351). Written by 116-04 Task 1. Three
+    candidates for a path-carrying issuer, two for a path-less one. The OIDC APPENDED
+    form is present in every list — today's only shipped behaviour and the regression
+    fence for RESEARCH Pitfall 2.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_discovery_anchor
+  function: issuer_matches_metadata
+  module_path: pmcp::shared::oauth_validation
+  signature: '#[must_use] pub fn issuer_matches_metadata(issuer_used_to_build_url: &str, document_issuer: &str) -> bool'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-03 (RFC 8414 §3.3). Written by 116-04 Task 1. Byte-exact, no
+    normalization — the same rule the `iss` comparison follows, for the same reason.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_discovery_anchor
+  function: classify_discovery_failure
+  module_path: pmcp::shared::oauth_validation
+  signature: '#[must_use] pub fn classify_discovery_failure(failure: DiscoveryFailure) -> DiscoveryOutcome'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-03. Written by 116-04 Task 2. The explicit outcome matrix Codex
+    asked for. IssuerMismatch, BodyOverCap and MalformedSecurityMetadata are TERMINAL:
+    each is evidence about the AUTHORITY, so falling back to the next candidate would
+    launder a security signal into a retry.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_discovery_anchor
+  function: derive_application_type
+  module_path: pmcp::shared::oauth_validation
+  signature: 'pub fn derive_application_type(redirect_uris: &[String]) -> Result<ApplicationType>'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-03 (SEP-2351 DCR). Written by 116-04 Task 3. Loopback and custom
+    schemes derive `native`; https derives `web`. Consumed at the DCR construction site
+    in 116-10.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_credential_binding
+  function: parse_credential_snapshot
+  module_path: pmcp::shared::credential_store
+  signature: 'pub fn parse_credential_snapshot(bytes: &[u8]) -> Result<(CredentialSnapshot, MigrationReport)>'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-03 (SEP-2352). Written by 116-05 Task 1. The whole schema 1 -> 2
+    migration, kept PURE so the same bytes migrate identically in a file, in DynamoDB
+    and in a KV store — and so 116-08 can fuzz it. Total over arbitrary bytes: Err,
+    never a panic, and the message carries no byte of the input.
+
+- contract: mcp-protocol-sdk-v1.yaml
+  equation: oauth_credential_binding
+  function: CredentialKey::new
+  module_path: pmcp::shared::credential_store
+  signature: 'pub fn new<I: Into<String>, A: Into<String>, S: Into<String>>(issuer: I, account: A, server: S) -> Self'
+  status: implemented
+  notes: >-
+    Phase 116 / AUTH-03 (D-116-R1). Written by 116-05 Task 1. The key is THREE-part.
+    Two MCP servers can share one authorization server and one account while holding
+    different DCR registrations; under a narrower key one server's logout deletes the
+    other's credentials. RFC 8707 `resource` would have bound the audience instead and
+    is deferred by owner decision (b2bf9157), so the key carries the binding.
+
 critical_path:
 - jsonrpc_framing
 - protocol_version_negotiation

@@ -10,6 +10,7 @@
 //!
 //! - [`excel_round`] — round half away from zero to `digits` decimals.
 //! - [`excel_roundup`] — round AWAY FROM ZERO to `digits` decimals (Excel ROUNDUP).
+//! - [`excel_rounddown`] — round TOWARD ZERO to `digits` decimals (Excel ROUNDDOWN).
 //! - [`excel_ceiling`] — round AWAY FROM ZERO to the nearest multiple of
 //!   `significance` (Excel CEILING, magnitude rule).
 
@@ -60,6 +61,25 @@ pub fn excel_roundup(x: f64, digits: i32) -> f64 {
         pulled.floor()
     };
     away / factor
+}
+
+/// Excel `ROUNDDOWN(x, digits)` — round TOWARD ZERO to `digits` decimals.
+///
+/// The structural mirror of [`excel_roundup`]: `ROUNDDOWN(3.999, 2) == 3.99`;
+/// `ROUNDDOWN(-3.999, 2) == -3.99` (magnitude SHRINKS, sign preserved). A
+/// non-finite input passes through unchanged.
+pub fn excel_rounddown(x: f64, digits: i32) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let factor = pow10(digits);
+    let scaled = x * factor;
+    // Toward-zero: truncate the magnitude. Apply an epsilon PUSH away from zero
+    // — the inverse of `excel_roundup`'s pull — so a value that is exactly
+    // representable (or a hair under its decimal value due to f64 error) is not
+    // spuriously dropped a whole step.
+    let pushed = scaled + scaled.signum() * (scaled.abs() * ROUND_EPSILON);
+    pushed.trunc() / factor
 }
 
 /// Excel `CEILING(number, significance)` — round `number` AWAY FROM ZERO to the
@@ -120,6 +140,71 @@ mod tests {
         assert_eq!(excel_roundup(-3.001, 2), -3.01);
         assert_eq!(excel_roundup(3.0, 2), 3.0); // exact multiple not bumped
         assert_eq!(excel_roundup(0.0, 2), 0.0);
+    }
+
+    #[test]
+    fn rounddown_is_toward_zero() {
+        // The exact mirror of ROUNDUP: magnitude SHRINKS, sign preserved.
+        assert_eq!(excel_rounddown(3.999, 2), 3.99);
+        assert_eq!(excel_rounddown(-3.999, 2), -3.99);
+        // An exactly-representable decimal is NOT spuriously dropped a step —
+        // this is why the epsilon PUSHES away from zero before truncation.
+        assert_eq!(excel_rounddown(3.01, 2), 3.01);
+        assert_eq!(excel_rounddown(-3.01, 2), -3.01);
+        assert_eq!(excel_rounddown(0.0, 2), 0.0);
+    }
+
+    #[test]
+    fn rounddown_to_negative_digits() {
+        assert_eq!(excel_rounddown(1234.0, -2), 1200.0);
+        assert_eq!(excel_rounddown(1299.0, -2), 1200.0);
+        assert_eq!(excel_rounddown(-1299.0, -2), -1200.0);
+    }
+
+    #[test]
+    fn rounddown_passes_non_finite_through_unchanged() {
+        // Same guard as `excel_roundup` — the caller maps non-finite to an
+        // Excel error above this layer.
+        assert!(excel_rounddown(f64::NAN, 2).is_nan());
+        assert_eq!(excel_rounddown(f64::INFINITY, 2), f64::INFINITY);
+        assert_eq!(excel_rounddown(f64::NEG_INFINITY, 2), f64::NEG_INFINITY);
+    }
+
+    // PROPERTY tests (CLAUDE.md ALWAYS requirement). The generated magnitudes are
+    // deliberately bounded: `ROUND_EPSILON` is a RELATIVE nudge, so once
+    // `|x * 10^digits|` approaches `1/ROUND_EPSILON` the nudge exceeds one whole
+    // unit at the truncation boundary and both invariants below stop holding for
+    // arithmetic reasons that have nothing to do with the rounding rule. The
+    // bounds `|x| <= 1000` and `|digits| <= 5` keep `|scaled| <= 1e8`, two orders
+    // of magnitude inside `1/(2 * ROUND_EPSILON)`.
+    proptest::proptest! {
+        #[test]
+        fn prop_rounddown_never_grows_the_magnitude(
+            x in -1000.0f64..1000.0f64,
+            digits in -5i32..=5i32,
+        ) {
+            let out = excel_rounddown(x, digits);
+            proptest::prop_assert!(out.is_finite(), "rounddown({x}, {digits}) = {out} is non-finite");
+            // The relative epsilon push can carry the result at most a factor of
+            // (1 + ROUND_EPSILON) past |x|; 1e-8 covers that plus the division.
+            proptest::prop_assert!(
+                out.abs() <= x.abs() * (1.0 + 1e-8) + f64::EPSILON,
+                "rounddown({x}, {digits}) = {out} grew the magnitude"
+            );
+        }
+
+        #[test]
+        fn prop_rounddown_magnitude_never_exceeds_roundup(
+            x in -1000.0f64..1000.0f64,
+            digits in -5i32..=5i32,
+        ) {
+            let down = excel_rounddown(x, digits);
+            let up = excel_roundup(x, digits);
+            proptest::prop_assert!(
+                down.abs() <= up.abs(),
+                "rounddown({x}, {digits}) = {down} exceeds roundup = {up}"
+            );
+        }
     }
 
     #[test]

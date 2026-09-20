@@ -6,6 +6,10 @@ use std::time::Duration;
 use crate::deployment::{
     metadata::McpMetadata,
     r#trait::{BuildArtifact, DeploymentOutputs},
+    stack_routing::{
+        cloudformation_metadata_from, custom_stack_ts_reason, emit_descriptor_warnings,
+        extract_metadata_with_log, load_deploy_descriptor, mark_custom_stack,
+    },
     DeployConfig,
 };
 
@@ -98,10 +102,6 @@ pub async fn deploy_to_pmcp_run(
     // Get credentials (OAuth tokens)
     let credentials = auth::get_credentials().await?;
 
-    // Paths
-    let deploy_dir = config.project_root.join("deploy");
-    let cdk_out = deploy_dir.join("cdk.out");
-
     // Step 0: Extract MCP metadata for the CloudFormation template, then apply
     // the operator `[metadata]` override (DSTK-02/DSTK-03) so config-declared
     // server_type / snapshot_baked reach the synth context.
@@ -110,41 +110,29 @@ pub async fn deploy_to_pmcp_run(
         m
     });
 
-    // Step 1: Synthesize CloudFormation template with metadata context.
-    // FIX #2 (deploy-toml-inert-for-preserved-stack): pass developer-declared
-    // [environment] to the `cdk synth` child process — the pmcp-run equivalent
-    // of the aws-lambda `extra_env` path. The stack.ts consumes matching
-    // process.env.<KEY> reads, so [environment] is no longer globally inert.
-    // Secrets are intentionally NOT passed here (pmcp.run injects them
-    // server-side per D-08); only non-sensitive [environment] flows to synth.
+    // Step 1: Synthesize the CloudFormation template. Task 7 (CFN-renderer
+    // extraction) routes between the pure `pmcp-cfn-renderer` crate and the
+    // legacy `npx cdk synth` subprocess — see `synth_template`'s doc comment
+    // for the routing rule. `[environment]` (never `[secrets]`) reaches
+    // either path; see `synth_template`/`run_legacy_synth`.
     println!("📝 Synthesizing CloudFormation template...");
-    run_cdk_synth(&deploy_dir, metadata.as_ref(), &config.environment)?;
-    println!("✅ CloudFormation template synthesized");
-
-    // Step 2: Find the synthesized template
-    let template_path = find_template_file(&cdk_out)?;
-    println!("   Template: {}", template_path.display());
+    let synth = synth_template(config, metadata.as_ref())?;
+    match &synth.path {
+        SynthPath::Renderer => {
+            println!("✅ CloudFormation template rendered (pmcp-cfn-renderer)");
+        },
+        SynthPath::LegacyCdk { .. } => {
+            println!("✅ CloudFormation template synthesized (cdk synth)");
+        },
+    }
 
     // Step 3: Extract bootstrap data + content-type from the build artifact.
     let upload = read_bootstrap_upload(artifact)?;
     println!();
 
-    // Step 4: Read template file
-    let template = std::fs::read_to_string(&template_path)
-        .context("Failed to read CloudFormation template")?;
-
-    // Step 4b: Construct-agnostic `[environment]` delivery
-    // (`environment-inert-for-shared-cdk-constructs`). FIX #2 exported
-    // `[environment]` only as `process.env` to the `cdk synth` child, so
-    // shared/managed constructs that ignore `process.env` (e.g.
-    // `OpenApiMcpServerStack`) silently dropped the declared keys. Merge the
-    // declared `[environment]` directly into every `AWS::Lambda::Function`'s
-    // `Environment.Variables` in the synthesized template — construct-agnostic,
-    // guaranteed delivery regardless of how the stack.ts was authored. Secrets
-    // are EXCLUDED (they keep their server-side injection path per D-08).
-    // Precedence: `[environment]` OVERRIDES a construct's hardcoded value on
-    // key collision (locked product decision).
-    let template = apply_environment_merge(template, &config.environment, &config.secrets)?;
+    // Step 4: apply every post-synth template merge (see
+    // `apply_post_synth_merges`), then upload.
+    let template = apply_post_synth_merges(synth.template_json, config)?;
 
     log_upload_sizes(template.len(), upload.data.len(), upload.has_assets);
     println!();
@@ -209,26 +197,199 @@ pub async fn deploy_to_pmcp_run(
     ))
 }
 
-/// Extract MCP metadata and log what was found. Returns None when the project
-/// has no metadata (defaults apply).
-fn extract_metadata_with_log(project_root: &Path) -> Option<McpMetadata> {
-    println!("📋 Extracting MCP server metadata...");
-    match McpMetadata::extract(project_root) {
-        Ok(m) => {
-            println!("   Server: {} ({})", m.server_id, m.server_type);
-            if !m.resources.secrets.is_empty() {
-                println!("   Secrets: {}", m.resources.secrets.len());
-            }
-            if !m.capabilities.tools.is_empty() {
-                println!("   Tools: {}", m.capabilities.tools.len());
-            }
-            Some(m)
-        },
-        Err(_) => {
-            println!("   No metadata found (using defaults)");
-            None
+// ============================================================================
+// Task 7 (CFN-renderer extraction): synth routing between the pure
+// `pmcp-cfn-renderer` crate and the legacy `npx cdk synth` subprocess.
+// ============================================================================
+
+/// Outcome of synthesizing the pmcp-run CloudFormation template.
+///
+/// `path` records which code path produced `template_json` — Task 10's
+/// runbook and the `mcp:customStack` taint recording (see
+/// [`mark_custom_stack`]) both key off it.
+pub(crate) struct SynthOutput {
+    pub(crate) template_json: String,
+    pub(crate) path: SynthPath,
+}
+
+/// Which code path produced a [`SynthOutput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SynthPath {
+    /// The pure `pmcp-cfn-renderer` crate rendered the template directly
+    /// from `.pmcp/deploy.toml`'s `DeployDescriptor` — no `cdk synth`
+    /// subprocess, no Node.js.
+    Renderer,
+    /// Fell back to `npx cdk synth`. `reason` names why: a hand-modified
+    /// `deploy/lib/stack.ts`, a `.pmcp/deploy.toml` the renderer's
+    /// closed-set `DeployDescriptor` can't parse yet, or a declared section
+    /// the renderer doesn't implement for this target yet.
+    LegacyCdk { reason: String },
+}
+
+/// Synthesize the pmcp-run CloudFormation template, routing between the pure
+/// [`pmcp_cfn_renderer`] renderer and the legacy `npx cdk synth` subprocess.
+///
+/// # Routing rule
+///
+/// `deploy/lib/stack.ts` on disk (post `validate_and_regenerate_stack_ts`,
+/// which already ran by the time this is called) must byte-match what
+/// `cargo pmcp` itself would (re)generate for the renderer path to even be
+/// attempted — see [`custom_stack_ts_reason`]. A hand-modified stack.ts
+/// always falls back to `cdk synth` so operator customizations keep
+/// working, and is additionally tainted via [`mark_custom_stack`] so the
+/// platform can tell the two shapes apart from the synthesized template's
+/// own `mcp:*` metadata.
+///
+/// Even on the untainted (scaffold) path the renderer attempt can still
+/// fall back gracefully — never a hard error — because two things are still
+/// growing: `.pmcp/deploy.toml` may declare a table outside the renderer's
+/// closed-set `DeployDescriptor` (e.g. `[aws].account_id`, which
+/// `AwsSection` does not model), or a section the renderer doesn't
+/// implement for this target yet (e.g. pmcp-run `[auth].enabled = true` —
+/// the platform's own OAuth registration path is unaffected either way,
+/// since it never rendered into CFN in the legacy path). See [`try_render`].
+fn synth_template(config: &DeployConfig, metadata: Option<&McpMetadata>) -> Result<SynthOutput> {
+    let deploy_dir = config.project_root.join("deploy");
+    let cdk_out = deploy_dir.join("cdk.out");
+
+    if let Some(reason) = custom_stack_ts_reason(config)? {
+        warn_falling_back_to_cdk(&reason);
+        let tainted = mark_custom_stack(metadata);
+        return run_legacy_synth(&deploy_dir, &cdk_out, tainted.as_ref(), config, reason);
+    }
+
+    match try_render(config, metadata) {
+        Ok(template_json) => Ok(SynthOutput {
+            template_json,
+            path: SynthPath::Renderer,
+        }),
+        Err(reason) => {
+            warn_falling_back_to_cdk(&reason);
+            run_legacy_synth(&deploy_dir, &cdk_out, metadata, config, reason)
         },
     }
+}
+
+/// Print the standard "falling back to cdk synth" advisory, in the same
+/// yellow `warning:` style as `crate::deployment::iam::emit_warnings`.
+fn warn_falling_back_to_cdk(reason: &str) {
+    eprintln!(
+        "  {} {reason} — falling back to `cdk synth` for this deploy.",
+        console::style("warning:").yellow()
+    );
+}
+
+/// Attempt the pure-renderer synth path.
+///
+/// Parses `.pmcp/deploy.toml` as a [`DeployDescriptor`], surfaces the
+/// renderer's own `iam`/`cognito` advisory warnings directly (closing the
+/// T4/T6 review gap where `pmcp_cfn_renderer::render` discards them — see
+/// `crate::deployment::iam::emit_warnings` for the print style this
+/// mirrors), then renders. `Err` carries a human-readable reason for the
+/// caller to fall back to `cdk synth` on — never a hard failure, since both
+/// the descriptor's closed set and the renderer's resource-family surface
+/// are still growing (see `synth_template`'s doc comment).
+fn try_render(config: &DeployConfig, metadata: Option<&McpMetadata>) -> Result<String, String> {
+    let descriptor = load_deploy_descriptor(config).map_err(|e| {
+        format!(
+            "{} does not parse as pmcp-cfn-renderer's DeployDescriptor: {e:#}",
+            ".pmcp/deploy.toml"
+        )
+    })?;
+
+    emit_descriptor_warnings(&descriptor);
+
+    let params = build_render_params(config, metadata);
+
+    pmcp_cfn_renderer::render(&descriptor, &params)
+        .map(|template| template.to_canonical_json())
+        .map_err(|e| format!("pmcp-cfn-renderer cannot render this descriptor yet: {e}"))
+}
+
+/// Sentinel used for [`pmcp_cfn_renderer::RenderParams::account_id`] when
+/// the account is not resolvable in this flow.
+///
+/// Deliberately NOT a plausible-looking fake (unlike the renderer's own
+/// golden fixtures, which use AWS's docs placeholder `123456789012`):
+/// investigation for Task 7 found that the pmcp-run `cdk synth` path never
+/// sets `CDK_DEFAULT_ACCOUNT` either (only the aws-lambda `cdk deploy` path
+/// does, from `[aws].account_id` — see `commands/deploy/deploy.rs`), so
+/// `this.account` in the generated `stack.ts` resolves to CloudFormation's
+/// own `Ref: AWS::AccountId` pseudo-parameter — resolved server-side, in
+/// whatever account actually applies the stack. `pmcp-cfn-renderer` has no
+/// equivalent of a CFN pseudo-parameter: `RenderParams::account_id` is
+/// baked as a literal into IAM/ARN strings. This all-zeros sentinel stands
+/// in until the platform side of that gap is resolved (see Task 7's report
+/// / Task 10's runbook) — an operator CAN unblock it today by declaring
+/// `[aws] account_id = "..."`, which this function reads first.
+const UNRESOLVED_ACCOUNT_ID: &str = "000000000000";
+
+/// Placeholder S3 bucket for the renderer's `ArtifactRef` (Task 7,
+/// Interfaces §2).
+///
+/// The real upload key is only known after `graphql::get_upload_urls` runs
+/// (Step 5, strictly AFTER synth) — today's `cdk synth` leaves the same kind
+/// of synth-time placeholder in `Code.S3Bucket`/`Code.S3Key` (its local CDK
+/// asset-staging location), and the platform never deploys straight from
+/// either value: it deploys the bootstrap ZIP it receives at
+/// `bootstrapS3Key` instead (see `graphql::UploadUrls`). Kept as a distinct
+/// named constant (rather than reusing the account sentinel) so the two
+/// "unknown at synth time" gaps stay independently greppable.
+const ARTIFACT_PLACEHOLDER_BUCKET: &str = "pmcp-run-pending-upload";
+
+/// Build [`pmcp_cfn_renderer::RenderParams`] from the existing config/
+/// credential plumbing already threaded through `deploy.rs` — never from the
+/// `DeployDescriptor` (Task 7, Interfaces §2's identity/environment split).
+fn build_render_params(
+    config: &DeployConfig,
+    metadata: Option<&McpMetadata>,
+) -> pmcp_cfn_renderer::RenderParams {
+    let aws = config.aws();
+    pmcp_cfn_renderer::RenderParams {
+        account_id: aws
+            .account_id
+            .clone()
+            .unwrap_or_else(|| UNRESOLVED_ACCOUNT_ID.to_string()),
+        region: aws.region.clone(),
+        stack_name: format!("{}-stack", config.server.name),
+        artifact: pmcp_cfn_renderer::ArtifactRef {
+            s3_bucket: ARTIFACT_PLACEHOLDER_BUCKET.to_string(),
+            s3_key: format!("{}/bootstrap.zip", config.server.name),
+            digest: None,
+        },
+        environment: config
+            .environment
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        cloudformation_metadata: cloudformation_metadata_from(metadata),
+        // The `pmcp-run` target never routes through `aws_lambda::artifact`'s
+        // `ServerShape` detection (that module is `aws-lambda`-target-only —
+        // see its own module doc), so a `pmcp-run` deploy never needs the
+        // AWS Lambda Web Adapter bridge (T8 review fix). `None` here renders
+        // byte-identical output to before that field existed.
+        runtime_adapter: None,
+    }
+}
+
+/// Run the legacy `npx cdk synth` subprocess and read back the synthesized
+/// template — the pre-Task-7 Step 1/Step 2 body, now a fallback path.
+fn run_legacy_synth(
+    deploy_dir: &Path,
+    cdk_out: &Path,
+    metadata: Option<&McpMetadata>,
+    config: &DeployConfig,
+    reason: String,
+) -> Result<SynthOutput> {
+    run_cdk_synth(deploy_dir, metadata, &config.environment)?;
+    let template_path = find_template_file(cdk_out)?;
+    println!("   Template: {}", template_path.display());
+    let template_json = std::fs::read_to_string(&template_path)
+        .context("Failed to read CloudFormation template")?;
+    Ok(SynthOutput {
+        template_json,
+        path: SynthPath::LegacyCdk { reason },
+    })
 }
 
 /// Run `npx cdk synth --quiet` with optional metadata context args.
@@ -750,7 +911,7 @@ async fn poll_deployment_status(
 }
 
 /// Find the CloudFormation template file in cdk.out directory
-fn find_template_file(cdk_out: &PathBuf) -> Result<PathBuf> {
+fn find_template_file(cdk_out: &Path) -> Result<PathBuf> {
     let entries = std::fs::read_dir(cdk_out).with_context(|| {
         format!(
             "CDK output directory not found or unreadable: {}",
@@ -773,6 +934,50 @@ fn find_template_file(cdk_out: &PathBuf) -> Result<PathBuf> {
     }
 
     bail!("No CloudFormation template found in {}", cdk_out.display());
+}
+
+/// Apply every post-synth CloudFormation template merge, in order, to the
+/// template `synth_template` produced.
+///
+/// This exists as its own function so the WIRING is unit-testable: the async
+/// `deploy_to_pmcp_run` that calls it needs OAuth credentials, S3 presigned
+/// URLs and a live GraphQL endpoint, so nothing can assert from there that a
+/// merge is actually reached in production. Deleting a merge call inside this
+/// function fails `post_synth_merges_apply_environment_and_sizing` — deleting
+/// it from an inline chain inside `deploy_to_pmcp_run` would fail nothing.
+///
+/// # Why post-synth
+///
+/// Both merges run AFTER engine routing, so they cover `SynthPath::Renderer`
+/// and `SynthPath::LegacyCdk` alike. That is the whole point: a hand-modified
+/// `deploy/lib/stack.ts` always routes to `npx cdk synth` (see
+/// [`custom_stack_ts_reason`]), and hand-edited stacks are exactly the
+/// population that reported both of these bugs.
+///
+/// 1. `[environment]` — construct-agnostic env-var delivery into EVERY
+///    `AWS::Lambda::Function`'s `Environment.Variables`
+///    (`environment-inert-for-shared-cdk-constructs`). FIX #2 exported
+///    `[environment]` only as `process.env` to the `cdk synth` child, so
+///    shared/managed constructs that ignore `process.env` (e.g.
+///    `OpenApiMcpServerStack`) silently dropped the declared keys. Secrets are
+///    EXCLUDED (they keep their server-side injection path per D-08).
+///    Precedence: `[environment]` OVERRIDES a construct's hardcoded value on
+///    key collision (locked product decision).
+/// 2. `[server]` sizing — `Properties.MemorySize`/`Timeout` on the MCP
+///    function ONLY (debug session `deploy-server-memory-timeout`). Threading
+///    these into the stack.ts template instead was measured and rejected; see
+///    `init::AWS_LAMBDA_SCAFFOLD_MEMORY_MB`'s doc comment for the byte-match
+///    fallout. Unlike (1) this one must NOT touch every Lambda: an
+///    OAuth-enabled stack renders three functions at three different sizings,
+///    and resizing the 10-second authorizer would be a regression.
+fn apply_post_synth_merges(template: String, config: &DeployConfig) -> Result<String> {
+    let template = apply_environment_merge(template, &config.environment, &config.secrets)?;
+    apply_sizing_merge(
+        template,
+        &config.server.name,
+        config.server.memory_mb,
+        config.server.timeout_seconds,
+    )
 }
 
 /// Outcome of merging `[environment]` into a synthesized CloudFormation
@@ -958,6 +1163,221 @@ fn environment_no_lambda_warning(
     )
 }
 
+// ── [server] sizing: post-synth MemorySize/Timeout merge ────────────────────
+// (debug session `deploy-server-memory-timeout`)
+
+/// Outcome of merging `[server]` sizing into a synthesized CloudFormation
+/// template. See [`merge_sizing_into_template`].
+#[derive(Debug)]
+struct SizingMergeOutcome {
+    /// The re-serialized template JSON with the declared sizing applied.
+    template: String,
+    /// One human-readable line per MCP-function resource that was rewritten,
+    /// naming the before/after values (e.g.
+    /// `"McpFunction: MemorySize 256 -> 1024"`). Empty means no matching
+    /// Lambda was found — the caller uses this for the fail-loud warning.
+    ///
+    /// A property already carrying the declared value produces no entry for
+    /// that property, so an idempotent re-deploy stays quiet about it while
+    /// the resource is still reported as matched.
+    changes: Vec<String>,
+    /// `true` when at least one `AWS::Lambda::Function` whose
+    /// `Properties.FunctionName` equals the configured server name was found.
+    /// Distinct from `changes` being non-empty: a matched-but-already-correct
+    /// template yields `matched = true` with no changes, which must NOT trip
+    /// the fail-loud path.
+    matched: bool,
+}
+
+/// Merge the synthesized template with the declared `[server]` sizing and emit
+/// operator feedback.
+///
+/// Thin deploy-time wrapper around the pure [`merge_sizing_into_template`]
+/// helper: it prints either a per-property before/after summary or the
+/// fail-loud "no matching Lambda" warning, and returns the (possibly modified)
+/// template string. When neither `memory_mb` nor `timeout_seconds` is declared
+/// the template is returned unchanged and nothing is printed.
+///
+/// # Precedence — a DELIBERATE divergence from the `[environment]` fix
+///
+/// The sibling session (`deploy-toml-inert-for-preserved-stack`) ruled that a
+/// `stack.ts` literal WINS over `deploy.toml` for `[environment]`. That rule
+/// is deliberately NOT followed here: declared sizing OVERRIDES the stack.ts
+/// literal. The two cases are not analogous — `[environment]` is a MAP, where
+/// "the literal wins" is a coherent additive-fill (deploy.toml contributes
+/// keys the construct did not set), whereas `memorySize` is a SCALAR the
+/// construct always sets, so "the literal wins" would degenerate to "the
+/// config is inert", which is the bug being fixed. The sibling already broke
+/// its own rule once, for construct collisions. The divergence and this
+/// rationale are documented in `cargo-pmcp/docs/commands/deploy.md`.
+fn apply_sizing_merge(
+    template: String,
+    function_name: &str,
+    memory_mb: Option<u32>,
+    timeout_seconds: Option<u32>,
+) -> Result<String> {
+    if memory_mb.is_none() && timeout_seconds.is_none() {
+        return Ok(template);
+    }
+
+    let outcome = merge_sizing_into_template(&template, function_name, memory_mb, timeout_seconds)?;
+
+    if outcome.matched {
+        if outcome.changes.is_empty() {
+            println!("   ✅ [server] sizing already matches the synthesized template");
+        } else {
+            for change in &outcome.changes {
+                println!("   ✅ Applied [server] sizing — {change}");
+            }
+        }
+    } else {
+        // Fail-loud: sizing was declared but no Lambda in the synthesized
+        // template carries this server's FunctionName, so there is nothing to
+        // apply it to. Warn prominently instead of dropping it silently — the
+        // silence is precisely what made this bug survive three sessions.
+        eprintln!(
+            "{}",
+            sizing_no_lambda_warning(function_name, memory_mb, timeout_seconds)
+        );
+    }
+
+    Ok(outcome.template)
+}
+
+/// Rewrite `Properties.MemorySize` / `Properties.Timeout` on the MCP function
+/// in a synthesized CloudFormation template. Pure and unit-testable — no
+/// synth, no I/O.
+///
+/// # Which resource is targeted
+///
+/// ONLY `AWS::Lambda::Function` resources whose `Properties.FunctionName`
+/// equals `function_name`. Matching on `Type` alone (the way the
+/// `[environment]` merge does) would be a regression: an OAuth-enabled stack
+/// renders THREE Lambdas at three different sizings — `<name>-oauth-proxy`
+/// at 256/30, `<name>` at 512/30, and `<name>-authorizer` at 256/**10** — and
+/// resizing the authorizer to the MCP function's memory and timeout would
+/// silently reconfigure infrastructure the operator never mentioned. Both
+/// synth engines set the discriminating property the same way (the renderer
+/// via `function_name: d.server.name`, the TS scaffold via
+/// `functionName: serverId`), so this is exact on either path. Logical IDs
+/// are deliberately NOT used: they are CDK-generated and unknowable for
+/// hand-authored or shared constructs.
+///
+/// # Precedence
+/// A declared value OVERRIDES whatever the construct emitted — see
+/// [`apply_sizing_merge`]'s doc comment for why this deliberately diverges
+/// from the `[environment]` merge's additive-fill rule. A `None` argument
+/// leaves that property exactly as synthesized.
+fn merge_sizing_into_template(
+    template_json: &str,
+    function_name: &str,
+    memory_mb: Option<u32>,
+    timeout_seconds: Option<u32>,
+) -> Result<SizingMergeOutcome> {
+    let mut template: serde_json::Value = serde_json::from_str(template_json)
+        .context("Failed to parse synthesized CloudFormation template JSON")?;
+
+    let mut changes: Vec<String> = Vec::new();
+    let mut matched = false;
+
+    if let Some(resources) = template
+        .get_mut("Resources")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (logical_id, resource) in resources.iter_mut() {
+            if !is_mcp_lambda_function(resource, function_name) {
+                continue;
+            }
+            matched = true;
+            apply_sizing_to_lambda(
+                resource,
+                logical_id,
+                memory_mb,
+                timeout_seconds,
+                &mut changes,
+            );
+        }
+    }
+
+    changes.sort();
+
+    let merged = serde_json::to_string_pretty(&template)
+        .context("Failed to re-serialize merged CloudFormation template")?;
+
+    Ok(SizingMergeOutcome {
+        template: merged,
+        changes,
+        matched,
+    })
+}
+
+/// True when `resource` is an `AWS::Lambda::Function` whose
+/// `Properties.FunctionName` equals `function_name` — the MCP function, as
+/// opposed to an OAuth proxy or authorizer sharing the same stack.
+fn is_mcp_lambda_function(resource: &serde_json::Value, function_name: &str) -> bool {
+    is_lambda_function(resource)
+        && resource
+            .get("Properties")
+            .and_then(|p| p.get("FunctionName"))
+            .and_then(serde_json::Value::as_str)
+            == Some(function_name)
+}
+
+/// Write the declared sizing onto one matched Lambda resource, appending a
+/// `"<logical id>: <Property> <before> -> <after>"` line to `changes` for each
+/// property whose value actually moved. Creates `Properties` if absent.
+fn apply_sizing_to_lambda(
+    resource: &mut serde_json::Value,
+    logical_id: &str,
+    memory_mb: Option<u32>,
+    timeout_seconds: Option<u32>,
+    changes: &mut Vec<String>,
+) {
+    let Some(properties) = resource
+        .as_object_mut()
+        .and_then(|r| ensure_object(r, "Properties"))
+    else {
+        return;
+    };
+
+    for (key, declared) in [("MemorySize", memory_mb), ("Timeout", timeout_seconds)] {
+        let Some(declared) = declared else { continue };
+        let before = properties.get(key).and_then(serde_json::Value::as_u64);
+        if before == Some(u64::from(declared)) {
+            continue;
+        }
+        let before_label = before.map_or_else(|| "(unset)".to_string(), |v| v.to_string());
+        changes.push(format!("{logical_id}: {key} {before_label} -> {declared}"));
+        properties.insert(key.to_string(), serde_json::Value::from(declared));
+    }
+}
+
+/// Build the fail-loud warning shown when `[server]` sizing is declared but the
+/// synthesized template contains no `AWS::Lambda::Function` whose
+/// `FunctionName` matches the configured server name.
+fn sizing_no_lambda_warning(
+    function_name: &str,
+    memory_mb: Option<u32>,
+    timeout_seconds: Option<u32>,
+) -> String {
+    let mut declared: Vec<String> = Vec::new();
+    if let Some(m) = memory_mb {
+        declared.push(format!("memory_mb = {m}"));
+    }
+    if let Some(t) = timeout_seconds {
+        declared.push(format!("timeout_seconds = {t}"));
+    }
+    let declared = declared.join(", ");
+    format!(
+        "⚠️  [server] sizing declared but NOT applied — the synthesized CloudFormation \
+         template contains no AWS::Lambda::Function whose FunctionName is \
+         '{function_name}'.\n     \
+         Declared: {declared}\n     \
+         Check that [server] name matches the function your stack.ts creates; otherwise the \
+         deployed function keeps whatever size the template hardcodes."
+    )
+}
+
 /// Run the fail-closed IAM validator and rewrite `deploy/lib/stack.ts` from
 /// the loaded [`DeployConfig`], so `[iam]` declared in `.pmcp/deploy.toml`
 /// lands in the synthesized CloudFormation template. Mirrors
@@ -988,9 +1408,16 @@ fn validate_and_regenerate_stack_ts(config: &DeployConfig) -> Result<()> {
         // preserved stack.ts means declared [iam]/[environment] are not
         // auto-applied. Mirrors the aws-lambda path
         // (commands/deploy/deploy.rs) so the signal is target-uniform.
+        // `sizing_inert = false`: unlike the aws-lambda target, this one
+        // rewrites `Properties.MemorySize`/`Timeout` post-synth (see
+        // `apply_sizing_merge`), on BOTH synth engines — so a preserved
+        // stack.ts does not make `[server]` sizing inert here and warning
+        // about it would be false (debug session
+        // `deploy-server-memory-timeout`).
         if let Some(warning) = crate::deployment::config::stack_ts_preserved_inert_warning(
             config.iam.is_empty(),
             config.environment.is_empty(),
+            false,
         ) {
             eprintln!("{warning}");
         }
@@ -1160,6 +1587,335 @@ mod tests {
             found,
             "[environment] entry must be set on the cdk synth child process (FIX #2)"
         );
+    }
+
+    // ========================================================================
+    // Task 7 (CFN-renderer extraction): synth routing + renderer-path tests.
+    // ========================================================================
+
+    /// Write `.pmcp/deploy.toml` to `project_root` by serializing `config` —
+    /// the on-disk file `load_deploy_descriptor`/`try_render` actually read.
+    /// Task 7 parses the renderer's `DeployDescriptor` straight from disk,
+    /// never from the in-memory `DeployConfig` (Interfaces §2), so routing
+    /// tests need a real file on top of the in-memory fixture.
+    fn write_deploy_toml(project_root: &std::path::Path, config: &DeployConfig) {
+        let dir = project_root.join(".pmcp");
+        std::fs::create_dir_all(&dir).expect("create .pmcp dir");
+        let text = toml::to_string_pretty(config).expect("serialize DeployConfig");
+        std::fs::write(dir.join("deploy.toml"), text).expect("write .pmcp/deploy.toml");
+    }
+
+    /// Routing rule (Step 1): a stack.ts that still matches the regenerated
+    /// scaffold takes the renderer path — `custom_stack_ts_reason` returns
+    /// `None`, and `try_render` actually renders a template from the
+    /// on-disk `.pmcp/deploy.toml` (no `cdk synth` subprocess involved).
+    #[test]
+    fn synth_routes_to_renderer_when_stack_ts_matches_scaffold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        write_deploy_toml(tmp.path(), &config);
+        validate_and_regenerate_stack_ts(&config).expect("scaffold stack.ts written");
+
+        assert_eq!(
+            custom_stack_ts_reason(&config).expect("taint check succeeds"),
+            None,
+            "a freshly (re)generated stack.ts must match its own scaffold"
+        );
+
+        let rendered =
+            try_render(&config, None).expect("renderer must succeed on a fresh scaffold");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert!(
+            parsed.get("Resources").is_some(),
+            "rendered template must carry a Resources section, got: {rendered}"
+        );
+    }
+
+    /// Routing rule (Step 1): a hand-modified stack.ts falls back to the
+    /// legacy path — `custom_stack_ts_reason` names the file, and the taint
+    /// is recorded onto the deploy metadata map (`custom_stack`) alongside
+    /// `server_type`/`snapshot_baked` via `mark_custom_stack`.
+    #[test]
+    fn synth_routes_to_legacy_when_stack_ts_is_hand_modified() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        write_deploy_toml(tmp.path(), &config);
+        let (path, _curated) = seed_curated_stack_ts(tmp.path());
+
+        let reason = custom_stack_ts_reason(&config)
+            .expect("taint check succeeds")
+            .expect("hand-curated stack.ts must be detected as modified");
+        assert!(
+            reason.contains(&path.display().to_string()),
+            "reason must name the stack.ts path, got: {reason}"
+        );
+
+        let metadata = McpMetadata::extract(tmp.path()).ok();
+        let tainted = mark_custom_stack(metadata.as_ref()).expect("metadata always present");
+        assert!(
+            tainted.custom_stack,
+            "custom_stack must be recorded onto the metadata map"
+        );
+        assert!(
+            tainted
+                .to_cdk_context()
+                .iter()
+                .any(|c| c.contains("mcp:customStack=true")),
+            "the taint must reach the cdk synth context args"
+        );
+    }
+
+    /// `mark_custom_stack` is a no-op on `None` — a project with no
+    /// discoverable metadata has nothing to tag.
+    #[test]
+    fn mark_custom_stack_none_stays_none() {
+        assert!(mark_custom_stack(None).is_none());
+    }
+
+    /// A `.pmcp/deploy.toml` that doesn't exist yet (or fails to parse as
+    /// the renderer's closed-set `DeployDescriptor`) is a graceful `Err`
+    /// (fallback reason), never a panic or hard failure — `synth_template`
+    /// relies on this to fall back to `cdk synth` instead of breaking the
+    /// deploy outright.
+    #[test]
+    fn try_render_reports_a_reason_when_deploy_toml_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        // Deliberately do not write .pmcp/deploy.toml.
+
+        let reason = try_render(&config, None).expect_err("missing deploy.toml must not panic");
+        assert!(
+            reason.contains("deploy.toml"),
+            "reason must name the missing/unparseable file, got: {reason}"
+        );
+    }
+
+    /// `RenderParams::account_id` falls back to the documented all-zeros
+    /// sentinel when `.pmcp/deploy.toml`'s `[aws]` has no `account_id` —
+    /// matching what today's `cdk synth` receives for pmcp-run (nothing;
+    /// `CDK_DEFAULT_ACCOUNT` is never set on that path).
+    #[test]
+    fn build_render_params_account_id_falls_back_to_sentinel_when_unset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        assert!(config.aws().account_id.is_none());
+
+        let params = build_render_params(&config, None);
+        assert_eq!(params.account_id, UNRESOLVED_ACCOUNT_ID);
+    }
+
+    /// When the operator DOES declare `[aws] account_id`, it is used
+    /// verbatim — the same field the sibling aws-lambda `cdk deploy` path
+    /// already reads (`commands/deploy/deploy.rs`).
+    #[test]
+    fn build_render_params_uses_declared_account_id_when_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        config.aws.as_mut().expect("aws present").account_id = Some("111122223333".to_string());
+
+        let params = build_render_params(&config, None);
+        assert_eq!(params.account_id, "111122223333");
+    }
+
+    /// `RenderParams.environment` mirrors `config.environment` exactly —
+    /// never `config.secrets` (Interfaces §5: secret VALUES must never
+    /// reach the renderer).
+    #[test]
+    fn build_render_params_environment_excludes_secrets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        config
+            .environment
+            .insert("RUST_LOG".to_string(), "debug".to_string());
+        config
+            .secrets
+            .insert("API_TOKEN".to_string(), "shhh".to_string());
+
+        let params = build_render_params(&config, None);
+        assert_eq!(
+            params.environment.get("RUST_LOG"),
+            Some(&"debug".to_string())
+        );
+        assert!(
+            !params.environment.contains_key("API_TOKEN"),
+            "secret keys/values must never reach RenderParams.environment"
+        );
+    }
+
+    /// `RenderParams.stack_name` mirrors the `${serverName}-stack` name the
+    /// legacy `app.ts` scaffold hardcodes (Task 7, byte-parity with the
+    /// upload flow's expectations).
+    #[test]
+    fn build_render_params_stack_name_matches_app_ts_convention() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+
+        let params = build_render_params(&config, None);
+        assert_eq!(params.stack_name, "demo-server-stack");
+    }
+
+    /// T7 review fix: `cloudformation_metadata_from` populates
+    /// `RenderParams::cloudformation_metadata` from the EXISTING maintained
+    /// `McpMetadata::to_cloudformation_metadata` (DSTK-03 shape) —
+    /// previously called nowhere in the renderer path, so the uploaded
+    /// template's `Metadata` block lost all `mcp:*` provenance. Asserts the
+    /// object's keys/values, not just that it's non-empty.
+    #[test]
+    fn cloudformation_metadata_from_maps_the_maintained_dstk03_shape() {
+        let metadata = McpMetadata {
+            version: "1.0".to_string(),
+            server_type: "graphql-api".to_string(),
+            server_id: "srv-1".to_string(),
+            template_id: Some("types/graphql".to_string()),
+            template_version: None,
+            resources: crate::deployment::metadata::ResourceRequirements::default(),
+            capabilities: crate::deployment::metadata::ServerCapabilities::default(),
+            available_operations: None,
+            snapshot_baked: false,
+            custom_stack: false,
+        };
+
+        let cf_metadata = cloudformation_metadata_from(Some(&metadata));
+        assert_eq!(
+            cf_metadata.get("mcp:version"),
+            Some(&serde_json::json!("1.0"))
+        );
+        assert_eq!(
+            cf_metadata.get("mcp:serverType"),
+            Some(&serde_json::json!("graphql-api"))
+        );
+        assert_eq!(
+            cf_metadata.get("mcp:serverId"),
+            Some(&serde_json::json!("srv-1"))
+        );
+        assert_eq!(
+            cf_metadata.get("mcp:templateId"),
+            Some(&serde_json::json!("types/graphql"))
+        );
+        assert!(cf_metadata.contains_key("mcp:resources"));
+        assert!(cf_metadata.contains_key("mcp:capabilities"));
+        // DSTK-03 conditional emission: not opted into snapshot_baked here,
+        // so that key must be absent, matching `to_cloudformation_metadata`'s
+        // own byte-identity-for-non-opting-servers rule.
+        assert!(!cf_metadata.contains_key("mcp:snapshotBaked"));
+    }
+
+    /// `cloudformation_metadata_from(None)` yields an empty map — "no
+    /// metadata resolved yet" falls back to an empty map, and (via
+    /// `CfnTemplate`'s envelope rule) results in no `Metadata` key in the
+    /// rendered template at all.
+    #[test]
+    fn cloudformation_metadata_from_none_is_empty() {
+        assert!(cloudformation_metadata_from(None).is_empty());
+    }
+
+    /// End-to-end: `build_render_params` actually wires
+    /// `cloudformation_metadata_from`'s output onto
+    /// `RenderParams::cloudformation_metadata` — not just that the helper
+    /// function works in isolation.
+    #[test]
+    fn build_render_params_populates_cloudformation_metadata_from_mcp_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "pmcp-run", IamConfig::default());
+        let metadata = McpMetadata {
+            version: "1.0".to_string(),
+            server_type: "custom".to_string(),
+            server_id: "srv-build-params".to_string(),
+            template_id: None,
+            template_version: None,
+            resources: crate::deployment::metadata::ResourceRequirements::default(),
+            capabilities: crate::deployment::metadata::ServerCapabilities::default(),
+            available_operations: None,
+            snapshot_baked: false,
+            custom_stack: false,
+        };
+
+        let params = build_render_params(&config, Some(&metadata));
+        assert_eq!(
+            params.cloudformation_metadata,
+            metadata
+                .to_cloudformation_metadata()
+                .as_object()
+                .cloned()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            params.cloudformation_metadata.get("mcp:serverId"),
+            Some(&serde_json::json!("srv-build-params"))
+        );
+    }
+
+    /// Item 3 (the tracked T4/T6 warnings-discard gap): `emit_descriptor_warnings`
+    /// must not panic against a descriptor that actually triggers BOTH
+    /// `pmcp_cfn_renderer::resources::iam::validate` warning classes —
+    /// `iam.unknown_service_prefix` and `iam.cross_account_arn` — proving the
+    /// wiring (field access + the `Vec<Warning>` extend/print loop) is
+    /// correct end-to-end, not just that the underlying `validate` functions
+    /// work (those are already exhaustively tested in `pmcp-cfn-renderer`
+    /// itself). Run with `-- --nocapture` to see the printed advisories.
+    #[test]
+    fn emit_descriptor_warnings_prints_both_iam_warning_classes() {
+        use pmcp_package::package::{DeployDescriptor, IamSection, IamStatement};
+        let descriptor_iam = IamSection {
+            statements: vec![IamStatement {
+                effect: "Allow".to_string(),
+                actions: vec!["foobar:DoSomething".to_string()],
+                resources: vec!["arn:aws:foobar:us-east-1:999999999999:thing/x".to_string()],
+            }],
+        };
+        let descriptor = DeployDescriptor {
+            target: pmcp_package::package::TargetSection {
+                target_type: "pmcp-run".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            metadata: None,
+            aws: pmcp_package::package::AwsSection {
+                region: "us-east-1".to_string(),
+            },
+            server: pmcp_package::package::ServerSection {
+                name: "scratch".to_string(),
+                memory_mb: Some(512),
+                timeout_seconds: 30,
+                memory: None,
+                cpu: None,
+                ingress: None,
+                allow_unauthenticated: None,
+                binary: None,
+            },
+            environment: Default::default(),
+            secrets: Default::default(),
+            auth: pmcp_package::package::AuthSection {
+                enabled: false,
+                provider: "none".to_string(),
+                callback_urls: vec![],
+                cognito: None,
+                dcr: None,
+                groups: None,
+                scopes: None,
+            },
+            observability: pmcp_package::package::ObservabilitySection {
+                log_retention_days: 30,
+                enable_xray: true,
+                create_dashboard: true,
+                alarms: None,
+            },
+            composition: None,
+            assets: None,
+            iam: Some(descriptor_iam),
+            gcp: None,
+            layout: None,
+        };
+        emit_descriptor_warnings(&descriptor);
     }
 }
 
@@ -1433,6 +2189,468 @@ mod env_merge_tests {
             &secret_keys(&[]),
         )
         .expect_err("invalid JSON must error");
+        assert!(
+            err.to_string().contains("parse synthesized CloudFormation"),
+            "error must name the parse failure"
+        );
+    }
+}
+
+// ── [server] sizing: post-synth MemorySize/Timeout merge ────────────────────
+// (debug session `deploy-server-memory-timeout`)
+#[cfg(test)]
+mod sizing_merge_tests {
+    use super::{
+        apply_sizing_merge, is_mcp_lambda_function, merge_sizing_into_template,
+        sizing_no_lambda_warning,
+    };
+    use serde_json::{json, Value};
+
+    const SERVER: &str = "okf-demo";
+
+    /// A single-Lambda pmcp-run template as the scaffold/`cdk synth` engine
+    /// emits it: `memorySize: 256`, `timeout: cdk.Duration.seconds(30)`.
+    fn scaffold_template() -> String {
+        json!({
+            "Resources": {
+                "McpFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": SERVER,
+                        "MemorySize": 256,
+                        "Timeout": 30,
+                        "Runtime": "provided.al2023"
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn props(v: &Value, logical_id: &str) -> Value {
+        v["Resources"][logical_id]["Properties"].clone()
+    }
+
+    fn merged(
+        template: &str,
+        memory_mb: Option<u32>,
+        timeout_seconds: Option<u32>,
+    ) -> (Value, Vec<String>, bool) {
+        let out = merge_sizing_into_template(template, SERVER, memory_mb, timeout_seconds)
+            .expect("merge must parse and re-serialize valid template JSON");
+        let parsed: Value =
+            serde_json::from_str(&out.template).expect("merged template must be valid JSON");
+        (parsed, out.changes, out.matched)
+    }
+
+    /// (1) No-op when nothing is declared: `apply_sizing_merge` returns the
+    /// template BYTE-IDENTICALLY rather than round-tripping it through serde.
+    ///
+    /// This is the case that protects the installed base. `memory_mb` /
+    /// `timeout_seconds` are `Option` precisely so a `deploy.toml` that never
+    /// mentioned sizing leaves the engine's own default alone, instead of
+    /// materializing the schema default (512) over the pmcp-run engine's 256
+    /// and silently doubling every Lambda nobody asked to resize.
+    #[test]
+    fn no_op_when_nothing_declared() {
+        let template = scaffold_template();
+        let out =
+            apply_sizing_merge(template.clone(), SERVER, None, None).expect("no-op merge succeeds");
+        assert_eq!(
+            out, template,
+            "an undeclared sizing must return the template untouched, byte for byte"
+        );
+    }
+
+    /// (2) Declared sizing lands on the MCP function's `MemorySize`/`Timeout`.
+    #[test]
+    fn applies_declared_memory_and_timeout() {
+        let (parsed, changes, matched) = merged(&scaffold_template(), Some(1024), Some(60));
+        assert!(matched, "the MCP function must be matched");
+        assert_eq!(props(&parsed, "McpFunction")["MemorySize"], json!(1024));
+        assert_eq!(props(&parsed, "McpFunction")["Timeout"], json!(60));
+        assert_eq!(
+            changes,
+            vec![
+                "McpFunction: MemorySize 256 -> 1024".to_string(),
+                "McpFunction: Timeout 30 -> 60".to_string(),
+            ],
+            "both moves must be reported with before/after values"
+        );
+    }
+
+    /// (3) A Lambda with no `Properties` at all gets one created.
+    #[test]
+    fn creates_properties_when_absent() {
+        // A resource with no Properties cannot carry a FunctionName, so it is
+        // not the MCP function and must NOT be matched. Give it the name and
+        // nothing else to exercise the create-the-nested-object branch.
+        let template = json!({
+            "Resources": {
+                "Fn": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": { "FunctionName": SERVER }
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, changes, matched) = merged(&template, Some(1024), Some(60));
+        assert!(matched);
+        assert_eq!(props(&parsed, "Fn")["MemorySize"], json!(1024));
+        assert_eq!(props(&parsed, "Fn")["Timeout"], json!(60));
+        assert_eq!(
+            changes,
+            vec![
+                "Fn: MemorySize (unset) -> 1024".to_string(),
+                "Fn: Timeout (unset) -> 60".to_string(),
+            ],
+            "an absent property must report `(unset)` as its before value"
+        );
+    }
+
+    /// (4) Every other property on the matched Lambda is preserved.
+    #[test]
+    fn other_properties_preserved() {
+        let template = json!({
+            "Resources": {
+                "McpFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": SERVER,
+                        "MemorySize": 256,
+                        "Timeout": 30,
+                        "Runtime": "provided.al2023",
+                        "Handler": "bootstrap",
+                        "Environment": { "Variables": { "RUST_LOG": "info" } }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, _, _) = merged(&template, Some(1024), None);
+        let p = props(&parsed, "McpFunction");
+        assert_eq!(p["Runtime"], json!("provided.al2023"));
+        assert_eq!(p["Handler"], json!("bootstrap"));
+        assert_eq!(
+            p["Environment"],
+            json!({ "Variables": { "RUST_LOG": "info" } })
+        );
+        assert_eq!(
+            p["Timeout"],
+            json!(30),
+            "an undeclared property must be left exactly as synthesized"
+        );
+    }
+
+    /// (5) THE REGRESSION GUARD. An OAuth-enabled stack renders THREE Lambdas
+    /// at three DIFFERENT sizings — measured from
+    /// `crates/pmcp-cfn-renderer/tests/goldens/oauth-cognito-dcr.golden.json`:
+    /// `<name>-oauth-proxy` 256/30, `<name>` 512/30, `<name>-authorizer`
+    /// 256/**10**. Matching on `Type == "AWS::Lambda::Function"` alone (the way
+    /// the `[environment]` merge does) would resize the 10-second authorizer to
+    /// the MCP function's timeout — a real regression, not a fix.
+    #[test]
+    fn discriminates_the_mcp_function_in_a_three_lambda_oauth_stack() {
+        let template = json!({
+            "Resources": {
+                "OAuthProxy": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": format!("{SERVER}-oauth-proxy"),
+                        "MemorySize": 256, "Timeout": 30
+                    }
+                },
+                "McpFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": SERVER,
+                        "MemorySize": 512, "Timeout": 30
+                    }
+                },
+                "Authorizer": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": format!("{SERVER}-authorizer"),
+                        "MemorySize": 256, "Timeout": 10
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, changes, matched) = merged(&template, Some(3008), Some(900));
+        assert!(matched);
+        assert_eq!(
+            changes,
+            vec![
+                "McpFunction: MemorySize 512 -> 3008".to_string(),
+                "McpFunction: Timeout 30 -> 900".to_string(),
+            ],
+            "ONLY the MCP function may be reported as changed"
+        );
+
+        assert_eq!(props(&parsed, "McpFunction")["MemorySize"], json!(3008));
+        assert_eq!(props(&parsed, "McpFunction")["Timeout"], json!(900));
+
+        assert_eq!(
+            props(&parsed, "OAuthProxy"),
+            json!({ "FunctionName": format!("{SERVER}-oauth-proxy"), "MemorySize": 256, "Timeout": 30 }),
+            "the OAuth proxy must be byte-preserved"
+        );
+        assert_eq!(
+            props(&parsed, "Authorizer"),
+            json!({ "FunctionName": format!("{SERVER}-authorizer"), "MemorySize": 256, "Timeout": 10 }),
+            "the 10-second authorizer must be byte-preserved"
+        );
+    }
+
+    /// (6) Non-Lambda resources are never touched.
+    #[test]
+    fn non_lambda_resources_untouched() {
+        let template = json!({
+            "Resources": {
+                "McpFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": { "FunctionName": SERVER, "MemorySize": 256, "Timeout": 30 }
+                },
+                "ClientsTable": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": { "TableName": SERVER, "MemorySize": 1 }
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, _, _) = merged(&template, Some(1024), Some(60));
+        assert_eq!(
+            props(&parsed, "ClientsTable"),
+            json!({ "TableName": SERVER, "MemorySize": 1 }),
+            "a non-Lambda resource must be byte-preserved even when its own \
+             properties collide by name and its FunctionName-equivalent matches"
+        );
+    }
+
+    /// (7) Fail-loud: sizing declared, but no Lambda carries this server's
+    /// FunctionName. `matched` stays false (the caller's warning trigger) and
+    /// the warning names the server and the declared values.
+    #[test]
+    fn fail_loud_when_no_matching_lambda() {
+        let template = json!({
+            "Resources": {
+                "SomeoneElse": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": { "FunctionName": "a-different-server", "MemorySize": 256 }
+                }
+            }
+        })
+        .to_string();
+
+        let (parsed, changes, matched) = merged(&template, Some(1024), Some(60));
+        assert!(
+            !matched,
+            "no FunctionName match must yield matched = false (fail-loud trigger)"
+        );
+        assert!(changes.is_empty());
+        assert_eq!(
+            props(&parsed, "SomeoneElse")["MemorySize"],
+            json!(256),
+            "the non-matching Lambda must be left alone"
+        );
+
+        let warning = sizing_no_lambda_warning(SERVER, Some(1024), Some(60));
+        assert!(warning.contains("NOT applied"), "warning is prominent");
+        assert!(
+            warning.contains(SERVER),
+            "warning names the expected function"
+        );
+        assert!(
+            warning.contains("memory_mb = 1024"),
+            "warning names the declared memory"
+        );
+        assert!(
+            warning.contains("timeout_seconds = 60"),
+            "warning names the declared timeout"
+        );
+    }
+
+    /// (8) A partial declaration touches only the declared property.
+    #[test]
+    fn partial_declaration_leaves_the_other_property_alone() {
+        let (parsed, changes, _) = merged(&scaffold_template(), None, Some(120));
+        assert_eq!(
+            changes,
+            vec!["McpFunction: Timeout 30 -> 120".to_string()],
+            "only the declared property may be reported"
+        );
+        assert_eq!(
+            props(&parsed, "McpFunction")["MemorySize"],
+            json!(256),
+            "an undeclared memory_mb must leave the engine's own value in place"
+        );
+        assert_eq!(props(&parsed, "McpFunction")["Timeout"], json!(120));
+    }
+
+    /// (9) Idempotent: a template already carrying the declared values is
+    /// matched with ZERO changes. `matched` and `changes.is_empty()` must stay
+    /// distinct signals — collapsing them would send an already-correct
+    /// re-deploy down the fail-loud path.
+    #[test]
+    fn idempotent_when_already_correct() {
+        let (parsed, changes, matched) = merged(&scaffold_template(), Some(256), Some(30));
+        assert!(matched, "an already-correct template is still a MATCH");
+        assert!(
+            changes.is_empty(),
+            "no property moved, so nothing may be reported as changed"
+        );
+        assert_eq!(props(&parsed, "McpFunction")["MemorySize"], json!(256));
+        assert_eq!(props(&parsed, "McpFunction")["Timeout"], json!(30));
+    }
+
+    /// (10) THE ENGINE-DIVERGENCE FIXTURE (and_gate condition C). Before this
+    /// fix the two pmcp-run synth engines emitted DIFFERENT timeouts for the
+    /// SAME `deploy.toml`: `pmcp-cfn-renderer` threaded
+    /// `timeout_seconds: d.server.timeout_seconds`, while the TypeScript
+    /// scaffold hardcoded `cdk.Duration.seconds(30)` — so whether a human had
+    /// ever touched `stack.ts` (which routes the deploy to `npx cdk synth`)
+    /// silently decided the deployed Timeout.
+    ///
+    /// The whole test corpus was blind to this because every golden fixture
+    /// declares the DEFAULT `timeout_seconds = 30`, where the two engines
+    /// agree by coincidence. This is that masking removed: a NON-default 60,
+    /// asserted to converge from BOTH engine outputs.
+    #[test]
+    fn both_synth_engines_converge_on_the_declared_timeout() {
+        // What `npx cdk synth` produces: the stack.ts literal, 30.
+        let legacy_cdk = scaffold_template();
+        // What `pmcp-cfn-renderer` produces: the descriptor's 60 for Timeout,
+        // but still its own module const for MemorySize.
+        let renderer = json!({
+            "Resources": {
+                "McpFunction": {
+                    "Type": "AWS::Lambda::Function",
+                    "Properties": {
+                        "FunctionName": SERVER,
+                        "MemorySize": 256,
+                        "Timeout": 60,
+                        "Runtime": "provided.al2023"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let (from_legacy, legacy_changes, _) = merged(&legacy_cdk, Some(1024), Some(60));
+        let (from_renderer, renderer_changes, _) = merged(&renderer, Some(1024), Some(60));
+
+        assert_eq!(
+            from_legacy["Resources"]["McpFunction"]["Properties"]["Timeout"],
+            json!(60)
+        );
+        assert_eq!(
+            from_renderer["Resources"]["McpFunction"]["Properties"]["Timeout"],
+            json!(60)
+        );
+        assert_eq!(
+            from_legacy, from_renderer,
+            "the two synth engines must land on IDENTICAL sizing for the same deploy.toml"
+        );
+
+        // And the divergence is visible in what each engine needed corrected:
+        // only the legacy path had a Timeout to move.
+        assert!(
+            legacy_changes.contains(&"McpFunction: Timeout 30 -> 60".to_string()),
+            "the cdk-synth engine's hardcoded 30 must be corrected, got {legacy_changes:?}"
+        );
+        assert!(
+            !renderer_changes
+                .iter()
+                .any(|c| c.starts_with("McpFunction: Timeout")),
+            "the renderer already honored the descriptor timeout, got {renderer_changes:?}"
+        );
+    }
+
+    /// (11) `is_mcp_lambda_function` matches on BOTH the CFN type and the
+    /// FunctionName — neither alone is sufficient.
+    #[test]
+    fn is_mcp_lambda_function_requires_type_and_name() {
+        assert!(is_mcp_lambda_function(
+            &json!({ "Type": "AWS::Lambda::Function", "Properties": { "FunctionName": SERVER } }),
+            SERVER
+        ));
+        assert!(
+            !is_mcp_lambda_function(
+                &json!({ "Type": "AWS::Lambda::Url", "Properties": { "FunctionName": SERVER } }),
+                SERVER
+            ),
+            "the right name on the wrong type must not match"
+        );
+        assert!(
+            !is_mcp_lambda_function(
+                &json!({ "Type": "AWS::Lambda::Function", "Properties": { "FunctionName": "other" } }),
+                SERVER
+            ),
+            "the right type with the wrong name must not match"
+        );
+        assert!(
+            !is_mcp_lambda_function(
+                &json!({ "Type": "AWS::Lambda::Function", "Properties": {} }),
+                SERVER
+            ),
+            "a missing FunctionName must not match"
+        );
+    }
+
+    /// (12) WIRING GUARD — proves both post-synth merges are actually reached
+    /// in production, not merely unit-tested in isolation.
+    ///
+    /// `deploy_to_pmcp_run` cannot be asserted from a unit test (it needs OAuth
+    /// credentials, presigned S3 URLs and a live GraphQL endpoint), which is
+    /// why the merge chain was extracted into `apply_post_synth_merges`.
+    /// Deleting either call there fails THIS test. Without it, a correct
+    /// `merge_sizing_into_template` that nothing ever calls would still show a
+    /// fully green suite — which is the exact shape of the original bug:
+    /// `memory_mb` parsed fine and was read by zero production code paths.
+    #[test]
+    fn post_synth_merges_apply_environment_and_sizing() {
+        use super::apply_post_synth_merges;
+
+        let mut config = crate::deployment::config::DeployConfig::default_for_server(
+            SERVER.to_string(),
+            "us-east-1".to_string(),
+            std::path::PathBuf::from("/tmp/pmcp-run-post-synth-merges"),
+        );
+        config.server.memory_mb = Some(1024);
+        config.server.timeout_seconds = Some(120);
+        config
+            .environment
+            .insert("FEATURE_FLAG".to_string(), "on".to_string());
+
+        let out = apply_post_synth_merges(scaffold_template(), &config)
+            .expect("post-synth merges succeed on a well-formed template");
+        let parsed: Value = serde_json::from_str(&out).expect("merged template is valid JSON");
+        let p = props(&parsed, "McpFunction");
+
+        assert_eq!(
+            p["Environment"]["Variables"]["FEATURE_FLAG"],
+            json!("on"),
+            "the [environment] merge must still be wired into the deploy path"
+        );
+        assert_eq!(
+            p["MemorySize"],
+            json!(1024),
+            "the [server] sizing merge must be wired into the deploy path"
+        );
+        assert_eq!(p["Timeout"], json!(120));
+    }
+
+    /// (12) Invalid template JSON surfaces a parse error rather than silently
+    /// dropping the merge.
+    #[test]
+    fn invalid_template_json_errors() {
+        let err = merge_sizing_into_template("{ not valid json", SERVER, Some(1024), None)
+            .expect_err("invalid JSON must error");
         assert!(
             err.to_string().contains("parse synthesized CloudFormation"),
             "error must name the parse failure"

@@ -483,3 +483,30 @@ mod tests {
         assert!(validate_path_string("path", "/etc/passwd").is_err());
     }
 }
+
+impl<T, F> std::fmt::Debug for WasmTypedTool<T, F>
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    F: Fn(T) -> Result<Value> + Send + Sync,
+{
+    /// Hand-written: `F` is a handler closure, deliberately not bounded by `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmTypedTool")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> std::fmt::Debug for SimpleWasmTool<T>
+where
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+{
+    /// Hand-written for the same reason as [`WasmTypedTool`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleWasmTool")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}

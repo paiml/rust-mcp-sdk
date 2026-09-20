@@ -376,6 +376,8 @@ cargo run --example t02_websocket_server_enhanced --features websocket
 ### SSE
 
 **t03_sse_optimized** — `OptimizedSseTransport` with compression, batching, and reconnection.
+*Deprecated since 2.18.0* — retained for 2.x compatibility; use `StreamableHttpTransport` for new
+code, which bounds every peer-controlled read and carries a configurable cap.
 ```bash
 cargo run --example t03_sse_optimized --features sse
 ```

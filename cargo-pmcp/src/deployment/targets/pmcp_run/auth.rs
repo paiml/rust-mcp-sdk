@@ -231,6 +231,54 @@ fn save_config_cache(config: &PmcpRunConfig) -> Result<()> {
     Ok(())
 }
 
+/// Delete the cached discovery document, if present. Idempotent — a missing file
+/// is success, so callers do not need to probe first.
+///
+/// The cache key is the `api_url` that produced the entry, which correctly
+/// invalidates when the USER points at a different deployment but NOT when the
+/// SERVER changes its answer under a stable `api_url`. Anything that changes which
+/// deployment we talk to, or that has evidence the cached answer is wrong, should
+/// call this rather than wait out the 1-hour TTL.
+pub(crate) fn clear_config_cache() -> Result<()> {
+    let path = config_cache_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Could not remove {}", path.display())),
+    }
+}
+
+/// Run discovery (populating the cache) and return the advertised `graphql_url`.
+///
+/// For the COLD-cache case, where a sync resolver would otherwise fall
+/// through to `DEFAULT_GRAPHQL_URL`. That default does not resolve, so a missing
+/// cache — a fresh machine, or a user told to delete the file — produced an opaque
+/// transport failure naming no endpoint. Returns `None` if discovery is unreachable
+/// or advertises no `graphql_url`, leaving the caller to decide the fallback.
+pub(crate) async fn discover_graphql_url() -> Option<String> {
+    fetch_pmcp_config().await.ok().and_then(|c| c.graphql_url)
+}
+
+/// Drop the cache and re-run discovery, returning the freshly advertised
+/// `graphql_url`.
+///
+/// Returns `None` when a refresh cannot change the endpoint — `PMCP_RUN_GRAPHQL_URL`
+/// pins it explicitly, discovery is unreachable, or the document carries no
+/// `graphql_url` — so callers can distinguish "no better answer available" from
+/// "here is a different endpoint to try".
+pub(crate) async fn refresh_graphql_url() -> Option<String> {
+    // An explicit override outranks discovery in graphql::resolve_graphql_url(),
+    // so re-fetching would change nothing and would cost a network round-trip on
+    // every failure.
+    if nonempty_env("PMCP_RUN_GRAPHQL_URL").is_some() {
+        return None;
+    }
+    // Best-effort: a cache we cannot delete is not a reason to skip the re-fetch,
+    // and fetch_pmcp_config() overwrites the entry on success anyway.
+    let _ = clear_config_cache();
+    fetch_pmcp_config().await.ok().and_then(|c| c.graphql_url)
+}
+
 /// Fetch configuration from pmcp.run discovery endpoint.
 /// Retries once on transient failure before giving up.
 async fn fetch_pmcp_config() -> Result<PmcpRunConfig> {
@@ -953,6 +1001,34 @@ mod cache_tests {
             api_type: Some("graphql".into()),
             version: Some("1.0".into()),
         }
+    }
+
+    /// Both assertions live in ONE test on purpose: each `with_isolated_env` block
+    /// mutates `HOME`, and `serial_test` only orders `#[serial]` tests against each
+    /// other — a non-serial test elsewhere that reads a HOME-derived path (e.g.
+    /// configure::resolver) can observe the tempdir and fail. Fewer HOME-mutating
+    /// tests means a narrower window for that pre-existing hazard.
+    #[test]
+    #[serial]
+    fn clear_config_cache_removes_the_entry_and_is_idempotent() {
+        with_isolated_env("https://dev.api.example.com", || {
+            save_config_cache(&fixture_config("https://dev.mcp.example.com")).unwrap();
+            assert!(
+                load_cached_config().is_some(),
+                "precondition: cache present"
+            );
+
+            clear_config_cache().unwrap();
+            assert!(
+                load_cached_config().is_none(),
+                "cache must be gone after clear_config_cache"
+            );
+
+            // Callers (configure add/use) treat this as best-effort and must not fail
+            // the command when there is nothing to remove.
+            clear_config_cache().expect("clearing an absent cache is success");
+            clear_config_cache().expect("and remains success when repeated");
+        });
     }
 
     #[test]

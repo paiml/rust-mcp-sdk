@@ -168,12 +168,10 @@ mod fixtures {
             // Mandatory llm slot — the EnvVarResolver falls back to this tested
             // value (no env var, no network); the concrete factory is built but
             // never invoked by tools/list.
-            llm: ConfigSlot {
-                slot: SlotType::LlmProvider {
-                    name: "primary-llm".to_string(),
-                    tested_value: "smoke-model".to_string(),
-                },
-            },
+            llm: ConfigSlot::new(SlotType::LlmProvider {
+                name: "primary-llm".to_string(),
+                tested_value: "smoke-model".to_string(),
+            }),
             max_tokens: 1024,
             max_iterations: 2,
             connectors: vec![],

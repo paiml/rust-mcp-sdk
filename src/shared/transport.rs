@@ -234,6 +234,63 @@ pub enum MessagePriority {
     High,
 }
 
+/// An OWNED handle that sends on a transport WITHOUT holding that transport's
+/// `&mut self` lock (Phase 118.2, plan 23).
+///
+/// Both operations take `&self`, which is the whole point: a consumer takes one
+/// of these under a momentary guard, DROPS the guard, and only then awaits the
+/// send. See [`Transport::shared_sender`] for why that matters and what goes
+/// wrong without it.
+///
+/// A transport that offers one MUST route it through the SAME send core its
+/// `&mut self` [`Transport::send`] uses. A handle with its own hand-rolled wire
+/// path would be a second emission surface — different headers, a different
+/// auth-refresh branch — which is a correctness hazard, not a performance one.
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+pub trait SharedSender: Send + Sync + Debug {
+    /// Send a typed message, exactly as [`Transport::send`] would.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the transport's own send path returns — synchronously, before
+    /// this future resolves. A handle that returned early and reported failures
+    /// out of band would break every caller that dispatches on the error.
+    async fn send_shared(&self, message: TransportMessage) -> Result<()>;
+
+    /// Send an ALREADY-ENCODED JSON-RPC frame verbatim, exactly as
+    /// [`Transport::send_raw`] would.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_shared`].
+    async fn send_raw_shared(&self, body: Vec<u8>) -> Result<()>;
+}
+
+/// wasm32 mirror of [`SharedSender`]; `?Send` because wasm futures are not
+/// `Send`.
+///
+/// Kept identical to the native definition — the same rule
+/// [`Transport::set_negotiated_protocol_version`] states — so the two cannot
+/// drift.
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait SharedSender: Debug {
+    /// Send a typed message, exactly as [`Transport::send`] would.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the transport's own send path returns.
+    async fn send_shared(&self, message: TransportMessage) -> Result<()>;
+
+    /// Send an ALREADY-ENCODED JSON-RPC frame verbatim.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_shared`].
+    async fn send_raw_shared(&self, body: Vec<u8>) -> Result<()>;
+}
+
 /// Core transport trait for MCP communication.
 ///
 /// All transport implementations (stdio, WebSocket, HTTP) must implement
@@ -321,8 +378,111 @@ pub trait Transport: Send + Sync + Debug {
     fn transport_type(&self) -> &'static str {
         "unknown"
     }
+
+    /// Receive the per-connection NEGOTIATED protocol version (Phase 113, CLNT-01).
+    ///
+    /// The client pushes its
+    /// [`ClientBuilder::with_protocol_version`](crate::ClientBuilder::with_protocol_version)
+    /// selection here EXACTLY ONCE at build time; a transport that has no wire
+    /// representation for it ignores the call (the default body). This is the
+    /// mode-propagation seam: `Client<T>` is generic over `T`, but emitting the
+    /// `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers is the
+    /// transport's job, so the selection has to cross that boundary explicitly
+    /// rather than by assumption.
+    ///
+    /// Deliberately NOT named `set_protocol_version`:
+    /// [`StreamableHttpTransport`](crate::shared::StreamableHttpTransport) already
+    /// has an INHERENT `set_protocol_version(&self, Option<String>)` that the
+    /// v1 handshake path writes, and an identically-named trait method would
+    /// shadow it confusingly.
+    fn set_negotiated_protocol_version(&mut self, _version: Option<String>) {}
+
+    /// Whether this transport has a wire representation for the negotiated
+    /// protocol version (Phase 113, CLNT-01).
+    ///
+    /// `false` by default. `ClientBuilder::build` emits a `tracing::warn!` when a
+    /// caller selects `2026-07-28` on a transport that answers `false`, so an
+    /// INERT v2 selection is visible instead of silently producing requests a v2
+    /// server rejects (T-113-53). v2-over-stdio is explicitly out of scope for
+    /// Phase 113.
+    fn supports_negotiated_protocol_version(&self) -> bool {
+        false
+    }
+
+    /// Send an ALREADY-ENCODED JSON-RPC frame verbatim (Phase 113, CLNT-01).
+    ///
+    /// The v2 (`2026-07-28`) client path needs this for two reasons the typed
+    /// [`TransportMessage::Request`] cannot serve:
+    ///
+    /// 1. Every v2 request must carry `params._meta` with the reserved
+    ///    `io.modelcontextprotocol/*` keys, and only three typed request structs
+    ///    have a `_meta` field — adding one to the rest is a MAJOR semver break
+    ///    (Phase-113 D-113-D).
+    /// 2. `server/discover` has no [`ClientRequest`](crate::types::ClientRequest)
+    ///    variant and must not gain one (adding a variant to an exhaustive public
+    ///    enum is also a MAJOR break, Phase-112 D-10).
+    ///
+    /// The default body errors, so a transport that does not implement it simply
+    /// cannot speak v2 — which is exactly what
+    /// [`Self::supports_negotiated_protocol_version`] reports up front.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`](crate::Error::InvalidState) by default.
+    /// Implementors return whatever their normal send path returns.
+    async fn send_raw(&mut self, _body: Vec<u8>) -> Result<()> {
+        Err(crate::Error::InvalidState(format!(
+            "transport {} cannot send raw JSON-RPC frames (required by the 2026-07-28 era)",
+            self.transport_type()
+        )))
+    }
+
+    /// An OWNED handle that can send WITHOUT this transport's `&mut self` lock
+    /// (Phase 118.2, plan 23). `None` by default.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::send`] and [`Self::receive`] both take `&mut self`, so a consumer
+    /// holding one transport for many callers — [`Client`](crate::Client) holds
+    /// it behind a single `RwLock` — necessarily serialises them. That is
+    /// harmless for a lock held across a local operation and catastrophic for
+    /// one held across a NETWORK round trip: an HTTP transport's `send` awaits
+    /// the peer's response HEADERS, so a peer that accepts a POST and never
+    /// answers holds the one lock forever and every other operation on that
+    /// client — a second call, a notification, a cancellation, even
+    /// [`Self::close`] — blocks at acquisition with nothing to bound it.
+    ///
+    /// # The handle is OWNED, and that is the point
+    ///
+    /// It is returned behind an [`Arc`](std::sync::Arc) precisely so the caller
+    /// can DROP its guard and only then await the send. A borrowed handle would
+    /// keep the guard alive for the caller's whole round trip, which is the
+    /// state of affairs this seam removes.
+    ///
+    /// # A READ guard is NOT an acceptable substitute
+    ///
+    /// tokio's `RwLock` is fair: a writer that arrives while a reader holds the
+    /// lock parks, and every reader arriving after that writer parks BEHIND it.
+    /// A read guard held across a round trip therefore blocks the next `receive`
+    /// and the next `close` exactly as completely as a write guard would. The
+    /// guard must be released, not merely downgraded.
+    ///
+    /// # The default `None` is what keeps every existing implementor unchanged
+    ///
+    /// A transport that answers `None` — which is every transport that does not
+    /// opt in, including every external one, without editing a line — is used
+    /// through the exclusive `&mut` path exactly as it is today, byte for byte.
+    /// Answering `Some` is an assertion that concurrent sends on this transport
+    /// are safe; do not make it lightly.
+    fn shared_sender(&self) -> Option<std::sync::Arc<dyn SharedSender>> {
+        None
+    }
 }
 
+/// A bidirectional MCP message transport.
+///
+/// wasm32 mirror of the native trait; `?Send` because wasm futures are not
+/// `Send`.
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait Transport: Debug {
@@ -343,6 +503,45 @@ pub trait Transport: Debug {
     /// Get the transport type name for debugging.
     fn transport_type(&self) -> &'static str {
         "unknown"
+    }
+
+    /// Receive the per-connection NEGOTIATED protocol version (Phase 113, CLNT-01).
+    ///
+    /// Parity mirror of the native definition — see that one for the full
+    /// contract. Kept identical so the two trait definitions cannot drift.
+    fn set_negotiated_protocol_version(&mut self, _version: Option<String>) {}
+
+    /// Whether this transport has a wire representation for the negotiated
+    /// protocol version (Phase 113, CLNT-01).
+    ///
+    /// Parity mirror of the native definition.
+    fn supports_negotiated_protocol_version(&self) -> bool {
+        false
+    }
+
+    /// Send an ALREADY-ENCODED JSON-RPC frame verbatim (Phase 113, CLNT-01).
+    ///
+    /// Parity mirror of the native definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`](crate::Error::InvalidState) by default.
+    async fn send_raw(&mut self, _body: Vec<u8>) -> Result<()> {
+        Err(crate::Error::InvalidState(format!(
+            "transport {} cannot send raw JSON-RPC frames (required by the 2026-07-28 era)",
+            self.transport_type()
+        )))
+    }
+
+    /// An OWNED handle that can send WITHOUT this transport's `&mut self` lock
+    /// (Phase 118.2, plan 23). `None` by default.
+    ///
+    /// Parity mirror of the native definition — see that one for the full
+    /// contract, including why a READ guard is not an acceptable substitute and
+    /// why the default `None` leaves every existing implementor unchanged. Kept
+    /// identical so the two trait definitions cannot drift.
+    fn shared_sender(&self) -> Option<std::sync::Arc<dyn SharedSender>> {
+        None
     }
 }
 
@@ -402,6 +601,42 @@ mod tests {
     fn priority_ordering() {
         assert!(MessagePriority::Low < MessagePriority::Normal);
         assert!(MessagePriority::Normal < MessagePriority::High);
+    }
+
+    // Plan 23: the accessor's DEFAULT body is what keeps every existing
+    // implementor unchanged. `NoSharedSend` implements exactly the three methods
+    // an implementor had to implement before this plan — nothing about
+    // `shared_sender` — and answers `None` without saying so, which is the whole
+    // of the additive claim.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_transport_that_does_not_opt_in_answers_none() {
+        #[derive(Debug)]
+        struct NoSharedSend;
+
+        #[async_trait]
+        impl Transport for NoSharedSend {
+            async fn send(&mut self, _message: TransportMessage) -> Result<()> {
+                Ok(())
+            }
+
+            async fn receive(&mut self) -> Result<TransportMessage> {
+                Err(crate::Error::InvalidState(
+                    "no receive in this fence".to_string(),
+                ))
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            NoSharedSend.shared_sender().is_none(),
+            "a transport that implements only the pre-existing trait surface must answer `None` \
+             from the DEFAULT body — that default is what makes this addition invisible to every \
+             external implementor"
+        );
     }
 
     // Regression (Phase 103 UAT, F2): a Request must serialize to a flat JSON-RPC

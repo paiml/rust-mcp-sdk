@@ -27,6 +27,15 @@
 //! - Local OCI artifact pack/unpack (construct manifests + content-addressed
 //!   blobs on disk — no registry calls).
 //! - Canonical-digest computation for approval-record keying.
+//! - A DELIBERATELY NARROW read of a server's own config document
+//!   (`oci::config_validation`): it reads the `[[config_slots]]` declaration
+//!   table and resolves the dotted TOML path each declared slot names, so
+//!   `pack_server` can refuse a package whose slot list disagrees with the
+//!   config it ships, or whose slot-declared value key holds a resolved
+//!   literal. That is the whole extent of it — the crate models no config
+//!   schema, holds no opinion about the toolkit's config shape beyond those
+//!   two things, and never re-serializes the document (config layer bytes stay
+//!   verbatim).
 //!
 //! It explicitly does **NOT** contain:
 //! - Agent runtime semantics (no execution, no LLM calls, no tool dispatch).
@@ -57,12 +66,18 @@ pub mod validation;
 pub use digest::{canonicalize, manifest_digest, verify, ManifestDigest};
 pub use error::{PackageError, Result};
 pub use oci::{
-    pack_agent, pack_server, pack_team, pack_workflow, unpack_agent, unpack_server, unpack_team,
-    unpack_workflow, OciLayout,
+    pack_agent, pack_server, pack_team, pack_workflow, parse_declared_config_slots, unpack_agent,
+    unpack_server, unpack_team, unpack_workflow, validate_config_slot_agreement,
+    validate_config_slot_placeholders, validate_no_undeclared_env_refs, AttestationFile,
+    BinaryMode, ConfigFile, DeclaredConfigSlot, OciLayout, OpenApiSpecFile, RestoredFile,
+    SubjectVerdict, UnpackedAttestation, UnpackedBinary, UnpackedServer, UnpackedTeam,
 };
 pub use package::{
     AgentPackage, CedarPolicySet, DeployDescriptor, ServerPackage, TeamPackage, WorkflowManifest,
 };
 pub use reference::{ComponentRef, PinnedRef};
-pub use slot::{aggregate, classify, detect_deviation, ConfigSlot, Deviation, SlotClass, SlotType};
+pub use slot::{
+    aggregate, classify, classify_slots, detect_deviation, required_slots, ClassifiedSlot,
+    ConfigSlot, Deviation, RequiredSlot, SlotClass, SlotType, SuppliedBy,
+};
 pub use validation::validate as validate_deploy_descriptor;

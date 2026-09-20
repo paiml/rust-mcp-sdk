@@ -250,6 +250,74 @@ pub struct ListPromptsResult {
     /// Pagination cursor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Cursor,
+
+    /// How long (in milliseconds) a client MAY cache this response — the
+    /// `2026-07-28` `CacheableResult.ttlMs` hint.
+    ///
+    /// `u64` is the MEASURED mapping: the vendored artifact declares
+    /// `$defs.CacheableResult.properties.ttlMs` as
+    /// `{"type": "integer", "minimum": 0}` (asserted by
+    /// `tests/v2_core_schema_facts.rs`), so integrality and non-negativity are
+    /// contract. The one residual is the absent upper bound — JSON Schema
+    /// `integer` is unbounded while `u64` is not — which at millisecond
+    /// resolution is roughly 584 million years and is an ACCEPTED risk.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`DEFAULT_TTL_MS`](crate::types::DEFAULT_TTL_MS)
+    /// (`0`, "immediately stale") — D-08.
+    ///
+    /// **v2 only.** On a `2025-11-25` wire the key is never emitted, and a
+    /// value set here is actively STRIPPED (D-11).
+    ///
+    /// **Why `Option` when the wire says REQUIRED (D-07).** The field is
+    /// required on the `2026-07-28` projection, but modelling it as `Option`
+    /// plus inject-on-v2 fails CLOSED (a missed path merely omits a hint),
+    /// whereas a non-`Option` field plus strip-on-v1 fails OPEN (a missed path
+    /// leaks a v2 key onto the v1 wire).
+    ///
+    /// Not to be confused with
+    /// [`TaskV2::ttl_ms`](crate::types::tasks::TaskV2::ttl_ms), which is a task
+    /// LIFETIME rather than a cache-freshness hint (D-10).
+    ///
+    /// **No builder by design.** `ListPromptsResult` is built by the dispatcher
+    /// from the registered prompt set, with no handler seam, so a builder
+    /// method here would be public API no server author can reach through
+    /// normal configuration — unlike `ListResourcesResult` and
+    /// `ReadResourceResult`, which a
+    /// [`ResourceHandler`](crate::server::ResourceHandler) returns from `list`
+    /// and `read` and which therefore do carry builders. The field stays `pub`,
+    /// so a caller constructing the struct directly can still set it.
+    ///
+    /// (`ListResourceTemplatesResult` carries builders too, but is NOT
+    /// handler-reachable — see its own note. Two of the six cacheable results
+    /// are settable through a handler, not three; 115-10 corrected an earlier
+    /// version of this paragraph that said three.)
+    ///
+    /// Adding this field is additive rather than a major bump because this
+    /// struct is `#[non_exhaustive]`, so `cargo semver-checks`'
+    /// `constructible_struct_adds_field` does not fire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+
+    /// The intended sharing scope of the cached response — the `2026-07-28`
+    /// `CacheableResult.cacheScope` hint.
+    ///
+    /// `None` means the handler expressed no preference; the v2 projection then
+    /// emits the safe default [`CacheScope::Private`](crate::types::CacheScope)
+    /// (D-08). Read [`CacheScope`](crate::types::CacheScope)'s `# Security`
+    /// section before setting `Public`: it authorizes a shared gateway to serve
+    /// this body across authorization contexts.
+    ///
+    /// **v2 only.** On a `2025-11-25` wire the key is never emitted, and a
+    /// value set here is actively STRIPPED (D-11).
+    ///
+    /// **Why `Option` when the wire says REQUIRED (D-07):** see
+    /// [`ttl_ms`](Self::ttl_ms).
+    ///
+    /// **No builder by design** — see [`ttl_ms`](Self::ttl_ms). Additive under
+    /// semver for the same `#[non_exhaustive]` reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<crate::types::caching::CacheScope>,
 }
 
 impl ListPromptsResult {
@@ -258,6 +326,8 @@ impl ListPromptsResult {
         Self {
             prompts,
             next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
         }
     }
 
@@ -277,8 +347,17 @@ pub struct GetPromptRequest {
     /// Prompt arguments
     #[serde(default)]
     pub arguments: HashMap<String, String>,
-    /// Request metadata (e.g., progress token)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Request metadata (e.g., progress token, per-request protocol context).
+    ///
+    /// The explicit `rename` defeats the struct-level `rename_all = "camelCase"`
+    /// (which would emit `meta`, not the MCP spelling); `alias = "meta"` keeps
+    /// ingress compatible with pre-Phase-113 pmcp peers.
+    #[serde(
+        rename = "_meta",
+        alias = "meta",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     #[allow(clippy::pub_underscore_fields)] // _meta is part of MCP protocol spec
     pub _meta: Option<RequestMeta>,
 }

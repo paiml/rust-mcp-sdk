@@ -115,7 +115,87 @@ Either way, `[environment]` values are **never written back to disk** and are im
 
 **Fail-loud (`pmcp-run`).** If `[environment]` is non-empty but the synthesized template contains **no** `AWS::Lambda::Function` resource to inject into, `cargo pmcp deploy` prints a prominent stderr warning naming the affected keys instead of silently dropping them.
 
-> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`). For `[environment]`, the `pmcp-run` target now applies it construct-agnostically via the post-synth template merge (a preserved stack.ts no longer blocks it); the `aws-lambda` target still needs the curated `stack.ts` to read the matching `process.env.<KEY>`. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
+> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`). For `[environment]`, the `pmcp-run` target now applies it construct-agnostically via the post-synth template merge (a preserved stack.ts no longer blocks it); the `aws-lambda` target still needs the curated `stack.ts` to read the matching `process.env.<KEY>`. On `aws-lambda` the warning also covers declared `[server] memory_mb`/`timeout_seconds` (see [Lambda sizing](#lambda-sizing-server-memory_mb--timeout_seconds)), because that target's `cdk deploy` path has no template to inject them into; `pmcp-run` does **not** warn about sizing, since its post-synth merge honors it there. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
+
+### Lambda sizing (`[server] memory_mb` / `timeout_seconds`)
+
+```toml
+[server]
+name = "okf-demo"
+memory_mb = 1024        # Lambda MemorySize
+timeout_seconds = 60    # Lambda Timeout
+```
+
+Both keys are **optional**. Omitting one means "leave whatever the deploy path's
+own default is" — it does **not** mean "512"/"30". That distinction is
+deliberate: with a parse-time default there is no way to tell an omitted key
+from an explicit one, and materializing 512 over the `pmcp-run` engine's
+built-in 256 would silently resize every function that never asked.
+
+Which paths honor them:
+
+| Deploy path | `memory_mb` | `timeout_seconds` |
+|---|---|---|
+| **`pmcp-run`** (both the `pmcp-cfn-renderer` and `npx cdk synth` engines) | ✅ applied | ✅ applied |
+| **`aws-lambda`** via the native CloudFormation engine | ⚠️ warns — memory is pinned by the renderer | ✅ applied |
+| **`aws-lambda`** via `npx cdk deploy` | ⚠️ warns — the `stack.ts` literal is authoritative | ⚠️ warns |
+| **`google-cloud-run`** | n/a — uses `[server] memory` | n/a |
+
+On `pmcp-run`, `cargo pmcp deploy` rewrites `Properties.MemorySize` /
+`Properties.Timeout` **in the synthesized CloudFormation template**, after
+engine routing and before upload — the same post-synth seam `[environment]`
+uses. Because it runs after routing it works for a **hand-edited, preserved
+`stack.ts`** too (those always route through `npx cdk synth`), which is the
+case that matters: the sizing literal a human once patched into `stack.ts` no
+longer has to be kept in sync by hand.
+
+Unlike the `[environment]` merge, this one targets **only the MCP function** —
+the `AWS::Lambda::Function` whose `FunctionName` equals `[server] name`. An
+OAuth-enabled stack renders three Lambdas at three sizings
+(`<name>-oauth-proxy` 256/30, `<name>` 512/30, `<name>-authorizer` 256/**10**);
+resizing the 10-second authorizer would be a regression, not a fix.
+
+The merge is **loud**. It prints what it changed, per property:
+
+```
+   ✅ Applied [server] sizing — McpFunction: MemorySize 256 -> 1024
+   ✅ Applied [server] sizing — McpFunction: Timeout 30 -> 60
+```
+
+**Precedence — `deploy.toml` WINS over the `stack.ts` literal.** This is a
+deliberate divergence from the `[environment]` rule two sections above, where
+the literal wins. The two are not analogous: `[environment]` is a **map**, so
+"the literal wins" is a coherent *additive fill* — `deploy.toml` contributes
+keys the construct never set. `memorySize` is a **scalar the construct always
+sets**, so "the literal wins" would degenerate to "the config is inert", which
+is the defect this behavior exists to fix. If you want a different size on
+`pmcp-run`, change `deploy.toml` — it is the source of truth.
+
+**Fail-loud.** If sizing is declared but the synthesized template contains no
+`AWS::Lambda::Function` matching `[server] name`, `cargo pmcp deploy` prints a
+prominent stderr warning naming the expected function and the declared values
+instead of dropping them.
+
+**Divergence warnings on `aws-lambda`.** Neither `aws-lambda` engine has a seam
+to inject sizing through, so `cargo pmcp deploy` says so rather than staying
+silent — but only when the declared value actually differs from what will be
+deployed, so a pristine scaffold (which declares exactly its own `stack.ts`
+literals) stays quiet:
+
+```
+⚠️  [server] sizing in .pmcp/deploy.toml is NOT applied on the aws-lambda `npx cdk deploy` path:
+   • memory_mb = 1024 declared, but 512 MB will be deployed
+   Edit deploy/lib/stack.ts's memorySize/timeout literals, or deploy to the pmcp-run target, which honors the declared sizing.
+```
+
+> **History.** Before this behavior existed, `memory_mb` was parsed and read by
+> **zero** production code paths on every target, while its own schema doc
+> claimed "used by AWS targets" — so operators set it in good faith, got the
+> hardcoded 256, and found out when a snapshot-baked server OOMed on its first
+> request with nothing in the logs. `timeout_seconds` had a subtler form of the
+> same problem: the CFN renderer honored it while the TypeScript scaffold did
+> not, so the same `deploy.toml` produced a different Timeout depending on
+> whether a human had ever touched `stack.ts`.
 
 ---
 

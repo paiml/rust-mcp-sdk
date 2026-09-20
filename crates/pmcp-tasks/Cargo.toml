@@ -1,9 +1,10 @@
 [package]
 name = "pmcp-tasks"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "MCP Tasks support for the PMCP SDK (experimental)"
 license = "MIT"
+repository = "https://github.com/paiml/rust-mcp-sdk"
 rust-version = "1.91.0"
 
 [dependencies]

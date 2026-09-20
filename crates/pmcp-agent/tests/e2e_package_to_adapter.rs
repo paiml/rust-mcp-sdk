@@ -82,12 +82,10 @@ fn sample_package() -> AgentPackage {
         name: "compose-agent".to_string(),
         version: semver::Version::parse("2.0.0").unwrap(),
         instructions: "You compose the whole pipeline end to end.".to_string(),
-        llm: ConfigSlot {
-            slot: SlotType::LlmProvider {
-                name: "primary-llm".to_string(),
-                tested_value: "test-model".to_string(),
-            },
-        },
+        llm: ConfigSlot::new(SlotType::LlmProvider {
+            name: "primary-llm".to_string(),
+            tested_value: "test-model".to_string(),
+        }),
         max_tokens: 2048,
         max_iterations: 4,
         connectors: vec![],

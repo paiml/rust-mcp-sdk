@@ -44,6 +44,7 @@ use std::sync::Arc;
 /// }
 /// ```
 #[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
 pub struct WasiHttpAdapter {
     /// Optional session management configuration
     session_enabled: bool,

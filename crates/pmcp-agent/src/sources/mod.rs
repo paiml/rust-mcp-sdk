@@ -10,7 +10,7 @@
 //!   for wasm32. The wasm32 CI gate (D-13) therefore proves the LOOP + SEAMS +
 //!   config path is target-clean, NOT SamplingSource-on-wasm.
 //! - `OpenAiCompatSource` — any OpenAI-compatible `/chat/completions` endpoint
-//!   (Ollama / vLLM / OpenRouter / …), behind the `openai-compat` feature
+//!   (Ollama / vLLM / `OpenRouter` / …), behind the `openai-compat` feature
 //!   (AGNT-05).
 //! - `AnthropicSource` — the Anthropic Messages API, behind the `anthropic`
 //!   feature (AGNT-06).

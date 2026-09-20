@@ -42,7 +42,19 @@ pub struct StdioTransport {
     /// full newline-delimited line is available.
     partial: Mutex<Vec<u8>>,
     stdout: Mutex<tokio::io::Stdout>,
-    closed: std::sync::atomic::AtomicBool,
+    /// Set on stdin EOF, or by `close()`. Gates `receive()`.
+    read_closed: std::sync::atomic::AtomicBool,
+    /// Set ONLY by `close()` or a real stdout write error. Gates `send()`.
+    ///
+    /// These were one flag, and stdin EOF set it — so `send()` then refused
+    /// every stdout write. A client that pipes a batch of requests and closes
+    /// stdin, which is the normal shape of a one-shot MCP session and the only
+    /// way this transport can signal end-of-input, never received the responses
+    /// to requests the server had already accepted and answered (#316).
+    ///
+    /// stdin and stdout are separate pipes. "I have no further requests" is not
+    /// "I have stopped reading your replies".
+    write_closed: std::sync::atomic::AtomicBool,
 }
 
 impl StdioTransport {
@@ -61,7 +73,8 @@ impl StdioTransport {
             stdin: Mutex::new(BufReader::new(tokio::io::stdin())),
             partial: Mutex::new(Vec::new()),
             stdout: Mutex::new(tokio::io::stdout()),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            read_closed: std::sync::atomic::AtomicBool::new(false),
+            write_closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -76,7 +89,9 @@ impl Default for StdioTransport {
 impl Transport for StdioTransport {
     async fn send(&mut self, message: TransportMessage) -> Result<()> {
         contract_pre_transport_abstraction!();
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+        // `write_closed`, not the read side: stdin EOF must not stop us
+        // answering what we already accepted (#316).
+        if self.write_closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(TransportError::ConnectionClosed.into());
         }
 
@@ -86,7 +101,7 @@ impl Transport for StdioTransport {
 
     async fn receive(&mut self) -> Result<TransportMessage> {
         contract_pre_transport_abstraction!();
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if self.read_closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(TransportError::ConnectionClosed.into());
         }
 
@@ -96,7 +111,10 @@ impl Transport for StdioTransport {
 
     async fn close(&mut self) -> Result<()> {
         contract_pre_transport_abstraction!();
-        self.closed
+        // close() still stops BOTH directions — that guarantee is unchanged.
+        self.read_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.write_closed
             .store(true, std::sync::atomic::Ordering::Release);
 
         // Flush any pending output
@@ -113,7 +131,9 @@ impl Transport for StdioTransport {
     }
 
     fn is_connected(&self) -> bool {
-        !self.closed.load(std::sync::atomic::Ordering::Acquire)
+        // Still connected while we can answer. A server that has read EOF but
+        // has responses to write is not disconnected.
+        !self.write_closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn transport_type(&self) -> &'static str {
@@ -134,20 +154,24 @@ impl StdioTransport {
     async fn write_message(&self, json_bytes: &[u8]) -> Result<()> {
         let mut stdout = self.stdout.lock().await;
 
+        // A real stdout failure — a closed or broken pipe — DOES close the
+        // write side. That is the other half of #316: `send()` no longer gives
+        // up on stdin EOF, so the write side must still latch shut when stdout
+        // itself is gone, or a dead pipe would be retried forever.
+        let mut fail = |e: std::io::Error| {
+            self.write_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            TransportError::from(e)
+        };
+
         // Write message payload
-        stdout
-            .write_all(json_bytes)
-            .await
-            .map_err(TransportError::from)?;
+        stdout.write_all(json_bytes).await.map_err(&mut fail)?;
 
         // Write newline delimiter (MCP spec requirement)
-        stdout
-            .write_all(b"\n")
-            .await
-            .map_err(TransportError::from)?;
+        stdout.write_all(b"\n").await.map_err(&mut fail)?;
 
         // Always flush stdio
-        stdout.flush().await.map_err(TransportError::from)?;
+        stdout.flush().await.map_err(&mut fail)?;
         drop(stdout);
 
         Ok(())
@@ -168,8 +192,9 @@ impl StdioTransport {
         if let Some(bytes) = Self::read_cancel_safe_line(&mut stdin, &mut partial).await? {
             Ok(bytes)
         } else {
-            // EOF reached.
-            self.closed
+            // EOF on stdin closes the READ side only. stdout stays writable so
+            // in-flight responses can still be delivered (#316).
+            self.read_closed
                 .store(true, std::sync::atomic::Ordering::Release);
             Err(TransportError::ConnectionClosed.into())
         }
@@ -184,8 +209,17 @@ impl StdioTransport {
     /// available. Returns:
     /// - `Ok(Some(bytes))` — one complete, non-empty line (trailing `\r`/`\n`
     ///   stripped);
-    /// - `Ok(None)` — EOF with no further complete line;
+    /// - `Ok(None)` — EOF with nothing left buffered;
     /// - `Err(InvalidMessage)` — an empty line (skipped per the MCP spec).
+    ///
+    /// # EOF with an unterminated tail
+    ///
+    /// A peer that writes a complete JSON-RPC frame and closes WITHOUT a
+    /// trailing newline leaves those bytes in `partial`. `read_line` — which
+    /// this replaced — returned them as the final message, so discarding them
+    /// here would silently drop the last frame of every such peer. The tail is
+    /// therefore delivered exactly once, and the next call sees an empty buffer
+    /// plus a `0`-byte read and reports EOF.
     ///
     /// Generic over the reader so the drop-mid-read cancel-safety property can
     /// be exercised in tests against an in-memory duplex pipe.
@@ -203,16 +237,7 @@ impl StdioTransport {
                 let mut line: Vec<u8> = partial.drain(..=idx).collect();
                 // Strip the trailing '\n' and an optional '\r'.
                 line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                if line.is_empty() {
-                    // Skip empty lines (per MCP spec: newline-delimited frames).
-                    return Err(
-                        TransportError::InvalidMessage("Empty line received".to_string()).into(),
-                    );
-                }
-                return Ok(Some(line));
+                return Self::finish_line(line);
             }
 
             // No complete line yet — append more bytes into the PERSISTENT
@@ -223,9 +248,28 @@ impl StdioTransport {
                 .await
                 .map_err(TransportError::from)?;
             if bytes_read == 0 {
-                return Ok(None);
+                // EOF. Anything still buffered is a final, newline-less frame:
+                // deliver it rather than dropping it (see the doc note above).
+                if partial.is_empty() {
+                    return Ok(None);
+                }
+                return Self::finish_line(std::mem::take(partial));
             }
         }
+    }
+
+    /// Trim an optional trailing `\r` off an already-`\n`-stripped line and
+    /// classify it — the ONE place both the newline-terminated and the
+    /// EOF-terminated exits above agree on what a line is.
+    fn finish_line(mut line: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            // Skip empty lines (per MCP spec: newline-delimited frames).
+            return Err(TransportError::InvalidMessage("Empty line received".to_string()).into());
+        }
+        Ok(Some(line))
     }
 
     /// Parse JSON message and determine its type.
@@ -344,5 +388,138 @@ mod tests {
             .await
             .unwrap();
         assert!(eof.is_none(), "closed pipe must yield EOF (Ok(None))");
+    }
+
+    /// A peer that writes a complete frame and closes WITHOUT a trailing
+    /// newline must still have that frame delivered — `read_line`, which the
+    /// cancel-safe reader replaced, returned it, so dropping it would silently
+    /// lose the last message of every such peer.
+    #[tokio::test]
+    async fn read_cancel_safe_line_delivers_an_unterminated_tail_at_eof() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(reader);
+        let mut partial: Vec<u8> = Vec::new();
+
+        writer.write_all(b"first\nlast-no-newline").await.unwrap();
+        drop(writer); // EOF with an unterminated tail still buffered.
+
+        let first = StdioTransport::read_cancel_safe_line(&mut reader, &mut partial)
+            .await
+            .unwrap()
+            .expect("the terminated line");
+        assert_eq!(first, b"first");
+
+        let last = StdioTransport::read_cancel_safe_line(&mut reader, &mut partial)
+            .await
+            .unwrap()
+            .expect("the unterminated tail is still a frame");
+        assert_eq!(last, b"last-no-newline");
+
+        // And it is delivered exactly once.
+        let eof = StdioTransport::read_cancel_safe_line(&mut reader, &mut partial)
+            .await
+            .unwrap();
+        assert!(eof.is_none(), "the tail must not be re-delivered");
+    }
+    // ================= #316: stdin EOF must not disable stdout =================
+
+    use crate::shared::Transport;
+    use std::sync::atomic::Ordering;
+
+    /// REGRESSION (#316): one `closed` flag served two independent pipes.
+    ///
+    /// Reaching EOF on **stdin** set it, and `send()` then refused every
+    /// **stdout** write — so a client that piped a batch of requests and closed
+    /// stdin never received the responses to requests the server had already
+    /// accepted and answered. That is the normal shape of a one-shot MCP
+    /// session, and closing stdin is the only way this transport can signal
+    /// end-of-input. Measured downstream: 40/40 sessions answered on pmcp 2.11,
+    /// 10/40 on 2.17.
+    ///
+    /// This assertion is over the SOURCE of `read_line`, deliberately.
+    /// `StdioTransport` reads the process's real stdin, so the EOF branch
+    /// cannot be driven from a unit test — and the first version of this test
+    /// set `read_closed` by hand instead, which meant it passed just as happily
+    /// with the bug reinstated. A test that cannot fail on the defect it names
+    /// is worse than none, so this reads the branch itself.
+    #[test]
+    fn stdin_eof_closes_the_read_side_only() {
+        // Only the PRODUCTION half of the file. `include_str!` pulls in this
+        // test module too, and the first version of this assertion matched its
+        // own string literals — the same self-reference that makes a drift
+        // guard silently compare the wrong thing.
+        let src = include_str!("stdio.rs");
+        let production = src
+            .split("mod tests {")
+            .next()
+            .expect("the file has a test module");
+        let body = production
+            .split("// EOF on stdin closes the READ side only")
+            .nth(1)
+            .expect("the EOF branch must carry its marker comment");
+        let branch = &body[..body.find("\n    }").unwrap_or_else(|| body.len().min(400))];
+        assert!(
+            branch.contains("read_closed"),
+            "the EOF branch must close the read side: {branch}"
+        );
+        assert!(
+            !branch.contains("write_closed"),
+            "stdin EOF must NOT close the write side — the server still owes \
+             responses to requests it already accepted (#316). Found:\n{branch}"
+        );
+    }
+
+    /// The state really is two independent flags, and a fresh transport has
+    /// both open.
+    #[test]
+    fn read_and_write_state_are_independent() {
+        let t = StdioTransport::new();
+        assert!(!t.read_closed.load(Ordering::Acquire));
+        assert!(!t.write_closed.load(Ordering::Acquire));
+
+        t.read_closed.store(true, Ordering::Release);
+        assert!(
+            !t.write_closed.load(Ordering::Acquire),
+            "closing reads must leave writes open"
+        );
+        assert!(t.is_connected(), "still connected while it can answer");
+    }
+
+    /// `close()` must still stop BOTH directions — the guarantee that existed
+    /// before the split, and the reason the split is not simply "drop the flag".
+    #[tokio::test]
+    async fn close_still_stops_both_directions() {
+        let mut t = StdioTransport::new();
+        t.close().await.expect("close");
+        assert!(
+            t.read_closed.load(Ordering::Acquire),
+            "close() closes reads"
+        );
+        assert!(
+            t.write_closed.load(Ordering::Acquire),
+            "close() closes writes"
+        );
+        assert!(!t.is_connected());
+    }
+
+    /// And a `send()` after `close()` is still refused, so the split did not
+    /// widen what the transport accepts.
+    #[tokio::test]
+    async fn send_after_close_is_still_refused() {
+        let mut t = StdioTransport::new();
+        t.close().await.expect("close");
+        let sent = t
+            .send(TransportMessage::Notification(
+                crate::types::Notification::Progress(crate::types::ProgressNotification {
+                    progress_token: crate::types::ProgressToken::String("t".into()),
+                    progress: 1.0,
+                    message: None,
+                    total: None,
+                }),
+            ))
+            .await;
+        assert!(sent.is_err(), "send() after close() must fail");
     }
 }

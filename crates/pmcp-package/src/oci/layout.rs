@@ -69,19 +69,51 @@ impl OciLayout {
         &self.root
     }
 
+    /// Describe the blob `bytes` WOULD have if it were written under
+    /// `media_type` — without writing anything.
+    ///
+    /// Side-effect free by construction: it touches no directory (hence no
+    /// `&self`), performs no filesystem call, and is infallible. Nothing on
+    /// this path can fail — `blob_path`'s `Result` comes only from its
+    /// `sha256:` prefix check, and a descriptor needs no path.
+    ///
+    /// # The contract that makes this load-bearing
+    ///
+    /// `Self::describe_blob(mt, b)` and `layout.write_blob(mt, b)` return
+    /// EQUAL descriptors — same digest, same size, same media type — for equal
+    /// inputs. The only difference between them is that one writes. That
+    /// equality is not a convenience: `pack_server`'s attestation-subject gate
+    /// computes the would-be unattested manifest digest from descriptions
+    /// alone, BEFORE the first blob is written, and then `pack_server` writes
+    /// those very layers. If the two paths ever disagreed, the gate would be
+    /// comparing against a digest no produced package could ever have.
+    ///
+    /// [`Self::write_blob`] is therefore expressed IN TERMS of this function
+    /// rather than constructing a descriptor of its own, and
+    /// `describe_blob_returns_the_same_descriptor_write_blob_does` pins the
+    /// equality. Do not "optimize" either path independently.
+    pub fn describe_blob(media_type: MediaType, bytes: &[u8]) -> Descriptor {
+        let digest = ManifestDigest::from_bytes(bytes);
+        Descriptor::new(media_type, bytes.len() as u64, oci_digest(&digest))
+    }
+
     /// Content-address `bytes` under `blobs/sha256/<hex>` and return the
     /// resulting `Descriptor` (the caller supplies `media_type` — the
     /// vendor `application/vnd.pmcp.*` type for this logical layer, or a
     /// standard OCI type for the manifest/empty-config blobs).
+    ///
+    /// The returned descriptor comes from [`Self::describe_blob`], so the
+    /// written blob and the described blob can never disagree on digest, size
+    /// or media type.
     pub fn write_blob(&self, media_type: MediaType, bytes: &[u8]) -> Result<Descriptor> {
-        let digest = ManifestDigest::from_bytes(bytes);
+        let descriptor = Self::describe_blob(media_type, bytes);
+        // Round-trips the descriptor's own digest rather than re-hashing the
+        // bytes, so the path written to is derived from the SAME digest the
+        // caller is handed back.
+        let digest = ManifestDigest::try_from(descriptor.digest())?;
         let path = self.blob_path(&digest)?;
         fs::write(&path, bytes)?;
-        Ok(Descriptor::new(
-            media_type,
-            bytes.len() as u64,
-            oci_digest(&digest),
-        ))
+        Ok(descriptor)
     }
 
     /// Read the blob addressed by `descriptor`'s digest. This looks the
@@ -216,6 +248,32 @@ mod tests {
         assert_eq!(read_back, bytes);
         assert_eq!(descriptor.digest().to_string(), expected_digest.as_str());
         assert_eq!(descriptor.size(), bytes.len() as u64);
+    }
+
+    /// The equality [`OciLayout::describe_blob`]'s rustdoc promises, pinned by
+    /// a test rather than left to inspection: the pure description and the
+    /// written one are the SAME descriptor, differing only in that one of them
+    /// touched the disk.
+    ///
+    /// The pack-time attestation-subject gate computes a manifest digest over
+    /// descriptions alone, then `pack_server` writes the very same layers. If
+    /// these two paths ever disagreed on digest, size or media type, that gate
+    /// would compare a digest no produced package could ever have.
+    #[test]
+    fn describe_blob_returns_the_same_descriptor_write_blob_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = OciLayout::create(dir.path()).unwrap();
+
+        let media_type = MediaType::Other("application/vnd.pmcp.test.v1+json".to_string());
+        let bytes = b"the pure and the writing path must agree";
+
+        let described = OciLayout::describe_blob(media_type.clone(), bytes);
+        let written = layout.write_blob(media_type, bytes).unwrap();
+
+        assert_eq!(
+            described, written,
+            "describe_blob and write_blob must return equal descriptors for equal inputs"
+        );
     }
 
     #[test]

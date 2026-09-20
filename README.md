@@ -61,7 +61,11 @@ cargo install pmcp-openapi-server
 # Curated configs ship with the crate — e.g. a London Tube (api_key) showcase and
 # a Microsoft-Graph / Excel "Contoso" (oauth_passthrough) example. These talk to a
 # live backend, so supply any required credential per the example's comments.
-pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
+#
+# `base_url` is a SLOT, not a baked literal, so the endpoint comes from the
+# environment too — the same package moves between environments unchanged.
+TFL_BASE_URL=https://api.tfl.gov.uk TFL_APP_KEY=<your-key> \
+  pmcp-openapi-server --config crates/pmcp-openapi-server/examples/london-tube.toml
 ```
 
 **Excel workbook — a governed spreadsheet, served as one MCP tool per output table** (no `config.toml`, no schema; the single input is a compiled `bundle@version` directory). Author inputs and outputs as named Excel **Tables** and each output table becomes its own well-named, well-typed MCP tool with a DAG-derived input schema:
@@ -444,18 +448,92 @@ cargo pmcp app build --url https://my-server.example.com
 
 ---
 
-## Latest Release: v2.0.0
+## Agents & Teams
 
-**PMCP v2.0 — aligned with the MCP TypeScript SDK v2.0 release (2026-03-22):**
+Everything so far builds MCP **servers** — things that wait to be called. An agent is
+the other side: it owns a decision loop, so it *is* an MCP client. PMCP ships that loop
+as a crate and scaffolds it from the CLI, so you can watch an agent make decisions
+before writing any Rust.
 
-- **Protocol v2025-11-25**: Full alignment with the latest MCP specification, backward compatible with `2024-11-05`
+```bash
+# Scaffold a runnable agent package (AgentPackage manifest + crate)
+cargo pmcp agent new research-agent
+cd research-agent
+
+# Run the loop offline first — no network, no API key
+cargo pmcp agent dev --source fixed
+
+# Then against a local model (defaults to Ollama at http://localhost:11434/v1)
+cargo pmcp agent dev --source openai-compat --model llama3.2
+
+# Run a two-member reference team in one process
+cargo pmcp team dev
+```
+
+The agent's identity — instructions, model slot, token and iteration limits — lives in
+an `agent.package.json` manifest, not in code, so the same package moves from your
+laptop to a deployment unedited. Only `--source` changes when you swap where completions
+come from; the loop does not.
+
+**The crates behind it:**
+- **🤖 `pmcp-agent`** - The `AgentEngine` loop over three seams (completion source, tool invoker, store), plus `AgentServer` for exposing an agent as an MCP tool that is sampled by its caller
+- **👥 `pmcp-team-servers`** - Four reference team servers and the in-process composition runtime `cargo pmcp team dev` drives
+- **📦 `pmcp-package`** - The portable AI-Package format (`AgentPackage`, `TeamPackage`) that makes an agent a description rather than a binary
+
+```bash
+# One AgentEngine, run twice: standalone, then hosted-sampled — no network, no key
+cargo run -p pmcp-agent --example s50_standalone_vs_sampled
+```
+
+**Learn more**: [Chapter 12.15: Agents as MCP Clients](https://paiml.github.io/rust-mcp-sdk/book/ch12-15-agents-as-mcp-clients.html) | [`pmcp-agent`](crates/pmcp-agent/) | [`pmcp-team-servers`](crates/pmcp-team-servers/)
+
+---
+
+## Protocol Versions
+
+PMCP speaks **two MCP protocol eras out of one binary**: **v1** (`2025-11-25`) and **v2**
+(`2026-07-28`). The era is negotiated **per request**, not per process — the same server answers a
+v1 client with sessions and a v2 client without them, concurrently, on the same port. You do not
+run two fleets, and you do not choose an era at build time.
+
+Throughout this project an era is written `v1`/`v2` with its date string, while the crate is always
+written with its name attached — "pmcp 2.18". A bare version number never means a protocol era.
+
+**Opting in, by role:**
+
+- **Servers** — one explicit call, `ServerBuilder::with_supported_protocol_versions(...)`, listing your v1 version *alongside* `PROTOCOL_VERSION_2026_07_28`. The default accept-list is v1-only by design, so upgrading the crate alone leaves a server answering v1 only. See `examples/s47_v2_stateless_mrtr.rs`.
+- **Clients** — one explicit call, `ClientBuilder::with_protocol_version(...)`. Without it a client stays on v1, exactly as before.
+- **Agents** — already done for you. `pmcp-agent`'s invoker prefers v2 and falls back to v1, so an agent scaffolded with `cargo pmcp agent new` speaks v2 wherever the server supports it.
+
+There is also a server-side lever in the *opposite* direction — opting **out** of v1:
+
+```bash
+cargo build -p pmcp --no-default-features --features full-v2
+```
+
+`--no-default-features` on its own proves nothing (it also strips the HTTP transport, so v1 would
+appear severed only because nothing was compiled). `full-v2` is the positive feature list: exactly
+what `full` carries, minus `v1-compat`.
+
+**Learn more**: [Chapter 12.17: Migrating to MCP 2026-07-28 (v2)](https://paiml.github.io/rust-mcp-sdk/book/ch12-17-migrating-to-mcp-2026-07-28.html) | [v1 sunset policy](docs/v1-sunset-policy.md)
+
+---
+
+## Latest Release: pmcp 2.18.0
+
+**Published 2026-08-16.** The in-flight line is **pmcp 2.19.0**, still unreleased — its entry at the
+top of the changelog is the authoritative list of what is landing next.
+
+- **Two protocol eras, one binary**: pmcp serves both MCP `2025-11-25` (v1) and `2026-07-28` (v2), negotiated per request — see [Protocol Versions](#protocol-versions) above
+- **Credential storage (2.18.0)**: one machine, one credential store — `pmcp::shared::credential_store` addressed by `(issuer, account, server)`, with an on-disk `FileCredentialStore` that `cargo pmcp auth` writes through
+- **Agents & Teams**: the `pmcp-agent` loop, four reference team servers, and the portable AI-Package format — see [Agents & Teams](#agents--teams) above
 - **MCP Apps**: Rich interactive HTML UI widgets served from MCP servers — works with ChatGPT, Claude Desktop, and other MCP clients. Live preview with browser-style DevTools (resizable panel, network/events/protocol/bridge tabs)
-- **MCP Tasks**: Experimental shared client/server state with DynamoDB-backed task lifecycle management and task variables
+- **MCP Tasks**: Shared client/server task lifecycle with pluggable stores (in-memory and DynamoDB) and task variables — the v2 shape is an extension and is still provisional
 - **Conformance Test Suite**: 19-scenario conformance engine across 5 domains with `cargo pmcp test conformance` and `mcp-tester conformance` CLI integration
 - **Tower Middleware**: DNS rebinding protection, CORS with origin-locked headers, configurable security headers — production-ready HTTP stack
 - **PMCP Server**: MCP server exposing SDK developer tools (test, scaffold, schema export) via Streamable HTTP, deployed on AWS Lambda
 - **Uniform Constructor DX**: Default impls, builders, and constructors for all protocol types — dramatically improved ergonomics
-- **60+ Examples**: Comprehensive coverage of all SDK features
+- **85 examples in [`examples/`](examples/)**: runnable coverage of the SDK surface (119 example targets across the whole workspace)
 
 **Full changelog**: [CHANGELOG.md](CHANGELOG.md)
 
@@ -514,7 +592,7 @@ cargo pmcp app build --url https://my-server.example.com
 
 ### 📚 Additional Resources
 
-- **[Examples](examples/)** - 200+ working examples
+- **[Examples](examples/)** - 85 working examples in `examples/` (119 example targets workspace-wide)
 - **[CHANGELOG](CHANGELOG.md)** - Version history
 - **[Migration Guides](docs/)** - Upgrade instructions
 - **[Contributing](CONTRIBUTING.md)** - How to contribute
@@ -531,7 +609,8 @@ cargo pmcp app build --url https://my-server.example.com
 
 ## Examples
 
-The SDK includes 60+ comprehensive examples covering all features:
+The SDK ships **85 runnable examples** in [`examples/`](examples/) — 119 example targets across the
+whole workspace — covering the full SDK surface:
 
 ```bash
 # Basic examples
@@ -551,6 +630,21 @@ cargo run --example m01_basic_middleware    # Middleware chain
 # Agent Skills (SEP-2640) — dual-surface skill + prompt
 cargo run --example s44_server_skills --features skills,full
 cargo run --example c10_client_skills --features skills,full
+
+# Agents & Teams — an agent loop, and four reference servers cooperating
+cargo run --example s49_sampling_host
+cargo run -p pmcp-agent --example s50_standalone_vs_sampled
+cargo run -p pmcp-team-servers --example doc_review_team --features runtime
+
+# MCP 2026-07-28 (v2) — start the SERVER first, in its own terminal; each client
+# takes the server address as its argument and defaults to where the server binds
+cargo run --example s47_v2_stateless_mrtr --features full   # serves on 127.0.0.1:8147
+cargo run --example s48_v2_mrtr_client --features full      # then, in another terminal
+cargo run --example s53_v2_agent_client --features full     # the pmcp-agent connector, v2 with v1 fallback
+
+# MCP 2026-07-28 (v2) Tasks — same rule: server first, then the agent
+cargo run --example s50_v2_tasks_server --features full     # serves on 127.0.0.1:8150
+cargo run --example s51_v2_tasks_agent --features full
 
 # Testing (mcp-tester is a standalone Cargo project in examples/26-server-tester)
 cargo install mcp-tester && mcp-tester test http://localhost:8080

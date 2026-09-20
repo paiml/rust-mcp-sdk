@@ -1,9 +1,10 @@
 [package]
 name = "pmcp-team-servers"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Dev-grade reference team servers (team-fs, mem-mcp, approval-mcp, team-mcp) for the PMCP SDK (experimental)"
 license = "MIT"
+repository = "https://github.com/paiml/rust-mcp-sdk"
 readme = "README.md"
 rust-version = "1.91.0"
 # .planning/ (GSD scaffolding), fuzz/ (workspace-excluded cargo-fuzz sub-package),
@@ -19,8 +20,8 @@ exclude = [".planning/", "fuzz/", "tests/"]
 # (RequestHandlerExtra.request_meta) landed additively in the local 2.17.x via
 # 109-00; the path dep provides the source regardless of exact minor.
 pmcp = { version = "2.17.0", path = "../..", default-features = false }
-pmcp-agent = { version = "0.1", path = "../pmcp-agent" }
-pmcp-package = { version = "0.1", path = "../pmcp-package" }
+pmcp-agent = { version = "0.4", path = "../pmcp-agent" }
+pmcp-package = { version = "0.4", path = "../pmcp-package" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
@@ -43,6 +44,14 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # gated behind the non-default `http` feature so the default/wasm build never
 # pulls it as a direct dep.
 url = { version = "2", optional = true }
+# Reader for the expected-difference baseline consumed by
+# `src/conformance/era_diff.rs` (Phase 118, CONF-02). serde_yaml 0.9 is ALREADY
+# resolved in this workspace — the root `Cargo.toml` carries it as a dev-dep and
+# `crates/mcp-tester/Cargo.toml` as a regular one — so this line costs ZERO new
+# third-party packages. Gated on `conformance` (a default feature) so a
+# single-server build (`--no-default-features --features team-fs`) does not pull
+# a YAML reader it never calls.
+serde_yaml = { version = "0.9", optional = true }
 
 [features]
 # default = the full reference-server set; this crate's purpose IS all four
@@ -54,7 +63,10 @@ team-fs = []
 mem-mcp = []
 approval-mcp = []
 team-mcp = []
-conformance = []
+# The fixture-replay harness PLUS the Phase-118 era substrate
+# (`era_observations` / `era_diff`). The latter reads the checked-in
+# `baselines/era-deltas.yaml`, hence `dep:serde_yaml`.
+conformance = ["dep:serde_yaml"]
 # Outbound approval-notification webhook (109-04) needs reqwest.
 webhook = ["dep:reqwest"]
 # team-mcp members run against a real LLM over an OpenAI-compatible endpoint
@@ -71,7 +83,49 @@ member-llm = ["pmcp-agent/openai-compat"]
 # (the `full` dev-dep previously masked this via feature unification). The
 # HTTP-first team-mcp binary also serves members against a real LLM, so `http`
 # pulls in `member-llm`. Gated so a stdio-only build stays clean.
-http = ["pmcp/streamable-http", "pmcp/http", "member-llm", "dep:url"]
+#
+# `dep:reqwest` (Phase 118, CONF-02/CONF-03): the era probes in
+# `src/conformance/era_probe.rs` need a RAW HTTP client because the typed
+# `pmcp::Client` surface deliberately hides the wire facts the era baseline is
+# made of — response headers, HTTP statuses and raw envelope keys. `http` is
+# NON-DEFAULT and already pulls reqwest transitively via `member-llm`
+# (`pmcp-agent/openai-compat`), so naming it here costs ZERO new registry
+# packages (T-118-SC) and the DEFAULT and wasm32 builds stay reqwest-free —
+# which is the property this feature block exists to protect (T-118-71).
+#
+# `pmcp/testing` (Phase 118): a raw v2 request body cannot be built without the
+# three reserved `_meta` key spellings, because the server's era gate requires
+# the `MCP-Protocol-Version` HEADER and the `_meta` value to AGREE and rejects a
+# header-only claim with `-32020 HEADER_MISMATCH`. pmcp's own constants are
+# `pub(crate)` (`src/types/protocol/context.rs:304`) and their only public
+# re-export (`pmcp::testing::META_*`) sits behind pmcp's `testing` feature.
+# `testing = []` is a ZERO-DEPENDENCY code gate (root `Cargo.toml:311`), and the
+# in-repo `s52` example enables it for exactly this reason ("the example reads
+# the reserved `_meta` key spellings from `pmcp::testing`"), so this is the
+# sanctioned pattern rather than re-spelling the strings here and hoping they do
+# not drift.
+#
+# `pmcp/v1-compat` (Phase 118): the v1 SESSION + RESUMABILITY compatibility layer.
+# It is a member of pmcp's `default`, but this manifest pins
+# `default-features = false`, so it was OFF here and only appeared through the
+# `full` DEV-dependency — the classic feature-unification false green
+# (`cargo test` sees dev-deps, `cargo build` does not). It is load-bearing for
+# the era comparison in three separate places: `StreamableHttpServerConfig`'s
+# `session_id_generator` field and `http_constants::LAST_EVENT_ID` are both
+# `#[cfg(feature = "v1-compat")]`, and without them the era target has no v1
+# session path at all — so `header.mcp_session_id`, `header.last_event_id` and
+# `http.verb.get_delete` would report the SAME token under both eras and three
+# observations would silently collapse. `v1-compat = []` is a zero-dependency
+# code gate, so this costs no package either.
+http = [
+  "pmcp/streamable-http",
+  "pmcp/http",
+  "pmcp/testing",
+  "pmcp/v1-compat",
+  "member-llm",
+  "dep:url",
+  "dep:reqwest",
+]
 # Aggregate: all four server surfaces attached at once. compose::wiring (109-06)
 # cfg-gates its attachment branches behind this.
 runtime = ["team-fs", "mem-mcp", "approval-mcp", "team-mcp"]

@@ -33,15 +33,21 @@ prompt.distractors = [
     "Supporting files use a different MIME type than SKILL.md and break legacy clients",
     "Listing them would require a new RPC method (`references/list`)",
 ]
-answer.answer = "It keeps the discovery surface focused on top-level skills (one entry per SKILL.md plus the index) so agents pick skills cleanly without scanning every supporting file"
+answer.answer = "It keeps the listing focused on top-level skills (exactly one entry per SKILL.md) so agents pick skills cleanly without scanning every supporting file"
 answer.position = 3
 context = """
-The discovery surface is intentionally narrow. An agent calling `resources/list`
-should see one entry per skill plus the `skill://index.json` discovery URI - not
-every reference file under every skill. References are fetched by URI when the
-skill body tells the agent to fetch them. PMCP enforces this in
-`SkillsHandler::list()` regardless of how many references are registered, and the
-integration test in `tests/skills_integration.rs` asserts the filter holds.
+The listing is intentionally narrow. An agent calling `resources/list` should see
+exactly one entry per registered SKILL.md and nothing else - not every reference
+file under every skill. References are fetched by URI when the skill body tells
+the agent to fetch them. PMCP enforces this in `SkillsHandler::list()` regardless
+of how many references are registered, and the integration test in
+`tests/skills_integration.rs` asserts the filter holds.
+
+Note that "not listed" is not "hidden": a skill's COMPLETE file manifest - every
+reference, each with a sha256 digest and a byte size - is carried by that skill's
+entry in a `skills/list` / `skills/get` response. Those methods, not any resource,
+are the SEP-2640 discovery surface. PMCP once synthesized a `skill://` discovery
+index into `resources/list`; it was retired in favour of the method pair.
 """
 id = "f23a1b2c-d3e4-5678-abcd-123456800002"
 

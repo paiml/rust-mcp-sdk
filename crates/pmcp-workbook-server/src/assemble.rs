@@ -5,9 +5,15 @@
 //! a field-for-field re-skin of `pmcp-sql-server`; here the binary turns the
 //! operator's `--bundle-dir` into a [`LocalDirSource`], optionally asserts the
 //! loaded bundle's identity against `--bundle-id` (D-01, fail-closed BEFORE any
-//! tool is registered), and registers all five workbook tools + the `workbook://`
-//! render resource through the toolkit's
+//! tool is registered), and registers the bundle's workbook tools + the
+//! `workbook://` render resource through the toolkit's
 //! [`pmcp_server_toolkit::workbook::WorkbookBuilderExt::try_with_workbook_bundle`].
+//!
+//! The registered surface is WBV2-04's fan-out: ONE named compute tool per
+//! output Table declared in the bundle's `cell_map` (so the count follows the
+//! bundle, not a fixed five), plus the four workbook-wide meta tools
+//! (`explain`, `get_manifest`, `diff_version`, `render_workbook`). The generic
+//! single `calculate` tool is retired.
 //!
 //! # Boot integrity (T-95-01)
 //!
@@ -113,15 +119,18 @@ mod tests {
     }
 
     #[test]
-    fn build_server_from_golden_registers_five_tools() {
+    fn build_server_from_golden_registers_the_per_table_and_meta_tools() {
         let args = args_for(golden_bundle_dir(), None);
         let server = build_server(&args).expect("golden bundle assembles a server");
 
         // The stable public Server::get_tool inspection API (src/server/mod.rs:515,
-        // also used by pmcp-sql-server's tests/assemble.rs) confirms all five
-        // workbook tools registered.
+        // also used by pmcp-sql-server's tests/assemble.rs) confirms the WBV2-04
+        // surface: ONE named compute tool per output Table in the golden bundle
+        // (`Calculate_Tax` + `Estimate_Refund` -> `calculate_tax` +
+        // `estimate_refund`), PLUS the four workbook-wide meta tools.
         for name in [
-            "calculate",
+            "calculate_tax",
+            "estimate_refund",
             "explain",
             "get_manifest",
             "diff_version",
@@ -132,6 +141,15 @@ mod tests {
                 "built server must expose the '{name}' tool"
             );
         }
+
+        // The generic single `calculate` was RETIRED by the WBV2-04 fan-out (an
+        // LLM selects a named tool per output Table). Pinned here — not just in
+        // the toolkit's own tests/workbook_multi_tool.rs — because this binary's
+        // expectation is what silently rotted when the fan-out landed.
+        assert!(
+            server.get_tool("calculate").is_none(),
+            "the retired generic `calculate` tool must not come back"
+        );
     }
 
     #[test]
@@ -139,7 +157,7 @@ mod tests {
         // The golden bundle's BUNDLE.lock bundle_id is "tax-calc".
         let args = args_for(golden_bundle_dir(), Some("tax-calc"));
         let server = build_server(&args).expect("matching --bundle-id assembles a server");
-        assert!(server.get_tool("calculate").is_some());
+        assert!(server.get_tool("calculate_tax").is_some());
     }
 
     #[test]

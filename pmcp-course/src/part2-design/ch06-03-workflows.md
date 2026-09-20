@@ -11,7 +11,7 @@ Hard workflows execute entirely on the server side. When a user invokes a prompt
 │                                                                    │
 │  Client                          Server                            │
 │    │                               │                               │
-│    │──── prompts/get ──────────────►│                              │
+│    │──── prompts/get ─────────────►│                               │
 │    │     (quarterly_report Q3)     │                               │
 │    │                               │                               │
 │    │                               │ Step 1: sales_query(Q3)       │
@@ -25,7 +25,7 @@ Hard workflows execute entirely on the server side. When a user invokes a prompt
 │    │                               │   └─► uses sales_data, metrics│
 │    │                               │   └─► bind("report")          │
 │    │                               │                               │
-│    │◄─── complete conversation trace│                              │
+│    │◄── complete conversation trace│                               │
 │    │     (all results included)    │                               │
 │    ▼                               ▼                               │
 │                                                                    │

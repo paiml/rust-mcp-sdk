@@ -1,0 +1,1 @@
+{"schema_version":2,"credentials":{"https://as.example":{"https://mcp.example":{"sub-abc":{"access_token":"at","client_id":"cid","scopes":["mcp:read"]}},"https://other.example":{"sub-abc":{"access_token":"at2","client_id":"cid2"}}}},"issuers":{"https://mcp.example":"https://as.example"}}

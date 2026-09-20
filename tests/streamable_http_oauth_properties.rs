@@ -145,6 +145,22 @@ proptest! {
         if status == 401 {
             prop_assert_eq!(unauth_count, 1, "on_unauthorized must fire exactly once on 401");
             prop_assert_eq!(get_count, 2, "get_access_token must be called twice on 401 (original + retry)");
+        } else if status == 202 {
+            // 202 fetches a token TWICE, and not because of a retry.
+            //
+            // `ping_message()` is in fact the `notifications/initialized`
+            // notification, and since Phase 118.2 a 202 to THAT notification
+            // opens the GET session stream — a second HTTP request, which builds
+            // its own Authorization header through the same provider. Before
+            // 118.2 the stream-open sat inside `if !status.is_success()`, and
+            // 202 satisfies `is_success()`, so it was dead code and this case
+            // counted one. The property's SUBJECT is unchanged: `on_unauthorized`
+            // still fires iff 401.
+            prop_assert_eq!(unauth_count, 0,
+                "on_unauthorized must NOT fire on non-401 status {}", status);
+            prop_assert_eq!(get_count, 2,
+                "202 to notifications/initialized fetches a token for the POST and again for the \
+                 session-stream GET");
         } else {
             prop_assert_eq!(unauth_count, 0,
                 "on_unauthorized must NOT fire on non-401 status {}", status);

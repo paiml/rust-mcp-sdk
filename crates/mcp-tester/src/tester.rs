@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use pmcp::{
     shared::{
-        streamable_http::{StreamableHttpTransport, StreamableHttpTransportConfig},
-        StdioTransport,
+        streamable_http::{
+            StreamableHttpTransport, StreamableHttpTransportConfig,
+            StreamableHttpTransportConfigBuilder,
+        },
+        StdioTransport, Transport,
     },
     types::{
-        ClientCapabilities, InitializeResult, ListPromptsResult, ListResourcesResult,
-        ListToolsResult, PromptInfo, ResourceInfo, ServerCapabilities, ToolInfo,
+        protocol::{protocol_era, Era, ServerDiscoverResult, PROTOCOL_VERSION_2026_07_28},
+        ClientCapabilities, Implementation, InitializeResult, ListPromptsResult,
+        ListResourcesResult, ListToolsResult, PromptInfo, ProtocolVersion, ResourceInfo,
+        ServerCapabilities, ToolInfo,
     },
 };
 use reqwest::Client;
@@ -19,6 +24,37 @@ use url::Url;
 use crate::report::{TestCategory, TestReport, TestResult, TestStatus};
 use crate::validators::Validator;
 use std::collections::HashMap;
+
+/// The JSON-response Streamable-HTTP config every HTTP path in this file uses.
+///
+/// Built through [`StreamableHttpTransportConfigBuilder`] rather than a struct
+/// literal, and that is load-bearing rather than stylistic: `session_id` and
+/// `on_resumption_token` exist only behind pmcp's `v1-compat` feature as of
+/// Phase 117, so a literal naming them pins `mcp-tester` to a pmcp built WITH
+/// that feature and breaks the moment this crate's pmcp dependency drops it (the
+/// exact maneuver `crates/pmcp-code-mode/Cargo.toml` performs). The builder
+/// names neither field and compiles on both feature sets — the rule Phase 117
+/// applied to `tests/transport.rs`, `tests/tool_output_result_http.rs` and
+/// `src/composition/mcp_client.rs`.
+///
+/// One helper rather than three call sites, because the three had already been
+/// written out identically and a fourth would have been written out again.
+fn json_transport_config(
+    url: Url,
+    extra_headers: Vec<(String, String)>,
+    http_middleware_chain: Option<
+        std::sync::Arc<pmcp::client::http_middleware::HttpMiddlewareChain>,
+    >,
+) -> StreamableHttpTransportConfig {
+    let mut builder = StreamableHttpTransportConfigBuilder::new(url).enable_json_response();
+    for (name, value) in extra_headers {
+        builder = builder.with_header(name, value);
+    }
+    if let Some(chain) = http_middleware_chain {
+        builder = builder.with_http_middleware(chain);
+    }
+    builder.build()
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -55,12 +91,32 @@ pub struct ServerTester {
     pub transport_type: TransportType,
     http_config: Option<StreamableHttpTransportConfig>,
     json_rpc_client: Option<Client>,
+    /// Lazily-built, reused client for the RAW wire probes.
+    ///
+    /// A `reqwest::Client` owns its connection pool, TLS config and root-cert
+    /// store, so building one per probe meant ~23 constructions (and ~23
+    /// handshakes) per `--dual-run`. Built once on first probe; `Client` is
+    /// internally `Arc`'d so cloning it out is cheap.
+    raw_probe_client: std::sync::OnceLock<Client>,
     timeout: Duration,
     insecure: bool,
     api_key: Option<String>,
     #[allow(dead_code)]
     force_transport: Option<String>,
     server_info: Option<InitializeResult>,
+    /// The era this tester is PINNED to, set by [`ServerTester::with_protocol_version`].
+    ///
+    /// `None` — the default, and what all five `cargo-pmcp` call sites of
+    /// [`ServerTester::new`] get — means v1: byte-identical behaviour to 0.7.0.
+    pinned_protocol_version: Option<ProtocolVersion>,
+    /// The `server/discover` projection, populated ONLY on the v2 path.
+    ///
+    /// Deliberately a SEPARATE field from `server_info` rather than a
+    /// synthesised [`InitializeResult`]: v2 removed `initialize`, so
+    /// manufacturing one locally would conceal both the `initialize`-absent
+    /// delta (ERA-01) and the capability-relocation delta (ERA-10) that the
+    /// era baseline exists to detect.
+    discover_result: Option<ServerDiscoverResult>,
     tools: Option<Vec<ToolInfo>>,
     resources: Option<Vec<ResourceInfo>>,
     prompts: Option<Vec<PromptInfo>>,
@@ -104,15 +160,8 @@ impl ServerTester {
                     "HTTP middleware chain present: {}",
                     http_middleware_chain.is_some()
                 );
-                let config = StreamableHttpTransportConfig {
-                    url: parsed_url,
-                    extra_headers,
-                    auth_provider: None,
-                    session_id: None,
-                    enable_json_response: true,
-                    on_resumption_token: None,
-                    http_middleware_chain: http_middleware_chain.clone(),
-                };
+                let config =
+                    json_transport_config(parsed_url, extra_headers, http_middleware_chain.clone());
                 (TransportType::Http, Some(config), None)
             },
             Some("jsonrpc") => {
@@ -164,15 +213,11 @@ impl ServerTester {
                             "HTTP middleware chain (jsonrpc path) present: {}",
                             http_middleware_chain.is_some()
                         );
-                        let config = StreamableHttpTransportConfig {
-                            url: parsed_url,
+                        let config = json_transport_config(
+                            parsed_url,
                             extra_headers,
-                            auth_provider: None,
-                            session_id: None,
-                            enable_json_response: true,
-                            on_resumption_token: None,
-                            http_middleware_chain: http_middleware_chain.clone(),
-                        };
+                            http_middleware_chain.clone(),
+                        );
                         (TransportType::Http, Some(config), None)
                     }
                 }
@@ -204,6 +249,7 @@ impl ServerTester {
         );
 
         Ok(Self {
+            raw_probe_client: std::sync::OnceLock::new(),
             url: url.to_string(),
             transport_type,
             http_config,
@@ -213,6 +259,8 @@ impl ServerTester {
             api_key: api_key.map(|s| s.to_string()),
             force_transport: force_transport.map(|s| s.to_string()),
             server_info: None,
+            pinned_protocol_version: None,
+            discover_result: None,
             tools: None,
             resources: None,
             prompts: None,
@@ -221,6 +269,74 @@ impl ServerTester {
             http_middleware_chain: http_middleware_chain.clone(),
             tool_uis: HashMap::new(),
         })
+    }
+
+    /// PIN this tester to a protocol era (Phase 117, CLNT-04).
+    ///
+    /// # Why a consuming builder and not a seventh argument to [`Self::new`]
+    ///
+    /// `ServerTester::new` has FIVE call sites in `cargo-pmcp`
+    /// (`commands/pentest.rs`, `commands/test/apps.rs` ×2,
+    /// `commands/test/conformance.rs` ×2) which pass its six positional
+    /// arguments literally. `cargo-pmcp` links `mcp-tester` as a LIBRARY, so
+    /// widening the arity is a hard workspace compile break, not a runtime
+    /// surprise (A-D11). A builder is purely additive: every existing caller
+    /// keeps compiling and keeps getting v1.
+    ///
+    /// # What the pin changes
+    ///
+    /// With no call, the tester is a v1 tester and behaves exactly as 0.7.0
+    /// did. Pinned to `2026-07-28`, [`Self::test_initialize`] stops sending
+    /// `initialize` — v2 removed it — and establishes the connection with
+    /// `server/discover` instead.
+    #[must_use]
+    pub fn with_protocol_version(mut self, version: ProtocolVersion) -> Self {
+        self.pinned_protocol_version = Some(version);
+        self
+    }
+
+    /// The era this tester speaks.
+    ///
+    /// [`Era::V1`] unless [`Self::with_protocol_version`] pinned a v2-generation
+    /// version. Classified through pmcp's own [`protocol_era`] rather than a
+    /// string equality check, so its conservative unknown-to-`V1` fallback
+    /// applies here identically.
+    pub fn era(&self) -> Era {
+        self.pinned_protocol_version
+            .as_ref()
+            .map_or(Era::V1, |v| protocol_era(v.as_str()))
+    }
+
+    /// The `server/discover` projection, when this tester established a v2
+    /// connection. Always `None` on v1.
+    pub fn discover_result(&self) -> Option<&ServerDiscoverResult> {
+        self.discover_result.as_ref()
+    }
+
+    /// The protocol version the CONNECTION reports, whichever era established it.
+    ///
+    /// On v1 this is the `initialize` result's `protocolVersion`; on v2 it is
+    /// the `server/discover` projection's. Reading it through one accessor is
+    /// what lets the Core conformance domain stay era-agnostic for C-02 without
+    /// a synthesised [`InitializeResult`].
+    pub fn negotiated_protocol_version(&self) -> Option<&str> {
+        self.server_info
+            .as_ref()
+            .map(|info| info.protocol_version.0.as_str())
+            .or_else(|| {
+                self.discover_result
+                    .as_ref()
+                    .map(|d| d.protocol_version.as_str())
+            })
+    }
+
+    /// The server's SELF-REPORTED implementation info, whichever era established
+    /// the connection. Never derive authorization from it.
+    pub fn negotiated_server_info(&self) -> Option<&Implementation> {
+        self.server_info
+            .as_ref()
+            .map(|info| &info.server_info)
+            .or_else(|| self.discover_result.as_ref().map(|d| &d.server_info))
     }
 
     /// Return the URL the tester was constructed with.
@@ -1004,7 +1120,23 @@ impl ServerTester {
         }
     }
 
+    /// Establish the connection for this tester's era.
+    ///
+    /// # THE ONE ERA BRANCH
+    ///
+    /// `test_initialize` has SEVEN call sites inside this file (the full suite,
+    /// the compliance suite, the tools/resources/prompts/apps entry points and
+    /// the two-server comparison) plus the Core conformance domain. Branching on
+    /// the era at each of them would be the "second era resolver" anti-pattern —
+    /// eight places to keep in agreement. Instead the branch lives HERE, once,
+    /// and every caller inherits it unchanged.
+    ///
+    /// On v1 the body below is byte-identical to 0.7.0. On v2 it delegates to
+    /// [`Self::establish_v2_connection`], which sends NO `initialize` at all.
     pub async fn test_initialize(&mut self) -> TestResult {
+        if self.era() == Era::V2 {
+            return self.establish_v2_connection().await;
+        }
         let start = Instant::now();
         let name = "Initialize".to_string();
 
@@ -1132,6 +1264,70 @@ impl ServerTester {
                 error: Some(e.to_string()),
                 details: None,
             },
+        }
+    }
+
+    /// Establish a `2026-07-28` connection WITHOUT an `initialize` handshake.
+    ///
+    /// v2 removed `initialize` (ERA-01), so the connection is established by an
+    /// explicit `server/discover` instead. `ClientBuilder::build` marks a
+    /// v2-pinned client already-initialized, so this sends ZERO handshake bytes:
+    /// `server/discover` is the first and only request on the wire.
+    ///
+    /// The projection is stored in `discover_result`, NOT converted into an
+    /// [`InitializeResult`]. See that field's own comment for why synthesising
+    /// one is forbidden.
+    async fn establish_v2_connection(&mut self) -> TestResult {
+        let start = Instant::now();
+        let name = "Connect (v2 server/discover)".to_string();
+
+        let TransportType::Http = self.transport_type else {
+            return TestResult::skipped(
+                name,
+                TestCategory::Core,
+                "The 2026-07-28 era is Streamable-HTTP only in this tester; \
+                 re-run against an http(s):// endpoint.",
+            );
+        };
+        let Some(config) = &self.http_config else {
+            return TestResult::failed(
+                name,
+                TestCategory::Core,
+                start.elapsed(),
+                "HTTP config not available",
+            );
+        };
+        let version = self
+            .pinned_protocol_version
+            .clone()
+            .unwrap_or_else(|| ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()));
+
+        let transport = StreamableHttpTransport::new(config.clone());
+        let builder = match pmcp::ClientBuilder::new(transport).with_protocol_version(version) {
+            Ok(builder) => builder,
+            Err(e) => {
+                return TestResult::failed(name, TestCategory::Core, start.elapsed(), e.to_string())
+            },
+        };
+        let mut client = builder.build();
+        match client.server_discover().await {
+            Ok(discovered) => {
+                let details = format!(
+                    "Server: {} v{}, Protocol: {} (server/discover; no initialize sent)",
+                    discovered.server_info.name,
+                    discovered.server_info.version,
+                    discovered.protocol_version
+                );
+                self.discover_result = Some(discovered);
+                self.pmcp_client = Some(client);
+                TestResult::passed(name, TestCategory::Core, start.elapsed(), details)
+            },
+            Err(e) => TestResult::failed(
+                name,
+                TestCategory::Core,
+                start.elapsed(),
+                format!("server/discover failed: {e}"),
+            ),
         }
     }
 
@@ -2769,10 +2965,19 @@ impl ServerTester {
         self.tools.as_ref()
     }
 
-    /// Get the full server capabilities from the last initialize response.
-    /// Derived from `server_info` -- no separate cached field.
+    /// Get the full server capabilities for whichever era established the
+    /// connection.
+    ///
+    /// On v1 these come from the `initialize` response (derived from
+    /// `server_info` -- no separate cached field, exactly as in 0.7.0). On v2
+    /// there IS no initialize response, so they come from the `server/discover`
+    /// projection instead. The fallback is ordered so the v1 path is reached
+    /// first and is bit-for-bit unchanged.
     pub fn server_capabilities(&self) -> Option<&ServerCapabilities> {
-        self.server_info.as_ref().map(|info| &info.capabilities)
+        self.server_info
+            .as_ref()
+            .map(|info| &info.capabilities)
+            .or_else(|| self.discover_result.as_ref().map(|d| &d.capabilities))
     }
 
     /// Get the full initialize result (server info, capabilities, protocol version).
@@ -3254,6 +3459,897 @@ impl ServerTester {
 </html>"#,
             html_base64 = html_base64
         )
+    }
+}
+
+// ===========================================================================
+// The RAW WIRE PROBE seam (Phase 117, CLNT-04).
+// ===========================================================================
+
+/// The reserved `_meta` key carrying the per-request protocol version.
+///
+/// # Why this is spelled here rather than imported
+///
+/// pmcp's own constant is `pub(crate)`
+/// (`src/types/protocol/context.rs:304`) and its only public re-export,
+/// `pmcp::testing::META_PROTOCOL_VERSION`, sits behind the `testing` feature —
+/// which `crates/mcp-tester/Cargo.toml` does not enable and MUST NOT start
+/// enabling (T-117-SC keeps that manifest byte-identical). A raw v2 request
+/// cannot be built without the key: the server's era gate requires the
+/// `MCP-Protocol-Version` header AND the `_meta` value to AGREE, and rejects a
+/// header-only claim with `-32020 HEADER_MISMATCH`
+/// (`classify_v2_request` in `src/server/streamable_http_server.rs`).
+///
+/// The drift risk this creates is closed by a TRIPWIRE, not by hope:
+/// `crates/mcp-tester/tests/dual_run.rs` captures the bytes a real, SDK-built
+/// v2 `pmcp::Client` puts on the wire and asserts this literal appears in them.
+/// That check is non-circular — it compares this constant against the SDK's
+/// behaviour, not against itself.
+pub const RESERVED_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// The reserved `_meta` key carrying the per-request client identity.
+/// Same sourcing rationale as [`RESERVED_PROTOCOL_VERSION_KEY`].
+pub const RESERVED_CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+
+/// The reserved `_meta` key carrying the per-request client capabilities.
+/// Same sourcing rationale as [`RESERVED_PROTOCOL_VERSION_KEY`].
+pub const RESERVED_CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// Whether a v2 raw probe emits the v2 routing headers.
+///
+/// `Omit` exists for exactly one observation — `header.mcp_method_and_name` —
+/// which can only be established by SENDING a request without them and seeing
+/// what happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2HeaderMode {
+    /// Emit `Mcp-Method`, `Mcp-Name` and `MCP-Protocol-Version` (the conformant
+    /// shape). `Mcp-Name` is emitted even when empty: since Phase 118 D-13 a
+    /// server requires it only on name-bearing methods and discards it
+    /// elsewhere, so emitting it unconditionally is a valid superset.
+    Standard,
+    /// Emit only `MCP-Protocol-Version`, deliberately omitting `Mcp-Method` and
+    /// `Mcp-Name`.
+    OmitMethodAndName,
+}
+
+/// What a raw wire probe SAW. Pure data — no classification.
+///
+/// Classification is the caller's job, and deliberately so: a probe that
+/// classified its own result would put the era rule in as many places as there
+/// are probes.
+#[derive(Debug, Clone)]
+pub struct RawProbeOutcome {
+    /// HTTP status of the response.
+    pub http_status: u16,
+    /// The `Mcp-Session-Id` response header, if the server sent one.
+    pub session_header: Option<String>,
+    /// The JSON-RPC `result` object, when the response carried one.
+    pub result: Option<Value>,
+    /// The JSON-RPC error code, when the response carried an error.
+    pub error_code: Option<i64>,
+    /// The JSON-RPC error MESSAGE, when the response carried an error.
+    ///
+    /// Carried alongside [`Self::error_code`] because the code alone cannot
+    /// always say WHY a request was refused. On the `2026-07-28` wire a
+    /// `-32601` for a RETIRED method and a `-32601` for params that never
+    /// deserialized are the same code, the same HTTP status and the same
+    /// echoed id — the message text is the only wire fact that separates them
+    /// (`v2_retirement_message` vs `map_unparsed_body_for_v2`, both in
+    /// `src/server/streamable_http_server.rs`). A probe that dropped the
+    /// message could not tell a SEVERED method from a MALFORMED request, which
+    /// is exactly the confusion that made two of the official suite's
+    /// retirement checks pass for the wrong reason.
+    pub error_message: Option<String>,
+}
+
+impl RawProbeOutcome {
+    /// Whether the response carried a JSON-RPC `result`.
+    pub fn is_result(&self) -> bool {
+        self.result.is_some()
+    }
+}
+
+/// Maximum response bytes a raw probe reads. Bounds a streaming SSE server.
+const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
+
+/// Truncate a probe response body to [`MAX_PROBE_BODY_BYTES`] on a CHARACTER
+/// boundary.
+///
+/// Slicing a `str` at a raw byte index PANICS when that index lands inside a
+/// multi-byte UTF-8 sequence, and a 64 KiB cut through a body containing any
+/// non-ASCII text (a server name, an error message, a tool description) lands
+/// there roughly three times in four. A testing tool must not panic on what a
+/// server sent it, so the cut is walked back to the nearest boundary.
+///
+/// PURE and unit-tested below.
+fn truncate_probe_body(text: &str) -> &str {
+    if text.len() <= MAX_PROBE_BODY_BYTES {
+        return text;
+    }
+    let mut end = MAX_PROBE_BODY_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Extract the JSON-RPC envelope from a response body that may be SSE-framed.
+///
+/// A Streamable-HTTP server may answer a POST either with `application/json`
+/// (the whole envelope) or with `text/event-stream` (the envelope inside one or
+/// more `data:` lines). Both are conformant, so both are parsed here — a probe
+/// that understood only one framing would misread half the servers it meets.
+///
+/// PURE, and unit-tested below: no I/O, total over arbitrary input.
+pub fn extract_jsonrpc_envelope(content_type: &str, body: &str) -> Option<Value> {
+    if content_type.contains("text/event-stream") {
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                return Some(value);
+            }
+        }
+        return None;
+    }
+    serde_json::from_str::<Value>(body).ok()
+}
+
+impl ServerTester {
+    /// Send ONE raw JSON-RPC request over HTTP with era-appropriate framing and
+    /// report what came back.
+    ///
+    /// This is the single raw-wire seam in the crate. It exists because the
+    /// era-difference evidence is mostly WIRE FACTS — response headers, HTTP
+    /// statuses, envelope keys — that the typed `pmcp::Client` surface
+    /// deliberately hides, and because
+    /// [`send_custom_request`](Self::send_custom_request) only supports the
+    /// `JsonRpcHttp` transport.
+    ///
+    /// `name` is the logical name for the `Mcp-Name` header: pass `""` for a
+    /// method that has none, which is the locked cross-plan rule (the header is
+    /// always PRESENT, its value cross-checked only for name-bearing methods).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport failure as a `String` when the request could not
+    /// be completed at all — which is a different fact from "the server
+    /// answered with an error", and the callers depend on the distinction.
+    pub async fn raw_jsonrpc_probe(
+        &self,
+        method: &str,
+        name: &str,
+        params: Value,
+        era: Era,
+        header_mode: V2HeaderMode,
+    ) -> std::result::Result<RawProbeOutcome, String> {
+        self.raw_jsonrpc_probe_with_session(method, name, params, era, header_mode, None)
+            .await
+    }
+
+    /// [`Self::raw_jsonrpc_probe`] carrying an explicit `Mcp-Session-Id`.
+    ///
+    /// # Why this exists
+    ///
+    /// MEASURED: a STATEFUL v1 server rejects every non-initialization request
+    /// that arrives without a session id — `400` with
+    /// `"Session ID required for non-initialization requests"`
+    /// (`validate_non_init_session` in
+    /// `src/server/streamable_http_server/v1_session.rs`). A v1 probe that
+    /// carried no session would therefore be refused for a SESSION reason while
+    /// looking exactly like a refusal for the reason the probe is about, and
+    /// would mis-observe `header.mcp_method_and_name`,
+    /// `http.status.error_code_mapping`, `method.tasks_list` and
+    /// `method.resources_subscribe` all at once.
+    ///
+    /// v2 never mints a session (ERA-03), so on that path this is always `None`
+    /// and the parameter costs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport failure as a `String`.
+    pub async fn raw_jsonrpc_probe_with_session(
+        &self,
+        method: &str,
+        name: &str,
+        params: Value,
+        era: Era,
+        header_mode: V2HeaderMode,
+        session_id: Option<&str>,
+    ) -> std::result::Result<RawProbeOutcome, String> {
+        use pmcp::shared::http_constants::{
+            ACCEPT_STREAMABLE, MCP_METHOD, MCP_NAME, MCP_PROTOCOL_VERSION, MCP_SESSION_ID,
+        };
+
+        let body = build_probe_body(method, params, era);
+        let client = self.build_raw_probe_client()?;
+        let mut request = client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", ACCEPT_STREAMABLE);
+        if era == Era::V2 {
+            request = request.header(MCP_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28);
+            if header_mode == V2HeaderMode::Standard {
+                request = request.header(MCP_METHOD, method).header(MCP_NAME, name);
+            }
+        }
+        if let Some(session) = session_id {
+            request = request.header(MCP_SESSION_ID, session);
+        }
+        if let Some(key) = &self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let response = request
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("{method} probe transport failure: {e}"))?;
+        let http_status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let session_header = response
+            .headers()
+            .get(MCP_SESSION_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let text = response.text().await.unwrap_or_default();
+        let envelope = extract_jsonrpc_envelope(&content_type, truncate_probe_body(&text));
+
+        let result = envelope
+            .as_ref()
+            .and_then(|e| e.get("result"))
+            .filter(|r| !r.is_null())
+            .cloned();
+        let error_code = envelope
+            .as_ref()
+            .and_then(|e| e.get("error"))
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_i64);
+        let error_message = envelope
+            .as_ref()
+            .and_then(|e| e.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        Ok(RawProbeOutcome {
+            http_status,
+            session_header,
+            result,
+            error_code,
+            error_message,
+        })
+    }
+
+    /// Send a raw HTTP VERB (`GET` / `DELETE`) at the MCP endpoint and report
+    /// the status and content type. Used for the HTTP-surface observations that
+    /// no JSON-RPC request can see.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport failure as a `String`.
+    pub async fn raw_verb_probe(
+        &self,
+        verb: &str,
+        era: Era,
+        extra_headers: &[(&str, &str)],
+    ) -> std::result::Result<(u16, String), String> {
+        use pmcp::shared::http_constants::{ACCEPT_STREAMABLE, MCP_PROTOCOL_VERSION};
+
+        let client = self.build_raw_probe_client()?;
+        let request_method = reqwest::Method::from_bytes(verb.as_bytes())
+            .map_err(|e| format!("invalid HTTP verb {verb}: {e}"))?;
+        let mut request = client
+            .request(request_method, &self.url)
+            .header("Accept", ACCEPT_STREAMABLE);
+        if era == Era::V2 {
+            request = request.header(MCP_PROTOCOL_VERSION, PROTOCOL_VERSION_2026_07_28);
+        }
+        for (key, value) in extra_headers {
+            request = request.header(*key, *value);
+        }
+        if let Some(key) = &self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("{verb} probe transport failure: {e}"))?;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok((response.status().as_u16(), content_type))
+    }
+
+    /// The probe `reqwest::Client`, built once and reused.
+    ///
+    /// Delegates to [`crate::conformance::transport::build_probe_client`] rather
+    /// than rebuilding the same body: that helper is the crate's single
+    /// definition of probe TLS/timeout posture, and it clamps the operator
+    /// timeout with `min(timeout, PROBE_RECEIVE_TIMEOUT)`. An open-coded copy
+    /// here had drifted from it — `--timeout 300` gave the era probes a
+    /// five-MINUTE ceiling while every other probe in the crate got five
+    /// seconds.
+    fn build_raw_probe_client(&self) -> std::result::Result<Client, String> {
+        if let Some(client) = self.raw_probe_client.get() {
+            return Ok(client.clone());
+        }
+        let client = crate::conformance::transport::build_probe_client(self)?;
+        let _ = self.raw_probe_client.set(client.clone());
+        Ok(client)
+    }
+}
+
+/// Build the JSON-RPC request body for `era`.
+///
+/// On v2 the reserved `_meta` keys are attached because the server's era gate
+/// requires the header and the body to AGREE — see
+/// [`RESERVED_PROTOCOL_VERSION_KEY`]. On v1 the body carries no reserved keys at
+/// all, which is what makes it a v1 request.
+///
+/// PURE and unit-tested below.
+pub fn build_probe_body(method: &str, params: Value, era: Era) -> String {
+    // Keep the MAP, not a rebuilt `Value`: the previous form destructured
+    // `Value::Object(map)` only to wrap it straight back up, then guarded the
+    // insert behind an `as_object_mut()` branch that could never be `None`.
+    let mut params = match params {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    if era == Era::V2 {
+        params.insert(
+            "_meta".to_string(),
+            json!({
+                RESERVED_PROTOCOL_VERSION_KEY: PROTOCOL_VERSION_2026_07_28,
+                RESERVED_CLIENT_INFO_KEY: {
+                    "name": "mcp-tester",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                RESERVED_CLIENT_CAPABILITIES_KEY: {
+                    "elicitation": {}, "sampling": {}, "roots": {},
+                },
+            }),
+        );
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": rand::random::<u32>(),
+        "method": method,
+        "params": params,
+    })
+    .to_string()
+}
+
+// ===========================================================================
+// Era auto-detection (Phase 117, CLNT-04 / D-05).
+// ===========================================================================
+
+/// Which MCP eras a server was OBSERVED to serve.
+///
+/// Produced by [`detect_eras`] from two explicit era-pinned attempts. The two
+/// "neither" outcomes are separate variants ON PURPOSE: one is an
+/// infrastructure fault and the other is a conformance finding, and collapsing
+/// them would report a down host as a non-conformant server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraSupport {
+    /// BOTH eras handshook. This is the EXPECTED outcome against a pmcp server
+    /// that opted into `2026-07-28`, and the only one that can be dual-run.
+    Dual,
+    /// Only the `initialize` handshake succeeded.
+    V1Only,
+    /// Only `server/discover` succeeded.
+    V2Only,
+    /// Neither era handshook, and the endpoint never ANSWERED — DNS, TCP or
+    /// timeout. An INFRASTRUCTURE fault: nothing was learned about the server.
+    Unreachable,
+    /// Neither era handshook, but the endpoint DID answer. A CONFORMANCE
+    /// finding: something is listening and it speaks no era we know.
+    NoEraSpoken,
+}
+
+impl EraSupport {
+    /// Short stable label for reports and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dual => "dual",
+            Self::V1Only => "v1-only",
+            Self::V2Only => "v2-only",
+            Self::Unreachable => "unreachable",
+            Self::NoEraSpoken => "no-era-spoken",
+        }
+    }
+}
+
+/// How long [`endpoint_is_reachable`] waits for a TCP connection before it
+/// declares the endpoint "did NOT answer".
+///
+/// EXPLICIT and bounded: an unbounded probe would turn a black-holed host into
+/// a hang, and the whole point of the probe is that its failure is a fast,
+/// unambiguous fact.
+const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Establish, at the HOST layer, whether `url`'s endpoint ANSWERS at all.
+///
+/// # THE CLASSIFICATION CONTRACT — CITED, NOT RE-DERIVED
+///
+/// This applies plan 117-07's contract, which is written out in full in the
+/// `THE CLASSIFICATION CONTRACT` doc block on `endpoint_is_reachable` in
+/// `crates/pmcp-agent/src/invoker/factory.rs`. That block is the single
+/// authored copy; this one deliberately restates only its rule:
+///
+/// ```text
+/// The endpoint ANSWERED (any HTTP response, any JSON-RPC error) => era rejection.
+/// The endpoint did NOT answer (DNS / TCP / timeout)             => infrastructure.
+/// ```
+///
+/// `pmcp-agent` is NOT a dependency of `mcp-tester` (and must not become one —
+/// it is an experimental 0.x crate and this is a published 0.7.0 tool), so the
+/// two crates cannot share the CODE. They therefore share the written CONTRACT,
+/// by citation, which is what keeps two classifiers on the same seam from
+/// drifting apart.
+///
+/// The reason the contract exists is measured in that block and is not repeated
+/// here: the connect-failure site and the non-2xx-status sites in
+/// `src/shared/streamable_http.rs` all produce the SAME
+/// `Error::Transport(TransportError::Request(String))`, so neither the error
+/// variant nor its prose can tell "the server answered" from "the server is
+/// unreachable". Its two known imprecisions (a TLS handshake failure passes the
+/// TCP probe; a host that accepts TCP but never responds is called `Answered`)
+/// are harmless here for the same STRUCTURAL reason: [`detect_eras`] reports an
+/// era ONLY when that era's handshake actually SUCCEEDED, so a
+/// misclassification can change which error is reported but can never invent a
+/// supported era.
+///
+/// Returns a plain `bool` rather than a `Result` on purpose: every failure mode
+/// means exactly one thing to the only caller — "did not answer".
+async fn endpoint_is_reachable(url: &Url) -> bool {
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    // `Url::host_str` returns an IPv6 literal WITH its URL brackets
+    // (`http://[::1]:8080/` -> `"[::1]"`), and `ToSocketAddrs` would try to
+    // resolve that as a DNS name and fail — reporting a perfectly live IPv6
+    // endpoint as "did not answer". The brackets are URL syntax, not part of
+    // the address.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // The stream is dropped immediately: the ANSWER is the whole fact.
+    matches!(
+        tokio::time::timeout(
+            REACHABILITY_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect((host, port)),
+        )
+        .await,
+        Ok(Ok(_stream))
+    )
+}
+
+/// Detect which eras `url` serves, by TWO explicit era-pinned attempts.
+///
+/// # Hazard (a) — DUAL is the EXPECTED outcome, not an exotic one
+///
+/// A pmcp server that opted into `2026-07-28` via
+/// `ServerCoreBuilder::with_supported_protocol_versions` STILL serves
+/// `2025-11-25` on the same endpoint: per-request era negotiation is the entire
+/// dual-version design of this SDK, not a transitional state. So against pmcp's
+/// own opted-in examples the correct answer is [`EraSupport::Dual`], and this
+/// detector must treat that as the normal case. A detector that stopped at the
+/// first era that worked would silently pick one and never be able to show that
+/// the two AGREE, which is the actual risk the milestone takes on.
+///
+/// # Hazard (b) — the v1 attempt MINTS a session, so it is torn down
+///
+/// Both attempts open REAL connections. Against a stateful v1 server the
+/// `initialize` attempt causes `process_init_session` (in
+/// `src/server/streamable_http_server/v1_session.rs`)
+/// to mint and store a session id, and a detector that simply dropped its
+/// client would leak one session PER INVOCATION — an unbounded resource leak on
+/// the server under repeated CI runs. The mitigation implemented here is
+/// DELETE: the v1 probe keeps a handle on its `StreamableHttpTransport` (a
+/// clone shares the `Arc<RwLock<config>>`, so it sees the session id the
+/// response installed) and calls `Transport::close`, which issues the spec's
+/// `DELETE` teardown and clears the id. The v2 attempt needs no teardown
+/// because v2 never mints a session at all (ERA-03).
+///
+/// # No SDK auto-probe
+///
+/// The two attempts are era-PINNED HOST-level choices, mirroring
+/// `crates/pmcp-agent/src/invoker/factory.rs`. Nothing is added to
+/// `pmcp::Client`: A-D08 and the "do not restore the latter" lock on
+/// `Client::server_discover` (see its rustdoc in `src/client/mod.rs`) forbid an SDK-level
+/// era probe, and this function is the host layer that is allowed to choose.
+///
+/// # Classification
+///
+/// Applies the contract cited on [`endpoint_is_reachable`]. An era is reported
+/// ONLY when its handshake SUCCEEDED, so no reachability verdict can invent
+/// one; reachability decides only WHICH "neither" is reported.
+///
+/// Correct only against an UNAUTHENTICATED, publicly-trusted endpoint — it
+/// presents no credentials. The CLI uses [`detect_eras_with_auth`]; see
+/// [`EraProbeAuth`].
+///
+// Why the allow: this module is compiled into BOTH the library and the binary,
+// which are separate crates with independent dead-code analysis. The library
+// exports this as public API (where `dead_code` cannot fire); the binary reaches
+// only `detect_eras_with_auth`. The same bin/lib split `main.rs` documents for
+// the `era_diff` / `era_observations` modules.
+#[allow(dead_code)]
+pub async fn detect_eras(url: &str, timeout: Duration) -> EraSupport {
+    detect_eras_with_auth(url, timeout, &EraProbeAuth::default()).await
+}
+
+/// The credentials and TLS posture the two era probes must present.
+///
+/// # Why this exists
+///
+/// [`detect_eras`] opens REAL connections, so it needs the SAME credentials the
+/// suite it gates will use. Without them, `--dual-run` against any endpoint
+/// behind an API key, an OAuth chain or a self-signed certificate reports
+/// [`EraSupport::Unreachable`] or [`EraSupport::NoEraSpoken`] and degrades to a
+/// single run — a silent false negative that looks exactly like a v1-only
+/// server. The CLI's `--api-key`, `--insecure` and OAuth options must reach the
+/// detector, not just the suite.
+///
+/// A struct rather than three positional arguments: it is threaded through two
+/// probes and grows whenever a new auth surface lands, and
+/// [`Default`] keeps the unauthenticated case a one-word call.
+#[derive(Clone, Default)]
+pub struct EraProbeAuth {
+    /// Bearer token to present, as `--api-key` supplies it.
+    pub api_key: Option<String>,
+    /// Skip TLS certificate verification, as `--insecure` supplies it.
+    pub insecure: bool,
+    /// The OAuth/HTTP middleware chain the suite was built with.
+    pub oauth_middleware:
+        Option<std::sync::Arc<pmcp::client::http_middleware::HttpMiddlewareChain>>,
+}
+
+impl std::fmt::Debug for EraProbeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // NEVER print the token itself.
+        f.debug_struct("EraProbeAuth")
+            .field("api_key", &self.api_key.is_some())
+            .field("insecure", &self.insecure)
+            .field("oauth_middleware", &self.oauth_middleware.is_some())
+            .finish()
+    }
+}
+
+/// [`detect_eras`] carrying explicit credentials and TLS posture.
+///
+/// See [`EraProbeAuth`] for why the plain `detect_eras` — which passes
+/// [`EraProbeAuth::default`] — is only correct against an unauthenticated,
+/// publicly-trusted endpoint.
+pub async fn detect_eras_with_auth(
+    url: &str,
+    timeout: Duration,
+    auth: &EraProbeAuth,
+) -> EraSupport {
+    let Ok(parsed) = Url::parse(url) else {
+        // A URL that cannot be parsed cannot answer. Reported as infrastructure
+        // rather than as a conformance finding: no server was ever contacted.
+        return EraSupport::Unreachable;
+    };
+    let v2_ok = probe_v2(url, timeout, auth).await;
+    let v1_ok = probe_v1(url, timeout, auth).await;
+
+    match (v1_ok, v2_ok) {
+        (true, true) => EraSupport::Dual,
+        (true, false) => EraSupport::V1Only,
+        (false, true) => EraSupport::V2Only,
+        // ONLY the "neither era answered" case needs the reachability fact, so
+        // the probe is paid only here rather than on every detection. The
+        // contract cited on `endpoint_is_reachable` is about not deriving
+        // reachability from an ERROR STRING; a TCP connect run at this point
+        // still stringifies nothing, so running it lazily preserves it.
+        // (An `if` rather than a match guard because guards cannot `.await`.)
+        (false, false) => {
+            if endpoint_is_reachable(&parsed).await {
+                EraSupport::NoEraSpoken
+            } else {
+                EraSupport::Unreachable
+            }
+        },
+    }
+}
+
+/// Attempt 1 — the `2026-07-28` era, PINNED. Mints no session (ERA-03).
+async fn probe_v2(url: &str, timeout: Duration, auth: &EraProbeAuth) -> bool {
+    let Ok(mut tester) = ServerTester::new(
+        url,
+        timeout,
+        auth.insecure,
+        auth.api_key.as_deref(),
+        Some("http"),
+        auth.oauth_middleware.clone(),
+    ) else {
+        return false;
+    };
+    tester = tester.with_protocol_version(ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()));
+    tester.test_initialize().await.status == TestStatus::Passed
+}
+
+/// Attempt 2 — v1, byte-identical to the pre-117 handshake, with the minted
+/// session explicitly TORN DOWN (hazard (b) on [`detect_eras`]).
+///
+/// Built from the transport directly rather than through [`ServerTester`]
+/// because the teardown needs a handle on the transport, and `ServerTester`
+/// hands its transport to `pmcp::Client` by value.
+async fn probe_v1(url: &str, timeout: Duration, auth: &EraProbeAuth) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    // The probe must present the SAME credentials the suite will — otherwise an
+    // authenticated endpoint answers 401 to both attempts and the detector
+    // reports `NoEraSpoken` for a perfectly conformant dual-era server.
+    let extra_headers = auth.api_key.as_ref().map_or_else(Vec::new, |key| {
+        vec![("Authorization".to_string(), format!("Bearer {key}"))]
+    });
+    let config = json_transport_config(parsed, extra_headers, auth.oauth_middleware.clone());
+    let mut probe_handle = StreamableHttpTransport::new(config);
+    let mut client = pmcp::Client::new(probe_handle.clone());
+    let ok = tokio::time::timeout(timeout, client.initialize(ClientCapabilities::full()))
+        .await
+        .is_ok_and(|r| r.is_ok());
+    // DELETE the session this probe just minted. Best effort: a stateless
+    // server answers 405 and a v1 server that minted nothing is a no-op.
+    let _ = probe_handle.close().await;
+    ok
+}
+
+/// The report an UNREACHABLE endpoint produces.
+///
+/// Routed through [`TestReport::from_error`] — the existing connectivity-failure
+/// path (`report.rs:191`) — because an unreachable host is an INFRASTRUCTURE
+/// fault: no conformance claim can be made about a server that never answered.
+pub fn unreachable_report(url: &str) -> TestReport {
+    TestReport::from_error(anyhow::anyhow!(
+        "{url} did not answer: neither the 2025-11-25 initialize handshake nor \
+         the 2026-07-28 server/discover reached a listening endpoint (DNS, TCP \
+         or timeout). This is an infrastructure fault, not a conformance result."
+    ))
+}
+
+/// The report a REACHABLE endpoint that speaks no known era produces.
+///
+/// Deliberately NOT [`TestReport::from_error`]: something answered, so this is
+/// a conformance FINDING about that something and belongs in the Core domain
+/// where a reader will look for it.
+pub fn no_era_spoken_report(url: &str) -> TestReport {
+    let mut report = TestReport::new();
+    report.add_test(TestResult::failed(
+        "Core: protocol era detection",
+        TestCategory::Core,
+        Duration::ZERO,
+        format!(
+            "{url} answered, but neither era handshake succeeded: `initialize` \
+             (2025-11-25) failed AND `server/discover` (2026-07-28) failed. The \
+             endpoint is reachable and serves no MCP era this tester speaks."
+        ),
+    ));
+    report
+}
+
+#[cfg(test)]
+mod raw_probe_seam {
+    use super::*;
+
+    #[test]
+    fn v1_probe_body_carries_no_reserved_meta_keys() {
+        let body = build_probe_body("tools/list", json!({}), Era::V1);
+        assert!(
+            !body.contains(RESERVED_PROTOCOL_VERSION_KEY),
+            "a v1 request that carried the era key would be a v2 request: {body}"
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["method"], "tools/list");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+    }
+
+    /// The v2 gate requires the header AND `_meta` to agree, so all three
+    /// reserved keys must be on the body — a header-only claim is rejected
+    /// `-32020`.
+    #[test]
+    fn v2_probe_body_carries_all_three_reserved_meta_keys() {
+        let body = build_probe_body("server/discover", json!({}), Era::V2);
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        let meta = &parsed["params"]["_meta"];
+        assert_eq!(meta[RESERVED_PROTOCOL_VERSION_KEY], "2026-07-28");
+        assert!(meta[RESERVED_CLIENT_INFO_KEY].is_object());
+        assert!(meta[RESERVED_CLIENT_CAPABILITIES_KEY].is_object());
+    }
+
+    #[test]
+    fn probe_body_preserves_caller_params() {
+        let body = build_probe_body("tools/call", json!({ "name": "echo" }), Era::V2);
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["params"]["name"], "echo");
+    }
+
+    /// A non-object `params` is replaced with `{}` rather than dropped, so the
+    /// `_meta` insertion always has somewhere to go.
+    #[test]
+    fn probe_body_normalizes_non_object_params() {
+        let body = build_probe_body("ping", json!(42), Era::V2);
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(parsed["params"]["_meta"].is_object());
+    }
+
+    #[test]
+    fn envelope_is_extracted_from_plain_json() {
+        let value = extract_jsonrpc_envelope("application/json", r#"{"jsonrpc":"2.0","id":1}"#)
+            .expect("plain JSON parses");
+        assert_eq!(value["id"], 1);
+    }
+
+    #[test]
+    fn envelope_is_extracted_from_sse_framing() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n";
+        let value = extract_jsonrpc_envelope("text/event-stream", body)
+            .expect("an SSE-framed envelope must be readable");
+        assert_eq!(value["id"], 7);
+        assert!(value["result"].is_object());
+    }
+
+    /// A probe that understood only one framing would misread half the servers
+    /// it meets, so SSE with no parsable `data:` line must be `None` rather
+    /// than a panic or a bogus value.
+    #[test]
+    fn envelope_extraction_returns_none_for_unparsable_sse() {
+        assert!(extract_jsonrpc_envelope("text/event-stream", "event: ping\n\n").is_none());
+        assert!(extract_jsonrpc_envelope("application/json", "not json").is_none());
+    }
+
+    /// An oversized body whose 64 KiB mark falls INSIDE a multi-byte character
+    /// must be cut back to a boundary, not sliced through — a raw byte slice
+    /// there panics, and a testing tool must not panic on what a server sent.
+    #[test]
+    fn probe_body_truncation_never_splits_a_character() {
+        // Pad to one byte short of the cap, then push multi-byte characters so
+        // the cap lands mid-sequence.
+        let mut body = "a".repeat(MAX_PROBE_BODY_BYTES - 1);
+        body.push_str(&"é".repeat(64));
+        let cut = truncate_probe_body(&body);
+        assert!(cut.len() <= MAX_PROBE_BODY_BYTES);
+        assert_eq!(
+            cut.len(),
+            MAX_PROBE_BODY_BYTES - 1,
+            "the cut must walk back off the multi-byte sequence"
+        );
+
+        let short = "under the cap";
+        assert_eq!(
+            truncate_probe_body(short),
+            short,
+            "a short body is untouched"
+        );
+    }
+
+    // CLAUDE.md ALWAYS / PROPERTY testing: both pure seams are TOTAL.
+    proptest::proptest! {
+        /// `extract_jsonrpc_envelope` returns, never unwinds, for arbitrary
+        /// content types and bodies.
+        #[test]
+        fn envelope_extraction_never_panics(ct in ".*", body in ".*") {
+            let _ = extract_jsonrpc_envelope(&ct, &body);
+        }
+
+        /// `truncate_probe_body` is TOTAL: it returns a valid prefix for any
+        /// text, at any length, without unwinding.
+        #[test]
+        fn probe_body_truncation_never_panics(body in ".*") {
+            let cut = truncate_probe_body(&body);
+            proptest::prop_assert!(cut.len() <= body.len());
+            proptest::prop_assert!(body.starts_with(cut));
+        }
+
+        /// Whatever the method name, a v2 body is valid JSON carrying the era
+        /// key and a v1 body never carries it.
+        #[test]
+        fn probe_body_is_always_valid_json(method in ".*") {
+            for era in [Era::V1, Era::V2] {
+                let body = build_probe_body(&method, json!({}), era);
+                let parsed: Value =
+                    serde_json::from_str(&body).expect("build_probe_body emits valid JSON");
+                proptest::prop_assert_eq!(&parsed["method"], &json!(method));
+                proptest::prop_assert_eq!(
+                    body.contains(RESERVED_PROTOCOL_VERSION_KEY),
+                    era == Era::V2
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod era_detection {
+    use super::*;
+
+    #[test]
+    fn era_support_labels_are_stable() {
+        assert_eq!(EraSupport::Dual.label(), "dual");
+        assert_eq!(EraSupport::V1Only.label(), "v1-only");
+        assert_eq!(EraSupport::V2Only.label(), "v2-only");
+        assert_eq!(EraSupport::Unreachable.label(), "unreachable");
+        assert_eq!(EraSupport::NoEraSpoken.label(), "no-era-spoken");
+    }
+
+    /// The two "neither" outcomes must stay DISTINCT values — collapsing them
+    /// would report a down host as a non-conformant server.
+    #[test]
+    fn neither_outcomes_are_distinguished() {
+        assert_ne!(EraSupport::Unreachable, EraSupport::NoEraSpoken);
+    }
+
+    /// Unreachable routes through `TestReport::from_error`; "answered but no
+    /// era" does not. Both are covered here so the split cannot be silently
+    /// merged later.
+    #[test]
+    fn unreachable_and_no_era_produce_different_reports() {
+        let unreachable = unreachable_report("http://127.0.0.1:1/mcp");
+        assert_eq!(unreachable.tests.len(), 1);
+        assert_eq!(
+            unreachable.tests[0].name, "Error",
+            "the unreachable path must go through TestReport::from_error, whose \
+             result is named `Error`"
+        );
+        assert!(unreachable.has_failures());
+
+        let no_era = no_era_spoken_report("http://127.0.0.1:1/mcp");
+        assert_eq!(no_era.tests.len(), 1);
+        assert_eq!(no_era.tests[0].name, "Core: protocol era detection");
+        assert!(no_era.has_failures());
+        assert_ne!(no_era.tests[0].name, unreachable.tests[0].name);
+    }
+
+    /// A port nothing listens on cannot answer, so BOTH attempts fail and the
+    /// verdict is the infrastructure one.
+    #[tokio::test]
+    async fn detect_eras_reports_unreachable_for_a_dead_port() {
+        // Port 1 on loopback: reserved, never bound by a test server.
+        let verdict = detect_eras("http://127.0.0.1:1/mcp", Duration::from_secs(2)).await;
+        assert_eq!(verdict, EraSupport::Unreachable, "nothing is listening");
+    }
+
+    #[tokio::test]
+    async fn detect_eras_reports_unreachable_for_an_unparseable_url() {
+        let verdict = detect_eras("not a url at all", Duration::from_secs(1)).await;
+        assert_eq!(verdict, EraSupport::Unreachable);
+    }
+
+    #[test]
+    fn era_defaults_to_v1_and_is_pinned_by_the_builder() {
+        let tester = ServerTester::new(
+            "http://example.test/mcp",
+            Duration::from_secs(1),
+            false,
+            None,
+            Some("http"),
+            None,
+        )
+        .expect("constructible tester");
+        assert_eq!(tester.era(), Era::V1, "no pin means v1");
+
+        let pinned =
+            tester.with_protocol_version(ProtocolVersion(PROTOCOL_VERSION_2026_07_28.to_string()));
+        assert_eq!(pinned.era(), Era::V2);
+        assert!(
+            pinned.discover_result().is_none(),
+            "pinning alone must not fabricate a projection"
+        );
+        assert!(
+            pinned.server_capabilities().is_none(),
+            "no InitializeResult is ever synthesised for v2"
+        );
     }
 }
 

@@ -1211,7 +1211,7 @@ fn quirk_text_coercion_spec() -> WorkbookSpec {
 ///
 /// It is whitelist-legal: NO `PMT`, NO `POWER`, NO exponentiation (an
 /// arbitrary-term `(1+r)^n` amortization is NOT expressible and is deferred);
-/// the first-period interest model below stays inside the 13-fn whitelist.
+/// the first-period interest model below stays inside the 17-fn whitelist.
 ///
 /// # Named inputs / outputs (with units)
 ///

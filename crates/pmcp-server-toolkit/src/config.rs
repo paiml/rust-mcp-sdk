@@ -132,6 +132,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tools: Vec<ToolDecl>,
 
+    /// `[[config_slots]]` — declared config slots the TARGET environment must
+    /// fill (PKG-03). Additive per the REF-01 superset invariant: a config
+    /// omitting the block parses to an empty vec.
+    ///
+    /// Deliberately NOT gated on the `http` feature — a SQL or workbook Shape A
+    /// server declares slots too, and gating it would make the field vanish in
+    /// the toolkit's own default build.
+    #[serde(default)]
+    pub config_slots: Vec<ConfigSlotDecl>,
+
     /// `[[prompts]]` — declarative prompt surface.
     #[serde(default)]
     pub prompts: Vec<PromptDecl>,
@@ -222,7 +232,11 @@ impl ServerConfig {
     /// 4. No `[[tools]]` entry mixes tool kinds (`sql` / `path`+`method` /
     ///    `script`) — D-01 / T-90-02-04.
     /// 5. Every `[[database.tables]]` entry has a non-empty `name`.
-    /// 6. When a `[backend]` block is present (`http` feature), its `base_url`
+    /// 6. Every `[[config_slots]]` entry has a non-empty `key` AND `name`
+    ///    (PKG-03). The entry's `kind` needs no rule here — it is the closed
+    ///    [`ConfigSlotKind`] enum, so serde rejects an unknown discriminator at
+    ///    parse time, before `validate()` is called.
+    /// 7. When a `[backend]` block is present (`http` feature), its `base_url`
     ///    is non-empty (trimmed) — GAP 3 / WR-02. Absent on no-http builds.
     ///
     /// # Errors
@@ -252,6 +266,25 @@ impl ServerConfig {
                 return Err(ConfigValidationError::EmptyTableName(i));
             }
         }
+        // PKG-03 (Phase 120 Plan 04): a declared slot must actually name a
+        // config path AND a variable. An empty `key`/`name` claims coverage the
+        // declaration cannot deliver. Deliberately NOT a completeness
+        // heuristic — a "this literal looks secret, so a slot is missing" check
+        // would flag the london-tube fixture's guarded dev `token_secret`, and
+        // a check that cries wolf is worse than none.
+        for (i, slot) in self.config_slots.iter().enumerate() {
+            if slot.key.trim().is_empty() || slot.name.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyConfigSlotField(i));
+            }
+            // Identity-bearing slots structurally carry no value (the whole
+            // "secrets never travel" premise) — a `tested_value` on a `secret`
+            // declaration is the one field where a REAL credential could sit in
+            // a config that is served but never packed, so the doc-comment rule
+            // is enforced here rather than trusted.
+            if slot.kind == ConfigSlotKind::Secret && slot.tested_value.is_some() {
+                return Err(ConfigValidationError::SecretSlotCarriesTestedValue(i));
+            }
+        }
         // Phase 90 gap-closure (GAP 3 / WR-02): when a `[backend]` block is
         // declared, its `base_url` must be non-empty. Catch a typo'd / omitted
         // URL here (the field is `#[serde(default)]` -> `""`) rather than
@@ -262,6 +295,25 @@ impl ServerConfig {
         if let Some(backend) = &self.backend {
             if backend.base_url.trim().is_empty() {
                 return Err(ConfigValidationError::EmptyBackendBaseUrl);
+            }
+            // Phase 120 follow-up: a reference-shaped base_url must name
+            // exactly ONE variable. The grammar maps every malformed brace
+            // form — the empty `${}` and multi-placeholder compositions like
+            // `${SCHEME}://${HOST}` — to the empty name; catching that here
+            // turns a boot-time `UnresolvedBaseUrlRef` with an empty variable
+            // name into a load-time error naming the actual mistake.
+            if crate::env_ref::parse_env_ref(&backend.base_url) == Some("") {
+                return Err(ConfigValidationError::MalformedBackendBaseUrlRef);
+            }
+            // The same rule for `[backend.auth]` credentials. It is NOT the
+            // same consequence: an unresolvable base_url breaks every request
+            // loudly, while an unresolvable CREDENTIAL was silently omitted
+            // (`expand_api_key_map` drops the entry; the scalar variants
+            // collapse to `NoAuth`), so the server booted and sent every
+            // backend request unauthenticated. Catching it here is what makes
+            // that failure visible at all.
+            if let Some(field) = backend.auth.malformed_env_ref_field() {
+                return Err(ConfigValidationError::MalformedBackendAuthRef(field));
             }
         }
         Ok(())
@@ -457,6 +509,79 @@ pub struct BackendSection {
     pub http: HttpConfig,
 }
 
+#[cfg(feature = "http")]
+impl BackendSection {
+    /// Resolve [`Self::base_url`], expanding a `${VAR}` / `env:VAR` reference
+    /// from the process environment. Callers MUST use this rather than reading
+    /// `base_url` directly — the raw field may hold an unresolved placeholder.
+    ///
+    /// A Shape A server's endpoint is frequently a slot the target environment
+    /// fills, so the config records `base_url = "${TFL_BASE_URL}"` and the
+    /// package digest stays environment-independent. Without expansion that
+    /// literal `${...}` parses, VALIDATES (it is non-empty, so the emptiness
+    /// rule passes) and is then sent as the request URL.
+    ///
+    /// Resolution rules — the grammar is [`crate::env_ref::parse_env_ref`], the
+    /// single toolkit-wide chokepoint:
+    /// - a plain literal (no `${...}` / `env:` prefix) is returned VERBATIM;
+    /// - `${VAR}` / `env:VAR` reads `VAR` from the process environment;
+    /// - a MALFORMED reference — the empty `${}`, or a multi-placeholder
+    ///   composition like `${A}://${B}` (a brace reference names exactly ONE
+    ///   variable) — is an error;
+    /// - an UNSET variable, or one set to an empty / whitespace-only value, is
+    ///   an error.
+    ///
+    /// # Deliberate divergence from credential resolution
+    ///
+    /// A credential resolves an unset reference to the empty string so an
+    /// optional credential is OMITTED (see `crate::http::auth`). An endpoint
+    /// does NOT get that treatment: an empty credential yields a degraded
+    /// request, but an empty endpoint yields a broken one, and
+    /// [`ServerConfig::validate`] only checks emptiness at parse time — an
+    /// empty resolution would sail through and then break every request. This
+    /// uses the error-on-unset semantics of `code_mode`'s `token_secret`
+    /// resolution instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolkitError::UnresolvedBaseUrlRef`] when the reference cannot
+    /// be resolved. Per T-120-17 the error names the FIELD and the
+    /// environment-variable NAME only — never a resolved URL or credential.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pmcp_server_toolkit::config::ServerConfig;
+    ///
+    /// let cfg = ServerConfig::from_toml_strict_validated(
+    ///     "[server]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+    ///      [backend]\nbase_url = \"https://api.example.com\"\n",
+    /// )
+    /// .expect("valid config");
+    /// let backend = cfg.backend.as_ref().expect("[backend] present");
+    /// // A plain literal is used verbatim.
+    /// assert_eq!(backend.resolved_base_url().unwrap(), "https://api.example.com");
+    /// ```
+    pub fn resolved_base_url(&self) -> std::result::Result<String, ToolkitError> {
+        match crate::env_ref::parse_env_ref(&self.base_url) {
+            // Plain literal — used verbatim (every existing [backend] config
+            // and the four SQL reference configs land here, unchanged).
+            None => Ok(self.base_url.clone()),
+            // Malformed `${}` — a reference to an empty name. A credential
+            // treats this as "omit"; an endpoint cannot be omitted.
+            Some("") => Err(ToolkitError::UnresolvedBaseUrlRef { var: String::new() }),
+            Some(name) => match std::env::var(name) {
+                Ok(value) if !value.trim().is_empty() => Ok(value),
+                // Unset, or set-but-empty/whitespace — the same error either
+                // way. The VALUE is never carried into the error.
+                _ => Err(ToolkitError::UnresolvedBaseUrlRef {
+                    var: name.to_string(),
+                }),
+            },
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // [code_mode]
 // -----------------------------------------------------------------------------
@@ -567,6 +692,131 @@ pub struct SharedPolicyStoreSection {
     /// `"PermitAllSelects"`, `"ForbidAllDeletes"`).
     #[serde(default)]
     pub templates: Vec<String>,
+}
+
+// -----------------------------------------------------------------------------
+// [[config_slots]]
+// -----------------------------------------------------------------------------
+
+/// The kind of a declared `[[config_slots]]` entry — a CLOSED vocabulary.
+///
+/// Deliberately an enum rather than a free `String`. A free string lets a typo
+/// (`kind = "endpont"`) parse cleanly, survive
+/// [`ServerConfig::validate`], and fail only at package time when it maps to no
+/// slot type — the failure surfacing two crates away from its cause. As a closed
+/// enum, an unrecognized discriminator is a serde parse error naming the
+/// accepted set, and a fourth kind becomes a deliberate addition here rather
+/// than a silent pass-through.
+///
+/// # Why this type is toolkit-LOCAL
+///
+/// The three `snake_case` discriminators (`endpoint`, `secret`, `auth_mode`)
+/// are deliberately the same strings the `pmcp-package` slot-type discriminator
+/// uses for the corresponding variants, so a packaging tool can compare a
+/// declaration against a package slot **without either crate depending on the
+/// other**. The toolkit must NOT depend on `pmcp-package`: that crate is the
+/// workspace-excluded leaf, and a toolkit dependency on it inverts the layering.
+/// The agreement is enforced by the package side re-parsing the SAME config
+/// bytes, not by a shared type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSlotKind {
+    /// A network endpoint the target environment must supply (e.g. the backend
+    /// API root). Behaviour-relevant: its `tested_value` records the endpoint
+    /// the package was tested against.
+    #[default]
+    Endpoint,
+    /// A named secret the target environment must supply (e.g. an API key).
+    /// Identity-bearing: it structurally carries no `tested_value`.
+    Secret,
+    /// The backend authentication MODE. Structural rather than value-bearing:
+    /// the auth-mode key is a serde tag, so no `${VAR}` placeholder form of it
+    /// can deserialize — the baked literal IS the default and deviation
+    /// surfaces through slot classification, not through a placeholder.
+    AuthMode,
+}
+
+/// Single `[[config_slots]]` entry — a config value the TARGET environment must
+/// fill for this server to run.
+///
+/// A Shape A server's whole identity is its config, so "what must the operator
+/// supply?" has to be declarable IN that config rather than discovered by
+/// grepping for `${...}`. This block is that declaration: it names the config
+/// path, the kind of thing it is, and the value exercised when the server was
+/// tested.
+///
+/// Additive per the REF-01 superset invariant — a config omitting the block
+/// parses to an empty [`ServerConfig::config_slots`]. Strict-parse discipline
+/// (D-13) applies: `#[serde(deny_unknown_fields)]` rejects a typo'd inner key.
+///
+/// # Example
+///
+/// ```toml
+/// [[config_slots]]
+/// key = "backend.base_url"
+/// kind = "endpoint"
+/// name = "TFL_BASE_URL"
+/// tested_value = "https://api.tfl.gov.uk"
+/// ```
+/// Who fills a config slot's value.
+///
+/// Mirrors `pmcp-package`'s `SuppliedBy` **by TOML value name, never by shared
+/// type** — the same arrangement as [`ConfigSlotKind`], and for the same
+/// reason: the toolkit must NOT depend on `pmcp-package` (the
+/// workspace-excluded leaf), and a dependency the other way inverts the
+/// layering. The agreement is enforced by the package side re-parsing these
+/// same config bytes, not by a shared definition.
+///
+/// Defaults to [`Environment`](Self::Environment), so every config written
+/// before this field existed keeps its exact meaning: the operator supplies it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSlotSuppliedBy {
+    /// The operator supplies it in the target environment. The default, and the
+    /// only class a package enumerates as REQUIRED of an operator.
+    #[default]
+    Environment,
+    /// The hosting platform injects it at deploy time.
+    Platform,
+    /// The execution environment injects it (e.g. `AWS_LAMBDA_FUNCTION_NAME`);
+    /// neither the operator nor the platform supplies it.
+    Runtime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSlotDecl {
+    /// The dotted TOML path this slot fills, e.g. `backend.base_url`,
+    /// `backend.auth.query_params.app_key`, `backend.auth.type`.
+    #[serde(default)]
+    pub key: String,
+    /// The slot kind ([`ConfigSlotKind`] — a closed vocabulary). REQUIRED: an
+    /// entry omitting `kind` is a parse error, because a defaulted kind would
+    /// silently mis-classify the slot.
+    pub kind: ConfigSlotKind,
+    /// The slot's declared name — for a `secret`, the environment-variable
+    /// name; for an `endpoint`, the variable the `${VAR}` placeholder reads.
+    #[serde(default)]
+    pub name: String,
+    /// The value exercised when the server was tested. `None` for
+    /// identity-bearing slots (a secret), which structurally carry no value —
+    /// ENFORCED by [`ServerConfig::validate`], not just stated: a `secret`
+    /// entry carrying a `tested_value` is refused, because that field is the
+    /// one place a real credential could sit in a config that is served but
+    /// never packed.
+    #[serde(default)]
+    pub tested_value: Option<String>,
+    /// Who fills this slot — see [`ConfigSlotSuppliedBy`]. Defaults to
+    /// `environment` (the operator supplies it), so a config written before this
+    /// field existed is unchanged in meaning.
+    ///
+    /// This field is why the toolkit had to move in the same change as the
+    /// packer: `deny_unknown_fields` above means a config carrying
+    /// `supplied_by` would FAIL TO BOOT if only the package side learned it,
+    /// and `pmcp-package` refuses to pack a config it knows the server cannot
+    /// parse. Both sides accept it, or neither does.
+    #[serde(default)]
+    pub supplied_by: ConfigSlotSuppliedBy,
 }
 
 // -----------------------------------------------------------------------------
@@ -957,6 +1207,146 @@ mod tests {
         }
     }
 
+    /// A multi-placeholder composition (`${SCHEME}://${HOST}`) is a MALFORMED
+    /// reference — the grammar resolves one whole-value `${VAR}`, it does not
+    /// interpolate — so validate() refuses it at load time instead of letting
+    /// every boot fail with an `UnresolvedBaseUrlRef` naming an empty variable.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_rejects_multi_placeholder_backend_base_url() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "${TFL_SCHEME}://${TFL_HOST}"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::MalformedBackendBaseUrlRef) => {},
+            other => panic!("expected MalformedBackendBaseUrlRef, got {other:?}"),
+        }
+    }
+
+    /// The empty `${}` form is the same class of defect and gets the same
+    /// load-time refusal.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_rejects_empty_name_backend_base_url_ref() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "${}"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::MalformedBackendBaseUrlRef) => {},
+            other => panic!("expected MalformedBackendBaseUrlRef, got {other:?}"),
+        }
+    }
+
+    /// A well-formed single reference stays valid — the check refuses only
+    /// malformed shapes, never the deferred-to-environment pattern itself.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_accepts_single_reference_backend_base_url() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "${TFL_BASE_URL}"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        cfg.validate()
+            .expect("a single ${VAR} backend.base_url reference must validate");
+    }
+
+    /// The SAME malformed-reference rule applies to `[backend.auth]`
+    /// credentials, and it applies at LOAD time. Without it the credential path
+    /// resolved a malformed reference to the empty string and then OMITTED it:
+    /// the server booted, every backend call went out unauthenticated, and
+    /// nothing was logged. `${TFL-APP-KEY}` is the realistic shape — a dash is
+    /// not a portably settable variable name, so the reference names nothing.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_rejects_malformed_backend_auth_credential_ref() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://api.example.com"
+
+            [backend.auth]
+            type = "bearer"
+            token = "${TFL-APP-KEY}"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::MalformedBackendAuthRef(field)) => {
+                assert_eq!(field, "token");
+            },
+            other => panic!("expected MalformedBackendAuthRef, got {other:?}"),
+        }
+    }
+
+    /// The api_key map path gets the same refusal, and the error names the
+    /// offending entry so the operator knows WHICH parameter to fix.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_rejects_malformed_backend_auth_api_key_entry() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://api.example.com"
+
+            [backend.auth]
+            type = "api_key"
+            query_params = { app_key = "${TFL_SCHEME}://${TFL_HOST}" }
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::MalformedBackendAuthRef(field)) => {
+                assert_eq!(field, "query_params.app_key");
+            },
+            other => panic!("expected MalformedBackendAuthRef, got {other:?}"),
+        }
+    }
+
+    /// The refusal is scoped to MALFORMED shapes only: a well-formed reference
+    /// and a plain literal both still validate, so the deferred-to-environment
+    /// pattern and committed dev configs are untouched.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_accepts_wellformed_and_literal_backend_auth_credentials() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://api.example.com"
+
+            [backend.auth]
+            type = "basic"
+            username = "svc-account"
+            password = "${TFL_APP_KEY}"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        cfg.validate()
+            .expect("a literal username and a single ${VAR} password must validate");
+    }
+
     /// A `[backend]` block with a non-empty `base_url` validates OK.
     #[cfg(feature = "http")]
     #[test]
@@ -1290,6 +1680,318 @@ mod tests {
         let err =
             ServerConfig::from_toml(toml).expect_err("unknown [backend.http] key must be rejected");
         assert!(matches!(err, ToolkitError::Parse(_)), "got: {err:?}");
+    }
+
+    // -------------------------------------------------------------------------
+    // `[[config_slots]]` — PKG-03 slot declarations (Phase 120 Plan 04 Task 1)
+    // -------------------------------------------------------------------------
+
+    /// The three-slot declaration block the london-tube proving fixture carries.
+    const CONFIG_SLOTS_TOML: &str = r#"
+        [server]
+        name = "london-tube"
+        version = "1.1.0"
+
+        [[config_slots]]
+        key = "backend.base_url"
+        kind = "endpoint"
+        name = "TFL_BASE_URL"
+        tested_value = "https://api.tfl.gov.uk"
+
+        [[config_slots]]
+        key = "backend.auth.query_params.app_key"
+        kind = "secret"
+        name = "TFL_APP_KEY"
+
+        [[config_slots]]
+        key = "backend.auth.type"
+        kind = "auth_mode"
+        name = "backend-auth-mode"
+        tested_value = "api_key"
+    "#;
+
+    /// Test 1: a `[[config_slots]]` block parses through the STRICT + validated
+    /// entry point and exposes all three entries with their fields intact.
+    #[test]
+    fn config_slots_block_parses_through_strict_entry_point() {
+        let cfg = ServerConfig::from_toml_strict_validated(CONFIG_SLOTS_TOML)
+            .expect("[[config_slots]] must parse through the strict entry point");
+        assert_eq!(cfg.config_slots.len(), 3, "three declared slots");
+
+        assert_eq!(cfg.config_slots[0].key, "backend.base_url");
+        assert_eq!(cfg.config_slots[0].kind, ConfigSlotKind::Endpoint);
+        assert_eq!(cfg.config_slots[0].name, "TFL_BASE_URL");
+        assert_eq!(
+            cfg.config_slots[0].tested_value.as_deref(),
+            Some("https://api.tfl.gov.uk")
+        );
+
+        assert_eq!(cfg.config_slots[1].kind, ConfigSlotKind::Secret);
+        assert_eq!(cfg.config_slots[1].name, "TFL_APP_KEY");
+        assert_eq!(cfg.config_slots[2].kind, ConfigSlotKind::AuthMode);
+    }
+
+    /// A `[[config_slots]]` entry carrying `supplied_by` must BOOT.
+    ///
+    /// This is the load-bearing half of a two-crate change. `pmcp-package`
+    /// refuses to pack a config whose fields this struct's
+    /// `deny_unknown_fields` would reject, on the grounds that packing it would
+    /// ship a server that cannot start. So if the packer learns `supplied_by`
+    /// and this struct does not, every config using the field becomes
+    /// unpackable; if this struct learns it and the packer does not, the packer
+    /// rejects configs the server boots from happily. Both sides move together
+    /// or neither does, and this test is the runtime half of that pin.
+    #[test]
+    fn a_config_slot_declaring_supplied_by_parses_through_the_strict_entry_point() {
+        let toml = r#"
+            [server]
+            name = "tube"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            name = "TFL_BASE_URL"
+            tested_value = "https://api.tfl.gov.uk"
+            supplied_by = "platform"
+
+            [[config_slots]]
+            key = "backend.function_name"
+            kind = "secret"
+            name = "AWS_LAMBDA_FUNCTION_NAME"
+            supplied_by = "runtime"
+        "#;
+        let cfg = ServerConfig::from_toml_strict_validated(toml)
+            .expect("`supplied_by` must parse under deny_unknown_fields");
+        assert_eq!(
+            cfg.config_slots[0].supplied_by,
+            ConfigSlotSuppliedBy::Platform
+        );
+        assert_eq!(
+            cfg.config_slots[1].supplied_by,
+            ConfigSlotSuppliedBy::Runtime
+        );
+    }
+
+    /// Omitting it means `environment`, so every config written before the
+    /// field existed keeps its meaning rather than failing to parse.
+    #[test]
+    fn a_config_slot_without_supplied_by_defaults_to_environment() {
+        let cfg = ServerConfig::from_toml_strict_validated(CONFIG_SLOTS_TOML)
+            .expect("the pre-existing fixture must still parse");
+        for slot in &cfg.config_slots {
+            assert_eq!(slot.supplied_by, ConfigSlotSuppliedBy::Environment);
+        }
+    }
+
+    /// An unrecognized value is a parse ERROR, not a silent default — strict
+    /// parse discipline (D-13). A defaulted typo here would tell an operator to
+    /// supply a value the platform actually injects.
+    #[test]
+    fn an_unknown_supplied_by_value_is_a_parse_error() {
+        let toml = r#"
+            [server]
+            name = "tube"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            name = "TFL_BASE_URL"
+            tested_value = "x"
+            supplied_by = "platfrom"
+        "#;
+        ServerConfig::from_toml_strict_validated(toml)
+            .expect_err("a misspelled supplied_by must not silently default");
+    }
+
+    /// Test 2: the field is ADDITIVE — a config with no `[[config_slots]]` block
+    /// parses unchanged and yields an empty vec (`#[serde(default)]`).
+    #[test]
+    fn config_without_config_slots_parses_with_empty_vec() {
+        let cfg = ServerConfig::from_toml_strict_validated(MINIMAL)
+            .expect("a config omitting [[config_slots]] still parses");
+        assert!(
+            cfg.config_slots.is_empty(),
+            "absent block yields an empty vec, not a default entry"
+        );
+    }
+
+    /// Test 3: `deny_unknown_fields` still bites at the TOP level — a typo'd
+    /// `[[config_slotz]]` is a hard parse error, never a silently-ignored block.
+    #[test]
+    fn top_level_config_slots_typo_is_still_rejected() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[config_slotz]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            name = "TFL_BASE_URL"
+        "#;
+        let err = ServerConfig::from_toml(toml)
+            .expect_err("a typo'd top-level array-of-tables must be rejected");
+        assert!(matches!(err, ToolkitError::Parse(_)), "got: {err:?}");
+    }
+
+    /// Test 4: the decl struct is itself `deny_unknown_fields` — a typo INSIDE
+    /// the block (`nmae`) is rejected rather than silently dropped.
+    #[test]
+    fn config_slot_unknown_inner_key_is_rejected() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.base_url"
+            kind = "endpoint"
+            nmae = "TFL_BASE_URL"
+        "#;
+        let err = ServerConfig::from_toml(toml)
+            .expect_err("an unknown key inside [[config_slots]] must be rejected");
+        assert!(matches!(err, ToolkitError::Parse(_)), "got: {err:?}");
+    }
+
+    /// Test 5: `tested_value` is OPTIONAL — an identity-bearing slot structurally
+    /// carries no value, so omitting it parses to `None`.
+    #[test]
+    fn config_slot_tested_value_is_optional() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.auth.query_params.app_key"
+            kind = "secret"
+            name = "TFL_APP_KEY"
+        "#;
+        let cfg = ServerConfig::from_toml_strict_validated(toml)
+            .expect("an entry without tested_value parses");
+        assert_eq!(cfg.config_slots.len(), 1);
+        assert!(
+            cfg.config_slots[0].tested_value.is_none(),
+            "omitted tested_value parses to None"
+        );
+    }
+
+    /// Test 6 (Codex MEDIUM — the invalid-kind hole): `kind` is a CLOSED
+    /// vocabulary. A typo such as `endpont` — or an empty string — is a PARSE
+    /// error naming the accepted set, not a declaration that parses cleanly and
+    /// then fails to map to any package slot type two crates away.
+    #[test]
+    fn config_slot_invalid_kind_is_rejected_naming_the_accepted_set() {
+        for bad in ["endpont", ""] {
+            let toml = format!(
+                r#"
+                [server]
+                name = "demo"
+                version = "0.1.0"
+
+                [[config_slots]]
+                key = "backend.base_url"
+                kind = "{bad}"
+                name = "TFL_BASE_URL"
+                "#
+            );
+            let err = ServerConfig::from_toml(&toml)
+                .expect_err("an unrecognized config-slot kind must be rejected at parse time");
+            let rendered = err.to_string();
+            for accepted in ["endpoint", "secret", "auth_mode"] {
+                assert!(
+                    rendered.contains(accepted),
+                    "the error for kind = \"{bad}\" must name the accepted kind \
+                     `{accepted}`: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// Test 7: all three valid kinds parse, and the parsed value is a CLOSED
+    /// enum — comparable as `ConfigSlotKind`, not as a free string. A fourth
+    /// kind is therefore a deliberate addition here, never a silent
+    /// pass-through to the package side.
+    #[test]
+    fn config_slot_all_three_kinds_parse_as_a_closed_enum() {
+        let cfg = ServerConfig::from_toml_strict_validated(CONFIG_SLOTS_TOML)
+            .expect("all three kinds parse");
+        let kinds: Vec<ConfigSlotKind> = cfg.config_slots.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ConfigSlotKind::Endpoint,
+                ConfigSlotKind::Secret,
+                ConfigSlotKind::AuthMode
+            ],
+            "kind is a closed enum, not a free string"
+        );
+    }
+
+    /// `validate()` rejects an entry whose `key` or `name` is empty/whitespace,
+    /// carrying the offending entry INDEX (the `EmptyTableName(i)` error shape).
+    #[test]
+    fn config_slot_empty_key_or_name_fails_validation() {
+        for field in ["key", "name"] {
+            let (key, name) = if field == "key" {
+                ("   ", "TFL_BASE_URL")
+            } else {
+                ("backend.base_url", "  ")
+            };
+            let toml = format!(
+                r#"
+                [server]
+                name = "demo"
+                version = "0.1.0"
+
+                [[config_slots]]
+                key = "{key}"
+                kind = "endpoint"
+                name = "{name}"
+                "#
+            );
+            let cfg = ServerConfig::from_toml(&toml).expect("parses; emptiness is semantic");
+            let err = cfg
+                .validate()
+                .expect_err("an empty config-slot key/name must fail validation");
+            assert!(
+                matches!(err, ConfigValidationError::EmptyConfigSlotField(0)),
+                "empty {field} must yield EmptyConfigSlotField(0), got: {err:?}"
+            );
+        }
+    }
+
+    /// `validate()` refuses a `secret` declaration carrying a `tested_value` —
+    /// identity-bearing slots structurally record no value, and this field is
+    /// the one place a REAL credential could sit in a config that is served
+    /// but never packed (pack-time gates only run on packaging).
+    #[test]
+    fn config_slot_secret_with_tested_value_fails_validation_without_echoing_it() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[config_slots]]
+            key = "backend.auth.query_params.app_key"
+            kind = "secret"
+            name = "TFL_APP_KEY"
+            tested_value = "sentinel-real-credential"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parses; the rule is semantic");
+        let err = cfg
+            .validate()
+            .expect_err("a secret slot carrying a tested_value must fail validation");
+        assert!(
+            matches!(err, ConfigValidationError::SecretSlotCarriesTestedValue(0)),
+            "got: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("sentinel-real-credential"),
+            "the error must not echo the value: {err}"
+        );
     }
 
     proptest! {

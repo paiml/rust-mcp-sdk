@@ -95,6 +95,42 @@ mcp-tester conformance http://localhost:3000 --domain core,tools
 cargo pmcp test conformance http://localhost:3000
 ```
 
+### Dual-era comparison (`--dual-run`)
+
+A v2 (2026-07-28) server usually serves v1 (2025-11-25) too. `--dual-run` detects
+that, runs the suite against BOTH eras, and classifies every v1-vs-v2 difference
+against the checked-in baseline (`baselines/era-deltas.yaml`):
+
+```bash
+mcp-tester conformance --dual-run http://localhost:3000
+```
+
+```text
+Era support : dual
+v1 suite    : 19 tests, 0 failed
+v2 suite    : 19 tests, 1 failed
+Differences : 4 expected, 0 unexpected, 10 missing
+
+V2 SUITE FAILURES (1)
+  Resources: read first resource [Resources]
+      resources/read failed: Protocol error: -32020 - …
+```
+
+A listed delta is correct by design, an unlisted one is a finding, and a listed
+one that no longer reproduces is also a finding. Against a single-era server this
+degrades to one run and says so.
+
+**By default `--dual-run` REPORTS but does not GATE.** The exit code keeps
+meaning "did the v1 suite pass", so adding the flag to an existing CI job cannot
+change its verdict. To make the findings fail the job:
+
+```bash
+mcp-tester conformance --dual-run --fail-on-era-findings http://localhost:3000
+```
+
+That folds v2-suite failures and UNEXPECTED era differences in as named
+`[v2 suite]` / `[era]` failures and exits non-zero. It requires `--dual-run`.
+
 Output includes a per-domain CI summary line:
 
 ```
@@ -192,7 +228,7 @@ cargo pmcp test run --server my-server --scenarios tests/
 |---------|-------------|
 | `test` | Full test suite — protocol, tools, resources, prompts |
 | `quick` | Fast connectivity and protocol check |
-| `conformance` | MCP protocol conformance validation (19 scenarios across 5 domains) |
+| `conformance` | MCP protocol conformance validation (19 scenarios across 5 domains); `--dual-run` compares v1 vs v2, `--fail-on-era-findings` gates on the result |
 | `tools` | Discover tools and validate schemas |
 | `resources` | Test resource discovery and reading |
 | `prompts` | Validate prompt templates and arguments |
@@ -202,6 +238,16 @@ cargo pmcp test run --server my-server --scenarios tests/
 | `diagnose` | Layer-by-layer connection diagnostics |
 | `compare` | Compare two servers side-by-side |
 | `health` | Health check endpoint |
+
+### Global flags
+
+| Flag | Description |
+|------|-------------|
+| `--dump-wire` | Dump every HTTP request/response on the wire, credentials redacted. Equivalent to `RUST_LOG=pmcp::wire=debug`. See [Wire Debugging](#wire-debugging---dump-wire). |
+| `--format` | `pretty` (default), `json`, `minimal`, `verbose` |
+| `-v, --verbose` | Verbosity 0–3 |
+| `--insecure` | Skip TLS verification |
+| `--api-key` | Bearer credential (also `MCP_API_KEY`) |
 
 ## Key Features
 
@@ -226,6 +272,78 @@ cargo pmcp test run --server my-server --scenarios tests/
 # Any CI — exit code tells you pass/fail
 mcp-tester test "$SERVER_URL" --format minimal
 ```
+
+## Wire Debugging (`--dump-wire`)
+
+The first question in any conformance dispute is *what did we actually send?*
+`--dump-wire` answers it — the request line, every header (including the v2
+routing trio `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`), the body, and
+the response status and headers.
+
+```bash
+mcp-tester conformance --dual-run --dump-wire "$SERVER_URL"
+```
+
+```text
+DEBUG pmcp::wire: outgoing MCP request direction="request" method=POST
+  headers=mcp-protocol-version: 2026-07-28
+          mcp-method: resources/read
+          mcp-name: ui://app/keypad
+  body={"jsonrpc":"2.0","id":"…","method":"resources/read","params":{…}}
+```
+
+**Credentials are redacted by default.** `Authorization`, `Cookie`,
+`Mcp-Session-Id` and friends render as `<redacted N bytes>` — the name and length
+survive (so "present but empty" stays distinguishable from "present with a
+value") but the secret never reaches a log you might paste into an issue.
+
+### It is `tracing`, so it composes
+
+`--dump-wire` is a preset over the SDK's `pmcp::wire` target, not a separate
+logger. The flag is a convenience; these are equivalent:
+
+```bash
+mcp-tester conformance --dump-wire "$SERVER_URL"
+RUST_LOG=pmcp::wire=debug mcp-tester conformance "$SERVER_URL"
+```
+
+Because it is its own target, you get wire frames **without** turning on every
+other SDK debug line — and you can widen when you want both:
+
+```bash
+RUST_LOG=pmcp::wire=debug,pmcp=info mcp-tester conformance "$SERVER_URL"
+```
+
+With neither the flag nor `RUST_LOG`, nothing is emitted and nothing is built:
+every entry point is guarded before it allocates a diagnostic string, so leaving
+the instrumentation compiled in costs a production request nothing.
+
+### In CI
+
+Wire frames are ordinary `tracing` events, so a job can archive them as a
+machine-readable artifact and attach it to a failure:
+
+```yaml
+- name: Conformance (with wire capture on failure)
+  run: |
+    mcp-tester conformance --dual-run --fail-on-era-findings "$SERVER_URL" \
+      || {
+        echo "conformance failed — re-running with wire capture"
+        mcp-tester conformance --dual-run --dump-wire "$SERVER_URL" 2> wire.log || true
+        exit 1
+      }
+
+- name: Upload wire capture
+  if: failure()
+  uses: actions/upload-artifact@v4
+  with:
+    name: mcp-wire-capture
+    path: wire.log
+```
+
+Pair it with `--fail-on-era-findings` (see `conformance --help`) so a v2-suite
+failure or an unexpected v1/v2 difference actually fails the job — without it,
+`--dual-run` reports but does not gate.
 
 ## Documentation
 

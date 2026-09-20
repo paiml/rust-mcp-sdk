@@ -12,8 +12,11 @@ pub(crate) mod tasks;
 pub(crate) mod tools;
 pub(crate) mod transport;
 
+use crate::era_diff::{DualRunReport, EraBaseline};
+use crate::era_observations;
 use crate::report::{TestCategory, TestReport, TestResult};
 use crate::tester::ServerTester;
+use pmcp::types::protocol::Era;
 use pmcp::types::ServerCapabilities;
 use std::time::Instant;
 
@@ -130,6 +133,57 @@ impl ConformanceRunner {
         }
 
         report.duration = start.elapsed();
+        report
+    }
+
+    /// Run the SAME suite twice — once per era — and compare the two runs
+    /// against the expected-difference baseline (Phase 117, CLNT-04 / D-05).
+    ///
+    /// # Why this WRAPS `run` rather than forking it
+    ///
+    /// [`Self::run`] is already a clean straight-line orchestrator, and every
+    /// domain has the identical
+    /// `async fn run_X_conformance(&mut ServerTester) -> Vec<TestResult>` shape.
+    /// So a dual run is literally "call it twice". Duplicating any domain logic
+    /// here would create a second copy that could drift from the first, and the
+    /// whole value of a dual run is that BOTH eras went through the SAME suite —
+    /// a comparison between two different suites proves nothing. `strict` and
+    /// `domains` are reused unchanged for exactly the same reason.
+    ///
+    /// The two `TestReport`s are carried into the result whole, for the human
+    /// reader. The COMPARISON reads only the [`crate::era_observations`] probes,
+    /// because `TestReport` cannot represent a header, a session id, a
+    /// result-envelope field, a capability location, a caching hint or an HTTP
+    /// status — which is most of what the baseline is about.
+    pub async fn run_dual(&self, v1: &mut ServerTester, v2: &mut ServerTester) -> DualRunReport {
+        let v1_report = self.run(v1).await;
+        let v2_report = self.run(v2).await;
+
+        let v1_observations = era_observations::observe(v1, Era::V1).await;
+        let v2_observations = era_observations::observe(v2, Era::V2).await;
+
+        // A baseline that cannot be parsed is a build-time impossibility (it is
+        // compiled in and gated by `tests/era_baseline.rs`), but it is reported
+        // rather than unwrapped: a testing tool must not panic on its own data.
+        let (baseline, note) = match crate::era_diff::load_default_baseline() {
+            Ok(baseline) => (baseline, None),
+            Err(e) => (
+                EraBaseline::empty(),
+                Some(format!(
+                    "the compiled-in era baseline could not be parsed, so NOTHING \
+                     was classified: {e}"
+                )),
+            ),
+        };
+        let mut report = crate::era_diff::build_dual_run_report(
+            "dual",
+            v1_report,
+            v2_report,
+            v1_observations,
+            v2_observations,
+            &baseline,
+        );
+        report.note = note;
         report
     }
 

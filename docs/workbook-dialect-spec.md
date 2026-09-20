@@ -48,7 +48,7 @@ is **deny-by-default**: any function token not in the set is a located
 `whitelist/unsupported-fn` lint **error** (never silently accepted, never
 auto-widened — see §6).
 
-The set is a flat list of **13 first-class functions** that the lighthouse
+The set is a flat list of **17 first-class functions** that the lighthouse
 workbook (`UFH_Quote_Process_Model_Plot3.xlsx` — the lighthouse project's
 reference workbook, not vendored in this repository) already authors, so it
 lints clean **as-authored**. Every function below is first-class — there is no
@@ -69,8 +69,12 @@ core/widened tiering.
 | `SEARCH` | whitelist | substring search the lighthouse authors |
 | `ROUND` | whitelist | half-up rounding the lighthouse authors |
 | `TEXT` | whitelist | number formatting the lighthouse authors |
+| `ROUNDDOWN` | whitelist | round toward zero (dialect 1.1) |
+| `MAX` | whitelist | aggregate maximum (dialect 1.1) |
+| `MIN` | whitelist | aggregate minimum (dialect 1.1) |
+| `XLOOKUP` | whitelist | exact lookup, narrow 3/4-arg form only — see §3.2 (dialect 1.1) |
 
-Total: **13 names**. This table is the *published* contract; the `WHITELIST`
+Total: **17 names**. This table is the *published* contract; the `WHITELIST`
 const is the *enforced* contract. An automated binding test
 (`pmcp_workbook_dialect::dialect_spec::doc_whitelist_table_matches_const`) parses
 the function names out of this very table and asserts set-equality with
@@ -78,6 +82,60 @@ the function names out of this very table and asserts set-equality with
 
 The arithmetic **operators** `+ - * / ^` are part of the dialect but are checked
 separately — they are not function tokens and do not appear in the whitelist.
+
+### 3.1 Exact-match lookup contract (dialect 1.1)
+
+`VLOOKUP`, `MATCH` and `XLOOKUP` perform **EXACT matching only**. The dialect
+does not support approximate (sorted-range) lookup in any form, and it will not
+guess one for you:
+
+| You wrote | Result | Repair |
+|-----------|--------|--------|
+| `VLOOKUP(key, table, col, FALSE)` | accepted | — |
+| `VLOOKUP(key, table, col, 0)` | accepted | — |
+| `VLOOKUP(key, table, col)` | **refused** | write `VLOOKUP(key, table, col, FALSE)` |
+| `VLOOKUP(key, table, col, TRUE)` / `…, 1)` | **refused** | write `VLOOKUP(key, table, col, FALSE)` |
+| `MATCH(key, range, 0)` | accepted | — |
+| `MATCH(key, range)` | **refused** | write `MATCH(key, range, 0)` |
+| `MATCH(key, range, 1)` / `…, -1)` | **refused** | write `MATCH(key, range, 0)` |
+
+The fourth `VLOOKUP` argument and the third `MATCH` argument are **REQUIRED**,
+even though Excel itself lets you omit them.
+
+**Why the omitted form is refused rather than assumed exact.** Excel's DEFAULT
+for both is **APPROXIMATE**. An approximate lookup over an unsorted governed
+table does not fail — it returns *a wrong number, with no signal*, silently
+propagating through every downstream formula. A refusal costs the author one
+edit; a silently wrong answer costs whatever the number was used for. This
+dialect refuses rather than guesses.
+
+The refusal is raised at parse time as a **located** error naming the cell
+(`parse 1_Inputs!B7: call to \`MATCH\` has an unsupported shape: …`), and the
+evaluator carries an independent `#VALUE!` backstop for the same conditions, so
+neither layer can be bypassed.
+
+### 3.2 `XLOOKUP` — the constrained form (dialect 1.1)
+
+The one accepted signature is:
+
+```text
+XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found])
+```
+
+- **Exact match only.** The optional Excel arguments `match_mode` and
+  `search_mode` are **NOT supported** — a 5th or 6th argument is refused at parse
+  time. The evaluator never guesses a mode.
+- **`return_array` must be single-column.** A multi-column `return_array` is
+  refused.
+- **`lookup_array` and `return_array` must be conformable** — equal member
+  counts, so the positional pairing is meaningful.
+- **`if_not_found` is optional.** On a miss it is returned; when it is omitted a
+  miss yields Excel's `#N/A`.
+
+**No correct spill behaviour is being withheld.** A spilling `XLOOKUP` is
+already refused independently by the §5 `formula/array` rule, and the compiled IR
+carries a scalar value per cell, so a spilling form is unrepresentable rather
+than merely unimplemented.
 
 ## 4. Typed inputs and the two-layer metadata model
 
@@ -215,8 +273,38 @@ if either drifts the build fails.
 
 | Version field | Value | Meaning |
 |---------------|-------|---------|
-| `supported` | `1.0` | the maximum `MAJOR.MINOR` the compiler accepts |
+| `supported` | `1.1` | the maximum `MAJOR.MINOR` the compiler accepts |
 | `baseline` | `1.0` | the dialect an absent declaration targets (D-05) |
+
+### 7.6 Recorded narrowing (dialect 1.1)
+
+Dialect 1.1 both **WIDENS** and **NARROWS**, and the narrowing rode a MINOR
+bump deliberately. The reasoning is recorded here, in the published contract,
+rather than in a commit message.
+
+- **The widening:** four new first-class functions — `ROUNDDOWN`, `MAX`, `MIN`,
+  `XLOOKUP` (§3).
+- **The narrowing:** the EXACT-match contract of §3.1 is now ENFORCED. A
+  `VLOOKUP` without its `range_lookup` argument, and a `MATCH` without its
+  `match_type` argument, are refused where they previously compiled.
+
+**A MAJOR bump was considered and rejected**, for three reasons:
+
+1. **Nothing correct is being removed.** EXACT-ONLY was ALWAYS the published
+   contract — the approximate form was never supported, it was silently
+   mis-evaluated as exact. Dialect 1.1 makes an already-published refusal real.
+   That is a bug fix, not a capability withdrawal.
+2. **The measured blast radius is zero.** Every `VLOOKUP`/`MATCH` call authored
+   anywhere in this repository — fixtures, authored fixture source and unit
+   tests alike — already writes the exact-match argument. No workbook and no
+   fixture needed an edit.
+3. **A major bump would fail closed on EVERY existing workbook.** Under §7.3 a
+   `2.0` supported version rejects every workbook declaring `1.0` and (via
+   §7.4's baseline) every workbook declaring nothing at all. Refusing the entire
+   existing corpus is a catastrophic response to fixing a wrong answer.
+
+Under §7.3, `supported = 1.1` keeps every `1.0`-declaring and every undeclared
+workbook accepted.
 
 ---
 

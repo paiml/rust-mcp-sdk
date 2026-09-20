@@ -77,6 +77,13 @@ pub fn execute(args: AddArgs, _global_flags: &GlobalFlags) -> Result<()> {
     cfg.targets.insert(args.name.clone(), entry);
     cfg.write_atomic(&path)?;
 
+    // A new/!changed target can point at a DIFFERENT deployment, and the discovery
+    // cache (~/.pmcp/pmcp-run-config.json) is keyed by api_url, so a stale entry for
+    // the previous target would otherwise survive until its 1-hour TTL. Best-effort:
+    // failing to clear a cache must not fail the command — the worst case is one
+    // stale lookup, which the retry in pmcp_run::graphql also covers.
+    let _ = crate::deployment::targets::pmcp_run::auth::clear_config_cache();
+
     eprintln!("✓ target '{}' added to {}", args.name, path.display());
     eprintln!(
         "  run `cargo pmcp configure use {}` to make it active in this workspace",

@@ -40,6 +40,8 @@ pub struct UIResourceBuilder {
     description: Option<String>,
     mime_type: UIMimeType,
     content: Option<String>,
+    /// `(connect_domains, resource_domains)` — set via [`Self::csp`].
+    csp: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl UIResourceBuilder {
@@ -64,7 +66,28 @@ impl UIResourceBuilder {
             description: None,
             mime_type: UIMimeType::HtmlMcpApp,
             content: None,
+            csp: None,
         }
+    }
+
+    /// Declare the widget's Content Security Policy domains.
+    ///
+    /// `connect_domains` are origins the widget may fetch/XHR/WebSocket to;
+    /// `resource_domains` are origins it may load static assets from. Pass
+    /// empty vectors to declare explicitly that the widget is fully
+    /// self-contained — hosts treat a declared empty list as intent, whereas
+    /// an absent declaration is an unknown.
+    ///
+    /// Emitted in the resource contents `_meta` in both shapes hosts consume:
+    /// the MCP Apps standard `ui.csp` (`connectDomains`/`resourceDomains`)
+    /// and the `ChatGPT` host key `openai/widgetCSP`
+    /// (`connect_domains`/`resource_domains`).
+    ///
+    /// External *navigation* (link-outs) is not part of CSP — widgets should
+    /// route those through the host bridge (e.g. `openExternal`).
+    pub fn csp(mut self, connect_domains: Vec<String>, resource_domains: Vec<String>) -> Self {
+        self.csp = Some((connect_domains, resource_domains));
+        self
     }
 
     /// Set the description for this UI resource.
@@ -231,9 +254,34 @@ impl UIResourceBuilder {
             )
         })?;
 
+        let csp = self.csp.clone();
         let resource = self.build()?;
 
-        let contents = UIResourceContents::html(uri, content);
+        let mut contents = UIResourceContents::html(uri.clone(), content);
+
+        if let Some((connect, resources)) = csp {
+            let mut meta = serde_json::Map::new();
+            // The read-path merge inserts standard keys with entry().or_insert,
+            // so a pre-populated "ui" object must carry resourceUri itself.
+            meta.insert(
+                "ui".to_string(),
+                serde_json::json!({
+                    "resourceUri": uri,
+                    "csp": {
+                        "connectDomains": connect,
+                        "resourceDomains": resources,
+                    }
+                }),
+            );
+            meta.insert(
+                "openai/widgetCSP".to_string(),
+                serde_json::json!({
+                    "connect_domains": connect,
+                    "resource_domains": resources,
+                }),
+            );
+            contents.meta = Some(meta);
+        }
 
         Ok((resource, contents))
     }
@@ -242,6 +290,47 @@ impl UIResourceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_csp_declaration_lands_in_contents_meta() {
+        let (_resource, contents) = UIResourceBuilder::new("ui://test/csp", "CSP Test")
+            .html_template("<html><body>Test</body></html>")
+            .csp(vec!["https://api.example.com".to_string()], Vec::new())
+            .build_with_contents()
+            .expect("Failed to build");
+
+        let meta = contents.meta.expect("csp() must populate contents._meta");
+
+        // MCP Apps standard shape — nested under "ui" WITH resourceUri, because
+        // the read-path merge or_inserts per top-level key and must not clobber.
+        let ui = meta.get("ui").expect("ui key present");
+        assert_eq!(ui["resourceUri"], "ui://test/csp");
+        assert_eq!(ui["csp"]["connectDomains"][0], "https://api.example.com");
+        assert_eq!(
+            ui["csp"]["resourceDomains"].as_array().map(Vec::len),
+            Some(0),
+            "empty list must be declared explicitly, not omitted"
+        );
+
+        // OpenAI host key — snake_case, top-level sibling of "ui".
+        let openai = meta
+            .get("openai/widgetCSP")
+            .expect("openai/widgetCSP key present");
+        assert_eq!(openai["connect_domains"][0], "https://api.example.com");
+        assert_eq!(openai["resource_domains"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn test_no_csp_means_no_meta() {
+        let (_resource, contents) = UIResourceBuilder::new("ui://test/plain", "Plain")
+            .html_template("<html><body>Test</body></html>")
+            .build_with_contents()
+            .expect("Failed to build");
+        assert!(
+            contents.meta.is_none(),
+            "builder without csp() must not invent contents meta"
+        );
+    }
 
     #[test]
     fn test_basic_builder() {

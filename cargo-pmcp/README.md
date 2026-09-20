@@ -292,7 +292,39 @@ cargo pmcp team dev --serve --port 8080     # or serve team-mcp over HTTP
 
 # 4. Inspect a portable AI-Package bundle locally, fully offline:
 cargo pmcp package inspect ./some-agent.pmcp
+
+# 5. Pack a server into a portable AI-Package. After `cargo pmcp deploy` has
+#    built the bootstrap, this needs no binary flag at all:
+cargo pmcp package save --config ./config.toml -o my-server.tar
 ```
+
+### Packing a server: the binary
+
+`package save` needs to know which runtime binary the package is about. It
+defaults to `deploy/.build/bootstrap` — where `cargo pmcp deploy` leaves the
+artifact it uploads — so the common case is the bare command above.
+
+| Flag | What it does |
+|---|---|
+| *(none)* | references `deploy/.build/bootstrap`, deriving the digest from it |
+| `--binary-from <path>` | references that file, deriving the digest from it |
+| `--binary <path>` | **embeds** the bytes; the package is self-contained |
+| `--binary-digest sha256:<hex>` | references a digest you supply (CI, artifact built elsewhere) |
+
+Deriving the digest from the bytes is the point of the first three: a digest you
+type by hand can disagree with the binary it names, and nothing downstream can
+tell.
+
+**Referencing is the default on purpose.** A configuration server should NAME its
+runtime rather than carry it, and a team package holding several agents that
+share one MCP server would otherwise carry that binary once per agent.
+
+**If you do embed**, know the trade: an embedded package's digest moves whenever
+the binary is rebuilt — including a byte-identical-source rebuild on a different
+toolchain — while a referenced package's digest does not. That stability is what
+lets one tested package move between environments unchanged. For a hand-rolled
+server whose identity *is* its code, a digest that tracks the code is arguably
+what you want; for a configuration server it is not.
 
 > `package inspect` reads an OCI image-layout `.pmcp` bundle. The remote
 > `capture`/`show` verbs (upload / fetch against the pmcp.run platform) are a
@@ -496,6 +528,40 @@ Same validator, same verdict shape, two ingestion paths.
 | `--verbose` | `-v` | Enable verbose output for debugging |
 | `--no-color` | | Suppress colored output (also respects `NO_COLOR` env and non-TTY) |
 | `--quiet` | | Suppress all non-error output (verbose wins if both are set) |
+| `--dump-wire` | | Dump every HTTP request/response the SDK puts on the wire, credentials redacted. See below. |
+
+### `--dump-wire` — what did we actually send?
+
+When a deployed server rejects a request, the first question is what went on the
+wire. `--dump-wire` answers it for any command that talks to a server:
+
+```bash
+cargo pmcp test conformance --dump-wire https://your-server.example.com/mcp
+```
+
+```text
+DEBUG pmcp::wire: outgoing MCP request direction="request" method=POST
+  headers=mcp-protocol-version: 2026-07-28
+          mcp-method: resources/read
+          mcp-name: ui://app/keypad
+  body={"jsonrpc":"2.0","id":"…","method":"resources/read","params":{…}}
+DEBUG pmcp::wire: incoming MCP response direction="response" status=400
+```
+
+`Authorization`, `Cookie`, `Mcp-Session-Id` and friends render as
+`<redacted N bytes>` — the name and length survive so "present but empty" stays
+distinguishable, but the secret never reaches a log or a CI artifact.
+
+It is a preset over the SDK's `pmcp::wire` tracing target, not a separate logger,
+so these are equivalent and any `tracing_subscriber` layer composes with it:
+
+```bash
+cargo pmcp test conformance --dump-wire "$URL"
+RUST_LOG=pmcp::wire=debug cargo pmcp test conformance "$URL"
+```
+
+With neither, no subscriber is installed and the SDK's guards keep every wire
+path from allocating — it costs a normal run nothing.
 
 ## OAuth Authentication
 
@@ -594,6 +660,34 @@ The `require()` function returns an error message that includes the exact `cargo
 ## CI/CD Integration
 
 `cargo-pmcp` supports OAuth 2.0 client credentials flow for automated deployments.
+
+### Post-deploy verification, with wire capture on failure
+
+Conformance-check the deployment, and if it fails re-run with `--dump-wire` and
+archive the frames — so a red build ships the evidence instead of just a verdict:
+
+```yaml
+- name: Verify deployment
+  run: |
+    cargo pmcp test conformance "$SERVER_URL" --format json > conformance.json \
+      || {
+        echo "conformance failed — re-running with wire capture"
+        cargo pmcp test conformance --dump-wire "$SERVER_URL" 2> wire.log || true
+        exit 1
+      }
+
+- name: Upload wire capture
+  if: failure()
+  uses: actions/upload-artifact@v4
+  with:
+    name: mcp-wire-capture
+    path: wire.log
+```
+
+Credentials are redacted in the capture, so the artifact is safe to attach to a
+public build. For the v1-vs-v2 era comparison and a flag that makes those
+findings fail the job, see `mcp-tester conformance --dual-run
+--fail-on-era-findings` in the [mcp-tester README](../crates/mcp-tester/README.md).
 
 ```bash
 export PMCP_CLIENT_ID="your-client-id"

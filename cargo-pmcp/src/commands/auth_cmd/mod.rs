@@ -5,15 +5,20 @@
 //! `connect`, `preview`, `schema`, `dev`, `loadtest/run`, and `pentest`
 //! invocation.
 //!
-//! Per-server token cache: `~/.pmcp/oauth-cache.json` (schema_version: 1).
+//! Credentials live in the SDK's shared store at `~/.pmcp/oauth-cache.json`,
+//! addressed by `(issuer, account, server)`. This crate carries no credential
+//! format, no reader and no writer of its own; every subcommand below is a thin
+//! wrapper over `pmcp`'s `CredentialStore` / `CredentialStoreAdmin` — the same
+//! seam a hosting platform would implement.
 //!
 //! # Concurrency
 //!
-//! Parallel `auth login` invocations are not safe; prefer sequential logins.
-//! The cache file uses last-writer-wins atomic-rename semantics
-//! (`tempfile::NamedTempFile::persist`), so concurrent logins to either the
-//! same URL or different URLs may result in lost entries. Matches
-//! `gh auth login` / `aws sso login` behavior.
+//! Each mutation is a serialized read-modify-write inside the SDK: an advisory
+//! lock file beside the document, the read taken INSIDE the lock, and an atomic
+//! rename on the way out. Two concurrent logins therefore no longer discard one
+//! another's credentials the way the previous last-writer-wins cache could.
+//! The lock is advisory and is broken if it goes stale, which is documented on
+//! `FileCredentialStore`.
 
 pub mod cache;
 pub mod login;
@@ -38,7 +43,7 @@ pub enum AuthCommand {
     Status(status::StatusArgs),
     /// Print the cached access token to stdout (raw, gh-style)
     Token(token::TokenArgs),
-    /// Force-refresh the cached access token using the cached refresh_token
+    /// Renew the stored access token (spends the refresh token once expired)
     Refresh(refresh::RefreshArgs),
 }
 

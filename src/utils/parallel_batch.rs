@@ -166,7 +166,10 @@ where
                                 id: crate::types::RequestId::from("null"),
                                 payload: crate::types::jsonrpc::ResponsePayload::Error(
                                     crate::types::jsonrpc::JSONRPCError {
-                                        code: -32603,
+                                        // Wire value -32603 preserved (byte-identical) via the
+                                        // centralized table; a request timeout surfaces as an
+                                        // internal error on the wire today (VERS-06).
+                                        code: crate::types::protocol::error_codes::INTERNAL_ERROR,
                                         message: "Request timeout".to_string(),
                                         data: None,
                                     },

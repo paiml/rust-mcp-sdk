@@ -85,4 +85,53 @@ mod tests {
         };
         assert_eq!(classify(&slot), SlotClass::BehaviorRelevant);
     }
+
+    #[test]
+    fn endpoint_is_behavior_relevant() {
+        let slot = SlotType::Endpoint {
+            name: "backend.base_url".to_string(),
+            tested_value: "https://api.tfl.gov.uk".to_string(),
+        };
+        assert_eq!(classify(&slot), SlotClass::BehaviorRelevant);
+    }
+
+    #[test]
+    fn auth_mode_is_behavior_relevant() {
+        let slot = SlotType::AuthMode {
+            name: "backend.auth.type".to_string(),
+            tested_value: "api_key".to_string(),
+        };
+        assert_eq!(classify(&slot), SlotClass::BehaviorRelevant);
+    }
+
+    /// D-03 regression guard for the two variants added in phase 120: they must have
+    /// landed in the BEHAVIOR-RELEVANT family, which is observable only through the
+    /// downstream consequence. `detect_deviation` still returns `None` for equal
+    /// identity-bearing slots (its narrower, deliberately-unchanged contract), and now
+    /// returns `Some(..)` for two `Endpoint`s whose `tested_value`s differ. Had the
+    /// `tested_value()` catch-all survived, `Endpoint` would classify as
+    /// `IdentityBearing`, this assertion would fail, and every other test would stay green.
+    #[test]
+    fn new_variants_are_behavior_relevant_as_observed_through_detect_deviation() {
+        use crate::slot::deviation::detect_deviation;
+
+        let secret = SlotType::Secret {
+            name: "TFL_API_KEY".to_string(),
+        };
+        assert_eq!(detect_deviation(&secret, &secret.clone()), None);
+
+        let tested = SlotType::Endpoint {
+            name: "backend.base_url".to_string(),
+            tested_value: "https://api.tfl.gov.uk".to_string(),
+        };
+        let proposed = SlotType::Endpoint {
+            name: "backend.base_url".to_string(),
+            tested_value: "https://staging.tfl.gov.uk".to_string(),
+        };
+        let dev = detect_deviation(&tested, &proposed)
+            .expect("Endpoint must be behavior-relevant, so a differing value is a deviation");
+        assert_eq!(dev.slot_name, "backend.base_url");
+        assert_eq!(dev.tested, "https://api.tfl.gov.uk");
+        assert_eq!(dev.proposed, "https://staging.tfl.gov.uk");
+    }
 }

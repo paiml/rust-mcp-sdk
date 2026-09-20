@@ -152,6 +152,77 @@ pub mod workbook_explain;
 #[path = "commands/package/kind.rs"]
 pub mod package_kind;
 
+// PKGX-02 (Phase 123-01): expose ONLY the `.tar` <-> OCI-layout codec to the lib
+// target (mirrors the `package_kind` `#[path]` convention immediately above).
+// `artifact.rs` references only `tar`, `anyhow`, `serde_json`, `oci_spec`,
+// `tempfile`, `pmcp_package` and std (NO `clap`/`GlobalFlags`/the bin-only
+// `commands::*` tree), so it compiles in the lib target on its own.
+//
+// This seam exists so the module's property tests run under `cargo test --lib`
+// and so a fuzz target can point straight at `read_verified` — the
+// untrusted-bytes boundary, where a `.tar` handed to `package load`/`pull`
+// arrives with no known provenance. It is ALSO what forbids `super::` and
+// `crate::commands::` inside that file: here its parent is the crate root,
+// which declares no `commands` module. That constraint is why
+// `install_layout` takes its semantic gate as a closure.
+// `#[doc(hidden)]`: an internal support surface, not a stable public API.
+#[doc(hidden)]
+#[path = "commands/package/artifact.rs"]
+pub mod package_artifact;
+
+// PKGX-02 (Phase 123-03): expose the ONE human-text report renderer that the
+// local read verbs share, mirroring the `package_kind`/`package_artifact`
+// `#[path]` convention immediately above.
+//
+// This seam is what makes the renderer testable AND shareable. Two things
+// depend on it and neither works without it: the module's own unit tests run
+// under `cargo test -p cargo-pmcp --lib` (declared only in
+// `commands/package/mod.rs`, they would compile into the bin tree, where no
+// `--lib` run and no `tests/` binary can see them — they would simply be
+// ABSENT rather than failing), and plan 05's lib-mounted `pull` pipeline calls
+// the same renderer `load` calls, which is what keeps the two verbs on one
+// output shape by construction rather than by discipline.
+//
+// `render.rs` references only `pmcp_package` types and std — NO `clap`, NO
+// `GlobalFlags`, NO `crate::commands::*` — which is exactly what lets it
+// compile in the lib target on its own, where the crate root declares no
+// `commands` module. It is also why the file may never name `super::`.
+//
+// `#[doc(hidden)]`: an internal support surface, not a stable public API.
+#[doc(hidden)]
+#[path = "commands/package/render.rs"]
+pub mod package_render;
+
+// PKGX-02 (Phase 123-05): expose the `package pull` PIPELINE — stages 2 through
+// 6 plus the ONE transport seam — to the lib target, mirroring the
+// `package_artifact` / `package_render` `#[path]` convention immediately above.
+//
+// This mount is what makes the seam REACHABLE, and that is not a style point.
+// `lib.rs` declares no `mod commands`, so a pipeline declared only under
+// `commands/package/` is compiled into the BIN target and nowhere else; a file
+// under `cargo-pmcp/tests/` is an external crate linking the LIB and can neither
+// see a bin-private module nor implement a trait declared in one. Without this
+// line `tests/package_portability_contract.rs` cannot substitute a fake
+// transport, and `pull`'s verification half — the security-relevant half —
+// would be claimed rather than exercised.
+//
+// It is mounted into the LIB ONLY, and deliberately NOT declared in
+// `commands/package/mod.rs`. A second declaration would compile the file twice
+// and split `ArtifactTransport` into two incompatible types, so the bin's live
+// implementation and the test's fake one would stop being interchangeable —
+// which is the whole point of having one seam.
+//
+// `pull_pipeline.rs` references only `anyhow`, `serde_json`, `pmcp_package`,
+// `async-trait`, std and the sibling lib mounts (`package_artifact`,
+// `package_kind`, `package_render`, `pmcp_run_graphql`) — NO `clap`, NO
+// `GlobalFlags`, NO `reqwest`, NO `crate::commands::*` — which is exactly what
+// lets it compile in the lib target, where the crate root declares no `commands`
+// module. It is also why the file may never name `super::`.
+// `#[doc(hidden)]`: an internal support surface, not a stable public API.
+#[doc(hidden)]
+#[path = "commands/package/pull_pipeline.rs"]
+pub mod package_pull_pipeline;
+
 // Package-capture contract test seam (170-08 Task 3; extended in the
 // final-review fix wave with pure SDL-extraction helpers): expose the two
 // dependency-light capture GraphQL query consts, plus the pure,

@@ -3,6 +3,27 @@
 //! This module provides a generic OIDC provider implementation that works with
 //! any OIDC-compliant identity provider (Google, Auth0, Okta, Azure AD, etc.).
 //! JWT validation is delegated to [`JwtValidator`] for code reuse and shared JWKS caching.
+//!
+//! # Discovery is an ordered probe with a validated anchor
+//!
+//! Discovery follows the MCP specification's ordered authorization-server
+//! metadata probe (SEP-2351) rather than one constructed URL, and every document
+//! it retrieves is compared against the issuer the URL was built from
+//! (RFC 8414 §3.3 / `OpenID` Connect Discovery §4.3) **before** it leaves the
+//! fetch helper. Without that second half the anchor is a value the served
+//! document chose for itself.
+//!
+//! `src/client/auth.rs` and `src/server/auth/providers/cognito.rs` implement the
+//! same three-part shape — ordered probe, anchor check, bounded reads — over the
+//! SAME shared derivation
+//! ([`discovery_url_candidates`](crate::shared::oauth_validation::discovery_url_candidates))
+//! and the SAME outcome matrix
+//! ([`classify_discovery_failure`](crate::shared::oauth_validation::classify_discovery_failure)).
+//! The three are deliberately written to mirror each other so they can be
+//! reviewed side by side; a change to one of them belongs in all three.
+//!
+//! Every whole-body read here is bounded, on success AND on error paths — a
+//! hostile identity provider controls its error bodies too.
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -17,6 +38,40 @@ use crate::server::auth::provider::{
     ProviderCapabilities, TokenExchangeParams, TokenResponse,
 };
 use crate::server::auth::traits::{AuthContext, ClaimMappings};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::shared::http_body_cap::{
+    collect_reqwest_body_within_cap, hardened_discovery_client, is_body_over_cap,
+    is_redirect_refusal, DEFAULT_AUTH_RESPONSE_BYTES,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::shared::oauth_validation::{
+    classify_discovery_failure, discovery_url_candidates, issuer_matches_metadata,
+    DiscoveryFailure, DiscoveryOutcome,
+};
+
+/// How long a single discovery request may take.
+///
+/// The same budget the provider's general-purpose client already uses, so the
+/// ordered probe cannot hang on a candidate that never answers.
+#[cfg(not(target_arch = "wasm32"))]
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many attempts ONE candidate gets before the probe falls back to the next.
+#[cfg(not(target_arch = "wasm32"))]
+const DISCOVERY_MAX_ATTEMPTS: usize = 3;
+
+/// Delay between attempts against a single candidate.
+#[cfg(not(target_arch = "wasm32"))]
+const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// How much of a peer-supplied issuer string a refusal may reproduce.
+///
+/// RFC 8414 §3.3's whole value is telling an operator which two values
+/// disagreed, so the refusal names both — but the DOCUMENT's issuer is arbitrary
+/// attacker-chosen text, and truncating it stops a megabyte-long "issuer" from
+/// flooding a log.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_ECHOED_DOCUMENT_ISSUER: usize = 256;
 
 /// Cached data with expiration.
 struct CachedData<T: std::fmt::Debug> {
@@ -206,9 +261,20 @@ pub struct GenericOidcProvider {
     /// Cached discovery document.
     #[cfg(not(target_arch = "wasm32"))]
     discovery_cache: DiscoveryCache,
-    /// HTTP client.
+    /// HTTP client for token, JWKS, `UserInfo`, revocation and DCR requests.
     #[cfg(not(target_arch = "wasm32"))]
     http_client: reqwest::Client,
+    /// HTTP client for DISCOVERY only, whose redirect policy refuses any
+    /// redirect that leaves the issuer's origin.
+    ///
+    /// A separate client on purpose: the origin pin is a statement about who may
+    /// AUTHOR the metadata document, and applying it to the token or `UserInfo`
+    /// endpoints — which legitimately redirect at some providers — would change
+    /// behaviour this plan does not own. Both discovery call sites in this crate
+    /// build theirs from the same [`hardened_discovery_client`], so the policy
+    /// cannot diverge between them.
+    #[cfg(not(target_arch = "wasm32"))]
+    discovery_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for GenericOidcProvider {
@@ -232,13 +298,14 @@ impl GenericOidcProvider {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| Error::internal(format!("Failed to create HTTP client: {}", e)))?;
+        let discovery_client = hardened_discovery_client(DISCOVERY_TIMEOUT)?;
 
         // Leak strings for static lifetime (these are typically created once per app)
         let id: &'static str = Box::leak(config.id.clone().into_boxed_str());
         let display_name: &'static str = Box::leak(config.display_name.clone().into_boxed_str());
 
         // Fetch discovery to get JWKS URI
-        let discovery = fetch_discovery_doc(&http_client, &config.issuer).await?;
+        let discovery = fetch_discovery_doc(&discovery_client, &config.issuer).await?;
 
         // Cache the discovery document
         let discovery_cache = Arc::new(RwLock::new(Some(CachedData::new(
@@ -262,6 +329,7 @@ impl GenericOidcProvider {
             display_name,
             discovery_cache,
             http_client,
+            discovery_client,
         };
 
         Ok(provider)
@@ -295,12 +363,13 @@ impl GenericOidcProvider {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| Error::internal(format!("Failed to create HTTP client: {}", e)))?;
+        let discovery_client = hardened_discovery_client(DISCOVERY_TIMEOUT)?;
 
         let id: &'static str = Box::leak(config.id.clone().into_boxed_str());
         let display_name: &'static str = Box::leak(config.display_name.clone().into_boxed_str());
 
         // Fetch discovery to get JWKS URI
-        let discovery = fetch_discovery_doc(&http_client, &config.issuer).await?;
+        let discovery = fetch_discovery_doc(&discovery_client, &config.issuer).await?;
 
         let discovery_cache = Arc::new(RwLock::new(Some(CachedData::new(
             discovery.clone(),
@@ -321,6 +390,7 @@ impl GenericOidcProvider {
             display_name,
             discovery_cache,
             http_client,
+            discovery_client,
         })
     }
 
@@ -330,6 +400,15 @@ impl GenericOidcProvider {
     }
 
     /// Fetch and cache the OIDC discovery document.
+    ///
+    /// The TTL cache sits directly ABOVE the ordered probe and short-circuits it
+    /// entirely, so a warm provider issues no discovery request at all. It is
+    /// also why this provider needs no second, candidate-index cache: the probe
+    /// runs at most once per `cache_ttl`.
+    ///
+    /// An anchor-REJECTED document never reaches the cache write below, because
+    /// [`fetch_discovery_doc`] returns `Err` and the `?` short-circuits. Caching
+    /// a rejected document would turn a one-shot spoof into a persistent one.
     #[cfg(not(target_arch = "wasm32"))]
     async fn fetch_discovery(&self) -> Result<OidcDiscovery> {
         // Check cache first
@@ -343,7 +422,7 @@ impl GenericOidcProvider {
         }
 
         // Fetch discovery document
-        let discovery = fetch_discovery_doc(&self.http_client, &self.config.issuer).await?;
+        let discovery = fetch_discovery_doc(&self.discovery_client, &self.config.issuer).await?;
 
         // Cache the discovery document
         {
@@ -387,32 +466,319 @@ impl GenericOidcProvider {
     }
 }
 
-/// Fetch OIDC discovery document (helper function).
+/// Fetch and VALIDATE the OIDC discovery document for `issuer`.
+///
+/// Probes the specification's ordered candidate endpoints (SEP-2351) instead of
+/// one constructed URL, and every failure is classified by the shared matrix:
+/// `Retry` re-attempts the same candidate within [`DISCOVERY_MAX_ATTEMPTS`],
+/// `Fallback` moves to the next candidate, and `Terminal` aborts the whole
+/// probe. When every candidate fails, the error enumerates all of them rather
+/// than only the last.
 #[cfg(not(target_arch = "wasm32"))]
 async fn fetch_discovery_doc(http_client: &reqwest::Client, issuer: &str) -> Result<OidcDiscovery> {
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    tracing::debug!("Fetching OIDC discovery from {}", discovery_url);
+    let candidates = discovery_url_candidates(issuer)?;
+    let mut attempted: Vec<String> = Vec::new();
 
-    let response = http_client
-        .get(&discovery_url)
-        .send()
-        .await
-        .map_err(|e| Error::internal(format!("Failed to fetch discovery: {}", e)))?;
-
-    if !response.status().is_success() {
-        return Err(Error::internal(format!(
-            "Discovery endpoint returned status {}",
-            response.status()
-        )));
+    for url in &candidates {
+        tracing::debug!("Fetching OIDC discovery from {}", url);
+        match probe_discovery_candidate(http_client, url, issuer).await {
+            Ok(document) => return Ok(document),
+            // A TERMINAL outcome aborts the WHOLE discovery. Falling through
+            // here would turn a security failure into a silent DOWNGRADE: an
+            // attacker who can make one candidate fail in a security-relevant
+            // way would steer this provider onto a candidate they serve. Do NOT
+            // "simplify" this back into `if !ok { continue }`.
+            Err((DiscoveryOutcome::Terminal, error)) => return Err(error),
+            Err((_, error)) => attempted.push(format!("{url}: {error}")),
+        }
     }
 
-    response
-        .json()
+    Err(every_candidate_failed(issuer, &attempted))
+}
+
+/// Probe ONE candidate URL, applying the shared outcome matrix.
+///
+/// `Retry` re-attempts this candidate within [`DISCOVERY_MAX_ATTEMPTS`] and
+/// becomes `Fallback` once that budget is spent; `Terminal` propagates unchanged
+/// so the caller aborts.
+#[cfg(not(target_arch = "wasm32"))]
+async fn probe_discovery_candidate(
+    http_client: &reqwest::Client,
+    url: &url::Url,
+    expected_issuer: &str,
+) -> std::result::Result<OidcDiscovery, (DiscoveryOutcome, Error)> {
+    let mut attempts: usize = 0;
+    loop {
+        let (failure, error) =
+            match fetch_discovery_candidate(http_client, url, expected_issuer).await {
+                Ok(document) => return Ok(document),
+                Err(pair) => pair,
+            };
+
+        match classify_discovery_failure(failure) {
+            DiscoveryOutcome::Terminal => return Err((DiscoveryOutcome::Terminal, error)),
+            DiscoveryOutcome::Fallback => return Err((DiscoveryOutcome::Fallback, error)),
+            DiscoveryOutcome::Retry => {
+                attempts += 1;
+                if attempts >= DISCOVERY_MAX_ATTEMPTS {
+                    return Err((DiscoveryOutcome::Fallback, error));
+                }
+                tokio::time::sleep(DISCOVERY_RETRY_DELAY).await;
+            },
+        }
+    }
+}
+
+/// Fetch and VALIDATE a discovery document from ONE candidate URL.
+///
+/// The body is read through the bounded reader and the document's `issuer` is
+/// compared against `expected_issuer` per RFC 8414 §3.3 — both before any
+/// metadata leaves this function. `expected_issuer` is the ISSUER, not the
+/// candidate URL: every candidate for one issuer shares the same expected value.
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_discovery_candidate(
+    http_client: &reqwest::Client,
+    url: &url::Url,
+    expected_issuer: &str,
+) -> std::result::Result<OidcDiscovery, (DiscoveryFailure, Error)> {
+    let response = http_client
+        .get(url.as_str())
+        .header("Accept", "application/json")
+        .send()
         .await
-        .map_err(|e| Error::internal(format!("Failed to parse discovery: {}", e)))
+        .map_err(|e| discovery_request_failure(url, &e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(discovery_status_failure(url, status));
+    }
+
+    let bytes = collect_reqwest_body_within_cap(response, DEFAULT_AUTH_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            let failure = if is_body_over_cap(&e) {
+                DiscoveryFailure::BodyOverCap
+            } else {
+                DiscoveryFailure::Transport
+            };
+            (failure, e)
+        })?;
+
+    let document: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| unparseable_discovery_document(url, &e))?;
+
+    // RFC 8414 section 3.3 / OpenID Connect Discovery section 4.3, BEFORE the
+    // document escapes this function. This provider deserializes into its own
+    // `OidcDiscovery` type, so the anchor is read from the parsed JSON first: an
+    // absent or wrongly-typed `issuer` must be a refusal, never a `None` that
+    // reads as "nothing to check".
+    let document_issuer = discovery_document_issuer(url, &document)?;
+    if !issuer_matches_metadata(expected_issuer, document_issuer) {
+        return Err(discovery_issuer_mismatch(
+            url,
+            expected_issuer,
+            document_issuer,
+        ));
+    }
+
+    serde_json::from_slice(&bytes).map_err(|e| unparseable_discovery_document(url, &e))
+}
+
+/// The document's `issuer`, which MUST be present and MUST be a string.
+///
+/// It is the value every downstream trust decision is anchored on, so neither
+/// absence nor a wrong type may be tolerated into a `None`.
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_document_issuer<'a>(
+    url: &url::Url,
+    document: &'a serde_json::Value,
+) -> std::result::Result<&'a str, (DiscoveryFailure, Error)> {
+    match document.get("issuer") {
+        Some(serde_json::Value::String(issuer)) => Ok(issuer),
+        Some(_) => Err(malformed_discovery_metadata(
+            url,
+            "`issuer` is present but is not a JSON string. It is the value the RFC 8414 \
+             section 3.3 anchor comparison is made against, so a wrongly-typed issuer cannot be \
+             tolerated",
+        )),
+        None => Err(malformed_discovery_metadata(
+            url,
+            "`issuer` is absent. RFC 8414 section 3.3 requires it, and an absent anchor must not \
+             read as `nothing to check`",
+        )),
+    }
+}
+
+/// Classify a failed discovery REQUEST.
+///
+/// A refused redirect is a statement about who would have AUTHORED the document,
+/// not about availability: retrying returns the same answer, and falling through
+/// to another candidate is the downgrade the redirect policy exists to prevent.
+/// Everything else — connect failures, DNS, TLS, timeouts — is an availability
+/// failure.
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_request_failure(url: &url::Url, source: &reqwest::Error) -> (DiscoveryFailure, Error) {
+    let failure = if is_redirect_refusal(source) {
+        DiscoveryFailure::MalformedSecurityMetadata
+    } else {
+        DiscoveryFailure::Transport
+    };
+    (
+        failure,
+        Error::internal(format!(
+            "Failed to fetch discovery document from {url}: {}",
+            rendered_source_chain(source)
+        )),
+    )
+}
+
+/// Classify a discovery response whose HTTP status is not a success.
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_status_failure(
+    url: &url::Url,
+    status: reqwest::StatusCode,
+) -> (DiscoveryFailure, Error) {
+    let failure = if status == reqwest::StatusCode::NOT_FOUND {
+        DiscoveryFailure::NotFound
+    } else {
+        DiscoveryFailure::HttpStatus(status.as_u16())
+    };
+    (
+        failure,
+        Error::internal(format!("Discovery endpoint {url} returned status {status}")),
+    )
+}
+
+/// The refusal for a body that is not the JSON this endpoint serves.
+///
+/// Carries `serde_json`'s CLASSIFICATION plus line and column, never its
+/// message: a `serde_json` data error reproduces the offending value, and this
+/// body is peer-controlled.
+#[cfg(not(target_arch = "wasm32"))]
+fn unparseable_discovery_document(
+    url: &url::Url,
+    source: &serde_json::Error,
+) -> (DiscoveryFailure, Error) {
+    (
+        DiscoveryFailure::InvalidJson,
+        Error::internal(format!(
+            "Discovery document from {url} is not the JSON document this endpoint serves \
+             ({:?} error at line {}, column {}). The parser's own message is not reproduced here \
+             because a data error echoes the offending input",
+            source.classify(),
+            source.line(),
+            source.column()
+        )),
+    )
+}
+
+/// The RFC 8414 §3.3 refusal, naming BOTH issuers.
+#[cfg(not(target_arch = "wasm32"))]
+fn discovery_issuer_mismatch(
+    url: &url::Url,
+    expected_issuer: &str,
+    document_issuer: &str,
+) -> (DiscoveryFailure, Error) {
+    (
+        DiscoveryFailure::IssuerMismatch,
+        Error::protocol(
+            ErrorCode::INVALID_REQUEST,
+            format!(
+                "Discovery document fetched from {url} declares issuer `{}`, but the URL was \
+                 built from issuer `{expected_issuer}`. RFC 8414 section 3.3 and OpenID Connect \
+                 Discovery section 4.3 require these to be identical, so the metadata is NOT \
+                 used. The document's value is peer-controlled and is truncated at \
+                 {MAX_ECHOED_DOCUMENT_ISSUER} characters here",
+                truncate_for_message(document_issuer)
+            ),
+        ),
+    )
+}
+
+/// The refusal for a document that parsed but whose security metadata is broken.
+#[cfg(not(target_arch = "wasm32"))]
+fn malformed_discovery_metadata(url: &url::Url, detail: &str) -> (DiscoveryFailure, Error) {
+    (
+        DiscoveryFailure::MalformedSecurityMetadata,
+        Error::protocol(
+            ErrorCode::INVALID_REQUEST,
+            format!("Discovery document from {url} carries malformed security metadata: {detail}"),
+        ),
+    )
+}
+
+/// The refusal when the ordered probe is exhausted, enumerating every candidate.
+#[cfg(not(target_arch = "wasm32"))]
+fn every_candidate_failed(issuer: &str, attempted: &[String]) -> Error {
+    Error::internal(format!(
+        "Failed to discover OIDC configuration for issuer `{issuer}`. Every candidate endpoint \
+         was tried and none served a usable document:\n  - {}",
+        attempted.join("\n  - ")
+    ))
+}
+
+/// Bound a peer-controlled string before it reaches an error message.
+#[cfg(not(target_arch = "wasm32"))]
+fn truncate_for_message(value: &str) -> String {
+    if value.chars().count() <= MAX_ECHOED_DOCUMENT_ISSUER {
+        return value.to_owned();
+    }
+    let head: String = value.chars().take(MAX_ECHOED_DOCUMENT_ISSUER).collect();
+    format!("{head}… (truncated)")
+}
+
+/// Render an error together with its whole source chain.
+///
+/// `reqwest::Error`'s own `Display` omits the source, which is where the
+/// hardened client's redirect refusal explains itself.
+#[cfg(not(target_arch = "wasm32"))]
+fn rendered_source_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        rendered.push_str(" <- ");
+        rendered.push_str(&cause.to_string());
+        current = cause.source();
+    }
+    rendered
+}
+
+/// Read a peer-supplied SUCCESS body and deserialize it, bounded.
+///
+/// Every whole-body read in this module goes through here or through
+/// [`read_error_body_within_cap`], so no identity provider ever chooses this
+/// crate's allocation. The parse refusal carries `serde_json`'s CLASSIFICATION
+/// plus line and column and never its message, because a data error reproduces
+/// the offending input and a token response body carries credentials.
+#[cfg(not(target_arch = "wasm32"))]
+async fn read_json_within_cap<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<T> {
+    let bytes = collect_reqwest_body_within_cap(response, DEFAULT_AUTH_RESPONSE_BYTES)
+        .await
+        .map_err(|e| Error::internal(format!("Failed to read {what} body: {e}")))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        Error::internal(format!(
+            "Failed to parse {what} ({:?} error at line {}, column {}). The parser's own message \
+             is not reproduced here because a data error echoes the offending input",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })
+}
+
+/// Read a peer-supplied ERROR body, bounded, for interpolation into a message.
+///
+/// Error paths matter as much as success paths: a hostile identity provider
+/// controls its error bodies too, and this one is interpolated into a refusal.
+#[cfg(not(target_arch = "wasm32"))]
+async fn read_error_body_within_cap(response: reqwest::Response) -> String {
+    match collect_reqwest_body_within_cap(response, DEFAULT_AUTH_RESPONSE_BYTES).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => format!("<error body not read: {e}>"),
+    }
 }
 
 #[async_trait]
@@ -487,10 +853,7 @@ impl IdentityProvider for GenericOidcProvider {
             )));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to parse JWKS: {}", e)))
+        read_json_within_cap(response, "JWKS response").await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -573,17 +936,14 @@ impl IdentityProvider for GenericOidcProvider {
             .map_err(|e| Error::internal(format!("Token exchange failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_error_body_within_cap(response).await;
             return Err(Error::protocol(
                 ErrorCode::INVALID_REQUEST,
                 format!("Token exchange failed: {}", error_text),
             ));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to parse token response: {}", e)))
+        read_json_within_cap(response, "token exchange response").await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -617,17 +977,14 @@ impl IdentityProvider for GenericOidcProvider {
             .map_err(|e| Error::internal(format!("Token refresh failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_error_body_within_cap(response).await;
             return Err(Error::protocol(
                 ErrorCode::INVALID_REQUEST,
                 format!("Token refresh failed: {}", error_text),
             ));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to parse token response: {}", e)))
+        read_json_within_cap(response, "token refresh response").await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -661,17 +1018,14 @@ impl IdentityProvider for GenericOidcProvider {
             .map_err(|e| Error::internal(format!("DCR request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_error_body_within_cap(response).await;
             return Err(Error::protocol(
                 ErrorCode::INVALID_REQUEST,
                 format!("DCR failed: {}", error_text),
             ));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to parse DCR response: {}", e)))
+        read_json_within_cap(response, "DCR response").await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -706,7 +1060,7 @@ impl IdentityProvider for GenericOidcProvider {
 
         // Revocation endpoints typically return 200 even for invalid tokens
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_error_body_within_cap(response).await;
             return Err(Error::protocol(
                 ErrorCode::INVALID_REQUEST,
                 format!("Token revocation failed: {}", error_text),
@@ -744,17 +1098,14 @@ impl IdentityProvider for GenericOidcProvider {
             .map_err(|e| Error::internal(format!("UserInfo request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_text = read_error_body_within_cap(response).await;
             return Err(Error::protocol(
                 ErrorCode::INVALID_REQUEST,
                 format!("UserInfo request failed: {}", error_text),
             ));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| Error::internal(format!("Failed to parse UserInfo response: {}", e)))
+        read_json_within_cap(response, "UserInfo response").await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -938,29 +1289,131 @@ mod tests {
     // URL Generation Tests (Unit tests without network)
     // =========================================================================
 
+    /// SEP-2351: discovery is an ORDERED probe, not a single constructed URL.
+    ///
+    /// Both rows previously re-implemented the removed `format!` inline and
+    /// asserted its output, so they were green while measuring nothing about the
+    /// provider — and they pinned the single-URL shape this plan replaced. They
+    /// now assert the derivation the provider actually calls.
     #[test]
-    fn test_discovery_url_format() {
-        let issuer = "https://accounts.google.com";
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer.trim_end_matches('/')
-        );
+    fn test_discovery_url_candidates_for_a_path_less_issuer() {
+        // For a path-less issuer the RFC 8414 inserted form and the OIDC
+        // appended form coincide, so the list is TWO, not three.
+        let rendered: Vec<String> = discovery_url_candidates("https://accounts.google.com")
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         assert_eq!(
-            discovery_url,
-            "https://accounts.google.com/.well-known/openid-configuration"
+            rendered,
+            vec![
+                "https://accounts.google.com/.well-known/oauth-authorization-server",
+                "https://accounts.google.com/.well-known/openid-configuration",
+            ]
         );
     }
 
     #[test]
-    fn test_discovery_url_format_with_trailing_slash() {
-        let issuer = "https://example.auth0.com/";
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            issuer.trim_end_matches('/')
-        );
+    fn test_discovery_url_candidates_with_trailing_slash() {
+        // A trailing slash is a formatting difference, not a path component, so
+        // it derives the SAME list and never a doubled slash.
+        let with_slash: Vec<String> = discovery_url_candidates("https://example.auth0.com/")
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let without: Vec<String> = discovery_url_candidates("https://example.auth0.com")
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(with_slash, without);
         assert_eq!(
-            discovery_url,
-            "https://example.auth0.com/.well-known/openid-configuration"
+            with_slash,
+            vec![
+                "https://example.auth0.com/.well-known/oauth-authorization-server",
+                "https://example.auth0.com/.well-known/openid-configuration",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_discovery_refusals_name_the_rule_and_bound_the_peer_value() {
+        let url = url::Url::parse("https://as.example/.well-known/openid-configuration").unwrap();
+
+        let (failure, error) =
+            discovery_issuer_mismatch(&url, "https://as.example", "https://honest.example");
+        assert_eq!(failure, DiscoveryFailure::IssuerMismatch);
+        assert_eq!(
+            classify_discovery_failure(failure),
+            DiscoveryOutcome::Terminal
+        );
+        let message = error.to_string();
+        assert!(message.contains("https://as.example"), "{message}");
+        assert!(message.contains("https://honest.example"), "{message}");
+
+        // A peer-chosen issuer is arbitrary text of unbounded length.
+        let flood = "z".repeat(10_000);
+        let (_, error) = discovery_issuer_mismatch(&url, "https://as.example", &flood);
+        assert!(
+            error.to_string().len() < 2_000,
+            "a peer-chosen issuer must not flood the message"
+        );
+    }
+
+    #[test]
+    fn test_discovery_document_issuer_rows() {
+        let url = url::Url::parse("https://as.example/.well-known/openid-configuration").unwrap();
+
+        let good = serde_json::json!({ "issuer": "https://as.example" });
+        assert_eq!(
+            discovery_document_issuer(&url, &good).unwrap(),
+            "https://as.example"
+        );
+
+        // An absent or wrongly-typed anchor is TERMINAL, never a quiet `None`.
+        for hostile in [
+            serde_json::json!({}),
+            serde_json::json!({ "issuer": 7 }),
+            serde_json::json!({ "issuer": null }),
+        ] {
+            let (failure, error) = discovery_document_issuer(&url, &hostile).unwrap_err();
+            assert_eq!(
+                failure,
+                DiscoveryFailure::MalformedSecurityMetadata,
+                "issuer {hostile} must be malformed security metadata"
+            );
+            assert_eq!(
+                classify_discovery_failure(failure),
+                DiscoveryOutcome::Terminal
+            );
+            assert!(error.to_string().contains("issuer"));
+        }
+    }
+
+    #[test]
+    fn test_discovery_status_classification_rows() {
+        let url = url::Url::parse("https://as.example/.well-known/openid-configuration").unwrap();
+
+        // 404 is the ordinary "not this form" answer the ordered probe is FOR.
+        let (failure, _) = discovery_status_failure(&url, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(failure, DiscoveryFailure::NotFound);
+        assert_eq!(
+            classify_discovery_failure(failure),
+            DiscoveryOutcome::Fallback
+        );
+
+        // 5xx: the endpoint is the right one and is temporarily unwell.
+        let (failure, _) = discovery_status_failure(&url, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failure, DiscoveryFailure::HttpStatus(503));
+        assert_eq!(classify_discovery_failure(failure), DiscoveryOutcome::Retry);
+
+        // Another 4xx: the endpoint answered and refused; another form may serve.
+        let (failure, _) = discovery_status_failure(&url, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(failure, DiscoveryFailure::HttpStatus(401));
+        assert_eq!(
+            classify_discovery_failure(failure),
+            DiscoveryOutcome::Fallback
         );
     }
 

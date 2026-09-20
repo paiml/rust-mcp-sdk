@@ -1,9 +1,10 @@
 [package]
 name = "pmcp-agent"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Deploy-anywhere agent decision loop for the PMCP SDK (experimental)"
 license = "MIT"
+repository = "https://github.com/paiml/rust-mcp-sdk"
 readme = "README.md"
 rust-version = "1.91.0"
 
@@ -14,7 +15,7 @@ rust-version = "1.91.0"
 # gives us everything while staying wasm-clean (no reqwest). Do NOT add pmcp
 # transport features here — see the `url-connector` opt-in below.
 pmcp = { version = "2.17.0", path = "../..", default-features = false }
-pmcp-package = { version = "0.1", path = "../pmcp-package" }
+pmcp-package = { version = "0.4", path = "../pmcp-package" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
@@ -24,7 +25,13 @@ tracing = "0.1"
 # Literal pins (the repo has NO [workspace.dependencies] table). jsonschema is
 # for `evaluate_submit_result` output-schema validation in plan 108-03; uuid is
 # for run-id minting in the 108-06 adapter.
-jsonschema = { version = "0.46", default-features = false }
+#
+# The 0.46 -> 0.49 bump (Phase 115 Plan 03) is workspace HYGIENE only — it keeps a single
+# `jsonschema` copy in any build containing both this crate and `pmcp`. This crate's
+# `validator_for` call (src/iteration/decide.rs) validates agent submit-results, NOT the
+# MCP `outputSchema` seam, so it is deliberately NOT pinned to Draft 2020-12: SCHM-01's
+# era-branched pin is scoped to `pmcp::server::output_validation`.
+jsonschema = { version = "0.49", default-features = false }
 uuid = { version = "1.17", features = ["v4"] }
 # Optional HTTP client for the feature-gated completion sources (108-04).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
@@ -32,6 +39,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # field is a `url::Url`) in the `url-connector` factory (108-05). Already in the
 # workspace tree via pmcp; gated so the default/wasm build never pulls it.
 url = { version = "2.5", optional = true }
+# The `url-connector` era probe needs an ASYNC, bounded TCP connect
+# (`endpoint_is_reachable` in `invoker/factory.rs`). tokio is ALREADY in this
+# feature's dependency graph via `pmcp/streamable-http`, so this adds no new
+# package to the supply chain (117 T-117-SC) — it only makes the package that
+# is already there nameable from this crate. Gated so the default/wasm32 build
+# never pulls it.
+tokio = { version = "1", features = ["net", "time"], optional = true }
 
 [features]
 # All optional features stay OUT of `default` so the default + wasm32 builds
@@ -41,7 +55,7 @@ anthropic = ["dep:reqwest"]
 # The concrete URL connector-client impl (108-05) needs pmcp's native-only
 # `StreamableHttpTransport` (`#[cfg(not(target_arch = "wasm32"))]`). Gating it
 # behind a non-default feature keeps the default/wasm32 build clean (BLOCKER-2).
-url-connector = ["pmcp/streamable-http", "dep:url"]
+url-connector = ["pmcp/streamable-http", "dep:url", "dep:tokio"]
 
 [dev-dependencies]
 pmcp = { version = "2.17.0", path = "../..", features = ["full"] }
