@@ -281,12 +281,18 @@ impl crate::executor::HttpExecutor for NoopHttpExecutor {
     async fn execute_request(
         &self,
         method: &str,
-        path: crate::executor::ResolvedPath<'_>,
+        _path: crate::executor::ResolvedPath<'_>,
         _body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, ExecutionError> {
+        // The path is deliberately NOT formatted into this message (T-128-21a).
+        // After Phase 128 D-09 the incoming `path` is the RESOLVED path rather
+        // than the template the script wrote, so echoing it here would hand a
+        // refused or attacker-shaped path straight back to the MCP client — and
+        // this would be the one surviving path-echo site in the crate while the
+        // phase claimed the Pitfall 7 class closed.
         Err(ExecutionError::RuntimeError {
             message: format!(
-                "HTTP calls not supported in this executor mode (attempted {method} {path}). \
+                "HTTP calls not supported in this executor mode (attempted a {method} request). \
                  Use JsCodeExecutor for HTTP-based execution."
             ),
         })

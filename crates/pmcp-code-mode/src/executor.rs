@@ -2473,9 +2473,7 @@ impl<'a> ResolvedPath<'a> {
     /// `validate_resolved_path`. The refusal is value-free: it names the rule and
     /// the declared expectation, never any byte of the path it refused.
     pub fn from_checked(path: &'a str) -> Result<Self, crate::PlaceholderRefusal> {
-        // RED-phase placeholder (Phase 128 plan 05, Task 2): accepts everything.
-        // The real body calls `crate::validate_resolved_path` and lands in the
-        // GREEN commit.
+        crate::validate_resolved_path(path)?;
         Ok(Self(path))
     }
 
@@ -2881,6 +2879,109 @@ fn refusal_to_execution_error(refusal: crate::PlaceholderRefusal) -> ExecutionEr
     }
 }
 
+/// Apply the LAYER-1 floor to one rendered `${var}` / `${expr}` contribution.
+///
+/// `PlaceholderRules::default()` and deliberately NOT
+/// [`HttpExecutor::placeholder_rules`]: a layer-1 part is not a spec-declared
+/// path parameter. It can appear anywhere in the template, including mid-segment,
+/// so there is no OpenAPI `Parameter` to narrow from — the unconditional
+/// character floor plus the always-on 256-code-point cap is exactly the right
+/// level here. A reader who expects a `placeholder_rules` consultation at this
+/// layer is looking for something that has no well-defined answer.
+fn floor_layer_one_contribution(param: &str, rendered: &str) -> Result<(), ExecutionError> {
+    crate::validate_path_placeholder(param, rendered, &crate::PlaceholderRules::default())
+        .map_err(refusal_to_execution_error)
+}
+
+/// Render a JSON scalar for a LAYER-2 `{key}` substitution, REJECTING non-scalars
+/// (WR-03 / GAP 4).
+///
+/// Moved up from `pmcp-server-toolkit`'s `HttpCodeExecutor::scalar_str` by D-09,
+/// with the rule preserved byte for byte: a scalar (`String`, `Number`, `Bool`,
+/// `Null`) renders to a bare string (`Null` -> `"null"`, preserving prior
+/// behaviour); an `Object` or `Array` is rejected rather than silently
+/// JSON-stringified into the URL.
+///
+/// # Errors
+///
+/// Returns [`ExecutionError::RuntimeError`] naming `key`. Per Pitfall 5 the
+/// message names the KEY only — never the value.
+fn render_path_scalar(key: &str, value: &JsonValue) -> Result<String, ExecutionError> {
+    match value {
+        JsonValue::String(s) => Ok(s.clone()),
+        JsonValue::Null => Ok("null".to_string()),
+        JsonValue::Number(n) => Ok(n.to_string()),
+        JsonValue::Bool(b) => Ok(b.to_string()),
+        JsonValue::Object(_) | JsonValue::Array(_) => Err(ExecutionError::RuntimeError {
+            message: format!("path/query param '{key}' must be a scalar"),
+        }),
+    }
+}
+
+/// LAYER-2 `{key}` placeholder resolution, moved ahead of
+/// [`HttpExecutor::execute_request`] by Phase 128 D-09.
+///
+/// Returns the substituted path plus the body with the path-consumed keys
+/// removed. An implementor used to do this inside its own impl, which is what
+/// made the public trait a blind seam (T-128-20).
+///
+/// # Ordering
+///
+/// Two passes on purpose. Pass one renders and CHECKS every contribution; pass
+/// two applies them. So a refusal on any one placeholder aborts with no
+/// substitution having been applied at all, rather than leaving a
+/// half-substituted path one `?` away from being dispatched. Pass one also tests
+/// containment against the ORIGINAL template rather than a progressively
+/// substituted copy, so a value that itself contains `{`/`}` cannot manufacture a
+/// placeholder for a later key to fill. Body iteration order is
+/// `serde_json::Map`'s, which is deterministic (insertion order under this
+/// workspace's `preserve_order`, key order otherwise).
+///
+/// # Errors
+///
+/// Returns [`ExecutionError::RuntimeError`] on a non-scalar value or a
+/// [`PlaceholderRefusal`](crate::PlaceholderRefusal). Both messages are
+/// value-free.
+fn resolve_layer_two_placeholders<H: HttpExecutor + ?Sized>(
+    http: &H,
+    method: &str,
+    template: &str,
+    body: Option<JsonValue>,
+) -> Result<(String, Option<JsonValue>), ExecutionError> {
+    let Some(JsonValue::Object(obj)) = body.as_ref() else {
+        return Ok((template.to_string(), body));
+    };
+
+    // PASS 1 — render + check, mutating nothing.
+    let mut substitutions: Vec<(String, String)> = Vec::new();
+    let mut remaining = serde_json::Map::new();
+    for (key, value) in obj {
+        let placeholder = format!("{{{key}}}");
+        if template.contains(&placeholder) {
+            let rendered = render_path_scalar(key, value)?;
+            let rules = http.placeholder_rules(method, template, key);
+            crate::validate_path_placeholder(key, &rendered, &rules)
+                .map_err(refusal_to_execution_error)?;
+            substitutions.push((placeholder, rendered));
+        } else {
+            remaining.insert(key.clone(), value.clone());
+        }
+    }
+
+    // PASS 2 — apply.
+    let mut resolved = template.to_string();
+    for (placeholder, rendered) in substitutions {
+        resolved = resolved.replace(&placeholder, &rendered);
+    }
+
+    let remaining = if remaining.is_empty() {
+        None
+    } else {
+        Some(JsonValue::Object(remaining))
+    };
+    Ok((resolved, remaining))
+}
+
 /// Executes a compiled execution plan.
 pub struct PlanExecutor<H: HttpExecutor> {
     http: H,
@@ -2991,11 +3092,25 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                         });
                     }
 
-                    let resolved_path = self.resolve_path(path)?;
-                    let resolved_body = match body {
+                    // LAYER 1 — `${var}` / `${expr}` interpolation, each
+                    // contribution floored inside `resolve_path` (FORK 2).
+                    let templated_path = self.resolve_path(path)?;
+                    let evaluated_body = match body {
                         Some(expr) => Some(self.evaluate(expr)?),
                         None => None,
                     };
+                    // LAYER 2 — `{key}` resolution, moved ahead of dispatch (D-09).
+                    let (resolved_path, resolved_body) = resolve_layer_two_placeholders(
+                        &self.http,
+                        method,
+                        &templated_path,
+                        evaluated_body,
+                    )?;
+                    // THE COMPOSED CHECK — the only check that can see an
+                    // adjacency (T-128-20b). `.` + `.` composes to a traversal and
+                    // 180 + 200 code points compose over the cap, from values that
+                    // each passed both per-value checks above; a residual `{`/`}`
+                    // from an unsubstituted placeholder is refused here too.
                     let checked_path = ResolvedPath::from_checked(&resolved_path)
                         .map_err(refusal_to_execution_error)?;
 
@@ -3005,7 +3120,12 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                         .execute_request(method, checked_path, resolved_body.clone())
                         .await
                         .map_err(|e| ExecutionError::RuntimeError {
-                            message: format!("{} {} failed: {}", method, resolved_path, e),
+                            // The resolved path is deliberately NOT formatted in
+                            // (RESEARCH Pitfall 7 / SC-7): a D4 refusal is
+                            // value-free where it is raised, and re-attaching the
+                            // path here is what would deliver the exact injected
+                            // path to the client.
+                            message: format!("{method} api call '{result_var}' failed: {e}"),
                         })?;
                     let duration_ms = call_start.elapsed().as_millis() as u64;
 
@@ -3159,7 +3279,7 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                 // results collected into an array assigned to result_var.
                 PlanStep::ParallelApiCalls { result_var, calls } => {
                     let mut results = Vec::with_capacity(calls.len());
-                    for (_temp_var, method, path, body) in calls {
+                    for (temp_var, method, path, body) in calls {
                         self.api_call_count += 1;
                         if self.api_call_count > self.config.max_api_calls {
                             return Err(ExecutionError::RuntimeError {
@@ -3170,8 +3290,18 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                             });
                         }
 
-                        let resolved_path = self.resolve_path(path)?;
-                        let resolved_body = body.as_ref().map(|b| self.evaluate(b)).transpose()?;
+                        // LAYER 1, then LAYER 2, then the COMPOSED check — the same
+                        // three steps as the single `ApiCall` arm. See that arm's
+                        // comments; both arms must carry all three or the class is
+                        // closed on only one of them.
+                        let templated_path = self.resolve_path(path)?;
+                        let evaluated_body = body.as_ref().map(|b| self.evaluate(b)).transpose()?;
+                        let (resolved_path, resolved_body) = resolve_layer_two_placeholders(
+                            &self.http,
+                            method,
+                            &templated_path,
+                            evaluated_body,
+                        )?;
                         let checked_path = ResolvedPath::from_checked(&resolved_path)
                             .map_err(refusal_to_execution_error)?;
                         let call_start = std::time::Instant::now();
@@ -3180,7 +3310,8 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                             .execute_request(method, checked_path, resolved_body.clone())
                             .await
                             .map_err(|e| ExecutionError::RuntimeError {
-                                message: format!("{} {} failed: {}", method, resolved_path, e),
+                                // No resolved path here either (Pitfall 7 / SC-7).
+                                message: format!("{method} api call '{temp_var}' failed: {e}"),
                             })?;
                         let duration_ms = call_start.elapsed().as_millis() as u64;
                         let response =
@@ -3306,10 +3437,31 @@ impl<H: HttpExecutor> PlanExecutor<H> {
         })
     }
 
-    /// Resolve a path template to a concrete path string.
+    /// Resolve a path template to a concrete path string — LAYER 1.
+    ///
+    /// # The FORK-2 floor (Phase 128, T-128-20a)
+    ///
+    /// Every DYNAMIC contribution is passed through
+    /// [`validate_path_placeholder`](crate::validate_path_placeholder) before it is
+    /// pushed, and the first refusal returns so nothing reaches `result`. This arm
+    /// used to push the stringified value straight in, which meant a script
+    /// writing `` api.get(`/search/${v}`) `` never touched a `{key}` placeholder,
+    /// never entered layer 2, and was never floored at all. Code Mode scripts are
+    /// model-authored, so that was the untrusted route.
+    ///
+    /// `PathPart::Literal` parts are deliberately NOT checked: they are the
+    /// script's own literal text from the compiled template, not
+    /// caller-substituted data, and flooring them would refuse every legitimate
+    /// template whose literal segments contain `/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::RuntimeError`] on an undefined variable, an
+    /// expression-evaluation failure, or a placeholder refusal. A refusal's
+    /// message comes from the refusal's own value-free `Display`.
     fn resolve_path(&self, path: &PathTemplate) -> Result<String, ExecutionError> {
         let mut result = String::new();
-        for part in &path.parts {
+        for (index, part) in path.parts.iter().enumerate() {
             match part {
                 PathPart::Literal(s) => result.push_str(s),
                 PathPart::Variable(var) => {
@@ -3319,17 +3471,22 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                             .ok_or_else(|| ExecutionError::RuntimeError {
                                 message: format!("Undefined variable in path: {}", var),
                             })?;
-                    result.push_str(&shared_json_to_string_with_mode(
-                        value,
-                        JsonStringMode::Json,
-                    ));
+                    let rendered = shared_json_to_string_with_mode(value, JsonStringMode::Json);
+                    // The refusal names the variable IDENTIFIER, which the part
+                    // carries. A script-chosen identifier is operator-shipped
+                    // content, unlike the value.
+                    floor_layer_one_contribution(var, &rendered)?;
+                    result.push_str(&rendered);
                 },
                 PathPart::Expression(expr) => {
                     let value = self.evaluate(expr)?;
-                    result.push_str(&shared_json_to_string_with_mode(
-                        &value,
-                        JsonStringMode::Json,
-                    ));
+                    let rendered = shared_json_to_string_with_mode(&value, JsonStringMode::Json);
+                    // An expression has NO name, and a rendering of the expression
+                    // body could itself contain caller text — so the refusal
+                    // carries a fixed positional descriptor and never interpolates
+                    // either the body or the evaluated value.
+                    floor_layer_one_contribution(&format!("path expression #{index}"), &rendered)?;
+                    result.push_str(&rendered);
                 },
             }
         }
