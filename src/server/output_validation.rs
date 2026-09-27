@@ -64,6 +64,12 @@
 //! mode, and the diagnostic value of the warning is the whole point of the
 //! module. See 115-RESEARCH § Finding 6.
 
+// Why this module gates on `schema-validation` and not `validation` (Phase 128, D-04):
+// everything here is supplied by `jsonschema`, which after the D-04 split is what
+// `schema-validation` pulls. `validation` is now a SUPERSET that additionally pulls
+// `garde`, which this module never uses — so `full` and `full-v2` still reach this
+// code through `validation`, and every existing `validation` consumer sees no change.
+
 // Why: same tug-of-war as `task_dispatch` — rustc's `unreachable_pub` demands
 // pub(crate) on items in a crate-internal module, while clippy's
 // `redundant_pub_crate` flags that as redundant inside a pub(crate) module.
@@ -75,7 +81,7 @@ use serde_json::Value;
 
 /// The JSON Schema Draft 2020-12 meta-schema URI — the dialect MCP 2026-07-28
 /// pins for `outputSchema`.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Warn (via `tracing`) when `value` does not conform to the tool's declared
@@ -91,7 +97,7 @@ const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 // compiled, so this has no caller THERE and nowhere else.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn warn_on_schema_mismatch(tool: &str, schema: &Value, value: &Value, era: Option<Era>) {
-    #[cfg(feature = "validation")]
+    #[cfg(feature = "schema-validation")]
     {
         if !tracing::enabled!(tracing::Level::WARN) {
             return;
@@ -103,7 +109,7 @@ pub(crate) fn warn_on_schema_mismatch(tool: &str, schema: &Value, value: &Value,
             );
         }
     }
-    #[cfg(not(feature = "validation"))]
+    #[cfg(not(feature = "schema-validation"))]
     let _ = (tool, schema, value, era);
 }
 
@@ -116,7 +122,7 @@ pub(crate) fn warn_on_schema_mismatch(tool: &str, schema: &Value, value: &Value,
 ///
 /// `era` selects the dialect policy: `Some(Era::V2)` pins Draft 2020-12,
 /// everything else (including `None`) keeps v1's `$schema` auto-detect.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 pub(crate) fn schema_mismatch(schema: &Value, value: &Value, era: Option<Era>) -> Option<String> {
     match cached_validator(era, schema) {
         Ok(validator) => {
@@ -146,7 +152,7 @@ pub(crate) fn schema_mismatch(schema: &Value, value: &Value, era: Option<Era>) -
 /// is a semantic corruption of the author's schema, not a normalization. Every
 /// other keyword's value is either a subschema, a map of subschemas or an array
 /// of subschemas, all of which a dialect declaration may legally appear inside.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 const DATA_ONLY_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
 /// Keywords whose VALUE is a MAP from AUTHOR-CHOSEN NAMES to subschemas.
@@ -232,7 +238,7 @@ const DATA_ONLY_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 /// The entry is ordered LAST deliberately: the restated mirrors in
 /// `tests/property_tests.rs` and `fuzz/fuzz_targets/fuzz_schema_draft_pin.rs`,
 /// and 115-19's drift gate, compare the three copies as ORDERED slices.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 const SUBSCHEMA_MAP_KEYWORDS: &[&str] = &[
     "properties",
     "patternProperties",
@@ -252,7 +258,7 @@ const SUBSCHEMA_MAP_KEYWORDS: &[&str] = &[
 /// declaration the rewriter cannot reach yields a `Cow::Owned` that still
 /// carries a legacy declaration, which `compile_2020_12` then announces as
 /// "the declaration is ignored" while having ignored nothing.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn first_legacy_dialect(node: &Value) -> Option<&str> {
     match node {
         Value::Object(map) => {
@@ -283,7 +289,7 @@ fn first_legacy_dialect(node: &Value) -> Option<&str> {
 /// The plan for 115-14 specified this signature without lifetimes; it does not
 /// compile that way (two input references, one borrowed output — elision is
 /// ambiguous), so the output lifetime is tied explicitly to `member_value`.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn first_legacy_dialect_in_member<'a>(
     member_key: &str,
     member_value: &'a Value,
@@ -309,7 +315,7 @@ fn first_legacy_dialect_in_member<'a>(
 /// The REWRITER half of the normalization; see [`first_legacy_dialect`] for the
 /// detector it must agree with, and [`normalize_schema_dialect`] for the single
 /// traversal rule both implement.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn pin_dialect_in_place(node: &mut Value) {
     match node {
         Value::Object(map) => {
@@ -339,7 +345,7 @@ fn pin_dialect_in_place(node: &mut Value) {
 /// `pmat quality-gate`'s threshold of 23 (measured with pmat 3.15.0; the same
 /// gate reported 0 violations at the commit before 115-14, so the extraction is
 /// this change's own cost and not an inherited one). Do not inline it back.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn pin_dialect_in_member(member_key: &str, member_value: &mut Value) {
     if SUBSCHEMA_MAP_KEYWORDS.contains(&member_key) {
         // NAME position: descend into every value of the map, and never
@@ -549,8 +555,12 @@ fn pin_dialect_in_member(member_key: &str, member_value: &mut Value) {
 /// 115-18 own it for the sixth (`dependencies`), and until they land the two
 /// mirrors are stale by construction — do not run the fuzz target to judge a
 /// tree in that window.**
-#[cfg(feature = "validation")]
-fn normalize_schema_dialect(schema: &Value) -> std::borrow::Cow<'_, Value> {
+#[cfg(feature = "schema-validation")]
+// Visibility widened to `pub(in crate::server)` for Phase 128 D-01: the sibling
+// `crate::server::schema_validation::compile_input_2020_12` REUSES this rather than
+// copying it, so inputs and outputs can never normalize a declared `$schema`
+// differently. Nothing else in this file changes visibility.
+pub(in crate::server) fn normalize_schema_dialect(schema: &Value) -> std::borrow::Cow<'_, Value> {
     use std::borrow::Cow;
 
     // No legacy declaration anywhere — including the undeclared document, which
@@ -570,7 +580,7 @@ fn normalize_schema_dialect(schema: &Value) -> std::borrow::Cow<'_, Value> {
 /// Warns when the normalization actually rewrote something: that warning is the
 /// only signal a tool author gets that their declared dialect was ignored, and
 /// it is the diagnostic D-02 leaves available.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn compile_2020_12(
     schema: &Value,
 ) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {
@@ -603,7 +613,7 @@ fn compile_2020_12(
 ///
 /// Splitting normalization, compilation and caching across three functions is
 /// also what keeps each of them under CI's cognitive-complexity cap.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn compile_for_era(era: Era, schema: &Value) -> Result<jsonschema::Validator, std::sync::Arc<str>> {
     match era {
         // D-01 freezes v1: this arm is today's behaviour VERBATIM — the dialect
@@ -627,7 +637,7 @@ fn compile_for_era(era: Era, schema: &Value) -> Result<jsonschema::Validator, st
 /// `None` resolves to [`Era::V1`], the same conservative fallback
 /// [`crate::types::protocol::protocol_era`] applies to unknown versions: a
 /// request with no resolved protocol context must never reach v2 behaviour.
-#[cfg(feature = "validation")]
+#[cfg(feature = "schema-validation")]
 fn cached_validator(
     era: Option<Era>,
     schema: &Value,
@@ -659,13 +669,13 @@ fn cached_validator(
 /// This module exists only behind `feature = "fuzzing"`, which is in neither
 /// `default` nor `full` (`Cargo.toml:220`), so `cargo public-api` never sees it
 /// on the shipped surface. Do not depend on it. The second gate,
-/// `feature = "validation"`, is what compiles the validator this seam drives —
+/// `feature = "schema-validation"`, is what compiles the validator this seam drives —
 /// without it there is nothing here to reach.
 ///
 /// The shape is verbatim the one `crate::server::request_state::fuzz_support`
 /// established, so the crate has ONE convention for a fuzz seam rather than
 /// three.
-#[cfg(all(feature = "fuzzing", feature = "validation"))]
+#[cfg(all(feature = "fuzzing", feature = "schema-validation"))]
 pub mod fuzz_support {
     use super::{compile_for_era, normalize_schema_dialect};
     use crate::types::protocol::Era;
@@ -808,7 +818,7 @@ pub mod fuzz_support {
 /// nothing else — `test(/fuzz_support/)` alone also matches
 /// `server::request_state::tests::fuzz_support_seam_rejects_garbage`, which
 /// predates this module.
-#[cfg(all(test, feature = "fuzzing", feature = "validation"))]
+#[cfg(all(test, feature = "fuzzing", feature = "schema-validation"))]
 mod fuzz_support_tests {
     use super::fuzz_support::{normalize_bytes, validate_bytes, SchemaVerdict};
 
@@ -929,7 +939,7 @@ mod fuzz_support_tests {
     }
 }
 
-#[cfg(all(test, feature = "validation"))]
+#[cfg(all(test, feature = "schema-validation"))]
 mod tests {
     use super::*;
     use serde_json::json;

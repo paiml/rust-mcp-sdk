@@ -145,9 +145,127 @@ fn synthesize_inner(
             decl: decl.clone(),
             connector: connector.clone(),
         });
+        // Push site 1 of 3 (SQL handler) — D1 enforcement.
+        let handler = enforce_input_schema(handler, &info, decl);
         out.push((decl.name.clone(), info, handler));
     }
     Ok(out)
+}
+
+/// Enforce a synthesized tool's declared `inputSchema` before its inner handler
+/// runs (Phase 128, D1 / T-128-01).
+///
+/// # Enforcing function
+///
+/// `pmcp::server::schema_validation::validate_input`, called from BOTH
+/// [`ValidatingToolHandler::handle`] and [`ValidatingToolHandler::handle_output`].
+/// Backed by `tests/input_validation_acceptance.rs` acceptance rows 8–11, which
+/// fail if either call is removed.
+///
+/// Wrapping happens at every handler push site in this module, so all four public
+/// entry points inherit the enforcement with none forgotten.
+///
+/// With the `input-validation` feature OFF this is the identity function, and the
+/// opt-out is logged once per synthesized tool at synthesis time: a validation rule
+/// that is off must never read as on.
+#[allow(unused_variables)]
+fn enforce_input_schema(
+    handler: Arc<dyn ToolHandler>,
+    info: &ToolInfo,
+    decl: &ToolDecl,
+) -> Arc<dyn ToolHandler> {
+    #[cfg(feature = "input-validation")]
+    {
+        ValidatingToolHandler::wrap(handler, info, decl)
+    }
+    #[cfg(not(feature = "input-validation"))]
+    {
+        tracing::warn!(
+            tool = %decl.name,
+            "the `input-validation` feature is OFF: this tool's arguments are NOT checked \
+             against its declared inputSchema before the backend call"
+        );
+        handler
+    }
+}
+
+/// Decorator that refuses a `tools/call` whose arguments violate the tool's
+/// declared `inputSchema`, WITHOUT invoking the inner handler.
+///
+/// Crate-private by design: the validator and the value-free refusal renderer both
+/// live in core `pmcp` (D-01), so this type holds no schema logic of its own.
+#[cfg(feature = "input-validation")]
+struct ValidatingToolHandler {
+    inner: Arc<dyn ToolHandler>,
+    /// The synthesized `ToolInfo`'s `input_schema`, verbatim.
+    input_schema: Value,
+    /// `input_schema.to_string()`, computed ONCE at synthesis so the hot
+    /// `tools/call` path never re-serializes the whole schema to hit the core
+    /// validator cache.
+    schema_key: String,
+    /// Declared parameter names in declaration order — the ONLY names a refusal
+    /// message may echo (SC-7).
+    declared: Vec<String>,
+}
+
+#[cfg(feature = "input-validation")]
+impl ValidatingToolHandler {
+    /// Wrap `handler`, taking the schema from the already-built `info` and the
+    /// declared parameter names from `decl`.
+    fn wrap(inner: Arc<dyn ToolHandler>, info: &ToolInfo, decl: &ToolDecl) -> Arc<dyn ToolHandler> {
+        let input_schema = info.input_schema.clone();
+        let schema_key = input_schema.to_string();
+        Arc::new(Self {
+            inner,
+            input_schema,
+            schema_key,
+            declared: decl.parameters.iter().map(|p| p.name.clone()).collect(),
+        })
+    }
+
+    /// Validate `args`, mapping any violation to a value-free
+    /// `pmcp::Error::Validation`. Kept a separate helper so both trait entry
+    /// points stay one-liners and well under the cog-25 gate.
+    fn check(&self, args: &Value) -> pmcp::Result<()> {
+        use pmcp::server::schema_validation::{render_refusal, validate_input};
+
+        validate_input(&self.input_schema, Some(args), Some(&self.schema_key)).map_err(
+            |violations| {
+                let declared: Vec<&str> = self.declared.iter().map(String::as_str).collect();
+                pmcp::Error::Validation(render_refusal(&violations, &declared))
+            },
+        )
+    }
+}
+
+#[cfg(feature = "input-validation")]
+#[async_trait]
+impl ToolHandler for ValidatingToolHandler {
+    async fn handle(&self, args: Value, extra: RequestHandlerExtra) -> pmcp::Result<Value> {
+        self.check(&args)?;
+        self.inner.handle(args, extra).await
+    }
+
+    fn metadata(&self) -> Option<ToolInfo> {
+        self.inner.metadata()
+    }
+
+    /// Validates, then DELEGATES to the inner handler's own `handle_output`.
+    ///
+    /// Implementing only `handle` would silently replace an inner handler's
+    /// `handle_output` override with the trait default
+    /// (`handle(..).map(ToolOutput::Payload)`), stripping that handler's ability to
+    /// own its `CallToolResult` envelope. A decorator must not narrow the contract
+    /// of what it wraps — and both entry points must validate, or an inner handler
+    /// that overrides `handle_output` becomes an unvalidated path.
+    async fn handle_output(
+        &self,
+        args: Value,
+        extra: RequestHandlerExtra,
+    ) -> pmcp::Result<pmcp::server::ToolOutput> {
+        self.check(&args)?;
+        self.inner.handle_output(args, extra).await
+    }
 }
 
 /// Flip widget metadata onto `info` when the declaration carries a
@@ -459,6 +577,10 @@ fn synthesize_http_inner(
     for decl in &config.tools {
         if decl.is_script_tool() {
             let (info, handler) = build_script_tool(decl)?;
+            // Push site 2 of 3 (SCRIPT tool) — D1 enforcement. This site is
+            // SEPARATE from the HTTP push below because of the `continue`; wrapping
+            // only the HTTP push would leave every script tool unvalidated.
+            let handler = enforce_input_schema(handler, &info, decl);
             out.push((decl.name.clone(), info, handler));
             continue;
         }
@@ -482,6 +604,8 @@ fn synthesize_http_inner(
             operation,
             connector: connector.clone(),
         });
+        // Push site 3 of 3 (single-call HTTP handler) — D1 enforcement.
+        let handler = enforce_input_schema(handler, &info, decl);
         out.push((decl.name.clone(), info, handler));
     }
     Ok(out)

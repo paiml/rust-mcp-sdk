@@ -324,7 +324,19 @@ sse = ["http-client", "dep:bytes"]
 websocket = ["dep:tokio-tungstenite"]
 http = ["dep:hyper", "dep:hyper-util", "dep:bytes"]
 streamable-http = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:rustls", "dep:futures-util", "dep:bytes", "dep:axum", "dep:tower", "dep:tower-http", "dep:ring", "dep:zeroize"]
-validation = ["dep:jsonschema", "dep:garde"]
+# Why: the JSON Schema engine ALONE — `src/server/output_validation.rs` (warn-only
+# emit-time `structuredContent` checks) and `src/server/schema_validation.rs`
+# (Phase 128 D-01 `tools/call` input enforcement). The split exists so a curated
+# single-call toolkit build (`pmcp-server-toolkit`'s `input-validation`) gets the
+# schema engine WITHOUT `garde`, which such servers never use: they declare every
+# argument in TOML and have no `#[derive(Validate)]` types at all, so `garde` would
+# be a dead dependency edge in every config-driven server.
+#
+# `validation` below is redefined as a SUPERSET of this, so every existing
+# `validation` consumer — and both `full` and `full-v2`, which keep naming
+# `validation` and are NOT edited — sees no change whatsoever (D-04).
+schema-validation = ["dep:jsonschema"]
+validation = ["schema-validation", "dep:garde"]
 resource-watcher = ["dep:notify", "dep:glob-match"]
 schema-generation = ["dep:schemars"]
 macros = ["dep:pmcp-macros", "schema-generation"]

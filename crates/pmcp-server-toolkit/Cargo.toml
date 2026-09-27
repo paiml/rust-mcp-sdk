@@ -51,7 +51,6 @@ aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
 aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"], optional = true }
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
 
-jsonschema = { version = "0.49", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
 # Why: Phase 90 OpenAPI HTTP backend (OAPI-01 / OAPI-03). These optional deps are
@@ -99,7 +98,17 @@ default = ["code-mode"]
 code-mode = ["dep:pmcp-code-mode", "pmcp-code-mode/sql-code-mode"]
 aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager", "dep:aws-sdk-ssm", "dep:tokio"]
 avp = ["code-mode", "pmcp-code-mode/avp"]
-input-validation = ["dep:jsonschema"]
+# Why: the toolkit deliberately holds NO second `jsonschema` path of its own
+# (Phase 128, D-01 — core `pmcp` owns the one validator path, so a tool's input and
+# output can never be checked under different dialects, and the compiled-validator
+# cache, the draft pin and the value-free refusal renderer are not duplicated). The
+# crate's own optional `jsonschema` dependency was REMOVED when this forward landed.
+#
+# The forward must be EXPLICIT: `pmcp` above carries `default-features = false`, so
+# nothing enables `pmcp/schema-validation` implicitly. With this feature OFF,
+# `tools.rs::enforce_input_schema` logs the opt-out once per synthesized tool at
+# startup — an enforcement that is off must never read as on.
+input-validation = ["pmcp/schema-validation"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
 # Why: the `http` feature serves two reconciled concerns (Phase 90 Plan 01,
 # Rule 3 — name reconciliation):

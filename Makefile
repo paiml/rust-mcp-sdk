@@ -581,10 +581,17 @@ test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 # `test-openapi-server`'s per-binary guard exists for, which is why the two
 # named binaries below are count-asserted individually rather than trusted to
 # the sum.
+#
+# `input-validation` is REQUIRED for the same MEASURED reason `http` already is
+# (Phase 128): `tests/input_validation_acceptance.rs` is
+# `#![cfg(all(feature = "http", feature = "input-validation"))]` and the toolkit's
+# `default` is still `["code-mode"]`, so without naming the feature here the whole
+# file -- acceptance-matrix rows 8-11, the D1 enforcement proof -- compiles to
+# `running 0 tests` and exits 0.
 .PHONY: test-server-toolkit
 test-server-toolkit:
 	@echo "$(BLUE)Running pmcp-server-toolkit's own tests...$(NC)"
-	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-server-toolkit --features http -- --test-threads=1 2>&1); \
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-server-toolkit --features http,input-validation -- --test-threads=1 2>&1); \
 	status=$$?; \
 	echo "$$out"; \
 	if [ $$status -ne 0 ]; then exit $$status; fi; \
@@ -593,7 +600,7 @@ test-server-toolkit:
 		echo "$(RED)✗ pmcp-server-toolkit reported 0 tests — the gate is not reaching this crate$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion"; \
+	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \
