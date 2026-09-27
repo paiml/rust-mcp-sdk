@@ -74,7 +74,7 @@ required = true
 name = "get_customer"
 description = "Fetch one customer row from the Contoso Customers sheet."
 script = """
-const resp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')?$select=values");
+const resp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')", { "$select": "values" });
 const rows = resp.values;
 const matches = rows.filter(row => row[0] === args.customer_id);
 return matches;

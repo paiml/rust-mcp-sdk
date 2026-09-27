@@ -76,7 +76,7 @@ retry_backoff_ms = 1000
 name = "get_customer"
 description = "Fetch one customer row (customer_id, name, segment, region) from the Contoso Customers sheet."
 script = """
-const resp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')?$select=values");
+const resp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')", { "$select": "values" });
 const rows = resp.values;
 const matches = rows.filter(row => row[0] === args.customer_id);
 return matches;
@@ -107,7 +107,7 @@ cost_hint = "low"
 name = "get_customer_orders"
 description = "Fetch the Orders rows (order_id, customer_id, order_date, amount) for one customer from the Contoso Orders sheet."
 script = """
-const resp = await api.get("/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='A2:D7')?$select=values");
+const resp = await api.get("/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='A2:D7')", { "$select": "values" });
 const rows = resp.values;
 const matches = rows.filter(row => row[1] === args.customer_id);
 return matches;
@@ -169,20 +169,20 @@ content = """
 
 ## Read one customer (read the block, filter by the id column)
 ```js
-const resp = await api.get(`/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')?$select=values`);
+const resp = await api.get(`/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')`, { "$select": "values" });
 const rows = resp.values;
 return rows.filter(row => row[0] === "C001");
 ```
 
 ## Read all customers (header excluded)
 ```js
-const r = await api.get(`/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')?$select=values`);
+const r = await api.get(`/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='A2:D7')`, { "$select": "values" });
 return r.values;
 ```
 
 ## Read all orders
 ```js
-const r = await api.get(`/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='A2:D7')?$select=values`);
+const r = await api.get(`/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='A2:D7')`, { "$select": "values" });
 return r.values;
 ```
 """
