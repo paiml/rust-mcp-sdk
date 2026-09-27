@@ -29,12 +29,15 @@
 //! character floor and the value-free refusal renderer all live in core
 //! `pmcp::server::schema_validation`; these hooks sit around them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::Value;
+
+use crate::config::ServerConfig;
 
 // -----------------------------------------------------------------------------
 // E1 — RequestPolicy
@@ -519,6 +522,229 @@ impl fmt::Debug for ToolkitHooks {
             .field("validators", &self.validators)
             .finish()
     }
+}
+
+// -----------------------------------------------------------------------------
+// The once-at-startup enforcement log (Phase 128, D-07)
+// -----------------------------------------------------------------------------
+
+/// The severity one [`render_validation_report`] line is emitted at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportLevel {
+    /// An enforcement that is ON, or the absence of any opt-out.
+    Info,
+    /// An enforcement that is OFF, or a registration that cannot take effect.
+    Warn,
+}
+
+/// One rendered enforcement-report line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportLine {
+    /// Whether the line reports something ON or something OFF.
+    pub level: ReportLevel,
+    /// The rendered text, drawn from DECLARATIONS only.
+    pub text: String,
+}
+
+/// Render what this server actually enforces, as the lines
+/// [`emit_validation_report`] logs (Phase 128, D-07).
+///
+/// Separate from the emission so a test can assert the exact line FORMATS without
+/// installing a `tracing` subscriber — and so the documentation deliverable has one
+/// authority for what an operator will see.
+///
+/// # It carries no request data, by construction
+///
+/// Every line is built from `[server.validation]`, from
+/// [`ServerConfig::validation_report`] (itself built from `[[tools]]` declarations),
+/// and from which tool NAMES carry a registered validator. No argument value and no
+/// credential can reach it, because none is in scope here. That is the property
+/// that keeps the log from becoming the PHI channel SC-7 closed everywhere else.
+///
+/// # What it reports
+///
+/// In order: the effective `[server.validation]` policy; the always-on floor; one
+/// line per tool naming its enforced rules; one WARN per ACTIVE opt-out, or one
+/// INFO stating that none is active; the E1 policy registration state; and the E2
+/// validator registrations, with a WARN for any registered under a tool name the
+/// config does not declare.
+///
+/// An enforcement that is OFF is always stated. A log that listed only what is on
+/// would let an operator read silence as safety.
+#[must_use]
+pub fn render_validation_report(config: &ServerConfig, hooks: &ToolkitHooks) -> Vec<ReportLine> {
+    let report = config.validation_report();
+    let mut out = Vec::new();
+
+    let schema_check = if cfg!(feature = "input-validation") {
+        if report.enforce_input_schema {
+            "ON"
+        } else {
+            "OFF"
+        }
+    } else {
+        "OFF (feature)"
+    };
+    out.push(ReportLine {
+        level: if schema_check == "ON" {
+            ReportLevel::Info
+        } else {
+            ReportLevel::Warn
+        },
+        text: format!(
+            "input validation: schema_check={schema_check} default_max_length={} \
+             additional_properties={} strict={} tools={}",
+            report.default_max_length,
+            report.additional_properties,
+            report.strict,
+            report.tools.len()
+        ),
+    });
+
+    if !cfg!(feature = "input-validation") {
+        out.push(ReportLine {
+            level: ReportLevel::Warn,
+            text: "input validation: the `input-validation` feature is OFF, so NO tool's \
+                   arguments are checked against its declared inputSchema. It is in the \
+                   toolkit's default feature set — an unenforced build is an explicit opt-out."
+                .to_string(),
+        });
+    }
+
+    for tool in &report.tools {
+        let rules = if tool.rules.is_empty() {
+            "(none declared; only the always-on path-placeholder character floor and \
+             length cap apply)"
+                .to_string()
+        } else {
+            tool.rules.join("; ")
+        };
+        out.push(ReportLine {
+            level: ReportLevel::Info,
+            text: format!("input validation: tool '{}' enforces {rules}", tool.tool),
+        });
+    }
+
+    if report.opt_outs.is_empty() {
+        out.push(ReportLine {
+            level: ReportLevel::Info,
+            text: "input validation: no [server.validation] opt-out is active — every rule \
+                   this config can enforce is enforced."
+                .to_string(),
+        });
+    } else {
+        for opt_out in &report.opt_outs {
+            out.push(ReportLine {
+                level: ReportLevel::Warn,
+                text: format!("input validation: [server.validation] opt-out ACTIVE — {opt_out}"),
+            });
+        }
+    }
+
+    render_hooks_lines(config, hooks, &mut out);
+    out
+}
+
+/// The E1 / E2 registration half of [`render_validation_report`].
+///
+/// Its own function to keep the caller under the cognitive-complexity 25 gate. A
+/// validator registered for a tool name the config does not declare is a WARN and
+/// NOT an error: a typo must be visible, but failing hard on a name a later config
+/// edit will introduce is worse than a warning.
+fn render_hooks_lines(config: &ServerConfig, hooks: &ToolkitHooks, out: &mut Vec<ReportLine>) {
+    out.push(ReportLine {
+        level: ReportLevel::Info,
+        text: format!(
+            "input validation: E1 RequestPolicy registered={}",
+            hooks.request_policy().is_some()
+        ),
+    });
+
+    let names = hooks.validator_names();
+    if names.is_empty() {
+        out.push(ReportLine {
+            level: ReportLevel::Info,
+            text: "input validation: no E2 ArgumentValidator is registered".to_string(),
+        });
+        return;
+    }
+    out.push(ReportLine {
+        level: ReportLevel::Info,
+        text: format!(
+            "input validation: E2 ArgumentValidator registered for {}",
+            names.join(", ")
+        ),
+    });
+    for name in names {
+        if !config.tools.iter().any(|t| t.name == name) {
+            out.push(ReportLine {
+                level: ReportLevel::Warn,
+                text: format!(
+                    "input validation: an ArgumentValidator is registered for '{name}', which \
+                     this config declares no [[tools]] entry for — it will never run"
+                ),
+            });
+        }
+    }
+}
+
+/// Emit the enforcement report ONCE per server, at startup (Phase 128, D-07).
+///
+/// The ONE formatter, called from BOTH assembly sites:
+/// [`crate::ServerBuilderExt::try_tools_from_config_with`] and
+/// `pmcp-openapi-server`'s `build_server`. Two call sites rather than two
+/// formatters, because the OpenAPI binary reaches the free synthesizer directly and
+/// never goes through the builder path — a report emitted only there would be
+/// absent from the deployment that most needs it (T-128-42a).
+///
+/// This log is the mechanism for tracing a server whose previously-unenforced
+/// `enum` or `pattern` starts refusing calls. It is not optional polish.
+///
+/// # Emitted once per SERVER, not once per call
+///
+/// Deduplicated on a hash of the RENDERED lines plus the server name and version,
+/// so a process that reaches both assembly paths for the same server logs once
+/// while a process hosting two DIFFERENT servers logs for each. Two servers with a
+/// byte-identical config and identical registrations log once between them — an
+/// accepted and stated limitation, since there is nothing in the report that would
+/// differ.
+///
+/// # It carries no request data
+///
+/// Guaranteed by [`render_validation_report`], which has no argument value and no
+/// credential in scope.
+pub fn emit_validation_report(config: &ServerConfig, hooks: &ToolkitHooks) {
+    let lines = render_validation_report(config, hooks);
+    if !claim_report_emission(&config.server.name, &config.server.version, &lines) {
+        return;
+    }
+    for line in lines {
+        match line.level {
+            ReportLevel::Info => {
+                tracing::info!(target: "pmcp_server_toolkit::policy", "{}", line.text);
+            },
+            ReportLevel::Warn => {
+                tracing::warn!(target: "pmcp_server_toolkit::policy", "{}", line.text);
+            },
+        }
+    }
+}
+
+/// Claim the right to emit for this (server, report) pair, returning `false` when
+/// it was already claimed.
+fn claim_report_emission(name: &str, version: &str, lines: &[ReportLine]) -> bool {
+    static EMITTED: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    version.hash(&mut hasher);
+    for line in lines {
+        line.text.hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    EMITTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(true, |mut seen| seen.insert(key))
 }
 
 #[cfg(test)]

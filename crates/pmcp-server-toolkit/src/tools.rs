@@ -37,6 +37,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{AnnotationsDecl, ParamDecl, ServerConfig, ToolDecl, ValidationSection};
 use crate::error::Result;
+use crate::policy::ToolkitHooks;
 use crate::sql::SqlConnector;
 
 #[cfg(feature = "http")]
@@ -83,7 +84,25 @@ pub type SynthesizedTool = (String, ToolInfo, Arc<dyn ToolHandler>);
 /// assert_eq!(synthesized.len(), 0);
 /// ```
 pub fn synthesize_from_config(config: &ServerConfig) -> Result<Vec<SynthesizedTool>> {
-    synthesize_inner(config, None)
+    synthesize_inner(config, None, &ToolkitHooks::default())
+}
+
+/// [`synthesize_from_config`] with registered E2 hooks (Phase 128).
+///
+/// PUBLIC, not `pub(crate)`: `crates/pmcp-openapi-server` is a DIFFERENT crate and
+/// calls the free synthesizers directly rather than going through
+/// [`crate::ServerBuilderExt`], so a crate-private variant would leave the shipped
+/// OpenAPI binary unable to pass hooks at all — a registration surface that exists
+/// and cannot be reached from the deployment that most needs it.
+///
+/// # Errors
+///
+/// As [`synthesize_from_config`].
+pub fn synthesize_from_config_and_hooks(
+    config: &ServerConfig,
+    hooks: &ToolkitHooks,
+) -> Result<Vec<SynthesizedTool>> {
+    synthesize_inner(config, None, hooks)
 }
 
 /// Synthesize tools that execute against a wired [`SqlConnector`] (Phase 84
@@ -123,7 +142,22 @@ pub fn synthesize_from_config_with_connector(
     config: &ServerConfig,
     connector: Arc<dyn SqlConnector>,
 ) -> Result<Vec<SynthesizedTool>> {
-    synthesize_inner(config, Some(connector))
+    synthesize_inner(config, Some(connector), &ToolkitHooks::default())
+}
+
+/// [`synthesize_from_config_with_connector`] with registered E2 hooks (Phase 128).
+///
+/// PUBLIC for the reason given on [`synthesize_from_config_and_hooks`].
+///
+/// # Errors
+///
+/// As [`synthesize_from_config_with_connector`].
+pub fn synthesize_from_config_with_connector_and_hooks(
+    config: &ServerConfig,
+    connector: Arc<dyn SqlConnector>,
+    hooks: &ToolkitHooks,
+) -> Result<Vec<SynthesizedTool>> {
+    synthesize_inner(config, Some(connector), hooks)
 }
 
 /// Shared synthesizer body for both [`synthesize_from_config`] (no connector)
@@ -136,6 +170,7 @@ pub fn synthesize_from_config_with_connector(
 fn synthesize_inner(
     config: &ServerConfig,
     connector: Option<Arc<dyn SqlConnector>>,
+    hooks: &ToolkitHooks,
 ) -> Result<Vec<SynthesizedTool>> {
     let validation = &config.server.validation;
     let mut out = Vec::with_capacity(config.tools.len());
@@ -146,8 +181,8 @@ fn synthesize_inner(
             decl: decl.clone(),
             connector: connector.clone(),
         });
-        // Push site 1 of 3 (SQL handler) — D1 enforcement.
-        let handler = enforce_input_schema(handler, &info, decl, validation);
+        // Push site 1 of 3 (SQL handler) — D1 enforcement + E2 validator.
+        let handler = enforce_input_schema(handler, &info, decl, validation, hooks);
         out.push((decl.name.clone(), info, handler));
     }
     Ok(out)
@@ -193,11 +228,13 @@ fn enforce_input_schema(
     info: &ToolInfo,
     decl: &ToolDecl,
     validation: &ValidationSection,
+    hooks: &ToolkitHooks,
 ) -> Arc<dyn ToolHandler> {
     #[cfg(feature = "input-validation")]
     {
-        // E2 (plan 09) replaces this with a registry lookup on `decl.name`.
-        let has_registered_validator = false;
+        // Phase 128 E2 — the registry lookup that replaced plan 03's
+        // `let has_registered_validator = false;` placeholder.
+        let has_registered_validator = hooks.validator_for(&decl.name).is_some();
         if !validation.enforce_input_schema && !has_registered_validator {
             tracing::warn!(
                 tool = %decl.name,
@@ -654,13 +691,45 @@ pub fn synthesize_from_config_with_http_connector(
     // [`synthesize_from_config_with_http_connector_and_scripts`], which supplies
     // a [`ScriptToolHandler`] builder so a `script` tool synthesizes a real
     // handler over the shared engine (OAPI-02b / D-01 / D-02).
-    synthesize_http_inner(config, connector, |decl| {
-        Err(ToolkitError::Synth(format!(
-            "tool '{}' is a script tool — script tools require the `openapi-code-mode` \
-             feature (use synthesize_from_config_with_http_connector_and_scripts)",
-            decl.name
-        )))
-    })
+    synthesize_from_config_with_http_connector_and_hooks(
+        config,
+        connector,
+        &ToolkitHooks::default(),
+    )
+}
+
+/// [`synthesize_from_config_with_http_connector`] with registered E2 hooks
+/// (Phase 128).
+///
+/// PUBLIC for the reason given on [`synthesize_from_config_and_hooks`].
+///
+/// # Errors
+///
+/// As [`synthesize_from_config_with_http_connector`].
+#[cfg(feature = "http")]
+pub fn synthesize_from_config_with_http_connector_and_hooks(
+    config: &ServerConfig,
+    connector: Arc<dyn HttpConnector>,
+    hooks: &ToolkitHooks,
+) -> Result<Vec<SynthesizedTool>> {
+    // No script-tool builder is supplied on this (single-call-only) entry point,
+    // so the `is_script_tool()` arm of [`synthesize_http_inner`] returns the
+    // typed Plan 05 seam error. The OpenAPI Code Mode build calls
+    // [`synthesize_from_config_with_http_connector_and_scripts`], which supplies
+    // a [`ScriptToolHandler`] builder so a `script` tool synthesizes a real
+    // handler over the shared engine (OAPI-02b / D-01 / D-02).
+    synthesize_http_inner(
+        config,
+        connector,
+        |decl| {
+            Err(ToolkitError::Synth(format!(
+                "tool '{}' is a script tool — script tools require the `openapi-code-mode` \
+                 feature (use synthesize_from_config_with_http_connector_and_scripts)",
+                decl.name
+            )))
+        },
+        hooks,
+    )
 }
 
 /// Synthesize single-call AND script `[[tools]]` against a wired
@@ -694,14 +763,48 @@ pub fn synthesize_from_config_with_http_connector_and_scripts(
     http_exec: HttpCodeExecutor,
     exec_config: ExecutionConfig,
 ) -> Result<Vec<SynthesizedTool>> {
+    synthesize_from_config_with_http_connector_and_scripts_and_hooks(
+        config,
+        connector,
+        http_exec,
+        exec_config,
+        &ToolkitHooks::default(),
+    )
+}
+
+/// [`synthesize_from_config_with_http_connector_and_scripts`] with registered E2
+/// hooks (Phase 128).
+///
+/// This is THE variant `crates/pmcp-openapi-server`'s `build_server` calls, which
+/// is why it is PUBLIC rather than `pub(crate)`: that crate reaches the
+/// synthesizer directly and never through [`crate::ServerBuilderExt`], so a
+/// crate-private variant would ship E2 as present-but-inert on this phase's
+/// principal HTTP surface (T-128-39b).
+///
+/// # Errors
+///
+/// As [`synthesize_from_config_with_http_connector_and_scripts`].
+#[cfg(feature = "openapi-code-mode")]
+pub fn synthesize_from_config_with_http_connector_and_scripts_and_hooks(
+    config: &ServerConfig,
+    connector: Arc<dyn HttpConnector>,
+    http_exec: HttpCodeExecutor,
+    exec_config: ExecutionConfig,
+    hooks: &ToolkitHooks,
+) -> Result<Vec<SynthesizedTool>> {
     let validation = &config.server.validation;
-    synthesize_http_inner(config, connector, |decl| {
-        let handler =
-            ScriptToolHandler::new(decl, http_exec.clone(), exec_config.clone(), validation)?;
-        let info = handler.tool_info.clone();
-        let arc: Arc<dyn ToolHandler> = Arc::new(handler);
-        Ok((info, arc))
-    })
+    synthesize_http_inner(
+        config,
+        connector,
+        |decl| {
+            let handler =
+                ScriptToolHandler::new(decl, http_exec.clone(), exec_config.clone(), validation)?;
+            let info = handler.tool_info.clone();
+            let arc: Arc<dyn ToolHandler> = Arc::new(handler);
+            Ok((info, arc))
+        },
+        hooks,
+    )
 }
 
 /// Shared synthesizer body for the single-call HTTP entry points.
@@ -716,6 +819,7 @@ fn synthesize_http_inner(
     config: &ServerConfig,
     connector: Arc<dyn HttpConnector>,
     mut build_script_tool: impl FnMut(&ToolDecl) -> Result<(ToolInfo, Arc<dyn ToolHandler>)>,
+    hooks: &ToolkitHooks,
 ) -> Result<Vec<SynthesizedTool>> {
     let validation = &config.server.validation;
     let mut out = Vec::with_capacity(config.tools.len());
@@ -725,7 +829,7 @@ fn synthesize_http_inner(
             // Push site 2 of 3 (SCRIPT tool) — D1 enforcement. This site is
             // SEPARATE from the HTTP push below because of the `continue`; wrapping
             // only the HTTP push would leave every script tool unvalidated.
-            let handler = enforce_input_schema(handler, &info, decl, validation);
+            let handler = enforce_input_schema(handler, &info, decl, validation, hooks);
             out.push((decl.name.clone(), info, handler));
             continue;
         }
@@ -749,8 +853,8 @@ fn synthesize_http_inner(
             operation,
             connector: connector.clone(),
         });
-        // Push site 3 of 3 (single-call HTTP handler) — D1 enforcement.
-        let handler = enforce_input_schema(handler, &info, decl, validation);
+        // Push site 3 of 3 (single-call HTTP handler) — D1 enforcement + E2 validator.
+        let handler = enforce_input_schema(handler, &info, decl, validation, hooks);
         out.push((decl.name.clone(), info, handler));
     }
     Ok(out)
@@ -2120,6 +2224,350 @@ mod synth_http_tests {
                 );
             },
             other => panic!("expected Synth error, got {other:?}"),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 E2 — the per-tool ArgumentValidator seam.
+//
+// A SIBLING of `mod tests`, selected by the `--lib tools::` filter. It drives the
+// PUBLIC `*_and_hooks` synthesizer so the assertions hold through the surface an
+// out-of-crate caller (`pmcp-openapi-server`) actually uses.
+// -----------------------------------------------------------------------------
+
+/// E2 ordering, the schema opt-out, and the empty case.
+#[cfg(all(test, feature = "input-validation"))]
+mod argument_validator_seam {
+    use super::synthesize_from_config_and_hooks;
+    use crate::config::ServerConfig;
+    use crate::policy::{ArgumentRefusal, ArgumentValidator, ToolkitHooks};
+    use pmcp::RequestHandlerExtra;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Counts its invocations, then refuses when `end < start`. The refusal is a
+    /// FIXED string: it names the rule, never a value.
+    struct EndAfterStart {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ArgumentValidator for EndAfterStart {
+        fn validate(&self, args: &Value) -> Result<(), ArgumentRefusal> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let start = args.get("start").and_then(Value::as_i64);
+            let end = args.get("end").and_then(Value::as_i64);
+            match (start, end) {
+                (Some(s), Some(e)) if e < s => {
+                    Err(ArgumentRefusal::new("`end` must not precede `start`"))
+                },
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// A `[[tools]]` whose declared schema permits any two integers, so the
+    /// cross-field rule is one only E2 can express.
+    fn cfg(enforce: bool) -> ServerConfig {
+        let toml = format!(
+            r#"
+[server]
+name = "range"
+version = "0.1.0"
+
+[server.validation]
+enforce_input_schema = {enforce}
+
+[[tools]]
+name = "range_query"
+description = "Query a range"
+sql = "SELECT 1"
+
+[[tools.parameters]]
+name = "start"
+type = "integer"
+required = true
+
+[[tools.parameters]]
+name = "end"
+type = "integer"
+required = true
+"#
+        );
+        ServerConfig::from_toml_strict_validated(&toml).expect("parse")
+    }
+
+    fn extra() -> RequestHandlerExtra {
+        RequestHandlerExtra::default()
+    }
+
+    fn hooks(calls: &Arc<AtomicUsize>) -> ToolkitHooks {
+        ToolkitHooks::default().with_argument_validator(
+            "range_query",
+            Arc::new(EndAfterStart {
+                calls: Arc::clone(calls),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_registered_validator_refuses_a_combination_the_schema_permits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(true), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        let err = handler
+            .handle(json!({ "start": 10, "end": 2 }), extra())
+            .await
+            .expect_err("the validator refuses");
+        assert!(
+            err.to_string().contains("`end` must not precede `start`"),
+            "the refusal must carry the validator's own message, got: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_registered_validator_allows_a_valid_combination() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(true), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        // No SQL connector is wired, so the INNER handler errors — which is itself
+        // the proof that the validator allowed the call through to it.
+        let err = handler
+            .handle(json!({ "start": 2, "end": 10 }), extra())
+            .await
+            .expect_err("no connector is wired");
+        assert!(
+            !err.to_string().contains("must not precede"),
+            "the validator must NOT have refused, got: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// T-128-41: the ordering is the contract. A validator must never see
+    /// arguments that failed the declared schema.
+    #[tokio::test]
+    async fn a_registered_validator_is_not_invoked_when_the_schema_refuses() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(true), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        // `start` is a declared integer; a string violates the schema.
+        let err = handler
+            .handle(json!({ "start": "ten", "end": 2 }), extra())
+            .await
+            .expect_err("D1 refuses");
+        assert!(
+            !err.to_string().contains("must not precede"),
+            "D1 must be the refuser, not E2, got: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the validator was invoked on arguments the schema already refused"
+        );
+    }
+
+    /// The joint test also present in plan 03: turning off one enforcement must
+    /// never silently turn off another.
+    #[tokio::test]
+    async fn a_registered_validator_still_runs_with_enforce_input_schema_false() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(false), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+
+        // Half one: the SCHEMA check is off, so an undeclared key is accepted.
+        let err = handler
+            .handle(json!({ "start": 2, "end": 10, "undeclared": 1 }), extra())
+            .await
+            .expect_err("no connector is wired");
+        assert!(
+            !err.to_string().contains("undeclared"),
+            "with enforce_input_schema=false an undeclared key must be accepted, got: {err}"
+        );
+
+        // Half two: the VALIDATOR still refuses.
+        let err = handler
+            .handle(json!({ "start": 10, "end": 2 }), extra())
+            .await
+            .expect_err("the validator refuses");
+        assert!(
+            err.to_string().contains("`end` must not precede `start`"),
+            "a registered validator must survive the schema opt-out, got: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_tool_with_no_registered_validator_runs_d1_only() {
+        let tools =
+            synthesize_from_config_and_hooks(&cfg(true), &ToolkitHooks::default()).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        // D1 still refuses a schema violation.
+        handler
+            .handle(json!({ "start": "ten", "end": 2 }), extra())
+            .await
+            .expect_err("D1 refuses");
+        // And a schema-valid call reaches the inner handler (which has no connector).
+        let err = handler
+            .handle(json!({ "start": 10, "end": 2 }), extra())
+            .await
+            .expect_err("no connector is wired");
+        assert!(!err.to_string().contains("must not precede"));
+    }
+
+    /// `handle_output` must validate too, or an inner handler that overrides it
+    /// becomes a path with schema enforcement and no custom rule.
+    #[tokio::test]
+    async fn handle_output_runs_the_validator_as_well() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(true), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        let err = handler
+            .handle_output(json!({ "start": 10, "end": 2 }), extra())
+            .await
+            .expect_err("the validator refuses");
+        assert!(
+            err.to_string().contains("`end` must not precede `start`"),
+            "handle_output must run the validator too, got: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// The once-at-startup enforcement report's line formats (Phase 128 D-07).
+#[cfg(all(test, feature = "input-validation"))]
+mod enforcement_report {
+    use crate::config::ServerConfig;
+    use crate::policy::{
+        render_validation_report, ArgumentRefusal, ArgumentValidator, ReportLevel, ToolkitHooks,
+    };
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Never;
+    impl ArgumentValidator for Never {
+        fn validate(&self, _args: &Value) -> Result<(), ArgumentRefusal> {
+            Err(ArgumentRefusal::new("disabled"))
+        }
+    }
+
+    fn cfg(extra_validation: &str) -> ServerConfig {
+        let toml = format!(
+            r#"
+[server]
+name = "report"
+version = "0.1.0"
+
+[server.validation]
+{extra_validation}
+
+[[tools]]
+name = "get_thing"
+description = "Get a thing"
+path = "/things/{{id}}"
+method = "GET"
+
+[[tools.parameters]]
+name = "id"
+type = "string"
+required = true
+pattern = "^[0-9]+$"
+"#
+        );
+        ServerConfig::from_toml_strict_validated(&toml).expect("parse")
+    }
+
+    fn texts(lines: &[crate::policy::ReportLine]) -> String {
+        lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_fully_enforcing_config_states_that_no_opt_out_is_active() {
+        let lines = render_validation_report(&cfg(""), &ToolkitHooks::default());
+        let joined = texts(&lines);
+        assert!(
+            joined.contains("input validation: schema_check=ON"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("tool 'get_thing' enforces"),
+            "one line per tool: {joined}"
+        );
+        assert!(
+            joined.contains("no [server.validation] opt-out is active"),
+            "the report must state the ABSENCE of an opt-out, not stay silent: {joined}"
+        );
+        assert!(
+            joined.contains("E1 RequestPolicy registered=false"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("no E2 ArgumentValidator is registered"),
+            "{joined}"
+        );
+        assert!(
+            lines.iter().all(|l| l.level == ReportLevel::Info),
+            "a fully enforcing config emits no warning"
+        );
+    }
+
+    #[test]
+    fn every_active_opt_out_is_reported_at_warn_level() {
+        let lines = render_validation_report(
+            &cfg("enforce_input_schema = false\ndefault_max_length = 0\nadditional_properties = true"),
+            &ToolkitHooks::default(),
+        );
+        let joined = texts(&lines);
+        assert!(joined.contains("schema_check=OFF"), "{joined}");
+        let warns: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.level == ReportLevel::Warn)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert!(
+            warns.len() >= 4,
+            "an enforcement that is OFF must never read as on; got {warns:#?}"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("opt-out ACTIVE")),
+            "{warns:#?}"
+        );
+    }
+
+    #[test]
+    fn a_validator_for_an_undeclared_tool_name_is_warned_not_refused() {
+        let hooks = ToolkitHooks::default()
+            .with_argument_validator("get_thing", Arc::new(Never))
+            .with_argument_validator("typoed_name", Arc::new(Never));
+        let lines = render_validation_report(&cfg(""), &hooks);
+        let joined = texts(&lines);
+        assert!(
+            joined.contains("E2 ArgumentValidator registered for get_thing, typoed_name"),
+            "{joined}"
+        );
+        let warns: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.level == ReportLevel::Warn)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(warns.len(), 1, "exactly the typo warns: {warns:#?}");
+        assert!(warns[0].contains("'typoed_name'"), "{:?}", warns[0]);
+        assert!(warns[0].contains("will never run"), "{:?}", warns[0]);
+    }
+
+    /// SC-7: the report is built from declarations, so it cannot carry request
+    /// data. Asserted rather than trusted, because the log is a channel.
+    #[test]
+    fn the_report_never_echoes_an_argument_value() {
+        let lines = render_validation_report(&cfg(""), &ToolkitHooks::default());
+        let joined = texts(&lines);
+        for forbidden in ["Bearer", "app_key", "super-secret"] {
+            assert!(!joined.contains(forbidden), "{joined}");
         }
     }
 }

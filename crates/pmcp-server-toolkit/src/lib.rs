@@ -171,8 +171,9 @@ pub use crate::sql::{ConnectorError, Dialect, SqlConnector};
 // `http` would make the registration surface exist only in HTTP builds while the
 // E2 half has nothing to do with HTTP.
 pub use crate::policy::{
-    ArgumentRefusal, ArgumentValidator, ArgumentValidators, OutboundRequest, PolicyRefusal,
-    RequestPolicy, ToolkitHooks,
+    emit_validation_report, render_validation_report, ArgumentRefusal, ArgumentValidator,
+    ArgumentValidators, OutboundRequest, PolicyRefusal, ReportLevel, ReportLine, RequestPolicy,
+    ToolkitHooks,
 };
 
 // HTTP connector (Phase 90 OAPI-01) — crate-root re-export of the headline
