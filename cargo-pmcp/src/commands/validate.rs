@@ -826,8 +826,15 @@ enum DiscoveredConfigLint {
 /// Never returns an error: every failure mode becomes
 /// [`DiscoveredConfigLint::Unreadable`], preserving `validate_deploy`'s exit-code
 /// contract.
-fn discover_server_config_lint(_project_root: &std::path::Path) -> DiscoveredConfigLint {
-    DiscoveredConfigLint::Findings(Vec::new())
+fn discover_server_config_lint(project_root: &std::path::Path) -> DiscoveredConfigLint {
+    let path = project_root.join(SERVER_CONFIG_FILE);
+    if !path.is_file() {
+        return DiscoveredConfigLint::Absent;
+    }
+    match load_server_config(&path) {
+        Ok(parsed) => DiscoveredConfigLint::Findings(render_config_lint_findings(&parsed)),
+        Err(err) => DiscoveredConfigLint::Unreadable(format!("{err:#}")),
+    }
 }
 
 /// Render a [`DiscoveredConfigLint`]. Prints NOTHING for
@@ -1145,7 +1152,7 @@ resources = ["*"]
     }
 
     #[test]
-    fn deploy_discovers_and_lints_a_toolkit_config_beside_the_deploy_document() {
+    fn validate_deploy_discovers_and_lints_a_toolkit_config_beside_it() {
         let (_dir, root) = write_deploy_project(
             BENIGN_IAM,
             Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
@@ -1175,7 +1182,7 @@ resources = ["*"]
     }
 
     #[test]
-    fn deploy_without_a_toolkit_config_reports_absent_and_stays_silent() {
+    fn validate_deploy_without_a_toolkit_config_reports_absent_and_stays_silent() {
         let (_dir, root) = write_deploy_project(BENIGN_IAM, None);
         assert!(
             matches!(
@@ -1190,7 +1197,7 @@ resources = ["*"]
     }
 
     #[test]
-    fn deploy_warns_on_a_malformed_toolkit_config_and_still_exits_zero() {
+    fn validate_deploy_warns_on_a_malformed_toolkit_config_and_still_exits_zero() {
         let (_dir, root) = write_deploy_project(BENIGN_IAM, Some("this is not = valid toml ["));
         assert!(
             matches!(
@@ -1209,7 +1216,7 @@ resources = ["*"]
     }
 
     #[test]
-    fn deploy_wildcard_allow_still_fails_with_lint_findings_present() {
+    fn validate_deploy_wildcard_allow_still_fails_with_lint_findings_present() {
         let (_dir, root) = write_deploy_project(
             WILDCARD_IAM,
             Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
