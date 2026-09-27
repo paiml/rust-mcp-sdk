@@ -99,7 +99,7 @@ pub mod progress;
 /// Runtime enforcement of a tool's declared `inputSchema` at `tools/call` time
 /// (Phase 128, D-01).
 ///
-/// The input counterpart to [`output_validation`], and deliberately a SEPARATE
+/// The input counterpart to `output_validation`, and deliberately a SEPARATE
 /// module rather than a widening of it: inputs REFUSE where outputs only warn,
 /// inputs pin Draft 2020-12 on both protocol eras where outputs keep v1's
 /// `$schema` auto-detect (D-02), and input refusals are rendered value-free
