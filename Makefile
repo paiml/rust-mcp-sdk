@@ -588,6 +588,14 @@ test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 # `default` is still `["code-mode"]`, so without naming the feature here the whole
 # file -- acceptance-matrix rows 8-11, the D1 enforcement proof -- compiles to
 # `running 0 tests` and exits 0.
+#
+# `tests/curated_path_injection.rs` (Phase 128 plan 06) is gated on the SAME pair
+# and is required below for the same reason. Note what it deliberately does NOT
+# require: `openapi-code-mode`. Its two CR-01 rows exist to prove the path
+# injection class is closed on the LIGHT, JS-engine-free curated build, so adding
+# the JS-engine feature to its gate would move them onto a build they are not
+# about. The `cargo tree -i pmcp-code-mode` check in that plan's verification is
+# the paired guard from the dependency side.
 .PHONY: test-server-toolkit
 test-server-toolkit:
 	@echo "$(BLUE)Running pmcp-server-toolkit's own tests...$(NC)"
@@ -600,7 +608,7 @@ test-server-toolkit:
 		echo "$(RED)✗ pmcp-server-toolkit reported 0 tests — the gate is not reaching this crate$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance"; \
+	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance curated_path_injection"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \
