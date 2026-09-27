@@ -505,6 +505,136 @@ fn render_one(v: &InputViolation, declared: &[&str], allowed: &str) -> String {
     }
 }
 
+// ===========================================================================
+// D4 — the ONE copy of the path-placeholder character floor.
+// ===========================================================================
+
+/// The hard upper bound on a path-placeholder value, in Unicode code points.
+///
+/// Deliberately a module CONSTANT and not a configuration value. D-08 requires
+/// the length half of the CR-01 fix to hold regardless of how D3 is configured —
+/// in particular when `default_max_length` is set to `0`, which would otherwise
+/// silently disable the "Length via two placeholders" acceptance row along with
+/// the free-text policy. A validation rule that a configuration value can switch
+/// off is the silent-hole class this phase exists to remove.
+///
+/// Counted in code points, not bytes and not grapheme clusters, so it agrees
+/// with `jsonschema`'s own `maxLength` semantics (RESEARCH Finding 1d).
+pub const PLACEHOLDER_MAX_LENGTH: usize = 256;
+
+/// The per-parameter narrowing a caller may declare on top of the floor.
+///
+/// `Default` means FLOOR-PLUS-CAP WITH NO NARROWING — all-`None` plus
+/// `allow_slash: false`. It emphatically does NOT mean "no checks": the
+/// unconditional floor and [`PLACEHOLDER_MAX_LENGTH`] still apply, which is why
+/// [`PlaceholderRules::default()`] is a safe value for a trait's default method
+/// body to return.
+///
+/// This struct is `#[non_exhaustive]`, so another crate cannot build it with a
+/// struct literal. Use [`PlaceholderRules::default()`] and the `with_*` builders:
+///
+/// ```ignore
+/// let rules = PlaceholderRules::default()
+///     .with_pattern(Some("^C[0-9]+$"))
+///     .with_max_length(Some(32));
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct PlaceholderRules<'a> {
+    /// A `pattern` declared for this parameter, which NARROWS the floor.
+    ///
+    /// Never replaces it: a spec pattern of `^.*$` accepts every CR-01 payload
+    /// (measured, RESEARCH Finding 5b), so pattern-supersedes-denylist would be a
+    /// no-op (D-10).
+    pub declared_pattern: Option<&'a str>,
+    /// A `maxLength` declared for this parameter.
+    ///
+    /// Narrows [`PLACEHOLDER_MAX_LENGTH`] further; a declared length LARGER than
+    /// the constant never widens it.
+    pub declared_max_length: Option<usize>,
+    /// Whether `/` is permitted inside this parameter's value.
+    ///
+    /// Its ONLY legitimate source is an explicit per-parameter entry in the
+    /// server's own config (D-11). An `OpenAPI` spec's `allowReserved` must never
+    /// be wired to it: a spec is third-party content baked into the package and
+    /// that keyword is widely copy-pasted without intent. Even when this is
+    /// `true`, the parent-directory sequence is refused with no escape.
+    pub allow_slash: bool,
+}
+
+impl<'a> PlaceholderRules<'a> {
+    /// Declare a narrowing `pattern`.
+    #[must_use]
+    pub fn with_pattern(mut self, pattern: Option<&'a str>) -> Self {
+        self.declared_pattern = pattern;
+        self
+    }
+
+    /// Declare a narrowing `maxLength`.
+    #[must_use]
+    pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
+        self.declared_max_length = max_length;
+        self
+    }
+
+    /// Opt this parameter in to `/` (D-11 — config only, never spec-derived).
+    #[must_use]
+    pub fn allowing_slash(mut self, allow_slash: bool) -> Self {
+        self.allow_slash = allow_slash;
+        self
+    }
+}
+
+/// Why a path-placeholder value was refused.
+///
+/// Carries the DECLARED parameter name and the DECLARED expectation only — never
+/// a byte of the rejected value, and never which character tripped the floor
+/// (naming the character would itself echo a byte of the value and turn the
+/// refusal into a one-byte oracle).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct PlaceholderRefusal {
+    /// The DECLARED parameter name, safe to echo.
+    pub param: String,
+    /// Which rule refused: `"nonEmpty"`, `"percentEncoding"`, `"characterFloor"`,
+    /// `"maxLength"`, `"pattern"`, `"segmentMaxLength"` or `"pathSegment"`.
+    pub rule: &'static str,
+    /// The DECLARED expectation, rendered value-free.
+    pub expected: String,
+}
+
+impl std::fmt::Display for PlaceholderRefusal {
+    /// Renders in the `render_scalar` house style (PATTERNS SP-1): name the
+    /// parameter, state the declared expectation, never the value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "param '{}' {}", self.param, self.expected)
+    }
+}
+
+impl std::error::Error for PlaceholderRefusal {}
+
+/// RED placeholder — accepts everything. GREEN implements the four ordered steps.
+///
+/// # Errors
+///
+/// `Err(PlaceholderRefusal)` when `value` is not a safe path-placeholder value.
+pub fn validate_path_placeholder(
+    _param: &str,
+    _value: &str,
+    _rules: &PlaceholderRules<'_>,
+) -> Result<(), PlaceholderRefusal> {
+    Ok(())
+}
+
+/// RED placeholder — accepts everything. GREEN implements the composed check.
+///
+/// # Errors
+///
+/// `Err(PlaceholderRefusal)` when the composed path is not safe.
+pub fn validate_resolved_path(_path: &str) -> Result<(), PlaceholderRefusal> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +1032,422 @@ mod tests {
     #[test]
     fn schema_validation_check_input_schema_compiles_accepts_a_well_formed_schema() {
         assert!(check_input_schema_compiles(&two_param_schema()).is_ok());
+    }
+
+    // ===================================================================
+    // Plan 02 Task 2 — the D4 character floor and the composed-path check.
+    // ===================================================================
+
+    /// The CR-01 probe payloads, verbatim from `128-CHANGE-REQUEST.md` and from
+    /// RESEARCH Finding 5b's measured `^.*$` probe.
+    const CR01_PAYLOADS: &[&str] = &[
+        "2026AA?string=x",
+        "current/../../search/current",
+        "current/../../search/current?string=x",
+        "%2e%2e%2f",
+        "%3Fstring%3Dx",
+        "a%00b",
+        "a#frag",
+    ];
+
+    #[test]
+    fn placeholder_accepts_the_cap_and_refuses_one_more() {
+        let rules = PlaceholderRules::default();
+        let at_cap = "a".repeat(PLACEHOLDER_MAX_LENGTH);
+        assert!(validate_path_placeholder("v", &at_cap, &rules).is_ok());
+
+        let over_cap = "a".repeat(PLACEHOLDER_MAX_LENGTH + 1);
+        let refusal = validate_path_placeholder("v", &over_cap, &rules)
+            .expect_err("one code point over the cap must be refused");
+        assert_eq!(refusal.rule, "maxLength");
+    }
+
+    #[test]
+    fn placeholder_counts_code_points_not_bytes() {
+        // A 256-emoji value is 1024 bytes and exactly at the cap.
+        let rules = PlaceholderRules::default();
+        let at_cap = "\u{1F600}".repeat(PLACEHOLDER_MAX_LENGTH);
+        assert_eq!(at_cap.len(), PLACEHOLDER_MAX_LENGTH * 4, "1024 bytes");
+        assert!(validate_path_placeholder("v", &at_cap, &rules).is_ok());
+    }
+
+    #[test]
+    fn placeholder_refuses_an_empty_value() {
+        let refusal = validate_path_placeholder("v", "", &PlaceholderRules::default())
+            .expect_err("an empty path segment changes the URL shape");
+        assert_eq!(refusal.rule, "nonEmpty");
+    }
+
+    #[test]
+    fn placeholder_refuses_a_bare_slash_unless_the_parameter_opts_in() {
+        assert!(
+            validate_path_placeholder("v", "/", &PlaceholderRules::default()).is_err(),
+            "`/` is denied by default"
+        );
+        let opted_in = PlaceholderRules::default().allowing_slash(true);
+        assert!(
+            validate_path_placeholder("v", "/", &opted_in).is_ok(),
+            "D-11: `/` is liftable by per-parameter CONFIG opt-in"
+        );
+    }
+
+    #[test]
+    fn placeholder_refuses_the_parent_directory_sequence_with_and_without_slash_opt_in() {
+        for allow_slash in [false, true] {
+            let rules = PlaceholderRules::default().allowing_slash(allow_slash);
+            for value in ["..", "a/../b", "%2e%2e", "%2E%2E"] {
+                assert!(
+                    validate_path_placeholder("v", value, &rules).is_err(),
+                    "traversal has NO escape even with allow_slash={allow_slash}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_every_cr01_payload() {
+        let rules = PlaceholderRules::default();
+        for payload in CR01_PAYLOADS {
+            assert!(
+                validate_path_placeholder("version", payload, &rules).is_err(),
+                "CR-01 payload must be refused: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_percent_scan_is_case_insensitive_on_hex() {
+        let rules = PlaceholderRules::default();
+        for value in ["%2e%2e%2f", "%2E%2E%2F", "%2f", "%2F", "%3f", "%3F"] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "the hex scan must be ASCII-case-insensitive: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_double_encoded_percent() {
+        let rules = PlaceholderRules::default();
+        for value in ["%252e", "%252E", "%25", "a%2525b"] {
+            let refusal = validate_path_placeholder("v", value, &rules)
+                .expect_err("`%25` must be refused outright, in any hex case");
+            assert_eq!(
+                refusal.rule, "percentEncoding",
+                "refusing `%25` up front is what BOUNDS the decode to one pass: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_a_malformed_percent_escape() {
+        let rules = PlaceholderRules::default();
+        for value in ["%zz", "%2", "%", "a%g0b"] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "a malformed escape has no legitimate use in a path value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_mixed_literal_and_encoded_traversal() {
+        // THE decode-once row. An enumerated literal-plus-encoded denylist admits
+        // both of these; decoding once does not.
+        let rules = PlaceholderRules::default();
+        for value in [".%2E", "%2E.", ".%2e", "%2e."] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "step 1 was implemented as an enumeration, not as decode-once: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_backslash_in_literal_and_encoded_form() {
+        let rules = PlaceholderRules::default();
+        for value in ["\\", "..\\", "a\\b", "%5c", "%5C"] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "reverse proxies normalize `\\` toward `/`: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_carriage_return_and_line_feed_in_both_forms() {
+        let rules = PlaceholderRules::default();
+        for value in ["a\rb", "a\nb", "a%0db", "a%0Db", "a%0ab", "a%0Ab", "a\tb"] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "a control character in a path is response-splitting surface: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_refuses_a_bare_single_dot() {
+        let rules = PlaceholderRules::default();
+        for value in [".", "%2e", "%2E"] {
+            assert!(
+                validate_path_placeholder("v", value, &rules).is_err(),
+                "two adjacent single dots compose to traversal: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_floor_runs_before_a_permissive_declared_pattern() {
+        // D-10, empirically justified: `^.*$` accepts every CR-01 payload
+        // (RESEARCH Finding 5b), so pattern-supersedes-floor would be a no-op.
+        let rules = PlaceholderRules::default().with_pattern(Some("^.*$"));
+        for payload in CR01_PAYLOADS {
+            assert!(
+                validate_path_placeholder("version", payload, &rules).is_err(),
+                "a permissive declared pattern must not relax the floor: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_declared_pattern_narrows() {
+        let rules = PlaceholderRules::default().with_pattern(Some("^C[0-9]+$"));
+        assert!(validate_path_placeholder("cui", "C0018787", &rules).is_ok());
+        let refusal = validate_path_placeholder("cui", "ABC", &rules)
+            .expect_err("the declared pattern must narrow");
+        assert_eq!(refusal.rule, "pattern");
+    }
+
+    #[test]
+    fn placeholder_refuses_a_declared_pattern_that_does_not_compile() {
+        let rules = PlaceholderRules::default().with_pattern(Some("^[A-Z"));
+        let refusal = validate_path_placeholder("cui", "C1", &rules)
+            .expect_err("a non-compiling declared pattern must refuse, never pass everything");
+        assert_eq!(refusal.rule, "pattern");
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("cui"), "must name the param: {rendered}");
+        assert!(
+            !rendered.contains("C1"),
+            "must not echo the value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn placeholder_declared_max_length_never_widens_the_module_cap() {
+        let rules = PlaceholderRules::default().with_max_length(Some(512));
+        let value = "a".repeat(300);
+        let refusal = validate_path_placeholder("v", &value, &rules)
+            .expect_err("the module constant is the HARD cap");
+        assert_eq!(refusal.rule, "maxLength");
+    }
+
+    #[test]
+    fn placeholder_declared_max_length_narrows_further() {
+        let rules = PlaceholderRules::default().with_max_length(Some(8));
+        assert!(validate_path_placeholder("v", "12345678", &rules).is_ok());
+        let refusal = validate_path_placeholder("v", "123456789", &rules)
+            .expect_err("the declared length narrows the cap");
+        assert_eq!(refusal.rule, "maxLength");
+    }
+
+    #[test]
+    fn placeholder_refusals_name_the_param_and_never_echo_the_value() {
+        let rules = PlaceholderRules::default().with_max_length(Some(4));
+        let values = [
+            "",
+            "2026AA?string=x",
+            "current/../../search/current",
+            "%252e",
+            "%zz",
+            "\\",
+            ".",
+            "aaaaaaaaaa",
+        ];
+        for value in values {
+            let refusal = validate_path_placeholder("version", value, &rules)
+                .expect_err("every one of these is refused");
+            let rendered = refusal.to_string();
+            assert!(
+                rendered.contains("version"),
+                "must name the declared param: {rendered}"
+            );
+            if !value.is_empty() {
+                assert!(
+                    !rendered.contains(value),
+                    "refusal echoed the rejected value {value:?}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placeholder_default_rules_are_floored_and_capped_never_permissive() {
+        let rules = PlaceholderRules::default();
+        assert!(rules.declared_pattern.is_none());
+        assert!(rules.declared_max_length.is_none());
+        assert!(!rules.allow_slash);
+        // `Clone` is required by plan 08's owned-rules construction.
+        let cloned = rules.clone();
+        for payload in CR01_PAYLOADS {
+            assert!(
+                validate_path_placeholder("v", payload, &cloned).is_err(),
+                "`PlaceholderRules::default()` must be floored and capped: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_declared_pattern_compiles_once_per_pattern() {
+        // Observe the MEMO, not the wall clock: a second lookup of the same schema
+        // text must hand back the SAME `Arc`, which is only true on a cache hit.
+        // This is what makes T-128-10's memoization claim checkable.
+        let compiling = json!({ "type": "string", "pattern": "^C[0-9]+$" });
+        let first = cached_input_validator(&compiling, None).expect("compiles");
+        let second = cached_input_validator(&compiling, None).expect("compiles");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second lookup recompiled instead of hitting the cache"
+        );
+
+        let broken = json!({ "type": "string", "pattern": "^[A-Z" });
+        let first_err = cached_input_validator(&broken, None).expect_err("does not compile");
+        let second_err = cached_input_validator(&broken, None).expect_err("does not compile");
+        assert!(
+            Arc::ptr_eq(&first_err, &second_err),
+            "a compile FAILURE must be cached too, or a broken declared pattern is \
+             recompiled on every request"
+        );
+
+        let rules = PlaceholderRules::default().with_pattern(Some("^[A-Z"));
+        let one = validate_path_placeholder("cui", "C1", &rules)
+            .expect_err("a broken pattern refuses")
+            .to_string();
+        let two = validate_path_placeholder("cui", "C1", &rules)
+            .expect_err("a broken pattern refuses")
+            .to_string();
+        assert_eq!(one, two, "refusals must be byte-identical across calls");
+    }
+
+    #[test]
+    fn placeholder_operates_on_the_rendered_string_not_a_json_value() {
+        // A non-string argument is rendered to a string by the CALLER
+        // (`render_scalar`) and the RENDERED string is what the floor and the cap
+        // see — which is why this primitive takes `&str` and never a `Value`.
+        let rules = PlaceholderRules::default();
+        for rendered in ["42", "true", "null", "1.5"] {
+            assert!(
+                validate_path_placeholder("v", rendered, &rules).is_ok(),
+                "a rendered scalar is an ordinary value: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_is_a_pure_function_safe_under_concurrency() {
+        // D4 concurrency edge: no shared mutable state of its own, so two Code
+        // Mode calls on one executor cannot interleave placeholder state. The
+        // validator cache behind the declared-pattern step is the only shared
+        // state and it is a `Mutex<HashMap<…>>`.
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    let rules = PlaceholderRules::default().with_pattern(Some("^C[0-9]+$"));
+                    let good = format!("C{worker}");
+                    assert!(validate_path_placeholder("cui", &good, &rules).is_ok());
+                    assert!(validate_path_placeholder("cui", "../etc", &rules).is_err());
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no worker panicked");
+        }
+    }
+
+    #[test]
+    fn resolved_path_refuses_a_segment_over_the_cap_composed_from_two_passing_values() {
+        // The adjacency proof: 180 + 200 code points compose to a 380-code-point
+        // segment, and NEITHER part alone exceeds the cap.
+        let rules = PlaceholderRules::default();
+        let a = "a".repeat(180);
+        let b = "b".repeat(200);
+        assert!(validate_path_placeholder("a", &a, &rules).is_ok());
+        assert!(validate_path_placeholder("b", &b, &rules).is_ok());
+
+        let composed = format!("/search/{a}{b}");
+        let refusal = validate_resolved_path(&composed)
+            .expect_err("the composed segment is over the cap even though each value passed");
+        assert_eq!(refusal.rule, "segmentMaxLength");
+    }
+
+    #[test]
+    fn resolved_path_refuses_a_traversal_segment_composed_from_two_single_dots() {
+        // `.` + `.` composes to `..` — traversal from two values neither of which
+        // contains the sequence. Closed at BOTH layers.
+        let rules = PlaceholderRules::default();
+        assert!(
+            validate_path_placeholder("a", ".", &rules).is_err(),
+            "the single-dot floor closes this at the value layer"
+        );
+        let refusal = validate_resolved_path("/x/..")
+            .expect_err("the composed segment is the parent-directory sequence");
+        assert_eq!(refusal.rule, "pathSegment");
+    }
+
+    #[test]
+    fn resolved_path_refuses_a_residual_placeholder_brace() {
+        for path in ["/x/{unsubstituted}", "/x/}", "/x/{"] {
+            assert!(
+                validate_resolved_path(path).is_err(),
+                "an unsubstituted placeholder must never reach the wire: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_refuses_an_empty_interior_segment_and_accepts_a_clean_path() {
+        assert!(validate_resolved_path("/a//b").is_err(), "empty interior");
+        assert!(validate_resolved_path("/a/b/").is_err(), "empty trailing");
+        assert!(validate_resolved_path("/a/b").is_ok(), "a clean path");
+        assert!(validate_resolved_path("/content/current/CUI/C0018787").is_ok());
+    }
+
+    #[test]
+    fn resolved_path_refuses_encoded_traversal_after_decode_once() {
+        for path in ["/a/%2e%2e/b", "/a/%2E%2E/b", "/a/%252e%252e/b", "/a/%zz/b"] {
+            assert!(
+                validate_resolved_path(path).is_err(),
+                "decode-once must reach this: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_refuses_query_and_fragment_markers_and_control_bytes() {
+        for path in ["/a?b=c", "/a#frag", "/a%3Fb", "/a\\b", "/a%00b", "/a\nb"] {
+            assert!(
+                validate_resolved_path(path).is_err(),
+                "must be refused anywhere in the composed path: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_path_refuses_a_single_dot_segment() {
+        assert!(validate_resolved_path("/a/./b").is_err());
+        assert!(validate_resolved_path("/a/%2e/b").is_err());
+    }
+
+    #[test]
+    fn resolved_path_refusal_names_the_position_not_a_caller_supplied_name() {
+        let refusal = validate_resolved_path("/x/../secret").expect_err("traversal");
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains("path segment"),
+            "the composed check is param-agnostic: {rendered}"
+        );
+        assert!(
+            !rendered.contains("secret"),
+            "must not echo the composed path: {rendered}"
+        );
     }
 }
