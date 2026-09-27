@@ -268,6 +268,20 @@ fn cached_input_validator(
         .clone()
 }
 
+/// Check that `schema` compiles as a Draft 2020-12 input schema (SC-2's
+/// config-time gate).
+///
+/// RED placeholder: accepts every schema. The GREEN commit compiles `schema`
+/// through `compile_input_2020_12` and projects the compile error's own
+/// `schema_path` into the returned violation.
+///
+/// # Errors
+///
+/// `Err(InputViolation)` when `schema` does not compile.
+pub fn check_input_schema_compiles(_schema: &Value) -> Result<(), InputViolation> {
+    Ok(())
+}
+
 /// Render `violations` as ONE client-facing refusal message.
 ///
 /// `declared` is the tool's declared parameter names, in declaration order; it is
@@ -412,5 +426,295 @@ mod tests {
             "0.49.2 error iteration order is deterministic, so refusals must be stable"
         );
         assert!(!first.is_empty(), "a refusal must never render empty");
+    }
+
+    // ===================================================================
+    // Plan 02 Task 1 — every `ValidationErrorKind` arm this phase can emit.
+    // ===================================================================
+
+    /// A one-property object schema, so each arm can be exercised in isolation.
+    fn one_prop(property: Value) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "p": property },
+            "additionalProperties": false,
+        })
+    }
+
+    /// Refuse `args` against `schema` and render the client-facing message.
+    fn refusal_for(schema: &Value, args: &Value, declared: &[&str]) -> String {
+        let violations =
+            validate_input(schema, Some(args), None).expect_err("the pair must be refused");
+        render_refusal(&violations, declared)
+    }
+
+    #[test]
+    fn schema_validation_max_length_refusal_names_the_limit_not_the_value() {
+        let schema = one_prop(json!({ "type": "string", "maxLength": 8 }));
+        let value = "x".repeat(5000);
+        let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+        assert!(msg.contains('8'), "must carry the declared limit: {msg}");
+        assert!(
+            !msg.contains(&"x".repeat(10)),
+            "must not echo the rejected value: {msg}"
+        );
+        assert!(!msg.contains(&value), "must not echo the value: {msg}");
+    }
+
+    #[test]
+    fn schema_validation_enum_refusal_lists_declared_options_only() {
+        let schema = one_prop(json!({ "enum": ["exact", "words"] }));
+        let value = "Jane Doe DOB 1970-01-01";
+        let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+        assert!(msg.contains("exact"), "must list declared options: {msg}");
+        assert!(msg.contains("words"), "must list declared options: {msg}");
+        assert!(!msg.contains(value), "must not echo the value: {msg}");
+    }
+
+    #[test]
+    fn schema_validation_pattern_refusal_names_the_declared_pattern() {
+        let schema = one_prop(json!({ "type": "string", "pattern": "^C[0-9]+$" }));
+        let value = "Jane Doe DOB 1970-01-01";
+        let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+        assert!(
+            msg.contains("^C[0-9]+$"),
+            "must name the declared pattern: {msg}"
+        );
+        assert!(!msg.contains(value), "must not echo the value: {msg}");
+    }
+
+    #[test]
+    fn schema_validation_bound_refusals_name_the_declared_bound_only() {
+        let cases: &[(Value, Value, &str)] = &[
+            (
+                json!({ "type": "integer", "maximum": 10 }),
+                json!(4242),
+                "10",
+            ),
+            (json!({ "type": "integer", "minimum": 10 }), json!(-7), "10"),
+            (
+                json!({ "type": "string", "minLength": 4 }),
+                json!("ab"),
+                "4",
+            ),
+            (
+                json!({ "type": "array", "maxItems": 2 }),
+                json!(["a", "b", "c"]),
+                "2",
+            ),
+        ];
+        for (property, value, declared_bound) in cases {
+            let schema = one_prop(property.clone());
+            let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+            assert!(
+                msg.contains(declared_bound),
+                "must name the declared bound {declared_bound}: {msg}"
+            );
+            assert!(
+                !msg.contains(&value.to_string()),
+                "must not echo the rejected value: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_type_refusal_names_the_declared_type_only() {
+        let schema = one_prop(json!({ "type": "integer" }));
+        let msg = refusal_for(&schema, &json!({ "p": "Jane Doe" }), &["p"]);
+        assert!(
+            msg.contains("integer"),
+            "must name the declared type: {msg}"
+        );
+        assert!(!msg.contains("Jane Doe"), "must not echo the value: {msg}");
+    }
+
+    #[test]
+    fn schema_validation_format_refusal_names_the_declared_format_only() {
+        // Q1: inputs compile through a format-ASSERTING builder, so `format` is a
+        // kind this phase actively produces and must render value-free.
+        let schema = one_prop(json!({ "type": "string", "format": "uri" }));
+        let value = "!!!not-a-uri!!!";
+        let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+        assert!(msg.contains("uri"), "must name the declared format: {msg}");
+        assert!(!msg.contains(value), "must not echo the value: {msg}");
+    }
+
+    #[test]
+    fn schema_validation_required_refusal_names_the_declared_property() {
+        let schema = two_param_schema();
+        let msg = refusal_for(
+            &schema,
+            &json!({ "version": "2026AA" }),
+            &["cui", "version"],
+        );
+        assert!(
+            msg.contains("cui"),
+            "must name the declared required property: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_additional_properties_refusal_carries_a_count_and_no_keys() {
+        let schema = two_param_schema();
+        let msg = refusal_for(
+            &schema,
+            &json!({ "cui": "C1", "apiKey": "secret", "Jane Doe DOB 1970-01-01": "x" }),
+            &["cui", "version"],
+        );
+        assert!(msg.contains('2'), "must carry the count 2: {msg}");
+        assert!(msg.contains("cui"), "must name the allow-list: {msg}");
+        assert!(msg.contains("version"), "must name the allow-list: {msg}");
+        assert!(!msg.contains("apiKey"), "must not echo a key: {msg}");
+        assert!(
+            !msg.contains("Jane Doe"),
+            "must not echo a caller key: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_empty_rejected_value_refusal_is_value_free() {
+        let schema = one_prop(json!({ "type": "string", "minLength": 3 }));
+        let msg = refusal_for(&schema, &json!({ "p": "" }), &["p"]);
+        assert!(msg.contains('3'), "must name the declared minimum: {msg}");
+        assert!(
+            msg.contains("at least"),
+            "must state the declared expectation: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_astral_and_combining_value_never_reaches_the_refusal() {
+        // `maxLength` counts code points (RESEARCH Finding 1d): 4 emoji + a
+        // decomposed `é` is over a cap of 3.
+        let schema = one_prop(json!({ "type": "string", "maxLength": 3 }));
+        let value = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}e\u{0301}";
+        let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
+        for ch in value.chars() {
+            assert!(
+                !msg.contains(ch),
+                "code point {ch:?} from the rejected value reached the refusal: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_validation_array_form_items_schema_refuses_with_a_schema_keyword() {
+        // Draft-07 array-form `items` does not compile under the 2020-12 pin
+        // (RESEARCH Finding 1h): a drifted declaration must REFUSE, value-free.
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": { "tags": { "type": "array", "items": [ { "type": "string" } ] } },
+        });
+        let violations = validate_input(&schema, Some(&json!({ "tags": ["a"] })), None)
+            .expect_err("a non-compiling declared schema must refuse every call");
+        assert_eq!(violations.len(), 1, "exactly one schema violation");
+        assert_eq!(violations[0].keyword, "schema");
+        let msg = render_refusal(&violations, &["tags"]);
+        assert!(
+            !msg.contains("type"),
+            "the compile detail is logged server-side, never rendered: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_pattern_properties_key_never_reaches_the_refusal() {
+        // `patternProperties` names the CALLER's key in the instance pointer, so a
+        // raw `instance_path()` copy would leak it (Codex HIGH / T-128-08a).
+        let schema = json!({
+            "type": "object",
+            "patternProperties": { "^.*$": { "type": "integer" } },
+        });
+        let args = json!({ "Jane Doe DOB 1970-01-01": "x" });
+        let violations =
+            validate_input(&schema, Some(&args), None).expect_err("a string is not an integer");
+        // The POINTER itself must be sanitized, not merely suppressed by
+        // `render_refusal`: `InputViolation` is public and its `pointer` reaches
+        // logs, execution records and third-party renderers.
+        assert!(
+            !violations[0].pointer.contains("Jane Doe"),
+            "a caller-chosen property name reached `InputViolation::pointer`: {}",
+            violations[0].pointer
+        );
+        let msg = render_refusal(&violations, &["p"]);
+        assert!(
+            !msg.contains("Jane Doe"),
+            "a caller-chosen property name reached the refusal: {msg}"
+        );
+        assert!(
+            !msg.contains("1970-01-01"),
+            "a caller-chosen property name reached the refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_additional_properties_subschema_key_never_reaches_the_refusal() {
+        // `additionalProperties` as a SUBSCHEMA (not `false`) also puts the
+        // caller's key in the pointer.
+        let schema = json!({
+            "type": "object",
+            "properties": { "cui": { "type": "string" } },
+            "additionalProperties": { "type": "integer" },
+        });
+        let args = json!({ "Jane Doe DOB 1970-01-01": "x" });
+        let violations =
+            validate_input(&schema, Some(&args), None).expect_err("a string is not an integer");
+        assert!(
+            !violations[0].pointer.contains("Jane Doe"),
+            "a caller-chosen property name reached `InputViolation::pointer`: {}",
+            violations[0].pointer
+        );
+        let msg = render_refusal(&violations, &["cui"]);
+        assert!(
+            !msg.contains("Jane Doe"),
+            "a caller-chosen property name reached the refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_declared_property_pointer_survives_the_projection() {
+        // The redaction must not be a blanket suppression: a DECLARED name is
+        // still what makes a refusal actionable for the legitimate caller.
+        let schema = one_prop(json!({ "type": "string", "maxLength": 2 }));
+        let violations = validate_input(&schema, Some(&json!({ "p": "abc" })), None)
+            .expect_err("over the declared maxLength");
+        assert_eq!(violations[0].pointer, "/p", "declared names stay verbatim");
+    }
+
+    #[test]
+    fn schema_validation_declared_array_index_pointer_survives_the_projection() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "items": { "type": "string", "maxLength": 2 } },
+            },
+        });
+        let violations = validate_input(&schema, Some(&json!({ "tags": ["ok", "toolong"] })), None)
+            .expect_err("the second item is over the declared maxLength");
+        assert_eq!(
+            violations[0].pointer, "/tags/1",
+            "a base-10 array index carries no caller-chosen text"
+        );
+    }
+
+    #[test]
+    fn schema_validation_check_input_schema_compiles_names_the_offending_property_path() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "bad": { "type": "string", "pattern": "^[A-Z" } },
+        });
+        let violation = check_input_schema_compiles(&schema)
+            .expect_err("a nested non-compiling `pattern` must be caught at config time");
+        assert_eq!(violation.keyword, "schema");
+        assert!(
+            violation.pointer.contains("bad"),
+            "the pointer must name the offending property path: {}",
+            violation.pointer
+        );
+    }
+
+    #[test]
+    fn schema_validation_check_input_schema_compiles_accepts_a_well_formed_schema() {
+        assert!(check_input_schema_compiles(&two_param_schema()).is_ok());
     }
 }
