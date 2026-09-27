@@ -234,7 +234,7 @@ fn enforce_input_schema(
     {
         // Phase 128 E2 — the registry lookup that replaced plan 03's
         // `let has_registered_validator = false;` placeholder.
-        let registered_validator = hooks.validator_for(&decl.name);
+        let registered_validator = hooks.argument_validator_for(&decl.name);
         if !validation.enforce_input_schema && registered_validator.is_none() {
             tracing::warn!(
                 tool = %decl.name,

@@ -493,8 +493,18 @@ impl ToolkitHooks {
     }
 
     /// The [`ArgumentValidator`] registered for `tool`, if any.
+    ///
+    /// Named `argument_validator_for` and NOT `validator_for`: the root crate's
+    /// `tests/v2_schema_tripwires.rs` scans every workspace source file for the
+    /// token `validator_for(` as the signature of a `jsonschema` validator being
+    /// constructed, and requires each site to declare its dialect policy. A method
+    /// with that name here — and every call to it — would fire that security
+    /// tripwire on code that has nothing to do with JSON Schema dialects, and the
+    /// only ways out would be to bloat a dialect allowlist with non-dialect entries
+    /// or to re-fire on every future call site. Measured: the short name failed the
+    /// tripwire with two UNKNOWN sites.
     #[must_use]
-    pub fn validator_for(&self, tool: &str) -> Option<Arc<dyn ArgumentValidator>> {
+    pub fn argument_validator_for(&self, tool: &str) -> Option<Arc<dyn ArgumentValidator>> {
         self.validators.get(tool)
     }
 
@@ -830,7 +840,7 @@ mod tests {
         let hooks = ToolkitHooks::default();
         assert!(hooks.is_empty());
         assert!(hooks.request_policy().is_none());
-        assert!(hooks.validator_for("anything").is_none());
+        assert!(hooks.argument_validator_for("anything").is_none());
         assert!(hooks.validator_names().is_empty());
     }
 
