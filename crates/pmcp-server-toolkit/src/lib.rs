@@ -48,6 +48,7 @@ pub mod config;
 pub mod env_ref;
 
 pub mod error;
+pub mod policy;
 pub mod prompts;
 pub mod resources;
 pub mod secrets;
@@ -158,6 +159,21 @@ pub use crate::builder_ext::ServerBuilderExt;
 // (pmcp-server-toolkit 0.2.0) once the first real connector validates the
 // contract. `MockSqlConnector` stays `pub(crate)` — it's test-only.
 pub use crate::sql::{ConnectorError, Dialect, SqlConnector};
+
+// Phase 128 E1/E2 escape hatches — the FULL registration surface at the crate
+// root, deliberately not feature-gated. A toolkit example's imports are ONE
+// crate-root block (D-15), and this is the re-export that keeps it so: if an
+// example cannot name `RequestPolicy` this way the fix is here, never a
+// module-path-qualified import in the example.
+//
+// `policy` carries no `#[cfg]` because `ToolkitHooks` is a parameter of the
+// always-present `ServerBuilderExt::try_tools_from_config_with`; gating it on
+// `http` would make the registration surface exist only in HTTP builds while the
+// E2 half has nothing to do with HTTP.
+pub use crate::policy::{
+    ArgumentRefusal, ArgumentValidator, ArgumentValidators, OutboundRequest, PolicyRefusal,
+    RequestPolicy, ToolkitHooks,
+};
 
 // HTTP connector (Phase 90 OAPI-01) — crate-root re-export of the headline
 // types, mirroring the SQL connector re-export. Feature-gated on `http`.

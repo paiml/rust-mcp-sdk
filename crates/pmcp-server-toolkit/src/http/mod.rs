@@ -33,6 +33,7 @@
 #![allow(clippy::doc_markdown)]
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Authentication providers for OUTGOING HTTP requests (OAPI-03 / D-05).
@@ -178,6 +179,54 @@ pub trait HttpConnector: Send + Sync + 'static {
 
     /// The configured base URL (analog of `SqlConnector::dialect()`).
     fn base_url(&self) -> &str;
+
+    /// Execute `operation` on behalf of the MCP tool named `tool` (Phase 128 E1).
+    ///
+    /// The tool name is the one thing an `Operation` cannot carry — it describes an
+    /// endpoint, not a tool — and an E1 [`crate::policy::RequestPolicy`] that keys
+    /// on the tool needs it. The synthesized single-call handler calls THIS method;
+    /// the default body delegates to [`execute`](HttpConnector::execute), so an
+    /// out-of-repo implementation compiles unchanged and simply reports no tool.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](HttpConnector::execute).
+    async fn execute_for_tool(
+        &self,
+        tool: &str,
+        operation: &Operation,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpConnectorError> {
+        let _ = tool;
+        self.execute(operation, args).await
+    }
+
+    /// Whether this connector consults an E1 policy before sending (Phase 128).
+    ///
+    /// Default `false`. Overridden by [`crate::http::HttpClient`]. It exists so a
+    /// registered-but-unreached policy cannot look registered: the wiring that
+    /// attaches one lives in a different crate
+    /// (`pmcp-openapi-server`'s `build_server`) and the connector is an
+    /// `Arc<dyn HttpConnector>` by then, so the only way to PROVE the attachment
+    /// took is to ask through the trait.
+    fn has_request_policy(&self) -> bool {
+        false
+    }
+
+    /// A clone of this connector that consults `policy` before every outbound
+    /// request (Phase 128 E1), or `None` when the implementation cannot host one.
+    ///
+    /// `None` is the default, and a caller that holds a policy MUST treat `None`
+    /// as a hard problem rather than a silent no-op — a policy the operator
+    /// registered and the connector never consults is precisely the
+    /// present-but-inert defect this phase exists to close.
+    fn governed(
+        &self,
+        policy: Arc<dyn crate::policy::RequestPolicy>,
+    ) -> Option<Arc<dyn HttpConnector>> {
+        let _ = policy;
+        None
+    }
 }
 
 #[cfg(test)]

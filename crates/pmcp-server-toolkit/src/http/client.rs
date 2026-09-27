@@ -71,6 +71,12 @@ pub struct HttpClient {
     base_url: url::Url,
     auth: Arc<dyn HttpAuthProvider>,
     http_config: HttpConfig,
+    /// The E1 outbound-request policy, when one was registered (Phase 128).
+    ///
+    /// `None` on every client built by [`HttpClient::new`], which is what keeps
+    /// that constructor's signature unchanged and what keeps a server that
+    /// registers no policy allocating nothing extra on the request path.
+    policy: Option<Arc<dyn crate::policy::RequestPolicy>>,
 }
 
 impl HttpClient {
@@ -106,7 +112,20 @@ impl HttpClient {
             base_url,
             auth,
             http_config,
+            policy: None,
         })
+    }
+
+    /// Attach the E1 [`crate::policy::RequestPolicy`] consulted before every
+    /// outbound request (Phase 128).
+    ///
+    /// Cheap clone-with-builder, the same shape as
+    /// `HttpCodeExecutor::with_inbound_token`. Neither [`HttpClient::new`] nor
+    /// [`HttpClient::with_config`] changed signature.
+    #[must_use]
+    pub fn with_request_policy(mut self, policy: Arc<dyn crate::policy::RequestPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// Build a client from an [`HttpConfig`], constructing the reqwest client with
@@ -1302,6 +1321,297 @@ mod tests {
         assert!(
             !rendered.contains("http://"),
             "status error must not echo the URL"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 E1 — the curated surface's outbound-policy seam.
+//
+// A SIBLING of `mod tests` at the `client` module level, like `placeholder_floor`
+// and `query_separator` above, so the `--lib http::client` filter selects it while
+// it keeps access to the private `HttpClient` internals.
+// -----------------------------------------------------------------------------
+
+/// The E1 hook on the curated single-call surface: it must run before auth and
+/// before the send.
+#[cfg(test)]
+mod request_policy_seam {
+    use super::{HttpClient, HttpConfig, HttpConnectorError};
+    use crate::http::auth::HttpAuthProvider;
+    use crate::http::{HttpConnector, Operation, Parameter, ParameterLocation};
+    use crate::policy::{OutboundRequest, PolicyRefusal, RequestPolicy};
+    use async_trait::async_trait;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// An auth provider that RECORDS whether it was invoked, so a refusal test can
+    /// prove the policy ran BEFORE auth rather than merely before the send.
+    struct RecordingAuth {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HttpAuthProvider for RecordingAuth {
+        async fn apply(
+            &self,
+            headers: &mut HeaderMap,
+            _query: &mut HashMap<String, String>,
+            _inbound_token: Option<&str>,
+        ) -> Result<(), HttpConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+            Ok(())
+        }
+    }
+
+    /// One recorded `OutboundRequest`: `(tool, path, query, body)`.
+    type Seen = Arc<Mutex<Vec<(String, String, Vec<(String, String)>, Option<String>)>>>;
+
+    /// Records every request it is shown, then allows or refuses.
+    struct Recorder {
+        seen: Seen,
+        refuse: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl RequestPolicy for Recorder {
+        async fn check(&self, req: &OutboundRequest<'_>) -> Result<(), PolicyRefusal> {
+            self.seen.lock().expect("lock").push((
+                req.tool.to_string(),
+                req.path.to_string(),
+                req.query.to_vec(),
+                req.body.map(ToString::to_string),
+            ));
+            match self.refuse {
+                Some(msg) => Err(PolicyRefusal::new(msg)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn op() -> Operation {
+        Operation {
+            method: "GET".to_string(),
+            path: "/users/{id}".to_string(),
+            parameters: vec![
+                Parameter::new("id", ParameterLocation::Path, true),
+                Parameter::new("q", ParameterLocation::Query, false),
+            ],
+            has_request_body: false,
+            base_url: None,
+        }
+    }
+
+    /// A client over `base_url` carrying `policy`, a recording auth provider, and
+    /// ZERO retries (so a refusal test cannot be confused by a retry loop).
+    fn client(
+        base_url: String,
+        policy: Option<Arc<dyn RequestPolicy>>,
+    ) -> (HttpClient, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(RecordingAuth {
+            calls: Arc::clone(&calls),
+        });
+        let cfg = HttpConfig {
+            retries: 0,
+            ..HttpConfig::default()
+        };
+        let c = HttpClient::with_config(reqwest::Client::new(), base_url, auth, cfg)
+            .expect("client builds");
+        let c = match policy {
+            Some(p) => c.with_request_policy(p),
+            None => c,
+        };
+        (c, calls)
+    }
+
+    fn recorder(refuse: Option<&'static str>) -> (Arc<Recorder>, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+                refuse,
+            }),
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_refusing_policy_stops_the_request_before_auth_and_before_the_send() {
+        use wiremock::MockServer;
+        // No mock is mounted: any request that escapes the policy 404s, so a
+        // false GREEN here cannot masquerade as success.
+        let server = MockServer::start().await;
+        let (policy, _seen) = recorder(Some("refused by test policy"));
+        let (client, auth_calls) = client(server.uri(), Some(policy));
+
+        let err = client
+            .execute(&op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect_err("the policy refuses");
+
+        assert_eq!(
+            err.to_string(),
+            "http backend error: refused by test policy",
+            "the refusal must carry the policy's own message"
+        );
+        assert_eq!(
+            auth_calls.load(Ordering::SeqCst),
+            0,
+            "the auth provider must NOT have been invoked — the hook is before auth"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        assert!(requests.is_empty(), "a refusal must send nothing");
+    }
+
+    #[tokio::test]
+    async fn the_same_refused_call_twice_is_identical_and_sends_nothing() {
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        let (policy, _seen) = recorder(Some("refused by test policy"));
+        let (client, _auth) = client(server.uri(), Some(policy));
+
+        let first = client
+            .execute(&op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect_err("refuses");
+        let second = client
+            .execute(&op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect_err("refuses again");
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_allowing_policy_lets_the_request_through_and_auth_is_applied() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/42"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let (policy, _seen) = recorder(None);
+        let (client, auth_calls) = client(server.uri(), Some(policy));
+        let out = client
+            .execute(&op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect("allowed");
+        assert_eq!(out["ok"], true);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_policy_sees_the_resolved_path_and_the_query_pairs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (policy, seen) = recorder(None);
+        let (client, _auth) = client(server.uri(), Some(policy));
+        client
+            .execute(&op(), &serde_json::json!({ "id": "42", "q": "hay" }))
+            .await
+            .expect("allowed");
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1, "exactly one invocation per logical request");
+        let (_tool, observed_path, query, body) = &seen[0];
+        assert!(
+            observed_path.ends_with("/users/42"),
+            "the policy must see the SUBSTITUTED path, got {observed_path}"
+        );
+        assert!(
+            !observed_path.contains('{'),
+            "the policy must never see the template"
+        );
+        assert_eq!(query.as_slice(), &[("q".to_string(), "hay".to_string())]);
+        assert!(body.is_none(), "a GET carries no body");
+    }
+
+    #[tokio::test]
+    async fn no_policy_behaves_exactly_as_before() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let (client, auth_calls) = client(server.uri(), None);
+        assert!(!client.has_request_policy());
+        let out = client
+            .execute(&op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect("succeeds");
+        assert_eq!(out["ok"], true);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_policy_is_told_which_tool_the_call_came_from() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (policy, seen) = recorder(None);
+        let (client, _auth) = client(server.uri(), Some(policy));
+        client
+            .execute_for_tool("get_user", &op(), &serde_json::json!({ "id": "42" }))
+            .await
+            .expect("allowed");
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "get_user");
+    }
+
+    #[test]
+    fn a_governed_connector_reports_its_policy_through_the_dyn_trait() {
+        let (policy, _seen) = recorder(None);
+        let (client, _auth) = client("https://example.test".to_string(), None);
+        let bare: Arc<dyn HttpConnector> = Arc::new(client);
+        assert!(
+            !bare.has_request_policy(),
+            "a bare connector carries no policy"
+        );
+        let governed = bare
+            .governed(policy)
+            .expect("HttpClient supports policy attachment");
+        assert!(
+            governed.has_request_policy(),
+            "a registered policy must be observable on the dyn connector, or it could \
+             look registered while never running"
         );
     }
 }

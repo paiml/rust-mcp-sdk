@@ -862,6 +862,21 @@ pub struct HttpCodeExecutor {
     /// cloned. Read ONLY by
     /// [`placeholder_rules`](pmcp_code_mode::HttpExecutor::placeholder_rules).
     schema: Option<Arc<crate::http::OpenApiSchema>>,
+    /// The E1 outbound-request policy, when one was registered (Phase 128).
+    ///
+    /// `None` on every executor built by [`HttpCodeExecutor::new`], which keeps
+    /// that constructor's signature unchanged and keeps the no-policy request
+    /// path allocation-free.
+    policy: Option<Arc<dyn crate::policy::RequestPolicy>>,
+    /// The MCP tool this executor serves, for [`crate::policy::OutboundRequest`]'s
+    /// `tool` field (Phase 128 E1).
+    ///
+    /// `HttpExecutor::execute_request` is a `pmcp-code-mode` trait method and
+    /// carries no tool name, so the label is attached where a PER-TOOL executor is
+    /// minted: a script tool's own `[[tools]]` `name` at synthesis, and
+    /// `execute_code` for the generic Code Mode tool. `Arc<str>` because the
+    /// executor is cloned per request.
+    tool_label: Option<Arc<str>>,
 }
 
 #[cfg(feature = "openapi-code-mode")]
@@ -882,7 +897,57 @@ impl HttpCodeExecutor {
             auth,
             inbound_token: None,
             schema: None,
+            policy: None,
+            tool_label: None,
         }
+    }
+
+    /// Label this executor with the MCP tool it serves, so an E1 policy is told
+    /// which `tools/call` an outbound request came from (Phase 128).
+    ///
+    /// Attach it where a PER-TOOL executor is minted — `ScriptToolHandler::new`
+    /// for a script tool, `code_mode_http_tools_from_executor` for `execute_code`.
+    /// On the Code Mode surface one `tools/call` may issue many outbound requests
+    /// and they all carry this same label.
+    #[must_use]
+    pub fn with_tool_label(mut self, tool: impl AsRef<str>) -> Self {
+        self.tool_label = Some(Arc::from(tool.as_ref()));
+        self
+    }
+
+    /// The MCP tool this executor serves, or `""` when it carries no label (a
+    /// caller driving the executor directly, with no tool to name).
+    #[must_use]
+    pub fn tool_label(&self) -> &str {
+        self.tool_label.as_deref().unwrap_or("")
+    }
+
+    /// Attach the E1 [`crate::policy::RequestPolicy`] consulted before every
+    /// outbound request this executor makes (Phase 128).
+    ///
+    /// Cheap clone-with-builder, the same shape as
+    /// [`with_inbound_token`](Self::with_inbound_token).
+    ///
+    /// # Call it BEFORE the executor fans out
+    ///
+    /// Both HTTP surfaces run on ONE executor (D-02) — script tools take a clone
+    /// and Code Mode takes the original — so a clone taken before this builder
+    /// runs is permanently ungoverned. The same constraint
+    /// [`with_schema`](Self::with_schema) documents, for the same reason.
+    #[must_use]
+    pub fn with_request_policy(mut self, policy: Arc<dyn crate::policy::RequestPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Whether this executor consults an E1 policy before sending.
+    ///
+    /// Public for the same reason [`has_schema`](Self::has_schema) is: the wiring
+    /// lives in a different crate, so a registered-but-unreached policy must be
+    /// observable from outside rather than only from a `#[cfg(test)]` accessor.
+    #[must_use]
+    pub fn has_request_policy(&self) -> bool {
+        self.policy.is_some()
     }
 
     /// Attach the operator's parsed OpenAPI document, so a path placeholder can be
@@ -2820,5 +2885,292 @@ mod placeholder_rules_override {
             pmcp_code_mode::validate_path_placeholder("id", clean, &bare_rules).is_ok(),
             "without the schema the same value passes — so the NARROWING refused it, not the floor"
         );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 E1 — the Code Mode surface's outbound-policy seam.
+//
+// The exact mirror of `http::client`'s `request_policy_seam`: same contract, same
+// assertions, different surface. Selected by the `--lib code_mode::` filter.
+// -----------------------------------------------------------------------------
+
+/// The E1 hook on the Code Mode / script-tool surface.
+#[cfg(all(test, feature = "openapi-code-mode"))]
+mod request_policy_seam {
+    use super::HttpCodeExecutor;
+    use crate::http::auth::HttpAuthProvider;
+    use crate::http::HttpConnectorError;
+    use crate::policy::{OutboundRequest, PolicyRefusal, RequestPolicy};
+    use async_trait::async_trait;
+    use pmcp_code_mode::{HttpExecutor, ResolvedPath};
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Records whether auth ran, so a refusal test proves the hook is BEFORE auth.
+    struct RecordingAuth {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl HttpAuthProvider for RecordingAuth {
+        async fn apply(
+            &self,
+            headers: &mut HeaderMap,
+            query: &mut HashMap<String, String>,
+            _inbound_token: Option<&str>,
+        ) -> Result<(), HttpConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+            // An API-key-in-query credential: the policy must NEVER see this pair.
+            query.insert("app_key".to_string(), "super-secret".to_string());
+            Ok(())
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<(String, String, Vec<(String, String)>, Option<String>)>>>;
+
+    struct Recorder {
+        seen: Seen,
+        refuse: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl RequestPolicy for Recorder {
+        async fn check(&self, req: &OutboundRequest<'_>) -> Result<(), PolicyRefusal> {
+            self.seen.lock().expect("lock").push((
+                req.tool.to_string(),
+                req.path.to_string(),
+                req.query.to_vec(),
+                req.body.map(ToString::to_string),
+            ));
+            match self.refuse {
+                Some(msg) => Err(PolicyRefusal::new(msg)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn recorder(refuse: Option<&'static str>) -> (Arc<Recorder>, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Recorder {
+                seen: Arc::clone(&seen),
+                refuse,
+            }),
+            seen,
+        )
+    }
+
+    fn exec(
+        base_url: String,
+        policy: Option<Arc<dyn RequestPolicy>>,
+    ) -> (HttpCodeExecutor, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let auth = Arc::new(RecordingAuth {
+            calls: Arc::clone(&calls),
+        });
+        let e = HttpCodeExecutor::new(reqwest::Client::new(), base_url, auth);
+        let e = match policy {
+            Some(p) => e.with_request_policy(p),
+            None => e,
+        };
+        (e, calls)
+    }
+
+    #[tokio::test]
+    async fn a_refusing_policy_stops_the_request_before_auth_and_before_the_send() {
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        let (policy, _seen) = recorder(Some("refused by test policy"));
+        let (executor, auth_calls) = exec(server.uri(), Some(policy));
+
+        let err = executor
+            .execute_request(
+                "GET",
+                ResolvedPath::from_checked("/users/42").expect("checked"),
+                None,
+            )
+            .await
+            .expect_err("the policy refuses");
+        assert!(
+            err.to_string().contains("refused by test policy"),
+            "the refusal must carry the policy's own message, got: {err}"
+        );
+        assert_eq!(
+            auth_calls.load(Ordering::SeqCst),
+            0,
+            "the auth provider must NOT have been invoked — the hook is before auth"
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_allowing_policy_lets_the_request_through_and_auth_is_applied() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/42"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let (policy, _seen) = recorder(None);
+        let (executor, auth_calls) = exec(server.uri(), Some(policy));
+        let out = executor
+            .execute_request(
+                "GET",
+                ResolvedPath::from_checked("/users/42").expect("checked"),
+                None,
+            )
+            .await
+            .expect("allowed");
+        assert_eq!(out["ok"], true);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The assertion that fails if the non-auth half of step (4) is moved back
+    /// BELOW the hook: a policy written to inspect query pairs would then inspect
+    /// an empty slice while the pairs about to be sent still sat in the body.
+    #[tokio::test]
+    async fn the_policy_sees_the_remaining_body_query_pairs_on_a_get() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (policy, seen) = recorder(None);
+        let (executor, _auth) = exec(server.uri(), Some(policy));
+        executor
+            .execute_request(
+                "GET",
+                ResolvedPath::from_checked("/search").expect("checked"),
+                Some(serde_json::json!({ "term": "aspirin", "limit": 5 })),
+            )
+            .await
+            .expect("allowed");
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        let (_tool, observed_path, query, body) = &seen[0];
+        assert!(observed_path.ends_with("/search"));
+        assert!(
+            !query.is_empty(),
+            "OutboundRequest.query must carry the remaining-body pairs a GET will send"
+        );
+        let keys: Vec<&str> = query.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            keys.contains(&"term") && keys.contains(&"limit"),
+            "got {keys:?}"
+        );
+        assert!(
+            body.is_none(),
+            "a GET's remaining body became query pairs before the hook ran"
+        );
+    }
+
+    /// The credential must be absent from every field, in-crate as well as in the
+    /// integration binary: the auth provider above contributes BOTH a header and
+    /// an `app_key` query pair, and neither may be visible.
+    #[tokio::test]
+    async fn the_policy_never_sees_the_credential() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (policy, seen) = recorder(None);
+        let (executor, _auth) = exec(server.uri(), Some(policy));
+        executor
+            .execute_request(
+                "POST",
+                ResolvedPath::from_checked("/items").expect("checked"),
+                Some(serde_json::json!({ "name": "widget" })),
+            )
+            .await
+            .expect("allowed");
+
+        let seen = seen.lock().expect("lock");
+        let (tool, observed_path, query, body) = &seen[0];
+        for field in [tool.as_str(), observed_path.as_str()] {
+            assert!(
+                !field.contains("super-secret"),
+                "credential leaked: {field}"
+            );
+        }
+        assert!(
+            !query
+                .iter()
+                .any(|(k, v)| k == "app_key" || v.contains("super-secret")),
+            "the auth provider's query credential must be invisible to the policy"
+        );
+        assert!(!body.as_deref().unwrap_or("").contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn no_policy_behaves_exactly_as_before() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let (executor, auth_calls) = exec(server.uri(), None);
+        assert!(!executor.has_request_policy());
+        let out = executor
+            .execute_request(
+                "GET",
+                ResolvedPath::from_checked("/x").expect("checked"),
+                None,
+            )
+            .await
+            .expect("succeeds");
+        assert_eq!(out["ok"], true);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_policy_is_told_which_tool_the_executor_serves() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (policy, seen) = recorder(None);
+        let (executor, _auth) = exec(server.uri(), Some(policy));
+        let executor = executor.with_tool_label("lookup_code");
+        executor
+            .execute_request(
+                "GET",
+                ResolvedPath::from_checked("/x").expect("checked"),
+                None,
+            )
+            .await
+            .expect("allowed");
+        assert_eq!(seen.lock().expect("lock")[0].0, "lookup_code");
     }
 }
