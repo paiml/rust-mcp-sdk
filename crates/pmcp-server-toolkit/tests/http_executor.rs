@@ -2,7 +2,10 @@
 //!
 //! Drives `pmcp_code_mode::HttpExecutor::execute_request` against a wiremock
 //! backend, proving:
-//! - `{id}` path-param substitution + the returned JSON round-trip (GET).
+//! - An already-resolved path reaches the wiremock backend verbatim + the
+//!   returned JSON round-trip (GET). Placeholder substitution is NO LONGER this
+//!   executor's job: Phase 128 D-09 moved it up into `PlanExecutor`, so this
+//!   surface receives a `ResolvedPath` and must not resolve anything.
 //! - The per-request inbound token reaches the outgoing `Authorization` header
 //!   through an `oauth_passthrough` provider (H1).
 //! - `ExecutionError` Display NEVER echoes the URL or token (Pitfall 5 /
@@ -15,7 +18,7 @@
 
 #![cfg(feature = "openapi-code-mode")]
 
-use pmcp_code_mode::{ExecutionError, HttpExecutor};
+use pmcp_code_mode::{ExecutionError, HttpExecutor, ResolvedPath};
 use pmcp_server_toolkit::code_mode::HttpCodeExecutor;
 use pmcp_server_toolkit::http::auth::{
     create_auth_provider, create_passthrough_auth_provider, AuthConfig,
@@ -25,7 +28,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
-async fn http_executor_get_substitutes_path_param_and_returns_json() {
+async fn http_executor_get_sends_the_resolved_path_verbatim_and_returns_json() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/users/7"))
@@ -37,9 +40,13 @@ async fn http_executor_get_substitutes_path_param_and_returns_json() {
     let exec = HttpCodeExecutor::new(reqwest::Client::new(), server.uri(), auth);
 
     let result = exec
-        .execute_request("GET", "/users/{id}", Some(json!({"id": "7"})))
+        .execute_request(
+            "GET",
+            ResolvedPath::from_checked("/users/7").expect("a clean resolved path"),
+            None,
+        )
         .await
-        .expect("GET with path-param substitution must succeed");
+        .expect("GET with an already-resolved path must succeed");
     assert_eq!(result["id"], 7);
     assert_eq!(result["name"], "Ada");
 }
@@ -62,7 +69,11 @@ async fn http_executor_post_sends_body_and_applies_static_auth() {
     let exec = HttpCodeExecutor::new(reqwest::Client::new(), server.uri(), auth);
 
     let result = exec
-        .execute_request("POST", "/items", Some(json!({"name": "widget"})))
+        .execute_request(
+            "POST",
+            ResolvedPath::from_checked("/items").expect("a clean resolved path"),
+            Some(json!({"name": "widget"})),
+        )
         .await
         .expect("POST with body + static bearer must succeed");
     assert_eq!(result["created"], true);
@@ -92,7 +103,11 @@ async fn http_executor_forwards_per_request_inbound_token() {
         .with_inbound_token(Some("client-tok".to_string()));
 
     let result = exec
-        .execute_request("GET", "/me", None)
+        .execute_request(
+            "GET",
+            ResolvedPath::from_checked("/me").expect("a clean resolved path"),
+            None,
+        )
         .await
         .expect("per-request inbound token must reach the backend");
     assert_eq!(result["ok"], true);
@@ -118,7 +133,11 @@ async fn http_executor_connect_failure_is_redacted() {
     );
 
     let err = exec
-        .execute_request("GET", "/secret/path", None)
+        .execute_request(
+            "GET",
+            ResolvedPath::from_checked("/secret/path").expect("a clean resolved path"),
+            None,
+        )
         .await
         .expect_err("connect to an unroutable host must error");
     let rendered = err.to_string();

@@ -115,6 +115,32 @@ pub mod eval;
 // Re-export async_trait to avoid version conflicts in derive macro output (D-07)
 pub use async_trait::async_trait;
 
+/// The D4 path-placeholder floor, re-exported from core `pmcp`.
+///
+/// There is exactly **ONE** implementation of these rules and it lives in
+/// `pmcp::server::schema_validation`. This is a `pub use`, never a second copy
+/// (Phase 128, Q2). Two reasons the home is core rather than here:
+///
+/// 1. The toolkit's curated `http` build has no `pmcp-code-mode` edge and must
+///    not gain one (SC-1), so the shared rule cannot live in this crate.
+/// 2. This repo has a documented three-way-drift incident from a security rule
+///    that existed in more than one copy, so a second denylist is a prohibited
+///    shape rather than a style preference.
+///
+/// The re-export exists because D-09 obliges the SDK to publish the helper under
+/// the name a third-party `HttpExecutor` implementor would look for. An
+/// implementor whose template syntax is not OpenAPI's `{key}` can call
+/// `pmcp_code_mode::validate_path_placeholder` on each value it substitutes and
+/// `pmcp_code_mode::validate_resolved_path` on the composed result, reaching the
+/// same rule the SDK itself applies before calling
+/// `HttpExecutor::execute_request`. (Plain backticks, not an intra-doc link:
+/// `executor` is gated on `js-runtime` and the link would not resolve in a
+/// default-feature doc build.)
+pub use pmcp::server::schema_validation::{
+    validate_path_placeholder, validate_resolved_path, PlaceholderRefusal, PlaceholderRules,
+    PLACEHOLDER_MAX_LENGTH,
+};
+
 // High-level CodeExecutor trait (always available, no feature gate) (D-04)
 pub use code_executor::CodeExecutor;
 
@@ -142,8 +168,8 @@ pub use executor::{
     filter_blocked_fields, find_blocked_fields_in_output, ApiCallLog, ArrayMethodCall,
     BinaryOperator, BuiltinFunction, CompileError, ExecutionConfig, ExecutionPlan, ExecutionResult,
     HttpExecutor, JsExecutor, MockExecutionMode, MockHttpExecutor, MockedCall, PathPart,
-    PathTemplate, PlanCompiler, PlanExecutor, PlanMetadata, PlanStep, SdkExecutor, UnaryOperator,
-    ValueExpr,
+    PathTemplate, PlanCompiler, PlanExecutor, PlanMetadata, PlanStep, ResolvedPath, SdkExecutor,
+    UnaryOperator, ValueExpr,
 };
 
 // Standard CodeExecutor adapters (bridge low-level traits to derive-macro-compatible API)

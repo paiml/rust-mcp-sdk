@@ -172,8 +172,12 @@ proptest! {
 //   - client.rs via `HttpConnector::execute` with an OBJECT path param — the
 //     `substitute_path` rejection fires SYNCHRONOUSLY, before any network call.
 //   - code_mode.rs via the `HttpExecutor::execute_request` trait method with an
-//     OBJECT `{path}` value — the `resolve_path` rejection likewise fires before
-//     any network call.
+//     OBJECT GET-QUERY value — the `scalar_str` rejection likewise fires before
+//     any network call. It is the GET-query leg and no longer the `{path}` leg:
+//     Phase 128 D-09 moved `{key}` path resolution out of this executor and up
+//     into `PlanExecutor`, so `scalar_str` is now reached ONLY from the
+//     remaining-body-as-query-params step. The `{path}` half of the WR-03 rule
+//     is asserted in `pmcp-code-mode`'s own `layer_two` tests.
 // For a scalar value, the client.rs path produces a well-formed URL with no
 // literal `{`/`[`/`"` (asserted via the recorded operation + a manual join).
 // =============================================================================
@@ -226,12 +230,11 @@ proptest! {
 
 #[cfg(feature = "openapi-code-mode")]
 proptest! {
-    /// The code_mode.rs renderer rejects an OBJECT `{path}` value (naming the
-    /// key) through the public `HttpExecutor::execute_request`. A scalar value
-    /// for the SAME key resolves a clean path (no `{`/`[`/`"`).
+    /// The code_mode.rs renderer rejects an OBJECT GET-query value (naming the
+    /// key) through the public `HttpExecutor::execute_request`.
     #[test]
-    fn code_mode_render_scalar_rejects_object_path_value(key in "[a-z]{1,8}") {
-        use pmcp_code_mode::HttpExecutor;
+    fn code_mode_render_scalar_rejects_object_query_value(key in "[a-z]{1,8}") {
+        use pmcp_code_mode::{HttpExecutor, ResolvedPath};
         use pmcp_server_toolkit::code_mode::HttpCodeExecutor;
         use pmcp_server_toolkit::http::auth::create_auth_provider;
         use pmcp_server_toolkit::http::AuthConfig;
@@ -242,20 +245,25 @@ proptest! {
             "https://api.example.com".to_string(),
             auth,
         );
-        let path = format!("/things/{{{key}}}");
+
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        // Object value for the `{key}` substitution -> rejected before any call.
+        // Object value in the remaining body of a GET -> rejected as a query
+        // param before any call.
         let err = rt
             .block_on(async {
-                exec.execute_request("GET", &path, Some(json!({ &key: object_value() })))
-                    .await
+                exec.execute_request(
+                    "GET",
+                    ResolvedPath::from_checked("/things").expect("a clean resolved path"),
+                    Some(json!({ &key: object_value() })),
+                )
+                .await
             })
-            .expect_err("an object {path} value must be rejected");
+            .expect_err("an object GET-query value must be rejected");
         let rendered = err.to_string();
         prop_assert!(rendered.contains(&key), "error must name the key: {rendered}");
         for forbidden in ['{', '[', '"'] {

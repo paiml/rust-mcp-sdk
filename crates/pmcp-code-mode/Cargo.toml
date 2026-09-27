@@ -26,8 +26,22 @@ rustdoc-args = ["--cfg", "docsrs"]
 # compiles the file away and reports `0 tests, exit 0`: a severance proof that
 # silently proves nothing (plan 117-14). `v1-compat` is a marker feature this
 # crate uses no item from, so dropping it costs nothing here.
+#
+# `schema-validation` (Phase 128, D-09 / Q2): this crate re-exports
+# `pmcp::server::schema_validation::{validate_path_placeholder,
+# validate_resolved_path, ...}` from `src/lib.rs`, and that module is
+# `#[cfg(feature = "schema-validation")]`. The forward is UNCONDITIONAL on
+# purpose — a security floor that a feature flag can switch off is not a floor,
+# so the cost of always compiling `jsonschema` is accepted here.
+#
+# The version requirement is deliberately NOT moved: the in-tree `path` dep
+# already carries the feature, so the workspace builds, while raising it before
+# `pmcp` is actually published at 2.21.0 would break the path-dependency version
+# check. Plan 128-11 moves it to `>=2.21.0` in the same commit that sets `pmcp`'s
+# version to 2.21.0.
 pmcp = { version = ">=2.2.0", path = "../../", default-features = false, features = [
     "logging",
+    "schema-validation",
 ] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync"] }

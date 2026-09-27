@@ -972,9 +972,10 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
     async fn execute_request(
         &self,
         method: &str,
-        path: &str,
+        path: pmcp_code_mode::ResolvedPath<'_>,
         body: Option<serde_json::Value>,
     ) -> std::result::Result<serde_json::Value, ExecutionError> {
+        let path = path.as_str();
         let upper = method.to_uppercase();
         let is_get_like = matches!(upper.as_str(), "GET" | "HEAD" | "OPTIONS");
 
