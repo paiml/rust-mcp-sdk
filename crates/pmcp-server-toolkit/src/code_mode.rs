@@ -852,6 +852,16 @@ pub struct HttpCodeExecutor {
     /// `None` for the static-auth path; set per request via
     /// [`HttpCodeExecutor::with_inbound_token`].
     inbound_token: Option<String>,
+    /// The operator's parsed OpenAPI document, when one was supplied
+    /// (Phase 128 D4(b)).
+    ///
+    /// `None` on every executor built by [`HttpCodeExecutor::new`], which is what
+    /// keeps that constructor's signature unchanged. An `Arc` rather than an owned
+    /// document because the same parse is also served verbatim as the `api_schema`
+    /// resource, and the spec can be large — one allocation is shared, never
+    /// cloned. Read ONLY by
+    /// [`placeholder_rules`](pmcp_code_mode::HttpExecutor::placeholder_rules).
+    schema: Option<Arc<crate::http::OpenApiSchema>>,
 }
 
 #[cfg(feature = "openapi-code-mode")]
@@ -871,7 +881,28 @@ impl HttpCodeExecutor {
             base_url,
             auth,
             inbound_token: None,
+            schema: None,
         }
+    }
+
+    /// Attach the operator's parsed OpenAPI document, so a path placeholder can be
+    /// narrowed by what the spec DECLARES for it (Phase 128 D4(b)).
+    ///
+    /// Cheap clone-with-builder, the same shape as
+    /// [`with_inbound_token`](Self::with_inbound_token): the `Arc` is shared with
+    /// the `api_schema` resource rather than the document being duplicated.
+    ///
+    /// # Call it BEFORE the executor fans out
+    ///
+    /// Both HTTP surfaces run on ONE executor (D-02) — script tools take a clone
+    /// and Code Mode takes the original. A clone taken before this builder runs is
+    /// permanently unnarrowed, so the call has to precede both fan-out sites. The
+    /// production wiring is `pmcp-openapi-server`'s `build_server`, the only place
+    /// the executor and the parsed spec are both in scope.
+    #[must_use]
+    pub fn with_schema(mut self, schema: Arc<crate::http::OpenApiSchema>) -> Self {
+        self.schema = Some(schema);
+        self
     }
 
     /// Cheap clone-with-token builder (H1): the binary calls this PER REQUEST to
@@ -941,6 +972,20 @@ impl HttpCodeExecutor {
 #[cfg(feature = "openapi-code-mode")]
 #[pmcp_code_mode::async_trait]
 impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
+    /// STUB — the RED half of Phase 128 D4(b). Returns the floored-and-capped
+    /// default for every input so the narrowing assertions in
+    /// `placeholder_rules_override` fail on an assertion rather than on a missing
+    /// method. Replaced by the spec lookup in the GREEN commit.
+    fn placeholder_rules(
+        &self,
+        method: &str,
+        path_template: &str,
+        param: &str,
+    ) -> pmcp_code_mode::PlaceholderRules<'_> {
+        let _ = (self.schema.as_deref(), method, path_template, param);
+        pmcp_code_mode::PlaceholderRules::default()
+    }
+
     async fn execute_request(
         &self,
         method: &str,
@@ -2345,5 +2390,241 @@ mod sql_static_source_tests {
         assert!(server.get_tool("validate_code").is_some());
         assert!(server.get_tool("execute_code").is_some());
         std::env::remove_var("PMCP_TOOLKIT_90_10_SQL_SECRET");
+    }
+}
+
+// =============================================================================
+// Phase 128 D4(b) — the `placeholder_rules` override on `HttpCodeExecutor`
+// =============================================================================
+
+/// The spec-narrowing half of D4(b) on the Code Mode surface.
+///
+/// Plan 05 moved placeholder resolution ahead of dispatch and left
+/// `HttpExecutor::placeholder_rules` default-implemented, because `PlanExecutor`
+/// has no access to an OpenAPI document. These rows prove the executor that DOES
+/// own the document supplies the narrowing, and — the load-bearing half — that an
+/// executor without one is still floored and capped.
+///
+/// Nine of the rows assert what a MISS does, because a miss is the shape a reader
+/// most easily mistakes for "no checks".
+#[cfg(all(test, feature = "openapi-code-mode", feature = "input-validation"))]
+mod placeholder_rules_override {
+    use super::HttpCodeExecutor;
+    use crate::http::auth::{create_auth_provider, AuthConfig};
+    use crate::http::OpenApiSchema;
+    use pmcp_code_mode::HttpExecutor;
+    use std::sync::Arc;
+
+    /// A spec declaring a NARROW pattern on `GET /things/{id}`, a DIFFERENT
+    /// pattern on `DELETE /things/{id}` (so the method is provably load-bearing),
+    /// a `maxLength`, and `allowReserved: true` on a third path parameter (D-11).
+    const SPEC: &str = r#"{
+      "openapi": "3.0.0",
+      "info": { "title": "t", "version": "1" },
+      "paths": {
+        "/things/{id}": {
+          "get": {
+            "operationId": "getThing",
+            "parameters": [
+              { "name": "id", "in": "path", "required": true,
+                "schema": { "type": "string", "pattern": "^G[0-9]+$", "maxLength": 12 } }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          },
+          "delete": {
+            "operationId": "deleteThing",
+            "parameters": [
+              { "name": "id", "in": "path", "required": true,
+                "schema": { "type": "string", "pattern": "^D[0-9]+$" } }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          }
+        },
+        "/reserved/{seg}": {
+          "get": {
+            "operationId": "getReserved",
+            "parameters": [
+              { "name": "seg", "in": "path", "required": true,
+                "allowReserved": true,
+                "schema": { "type": "string" } }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          }
+        }
+      }
+    }"#;
+
+    fn bare() -> HttpCodeExecutor {
+        let auth = create_auth_provider(&AuthConfig::None).expect("noauth");
+        HttpCodeExecutor::new(
+            reqwest::Client::new(),
+            "https://api.example".to_string(),
+            auth,
+        )
+    }
+
+    fn with_spec() -> HttpCodeExecutor {
+        bare().with_schema(Arc::new(
+            OpenApiSchema::parse(SPEC).expect("the fixture spec parses"),
+        ))
+    }
+
+    /// `new`'s signature is unchanged, so the schema starts absent and every
+    /// pre-existing construction site keeps compiling. A default-returning
+    /// executor is FLOORED AND CAPPED — the assertion below is about the absence
+    /// of NARROWING, not about the absence of checks.
+    #[test]
+    fn an_executor_with_no_schema_returns_the_default() {
+        let exec = bare();
+        let rules = exec.placeholder_rules("GET", "/things/{id}", "id");
+        assert_eq!(rules.declared_pattern, None);
+        assert_eq!(rules.declared_max_length, None);
+        assert!(!rules.allow_slash);
+    }
+
+    #[test]
+    fn a_declared_pattern_reaches_the_rules() {
+        let exec = with_spec();
+        let rules = exec.placeholder_rules("GET", "/things/{id}", "id");
+        assert_eq!(rules.declared_pattern, Some("^G[0-9]+$"));
+        assert_eq!(rules.declared_max_length, Some(12));
+    }
+
+    /// The `method` parameter is load-bearing, not decoration: two operations on
+    /// one path declare different patterns and each must get its own.
+    #[test]
+    fn the_method_selects_the_operation() {
+        let exec = with_spec();
+        assert_eq!(
+            exec.placeholder_rules("DELETE", "/things/{id}", "id")
+                .declared_pattern,
+            Some("^D[0-9]+$"),
+            "a DELETE must never be narrowed by the GET's declared pattern"
+        );
+        assert_eq!(
+            exec.placeholder_rules("get", "/things/{id}", "id")
+                .declared_pattern,
+            Some("^G[0-9]+$"),
+            "`operation_for` upper-cases the method, so a lowercase verb still hits"
+        );
+    }
+
+    #[test]
+    fn an_unknown_path_template_returns_the_default() {
+        let exec = with_spec();
+        // The `/users/{alias}` versus `/users/{id}` spelling-drift case: a template
+        // the spec does not carry loses the NARROWING and keeps the floor + cap.
+        let rules = exec.placeholder_rules("GET", "/things/{alias}", "alias");
+        assert_eq!(rules.declared_pattern, None);
+        assert_eq!(rules.declared_max_length, None);
+        assert!(!rules.allow_slash);
+    }
+
+    #[test]
+    fn an_unknown_method_on_a_known_path_returns_the_default() {
+        let exec = with_spec();
+        assert_eq!(
+            exec.placeholder_rules("PUT", "/things/{id}", "id")
+                .declared_pattern,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_parameter_name_returns_the_default() {
+        let exec = with_spec();
+        assert_eq!(
+            exec.placeholder_rules("GET", "/things/{id}", "nope")
+                .declared_pattern,
+            None
+        );
+    }
+
+    /// A QUERY-position parameter of the same name must not narrow a PATH
+    /// placeholder: `placeholder_rules` answers a question about the path.
+    #[test]
+    fn a_non_path_parameter_is_not_consulted() {
+        let spec = r#"{
+          "openapi": "3.0.0",
+          "info": { "title": "t", "version": "1" },
+          "paths": {
+            "/q": {
+              "get": {
+                "operationId": "q",
+                "parameters": [
+                  { "name": "id", "in": "query", "required": false,
+                    "schema": { "type": "string", "pattern": "^Q[0-9]+$" } }
+                ],
+                "responses": { "200": { "description": "ok" } }
+              }
+            }
+          }
+        }"#;
+        let exec = bare().with_schema(Arc::new(OpenApiSchema::parse(spec).expect("parses")));
+        assert_eq!(
+            exec.placeholder_rules("GET", "/q", "id").declared_pattern,
+            None
+        );
+    }
+
+    /// D-11 / T-128-37 — a spec's reserved-expansion keyword must never reach
+    /// `allow_slash`. Asserted for EVERY spec-derived result this fixture can
+    /// produce, not only the one that declares the keyword.
+    #[test]
+    fn allow_slash_is_false_for_every_spec_derived_result() {
+        let exec = with_spec();
+        for (method, template, param) in [
+            ("GET", "/things/{id}", "id"),
+            ("DELETE", "/things/{id}", "id"),
+            ("GET", "/reserved/{seg}", "seg"),
+            ("GET", "/things/{alias}", "alias"),
+            ("PUT", "/things/{id}", "id"),
+        ] {
+            assert!(
+                !exec.placeholder_rules(method, template, param).allow_slash,
+                "{method} {template} {param}: allow_slash is config-only (D-11)"
+            );
+        }
+    }
+
+    /// A miss is not a hole: the value a floored-and-capped default refuses is
+    /// still refused. This is T-128-36 stated as a test rather than as a doc
+    /// sentence.
+    #[test]
+    fn a_schema_miss_still_refuses_a_floor_denied_value() {
+        let exec = with_spec();
+        let rules = exec.placeholder_rules("GET", "/things/{alias}", "alias");
+        assert!(
+            pmcp_code_mode::validate_path_placeholder("alias", "current/../../etc", &rules)
+                .is_err(),
+            "the floor survives a schema miss"
+        );
+        assert!(
+            pmcp_code_mode::validate_path_placeholder("alias", &"x".repeat(257), &rules).is_err(),
+            "the always-on cap survives a schema miss"
+        );
+    }
+
+    /// The narrowing actually narrows: a value that CLEARS the floor is refused by
+    /// the spec's declared pattern, and accepted without the schema.
+    #[test]
+    fn the_narrowing_refuses_a_floor_clean_value_the_spec_forbids() {
+        let clean = "NOTMATCHING";
+        let spec_exec = with_spec();
+        let narrowed = spec_exec.placeholder_rules("GET", "/things/{id}", "id");
+        let err = pmcp_code_mode::validate_path_placeholder("id", clean, &narrowed)
+            .expect_err("the declared pattern must refuse it");
+        assert_eq!(err.rule, "pattern");
+        assert!(
+            !err.to_string().contains(clean),
+            "the refusal must not echo the value: {err}"
+        );
+
+        let bare_exec = bare();
+        let bare_rules = bare_exec.placeholder_rules("GET", "/things/{id}", "id");
+        assert!(
+            pmcp_code_mode::validate_path_placeholder("id", clean, &bare_rules).is_ok(),
+            "without the schema the same value passes — so the NARROWING refused it, not the floor"
+        );
     }
 }
