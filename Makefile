@@ -528,7 +528,7 @@ test-cargo-pmcp:
 .PHONY: test-cargo-pmcp-integration
 test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 	@echo "$(BLUE)Running cargo-pmcp's contract/inspect integration tests...$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --test package_capture_contract --test package_attestation_contract --test package_inspect --test pmcp_package_pin --test package_save_load --test package_portability_contract --test package_artifact_framing --test verb_help -- --test-threads=1 2>&1); \
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --test package_capture_contract --test package_attestation_contract --test package_inspect --test pmcp_package_pin --test package_save_load --test package_portability_contract --test package_artifact_framing --test verb_help --test validate_server_config -- --test-threads=1 2>&1); \
 	status=$$?; \
 	echo "$$out"; \
 	if [ $$status -ne 0 ]; then exit $$status; fi; \
@@ -537,7 +537,7 @@ test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 		echo "$(RED)✗ cargo-pmcp integration tests reported 0 tests — the gate is not reaching cargo-pmcp/tests/$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="package_capture_contract package_attestation_contract package_inspect pmcp_package_pin package_save_load package_portability_contract package_artifact_framing verb_help"; \
+	REQUIRED_TEST_BINARIES="package_capture_contract package_attestation_contract package_inspect pmcp_package_pin package_save_load package_portability_contract package_artifact_framing verb_help validate_server_config"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \
