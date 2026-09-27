@@ -895,45 +895,7 @@ impl HttpCodeExecutor {
         self.inbound_token.as_deref()
     }
 
-    /// Substitute `{key}` path-template segments from `body` keys, returning the
-    /// resolved path and the remaining (non-path) body fields.
-    ///
-    /// Lifted from the pmcp-run reference `execute_request` (kept a free helper
-    /// so the trait method stays under the cog ≤25 budget).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutionError::RuntimeError`] naming the offending key when a
-    /// `{key}` path value is a non-scalar (`Object`/`Array`) — see
-    /// [`HttpCodeExecutor::scalar_str`] for the decided rule (WR-03 / GAP 4).
-    fn resolve_path(
-        path: &str,
-        body: &Option<serde_json::Value>,
-    ) -> std::result::Result<(String, Option<serde_json::Value>), ExecutionError> {
-        let mut resolved_path = path.to_string();
-        let remaining = if let Some(serde_json::Value::Object(obj)) = body {
-            let mut remaining = serde_json::Map::new();
-            for (key, value) in obj {
-                let placeholder = format!("{{{key}}}");
-                if resolved_path.contains(&placeholder) {
-                    resolved_path =
-                        resolved_path.replace(&placeholder, &Self::scalar_str(key, value)?);
-                } else {
-                    remaining.insert(key.clone(), value.clone());
-                }
-            }
-            if remaining.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::Object(remaining))
-            }
-        } else {
-            body.clone()
-        };
-        Ok((resolved_path, remaining))
-    }
-
-    /// Render a JSON scalar for path / query substitution (strings unquoted),
+    /// Render a JSON scalar for GET-query substitution (strings unquoted),
     /// REJECTING non-scalar values (WR-03 / GAP 4).
     ///
     /// This is the `code_mode` counterpart of [`crate::http::client`]'s
@@ -941,8 +903,18 @@ impl HttpCodeExecutor {
     /// the `Parameter` model carries no OpenAPI `style`/`explode`/`type` hint,
     /// the rule is uniform: a scalar (`String`, `Number`, `Bool`, `Null`)
     /// renders to a bare string (`Null` → `"null"`, preserving prior behavior);
-    /// an `Object` or `Array` in a `{path}` substitution or a GET-query field is
-    /// rejected rather than silently JSON-stringified into the URL.
+    /// an `Object` or `Array` in a GET-query field is rejected rather than
+    /// silently JSON-stringified into the URL.
+    ///
+    /// # Scope after Phase 128 D-09
+    ///
+    /// This is now reached ONLY from step (4) — the remaining-body-as-query-params
+    /// step. The `{path}` substitution half moved up to
+    /// `pmcp_code_mode::PlanExecutor`, which applies the identical rule
+    /// (`render_path_scalar`) and then additionally floors the rendered value
+    /// through `validate_path_placeholder`. The sibling `resolve_path` helper that
+    /// used to live here was deleted with step (1) rather than left as a
+    /// caller-less function.
     ///
     /// # Errors
     ///
@@ -979,9 +951,21 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
         let upper = method.to_uppercase();
         let is_get_like = matches!(upper.as_str(), "GET" | "HEAD" | "OPTIONS");
 
-        // (1) Path-param substitution from the body object. A non-scalar `{key}`
-        //     value is rejected (WR-03) rather than JSON-stringified into the URL.
-        let (resolved_path, remaining_body) = Self::resolve_path(path, &body)?;
+        // (1) REMOVED in Phase 128 (D-09). Placeholder resolution used to happen
+        //     here, and that is exactly what made this executor — and every other
+        //     `HttpExecutor` implementor, in this repo and out of it — blind BY
+        //     CONSTRUCTION to what it was about to send: a decorator wrapping the
+        //     public trait saw only the template the script wrote, never the
+        //     substituted values, so a placeholder carrying a query separator
+        //     became a different endpoint with nothing in a position to notice.
+        //
+        //     `pmcp_code_mode::PlanExecutor` now resolves BOTH layers and checks
+        //     the composed result before dispatch, so `path` arrives as a
+        //     `ResolvedPath` with every placeholder already substituted and
+        //     checked, and `body` already has the path-consumed keys removed.
+        //     Resolving again here would be a double-resolution bug.
+        let resolved_path = path;
+        let remaining_body = body;
 
         // (2) Shared join_url helper (Pitfall 2 — preserves an API-Gateway
         //     stage prefix; it does NOT use the RFC-3986 path-replacing join).
@@ -989,7 +973,7 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
         //     append query pairs because reqwest 0.13 gates
         //     RequestBuilder::query behind a `query` feature the toolkit
         //     deliberately does not enable (Plan 01 Rule 1).
-        let url = crate::http::join_url(&self.base_url, &resolved_path);
+        let url = crate::http::join_url(&self.base_url, resolved_path);
 
         // (3) Apply auth, threading the per-request inbound token (H1). Auth
         //     failures map to a RuntimeError WITHOUT echoing URL/token
