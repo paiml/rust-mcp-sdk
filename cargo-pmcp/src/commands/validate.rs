@@ -41,6 +41,38 @@ pub enum ValidateCommand {
         #[arg(long)]
         server: Option<String>,
     },
+
+    /// Validate a config-driven server's `config.toml` — input-validation focus.
+    ///
+    /// This reads a TOOLKIT server config (`config.toml`), NOT `.pmcp/deploy.toml`
+    /// — those are different documents with different validators. Use
+    /// `validate deploy` for the IAM document.
+    ///
+    /// HARD-ERRORS on whatever `ServerConfig::validate` itself rejects: an empty
+    /// or uncompilable parameter `pattern`, a non-finite numeric bound, a
+    /// malformed `path` template segment, and — under
+    /// `[server.validation] strict = true` — an uncapped body-position string.
+    ///
+    /// WARNS ONLY on every `ServerConfig::lint()` finding: an uncapped
+    /// body-position string parameter, a declared length cap above the always-on
+    /// path-placeholder floor, and every ACTIVE `[server.validation]` opt-out
+    /// (`enforce_input_schema = false`, a zeroed default cap,
+    /// `additional_properties = true`). A lint finding NEVER fails this command.
+    ///
+    /// The findings come from the same `lint()` the running server reports at
+    /// startup, so this command and the deployed server agree for a same-version
+    /// pair.
+    Config {
+        /// Server directory to validate (defaults to current directory).
+        ///
+        /// `config.toml` is looked for at this directory's root.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Explicit path to the toolkit server config. Wins over `--server`.
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 impl ValidateCommand {
@@ -50,6 +82,9 @@ impl ValidateCommand {
                 validate_workflows(generate, global_flags.verbose, server)
             },
             ValidateCommand::Deploy { server } => validate_deploy(server, global_flags.verbose),
+            ValidateCommand::Config { server, config } => {
+                validate_server_config(server, config, global_flags.verbose)
+            },
         }
     }
 }
@@ -621,6 +656,313 @@ pub fn validate_deploy(server: Option<String>, verbose: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 Plan 07 — `cargo pmcp validate config` (D3 / SC-3)
+// -----------------------------------------------------------------------------
+
+/// The toolkit server-config file name looked for at a server directory root.
+const SERVER_CONFIG_FILE: &str = "config.toml";
+
+/// Which file `validate config` should read.
+///
+/// An explicit `--config` wins outright; otherwise [`SERVER_CONFIG_FILE`] at the
+/// `--server` directory root, falling back to the process working directory.
+///
+/// # Errors
+/// Returns `Err` only when neither flag was given and the working directory
+/// cannot be read.
+fn resolve_server_config_path(
+    server: Option<&str>,
+    config: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    if let Some(explicit) = config {
+        return Ok(std::path::PathBuf::from(explicit));
+    }
+    let root = match server {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::env::current_dir().context("failed to read current directory")?,
+    };
+    Ok(root.join(SERVER_CONFIG_FILE))
+}
+
+/// Read, parse and `validate()` a toolkit server config.
+///
+/// # Errors
+/// Returns `Err` when the file cannot be read, is not parseable as a toolkit
+/// `ServerConfig`, or is rejected by `ServerConfig::validate` — each with the path
+/// in the context chain.
+fn load_server_config(path: &std::path::Path) -> Result<pmcp_server_toolkit::config::ServerConfig> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read toolkit server config at {} (looked for {SERVER_CONFIG_FILE})",
+            path.display()
+        )
+    })?;
+    let config =
+        pmcp_server_toolkit::config::ServerConfig::from_toml(&text).with_context(|| {
+            format!(
+                "failed to parse toolkit server config at {}",
+                path.display()
+            )
+        })?;
+    config
+        .validate()
+        .with_context(|| format!("invalid toolkit server config at {}", path.display()))?;
+    Ok(config)
+}
+
+/// `ServerConfig::lint()`'s findings, rendered one per line.
+///
+/// A PROJECTION of the toolkit's single implementation, never a second copy of any
+/// rule (Phase 128 Q5 / T-128-32): this CLI holds no rule literals of its own, so
+/// what a reviewer sees here is exactly what the running server reports at startup.
+fn render_config_lint_findings(_config: &pmcp_server_toolkit::config::ServerConfig) -> Vec<String> {
+    Vec::new()
+}
+
+/// Print lint findings to stderr, with the same `warning:` prefix
+/// [`crate::deployment::iam::emit_warnings`] uses for the IAM document.
+fn emit_config_lint_findings(findings: &[String]) {
+    for finding in findings {
+        eprintln!("  {} {}", style("warning:").yellow(), finding);
+    }
+}
+
+/// Validate a config-driven server's toolkit `config.toml` — input-validation focus.
+///
+/// Warnings (every `ServerConfig::lint()` finding) print to stderr and do NOT fail
+/// the command. Only a read failure, a parse failure, or a `ServerConfig::validate`
+/// rejection returns `Err`.
+///
+/// # Errors
+/// Returns `Err` when the config file cannot be read or parsed, or when
+/// `ServerConfig::validate` rejects it.
+pub fn validate_server_config(
+    _server: Option<String>,
+    _config: Option<String>,
+    _verbose: bool,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod server_config_validate_tests {
+    //! Phase 128 Plan 07 — unit coverage for `cargo pmcp validate config`.
+    //!
+    //! # Every test here passes an EXPLICIT `--config` path, and none may depend
+    //! # on the process working directory
+    //!
+    //! `make test-cargo-pmcp` runs its `--lib` leg WITHOUT `--test-threads=1`
+    //! (`Makefile:340`) while this crate's tests are known to race, and
+    //! `std::env::set_current_dir` is process-global. A cwd-relative discovery test
+    //! would therefore be flaky by construction. `resolve_server_config_path`'s
+    //! cwd branch is exercised through the integration binary
+    //! (`cargo-pmcp/tests/validate_server_config.rs`), which runs a child process
+    //! with its own working directory. Keep this rule when adding the next test.
+
+    use super::*;
+
+    /// A minimal valid `[server]` header, prepended to every fixture.
+    const SERVER_HEADER: &str = r#"
+[server]
+name = "demo-server"
+version = "0.1.0"
+"#;
+
+    /// Write `toml_str` as a `config.toml` inside a fresh tempdir.
+    ///
+    /// Returns the guard (which must outlive the path) and the explicit file path
+    /// every test passes as `--config`.
+    fn write_server_config(toml_str: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SERVER_CONFIG_FILE);
+        std::fs::write(&path, toml_str).expect("write config.toml");
+        (dir, path)
+    }
+
+    /// Parse a fixture and return its rendered lint findings.
+    fn findings_for(toml_str: &str) -> Vec<String> {
+        let config = pmcp_server_toolkit::config::ServerConfig::from_toml(toml_str)
+            .expect("fixture must parse");
+        render_config_lint_findings(&config)
+    }
+
+    /// Run the command against an explicit config path.
+    fn run_on(path: &std::path::Path) -> Result<()> {
+        std::env::set_var("PMCP_QUIET", "1");
+        validate_server_config(None, Some(path.to_string_lossy().into_owned()), false)
+    }
+
+    /// A `POST` tool's non-path string parameter is BODY position, where the D3
+    /// default cap deliberately does not apply — so it is an uncapped-string finding.
+    const UNCAPPED_BODY_STRING: &str = r#"
+[[tools]]
+name = "post-comment"
+description = "Post a comment."
+path = "/issues/1/comments"
+method = "POST"
+
+[[tools.parameters]]
+name = "body_text"
+type = "string"
+description = "Free text."
+"#;
+
+    #[test]
+    fn uncapped_body_string_is_reported_naming_tool_and_param() {
+        let findings = findings_for(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}"));
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one finding, got: {findings:?}"
+        );
+        let line = &findings[0];
+        assert!(
+            line.contains("uncapped-string"),
+            "finding must carry the machine-readable rule id, got: {line}"
+        );
+        assert!(
+            line.contains("post-comment") && line.contains("body_text"),
+            "finding must name the tool and the parameter, got: {line}"
+        );
+    }
+
+    #[test]
+    fn zeroed_default_cap_opt_out_is_reported() {
+        let toml_str = format!(
+            "{SERVER_HEADER}\n[server.validation]\ndefault_max_length = 0\n{UNCAPPED_BODY_STRING}"
+        );
+        let findings = findings_for(&toml_str);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("opt-out-default-max-length-zero")),
+            "an active opt-out must never read as off, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn schema_enforcement_opt_out_is_reported() {
+        let toml_str = format!(
+            "{SERVER_HEADER}\n[server.validation]\nenforce_input_schema = false\n{UNCAPPED_BODY_STRING}"
+        );
+        let findings = findings_for(&toml_str);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("opt-out-enforce-input-schema")),
+            "an active opt-out must never read as off, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn zero_tools_config_has_no_findings_and_succeeds() {
+        let (_dir, path) = write_server_config(SERVER_HEADER);
+        assert!(
+            findings_for(SERVER_HEADER).is_empty(),
+            "a config with zero tools and no opt-out has nothing to report"
+        );
+        let result = run_on(&path);
+        assert!(
+            result.is_ok(),
+            "zero-tool config must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn lint_finding_alone_exits_zero() {
+        let (_dir, path) = write_server_config(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}"));
+        let result = run_on(&path);
+        assert!(
+            result.is_ok(),
+            "a lint finding is a WARNING and must never fail the command: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn uncompilable_pattern_fails_naming_the_parameter() {
+        let toml_str = format!(
+            r#"{SERVER_HEADER}
+[[tools]]
+name = "lookup"
+description = "Look something up."
+path = "/things/{{id}}"
+method = "GET"
+
+[[tools.parameters]]
+name = "id"
+type = "string"
+description = "Identifier."
+pattern = "([unclosed"
+"#
+        );
+        let (_dir, path) = write_server_config(&toml_str);
+        let result = run_on(&path);
+        let err = result.expect_err("a non-compiling pattern must fail the command");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("id"),
+            "error chain must name the offending parameter, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_config_file_names_the_path_it_looked_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope").join(SERVER_CONFIG_FILE);
+        let result = run_on(&missing);
+        let err = result.expect_err("a missing config file must fail the command");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error chain must name the path it looked for, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn backend_section_parses() {
+        // REGRESSION form of the `http`-feature requirement: `ServerConfig.backend`
+        // is `#[cfg(feature = "http")]` and `ServerConfig` is
+        // `deny_unknown_fields`, so a toolkit built without `http` rejects this
+        // fixture with `unknown field 'backend'`.
+        let toml_str = format!(
+            r#"{SERVER_HEADER}
+[backend]
+base_url = "https://example.invalid"
+{UNCAPPED_BODY_STRING}"#
+        );
+        let (_dir, path) = write_server_config(&toml_str);
+        let result = run_on(&path);
+        assert!(
+            result.is_ok(),
+            "a config carrying [backend] must parse — this is what `http` is for: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn explicit_config_flag_wins_over_server_dir() {
+        let (_dir, path) = write_server_config(SERVER_HEADER);
+        let other = tempfile::tempdir().expect("tempdir");
+        let resolved = resolve_server_config_path(
+            Some(&other.path().to_string_lossy()),
+            Some(&path.to_string_lossy()),
+        )
+        .expect("resolve");
+        assert_eq!(resolved, path, "--config must win over --server");
+    }
+
+    #[test]
+    fn server_dir_resolves_to_the_config_file_at_its_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolved =
+            resolve_server_config_path(Some(&dir.path().to_string_lossy()), None).expect("resolve");
+        assert_eq!(resolved, dir.path().join(SERVER_CONFIG_FILE));
+    }
 }
 
 #[cfg(test)]

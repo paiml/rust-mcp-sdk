@@ -73,6 +73,32 @@ mcp-tester = { version = "0.8.0", path = "../crates/mcp-tester" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 mcp-preview = { version = "0.3.1", path = "../crates/mcp-preview" }
 pmcp-workbook-compiler = { version = "0.1.3", path = "../crates/pmcp-workbook-compiler" }
+# Why (Phase 128 Q5): `cargo pmcp validate config` and `cargo pmcp validate deploy`
+# must report the SAME findings a running config-driven server reports at startup,
+# so both surfaces call ONE implementation — `ServerConfig::lint()` — rather than
+# the CLI re-deriving the uncapped-string and opt-out rules against a local TOML
+# shape. Two copies of a security rule is the drift class this repo has already
+# been bitten by; route C of RESEARCH Finding 11b was rejected for exactly that.
+#
+# This is the first DIRECT toolkit edge, NOT the first edge. The toolkit already
+# reaches this CLI transitively through `pmcp-workbook-compiler` immediately above
+# (`crates/pmcp-workbook-compiler/Cargo.toml:113` pins it with
+# `default-features = false, features = ["workbook", "input-validation"]`). A future
+# reader measuring the graph will find the toolkit there too — that is expected.
+#
+# `default-features = false` is LOAD-BEARING: the toolkit's `default` is
+# `["code-mode", "input-validation"]`, and `code-mode` drags the SWC/JS engine into
+# a widely-installed CLI. `cargo tree -p cargo-pmcp -e normal -i swc_common` must
+# keep finding nothing.
+#
+# `http` is required, not optional: `ServerConfig.backend` is
+# `#[cfg(feature = "http")]` (`crates/pmcp-server-toolkit/src/config.rs:123`) and
+# `ServerConfig` carries `#[serde(deny_unknown_fields)]` (`:101`), so a toolkit
+# compiled WITHOUT `http` rejects every config carrying a `[backend]` section with
+# `unknown field 'backend'` — and `[backend]` is present in every single-call HTTP
+# and OpenAPI config, i.e. exactly the configs this command exists to lint.
+# `input-validation` is what compiles the placeholder-floor lint arm.
+pmcp-server-toolkit = { version = "0.1.0", path = "../crates/pmcp-server-toolkit", default-features = false, features = ["input-validation", "http"] }
 # Phase 110 agent/team/package verbs. Path wins locally; the version req applies
 # at publish (design §5: cargo-pmcp now publishes AFTER all three).
 # `openai-compat` enables the default `agent dev` completion source.
