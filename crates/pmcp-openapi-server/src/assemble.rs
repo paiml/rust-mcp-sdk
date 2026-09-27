@@ -242,15 +242,29 @@ fn register_prompts(
 /// [`AssembleError::Toolkit`] if a toolkit step fails (e.g. tool synthesis or a
 /// `token_secret` resolution error) or [`AssembleError::Build`] if the final
 /// `pmcp::Server` build fails.
-/// STUB — the RED half of Phase 128 D4(b)'s wiring. Returns the executor
-/// unchanged, ignoring the spec, so `narrowed_executor_attaches_a_supplied_spec`
-/// fails on an assertion rather than on a missing function.
+/// Attach the operator's parsed OpenAPI document to the executor, when there is
+/// one (Phase 128 D4(b)).
+///
+/// A named function rather than two lines inline, for one reason: it is the only
+/// thing outside this crate's own `build_server` that a test can call, and
+/// T-128-36c is the risk of a wiring nothing can observe. `build_server` returns a
+/// `pmcp::Server`, which exposes no route back to the executor it consumed — so
+/// without this seam the only provable statement would be "the server built".
+///
+/// The `Arc` is CLONED, never the document: the same parse is also served verbatim
+/// as the `api_schema` resource and a spec can be large.
+///
+/// `None` leaves the executor exactly as it was. That is the supported spec-less
+/// deployment, and it is still floored and capped — the unconditional character
+/// floor and the always-on length cap live in core and do not depend on a spec.
 fn narrowed_executor(
     http_exec: HttpCodeExecutor,
     spec: Option<&Arc<OpenApiSchema>>,
 ) -> HttpCodeExecutor {
-    let _ = spec;
-    http_exec
+    match spec {
+        Some(schema) => http_exec.with_schema(Arc::clone(schema)),
+        None => http_exec,
+    }
 }
 
 pub fn build_server(
