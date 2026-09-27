@@ -657,8 +657,7 @@ fn validate_tool_parameters(
     for p in &tool.parameters {
         check_param_patterns_non_empty(tool, p)?;
         check_param_bounds_representable(tool, p)?;
-        if false {
-            // RED-MUTATION
+        if validation.strict {
             check_param_capped_under_strict(tool, p, validation)?;
         }
     }

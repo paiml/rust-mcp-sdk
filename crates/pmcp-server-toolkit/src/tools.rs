@@ -198,8 +198,7 @@ fn enforce_input_schema(
     {
         // E2 (plan 09) replaces this with a registry lookup on `decl.name`.
         let has_registered_validator = false;
-        if false && !has_registered_validator {
-            // RED-MUTATION
+        if !validation.enforce_input_schema && !has_registered_validator {
             tracing::warn!(
                 tool = %decl.name,
                 "[server.validation] enforce_input_schema = false: this tool's arguments are \
@@ -278,8 +277,7 @@ impl ValidatingToolHandler {
     fn check(&self, args: &Value) -> pmcp::Result<()> {
         use pmcp::server::schema_validation::{render_refusal, validate_input};
 
-        if false {
-            // RED-MUTATION
+        if !self.enforce_schema {
             return Ok(());
         }
         validate_input(&self.input_schema, Some(args), Some(&self.schema_key)).map_err(
@@ -389,7 +387,7 @@ pub(crate) fn build_input_schema(decl: &ToolDecl, validation: &ValidationSection
         "type": "object",
         "properties": props,
         "required": required,
-        "additionalProperties": false, // RED-MUTATION
+        "additionalProperties": validation.additional_properties,
     })
 }
 
@@ -420,8 +418,7 @@ fn apply_position_cap(
     position: crate::config::ParamPosition,
     validation: &ValidationSection,
 ) {
-    if false {
-        // RED-MUTATION
+    if crate::config::default_cap_applies(p, position, validation) {
         prop["maxLength"] = json!(validation.default_max_length);
     }
 }
