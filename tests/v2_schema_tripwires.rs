@@ -973,18 +973,26 @@ fn v2_schema_tripwires_the_resolved_graph_enables_no_jsonschema_resolver_feature
 fn v2_schema_tripwires_the_manifest_scan_is_not_vacuous() {
     let declared = declared_jsonschema_deps();
     assert!(
-        declared.len() >= 3,
-        "expected at least three DECLARED `{JSONSCHEMA}` dependencies and found {}: {declared:#?}\
+        declared.len() >= 2,
+        "expected at least two DECLARED `{JSONSCHEMA}` dependencies and found {}: {declared:#?}\
          \n  Without this the two checks above would pass over an empty set, which is a green run \
          over nothing rather than a clean bill of health.",
         declared.len()
     );
 
+    // Floor lowered 3 -> 2 and `pmcp-server-toolkit` dropped from the required list by
+    // phase 128 plan 01: the toolkit's own optional `jsonschema` edge
+    // (`crates/pmcp-server-toolkit/Cargo.toml`) was REMOVED when `input-validation` became a
+    // forward to `pmcp/schema-validation` (D-01 / SC-1 — input and output must not be able to
+    // validate under different dialects, which a second `jsonschema` path in the toolkit
+    // permits). Two is the real count, not a number chosen to go green: this assertion is the
+    // positive control for the declared- and resolved-scan checks above, so its floor must
+    // equal the measured topology or it silently stops guarding them.
     let packages: BTreeSet<&str> = declared.iter().map(|dep| dep.package.as_str()).collect();
-    for required in ["pmcp", "pmcp-agent", "pmcp-server-toolkit"] {
+    for required in ["pmcp", "pmcp-agent"] {
         assert!(
             packages.contains(required),
-            "`{required}` declares `{JSONSCHEMA}` (measured 2026-08-01) yet the metadata scan did \
+            "`{required}` declares `{JSONSCHEMA}` (measured 2026-09-26) yet the metadata scan did \
              not find it. Observed: {packages:?}.\n  Either the declaration moved — in which case \
              update this list deliberately — or the scan is broken."
         );
