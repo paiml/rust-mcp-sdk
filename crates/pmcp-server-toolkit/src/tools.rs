@@ -785,23 +785,35 @@ fn build_operation(path: &str, method: &str, decl: &ToolDecl) -> Operation {
 
     let mut parameters = Vec::with_capacity(decl.parameters.len());
     // Path params (template `{...}` segments) — always required.
+    //
+    // Phase 128 D4(b): this loop iterates the TEMPLATE, not `decl.parameters`, so
+    // the declared narrowing is looked up BY NAME and falls back to "no declared
+    // rules" when the template names a segment the config never declared. Such a
+    // parameter still gets the unconditional character floor and the always-on cap
+    // at substitution time — it simply gets no narrowing on top (D-10).
     for name in &path_param_names {
-        parameters.push(Parameter::new(
-            (*name).to_string(),
-            ParameterLocation::Path,
-            true,
-        ));
+        let declared = decl.parameters.iter().find(|p| p.name == **name);
+        parameters.push(
+            Parameter::new((*name).to_string(), ParameterLocation::Path, true).with_rules(
+                declared.and_then(|p| p.pattern.clone()),
+                declared.and_then(|p| p.max_length),
+                // D-11: the config is the ONE legitimate source of this permission.
+                declared.is_some_and(|p| p.allow_slash),
+            ),
+        );
     }
     // Remaining declared params → query params.
     for p in &decl.parameters {
         if path_param_names.iter().any(|n| *n == p.name) {
             continue;
         }
-        parameters.push(Parameter::new(
-            p.name.clone(),
-            ParameterLocation::Query,
-            p.required,
-        ));
+        parameters.push(
+            Parameter::new(p.name.clone(), ParameterLocation::Query, p.required).with_rules(
+                p.pattern.clone(),
+                p.max_length,
+                p.allow_slash,
+            ),
+        );
     }
 
     let has_request_body = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH");

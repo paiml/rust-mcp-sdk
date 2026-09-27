@@ -408,24 +408,78 @@ fn convert_parameter(param_ref: &ReferenceOr<openapiv3::Parameter>) -> Option<Pa
         ReferenceOr::Item(p) => p,
         ReferenceOr::Reference { .. } => return None,
     };
-    match param {
-        openapiv3::Parameter::Query { parameter_data, .. } => Some(Parameter::new(
-            parameter_data.name.clone(),
+    let (location, parameter_data, required) = match param {
+        openapiv3::Parameter::Query { parameter_data, .. } => (
             ParameterLocation::Query,
+            parameter_data,
             parameter_data.required,
-        )),
-        openapiv3::Parameter::Path { parameter_data, .. } => Some(Parameter::new(
-            parameter_data.name.clone(),
-            ParameterLocation::Path,
-            true,
-        )),
-        openapiv3::Parameter::Header { parameter_data, .. } => Some(Parameter::new(
-            parameter_data.name.clone(),
+        ),
+        // A path parameter is always required, per the OpenAPI spec itself.
+        openapiv3::Parameter::Path { parameter_data, .. } => {
+            (ParameterLocation::Path, parameter_data, true)
+        },
+        openapiv3::Parameter::Header { parameter_data, .. } => (
             ParameterLocation::Header,
+            parameter_data,
             parameter_data.required,
-        )),
-        openapiv3::Parameter::Cookie { .. } => None,
-    }
+        ),
+        openapiv3::Parameter::Cookie { .. } => return None,
+    };
+    let (pattern, max_length) = declared_string_rules(parameter_data);
+    Some(
+        Parameter::new(parameter_data.name.clone(), location, required)
+            // Phase 128 D-11: the third argument is `false` UNCONDITIONALLY, and it
+            // must stay that way. `allow_slash` lifts the path-separator refusal, so
+            // the only legitimate source for it is the server operator's own
+            // `[[tools.parameters]]` declaration. NO keyword read from a parsed
+            // document may be wired here — including the one that grants latitude
+            // over reserved characters in a serialization, which describes
+            // percent-encoding rather than permission to restructure the request
+            // target and is widely copy-pasted without intent. A spec is
+            // third-party content baked into a package; it may NARROW the floor
+            // (the two values above) and may never widen it. See
+            // `crate::config::ParamDecl::allow_slash`, which names the keyword and
+            // states the rule in full.
+            .with_rules(pattern, max_length, false),
+    )
+}
+
+/// The `pattern` and `max_length` a spec parameter's OWN schema declares
+/// (Phase 128, D4(b)).
+///
+/// # Which schema shapes narrow, and which deliberately do not
+///
+/// ONLY a direct `ReferenceOr::Item` whose `SchemaKind` is
+/// `Type(Type::String(..))` contributes, and it contributes exactly that string
+/// type's own `pattern` and `max_length`. Every other shape yields `(None, None)`:
+/// an unresolved `$ref`, a `oneOf` / `allOf` / `anyOf` composition, a non-string
+/// type, and the `content` form (which is how a parameter with no direct `schema`
+/// is represented).
+///
+/// That is deliberately conservative and it is conservative in the SAFE direction
+/// per D-10: a shape this function does not understand contributes NO narrowing,
+/// which leaves the unconditional character floor and the always-on length cap
+/// fully intact. Guessing at a `$ref` target — this parser resolves no references —
+/// could narrow from the wrong schema, which is strictly worse than narrowing from
+/// nothing.
+fn declared_string_rules(
+    parameter_data: &openapiv3::ParameterData,
+) -> (Option<String>, Option<u64>) {
+    let openapiv3::ParameterSchemaOrContent::Schema(ReferenceOr::Item(schema)) =
+        &parameter_data.format
+    else {
+        return (None, None);
+    };
+    let openapiv3::SchemaKind::Type(openapiv3::Type::String(string_type)) = &schema.schema_kind
+    else {
+        return (None, None);
+    };
+    (
+        string_type.pattern.clone(),
+        // A declared length that does not fit a `u64` contributes nothing, which is
+        // the safe direction: the always-on module cap still applies.
+        string_type.max_length.and_then(|m| u64::try_from(m).ok()),
+    )
 }
 
 #[cfg(test)]

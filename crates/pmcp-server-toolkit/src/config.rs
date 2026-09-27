@@ -661,7 +661,67 @@ fn validate_tool_parameters(
             check_param_capped_under_strict(tool, p, validation)?;
         }
     }
+    check_path_template_segments(tool)?;
     check_tool_input_schema_compiles(tool, validation)
+}
+
+/// Refuse a single-call `path` template segment the curated substitution parser
+/// cannot recognize (Phase 128, D4(b)).
+///
+/// # Why this is a hard error rather than a `lint()` finding
+///
+/// A malformed segment has no working interpretation. `/search/{a}{b}` yields the
+/// parameter name `a}{b`, which no `[[tools.parameters]]` entry can match, and
+/// `/prefix-{id}` is not recognized as carrying a placeholder at all — so in both
+/// cases literal braces are what would travel toward the backend. That request is
+/// already refused at call time by the composed-path check in
+/// `crate::http::HttpClient`, so the choice here is only between failing loudly at
+/// startup and failing obscurely on every call. Nothing that worked before loses a
+/// working behaviour; a silently-broken tool gains a message naming the segment.
+///
+/// Contrast [`ConfigValidationError::UncappedStringParam`], which is `strict`-only
+/// precisely because an uncapped free-text field DOES have a working
+/// interpretation (D-05).
+///
+/// # Errors
+///
+/// [`ConfigValidationError::MalformedPathTemplateSegment`], naming the first
+/// offending segment in left-to-right order.
+fn check_path_template_segments(tool: &ToolDecl) -> std::result::Result<(), ConfigValidationError> {
+    let Some(path) = tool.path.as_deref() else {
+        // No `path` — a SQL or script tool carries no template.
+        return Ok(());
+    };
+    for segment in path.split('/') {
+        if is_supported_path_segment(segment) {
+            continue;
+        }
+        return Err(ConfigValidationError::MalformedPathTemplateSegment {
+            tool: tool.name.clone(),
+            segment: segment.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether ONE `/`-delimited path-template segment is a shape
+/// [`path_placeholder_names`] recognizes.
+///
+/// Exactly two shapes are supported: a segment containing no brace at all, and a
+/// segment that is exactly one non-empty `{name}` spanning the whole segment with
+/// no further brace inside the name. This predicate is the inverse of
+/// [`path_placeholder_names`]'s filter, extended to also catch the
+/// carries-a-brace-but-is-not-a-placeholder cases that filter silently drops.
+fn is_supported_path_segment(segment: &str) -> bool {
+    if !segment.contains('{') && !segment.contains('}') {
+        return true;
+    }
+    // `{` and `}` are single-byte, so the inner slice is always a char boundary.
+    segment.starts_with('{')
+        && segment.ends_with('}')
+        && segment.len() > 2
+        && !segment[1..segment.len() - 1].contains('{')
+        && !segment[1..segment.len() - 1].contains('}')
 }
 
 /// D-07 strict mode: promote an `uncapped-string` lint finding into a hard
