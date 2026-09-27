@@ -175,7 +175,11 @@ fn violation(e: &jsonschema::ValidationError<'_>, schema: &Value) -> InputViolat
 ///
 /// Carries no length and no hash of the redacted key: a length is a side channel
 /// on a value that may itself be PHI (T-128-08a).
-const REDACTED_SEGMENT: &str = "<redacted>";
+///
+/// `pub(crate)` so the E3 path (`super::typed_tool`'s `garde` mapping) redacts a
+/// caller-chosen `garde::Path` segment with the SAME token rather than a second
+/// literal that could drift — a D1 and an E3 refusal must read alike (T-128-17b).
+pub(crate) const REDACTED_SEGMENT: &str = "<redacted>";
 
 /// Project `e`'s instance pointer onto the DECLARED schema, redacting every
 /// segment whose name came from the instance rather than from the declaration.

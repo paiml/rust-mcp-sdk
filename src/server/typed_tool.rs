@@ -208,22 +208,35 @@ where
     /// message byte-identical, so no existing user's error text changes — the
     /// narrowing is what keeps E3 additive.
     ///
-    /// RED placeholder: currently emits today's message on BOTH paths, so the
-    /// redaction rows fail.
+    #[cfg(feature = "validation")]
+    fn deserialize_args(&self, args: Value) -> Result<T> {
+        serde_json::from_value(args).map_err(|e| {
+            if self.validator.is_some() {
+                redacted_deserialize_error(&self.name, &e)
+            } else {
+                legacy_deserialize_error(&self.name, &e)
+            }
+        })
+    }
+
+    /// Deserialize `args` into `T`. Without the `validation` feature no validated
+    /// constructor exists, so today's message is the only one.
+    #[cfg(not(feature = "validation"))]
     fn deserialize_args(&self, args: Value) -> Result<T> {
         serde_json::from_value(args).map_err(|e| legacy_deserialize_error(&self.name, &e))
     }
 
     /// Run the stored `garde` validator, if this tool has one.
     ///
-    /// RED placeholder: currently accepts everything, so every refusal row fails.
-    /// The `unnecessary_wraps` allow is part of the placeholder — the GREEN body
-    /// returns `Err` and both go away together.
+    /// A tool built through a plain constructor stores none, and this is a no-op.
     #[cfg(feature = "validation")]
-    #[allow(clippy::unnecessary_wraps)]
     fn run_garde(&self, typed_args: &T) -> Result<()> {
-        let _ = (typed_args, self.validator.as_deref());
-        Ok(())
+        match self.validator.as_deref() {
+            Some(validate) => {
+                validate(typed_args).map_err(|report| render_garde_refusal(&self.name, &report))
+            },
+            None => Ok(()),
+        }
     }
 
     /// Set the description for this tool.
@@ -419,6 +432,135 @@ fn legacy_deserialize_error(tool: &str, e: &serde_json::Error) -> Error {
     Error::Validation(format!("Invalid arguments for tool '{}': {}", tool, e))
 }
 
+/// The REDACTED deserialization refusal a VALIDATED tool returns (T-128-17a).
+///
+/// `serde_json::Error`'s `Display` quotes the caller's input for several failure
+/// kinds — an invalid string, an unknown enum variant, a type mismatch — and this
+/// route sits in FRONT of `garde`, so a tool advertising a value-free refusal would
+/// otherwise leak before any field rule ran. This renders the failure's
+/// CLASSIFICATION instead, plus the position when `serde_json` reports one (it does
+/// for `from_str`; `from_value` has no position and reports line 0).
+#[cfg(feature = "validation")]
+fn redacted_deserialize_error(tool: &str, e: &serde_json::Error) -> Error {
+    let classification = match e.classify() {
+        serde_json::error::Category::Data => {
+            "the arguments do not match the declared argument type"
+        },
+        serde_json::error::Category::Syntax => "the arguments are not well-formed JSON",
+        serde_json::error::Category::Eof => "the arguments ended unexpectedly",
+        serde_json::error::Category::Io => "the arguments could not be read",
+    };
+    let position = if e.line() == 0 {
+        String::new()
+    } else {
+        format!(" at line {}, column {}", e.line(), e.column())
+    };
+    Error::Validation(format!(
+        "Invalid arguments for tool '{tool}': {classification}{position}"
+    ))
+}
+
+/// Map a `garde::Report` onto a value-free [`Error::Validation`].
+///
+/// # Why the text is rebuilt rather than `Display`-formatted
+///
+/// `garde::Report`'s own `Display` is value-free by construction — a rule's message
+/// names the DECLARED bound ("length is greater than 10"), never the rejected value
+/// (measured, Phase 128 RESEARCH Finding 4b). The `Path` half is NOT: garde 0.23's
+/// map validator EXTENDS the path with the map's KEYS
+/// (`garde-0.23.0/src/validate.rs:293`), and `T` here is generic and unrestricted,
+/// so a `#[garde(dive)]` field of type `HashMap<String, _>` contributes
+/// caller-chosen segments that may themselves be PHI — the same class as an
+/// `additionalProperties` key on the D1 path (T-128-17b). Every segment is
+/// therefore PROJECTED through [`project_garde_segment`], reusing the D1 path's
+/// redaction token so the two refusals read alike.
+///
+/// # Residual leak surfaces, stated rather than implied
+///
+/// 1. **`#[garde(custom(..))]` supplies its own message**, copied here verbatim. A
+///    custom validator must not put the rejected value in it; `pmcp` cannot inspect
+///    a closure's text.
+/// 2. **A caller-chosen map key that is ITSELF a bare identifier survives.** The
+///    projection cannot enumerate `T`'s declared field names at runtime, so its
+///    test is "does this segment have the SHAPE of a declared identifier". A map key
+///    like `ssn` is indistinguishable from a field named `ssn` and is emitted. Keys
+///    carrying anything else — a space, a dot, a hyphen, a digit first — are
+///    redacted. A tool whose map keys are themselves sensitive should validate
+///    inside the handler body instead.
+#[cfg(feature = "validation")]
+fn render_garde_refusal(tool: &str, report: &garde::Report) -> Error {
+    let detail = report
+        .iter()
+        .map(|(path, error)| {
+            let pointer = project_garde_path(path);
+            if pointer.is_empty() {
+                error.message().to_string()
+            } else {
+                format!("{pointer}: {}", error.message())
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("; ");
+    let detail = if detail.is_empty() {
+        "the arguments do not satisfy the declared field rules".to_string()
+    } else {
+        detail
+    };
+    Error::Validation(format!("Invalid arguments for tool '{tool}': {detail}"))
+}
+
+/// Project a `garde::Path` into a value-free RFC 6901-shaped pointer.
+///
+/// Walks the path's COMPONENTS rather than parsing its `Display`, which is
+/// deliberate: `Display` joins components with `.` and `[`/`]`, so a caller-chosen
+/// key containing one of those characters is indistinguishable from a nesting
+/// separator once rendered, and a lossy split could emit half of a sensitive key
+/// verbatim (`ssn.value` -> `ssn` + `value`, two identifier-shaped halves).
+/// `Path::__iter` is `#[doc(hidden)]` in garde 0.23 and `garde_derive` itself calls
+/// it the same way (`garde_derive-0.23.0/src/lib.rs:126`); a future garde release
+/// that removes it is a COMPILE error here rather than a silent behaviour change.
+#[cfg(feature = "validation")]
+fn project_garde_path(path: &garde::Path) -> String {
+    let mut out = String::new();
+    for (_, component) in path.__iter().rev() {
+        out.push('/');
+        out.push_str(project_garde_segment(component.as_str()));
+    }
+    out
+}
+
+/// One segment of [`project_garde_path`]'s walk.
+///
+/// Emitted VERBATIM only when it cannot carry caller-chosen text — a bare
+/// identifier (the shape of a declared struct field name) or a base-10 index (a
+/// sequence position). Everything else becomes the D1 path's `REDACTED_SEGMENT`.
+#[cfg(feature = "validation")]
+fn project_garde_segment(segment: &str) -> &str {
+    if is_identifier_shaped(segment) || is_base10_index(segment) {
+        segment
+    } else {
+        crate::server::schema_validation::REDACTED_SEGMENT
+    }
+}
+
+/// `true` when `segment` has the shape of a Rust identifier, which is what a
+/// declared struct field name always is.
+#[cfg(feature = "validation")]
+fn is_identifier_shaped(segment: &str) -> bool {
+    let mut bytes = segment.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {},
+        _ => return false,
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// `true` when `segment` is a base-10 sequence index. Carries no caller text.
+#[cfg(feature = "validation")]
+fn is_base10_index(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// A synchronous typed tool implementation with automatic schema generation.
 pub struct TypedSyncTool<T, F>
 where
@@ -537,21 +679,35 @@ where
     /// why the validated path's message is redacted and the unvalidated path's is
     /// byte-identical to today (T-128-17a).
     ///
-    /// RED placeholder: currently emits today's message on BOTH paths.
+    #[cfg(feature = "validation")]
+    fn deserialize_args(&self, args: Value) -> Result<T> {
+        serde_json::from_value(args).map_err(|e| {
+            if self.validator.is_some() {
+                redacted_deserialize_error(&self.name, &e)
+            } else {
+                legacy_deserialize_error(&self.name, &e)
+            }
+        })
+    }
+
+    /// Deserialize `args` into `T`. Without the `validation` feature no validated
+    /// constructor exists, so today's message is the only one.
+    #[cfg(not(feature = "validation"))]
     fn deserialize_args(&self, args: Value) -> Result<T> {
         serde_json::from_value(args).map_err(|e| legacy_deserialize_error(&self.name, &e))
     }
 
     /// Run the stored `garde` validator, if this tool has one.
     ///
-    /// RED placeholder: currently accepts everything.
-    /// The `unnecessary_wraps` allow is part of the placeholder — the GREEN body
-    /// returns `Err` and both go away together.
+    /// A tool built through a plain constructor stores none, and this is a no-op.
     #[cfg(feature = "validation")]
-    #[allow(clippy::unnecessary_wraps)]
     fn run_garde(&self, typed_args: &T) -> Result<()> {
-        let _ = (typed_args, self.validator.as_deref());
-        Ok(())
+        match self.validator.as_deref() {
+            Some(validate) => {
+                validate(typed_args).map_err(|report| render_garde_refusal(&self.name, &report))
+            },
+            None => Ok(()),
+        }
     }
 
     /// Set the description for this tool.
