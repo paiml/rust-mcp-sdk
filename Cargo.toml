@@ -737,6 +737,16 @@ name = "s56_workflow_skill_projection"
 path = "examples/s56_workflow_skill_projection.rs"
 required-features = ["skills", "full"]
 
+# Phase 128 (E3 / SC-8): `garde` field validation on a hand-written typed tool.
+# `s56` above is the highest taken slot, hence `s57`. `required-features` is just
+# `full` on purpose — `full` already lists both `validation` and
+# `schema-generation` (verified against this file's `full` definition), so naming
+# either of them again would be redundant.
+[[example]]
+name = "s57_typed_tool_garde_validation"
+path = "examples/s57_typed_tool_garde_validation.rs"
+required-features = ["full"]
+
 [[example]]
 name = "s45_tool_as_task_lifecycle"
 path = "examples/s45_tool_as_task_lifecycle.rs"
