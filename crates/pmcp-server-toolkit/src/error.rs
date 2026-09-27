@@ -353,6 +353,37 @@ pub enum ConfigValidationError {
         /// The `[[tools.parameters]]` `name` with no `max_length`.
         param: String,
     },
+    /// Per Phase 128 D4(b): a single-call `[[tools]]` `path` carries a
+    /// `/`-delimited segment that is not a supported placeholder shape.
+    ///
+    /// # The supported shape, and why anything else is an author error
+    ///
+    /// On the curated single-call surface a placeholder is a WHOLE segment: the
+    /// `path_placeholder_names` helper recognizes `{name}` spanning an
+    /// entire `/`-delimited segment and nothing else. A segment that contains a
+    /// brace but is not exactly `{name}` therefore takes one of two bad routes at
+    /// call time, neither of which is what the author meant:
+    ///
+    /// - `/search/{a}{b}` parses to the single parameter name `a}{b`, which no
+    ///   `[[tools.parameters]]` entry can match, so nothing is substituted;
+    /// - `/prefix-{id}` is not recognized as carrying a placeholder at all, so the
+    ///   literal text `{id}` is what would travel toward the backend.
+    ///
+    /// Both used to pass config validation and fail obscurely later. Refusing here
+    /// turns a silently-wrong request into a startup error naming the segment. The
+    /// segment text is author-written configuration, so echoing it is safe and is
+    /// what makes the error actionable — it carries no caller data.
+    #[error(
+        "[[tools]] '{tool}' path template segment '{segment}' is not a supported \
+         placeholder shape: a segment either contains no braces at all, or is \
+         exactly one non-empty '{{name}}' spanning the whole segment"
+    )]
+    MalformedPathTemplateSegment {
+        /// The `[[tools]]` `name` whose `path` carries the offending segment.
+        tool: String,
+        /// The offending `/`-delimited segment, verbatim (author-written config).
+        segment: String,
+    },
 }
 
 /// One non-fatal finding from [`crate::config::ServerConfig::lint`]

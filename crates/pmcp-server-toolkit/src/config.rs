@@ -3478,6 +3478,95 @@ mod tests {
         assert!(rule.contains("maxLength=256 (default)"), "{rule}");
     }
 
+    // -- Phase 128 D4(b) step 3b: the curated template parser's limit, enforced at
+    //    CONFIG time rather than failing obscurely at call time. ---------------
+
+    /// A single-call `GET` tool on `path`, no parameters.
+    fn single_call_on(path: &str) -> ServerConfig {
+        cfg_with_one_tool(
+            ToolDecl {
+                name: "t".to_string(),
+                description: Some("t".to_string()),
+                path: Some(path.to_string()),
+                method: Some("GET".to_string()),
+                ..Default::default()
+            },
+            ValidationSection::default(),
+        )
+    }
+
+    fn assert_malformed_segment(path: &str) {
+        let err = single_call_on(path)
+            .validate()
+            .expect_err("an unsupported path-template segment must be refused at config time");
+        match err {
+            ConfigValidationError::MalformedPathTemplateSegment { tool, segment } => {
+                assert_eq!(tool, "t");
+                assert!(!segment.is_empty(), "the finding must name the segment");
+            },
+            other => panic!("expected MalformedPathTemplateSegment, got {other:?}"),
+        }
+    }
+
+    /// `/search/{a}{b}` parses to the SINGLE name `a}{b`, which no `ParamDecl` can
+    /// match — refused at config time instead of sending literal braces upstream.
+    #[test]
+    fn validate_rejects_a_path_template_segment_with_two_brace_pairs() {
+        assert_malformed_segment("/search/{a}{b}");
+    }
+
+    /// `/prefix-{id}` is not recognized as carrying a placeholder at all.
+    #[test]
+    fn validate_rejects_a_path_template_segment_with_text_adjacent_to_a_brace_pair() {
+        assert_malformed_segment("/prefix-{id}");
+    }
+
+    /// `{}` is a brace pair with no name — not a placeholder.
+    #[test]
+    fn validate_rejects_an_empty_path_template_placeholder() {
+        assert_malformed_segment("/a/{}/b");
+    }
+
+    /// An unbalanced brace is the same author error seen from the other side.
+    #[test]
+    fn validate_rejects_an_unbalanced_path_template_brace() {
+        assert_malformed_segment("/a/{id");
+    }
+
+    /// ACCEPT control: whole-segment placeholders are the supported shape. Without
+    /// this row the four refusals above are satisfiable by refusing every template.
+    #[test]
+    fn validate_accepts_whole_segment_path_template_placeholders() {
+        single_call_on("/content/{version}/CUI/{cui}")
+            .validate()
+            .expect("whole-segment placeholders are the supported shape");
+    }
+
+    /// ACCEPT control, and the CURATED half of the inherited `?` narrowing: an
+    /// author-written query string in a `[[tools]]` `path` is configuration, not
+    /// caller data, and must keep working.
+    #[test]
+    fn validate_accepts_a_path_template_carrying_an_author_written_query_string() {
+        single_call_on("/content/{version}/CUI?string=x")
+            .validate()
+            .expect("an author-written query string in a curated path must be accepted");
+    }
+
+    /// A SQL tool has no `path`, so the template rule cannot reach it.
+    #[test]
+    fn validate_ignores_the_template_rule_for_a_tool_with_no_path() {
+        cfg_with_one_tool(
+            ToolDecl {
+                name: "t".to_string(),
+                sql: Some("SELECT 1".to_string()),
+                ..Default::default()
+            },
+            ValidationSection::default(),
+        )
+        .validate()
+        .expect("a SQL tool carries no path template");
+    }
+
     proptest! {
         /// TEST-02: any valid `ServerConfig` round-trips through TOML.
         ///

@@ -1697,6 +1697,135 @@ mod tests {
 }
 
 // -----------------------------------------------------------------------------
+// Tests — Phase 128 D4(b): `build_operation` carries the declared placeholder
+// rules onto every `Parameter`.
+// -----------------------------------------------------------------------------
+
+/// Named `build_operation` deliberately: libtest matches the FULL test path, so a
+/// test placed in the crate's existing `mod tests` would be
+/// `tools::tests::build_operation_…` and this plan's `--lib tools::build_operation`
+/// verify filter would select ZERO tests while exiting 0. As a SIBLING of `tests`
+/// at the `tools` module level the filter resolves as written. Do not fold these
+/// into `mod tests`.
+#[cfg(all(test, feature = "http"))]
+mod build_operation {
+    use super::*;
+
+    /// A single-call `GET` tool on `path` carrying `parameters`.
+    fn decl(path: &str, parameters: Vec<ParamDecl>) -> ToolDecl {
+        ToolDecl {
+            name: "t".to_string(),
+            description: Some("t".to_string()),
+            path: Some(path.to_string()),
+            method: Some("GET".to_string()),
+            parameters,
+            ..Default::default()
+        }
+    }
+
+    fn param_named<'a>(op: &'a Operation, name: &str) -> &'a Parameter {
+        op.parameters
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("parameter {name} present"))
+    }
+
+    /// A path parameter declaring a `pattern` produces a `Parameter` carrying it.
+    #[test]
+    fn build_operation_carries_a_declared_path_pattern() {
+        let d = decl(
+            "/content/{version}",
+            vec![ParamDecl {
+                name: "version".to_string(),
+                param_type: Some("string".to_string()),
+                required: true,
+                pattern: Some("^C[0-9]+$".to_string()),
+                ..Default::default()
+            }],
+        );
+        let op = super::build_operation("/content/{version}", "GET", &d);
+        let p = param_named(&op, "version");
+        assert_eq!(p.location, ParameterLocation::Path);
+        assert_eq!(p.pattern.as_deref(), Some("^C[0-9]+$"));
+    }
+
+    /// A query parameter declaring `max_length = 64` produces a `Parameter`
+    /// carrying `max_length: Some(64)`.
+    #[test]
+    fn build_operation_carries_a_declared_query_max_length() {
+        let d = decl(
+            "/search",
+            vec![ParamDecl {
+                name: "q".to_string(),
+                param_type: Some("string".to_string()),
+                max_length: Some(64),
+                ..Default::default()
+            }],
+        );
+        let op = super::build_operation("/search", "GET", &d);
+        let p = param_named(&op, "q");
+        assert_eq!(p.location, ParameterLocation::Query);
+        assert_eq!(p.max_length, Some(64));
+    }
+
+    /// A template segment the config never declared carries NO declared rules and
+    /// `allow_slash: false` — the path loop iterates the TEMPLATE, so it must look
+    /// the `ParamDecl` up by name and fall back cleanly when there is none.
+    #[test]
+    fn build_operation_leaves_rules_absent_for_an_undeclared_template_segment() {
+        let d = decl("/content/{version}", vec![]);
+        let op = super::build_operation("/content/{version}", "GET", &d);
+        let p = param_named(&op, "version");
+        assert_eq!(p.pattern, None);
+        assert_eq!(p.max_length, None);
+        assert!(!p.allow_slash);
+        assert!(p.required, "a template path parameter stays required");
+    }
+
+    /// D-11: `allow_slash` reaches the `Parameter` from the server's OWN config —
+    /// the one legitimate source.
+    #[test]
+    fn build_operation_carries_allow_slash_from_the_config() {
+        let d = decl(
+            "/files/{subpath}",
+            vec![ParamDecl {
+                name: "subpath".to_string(),
+                param_type: Some("string".to_string()),
+                required: true,
+                allow_slash: true,
+                ..Default::default()
+            }],
+        );
+        let op = super::build_operation("/files/{subpath}", "GET", &d);
+        assert!(param_named(&op, "subpath").allow_slash);
+    }
+
+    /// The three rule fields round-trip into the core rules type the substitution
+    /// point reads.
+    #[cfg(feature = "input-validation")]
+    #[test]
+    fn build_operation_rules_reach_placeholder_rules() {
+        let d = decl(
+            "/files/{subpath}",
+            vec![ParamDecl {
+                name: "subpath".to_string(),
+                param_type: Some("string".to_string()),
+                required: true,
+                pattern: Some("^[a-z/]+$".to_string()),
+                max_length: Some(128),
+                allow_slash: true,
+                ..Default::default()
+            }],
+        );
+        let op = super::build_operation("/files/{subpath}", "GET", &d);
+        let rules = param_named(&op, "subpath").placeholder_rules();
+        assert_eq!(rules.declared_pattern, Some("^[a-z/]+$"));
+        assert_eq!(rules.declared_max_length, Some(128));
+        assert!(rules.allow_slash);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests — Phase 90 OAPI-02a single-call HTTP synthesizer (feature `http`)
 // -----------------------------------------------------------------------------
 
