@@ -901,6 +901,7 @@ impl HttpCodeExecutor {
     /// the executor and the parsed spec are both in scope.
     #[must_use]
     pub fn with_schema(mut self, schema: Arc<crate::http::OpenApiSchema>) -> Self {
+        warn_if_narrowing_unavailable();
         self.schema = Some(schema);
         self
     }
@@ -969,21 +970,191 @@ impl HttpCodeExecutor {
     }
 }
 
+/// The spec-declared narrowing for ONE layer-2 `{param}` value (Phase 128 D4(b)).
+///
+/// A free helper, not an inline block, for two reasons: it keeps the trait method
+/// trivially under the cog-25 gate (SP-4), and it lets the `input-validation`-off
+/// build be a SIBLING FUNCTION with its own doc rather than a `cfg` arm buried in
+/// the impl.
+///
+/// The lookup is an O(1) index hit. [`OpenApiSchema`](crate::http::OpenApiSchema)
+/// indexes operations by `(path, METHOD)`, which is why `method` is part of the
+/// trait signature: `GET /things/{id}` and `DELETE /things/{id}` are two
+/// operations that may declare different constraints for the same `id`, and a
+/// `(path_template, param)` signature could only scan linearly or narrow from the
+/// wrong operation.
+///
+/// Only PATH-position parameters are consulted. A query-position namesake
+/// describes a different part of the request and must not narrow a path
+/// placeholder.
+///
+/// # What a MISS costs
+///
+/// No schema, no matching operation, or no matching PATH parameter returns
+/// [`PlaceholderRules::default()`](pmcp_code_mode::PlaceholderRules) — which
+/// RETAINS the unconditional character floor and the always-on
+/// 256-code-point cap, and LOSES the spec's additional narrowing. That is a real
+/// reduction, not a no-op: a Code Mode script writing `/users/{alias}` against a
+/// spec that declares `/users/{id}` reaches the SAME endpoint while the declared
+/// `pattern` silently disappears, because the lookup is by exact template text.
+///
+/// Three things bound that, and they are all the bound there is:
+///
+/// 1. the sentence above, so the cost is stated rather than described as harmless;
+/// 2. [`log_spec_lookup_miss`], a `tracing::debug!` fired once per
+///    `(method, template)` pair, naming the method and the template and never a
+///    value — so a drifted template produces a signal instead of silence;
+/// 3. `ServerConfig::lint_against_spec`, which refuses the CONFIGURED case before
+///    deploy. Its bound, stated: it covers a template written in the config. A
+///    template a Code Mode script COMPOSES at runtime is not visible at config
+///    time, which is why (2) exists as well.
+///
+/// Template canonicalization is deliberately NOT attempted. Normalizing `{alias}`
+/// to `{id}` requires knowing the two denote the same parameter, which only the
+/// spec's own path can establish — so a canonicalizer either re-derives the exact
+/// match it was meant to replace, or guesses, and a wrong guess narrows from
+/// ANOTHER parameter's declared rules. That can refuse a legitimate value under a
+/// rule the caller's endpoint does not carry, which is strictly worse than not
+/// narrowing.
+///
+/// This function builds [`PlaceholderRules`](pmcp_code_mode::PlaceholderRules) and
+/// nothing else. It evaluates no pattern of its own: there is exactly one regex
+/// path in this phase and it lives in core, which is what makes a placeholder
+/// `pattern` and an `inputSchema` `pattern` resolve the whitespace shorthand
+/// identically.
+#[cfg(all(feature = "openapi-code-mode", feature = "input-validation"))]
+fn spec_placeholder_rules<'a>(
+    schema: Option<&'a crate::http::OpenApiSchema>,
+    method: &str,
+    path_template: &str,
+    param: &str,
+) -> pmcp_code_mode::PlaceholderRules<'a> {
+    let default = pmcp_code_mode::PlaceholderRules::default();
+    let Some(schema) = schema else {
+        return default;
+    };
+    let Some(operation) = schema.operation_for(path_template, method) else {
+        log_spec_lookup_miss(method, path_template);
+        return default;
+    };
+    operation
+        .path_parameters()
+        .into_iter()
+        .find(|p| p.name == param)
+        .map_or(default, |p| p.placeholder_rules())
+}
+
+/// Report a `(method, path_template)` pair the spec does not carry, ONCE.
+///
+/// At `debug!` rather than `warn!` because a Code Mode script may legitimately
+/// address a long-tail endpoint the operator's spec omits, so this is diagnostic
+/// signal and not an error. It names only author-written text — the method and the
+/// template — and never a placeholder value.
+#[cfg(all(feature = "openapi-code-mode", feature = "input-validation"))]
+fn log_spec_lookup_miss(method: &str, path_template: &str) {
+    /// Bound on the distinct pairs remembered.
+    ///
+    /// A Code Mode script composes its template at RUNTIME, so an unbounded memo
+    /// is an unbounded allocation driven by caller-influenced input. Past the
+    /// bound the LOG goes quiet rather than the process growing: a server that has
+    /// already produced this many distinct misses has a configuration problem the
+    /// first entries already named. Enforcement is unaffected either way — the
+    /// floor and the cap never depend on this memo.
+    const MAX_REMEMBERED: usize = 64;
+
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+
+    let Ok(mut seen) = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    else {
+        return;
+    };
+    if seen.len() >= MAX_REMEMBERED || !seen.insert((method.to_string(), path_template.to_string()))
+    {
+        return;
+    }
+    drop(seen);
+    tracing::debug!(
+        target: "pmcp_server_toolkit::code_mode",
+        method = method,
+        path_template = path_template,
+        "no OpenAPI operation matches this (method, path template) pair: every placeholder \
+         value still faces the unconditional character floor and the always-on length cap, \
+         and the spec's ADDITIONAL narrowing is NOT applied. A template written in the \
+         config is reported before deploy by ServerConfig::lint_against_spec; a template a \
+         Code Mode script composes at runtime can only be reported here."
+    );
+}
+
+/// The `input-validation`-off half of the spec narrowing.
+///
+/// `Parameter::placeholder_rules` — the accessor that names the core
+/// `PlaceholderRules` type — is gated on the toolkit's `input-validation` feature,
+/// so on a build without it there is no declared-rules accessor to read and the
+/// spec contributes no narrowing.
+///
+/// **This is not the floor being switched off.** The floor and the cap run inside
+/// `pmcp_code_mode::PlanExecutor`, which depends on `pmcp/schema-validation`
+/// unconditionally; they are not behind this feature and this feature cannot turn
+/// them off. What IS off is the spec's additional narrowing — and
+/// [`warn_if_narrowing_unavailable`] says so once, at the moment an operator
+/// supplies a spec and would otherwise believe it was being enforced.
+#[cfg(all(feature = "openapi-code-mode", not(feature = "input-validation")))]
+fn spec_placeholder_rules<'a>(
+    schema: Option<&'a crate::http::OpenApiSchema>,
+    method: &str,
+    path_template: &str,
+    param: &str,
+) -> pmcp_code_mode::PlaceholderRules<'a> {
+    let _ = (schema, method, path_template, param);
+    pmcp_code_mode::PlaceholderRules::default()
+}
+
+/// No-op on a build that HAS `input-validation`: the narrowing is available, so
+/// there is no opt-out to report. The sibling below is the half that speaks.
+#[cfg(all(feature = "openapi-code-mode", feature = "input-validation"))]
+fn warn_if_narrowing_unavailable() {}
+
+/// Report, ONCE, that a supplied spec cannot narrow on this build.
+///
+/// An enforcement that is off must never read as on. An operator who passes
+/// `--spec` has asked for the spec's declarations to be applied; on a build
+/// without `input-validation` they are not, and this is the only moment at which
+/// that intent is observable.
+#[cfg(all(feature = "openapi-code-mode", not(feature = "input-validation")))]
+fn warn_if_narrowing_unavailable() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED.set(()).is_ok() {
+        tracing::warn!(
+            target: "pmcp_server_toolkit::code_mode",
+            "an OpenAPI spec was supplied but this build has the toolkit's \
+             `input-validation` feature OFF, so a path placeholder gets the unconditional \
+             character floor and the always-on length cap and NOT the spec's declared \
+             pattern/maxLength narrowing. Rebuild with `input-validation` (it is in the \
+             toolkit's default feature set) to apply the declarations."
+        );
+    }
+}
+
 #[cfg(feature = "openapi-code-mode")]
 #[pmcp_code_mode::async_trait]
 impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
-    /// STUB — the RED half of Phase 128 D4(b). Returns the floored-and-capped
-    /// default for every input so the narrowing assertions in
-    /// `placeholder_rules_override` fail on an assertion rather than on a missing
-    /// method. Replaced by the spec lookup in the GREEN commit.
+    /// Narrow a layer-2 `{param}` value by what the carried OpenAPI document
+    /// DECLARES for it (Phase 128 D4(b)).
+    ///
+    /// Delegates to [`spec_placeholder_rules`], whose rustdoc states exactly what
+    /// a schema/operation/parameter MISS costs — the floor and the cap are
+    /// retained, the spec's narrowing is lost — and what bounds that loss.
     fn placeholder_rules(
         &self,
         method: &str,
         path_template: &str,
         param: &str,
     ) -> pmcp_code_mode::PlaceholderRules<'_> {
-        let _ = (self.schema.as_deref(), method, path_template, param);
-        pmcp_code_mode::PlaceholderRules::default()
+        spec_placeholder_rules(self.schema.as_deref(), method, path_template, param)
     }
 
     async fn execute_request(

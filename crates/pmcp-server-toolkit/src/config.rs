@@ -358,6 +358,72 @@ impl ServerConfig {
         out
     }
 
+    /// The findings that need the operator's OpenAPI document to be computable
+    /// (Phase 128, D4(b) / T-128-36a).
+    ///
+    /// Separate from [`Self::lint`] rather than folded into it, because `lint`
+    /// takes only `&self` and a config is meaningful with no spec at all — a
+    /// spec-less deployment is supported and must produce no findings from its own
+    /// absence.
+    ///
+    /// Returns, in `[[tools]]` declaration order, one
+    /// [`CONFIGURED_TEMPLATE_NOT_IN_SPEC`] finding per single-call tool whose
+    /// `(method, path)` matches no operation the spec declares. Such a tool reaches
+    /// its endpoint and keeps the unconditional character floor and the always-on
+    /// length cap, but the spec's declared `pattern`/`maxLength` narrowing for its
+    /// placeholders is silently not applied — the `/users/{alias}` versus
+    /// `/users/{id}` drift. That is an author error an operator can fix before
+    /// deploy, which is the whole reason this runs at config time.
+    ///
+    /// An author-written query string on the configured `path` is stripped before
+    /// the lookup, because an OpenAPI path template never carries one — so
+    /// `/content/{version}/CUI?string=x` is matched as `/content/{version}/CUI`
+    /// rather than reported as drift.
+    ///
+    /// # The bound on this guard, stated
+    ///
+    /// It covers a template written in the CONFIG. A template a Code Mode script
+    /// COMPOSES at runtime is not visible here and cannot be, which is why the
+    /// runtime miss is additionally reported once per `(method, template)` pair by
+    /// `crate::code_mode`'s `log_spec_lookup_miss`. Neither signal is a refusal:
+    /// this returns findings, and never an error.
+    ///
+    /// Tools with no `path`/`method` pair — SQL tools, script tools — are skipped:
+    /// they address no single spec operation.
+    #[cfg(feature = "http")]
+    #[must_use]
+    pub fn lint_against_spec(&self, spec: &crate::http::OpenApiSchema) -> Vec<ConfigWarning> {
+        let mut out = Vec::new();
+        for tool in &self.tools {
+            let (Some(path), Some(method)) = (tool.path.as_deref(), tool.method.as_deref()) else {
+                continue;
+            };
+            // An OpenAPI path template never carries a query string; the curated
+            // surface permits one (plan 06's `?` narrowing), so strip it first.
+            let template = path.split_once('?').map_or(path, |(p, _)| p);
+            if spec.operation_for(template, method).is_some() {
+                continue;
+            }
+            out.push(ConfigWarning {
+                tool: tool.name.clone(),
+                param: String::new(),
+                rule: CONFIGURED_TEMPLATE_NOT_IN_SPEC,
+                detail: format!(
+                    "declares `method = \"{method}\"` and `path = \"{path}\"`, which matches no \
+                     operation in the supplied OpenAPI document. The tool still works and its \
+                     path placeholders still face the unconditional character floor and the \
+                     always-on length cap, but the spec's declared pattern/maxLength narrowing \
+                     is NOT applied to them — a placeholder named differently from the spec's \
+                     own (`{{alias}}` against a declared `{{id}}`) reaches the same endpoint \
+                     with its declaration silently dropped. Spell the path and method exactly \
+                     as the spec declares them, or remove the spec if this endpoint is \
+                     deliberately undocumented."
+                ),
+            });
+        }
+        out
+    }
+
     /// A structured account of what THIS config actually enforces, for the
     /// once-at-startup log (Phase 128 D-07 / `<specifics>`).
     ///
@@ -620,6 +686,12 @@ pub const UNCAPPED_STRING: &str = "uncapped-string";
 /// above the always-on path-placeholder floor.
 pub const DECLARED_MAX_LENGTH_ABOVE_PLACEHOLDER_CAP: &str =
     "declared-max-length-above-placeholder-cap";
+/// Machine-readable [`ConfigWarning::rule`] identifier: a configured single-call
+/// `(method, path)` that matches no operation in the supplied OpenAPI document, so
+/// the spec's declared placeholder narrowing is not applied to that tool
+/// (Phase 128, D4(b) / T-128-36a). Emitted by
+/// [`ServerConfig::lint_against_spec`](crate::config::ServerConfig::lint_against_spec).
+pub const CONFIGURED_TEMPLATE_NOT_IN_SPEC: &str = "configured-template-not-in-spec";
 /// Machine-readable [`ConfigWarning::rule`] identifier: schema enforcement off.
 pub const OPT_OUT_ENFORCE_INPUT_SCHEMA: &str = "opt-out-enforce-input-schema";
 /// Machine-readable [`ConfigWarning::rule`] identifier: default cap disabled.
@@ -3651,5 +3723,127 @@ mod tests {
             prop_assert_eq!(parsed.server.name, name);
             prop_assert_eq!(parsed.server.version, version);
         }
+    }
+}
+
+/// `ServerConfig::lint_against_spec` — the CONFIG-time half of the
+/// template-spelling-drift guard (Phase 128, D4(b) / T-128-36a).
+///
+/// Four rows, and the shape matters: one row per DRIFT that must be reported, plus
+/// three accept rows for the shapes that must NOT be, because a finding-producing
+/// lint with no accept rows is indistinguishable from one that fires on everything.
+#[cfg(all(test, feature = "http"))]
+mod lint_against_spec_tests {
+    use super::{ServerConfig, ToolDecl, CONFIGURED_TEMPLATE_NOT_IN_SPEC};
+    use crate::http::OpenApiSchema;
+
+    const SPEC: &str = r#"{
+      "openapi": "3.0.0",
+      "info": { "title": "t", "version": "1" },
+      "paths": {
+        "/content/{version}/CUI": {
+          "get": {
+            "operationId": "getCui",
+            "parameters": [
+              { "name": "version", "in": "path", "required": true,
+                "schema": { "type": "string", "pattern": "^[a-z]+$" } }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          }
+        }
+      }
+    }"#;
+
+    fn spec() -> OpenApiSchema {
+        OpenApiSchema::parse(SPEC).expect("the fixture spec parses")
+    }
+
+    fn cfg_with(tools: Vec<ToolDecl>) -> ServerConfig {
+        ServerConfig {
+            server: super::ServerSection {
+                name: "t".to_string(),
+                version: "0.1.0".to_string(),
+                ..Default::default()
+            },
+            tools,
+            ..Default::default()
+        }
+    }
+
+    fn http_tool(name: &str, method: &str, path: &str) -> ToolDecl {
+        ToolDecl {
+            name: name.to_string(),
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The drift the guard exists for: a placeholder spelled differently from the
+    /// spec's own reaches the same endpoint with the declaration dropped.
+    #[test]
+    fn lint_against_spec_reports_a_template_the_spec_does_not_declare() {
+        let cfg = cfg_with(vec![http_tool("get_cui", "GET", "/content/{alias}/CUI")]);
+        let findings = cfg.lint_against_spec(&spec());
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule, CONFIGURED_TEMPLATE_NOT_IN_SPEC);
+        assert_eq!(findings[0].tool, "get_cui");
+        assert!(
+            findings[0].detail.contains("floor"),
+            "the finding must say what a miss RETAINS, not only what it loses: {}",
+            findings[0].detail
+        );
+    }
+
+    /// A method the spec does not declare on a path it does is the same class of
+    /// drift, because operations are indexed by `(path, METHOD)`.
+    #[test]
+    fn lint_against_spec_reports_a_method_the_spec_does_not_declare() {
+        let cfg = cfg_with(vec![http_tool(
+            "del_cui",
+            "DELETE",
+            "/content/{version}/CUI",
+        )]);
+        let rules: Vec<&str> = cfg
+            .lint_against_spec(&spec())
+            .iter()
+            .map(|w| w.rule)
+            .collect();
+        assert_eq!(rules, vec![CONFIGURED_TEMPLATE_NOT_IN_SPEC]);
+    }
+
+    /// ACCEPT — an exact match, in either method case, is no finding.
+    #[test]
+    fn lint_against_spec_accepts_an_exactly_declared_template() {
+        let cfg = cfg_with(vec![
+            http_tool("a", "GET", "/content/{version}/CUI"),
+            http_tool("b", "get", "/content/{version}/CUI"),
+        ]);
+        assert_eq!(cfg.lint_against_spec(&spec()), Vec::new());
+    }
+
+    /// ACCEPT — an author-written query string on the configured `path` is legal
+    /// curated authoring (plan 06's `?` narrowing) and an OpenAPI template never
+    /// carries one, so it is stripped before the lookup rather than reported.
+    #[test]
+    fn lint_against_spec_accepts_an_author_written_query_string() {
+        let cfg = cfg_with(vec![http_tool(
+            "a",
+            "GET",
+            "/content/{version}/CUI?string=x",
+        )]);
+        assert_eq!(cfg.lint_against_spec(&spec()), Vec::new());
+    }
+
+    /// ACCEPT — a tool that addresses no single spec operation is skipped, not
+    /// reported. A SQL tool has no `(method, path)` to look up.
+    #[test]
+    fn lint_against_spec_skips_a_tool_with_no_method_path_pair() {
+        let cfg = cfg_with(vec![ToolDecl {
+            name: "q".to_string(),
+            sql: Some("SELECT 1".to_string()),
+            ..Default::default()
+        }]);
+        assert_eq!(cfg.lint_against_spec(&spec()), Vec::new());
     }
 }
