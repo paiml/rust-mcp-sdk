@@ -919,6 +919,26 @@ impl HttpCodeExecutor {
         self
     }
 
+    /// Whether this executor carries an OpenAPI document, and therefore whether a
+    /// path placeholder can be narrowed by a spec DECLARATION (Phase 128 D4(b)).
+    ///
+    /// `false` never means "unchecked": a spec-less executor still applies the
+    /// unconditional character floor and the always-on length cap to every
+    /// placeholder value. It means only that no ADDITIONAL declared narrowing is
+    /// available.
+    ///
+    /// Public, and deliberately so. T-128-36c is the risk that `with_schema` gets
+    /// wired to a `#[cfg(test)]` helper — or applied after the executor has already
+    /// fanned out — leaving the production binary unnarrowed while every test
+    /// passes. The wiring lives in a DIFFERENT crate (`pmcp-openapi-server`'s
+    /// `build_server`), so a `#[cfg(test)]` accessor could not prove it from there.
+    /// This is a read-only boolean over a private field; it exposes nothing about
+    /// the document.
+    #[must_use]
+    pub fn has_schema(&self) -> bool {
+        self.schema.is_some()
+    }
+
     /// Test-only accessor for the per-request captured token, so unit tests can
     /// assert [`request_executor_from_extra`] threads the inbound token (the
     /// field is otherwise private — Plan 90-10).

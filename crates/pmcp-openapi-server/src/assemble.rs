@@ -242,6 +242,17 @@ fn register_prompts(
 /// [`AssembleError::Toolkit`] if a toolkit step fails (e.g. tool synthesis or a
 /// `token_secret` resolution error) or [`AssembleError::Build`] if the final
 /// `pmcp::Server` build fails.
+/// STUB — the RED half of Phase 128 D4(b)'s wiring. Returns the executor
+/// unchanged, ignoring the spec, so `narrowed_executor_attaches_a_supplied_spec`
+/// fails on an assertion rather than on a missing function.
+fn narrowed_executor(
+    http_exec: HttpCodeExecutor,
+    spec: Option<&Arc<OpenApiSchema>>,
+) -> HttpCodeExecutor {
+    let _ = spec;
+    http_exec
+}
+
 pub fn build_server(
     cfg: &ServerConfig,
     connector: Arc<dyn HttpConnector>,
@@ -261,7 +272,41 @@ pub fn build_server(
         );
     }
 
-    let resources = StaticResourceHandler::from_configs(&merge_spec_resource(cfg, spec.as_ref()))?;
+    // ONE `Arc<OpenApiSchema>`, shared between the `api_schema` resource below and
+    // the executor's D4(b) narrowing. The parsed document is retained verbatim and
+    // can be large; cloning it to give the executor its own copy would double that
+    // allocation for no benefit.
+    let spec = spec.map(Arc::new);
+
+    let resources =
+        StaticResourceHandler::from_configs(&merge_spec_resource(cfg, spec.as_deref()))?;
+
+    // Phase 128 D4(b) — the executor gets the spec HERE, and the position is
+    // load-bearing rather than incidental.
+    //
+    // Both HTTP surfaces run on ONE executor (D-02): the synthesizer at (1) takes a
+    // CLONE and Code Mode at (2) takes the original. `HttpCodeExecutor` is a
+    // cheap-clone value type, so a clone taken before `with_schema` would be
+    // permanently unnarrowed — the narrowing has to be attached before EITHER
+    // fan-out, which is why this statement precedes both. `build_server` is also the
+    // only place the executor and the parsed spec are both in scope: `dispatch.rs`
+    // constructs the executor with no spec available, and the two `#[cfg(test)]`
+    // helpers that look like candidates would leave the production binary
+    // unnarrowed while every test passed (T-128-36c).
+    let http_exec = narrowed_executor(http_exec, spec.as_ref());
+
+    // The CONFIGURED half of the template-spelling guard (T-128-36a). A `[[tools]]`
+    // `(method, path)` the spec does not declare keeps the unconditional floor and
+    // the always-on cap but loses the spec's narrowing, and that is an author error
+    // the operator can fix before deploy — so it is reported once, at startup, in
+    // the deploy log. Its bound is stated on `lint_against_spec`: a template a Code
+    // Mode script composes at RUNTIME is invisible at config time and is reported
+    // instead by the toolkit's once-per-pair debug log.
+    if let Some(schema) = spec.as_deref() {
+        for finding in cfg.lint_against_spec(schema) {
+            tracing::warn!(target: "pmcp_openapi_server", "{finding}");
+        }
+    }
 
     // 1. Single-call + script tools over the shared connector + http_exec.
     let synthesized = synthesize_from_config_with_http_connector_and_scripts(
@@ -400,4 +445,77 @@ required = true
     // dead). Its unit coverage now lives in the toolkit
     // (`code_mode::per_request_executor_tests`), and the end-to-end
     // handler-path forwarding proof is `tests/oauth_passthrough_e2e.rs`.
+
+    /// A spec declaring a NARROW pattern on the curated tool's own path, so the
+    /// wiring's effect is observable rather than merely present.
+    const NARROWING_SPEC: &str = r#"{
+      "openapi": "3.0.0",
+      "info": { "title": "tube", "version": "1" },
+      "paths": {
+        "/Line/{id}/Status": {
+          "get": {
+            "operationId": "getLineStatus",
+            "parameters": [
+              { "name": "id", "in": "path", "required": true,
+                "schema": { "type": "string", "pattern": "^[a-z]+$" } }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          }
+        }
+      }
+    }"#;
+
+    /// T-128-36c — the wiring must attach a supplied spec to the executor the
+    /// binary actually serves with. Asserted through the toolkit's public
+    /// `has_schema()` because the wiring lives in THIS crate while the field lives
+    /// in the toolkit, so a `#[cfg(test)]` accessor could not reach it.
+    #[test]
+    fn narrowed_executor_attaches_a_supplied_spec() {
+        let spec = std::sync::Arc::new(OpenApiSchema::parse(NARROWING_SPEC).expect("parses"));
+        assert!(
+            !http_exec().has_schema(),
+            "the constructor must leave the schema absent, or this row proves nothing"
+        );
+        assert!(
+            super::narrowed_executor(http_exec(), Some(&spec)).has_schema(),
+            "a supplied spec must reach the executor"
+        );
+    }
+
+    /// The spec-less deployment stays supported: no spec, no schema, and the floor
+    /// plus the cap are what still protect it.
+    #[test]
+    fn narrowed_executor_leaves_a_spec_less_executor_alone() {
+        assert!(!super::narrowed_executor(http_exec(), None).has_schema());
+    }
+
+    /// ONE `Arc` is shared rather than the document being cloned: the executor's
+    /// copy and the caller's are the same allocation.
+    #[test]
+    fn narrowed_executor_shares_one_arc() {
+        let spec = std::sync::Arc::new(OpenApiSchema::parse(NARROWING_SPEC).expect("parses"));
+        let before = std::sync::Arc::strong_count(&spec);
+        let exec = super::narrowed_executor(http_exec(), Some(&spec));
+        assert_eq!(
+            std::sync::Arc::strong_count(&spec),
+            before + 1,
+            "the executor must hold a clone of the Arc, not a clone of the document"
+        );
+        drop(exec);
+        assert_eq!(std::sync::Arc::strong_count(&spec), before);
+    }
+
+    /// `build_server` with a spec still builds and registers both tool families —
+    /// the narrowing is additive, not a new failure mode.
+    #[test]
+    fn build_server_with_a_spec_builds_and_registers_tools() -> Result<(), AssembleError> {
+        std::env::set_var("OPENAPI_ASSEMBLE_SECRET", "s3cr3t-assemble-narrowing");
+        let cfg = curated_only_cfg();
+        let spec = OpenApiSchema::parse(NARROWING_SPEC).expect("parses");
+        let server = build_server(&cfg, connector(), http_exec(), Some(spec))?;
+        assert!(server.get_tool("get_line_status").is_some());
+        assert!(server.get_tool("execute_code").is_some());
+        std::env::remove_var("OPENAPI_ASSEMBLE_SECRET");
+        Ok(())
+    }
 }

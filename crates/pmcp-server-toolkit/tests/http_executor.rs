@@ -384,3 +384,110 @@ async fn http_executor_compliant_placeholder_call_produces_exactly_one_request()
         "auth is added server-side, never by the script"
     );
 }
+
+// =============================================================================
+// Phase 128 D4(b) — the SPEC-DECLARED narrowing, end to end through PlanExecutor
+//
+// The two rows below are a PAIR and neither is meaningful alone. The first proves
+// a value that CLEARS the unconditional floor is refused because the operator's
+// spec declares a narrower `pattern` for that parameter. The second runs the
+// IDENTICAL value on an executor carrying no schema and asserts it reaches the
+// upstream — which is what proves the NARROWING did the refusing and not the
+// floor. Without the control, deleting the narrowing and letting the floor refuse
+// something else would keep the first row green.
+// =============================================================================
+
+/// The spec the pair shares: `GET /content/{version}/CUI/{cui}` with a narrow
+/// `pattern` on `version` (lowercase letters only) and nothing declared on `cui`.
+const NARROWING_SPEC: &str = r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "umls", "version": "1" },
+  "paths": {
+    "/content/{version}/CUI/{cui}": {
+      "get": {
+        "operationId": "getCui",
+        "parameters": [
+          { "name": "version", "in": "path", "required": true,
+            "schema": { "type": "string", "pattern": "^[a-z]+$" } },
+          { "name": "cui", "in": "path", "required": true,
+            "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "ok" } }
+      }
+    }
+  }
+}"#;
+
+/// The script both rows run: `version` is `FLOORCLEAN` — no path separator, no
+/// traversal, no query marker, no control byte, well under the cap — so the
+/// unconditional floor accepts it. Only the spec's `^[a-z]+$` can refuse it.
+const NARROWING_SCRIPT: &str = "const r = await api.get('/content/{version}/CUI/{cui}', \
+     { version: 'FLOORCLEAN', cui: 'C0018787' });\nreturn r;";
+
+/// Run `NARROWING_SCRIPT` with or without the spec attached, returning the
+/// outcome and the number of requests the upstream actually observed.
+async fn run_narrowing_probe(with_spec: bool) -> (Result<serde_json::Value, String>, usize) {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let auth = create_auth_provider(&AuthConfig::None).expect("noauth");
+    let exec = HttpCodeExecutor::new(reqwest::Client::new(), server.uri(), auth);
+    let exec = if with_spec {
+        let schema = pmcp_server_toolkit::http::OpenApiSchema::parse(NARROWING_SPEC)
+            .expect("the fixture spec parses");
+        exec.with_schema(std::sync::Arc::new(schema))
+    } else {
+        exec
+    };
+    assert_eq!(
+        exec.has_schema(),
+        with_spec,
+        "the probe must actually be in the configuration it claims"
+    );
+
+    let mut compiler = PlanCompiler::new();
+    let plan = compiler
+        .compile_code(NARROWING_SCRIPT)
+        .expect("the probe script compiles");
+    let mut executor = PlanExecutor::new(exec, ExecutionConfig::default());
+    let outcome = executor
+        .execute(&plan)
+        .await
+        .map(|r| r.value)
+        .map_err(|e| e.to_string());
+
+    let observed = server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .len();
+    (outcome, observed)
+}
+
+/// D4(b) — the operator's declared `pattern` refuses a FLOOR-CLEAN value, before
+/// dispatch, with zero upstream requests and no echo of the value.
+#[tokio::test]
+async fn http_executor_spec_pattern_refuses_a_floor_clean_value() {
+    let (outcome, observed) = run_narrowing_probe(true).await;
+    assert_refused(&outcome, observed, &["FLOORCLEAN", "/content/", "C0018787"]);
+}
+
+/// The CONTROL for the row above. The same value on an executor with NO schema
+/// reaches the upstream — so what refused it there was the spec's narrowing and
+/// not the floor. A spec-less deployment is still floored and capped; it simply
+/// has no additional declaration to apply.
+#[tokio::test]
+async fn http_executor_without_a_spec_accepts_the_same_floor_clean_value() {
+    let (outcome, observed) = run_narrowing_probe(false).await;
+    assert!(
+        outcome.is_ok(),
+        "with no schema the floor-clean value must be accepted: {outcome:?}"
+    );
+    assert_eq!(
+        observed, 1,
+        "exactly one upstream request proves the value was dispatched, not refused"
+    );
+}
