@@ -356,28 +356,57 @@ const MAX_EXACT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
 /// `[[tools.parameters]]` declaration order.
 fn validate_tool_parameters(tool: &ToolDecl) -> std::result::Result<(), ConfigValidationError> {
     for p in &tool.parameters {
-        let declared_patterns = [
-            p.pattern.as_deref(),
-            p.items.as_ref().and_then(|i| i.pattern.as_deref()),
-        ];
-        for pattern in declared_patterns.into_iter().flatten() {
-            if pattern.is_empty() {
-                return Err(ConfigValidationError::EmptyParamPattern {
-                    tool: tool.name.clone(),
-                    param: p.name.clone(),
-                });
-            }
-        }
-        for bound in [p.minimum, p.maximum].into_iter().flatten() {
-            if !bound.is_finite() || bound.abs() > MAX_EXACT_INTEGER_BOUND {
-                return Err(ConfigValidationError::NonFiniteParamBound {
-                    tool: tool.name.clone(),
-                    param: p.name.clone(),
-                });
-            }
-        }
+        check_param_patterns_non_empty(tool, p)?;
+        check_param_bounds_representable(tool, p)?;
     }
     check_tool_input_schema_compiles(tool)
+}
+
+/// SC-2 edge (empty): refuse `pattern = ""` on the parameter OR on its
+/// `[tools.parameters.items]` sub-table.
+///
+/// # Errors
+///
+/// [`ConfigValidationError::EmptyParamPattern`].
+fn check_param_patterns_non_empty(
+    tool: &ToolDecl,
+    p: &ParamDecl,
+) -> std::result::Result<(), ConfigValidationError> {
+    let declared = [
+        p.pattern.as_deref(),
+        p.items.as_ref().and_then(|i| i.pattern.as_deref()),
+    ];
+    if declared.into_iter().flatten().any(str::is_empty) {
+        return Err(ConfigValidationError::EmptyParamPattern {
+            tool: tool.name.clone(),
+            param: p.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// D3 edge (precision): refuse a `minimum`/`maximum` that an `f64` cannot carry
+/// exactly. See [`ConfigValidationError::NonFiniteParamBound`] for what this does
+/// and does not establish.
+///
+/// # Errors
+///
+/// [`ConfigValidationError::NonFiniteParamBound`].
+fn check_param_bounds_representable(
+    tool: &ToolDecl,
+    p: &ParamDecl,
+) -> std::result::Result<(), ConfigValidationError> {
+    let unrepresentable = [p.minimum, p.maximum]
+        .into_iter()
+        .flatten()
+        .any(|b| !b.is_finite() || b.abs() > MAX_EXACT_INTEGER_BOUND);
+    if unrepresentable {
+        return Err(ConfigValidationError::NonFiniteParamBound {
+            tool: tool.name.clone(),
+            param: p.name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// SC-2: compile the tool's synthesized `inputSchema` at CONFIG time, so a
@@ -438,9 +467,9 @@ fn check_tool_input_schema_compiles(
 #[cfg(not(feature = "input-validation"))]
 fn warn_if_pattern_checking_unavailable(tools: &[ToolDecl]) {
     let declares_a_pattern = tools.iter().any(|t| {
-        t.parameters.iter().any(|p| {
-            p.pattern.is_some() || p.items.as_ref().is_some_and(|i| i.pattern.is_some())
-        })
+        t.parameters
+            .iter()
+            .any(|p| p.pattern.is_some() || p.items.as_ref().is_some_and(|i| i.pattern.is_some()))
     });
     if declares_a_pattern {
         tracing::warn!(
@@ -2390,7 +2419,10 @@ mod tests {
                     position.contains("region"),
                     "position must name the offending parameter, got {position:?}"
                 );
-                assert!(!detail.is_empty(), "the author-facing detail must be present");
+                assert!(
+                    !detail.is_empty(),
+                    "the author-facing detail must be present"
+                );
             },
             other => panic!("expected UncompilableParamSchema, got {other:?}"),
         }

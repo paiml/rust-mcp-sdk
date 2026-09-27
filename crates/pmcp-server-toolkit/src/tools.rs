@@ -1124,7 +1124,6 @@ mod tests {
         assert_eq!(params, vec![("limit".to_string(), serde_json::json!(5))]);
     }
 
-
     // -------------------------------------------------------------------------
     // Phase 128 D2 — the six new `ParamDecl` keywords reach `inputSchema`
     // -------------------------------------------------------------------------
