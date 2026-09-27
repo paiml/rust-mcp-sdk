@@ -91,7 +91,12 @@ pmcp = {{ version = "{PMCP_VERSION}", features = ["streamable-http"] }}
 # DEFAULT pulls `code-mode` → pmcp-code-mode (SWC/JS) into the served tree and
 # trips `make purity-check`. `workbook-embedded` (NOT bare workbook) supplies
 # EmbeddedSource; `http` forwards the streamable-HTTP server.
-pmcp-server-toolkit = {{ version = "{TOOLKIT_VERSION}", default-features = false, features = ["workbook-embedded", "http"] }}
+# `input-validation` MUST be named explicitly for the same reason (Phase 128 Q7):
+# it is in the toolkit's `default`, which `default-features = false` discards, so
+# without it every project created from this scaffold would serve its declared
+# `inputSchema` UNENFORCED. It forwards only `pmcp/schema-validation` — no JS
+# engine, so the purity posture above is unaffected.
+pmcp-server-toolkit = {{ version = "{TOOLKIT_VERSION}", default-features = false, features = ["workbook-embedded", "http", "input-validation"] }}
 include_dir = "0.7.4"
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 "#,
@@ -343,10 +348,20 @@ mod tests {
             effective.contains("default-features = false"),
             "emitted Cargo.toml MUST disable toolkit default features (T-95-06): {cargo}"
         );
-        assert!(
-            effective.contains(r#"features = ["workbook-embedded", "http"]"#),
-            "emitted Cargo.toml MUST use the workbook-embedded + http feature set: {cargo}"
-        );
+        // Phase 128 Q7: asserted MEMBER-WISE rather than against the exact array
+        // text. The previous form pinned the literal
+        // `features = ["workbook-embedded", "http"]`, which made this purity guard
+        // fail the moment a NEW and unrelated feature was legitimately added
+        // (`input-validation`) — a guard that fires on a correct change is a guard
+        // people learn to edit past. What this test actually cares about is that the
+        // two purity-relevant features are present and `code-mode` is absent; the
+        // completeness of the list is `emitted_toolkit_dependency_names_input_validation`'s job.
+        for required in ["workbook-embedded", "http"] {
+            assert!(
+                effective.contains(&format!("\"{required}\"")),
+                "emitted Cargo.toml MUST enable the `{required}` toolkit feature: {cargo}"
+            );
+        }
         assert!(
             !effective.contains("code-mode"),
             "emitted Cargo.toml MUST NOT enable code-mode (purity gate): {cargo}"
@@ -508,5 +523,73 @@ mod tests {
             "the scaffold's hardcoded pmcp-server-toolkit version `{TOOLKIT_VERSION}` drifted \
              from the workspace pin `{toolkit_version}` — bump TOOLKIT_VERSION in workbook_server.rs"
         );
+    }
+
+    /// Phase 128 Q7 / T-128-13a: the emitted toolkit dependency MUST name
+    /// `input-validation`.
+    ///
+    /// This scaffold sets `default-features = false` (mandatory for the T-95-06
+    /// purity gate), which discards the toolkit's `default` — and
+    /// `input-validation` lives there. Without the explicit entry every project
+    /// created by `cargo pmcp new --kind workbook-server` would serve its declared
+    /// `inputSchema` UNENFORCED, and the failure would propagate OUTSIDE this
+    /// repository rather than staying in it.
+    ///
+    /// `cargo build` cannot catch a drop here, because the manifest is emitted
+    /// string-literal text. So the guard is this test, in the same shape as the two
+    /// version guards above — and for the same reason CLAUDE.md item 13 records for
+    /// the version half of this very file: unguarded literals rot.
+    ///
+    /// Asserted against the ACTUAL emitted file, parsed as TOML, rather than by
+    /// grepping the source — a `grep` would also match the explanatory comment and
+    /// would pass even if the feature were removed from the array.
+    #[test]
+    fn emitted_toolkit_dependency_names_input_validation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("src dir");
+        generate(tmp.path(), "wb_feature_guard_demo").expect("generate scaffold");
+
+        let emitted = std::fs::read_to_string(tmp.path().join("Cargo.toml"))
+            .expect("read the emitted Cargo.toml");
+        let parsed: toml::Value = toml::from_str(&emitted).expect("emitted Cargo.toml must parse");
+        let dep = parsed
+            .get("dependencies")
+            .and_then(|d| d.get("pmcp-server-toolkit"))
+            .expect("emitted Cargo.toml declares pmcp-server-toolkit");
+
+        // Positive control for the assertion below: if this crate ever stopped
+        // setting `default-features = false`, it WOULD inherit the feature and this
+        // guard would become vacuous — so assert the precondition that makes the
+        // guard load-bearing, not just the feature itself.
+        assert_eq!(
+            dep.get("default-features").and_then(toml::Value::as_bool),
+            Some(false),
+            "this guard exists BECAUSE the scaffold opts out of default features; if that \
+             changed, revisit whether the explicit entry is still required"
+        );
+
+        let features: Vec<&str> = dep
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .expect("the toolkit dependency declares a features array")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(
+            features.contains(&"input-validation"),
+            "the emitted pmcp-server-toolkit features {features:?} must name \
+             `input-validation` — this scaffold sets default-features = false, so it does NOT \
+             inherit it from the toolkit's `default`, and every project created from this \
+             template would otherwise ship with its declared inputSchema UNENFORCED \
+             (Phase 128 Q7 / T-128-13a)"
+        );
+        // Sanity: the two features this scaffold has always needed are still there,
+        // so a careless edit to the array cannot pass by naming only the new one.
+        for expected in ["workbook-embedded", "http"] {
+            assert!(
+                features.contains(&expected),
+                "the emitted feature list lost `{expected}`: {features:?}"
+            );
+        }
     }
 }

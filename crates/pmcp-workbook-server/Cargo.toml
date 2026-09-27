@@ -40,7 +40,14 @@ pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
 # `pmcp-code-mode` into the served binary tree and TRIPS the Phase 95
 # `make purity-check` reader/JS-absence gate. Disabling defaults keeps the
 # served cone reader-free + code-mode-free, matching the D-11 posture above.
-pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "http"] }
+# Why `input-validation` is named EXPLICITLY (Phase 128, Q7): it is in the
+# toolkit's `default`, and `default-features = false` above means this crate does
+# not inherit it. Without this entry a workbook server would ship with its
+# declared `inputSchema` unenforced while every other config-driven server in this
+# workspace enforces — which is the exact silent-weakening class this phase closes.
+# It forwards only `pmcp/schema-validation`, so it does not re-admit the JS engine
+# the purity gate keeps out of the served cone.
+pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "http", "input-validation"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

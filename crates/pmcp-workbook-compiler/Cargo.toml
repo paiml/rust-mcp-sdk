@@ -104,7 +104,13 @@ rust_xlsxwriter = { version = "0.99", default-features = false }
 # Phase 92 served loader. The `workbook` feature pulls the LocalDirSource + the
 # fail-closed BundleLoader. Dev-only — the compiler never depends on the toolkit
 # at runtime (the purity boundary keeps umya out of the served tree).
-pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook"] }
+# Why `input-validation` is named EXPLICITLY (Phase 128, Q7): same reason as
+# `pmcp-workbook-server` — `default-features = false` means this crate does not
+# inherit it from the toolkit's `default`, so the emitted-bundle loader test would
+# exercise an UNENFORCED toolkit while production is enforced. A test harness that
+# runs a weaker configuration than the shipped one is how an enforcement gap
+# survives a green suite.
+pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "input-validation"] }
 # PROPERTY testing (CLAUDE.md ALWAYS: PROPERTY) — `harvest_roundtrip_prop.rs`
 # proves the §3.3 per-row harvest projection (Plan 02) is total + stable + closed
 # over arbitrary well-formed rows. Workspace-standard pin. Dev-only.

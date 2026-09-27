@@ -89,7 +89,23 @@ pmcp-workbook-runtime = { version = "0.2.0", path = "../pmcp-workbook-runtime", 
 include_dir = { version = "0.7.4", optional = true }
 
 [features]
-default = ["code-mode"]
+# Why: `input-validation` is in `default` because that is the MECHANISM by which
+# this phase's "the defaults ship on" story actually happens (Phase 128, Q7).
+# Before this edit `default = ["code-mode"]` did not contain it, so every
+# config-driven server built from this workspace registered tools whose declared
+# `inputSchema` was never checked — a documented-but-absent mitigation.
+#
+# It is cheap to carry: `input-validation` forwards ONLY `pmcp/schema-validation`,
+# so a curated single-call build pays for the schema engine and NOT for `garde`
+# (which lives behind `pmcp/validation`) and NOT for the JS engine.
+#
+# NOTE: two in-tree consumers set `default-features = false` and therefore do NOT
+# inherit this — `pmcp-workbook-server` and `pmcp-workbook-compiler` name
+# `input-validation` explicitly in their own feature lists, as does the
+# `cargo pmcp new --kind workbook-server` scaffold template. Anything that opts out
+# of defaults must opt back in, or it ships unenforced while every sibling is
+# enforced.
+default = ["code-mode", "input-validation"]
 # Why: the toolkit's code-mode wiring needs `ValidationPipeline::validate_sql_query`
 # for the SC-3 anchor (`allow_writes=false` rejects INSERT). That method is gated
 # behind `pmcp-code-mode/sql-code-mode` (see Phase 83 Plan 06 CODE_MODE_API_NOTES.md
