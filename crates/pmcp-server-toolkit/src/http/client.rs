@@ -10,7 +10,7 @@
 //! never echo the URL or a credential (Pitfall 5).
 
 use super::auth::HttpAuthProvider;
-use super::{join_url, HttpConnector, HttpConnectorError, Operation};
+use super::{join_url, HttpConnector, HttpConnectorError, Operation, Parameter};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -142,23 +142,98 @@ impl HttpClient {
 
     /// Substitute path parameters into the operation path template.
     ///
+    /// # Phase 128 D4 — the curated surface's path-injection floor
+    ///
+    /// Two passes, in this order, and the order is load-bearing:
+    ///
+    /// 1. every path parameter's value is rendered and then checked by
+    ///    `pmcp::server::schema_validation::validate_path_placeholder` against that
+    ///    parameter's declared rules (`Parameter::placeholder_rules`) — with
+    ///    NOTHING substituted yet, so a refusal on the second of two placeholders
+    ///    cannot leave a half-substituted path in existence anywhere;
+    /// 2. only once every value has passed are the replacements applied, and the
+    ///    COMPOSED result is then checked by
+    ///    `pmcp::server::schema_validation::validate_resolved_path` before the
+    ///    caller can dispatch it.
+    ///
+    /// Step 2 is not redundant with step 1. A composition belongs to no single
+    /// value, so only the composed check can see a segment that a template literal
+    /// and a passing value jointly push over the cap, traversal written into the
+    /// template itself, or a residual `{`/`}` left by a placeholder with no
+    /// supplied argument.
+    ///
+    /// ## The one narrowing: an operator-written `?` is permitted
+    ///
+    /// `validate_resolved_path` refuses a query separator anywhere, and core keeps
+    /// that strict rule for its other callers. This function splits the composed
+    /// path at the FIRST `?` and applies the full, unmodified rule set to each
+    /// side, which exempts exactly that one separator and nothing else. It is safe
+    /// rather than a hole because step 1 already refuses `?` inside a substituted
+    /// value, in literal AND percent-encoded form with a decode-once pass — so a
+    /// `?` surviving into the composed string can only have come from the
+    /// `[[tools]]` `path` an operator authored, not from caller data. Refusing `..`
+    /// from that template catches a traversal bug; refusing `?` from it rejects
+    /// legitimate configuration. Same rule, different work. A SECOND `?`, a
+    /// dangling `?` with an empty query, a `#` fragment marker and anything else
+    /// stay refused, because the query portion faces the same rule.
+    ///
+    /// ## What counts as a placeholder here
+    ///
+    /// Substitution is textual, so a spec-derived operation's mid-segment
+    /// placeholder (`.../range(address='{address}')`) is substituted. A curated
+    /// `[[tools]]` `path`, by contrast, only ever reaches this function in the
+    /// whole-segment shape: a segment containing anything other than exactly one
+    /// `{name}` spanning the whole segment is refused at CONFIG time by
+    /// `crate::config::ServerConfig::validate`, because such a segment produces
+    /// either a parameter name no declaration can match or literal braces on the
+    /// wire.
+    ///
+    /// ## Without the `input-validation` feature
+    ///
+    /// Both checks are `#[cfg(feature = "input-validation")]`-gated and this
+    /// function behaves exactly as it did before Phase 128. `input-validation` is
+    /// in the toolkit's `default` feature set, so an unenforced build is an
+    /// explicit opt-out rather than an accident.
+    ///
     /// # Errors
     ///
-    /// Returns [`HttpConnectorError::Backend`] (via [`render_scalar`]) when a path
-    /// parameter value is a non-scalar (`Object`/`Array`) — such a value would
-    /// otherwise be JSON-stringified into the URL (WR-03).
+    /// Returns [`HttpConnectorError::Backend`]:
+    ///
+    /// - via [`render_scalar`] when a path parameter value is a non-scalar
+    ///   (`Object`/`Array`) — such a value would otherwise be JSON-stringified
+    ///   into the URL (WR-03);
+    /// - when `validate_path_placeholder` refuses a rendered value (the character
+    ///   floor, the always-on length cap, or the declared `pattern`/`max_length`
+    ///   narrowing on top of them);
+    /// - when a declared path parameter has no supplied argument, naming that
+    ///   parameter and nothing else;
+    /// - when `validate_resolved_path` refuses the composed path on either side of
+    ///   an operator-written `?`.
+    ///
+    /// Every one of these messages names the declared parameter or the rule and
+    /// carries no byte of the rejected value and no fragment of the resolved path
+    /// (Pitfall 5, as [`render_scalar`] states it).
     fn substitute_path(
         operation: &Operation,
         args: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<String, HttpConnectorError> {
-        let mut path = operation.path.clone();
+        // Pass 1 — render and CHECK every contribution. Nothing is applied yet.
+        let mut rendered: Vec<(String, String)> = Vec::new();
         for param in operation.path_parameters() {
-            let placeholder = format!("{{{}}}", param.name);
-            if let Some(value) = args.get(&param.name) {
-                let value_str = render_scalar(&param.name, value)?;
-                path = path.replace(&placeholder, &value_str);
-            }
+            let Some(value) = args.get(&param.name) else {
+                refuse_missing_path_argument(&param.name)?;
+                continue;
+            };
+            let value_str = render_scalar(&param.name, value)?;
+            check_placeholder_value(param, &value_str)?;
+            rendered.push((format!("{{{}}}", param.name), value_str));
         }
+        // Pass 2 — apply, then check the COMPOSED result.
+        let mut path = operation.path.clone();
+        for (placeholder, value_str) in &rendered {
+            path = path.replace(placeholder, value_str);
+        }
+        check_composed_path(&path)?;
         Ok(path)
     }
 
@@ -369,6 +444,124 @@ fn render_scalar(
             )))
         },
     }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 D4 — the three checks `substitute_path` calls, each as a `cfg` PAIR.
+//
+// A written `cfg(not(...))` half rather than `#[cfg]` inside the function body:
+// the enforced and unenforced shapes are then both visible at a glance, and
+// `substitute_path` reads as one flow in either build. There is NO second copy of
+// any rule here — each enforced half calls the ONE core implementation in
+// `pmcp::server::schema_validation`, which is what keeps the curated surface and
+// the Code Mode surface on a single denylist (Q2).
+// -----------------------------------------------------------------------------
+
+/// Map a core placeholder refusal into this connector's error type.
+///
+/// `PlaceholderRefusal`'s own `Display` is value-free — it names the declared
+/// parameter and the declared expectation — so forwarding it verbatim keeps the two
+/// HTTP surfaces indistinguishable to a caller: they differ only in error TYPE
+/// (`HttpConnectorError::Backend` here, `ExecutionError::RuntimeError` on the Code
+/// Mode side), never in wording.
+#[cfg(feature = "input-validation")]
+fn refusal_to_backend_error(
+    refusal: &pmcp::server::schema_validation::PlaceholderRefusal,
+) -> HttpConnectorError {
+    HttpConnectorError::Backend(format!("{refusal}"))
+}
+
+/// Check ONE rendered path-parameter value against the D4 floor, the always-on
+/// cap, and this parameter's declared narrowing.
+///
+/// # Errors
+///
+/// [`HttpConnectorError::Backend`] carrying the core refusal, which names the
+/// parameter and never the value.
+#[cfg(feature = "input-validation")]
+fn check_placeholder_value(param: &Parameter, value_str: &str) -> Result<(), HttpConnectorError> {
+    pmcp::server::schema_validation::validate_path_placeholder(
+        &param.name,
+        value_str,
+        &param.placeholder_rules(),
+    )
+    .map_err(|refusal| refusal_to_backend_error(&refusal))
+}
+
+/// The `input-validation`-off half: the pre-Phase-128 behaviour, which applied no
+/// character check to a path-parameter value at all.
+#[cfg(not(feature = "input-validation"))]
+fn check_placeholder_value(_param: &Parameter, _value_str: &str) -> Result<(), HttpConnectorError> {
+    Ok(())
+}
+
+/// Check the COMPOSED path, exempting one operator-written `?`.
+///
+/// The split lives HERE and deliberately not in core: `validate_resolved_path` is a
+/// general-purpose composed-path checker with other callers that want the strict
+/// `?`-anywhere rule, and relaxing it there would weaken all of them. Both sides of
+/// the first `?` face the full, unmodified rule set, so a second `?`, a fragment
+/// marker, traversal on either side, an over-cap query and an empty query portion
+/// all stay refused for free. See `HttpClient::substitute_path` for why exempting
+/// exactly that one byte is safe.
+///
+/// # Errors
+///
+/// [`HttpConnectorError::Backend`] carrying the core refusal, which names the rule
+/// and never any byte of the path.
+#[cfg(feature = "input-validation")]
+fn check_composed_path(path: &str) -> Result<(), HttpConnectorError> {
+    let checked = match path.split_once('?') {
+        // No operator-written separator: the whole string is a path.
+        None => pmcp::server::schema_validation::validate_resolved_path(path),
+        // Exactly one operator-written `?`. The separator itself is permitted;
+        // both sides still face the full, unmodified rule set.
+        Some((path_part, query_part)) => {
+            pmcp::server::schema_validation::validate_resolved_path(path_part)
+                .and_then(|()| pmcp::server::schema_validation::validate_resolved_path(query_part))
+        },
+    };
+    checked.map_err(|refusal| refusal_to_backend_error(&refusal))
+}
+
+/// The `input-validation`-off half: no composed check, so a residual `{name}` from
+/// a path parameter with no supplied argument reaches the outbound URL exactly as
+/// it did before Phase 128.
+#[cfg(not(feature = "input-validation"))]
+fn check_composed_path(_path: &str) -> Result<(), HttpConnectorError> {
+    Ok(())
+}
+
+/// Refuse a declared path parameter that has no supplied argument.
+///
+/// Its own refusal rather than leaning on the composed check's residual-brace rule,
+/// for one reason: this is the only route that can name the PARAMETER. The composed
+/// refusal is param-agnostic by construction (`param: "path segment"`), because a
+/// composition belongs to no single parameter — so it would tell a caller that
+/// something in the path is wrong without saying which declaration to supply. This
+/// is a presence check, not a second copy of the character denylist.
+///
+/// D1's `required` keyword does not make this unreachable: it refuses only when the
+/// `[[tools.parameters]]` declaration says `required = true`, while
+/// `tools.rs::build_operation` marks every template path parameter required
+/// INDEPENDENTLY of any declaration — so the two can disagree, and measurably did.
+///
+/// # Errors
+///
+/// Always [`HttpConnectorError::Backend`], naming `param_name` and nothing else —
+/// never the template and never the partially-substituted path.
+#[cfg(feature = "input-validation")]
+fn refuse_missing_path_argument(param_name: &str) -> Result<(), HttpConnectorError> {
+    Err(HttpConnectorError::Backend(format!(
+        "param '{param_name}' is a declared path parameter and must be supplied"
+    )))
+}
+
+/// The `input-validation`-off half: the parameter is skipped, which is the
+/// pre-Phase-128 behaviour (the literal placeholder text stays in the path).
+#[cfg(not(feature = "input-validation"))]
+fn refuse_missing_path_argument(_param_name: &str) -> Result<(), HttpConnectorError> {
+    Ok(())
 }
 
 #[async_trait]
