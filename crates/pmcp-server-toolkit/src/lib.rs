@@ -138,6 +138,15 @@ pub use crate::tools::synthesize_from_config_with_connector;
 #[cfg(feature = "http")]
 pub use crate::tools::synthesize_from_config_with_http_connector;
 
+// Phase 128 E2 — the hooks-carrying siblings of the two entry points above, at the
+// crate root for the same reason the originals are: a consumer's imports are ONE
+// crate-root block, and an integration test is an external consumer.
+#[cfg(feature = "http")]
+pub use crate::tools::synthesize_from_config_with_http_connector_and_hooks;
+pub use crate::tools::{
+    synthesize_from_config_and_hooks, synthesize_from_config_with_connector_and_hooks,
+};
+
 // Phase 90 (OAPI-02b / D-01 / D-02) — single-call + SCRIPT HTTP synthesizer.
 // Gated `openapi-code-mode` (the umbrella that forwards
 // `pmcp-code-mode/js-runtime`). Adds the shared `HttpCodeExecutor` + bounds so a
@@ -194,6 +203,16 @@ pub use crate::policy::{
 // types, mirroring the SQL connector re-export. Feature-gated on `http`.
 #[cfg(feature = "http")]
 pub use crate::http::{HttpConnector, HttpConnectorError, Operation};
+
+// Phase 128 — the rest of what an E1 example needs to build a governed connector in
+// ONE crate-root import block (D-15). `HttpClient` is the connector a
+// `RequestPolicy` is attached to, and the auth pair is what makes the
+// "the policy never sees the credential" demonstration meaningful: without a real
+// credential in play, a clean scan proves nothing.
+#[cfg(feature = "http")]
+pub use crate::http::auth::{create_auth_provider, AuthConfig};
+#[cfg(feature = "http")]
+pub use crate::http::HttpClient;
 
 // Workbook served-tool boot surface (Phase 92, WBSV-01/08/09 / D-11) — the
 // FULL consumer-side contract at the crate root so Shape A/B servers register a

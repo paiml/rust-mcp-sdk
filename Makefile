@@ -608,7 +608,7 @@ test-server-toolkit:
 		echo "$(RED)✗ pmcp-server-toolkit reported 0 tests — the gate is not reaching this crate$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance curated_path_injection path_placeholder_props"; \
+	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance curated_path_injection path_placeholder_props request_policy"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \

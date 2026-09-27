@@ -198,6 +198,15 @@ required-features = ["workbook-embedded", "http"]
 name = "workbook_table_authoring"
 required-features = ["workbook-embedded"]
 
+# Phase 128 (E1/E2 + SC-5) — the three input-validation layers, each catching what
+# only it can. `required-features` names TOOLKIT features only (see the note above
+# the feature table): `input-validation` for D1 + the two hooks, `http` for the
+# governed connector. Deliberately NOT `openapi-code-mode` — the demonstration runs
+# on the light, JS-engine-free curated build.
+[[example]]
+name = "e05_input_validation"
+required-features = ["input-validation", "http"]
+
 [dev-dependencies]
 proptest = "1.7"
 # Why: unit tests run with --test-threads=1 (project CLAUDE.md) where a
