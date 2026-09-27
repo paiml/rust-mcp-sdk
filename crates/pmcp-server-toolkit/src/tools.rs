@@ -828,7 +828,9 @@ impl ToolHandler for ScriptToolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AnnotationsDecl, ParamDecl, ServerConfig, ServerSection, ToolDecl};
+    use crate::config::{
+        AnnotationsDecl, ItemsDecl, ParamDecl, ServerConfig, ServerSection, ToolDecl,
+    };
     use serde_json::Value;
 
     /// Construct a minimal `ServerConfig` that satisfies `validate()` (non-empty
@@ -1070,6 +1072,207 @@ mod tests {
         let decl = decl_with_limit_default();
         let params = extract_named_params(&decl, &serde_json::json!({ "limit": 5 }));
         assert_eq!(params, vec![("limit".to_string(), serde_json::json!(5))]);
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Phase 128 D2 — the six new `ParamDecl` keywords reach `inputSchema`
+    // -------------------------------------------------------------------------
+
+    /// Fetch the synthesized property object for `param` of the single tool in
+    /// `tools`.
+    fn prop_of(tools: Vec<ToolDecl>, param: &str) -> Value {
+        let cfg = cfg_with_tools(tools);
+        let out = synthesize_from_config(&cfg).expect("synthesize");
+        let (_name, info, _handler) = &out[0];
+        info.input_schema["properties"][param].clone()
+    }
+
+    /// D2 / SC-2: `pattern`, `minLength`, `format` and `maxItems` all reach the
+    /// emitted `inputSchema`.
+    #[test]
+    fn input_schema_emits_d2_scalar_keywords() {
+        let prop = prop_of(
+            vec![ToolDecl {
+                name: "lookup".to_string(),
+                parameters: vec![ParamDecl {
+                    name: "region".to_string(),
+                    param_type: Some("string".to_string()),
+                    required: true,
+                    pattern: Some("^[A-Z]{3}$".to_string()),
+                    min_length: Some(3),
+                    format: Some("uuid".to_string()),
+                    max_items: Some(5),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            "region",
+        );
+        assert_eq!(prop["pattern"], serde_json::json!("^[A-Z]{3}$"));
+        assert_eq!(prop["minLength"], serde_json::json!(3));
+        assert_eq!(prop["format"], serde_json::json!("uuid"));
+        assert_eq!(prop["maxItems"], serde_json::json!(5));
+    }
+
+    /// D2 / RESEARCH Finding 1h: `items` is emitted in OBJECT form. The array
+    /// (draft-07 tuple) form does not compile under the Draft 2020-12 pin and
+    /// would take the whole tool's validator down.
+    #[test]
+    fn input_schema_emits_items_as_object_never_array() {
+        let prop = prop_of(
+            vec![ToolDecl {
+                name: "batch".to_string(),
+                parameters: vec![ParamDecl {
+                    name: "codes".to_string(),
+                    param_type: Some("array".to_string()),
+                    required: true,
+                    items: Some(ItemsDecl {
+                        item_type: Some("string".to_string()),
+                        max_length: Some(8),
+                        pattern: Some("^[a-z]+$".to_string()),
+                    }),
+                    max_items: Some(10),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            "codes",
+        );
+        assert!(
+            prop["items"].is_object(),
+            "items must be an OBJECT, got: {}",
+            prop["items"]
+        );
+        assert!(
+            !prop["items"].is_array(),
+            "array-form items does not compile under the 2020-12 pin"
+        );
+        assert_eq!(
+            prop["items"],
+            serde_json::json!({
+                "type": "string",
+                "maxLength": 8,
+                "pattern": "^[a-z]+$",
+            })
+        );
+    }
+
+    /// D2 edge (empty): a `ParamDecl` carrying NONE of the six new keywords emits
+    /// exactly the five it emits today — no empty `pattern` string and no empty
+    /// `items` object appears.
+    #[test]
+    fn input_schema_omits_d2_keywords_when_undeclared() {
+        let prop = prop_of(
+            vec![ToolDecl {
+                name: "legacy".to_string(),
+                parameters: vec![ParamDecl {
+                    name: "count".to_string(),
+                    param_type: Some("integer".to_string()),
+                    description: Some("how many".to_string()),
+                    required: false,
+                    minimum: Some(1.0),
+                    maximum: Some(10.0),
+                    max_length: Some(4),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            "count",
+        );
+        let obj = prop.as_object().expect("property object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["description", "maxLength", "maximum", "minimum", "type"],
+            "exactly the five pre-D2 keywords, and no more"
+        );
+        for absent in ["pattern", "minLength", "format", "items", "maxItems"] {
+            assert!(
+                obj.get(absent).is_none(),
+                "undeclared keyword {absent} must not be emitted"
+            );
+        }
+    }
+
+    /// D2 edge (ordering): two synthesis runs over ONE config produce
+    /// byte-identical `input_schema` values, so `properties` and `required` follow
+    /// `[[tools.parameters]]` declaration order deterministically.
+    #[test]
+    fn input_schema_is_byte_identical_across_two_synthesis_runs() {
+        let tools = vec![ToolDecl {
+            name: "search".to_string(),
+            parameters: vec![
+                ParamDecl {
+                    name: "zebra".to_string(),
+                    param_type: Some("string".to_string()),
+                    required: true,
+                    pattern: Some("^z".to_string()),
+                    ..Default::default()
+                },
+                ParamDecl {
+                    name: "alpha".to_string(),
+                    param_type: Some("string".to_string()),
+                    required: true,
+                    min_length: Some(1),
+                    ..Default::default()
+                },
+                ParamDecl {
+                    name: "middle".to_string(),
+                    param_type: Some("integer".to_string()),
+                    required: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        let cfg = cfg_with_tools(tools);
+        let first = synthesize_from_config(&cfg).expect("synthesize")[0]
+            .1
+            .input_schema
+            .to_string();
+        let second = synthesize_from_config(&cfg).expect("synthesize")[0]
+            .1
+            .input_schema
+            .to_string();
+        assert_eq!(first, second, "synthesis must be byte-deterministic");
+        // Declaration order, not sorted order.
+        assert!(
+            first.find("\"zebra\"").unwrap() < first.find("\"alpha\"").unwrap(),
+            "properties must follow declaration order: {first}"
+        );
+    }
+
+    /// D2 edge (adjacency): `min_length == max_length` accepts exactly that length
+    /// and refuses one code point either side, through the SAME core validator the
+    /// D1 decorator uses.
+    #[cfg(feature = "input-validation")]
+    #[test]
+    fn min_length_equal_to_max_length_accepts_exactly_that_length() {
+        use pmcp::server::schema_validation::validate_input;
+
+        let cfg = cfg_with_tools(vec![ToolDecl {
+            name: "exact".to_string(),
+            parameters: vec![ParamDecl {
+                name: "code".to_string(),
+                param_type: Some("string".to_string()),
+                required: true,
+                min_length: Some(3),
+                max_length: Some(3),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        let out = synthesize_from_config(&cfg).expect("synthesize");
+        let schema = &out[0].1.input_schema;
+
+        validate_input(schema, Some(&serde_json::json!({ "code": "abc" })), None)
+            .expect("exactly three code points must be accepted");
+        validate_input(schema, Some(&serde_json::json!({ "code": "ab" })), None)
+            .expect_err("two code points must be refused");
+        validate_input(schema, Some(&serde_json::json!({ "code": "abcd" })), None)
+            .expect_err("four code points must be refused");
     }
 }
 

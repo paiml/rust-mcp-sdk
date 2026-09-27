@@ -916,6 +916,17 @@ impl ToolDecl {
 /// The `default` and `enum` fields use [`toml::Value`] because they are
 /// heterogeneous in the reference configs (a `default` may be an integer,
 /// a string, or a boolean depending on the parameter type).
+///
+/// # Forward incompatibility (Phase 128, D-15)
+///
+/// This struct carries `#[serde(deny_unknown_fields)]`, so a config declaring any
+/// of the Phase 128 D2 keys — `pattern`, `min_length`, `format`, `max_items`,
+/// `allow_slash`, or an `[tools.parameters.items]` table — fails to PARSE on
+/// toolkit 0.1.3 rather than degrading to "the key was ignored". That is
+/// deliberate (a silently-ignored validation rule is the class this phase closes)
+/// but it means a config written for this release cannot be loaded by an older
+/// toolkit. The same applies to the `[server.validation]` section. Named in the
+/// CHANGELOG.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ParamDecl {
@@ -938,14 +949,148 @@ pub struct ParamDecl {
     #[serde(default)]
     pub max_length: Option<u64>,
     /// Inclusive minimum (integer / number parameters only).
+    ///
+    /// Stored as `f64`. See [`Self::maximum`] for the precision limit that applies
+    /// to both bounds.
     #[serde(default)]
     pub minimum: Option<f64>,
     /// Inclusive maximum (integer / number parameters only).
+    ///
+    /// # Not a safe way to bound a 64-bit integer ID
+    ///
+    /// Both bounds are stored as `f64`, so an integer magnitude above 2^53
+    /// (`9007199254740992`) cannot be represented exactly. `9007199254740993`
+    /// written in TOML has ALREADY become `9007199254740992` by the time any code
+    /// in this crate sees it, and no post-parse check can recover the fact that it
+    /// was rounded. [`ServerConfig::validate`] therefore refuses a bound that is
+    /// non-finite or whose magnitude EXCEEDS 2^53
+    /// ([`ConfigValidationError::NonFiniteParamBound`]) — which catches the wildly
+    /// out-of-range case, and deliberately does not claim to catch a value sitting
+    /// one unit past the boundary.
+    ///
+    /// If you need to bound a `u64` identifier, express the rule as a
+    /// [`Self::pattern`] over its string form instead. This limitation is a
+    /// documented one, not an oversight: adding an `i64`-typed bound vocabulary is
+    /// out of scope for D2.
     #[serde(default)]
     pub maximum: Option<f64>,
     /// Closed set of allowed values (any TOML scalar).
     #[serde(default, rename = "enum")]
     pub enum_values: Option<Vec<toml::Value>>,
+    /// Regular expression the value must match, emitted as JSON Schema `pattern`
+    /// (string parameters only).
+    ///
+    /// # It is UNANCHORED
+    ///
+    /// JSON Schema `pattern` is a SUBSTRING search, exactly as ECMA-262
+    /// `RegExp.prototype.test` is. A rule written as a bare character class such as
+    /// `[A-Z]{3}` matches `"../../etc/passwd-ABC"` and therefore buys no
+    /// enforcement whatsoever. Anchor every rule you mean as a whole-value rule:
+    /// `^[A-Z]{3}$`.
+    ///
+    /// # `\s` and `\S` do not mean one thing here
+    ///
+    /// Two regex engines are live inside one `jsonschema` 0.49.2 process, and which
+    /// one evaluates your pattern depends on the pattern's own syntax:
+    ///
+    /// - A plain pattern takes the linear-time engine, whose `\s` is a PARTIAL
+    ///   ECMA-262 set — measured as
+    ///   `{U+0009, U+000A, U+000B, U+000C, U+000D, U+0020, U+00A0, U+2029, U+FEFF}`.
+    ///   It does NOT include U+3000 IDEOGRAPHIC SPACE, U+0085 NEL, U+1680,
+    ///   U+2000, U+2007, U+2028 or U+202F, and it DOES include the byte-order mark.
+    /// - A pattern containing a lookaround or a backreference takes the
+    ///   backtracking engine, where `\s` is exactly `\p{White_Space}` — so it DOES
+    ///   match U+3000, and does NOT match U+FEFF.
+    ///
+    /// Adding a lookahead to a pattern therefore silently changes what `\s` means
+    /// in it. For anything security-relevant, spell out an explicit character class
+    /// (e.g. `[^\p{White_Space}]`) rather than using the shorthand.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Minimum string length in Unicode code points, emitted as JSON Schema
+    /// `minLength` (string parameters only).
+    ///
+    /// Counted in code points — not bytes and not grapheme clusters — matching
+    /// `maxLength`'s unit so a `min_length == max_length` pair names exactly one
+    /// length.
+    #[serde(default)]
+    pub min_length: Option<u64>,
+    /// JSON Schema `format` assertion, e.g. `"uuid"`, `"email"`, `"date-time"`.
+    ///
+    /// # It IS enforced on inputs in this SDK
+    ///
+    /// `format` is ANNOTATIVE by default in `jsonschema` 0.49 — a bare
+    /// `draft202012` validator accepts `"!!!not-a-uuid!!!"` against
+    /// `format = "uuid"`. Declared inputs do not take that path: core `pmcp`
+    /// compiles a tool's `inputSchema` through a format-ASSERTING builder
+    /// (Phase 128, Q1), so a declared `format` refuses a non-conforming value at
+    /// `tools/call` time.
+    ///
+    /// Measured under this workspace's pinned `jsonschema` configuration
+    /// (`0.49`, `default-features = false`), all NINETEEN standard Draft 2020-12
+    /// format names assert: `date-time`, `date`, `time`, `duration`, `email`,
+    /// `idn-email`, `hostname`, `idn-hostname`, `ipv4`, `ipv6`, `uri`,
+    /// `uri-reference`, `iri`, `iri-reference`, `uuid`, `uri-template`,
+    /// `json-pointer`, `relative-json-pointer`, `regex`. A format name OUTSIDE
+    /// that list is accepted-and-ignored, per JSON Schema's own rule that an
+    /// unknown format is an annotation — so a typo such as `"uid"` for `"uuid"`
+    /// silently enforces nothing.
+    ///
+    /// `format` is NOT enforced on OUTPUTS: `structuredContent` validation is
+    /// deliberately annotative there, and only warns.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// `[tools.parameters.items]` — the element schema for an array parameter,
+    /// emitted as JSON Schema `items`.
+    ///
+    /// Emitted in OBJECT form only. Array-form `items` (the draft-07 tuple
+    /// construct) does not compile under the Draft 2020-12 pin and would take the
+    /// whole tool's validator down with it.
+    #[serde(default)]
+    pub items: Option<ItemsDecl>,
+    /// Maximum number of array elements, emitted as JSON Schema `maxItems`
+    /// (array parameters only).
+    #[serde(default)]
+    pub max_items: Option<u64>,
+    /// Permit `/` inside this parameter's value when it is interpolated into a
+    /// single-call tool's path template (Phase 128, D-11).
+    ///
+    /// Path-placeholder values are refused for path separators by default, because
+    /// a `/` in a `{segment}` lets a caller reshape the request target. This
+    /// per-parameter opt-in is the ONLY legitimate source of that permission — it
+    /// exists for the genuine case of a parameter that names a multi-segment
+    /// resource path.
+    ///
+    /// An OpenAPI spec's `allowReserved` must NEVER be wired to this field. That
+    /// keyword describes URL percent-encoding latitude in the spec author's
+    /// serialization rules; it is not a statement that the value may restructure
+    /// the path, and treating it as one would turn a routine spec detail into a
+    /// silent path-traversal opening.
+    #[serde(default)]
+    pub allow_slash: bool,
+}
+
+/// `[tools.parameters.items]` — the element schema of an array parameter
+/// (Phase 128, D2).
+///
+/// Emitted into `inputSchema` as an OBJECT-form JSON Schema `items` value. The
+/// array form of `items` is a draft-07 tuple construct that does not compile under
+/// the Draft 2020-12 pin, so this struct has no way to express it by design.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ItemsDecl {
+    /// Element type (`"string"`, `"integer"`, …). Defaults to `"string"` when
+    /// omitted, matching [`ParamDecl::param_type`]'s convention.
+    #[serde(default, rename = "type")]
+    pub item_type: Option<String>,
+    /// Maximum element length in Unicode code points (string elements only).
+    #[serde(default)]
+    pub max_length: Option<u64>,
+    /// Regular expression each element must match. UNANCHORED — see
+    /// [`ParamDecl::pattern`] for the anchoring and two-engine `\s` caveats, which
+    /// apply identically here.
+    #[serde(default)]
+    pub pattern: Option<String>,
 }
 
 /// `[tools.annotations]` — MCP `toolAnnotations` hints.
@@ -1992,6 +2137,233 @@ mod tests {
             !err.to_string().contains("sentinel-real-credential"),
             "the error must not echo the value: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 128 D2 / SC-2 — the six new `ParamDecl` keys and the config-time
+    // pattern-compile gate.
+    // -------------------------------------------------------------------------
+
+    /// D2: all six new keys parse from TOML, including the
+    /// `[tools.parameters.items]` sub-table.
+    #[test]
+    fn param_decl_parses_all_d2_keys() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "batch_lookup"
+
+            [[tools.parameters]]
+            name = "codes"
+            type = "array"
+            required = true
+            max_items = 25
+            min_length = 2
+            format = "uuid"
+            pattern = "^[A-Z]{3}$"
+            allow_slash = true
+
+            [tools.parameters.items]
+            type = "string"
+            max_length = 8
+            pattern = "^[a-z]+$"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        let p = &cfg.tools[0].parameters[0];
+        assert_eq!(p.pattern.as_deref(), Some("^[A-Z]{3}$"));
+        assert_eq!(p.min_length, Some(2));
+        assert_eq!(p.format.as_deref(), Some("uuid"));
+        assert_eq!(p.max_items, Some(25));
+        assert!(p.allow_slash);
+        let items = p.items.as_ref().expect("items sub-table");
+        assert_eq!(items.item_type.as_deref(), Some("string"));
+        assert_eq!(items.max_length, Some(8));
+        assert_eq!(items.pattern.as_deref(), Some("^[a-z]+$"));
+    }
+
+    /// D2: the six new keys survive a `Serialize` -> `Deserialize` round trip, so
+    /// a config re-emitted by the toolkit does not silently drop a declared rule.
+    #[test]
+    fn param_decl_d2_keys_round_trip_through_toml() {
+        let original = ParamDecl {
+            name: "codes".to_string(),
+            param_type: Some("array".to_string()),
+            required: true,
+            pattern: Some("^[A-Z]{3}$".to_string()),
+            min_length: Some(2),
+            format: Some("uuid".to_string()),
+            max_items: Some(25),
+            allow_slash: true,
+            items: Some(ItemsDecl {
+                item_type: Some("string".to_string()),
+                max_length: Some(8),
+                pattern: Some("^[a-z]+$".to_string()),
+            }),
+            ..Default::default()
+        };
+        let cfg = ServerConfig {
+            server: ServerSection {
+                name: "demo".to_string(),
+                version: "0.1.0".to_string(),
+                ..Default::default()
+            },
+            tools: vec![ToolDecl {
+                name: "batch_lookup".to_string(),
+                parameters: vec![original.clone()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).expect("serialize");
+        let parsed = ServerConfig::from_toml(&text).expect("re-parse");
+        assert_eq!(parsed.tools[0].parameters[0], original);
+    }
+
+    /// SC-2: a `pattern` that does not compile fails at CONFIG time, naming the
+    /// offending parameter — not at call time, where it would take the whole
+    /// tool's validator down.
+    #[test]
+    fn validate_rejects_uncompilable_param_pattern() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "lookup"
+
+            [[tools.parameters]]
+            name = "region"
+            type = "string"
+            pattern = "^[A-Z"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::UncompilableParamSchema {
+                ref tool,
+                ref position,
+                ref detail,
+            }) => {
+                assert_eq!(tool, "lookup");
+                assert!(
+                    position.contains("region"),
+                    "position must name the offending parameter, got {position:?}"
+                );
+                assert!(!detail.is_empty(), "the author-facing detail must be present");
+            },
+            other => panic!("expected UncompilableParamSchema, got {other:?}"),
+        }
+    }
+
+    /// SC-2 edge (adjacency): a pattern that COMPILES but matches nothing passes
+    /// config validation. Config validation checks compilability, not
+    /// satisfiability — `$^` will refuse every value at call time instead.
+    #[test]
+    fn validate_accepts_unsatisfiable_but_compilable_param_pattern() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "lookup"
+
+            [[tools.parameters]]
+            name = "region"
+            type = "string"
+            pattern = "$^"
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        cfg.validate()
+            .expect("an unsatisfiable pattern still compiles and must validate");
+    }
+
+    /// SC-2 edge (empty): an empty `pattern` matches everything, so it buys no
+    /// enforcement while reading like a rule. Refused as a likely author error.
+    #[test]
+    fn validate_rejects_empty_param_pattern() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "lookup"
+
+            [[tools.parameters]]
+            name = "region"
+            type = "string"
+            pattern = ""
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::EmptyParamPattern {
+                ref tool,
+                ref param,
+            }) => {
+                assert_eq!(tool, "lookup");
+                assert_eq!(param, "region");
+            },
+            other => panic!("expected EmptyParamPattern, got {other:?}"),
+        }
+    }
+
+    /// D3 edge (precision): a bound whose magnitude exceeds 2^53 is refused,
+    /// because `ParamDecl` stores bounds as `f64` and such a value cannot be
+    /// represented exactly.
+    #[test]
+    fn validate_rejects_non_finite_param_bound() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "lookup"
+
+            [[tools.parameters]]
+            name = "count"
+            type = "integer"
+            maximum = 1e300
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        match cfg.validate() {
+            Err(ConfigValidationError::NonFiniteParamBound {
+                ref tool,
+                ref param,
+            }) => {
+                assert_eq!(tool, "lookup");
+                assert_eq!(param, "count");
+            },
+            other => panic!("expected NonFiniteParamBound, got {other:?}"),
+        }
+    }
+
+    /// D3 edge (precision), the honest half: a bound AT the 2^53 boundary is
+    /// accepted. The check cannot see that a larger TOML integer was already
+    /// rounded into this value, and the rustdoc says so rather than claiming a
+    /// guarantee it cannot deliver.
+    #[test]
+    fn validate_accepts_param_bound_at_the_representable_boundary() {
+        let toml = r#"
+            [server]
+            name = "demo"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "lookup"
+
+            [[tools.parameters]]
+            name = "count"
+            type = "integer"
+            maximum = 9007199254740992
+        "#;
+        let cfg = ServerConfig::from_toml(toml).expect("parse");
+        cfg.validate()
+            .expect("a bound exactly at 2^53 is representable and must validate");
     }
 
     proptest! {

@@ -255,4 +255,83 @@ pub enum ConfigValidationError {
          the config file)"
     )]
     SecretSlotCarriesTestedValue(usize),
+    /// Per Phase 128 SC-2: a `[[tools]]` entry's synthesized `inputSchema` does
+    /// not compile as a Draft 2020-12 schema — in practice always a
+    /// `[[tools.parameters]]` `pattern` that is not a valid regular expression.
+    ///
+    /// Caught at CONFIG time rather than at call time, because a single
+    /// non-compiling `pattern` fails the whole document: the tool's validator
+    /// never builds, so every call to it is refused (or, if the compile error were
+    /// swallowed, every call passes unchecked). Neither outcome should first be
+    /// discovered by a client.
+    ///
+    /// # Why quoting `detail` is safe here
+    ///
+    /// `detail` is the engine's own compile-error text, which quotes the offending
+    /// SCHEMA — author-supplied config, never caller-supplied argument data. This
+    /// error is raised by [`crate::config::ServerConfig::validate`], which runs at
+    /// load time with no request in scope, and its audience is the config author,
+    /// who needs the detail to fix the regex. The SC-7 no-echo rule governs the
+    /// CLIENT-facing `tools/call` refusal path, where a non-compiling schema still
+    /// yields a detail-free message.
+    ///
+    /// `position` is the compile error's JSON schema path — e.g.
+    /// `/properties/region/pattern` — so it names the offending parameter directly.
+    #[error(
+        "[[tools]] '{tool}' has a declared parameter schema that does not compile at \
+         {position}: {detail}"
+    )]
+    UncompilableParamSchema {
+        /// The `[[tools]]` `name` whose parameter schema failed to compile.
+        tool: String,
+        /// JSON schema path of the offending declaration, e.g.
+        /// `/properties/region/pattern`.
+        position: String,
+        /// The engine's compile-error text. Schema-derived, never caller data.
+        detail: String,
+    },
+    /// Per Phase 128 SC-2: a `[[tools.parameters]]` `pattern` was declared as the
+    /// empty string.
+    ///
+    /// An empty `pattern` is a valid regular expression that matches every input,
+    /// so it buys no enforcement at all while reading — in a config review, in a
+    /// diff — exactly like a rule. Refused as a likely author error rather than
+    /// accepted as a no-op.
+    #[error(
+        "[[tools]] '{tool}' parameter '{param}' declares an empty pattern; an empty pattern \
+         matches every value and enforces nothing — remove the key or write the rule"
+    )]
+    EmptyParamPattern {
+        /// The `[[tools]]` `name` carrying the offending parameter.
+        tool: String,
+        /// The `[[tools.parameters]]` `name` whose `pattern` is empty.
+        param: String,
+    },
+    /// Per Phase 128 D3: a `[[tools.parameters]]` `minimum` or `maximum` is
+    /// non-finite (`NaN` / infinity) or has a magnitude EXCEEDING 2^53.
+    ///
+    /// # What this establishes, precisely
+    ///
+    /// [`crate::config::ParamDecl::minimum`] and
+    /// [`crate::config::ParamDecl::maximum`] are `f64`. A TOML integer above 2^53
+    /// has therefore ALREADY been rounded by the time this check runs, so the check
+    /// cannot see that rounding happened and does NOT promise to catch a bound
+    /// sitting one unit past the boundary. It catches the non-finite and the wildly
+    /// out-of-range cases, which is where a silently-mangled bound is most likely
+    /// to be load-bearing.
+    ///
+    /// The honest contract, stated on the field itself as well: `minimum` /
+    /// `maximum` are not a safe way to bound a 64-bit integer ID. Use a `pattern`
+    /// over the string form for that.
+    #[error(
+        "[[tools]] '{tool}' parameter '{param}' declares a minimum/maximum that is \
+         non-finite or exceeds 2^53; bounds are stored as f64, so such a value cannot be \
+         represented exactly — bound a large integer ID with a `pattern` instead"
+    )]
+    NonFiniteParamBound {
+        /// The `[[tools]]` `name` carrying the offending parameter.
+        tool: String,
+        /// The `[[tools.parameters]]` `name` whose bound cannot be represented.
+        param: String,
+    },
 }
