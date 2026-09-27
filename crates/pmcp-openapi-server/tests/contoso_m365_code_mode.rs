@@ -208,19 +208,10 @@ fn headline_script(
 // Read the WHOLE Customers + Orders blocks via the SAME Graph range-read API the
 // tools expose. The path is passed as a string literal directly to api.get (the
 // engine requires a string/template literal there), then .values is bound to a const.
-//
-// `$select` is passed as a BODY param and not written into the path as
-// `?$select=values`. Phase 128 D-09 moved placeholder resolution ahead of dispatch
-// and checks the composed path with `validate_resolved_path`, which refuses a query
-// separator ANYWHERE in a path — that is the composed-layer half of the CR-01
-// mitigation and it cannot tell an author-written `?` from an injected one. For a
-// GET the executor serializes remaining body fields as query params, so the request
-// still reaches Graph with the `$select` projection; this is now the only supported
-// way to express a query string from a Code Mode script.
-const customersResp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='{customers_addr}')", {{ "$select": "values" }});
+const customersResp = await api.get("/drives/CONTOSO_DRIVE/items/CUSTOMERS_ITEM/workbook/worksheets/Customers/range(address='{customers_addr}')?$select=values");
 const customerRows = customersResp.values;
 
-const ordersResp = await api.get("/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='{orders_addr}')", {{ "$select": "values" }});
+const ordersResp = await api.get("/drives/CONTOSO_DRIVE/items/ORDERS_ITEM/workbook/worksheets/Orders/range(address='{orders_addr}')?$select=values");
 const orderRows = ordersResp.values;
 
 // Known customer ids (join key) — column 0 of each Customers data row.
@@ -279,13 +270,12 @@ async fn contoso_m365_code_mode_headline_query_returns_deterministic_set() {
     Mock::given(method("GET"))
         .and(path(customers_path))
         .and(header("authorization", "Bearer contoso-user-tok"))
-        // The `$select` projection MUST still reach the wire. It moved from a
-        // literal `?$select=values` in the path to a body param (Phase 128 D-09 —
-        // `validate_resolved_path` refuses a query separator anywhere in a path),
-        // and for a GET the executor serializes remaining body fields as query
-        // params. Without this matcher the migration could have silently DROPPED
-        // the projection and the test would still pass, since `path()` ignores the
-        // query string.
+        // The `$select` projection the script writes as a literal `?$select=values`
+        // MUST arrive on the wire. `path()` ignores the query string entirely, so
+        // without this matcher the projection could be silently dropped — or
+        // mangled by the Phase-128 composed-path check — and the test would still
+        // pass. It also pins the `?` narrowing from the consumer side: a regression
+        // that refused or stripped an author-written query separator fails HERE.
         .and(query_param("$select", "values"))
         .respond_with(ResponseTemplate::new(200).set_body_json(customers_values_body(&wb)))
         .expect(1)

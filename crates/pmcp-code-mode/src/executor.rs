@@ -2432,11 +2432,14 @@ impl Default for PlanCompiler {
 ///   [`validate_path_placeholder`](crate::validate_path_placeholder) where it was
 ///   produced.
 /// - The COMPOSED string passed
-///   [`validate_resolved_path`](crate::validate_resolved_path), so it carries no
-///   parent-directory sequence, no residual `{`/`}`, no `?`/`#`, no backslash, no
-///   ASCII control byte, no over-cap segment and no empty interior segment — none
-///   of which a per-value check can see, because a composition belongs to no
-///   single value.
+///   [`validate_resolved_path`](crate::validate_resolved_path) — so it carries no
+///   parent-directory sequence, no residual `{`/`}`, no `#`, no backslash, no
+///   ASCII control byte, no over-cap segment and no empty interior segment, on
+///   EITHER side of an author-written `?`. None of those is visible to a per-value
+///   check, because a composition belongs to no single value.
+/// - **At most one `?`,** and only one an author wrote into a
+///   `PathPart::Literal`. See [`ResolvedPath::from_checked`] for why that single
+///   exemption is safe.
 /// - The `body` passed alongside has already had the path-consumed keys removed.
 ///
 /// # What the value does NOT guarantee
@@ -2467,13 +2470,57 @@ impl<'a> ResolvedPath<'a> {
     /// invariant documented on the type is established here rather than
     /// asserted.
     ///
+    /// # The one narrowing: an author-written `?` is permitted
+    ///
+    /// `validate_resolved_path` refuses a query separator ANYWHERE, and core keeps
+    /// that strict rule — it is a general-purpose composed-path checker and other
+    /// callers want it. This constructor splits at the FIRST `?` and applies the
+    /// full rule set to each side, which exempts exactly that one separator and
+    /// nothing else.
+    ///
+    /// Why that is safe rather than a hole. Both per-value floors already refuse
+    /// `?` in a substituted value, in literal AND percent-encoded form, with a
+    /// decode-once pass so `%253F`-style regress cannot slip through. So a `?`
+    /// surviving into the composed string can only have come from a
+    /// `PathPart::Literal` — script text the operator authored and shipped, not
+    /// caller data. The asymmetry with traversal is the whole point: refusing `..`
+    /// from a literal catches a traversal bug, while refusing `?` from a literal
+    /// rejects legitimate authoring. Same rule, different work.
+    ///
+    /// What the split does NOT relax, because a narrowing must not become a hole:
+    ///
+    /// - Traversal, control bytes, backslash, `#`, residual `{`/`}`, over-cap
+    ///   segments and empty interior segments are checked on **both** sides. So
+    ///   `/a/../b?x=1` is still refused for the traversal, and `/a?x=%00` is still
+    ///   refused for the control byte.
+    /// - A SECOND `?` is still refused: only the first is split off, so the query
+    ///   portion is checked by the unmodified rule, which denies `?`.
+    /// - An empty query portion is still refused — a dangling `/x?` is a doubled
+    ///   or trailing separator, which is the same class as a trailing `/`.
+    /// - A `?` reaching the composed string from a VALUE never gets here: the
+    ///   per-value floor has already refused it.
+    ///
+    /// One inherited conservatism, stated so it is not a surprise: `%25` is
+    /// refused outright (it is what bounds the decode to a single pass), so a query
+    /// carrying a percent-encoded percent sign is refused. That is unchanged from
+    /// the path portion's long-standing behaviour, not new here.
+    ///
     /// # Errors
     ///
     /// Returns the [`PlaceholderRefusal`](crate::PlaceholderRefusal) from
     /// `validate_resolved_path`. The refusal is value-free: it names the rule and
     /// the declared expectation, never any byte of the path it refused.
     pub fn from_checked(path: &'a str) -> Result<Self, crate::PlaceholderRefusal> {
-        crate::validate_resolved_path(path)?;
+        match path.split_once('?') {
+            // No author-written separator: the whole string is a path.
+            None => crate::validate_resolved_path(path)?,
+            // Exactly one author-written `?`. The separator itself is permitted;
+            // both sides still face the full, unmodified rule set.
+            Some((path_part, query_part)) => {
+                crate::validate_resolved_path(path_part)?;
+                crate::validate_resolved_path(query_part)?;
+            },
+        }
         Ok(Self(path))
     }
 
@@ -5925,5 +5972,192 @@ mod error_does_not_echo_path {
                  found {forbidden:?} in {rendered:?}"
             );
         }
+    }
+}
+
+/// The `?` narrowing, pinned in BOTH directions so it cannot become a hole.
+///
+/// `ResolvedPath::from_checked` splits at the first `?` and applies the full rule
+/// set to each side, which exempts exactly one author-written query separator.
+/// These rows assert what that buys AND everything it does not relax. A narrowing
+/// with only accept-rows is indistinguishable from a deleted check.
+#[cfg(test)]
+mod query_separator {
+    use super::d09_support::{get_step, literal, plan, RecordingHttp};
+    use super::*;
+
+    async fn run(
+        parts: Vec<PathPart>,
+        body: Option<JsonValue>,
+    ) -> (
+        Result<ExecutionResult, ExecutionError>,
+        Vec<super::d09_support::Seen>,
+    ) {
+        let (http, seen) = RecordingHttp::new();
+        let mut executor = PlanExecutor::new(http, ExecutionConfig::default());
+        let result = executor.execute(&plan(vec![get_step(parts, body)])).await;
+        let seen = seen.lock().unwrap().clone();
+        (result, seen)
+    }
+
+    // ---- ACCEPTED: the separator an author wrote into a literal ----
+
+    #[tokio::test]
+    async fn query_separator_accepts_an_author_written_query_string() {
+        // The row the operator's narrowing exists for: a `?` in the script's own
+        // literal path text reaches the wire instead of being refused.
+        let (result, seen) = run(literal("/Line/Mode/tube/Status?detail=true"), None).await;
+        result.expect("an author-written query string must be accepted");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/Line/Mode/tube/Status?detail=true");
+    }
+
+    #[tokio::test]
+    async fn query_separator_accepts_a_literal_query_alongside_a_floored_placeholder() {
+        // The separator is author-written; the `{v}` value still goes through the
+        // per-value floor. Both mechanisms coexist on one path.
+        let (result, seen) = run(
+            literal("/content/{version}/CUI?string=headache"),
+            Some(serde_json::json!({"version": "current"})),
+        )
+        .await;
+        result.expect("an author query plus a conforming placeholder must be accepted");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/content/current/CUI?string=headache");
+    }
+
+    #[tokio::test]
+    async fn query_separator_accepts_a_graph_style_dollar_projection() {
+        // The exact shape the in-tree Contoso M365 scripts author.
+        let (result, seen) = run(
+            literal("/drives/D/items/I/workbook/worksheets/Customers/range(address='A2:D7')?$select=values"),
+            None,
+        )
+        .await;
+        result.expect("a Graph $select projection in the path must be accepted");
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].path.ends_with("?$select=values"),
+            "{:?}",
+            seen[0].path
+        );
+    }
+
+    // ---- STILL REFUSED: everything the split does not relax ----
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_traversal_in_the_path_portion() {
+        // `/a/../b?x=1` — the traversal rule applies to the whole string, so
+        // appending a query does NOT launder a traversal past the composed check.
+        let (result, seen) = run(literal("/a/../b?x=1"), None).await;
+        let rendered = result
+            .expect_err("traversal must still be refused when a query follows it")
+            .to_string();
+        assert!(seen.is_empty(), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_traversal_in_the_query_portion() {
+        let (result, seen) = run(literal("/search?next=../../etc/passwd"), None).await;
+        let rendered = result
+            .expect_err("traversal inside the query portion must still be refused")
+            .to_string();
+        assert!(seen.is_empty(), "{rendered}");
+        assert!(!rendered.contains("passwd"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_a_control_byte_in_the_query_portion() {
+        // Percent-encoded NUL, so the decode-once pass is what has to catch it.
+        let (result, seen) = run(literal("/search?x=a%00b"), None).await;
+        assert!(
+            result.is_err(),
+            "a control byte in the query portion must still be refused"
+        );
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_an_over_cap_query_portion() {
+        let long = "z".repeat(crate::PLACEHOLDER_MAX_LENGTH + 1);
+        let (result, seen) = run(literal(&format!("/search?q={long}")), None).await;
+        assert!(
+            result.is_err(),
+            "an over-cap query portion must still be refused"
+        );
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_a_second_question_mark() {
+        // Only the FIRST `?` is split off, so the query portion faces the
+        // unmodified rule — which denies `?`. One exemption, not a general licence.
+        let (result, seen) = run(literal("/search?a=1?b=2"), None).await;
+        assert!(result.is_err(), "a second `?` must still be refused");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_an_empty_query_portion() {
+        // A dangling `/x?` is a trailing separator — the same class as a trailing
+        // `/`, which plan 02 refuses deliberately.
+        let (result, seen) = run(literal("/search?"), None).await;
+        assert!(result.is_err(), "a dangling `?` must still be refused");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_a_fragment_marker() {
+        // The split is `?`-only. `#` is never sent to a server and stays denied.
+        let (result, seen) = run(literal("/search#frag"), None).await;
+        assert!(result.is_err(), "a fragment marker must still be refused");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_an_injected_separator_from_a_value() {
+        // THE row that proves the narrowing is not a hole. The template carries an
+        // author-written `?` (now legal) AND a placeholder value carries an
+        // injected one (still refused, by the per-value floor — which is the
+        // mechanism the narrowing relies on for its safety argument).
+        let payload = format!("2026AA?string={}", "z".repeat(60));
+        let (result, seen) = run(
+            literal("/search/{v}?detail=true"),
+            Some(serde_json::json!({"v": payload})),
+        )
+        .await;
+        let rendered = result
+            .expect_err("an injected `?` in a VALUE must still be refused")
+            .to_string();
+        assert!(seen.is_empty(), "{rendered}");
+        assert!(
+            !rendered.contains("2026AA") && !rendered.contains('?'),
+            "the refusal must still carry no byte of the value: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_separator_still_refuses_an_injected_separator_from_a_layer_one_variable() {
+        // Same boundary, layer-1 route: `${v}` rather than `{v}`.
+        let (http, seen) = RecordingHttp::new();
+        let mut executor = PlanExecutor::new(http, ExecutionConfig::default());
+        executor.set_variable(
+            "lookupKey",
+            JsonValue::String("2026AA?string=x".to_string()),
+        );
+        let rendered = executor
+            .execute(&plan(vec![get_step(
+                vec![
+                    PathPart::Literal("/search/".to_string()),
+                    PathPart::Variable("lookupKey".to_string()),
+                    PathPart::Literal("?detail=true".to_string()),
+                ],
+                None,
+            )]))
+            .await
+            .expect_err("an injected `?` in a ${var} part must still be refused")
+            .to_string();
+        assert!(seen.lock().unwrap().is_empty(), "{rendered}");
+        assert!(rendered.contains("lookupKey"), "{rendered}");
     }
 }
