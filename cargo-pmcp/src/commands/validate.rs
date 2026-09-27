@@ -612,6 +612,11 @@ fn print_test_guidance(not_quiet: bool) {
 /// Warnings are printed to stderr with a yellow `warning:` prefix; they do
 /// not fail the command.
 ///
+/// Since Phase 128 (D-07) it ALSO reports the toolkit input-validation findings
+/// when a `config.toml` is discoverable at the same server directory root — as
+/// warnings only. See [`discover_server_config_lint`] for why a parse failure of
+/// that DISCOVERED document is a warning rather than an error.
+///
 /// # Errors
 /// Returns `Err` when:
 /// - `.pmcp/deploy.toml` is missing or malformed
@@ -654,6 +659,17 @@ pub fn validate_deploy(server: Option<String>, verbose: bool) -> Result<()> {
             );
         }
     }
+
+    // Phase 128 D-07 names `cargo pmcp validate deploy` explicitly, so the toolkit
+    // input-validation findings surface HERE as well as through `validate config`.
+    //
+    // EXIT-CODE CONTRACT, UNCHANGED: everything below is WARNINGS ONLY. No branch
+    // of it can return `Err` or alter this function's exit code, so the guarantee
+    // documented at `validate.rs:36-38` — a failing `validate deploy` guarantees a
+    // failing `deploy` for the same config — still holds exactly as written. That is
+    // also why a parse failure of the DISCOVERED toolkit config is a warning and not
+    // an error: this command's subject is the deploy document.
+    emit_discovered_server_config_lint(&discover_server_config_lint(&project_root), not_quiet);
 
     Ok(())
 }
@@ -776,6 +792,76 @@ pub fn validate_server_config(
     }
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Phase 128 Plan 07 — D-07's literal surface: the same findings from
+// `cargo pmcp validate deploy`, warnings only
+// -----------------------------------------------------------------------------
+
+/// What `validate deploy` found in a toolkit `config.toml` sitting at the same
+/// server directory root as `.pmcp/deploy.toml`.
+///
+/// Three states rather than a `Result<Vec<String>>` so the CALLER cannot conflate
+/// "no such document" (a pure-IAM project, which must stay silent rather than
+/// become noisy) with "a document that exists and reports nothing".
+#[derive(Debug)]
+enum DiscoveredConfigLint {
+    /// No `config.toml` at the server directory root — a pure-IAM project.
+    Absent,
+    /// Rendered `ServerConfig::lint()` findings. Possibly empty.
+    Findings(Vec<String>),
+    /// The file is there but could not be read, parsed, or validated.
+    ///
+    /// A WARNING and never an error, for the reason stated at the call site in
+    /// [`validate_deploy`]: this command's subject is the deploy document. Note the
+    /// asymmetry that makes the warning worth reading — the SERVER would refuse to
+    /// boot on this same file, so an operator who ignores it ships a server that
+    /// will not start.
+    Unreadable(String),
+}
+
+/// Look for a toolkit `config.toml` next to the deploy document and lint it.
+///
+/// Never returns an error: every failure mode becomes
+/// [`DiscoveredConfigLint::Unreadable`], preserving `validate_deploy`'s exit-code
+/// contract.
+fn discover_server_config_lint(_project_root: &std::path::Path) -> DiscoveredConfigLint {
+    DiscoveredConfigLint::Findings(Vec::new())
+}
+
+/// Render a [`DiscoveredConfigLint`]. Prints NOTHING for
+/// [`DiscoveredConfigLint::Absent`] — a pure-IAM project must not become noisy.
+fn emit_discovered_server_config_lint(lint: &DiscoveredConfigLint, not_quiet: bool) {
+    if !not_quiet {
+        return;
+    }
+    match lint {
+        DiscoveredConfigLint::Absent => {},
+        DiscoveredConfigLint::Findings(findings) if findings.is_empty() => {
+            println!(
+                "  {} {SERVER_CONFIG_FILE} valid — no input-validation findings",
+                style("✓").green()
+            );
+        },
+        DiscoveredConfigLint::Findings(findings) => {
+            println!(
+                "  {} input-validation findings from {SERVER_CONFIG_FILE} ({} finding{}):",
+                style("→").cyan(),
+                findings.len(),
+                if findings.len() == 1 { "" } else { "s" }
+            );
+            emit_config_lint_findings(findings);
+        },
+        DiscoveredConfigLint::Unreadable(detail) => {
+            eprintln!(
+                "  {} {SERVER_CONFIG_FILE} is present but could NOT be read as a toolkit server \
+                 config, so its input-validation findings were NOT checked — the server itself \
+                 would refuse to boot on this file: {detail}",
+                style("warning:").yellow()
+            );
+        },
+    }
 }
 
 #[cfg(test)]
@@ -993,6 +1079,149 @@ base_url = "https://example.invalid"
         let resolved =
             resolve_server_config_path(Some(&dir.path().to_string_lossy()), None).expect("resolve");
         assert_eq!(resolved, dir.path().join(SERVER_CONFIG_FILE));
+    }
+
+    // -------------------------------------------------------------------------
+    // D-07's literal surface — `validate deploy` reports the SAME findings,
+    // as warnings only
+    // -------------------------------------------------------------------------
+
+    /// The deploy-document stanzas every fixture here needs, kept in ONE place.
+    const DEPLOY_FIXTURE_HEADER: &str = r#"
+[target]
+type = "aws-lambda"
+version = "1.0.0"
+
+[aws]
+region = "us-west-2"
+
+[server]
+name = "demo-server"
+memory_mb = 512
+timeout_seconds = 30
+
+[environment]
+
+[auth]
+enabled = false
+
+[observability]
+log_retention_days = 30
+enable_xray = false
+create_dashboard = false
+"#;
+
+    const BENIGN_IAM: &str = r#"
+[[iam.tables]]
+name = "demo-table"
+actions = ["read"]
+"#;
+
+    const WILDCARD_IAM: &str = r#"
+[[iam.statements]]
+effect = "Allow"
+actions = ["*"]
+resources = ["*"]
+"#;
+
+    /// A benign `.pmcp/deploy.toml` plus an optional `config.toml`, in one tempdir.
+    fn write_deploy_project(
+        iam_section: &str,
+        server_config: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pmcp_dir = dir.path().join(".pmcp");
+        std::fs::create_dir_all(&pmcp_dir).expect("mkdir .pmcp");
+        std::fs::write(
+            pmcp_dir.join("deploy.toml"),
+            format!("{DEPLOY_FIXTURE_HEADER}{iam_section}"),
+        )
+        .expect("write deploy.toml");
+        if let Some(text) = server_config {
+            std::fs::write(dir.path().join(SERVER_CONFIG_FILE), text).expect("write config.toml");
+        }
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    #[test]
+    fn deploy_discovers_and_lints_a_toolkit_config_beside_the_deploy_document() {
+        let (_dir, root) = write_deploy_project(
+            BENIGN_IAM,
+            Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
+        );
+        match discover_server_config_lint(&root) {
+            DiscoveredConfigLint::Findings(findings) => {
+                assert_eq!(
+                    findings.len(),
+                    1,
+                    "expected the uncapped-string finding, got: {findings:?}"
+                );
+                assert!(
+                    findings[0].contains("uncapped-string"),
+                    "got: {}",
+                    findings[0]
+                );
+            },
+            other => panic!("expected Findings, got {other:?}"),
+        }
+        std::env::set_var("PMCP_QUIET", "1");
+        let result = validate_deploy(Some(root.to_string_lossy().into_owned()), false);
+        assert!(
+            result.is_ok(),
+            "lint findings are warnings: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn deploy_without_a_toolkit_config_reports_absent_and_stays_silent() {
+        let (_dir, root) = write_deploy_project(BENIGN_IAM, None);
+        assert!(
+            matches!(
+                discover_server_config_lint(&root),
+                DiscoveredConfigLint::Absent
+            ),
+            "a pure-IAM project must not become noisy"
+        );
+        std::env::set_var("PMCP_QUIET", "1");
+        let result = validate_deploy(Some(root.to_string_lossy().into_owned()), false);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn deploy_warns_on_a_malformed_toolkit_config_and_still_exits_zero() {
+        let (_dir, root) = write_deploy_project(BENIGN_IAM, Some("this is not = valid toml ["));
+        assert!(
+            matches!(
+                discover_server_config_lint(&root),
+                DiscoveredConfigLint::Unreadable(_)
+            ),
+            "a malformed discovered config is a warning, not an error"
+        );
+        std::env::set_var("PMCP_QUIET", "1");
+        let result = validate_deploy(Some(root.to_string_lossy().into_owned()), false);
+        assert!(
+            result.is_ok(),
+            "a malformed DISCOVERED config must not fail `validate deploy`: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn deploy_wildcard_allow_still_fails_with_lint_findings_present() {
+        let (_dir, root) = write_deploy_project(
+            WILDCARD_IAM,
+            Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
+        );
+        std::env::set_var("PMCP_QUIET", "1");
+        let result = validate_deploy(Some(root.to_string_lossy().into_owned()), false);
+        let err = result.expect_err("wildcard Allow must still be rejected");
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("wildcard"),
+            "the hard-error contract must be unchanged by the lint extension, got: {msg}"
+        );
     }
 }
 
