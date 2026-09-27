@@ -718,8 +718,8 @@ fn load_server_config(path: &std::path::Path) -> Result<pmcp_server_toolkit::con
 /// A PROJECTION of the toolkit's single implementation, never a second copy of any
 /// rule (Phase 128 Q5 / T-128-32): this CLI holds no rule literals of its own, so
 /// what a reviewer sees here is exactly what the running server reports at startup.
-fn render_config_lint_findings(_config: &pmcp_server_toolkit::config::ServerConfig) -> Vec<String> {
-    Vec::new()
+fn render_config_lint_findings(config: &pmcp_server_toolkit::config::ServerConfig) -> Vec<String> {
+    config.lint().iter().map(ToString::to_string).collect()
 }
 
 /// Print lint findings to stderr, with the same `warning:` prefix
@@ -740,10 +740,41 @@ fn emit_config_lint_findings(findings: &[String]) {
 /// Returns `Err` when the config file cannot be read or parsed, or when
 /// `ServerConfig::validate` rejects it.
 pub fn validate_server_config(
-    _server: Option<String>,
-    _config: Option<String>,
-    _verbose: bool,
+    server: Option<String>,
+    config: Option<String>,
+    verbose: bool,
 ) -> Result<()> {
+    let not_quiet = std::env::var("PMCP_QUIET").is_err();
+    let path = resolve_server_config_path(server.as_deref(), config.as_deref())?;
+
+    if not_quiet {
+        println!("\n{}", style("PMCP Server Config Validation").cyan().bold());
+        println!("{}", style("━".repeat(50)).dim());
+        if verbose {
+            println!("  Config: {}", path.display());
+        }
+    }
+
+    let parsed = load_server_config(&path)?;
+    let findings = render_config_lint_findings(&parsed);
+
+    if not_quiet {
+        emit_config_lint_findings(&findings);
+        if findings.is_empty() {
+            println!(
+                "  {} Server config valid — no input-validation findings",
+                style("✓").green()
+            );
+        } else {
+            println!(
+                "  {} Server config valid ({} input-validation finding{})",
+                style("✓").green(),
+                findings.len(),
+                if findings.len() == 1 { "" } else { "s" }
+            );
+        }
+    }
+
     Ok(())
 }
 
