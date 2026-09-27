@@ -308,7 +308,13 @@ fn build_tool_info(decl: &ToolDecl) -> ToolInfo {
 ///
 /// Decomposed from [`synthesize_from_config`] to keep cognitive complexity ≤25
 /// (Phase 75 D-03 + PATTERNS §Pattern G).
-fn build_input_schema(params: &[ParamDecl]) -> Value {
+///
+/// `pub(crate)` since Phase 128 SC-2: [`crate::config::ServerConfig::validate`]
+/// builds each tool's schema through THIS function and compiles it at config time,
+/// so the schema the compile gate checks is byte-identical to the one the runtime
+/// validator enforces. A second construction path there would let the gate pass a
+/// schema the server never serves.
+pub(crate) fn build_input_schema(params: &[ParamDecl]) -> Value {
     let mut props = Map::new();
     let mut required = Vec::new();
     for p in params {
@@ -327,10 +333,14 @@ fn build_input_schema(params: &[ParamDecl]) -> Value {
 
 /// Build a single JSON Schema property object from a [`ParamDecl`].
 ///
-/// Per-parameter constraints (`minimum`, `maximum`, `maxLength`, `default`,
-/// `enum`) are folded in only when present; the param's `param_type` defaults
-/// to `"string"` when omitted in TOML to match JSON Schema's permissive
-/// default.
+/// Per-parameter constraints (`minimum`, `maximum`, `maxLength`, `minLength`,
+/// `pattern`, `format`, `maxItems`, `items`, `default`, `enum`) are folded in only
+/// when present — an undeclared keyword is ABSENT from the emitted schema, never
+/// present-and-empty, because an empty `pattern` matches everything and an empty
+/// `items` object constrains nothing while both read like rules.
+///
+/// The param's `param_type` defaults to `"string"` when omitted in TOML to match
+/// JSON Schema's permissive default.
 fn build_param_property(p: &ParamDecl) -> Value {
     let ty = p.param_type.as_deref().unwrap_or("string");
     let mut prop = json!({ "type": ty });
@@ -346,6 +356,21 @@ fn build_param_property(p: &ParamDecl) -> Value {
     if let Some(max_len) = p.max_length {
         prop["maxLength"] = json!(max_len);
     }
+    if let Some(min_len) = p.min_length {
+        prop["minLength"] = json!(min_len);
+    }
+    if let Some(pattern) = &p.pattern {
+        prop["pattern"] = Value::String(pattern.clone());
+    }
+    if let Some(format) = &p.format {
+        prop["format"] = Value::String(format.clone());
+    }
+    if let Some(max_items) = p.max_items {
+        prop["maxItems"] = json!(max_items);
+    }
+    if let Some(items) = &p.items {
+        prop["items"] = build_items_property(items);
+    }
     if let Some(default) = &p.default {
         // toml::Value serializes losslessly into serde_json::Value via serde.
         if let Ok(v) = serde_json::to_value(default) {
@@ -356,6 +381,31 @@ fn build_param_property(p: &ParamDecl) -> Value {
         if let Ok(v) = serde_json::to_value(enum_vals) {
             prop["enum"] = v;
         }
+    }
+    prop
+}
+
+/// Build the OBJECT-form JSON Schema `items` value from an [`ItemsDecl`]
+/// (Phase 128, D2).
+///
+/// A separate free function for two reasons. First, cognitive complexity:
+/// [`build_param_property`] gained five arms in this phase and RESEARCH assumption
+/// A4 (that they stay under cog 25) was explicitly unmeasured, so the construction
+/// lives outside it. Second, and more importantly, there is exactly ONE place that
+/// can decide the SHAPE of `items`, and it returns a [`Value::Object`]
+/// unconditionally. The array form of `items` is a draft-07 tuple construct that
+/// does NOT compile under the Draft 2020-12 pin, and a schema that does not compile
+/// takes the whole tool's validator down — so "never an array here" is a safety
+/// property, not a style preference, and it is enforced by this function having no
+/// code path that builds a JSON array.
+fn build_items_property(items: &crate::config::ItemsDecl) -> Value {
+    let ty = items.item_type.as_deref().unwrap_or("string");
+    let mut prop = json!({ "type": ty });
+    if let Some(max_len) = items.max_length {
+        prop["maxLength"] = json!(max_len);
+    }
+    if let Some(pattern) = &items.pattern {
+        prop["pattern"] = Value::String(pattern.clone());
     }
     prop
 }

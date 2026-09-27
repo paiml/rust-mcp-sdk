@@ -238,12 +238,20 @@ impl ServerConfig {
     ///    parse time, before `validate()` is called.
     /// 7. When a `[backend]` block is present (`http` feature), its `base_url`
     ///    is non-empty (trimmed) — GAP 3 / WR-02. Absent on no-http builds.
+    /// 8. Every `[[tools.parameters]]` declaration is well-formed (Phase 128
+    ///    D2 / SC-2): no empty `pattern`, no `minimum`/`maximum` outside the
+    ///    exactly-representable `f64` integer range, and the tool's synthesized
+    ///    `inputSchema` COMPILES as a Draft 2020-12 schema. The compile check
+    ///    requires the `input-validation` feature; on a build without it the check
+    ///    is skipped and a `tracing::warn!` says so once, because an enforcement
+    ///    that is off must never read as on.
     ///
     /// # Errors
     ///
     /// Returns a [`ConfigValidationError`] variant identifying the
     /// first rule violated. Iteration order matches struct field order.
     pub fn validate(&self) -> std::result::Result<(), ConfigValidationError> {
+        warn_if_pattern_checking_unavailable(&self.tools);
         if self.server.name.trim().is_empty() {
             return Err(ConfigValidationError::EmptyServerName);
         }
@@ -260,6 +268,9 @@ impl ServerConfig {
             if tool.declared_kind_count() > 1 {
                 return Err(ConfigValidationError::AmbiguousToolKind(i));
             }
+            // Phase 128 D2 / SC-2. Deliberately placed AFTER the name and
+            // kind arms so no pre-existing test's expected variant changes.
+            validate_tool_parameters(tool)?;
         }
         for (i, table) in self.database.tables.iter().enumerate() {
             if table.name.trim().is_empty() {
@@ -319,6 +330,133 @@ impl ServerConfig {
         Ok(())
     }
 }
+
+// -----------------------------------------------------------------------------
+// Phase 128 D2 / SC-2 — per-parameter declaration checks
+// -----------------------------------------------------------------------------
+
+/// The largest integer magnitude an `f64` represents exactly (2^53).
+///
+/// [`ParamDecl::minimum`] / [`ParamDecl::maximum`] are `f64`, so a declared bound
+/// above this cannot round-trip. See [`ConfigValidationError::NonFiniteParamBound`]
+/// for exactly what a magnitude check on the already-parsed value can and cannot
+/// establish.
+const MAX_EXACT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
+
+/// Run the Phase 128 D2 / SC-2 declaration checks for ONE `[[tools]]` entry.
+///
+/// Split out of [`ServerConfig::validate`] so that function stays well under the
+/// cog-25 gate as rules accumulate.
+///
+/// # Errors
+///
+/// [`ConfigValidationError::EmptyParamPattern`],
+/// [`ConfigValidationError::NonFiniteParamBound`], or
+/// [`ConfigValidationError::UncompilableParamSchema`] — first rule violated, in
+/// `[[tools.parameters]]` declaration order.
+fn validate_tool_parameters(tool: &ToolDecl) -> std::result::Result<(), ConfigValidationError> {
+    for p in &tool.parameters {
+        let declared_patterns = [
+            p.pattern.as_deref(),
+            p.items.as_ref().and_then(|i| i.pattern.as_deref()),
+        ];
+        for pattern in declared_patterns.into_iter().flatten() {
+            if pattern.is_empty() {
+                return Err(ConfigValidationError::EmptyParamPattern {
+                    tool: tool.name.clone(),
+                    param: p.name.clone(),
+                });
+            }
+        }
+        for bound in [p.minimum, p.maximum].into_iter().flatten() {
+            if !bound.is_finite() || bound.abs() > MAX_EXACT_INTEGER_BOUND {
+                return Err(ConfigValidationError::NonFiniteParamBound {
+                    tool: tool.name.clone(),
+                    param: p.name.clone(),
+                });
+            }
+        }
+    }
+    check_tool_input_schema_compiles(tool)
+}
+
+/// SC-2: compile the tool's synthesized `inputSchema` at CONFIG time, so a
+/// non-compiling `pattern` fails here — naming the parameter — rather than at call
+/// time, where it would take the tool's entire validator down.
+///
+/// Reuses `crate::tools::build_input_schema`, the same constructor the runtime
+/// serves from, so the gate cannot pass a schema the server never actually uses.
+/// `jsonschema::meta::is_valid` is deliberately NOT the check: it returns `true`
+/// for a schema whose nested `pattern` does not compile (measured — RESEARCH
+/// Finding 1e), which is precisely the mistake this gate exists to catch.
+///
+/// # Errors
+///
+/// [`ConfigValidationError::UncompilableParamSchema`] carrying the compile error's
+/// own schema path and detail. Quoting the detail is safe here and only here: this
+/// runs at load time with no request in scope and its audience is the config author.
+#[cfg(feature = "input-validation")]
+fn check_tool_input_schema_compiles(
+    tool: &ToolDecl,
+) -> std::result::Result<(), ConfigValidationError> {
+    let schema = crate::tools::build_input_schema(&tool.parameters);
+    pmcp::server::schema_validation::check_input_schema_compiles(&schema).map_err(|violation| {
+        ConfigValidationError::UncompilableParamSchema {
+            tool: tool.name.clone(),
+            position: violation.pointer,
+            detail: violation.expected,
+        }
+    })
+}
+
+/// The `input-validation`-off half of the SC-2 gate.
+//
+// Why this arm exists at all, rather than an ungated call: `ServerConfig::validate`
+// compiles in EVERY toolkit feature set, while
+// `pmcp::server::schema_validation::check_input_schema_compiles` exists only under
+// `pmcp/schema-validation` (forwarded by the toolkit's `input-validation`). An
+// ungated call breaks `cargo build -p pmcp-server-toolkit --no-default-features
+// --features http`, which is a real supported configuration.
+//
+// Why it is not a SILENT skip: on this build a declared `pattern` is neither
+// verified here nor enforced at call time, so an author who sees `validate()`
+// return `Ok(())` would reasonably believe their rule was checked. That is exactly
+// the "an enforcement that is off must never read as on" prohibition. The warning
+// is emitted once per `validate()` by `warn_if_pattern_checking_unavailable`, not
+// per tool, so a large config does not bury it.
+#[cfg(not(feature = "input-validation"))]
+fn check_tool_input_schema_compiles(
+    _tool: &ToolDecl,
+) -> std::result::Result<(), ConfigValidationError> {
+    Ok(())
+}
+
+/// Emit the once-per-`validate()` warning when this build cannot check declared
+/// `pattern` values. A no-op when the `input-validation` feature is on, and a
+/// no-op when the config declares no `pattern` at all (there is nothing unchecked
+/// to report).
+#[cfg(not(feature = "input-validation"))]
+fn warn_if_pattern_checking_unavailable(tools: &[ToolDecl]) {
+    let declares_a_pattern = tools.iter().any(|t| {
+        t.parameters.iter().any(|p| {
+            p.pattern.is_some() || p.items.as_ref().is_some_and(|i| i.pattern.is_some())
+        })
+    });
+    if declares_a_pattern {
+        tracing::warn!(
+            "this build lacks the `input-validation` feature: declared \
+             [[tools.parameters]] `pattern` values were NOT checked for compilability at \
+             config time, and will NOT be enforced at tools/call time either — enable \
+             `input-validation` to get either"
+        );
+    }
+}
+
+/// See the `cfg(not(...))` sibling. Under `input-validation` the patterns ARE
+/// checked, so there is nothing to warn about.
+#[cfg(feature = "input-validation")]
+#[allow(clippy::missing_const_for_fn)] // Why: mirrors the cfg(not(...)) sibling's signature, which cannot be const.
+fn warn_if_pattern_checking_unavailable(_tools: &[ToolDecl]) {}
 
 // -----------------------------------------------------------------------------
 // [server]
