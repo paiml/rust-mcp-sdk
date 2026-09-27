@@ -1664,8 +1664,14 @@ doc-open: doc
 .PHONY: doc-check
 doc-check:
 	@echo "$(BLUE)Checking rustdoc warnings (zero-tolerance)...$(NC)"
+	# `schema-validation` (phase 128 D-04) is listed EXPLICITLY even though
+	# `validation` is now its superset and would pull it in transitively. Naming it
+	# here compiles the feature ALONGSIDE its superset and no more than that -- it
+	# does NOT establish that the feature stands alone. The isolated proof is
+	# `cargo build -p pmcp --no-default-features --features schema-validation`,
+	# which plan 128-01 Task 2 added and plan 128-02 Task 3 re-runs.
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps \
-		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,simd,skills,sse,streamable-http,validation,websocket,v1-compat
+		--features composition,http,http-client,jwt-auth,macros,mcp-apps,oauth,rayon,resource-watcher,schema-generation,schema-validation,simd,skills,sse,streamable-http,validation,websocket,v1-compat
 	@echo "$(GREEN)✓ Zero rustdoc warnings$(NC)"
 
 # Book documentation

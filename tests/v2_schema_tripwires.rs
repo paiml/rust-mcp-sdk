@@ -33,7 +33,8 @@
 //! 1. `cargo metadata --no-deps` → every workspace package's DECLARED
 //!    dependency, with `rename`, `optional`, `uses_default_features` and
 //!    `features` as structured fields;
-//! 2. `cargo metadata --features validation` → the RESOLVED graph's
+//! 2. `cargo metadata --features validation` — and, since phase 128 D-04 split
+//!    the feature, `--features schema-validation` as well → the RESOLVED graph's
 //!    `resolve.nodes[].features`, which is the definitive unification answer and
 //!    the only layer that sees a dev-dependency or an example turning a feature
 //!    on.
@@ -776,19 +777,30 @@ struct ResolvedNode {
     id: String,
 }
 
-/// Every resolved [`JSONSCHEMA`] node, with the features unification settled on.
+/// Every resolved [`JSONSCHEMA`] node under the `validation` feature.
 ///
 /// This is the definitive answer: `.resolve.nodes[].features` is what will
 /// actually be compiled, after every workspace member, example, dev-dependency
 /// and transitive dependency has had its say.
 fn resolved_jsonschema_nodes() -> Vec<ResolvedNode> {
-    let meta = cargo_metadata(&[
-        "metadata",
-        "--format-version",
-        "1",
-        "--features",
-        "validation",
-    ]);
+    resolved_jsonschema_nodes_for(VALIDATION_FEATURE)
+}
+
+/// The feature that has always gated output validation.
+const VALIDATION_FEATURE: &str = "validation";
+
+/// The feature phase 128 D-04 split out of [`VALIDATION_FEATURE`].
+///
+/// `validation` is now redefined as `["schema-validation", "dep:garde"]`, so it
+/// is a strict SUPERSET. A consumer that enables only `schema-validation` gets
+/// the same `jsonschema` resolver-feature exposure — which is why the fence needs
+/// an arm under this name too (RESEARCH Finding 8b).
+const SCHEMA_VALIDATION_FEATURE: &str = "schema-validation";
+
+/// Every resolved [`JSONSCHEMA`] node under `feature`, with the features
+/// unification settled on.
+fn resolved_jsonschema_nodes_for(feature: &str) -> Vec<ResolvedNode> {
+    let meta = cargo_metadata(&["metadata", "--format-version", "1", "--features", feature]);
     let packages = meta["packages"]
         .as_array()
         .expect("`cargo metadata` always reports a `packages` array");
@@ -801,7 +813,7 @@ fn resolved_jsonschema_nodes() -> Vec<ResolvedNode> {
         .expect("a resolving `cargo metadata` run always reports `resolve.nodes`");
     assert!(
         !nodes.is_empty(),
-        "`cargo metadata --features validation` resolved ZERO nodes; the unification check would \
+        "`cargo metadata --features {feature}` resolved ZERO nodes; the unification check would \
          pass over nothing"
     );
     let mut out = Vec::new();
@@ -934,25 +946,48 @@ fn v2_schema_tripwires_no_manifest_declares_jsonschema_with_default_features() {
 /// The RESOLVED graph — the definitive unification answer.
 #[test]
 fn v2_schema_tripwires_the_resolved_graph_enables_no_jsonschema_resolver_feature() {
-    let nodes = resolved_jsonschema_nodes();
+    assert_resolved_graph_enables_no_resolver_feature(VALIDATION_FEATURE);
+}
+
+/// The SAME fence, under the feature name phase 128 D-04 split out.
+///
+/// Additive to the arm above, not a replacement. `validation` is now
+/// `["schema-validation", "dep:garde"]`, so the original arm exercises only the
+/// SUPERSET path: a consumer enabling only `schema-validation` reaches the same
+/// `jsonschema` with nothing watching it. That is the gap RESEARCH Finding 8b
+/// measured, and this is the arm that closes it (T-128-09).
+#[test]
+fn v2_schema_tripwires_the_resolved_graph_enables_no_jsonschema_resolver_feature_under_schema_validation(
+) {
+    assert_resolved_graph_enables_no_resolver_feature(SCHEMA_VALIDATION_FEATURE);
+}
+
+/// The body both arms of the resolver-feature fence share.
+///
+/// Shared rather than restated so the two feature names cannot drift apart —
+/// which is the failure mode that let the split ship with a fence over only one
+/// of them in the first place.
+fn assert_resolved_graph_enables_no_resolver_feature(feature: &str) {
+    let nodes = resolved_jsonschema_nodes_for(feature);
 
     assert_eq!(
         nodes.len(),
         1,
-        "expected EXACTLY ONE resolved `{JSONSCHEMA}` node and found {}: {nodes:#?}.\n  Two nodes \
-         means two copies are compiled into the same graph, which is the state 115-03's \
-         workspace-wide bump to a single `0.49` requirement exists to prevent: one validator \
-         could then be pinned and the other not.",
+        "expected EXACTLY ONE resolved `{JSONSCHEMA}` node under `--features {feature}` and found \
+         {}: {nodes:#?}.\n  Two nodes means two copies are compiled into the same graph, which is \
+         the state 115-03's workspace-wide bump to a single `0.49` requirement exists to prevent: \
+         one validator could then be pinned and the other not.",
         nodes.len()
     );
 
     for node in &nodes {
         assert!(
             node.features.is_empty(),
-            "{SEP_2106_WHY}\n  RESOLVED node `{}` compiles with features {:?}, not [].\n  This is \
-             the ONLY check that sees the effect of a DEV-dependency, an example, or a sibling \
-             workspace crate turning a feature on: unification is graph-wide, so the declared \
-             dependency check above would still pass while the retriever is compiled in.",
+            "{SEP_2106_WHY}\n  Under `--features {feature}`, RESOLVED node `{}` compiles with \
+             features {:?}, not [].\n  This is the ONLY check that sees the effect of a \
+             DEV-dependency, an example, or a sibling workspace crate turning a feature on: \
+             unification is graph-wide, so the declared dependency check above would still pass \
+             while the retriever is compiled in.",
             node.id,
             node.features
         );
