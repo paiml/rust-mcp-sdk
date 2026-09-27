@@ -622,6 +622,121 @@ test-server-toolkit:
 	done; \
 	echo "$(GREEN)✓ pmcp-server-toolkit tests passed ($$ran tests)$(NC)"
 
+# Phase 128 Wave 0 gate repair, leg 1 of 2 — `pmcp-code-mode` had NO quality-gate
+# leg at all. MEASURED: `test-all` (see its prerequisite list) named `test-tester`,
+# `test-cargo-pmcp`, `test-server-toolkit` and `test-openapi-server` and NOT
+# `pmcp-code-mode`, so the crate whose public `HttpExecutor` contract this phase
+# changes was never compiled or run by `make quality-gate`.
+#
+# `--features js-runtime` is LOAD-BEARING, not stylistic. MEASURED:
+# `crates/pmcp-code-mode/Cargo.toml` sets `default = []`, and
+# `crates/pmcp-code-mode/src/lib.rs` gates `pub mod executor` on
+# `#[cfg(feature = "js-runtime")]`. A bare `cargo test -p pmcp-code-mode` compiles
+# the `cedar`, `sql` and shared-eval surfaces, reports a comfortably nonzero total,
+# and never builds `executor` at all.
+#
+# So a crate-wide nonzero count is NOT sufficient, and neither is an
+# `executor::`-scoped count on its own. MEASURED on this tree:
+#   cargo test -p pmcp-code-mode                     --lib executor::  -> 3 selected
+#   cargo test -p pmcp-code-mode -F js-runtime       --lib executor::  -> 81 selected
+# i.e. 3 unrelated tests whose PATH happens to contain `executor::` keep a
+# nonzero-count assertion green while the module itself is absent. Three guards
+# together close it: the crate-wide count, the `executor::`-scoped count, and a
+# comment-stripped `grep -c js-runtime` over this file (see the verify commands in
+# .planning/phases/128-.../128-01-PLAN.md) that pins the feature so a later edit
+# cannot drop it silently.
+.PHONY: test-code-mode
+test-code-mode:
+	@echo "$(BLUE)Running pmcp-code-mode's own tests (js-runtime)...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-code-mode --features js-runtime -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ pmcp-code-mode reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	REQUIRED_TEST_BINARIES="eval_semantic_regression"; \
+	for b in $$REQUIRED_TEST_BINARIES; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ required test binary '$$b' never RAN — cargo printed no 'Running tests/$$b.rs' target line.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ required test binary '$$b' printed a target line but NO 'test result:' line followed it.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ required test binary '$$b' RAN but passed ZERO tests — a #[cfg] gate turned false or an #[ignore] sweep landed.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ required test binary '$$b' — the count extractor produced no usable reading ('$$n').$(NC)"; \
+			exit 1;; \
+		*) \
+			echo "$(GREEN)  ✓ $$b passed $$n tests$(NC)";; \
+		esac; \
+	done; \
+	scoped=$$(RUST_LOG=$(RUST_LOG) $(CARGO) test -p pmcp-code-mode --features js-runtime --lib executor:: -- --test-threads=1 2>&1); \
+	sstatus=$$?; \
+	echo "$$scoped"; \
+	if [ $$sstatus -ne 0 ]; then exit $$sstatus; fi; \
+	sran=$$(echo "$$scoped" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$sran" -eq 0 ]; then \
+		echo "$(RED)✗ the executor::-scoped selection passed ZERO tests — pmcp-code-mode's pub mod executor is not compiled (is --features js-runtime still on this leg?) or the module's tests were renamed away. The crate-wide count above CANNOT catch this.$(NC)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)  ✓ executor::-scoped selection passed $$sran tests$(NC)"; \
+	echo "$(GREEN)✓ pmcp-code-mode tests passed ($$ran tests)$(NC)"
+
+# Phase 128 Wave 0 gate repair, leg 2 of 2 — the toolkit's `openapi-code-mode`
+# surface. MEASURED: `crates/pmcp-server-toolkit/tests/http_executor.rs` is
+# `#![cfg(feature = "openapi-code-mode")]` while `test-server-toolkit` above pins
+# `--features http,input-validation`, so its five existing tests compile to
+# `running 0 tests` and exit 0 in every gate run. `script_tool.rs`,
+# `script_tool_engine_parity.rs` and `code_mode_tools.rs` are in the same position.
+#
+# This is a SEPARATE leg rather than a feature added to `test-server-toolkit`
+# deliberately: SC-1's curated single-call build must stay free of the SWC/JS
+# engine, so the engine-bearing surface gets its own invocation.
+#
+# Same shape as the `test-skills`, `lint-skills` and `test-oauth` legs — the gate
+# is green on what it reaches, and until this leg existed the coverage lived in
+# what it did not.
+.PHONY: test-server-toolkit-code-mode
+test-server-toolkit-code-mode:
+	@echo "$(BLUE)Running pmcp-server-toolkit's Code Mode surface (openapi-code-mode)...$(NC)"
+	@out=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p pmcp-server-toolkit --features openapi-code-mode -- --test-threads=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	ran=$$(echo "$$out" | awk '/^test result:/ { total += $$4 } END { print total+0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+		echo "$(RED)✗ pmcp-server-toolkit (openapi-code-mode) reported 0 tests — the gate is not reaching this crate$(NC)"; \
+		exit 1; \
+	fi; \
+	REQUIRED_TEST_BINARIES="http_executor"; \
+	for b in $$REQUIRED_TEST_BINARIES; do \
+		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
+		case "$$n" in \
+		-1) \
+			echo "$(RED)✗ required test binary '$$b' never RAN — cargo printed no 'Running tests/$$b.rs' target line.$(NC)"; \
+			exit 1;; \
+		-2) \
+			echo "$(RED)✗ required test binary '$$b' printed a target line but NO 'test result:' line followed it.$(NC)"; \
+			exit 1;; \
+		0) \
+			echo "$(RED)✗ required test binary '$$b' RAN but passed ZERO tests — a #[cfg] gate turned false (check that this target still passes openapi-code-mode) or an #[ignore] sweep landed.$(NC)"; \
+			exit 1;; \
+		''|*[!0-9]*) \
+			echo "$(RED)✗ required test binary '$$b' — the count extractor produced no usable reading ('$$n').$(NC)"; \
+			exit 1;; \
+		*) \
+			echo "$(GREEN)  ✓ $$b passed $$n tests$(NC)";; \
+		esac; \
+	done; \
+	echo "$(GREEN)✓ pmcp-server-toolkit Code Mode tests passed ($$ran tests)$(NC)"
+
 # Proof that `test-openapi-server`'s per-binary count guard is SENSITIVE, not
 # merely present.
 #
@@ -1485,7 +1600,7 @@ test-playwright-ui:
 	@cd tests/playwright && npm run test:ui
 
 .PHONY: test-all
-test-all: test-unit test-doc test-property test-examples test-integration test-tester test-cargo-pmcp test-cargo-pmcp-integration test-server-toolkit test-openapi-server
+test-all: test-unit test-doc test-property test-examples test-integration test-tester test-cargo-pmcp test-cargo-pmcp-integration test-server-toolkit test-code-mode test-server-toolkit-code-mode test-openapi-server
 	@echo "$(GREEN)✓ All test suites passed (ALWAYS requirements met)$(NC)"
 
 # ALWAYS Requirements Validation (for new features)

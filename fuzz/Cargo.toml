@@ -35,13 +35,20 @@ default-features = false
 # `fuzz_support::verify_bytes` seam. `fuzzing` is in neither `default` nor `full`,
 # so enabling it here adds nothing to the shipped public API.
 #
-# `validation` (Phase 115-09, SCHM-01) gates the `jsonschema` validator inside
+# `validation` (Phase 115-09, SCHM-01) is what this crate's `features` list below
+# names, and it reaches the `jsonschema` validator inside
 # `src/server/output_validation.rs`: without it `compile_for_era` does not exist
 # and `output_validation::fuzz_support` compiles to nothing, so
 # `fuzz_schema_draft_pin` would have no seam to reach. `fuzzing` widens the
-# MODULE, `validation` supplies its CONTENTS — both are required, which is why
-# the seam itself is gated `#[cfg(all(feature = "fuzzing", feature =
-# "validation"))]`.
+# MODULE, the schema engine supplies its CONTENTS — both are required.
+#
+# Phase 128 D-04 split the CONTENTS half out under its own name: the feature that
+# actually pulls `jsonschema` is now `schema-validation`, and the seam is gated
+# `#[cfg(all(feature = "fuzzing", feature = "schema-validation"))]`. `validation`
+# is redefined as the SUPERSET `["schema-validation", "dep:garde"]`, so the entry
+# in the list below still reaches the seam and needs no change — naming
+# `schema-validation` here directly would be equivalent for this target but would
+# narrow what the rest of the fuzz crate builds with.
 #
 # `skills` (Phase 125-05) gates `src/server/skills/` in its entirety: without
 # it `pmcp::server::skills` does not exist and `fuzz_skill_entry` has no seam to
