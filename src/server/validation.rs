@@ -2,6 +2,40 @@
 //!
 //! Provides ergonomic validation functions that return consistent Error::Validation errors
 //! with optional machine-readable hints for client elicitation support.
+//!
+//! # DEPRECATED and `#[doc(hidden)]` since 2.21.0 (Phase 128, D-03)
+//!
+//! Nothing in `src/` has ever called any of the eleven validators below — the only
+//! in-tree references are the doctests in this file. Meanwhile the codebase map
+//! advertised this module as the live input-validation path, which is the
+//! documented-but-absent defect class Phase 128 exists to close.
+//!
+//! Use instead:
+//!
+//! - `pmcp::server::schema_validation::validate_input` — runtime enforcement of a
+//!   tool's declared `inputSchema` at `tools/call` time, for config-driven tools.
+//! - `TypedTool::new_validated` / `TypedSyncTool::new_validated` — `garde` field
+//!   rules on hand-written typed tools.
+//!
+//! Deprecated rather than deleted: removing a `pub mod` from the 2.x line is a
+//! semver break. Removal is booked against the next major (3.0).
+//!
+//! # What the D4 harvest took from here, and what it did not
+//!
+//! `validate_safe_path` below was the harvest source for
+//! `pmcp::server::schema_validation::validate_path_placeholder` (the Phase 128 D4
+//! path-placeholder floor). What carried over is its SHAPE — a sequence of
+//! independent character checks, each returning early — and the
+//! `ValidationError::elicit` convention of naming the EXPECTED form and never the
+//! rejected value, which is the ancestor of D1's value-free refusal rule.
+//!
+//! What did NOT carry over is its body. Measured during Phase 128 research against
+//! D4's unconditional denylist, `validate_safe_path` covers 1 of the 4 denied
+//! characters (`..` only, and as a literal substring) and 0 of the 4
+//! percent-encoded forms (`%2e%2e`, `%2f`, `%3f`, `%23`) — a literal
+//! `contains("..")` is bypassed by `%2E%2E`, and the check is not
+//! ASCII-case-insensitive over hex. `validate_path_placeholder` is therefore mostly
+//! new code, and `validate_safe_path` must not be mistaken for an equivalent.
 
 use crate::{Error, Result};
 use regex::Regex;
@@ -50,6 +84,7 @@ impl ValidationError {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_range;
 ///
@@ -76,6 +111,7 @@ where
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_one_of;
 ///
@@ -107,6 +143,7 @@ where
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_regex;
 ///
@@ -133,6 +170,7 @@ pub fn validate_regex(field: &str, value: &str, pattern: &str) -> Result<()> {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_length;
 ///
@@ -176,6 +214,7 @@ pub fn validate_length(
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_email;
 ///
@@ -210,6 +249,7 @@ pub fn validate_email(field: &str, value: &str) -> Result<()> {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_url;
 ///
@@ -242,6 +282,7 @@ pub fn validate_url(field: &str, value: &str) -> Result<()> {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_safe_path;
 ///
@@ -286,6 +327,7 @@ pub fn validate_safe_path(field: &str, path: &str, allowed_prefix: Option<&str>)
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_required;
 ///
@@ -308,6 +350,7 @@ pub fn validate_required(field: &str, value: &str) -> Result<()> {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_array_size;
 ///
@@ -351,6 +394,7 @@ pub fn validate_array_size<T>(
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::validate_percentage;
 ///
@@ -373,6 +417,7 @@ pub fn validate_percentage(field: &str, value: f64) -> Result<()> {
 ///
 /// # Example
 /// ```
+/// # #![allow(deprecated)]
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use pmcp::server::validation::Validator;
 ///
@@ -531,54 +576,5 @@ impl<'a> FieldValidator<'a, f64> {
             self.validator.add_error(e);
         }
         self.validator
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_range() {
-        assert!(validate_range("age", &25, &18, &65).is_ok());
-        assert!(validate_range("age", &10, &18, &65).is_err());
-        assert!(validate_range("age", &70, &18, &65).is_err());
-    }
-
-    #[test]
-    fn test_validate_one_of() {
-        assert!(validate_one_of("currency", &"USD", &["USD", "EUR", "GBP"]).is_ok());
-        assert!(validate_one_of("currency", &"JPY", &["USD", "EUR", "GBP"]).is_err());
-    }
-
-    #[test]
-    fn test_validate_email() {
-        assert!(validate_email("email", "user@example.com").is_ok());
-        assert!(validate_email("email", "invalid").is_err());
-        assert!(validate_email("email", "@example.com").is_err());
-        assert!(validate_email("email", "user@").is_err());
-    }
-
-    #[test]
-    fn test_validate_safe_path() {
-        assert!(validate_safe_path("path", "/tmp/file.txt", Some("/tmp/")).is_ok());
-        assert!(validate_safe_path("path", "/tmp/../etc/passwd", None).is_err());
-        assert!(validate_safe_path("path", "/etc/passwd", Some("/tmp/")).is_err());
-    }
-
-    #[test]
-    fn test_validator_builder() {
-        let mut v = Validator::new();
-        v.field("age", 25).range(&18, &65);
-        v.field("email", "user@example.com").email();
-        let result = v.validate();
-
-        assert!(result.is_ok());
-
-        let mut v2 = Validator::new();
-        v2.field("age", 10).range(&18, &65);
-        let result = v2.validate();
-
-        assert!(result.is_err());
     }
 }

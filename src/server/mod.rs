@@ -213,7 +213,25 @@ pub mod skills;
 pub use skills::{Skill, SkillReference, Skills};
 
 /// Validation helpers for typed tools.
+///
+/// DEPRECATED and HIDDEN (Phase 128, D-03). Eleven public validators with zero
+/// callers anywhere in `src/` — a surface the codebase map advertised as the live
+/// input-validation path while nothing in the SDK ever called it. The live paths
+/// are `pmcp::server::schema_validation::validate_input` for config-driven tools
+/// and the `new_validated` constructors on `TypedTool` / `TypedSyncTool` for
+/// hand-written ones. (Plain backticks, not intra-doc links: this module carries
+/// BOTH an outer doc here and inner `//!` docs in `validation.rs`, and rustdoc
+/// resolves the combined set in the parent module's scope.)
+///
+/// Deprecated rather than deleted on purpose: removing a `pub mod` from the 2.x
+/// line is a semver break, and CLAUDE.md's compat philosophy keeps core additive
+/// when that is cheap. Removal is booked against the next major.
 #[cfg(not(target_arch = "wasm32"))]
+#[deprecated(
+    since = "2.21.0",
+    note = "no caller in the SDK; use `pmcp::server::schema_validation::validate_input` for config-driven tools, or `TypedTool::new_validated` / `TypedSyncTool::new_validated` for hand-written ones. Removal is booked against the next major (3.0)."
+)]
+#[doc(hidden)]
 pub mod validation;
 
 /// Schema utilities for normalizing and inlining JSON schemas.
