@@ -299,7 +299,10 @@ fn missing_config_file_exits_non_zero_naming_the_path() {
 /// findings, exit 0.
 #[test]
 fn validate_deploy_reports_lint_findings_when_both_documents_are_present() {
-    let dir = project(Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")), true);
+    let dir = project(
+        Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
+        true,
+    );
     Command::cargo_bin("cargo-pmcp")
         .expect("cargo-pmcp binary must be available")
         .args(["validate", "deploy", "--server"])
