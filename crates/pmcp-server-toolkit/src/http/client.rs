@@ -440,6 +440,411 @@ impl HttpConnector for HttpClient {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Phase 128 D4 test support + the two sibling test modules.
+//
+// `mod placeholder_floor` and `mod query_separator` are SIBLINGS of `mod tests`
+// at the `client` module level, not children of it. Both are still selected by
+// this plan's `--lib http::client` verify filter (a module prefix), and the names
+// mirror `pmcp-code-mode`'s `executor::query_separator` so the two surfaces'
+// boundary suites read alike. Being children of `client` is what gives them
+// access to the private `HttpClient::substitute_path`.
+// -----------------------------------------------------------------------------
+
+/// Fixtures shared by the two Phase 128 D4 test modules.
+#[cfg(all(test, feature = "input-validation"))]
+mod d4_support {
+    use super::{HttpClient, HttpConnectorError, Operation};
+    use crate::http::{Parameter, ParameterLocation};
+
+    /// A `GET` operation on `path` carrying `parameters`.
+    pub fn op(path: &str, parameters: Vec<Parameter>) -> Operation {
+        Operation {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            parameters,
+            has_request_body: false,
+            base_url: None,
+        }
+    }
+
+    /// A required path parameter with no declared narrowing (floor + cap only).
+    pub fn path_param(name: &str) -> Parameter {
+        Parameter::new(name, ParameterLocation::Path, true)
+    }
+
+    /// Substitute `pairs` into `path`, treating every named key as a path
+    /// parameter with no declared narrowing.
+    pub fn substitute(
+        path: &str,
+        pairs: &[(&str, serde_json::Value)],
+    ) -> Result<String, HttpConnectorError> {
+        let parameters = pairs.iter().map(|(k, _)| path_param(k)).collect();
+        let mut args = serde_json::Map::new();
+        for (k, v) in pairs {
+            args.insert((*k).to_string(), v.clone());
+        }
+        HttpClient::substitute_path(&op(path, parameters), &args)
+    }
+
+    /// Substitute a single string `value` for `{name}` in `path`.
+    pub fn substitute_one(
+        path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<String, HttpConnectorError> {
+        substitute(
+            path,
+            &[(name, serde_json::Value::String(value.to_string()))],
+        )
+    }
+}
+
+/// The curated surface's D4 floor: every rendered placeholder value faces
+/// `validate_path_placeholder` before ANY substitution is applied, and the
+/// composed result faces `validate_resolved_path` before dispatch.
+#[cfg(all(test, feature = "input-validation"))]
+mod placeholder_floor {
+    use super::d4_support::{op, path_param, substitute, substitute_one};
+    use super::{HttpClient, HttpConnectorError};
+    use crate::http::{Parameter, ParameterLocation};
+    use pmcp::server::schema_validation::PLACEHOLDER_MAX_LENGTH;
+
+    /// Assert a refusal names the parameter and carries no byte of the value and
+    /// no fragment of the resolved path.
+    fn assert_value_free(err: &HttpConnectorError, param: &str, value: &str, path_fragment: &str) {
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(param),
+            "the refusal must name the declared parameter: {rendered}"
+        );
+        assert!(
+            !rendered.contains(value),
+            "the refusal must carry no byte of the value: {rendered}"
+        );
+        assert!(
+            !rendered.contains(path_fragment),
+            "the refusal must never contain the resolved path: {rendered}"
+        );
+    }
+
+    /// CR-01 row: a query separator inside a placeholder value.
+    #[test]
+    fn placeholder_floor_refuses_a_query_separator_in_a_value() {
+        let value = "current?string=x";
+        let err = substitute_one("/content/{version}/CUI", "version", value).unwrap_err();
+        assert_value_free(&err, "version", value, "/content/");
+    }
+
+    /// CR-01 row: parent-directory traversal inside a placeholder value.
+    #[test]
+    fn placeholder_floor_refuses_traversal_in_a_value() {
+        let value = "current/../../search/current";
+        let err = substitute_one("/content/{version}/CUI", "version", value).unwrap_err();
+        assert_value_free(&err, "version", value, "/content/");
+    }
+
+    /// Percent-encoded traversal in UPPER-case hex — the decode-once pass is what
+    /// has to catch it, not an enumerated denylist of spellings.
+    #[test]
+    fn placeholder_floor_refuses_upper_case_encoded_traversal() {
+        let err = substitute_one("/content/{version}/CUI", "version", "a%2E%2Eb").unwrap_err();
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+    }
+
+    /// Adjacency edge: a value that is EXACTLY a denied character. The check is a
+    /// character rule, not a substring-position heuristic.
+    #[test]
+    fn placeholder_floor_refuses_a_value_that_is_exactly_a_denied_character() {
+        let err = substitute_one("/content/{version}/CUI", "version", "?").unwrap_err();
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+    }
+
+    /// Encoding edge: a literal NUL byte, and separately its percent-encoded form.
+    #[test]
+    fn placeholder_floor_refuses_a_nul_byte_in_both_forms() {
+        assert!(substitute_one("/x/{v}", "v", "a\u{0}b").is_err());
+        assert!(substitute_one("/x/{v}", "v", "a%00b").is_err());
+    }
+
+    /// An empty value is refused — it would otherwise compose an empty segment.
+    #[test]
+    fn placeholder_floor_refuses_an_empty_value() {
+        assert!(substitute_one("/x/{v}", "v", "").is_err());
+    }
+
+    /// The always-on cap holds at exactly `PLACEHOLDER_MAX_LENGTH`.
+    #[test]
+    fn placeholder_floor_accepts_the_cap_and_refuses_one_more() {
+        let at_cap = "a".repeat(PLACEHOLDER_MAX_LENGTH);
+        assert_eq!(
+            substitute_one("/x/{v}", "v", &at_cap).expect("at the cap"),
+            format!("/x/{at_cap}")
+        );
+        let over_cap = "a".repeat(PLACEHOLDER_MAX_LENGTH + 1);
+        assert!(substitute_one("/x/{v}", "v", &over_cap).is_err());
+    }
+
+    /// A conforming value matching its DECLARED pattern is accepted and the path
+    /// is fully substituted.
+    #[test]
+    fn placeholder_floor_accepts_a_value_matching_its_declared_pattern() {
+        let parameters = vec![
+            Parameter::new("cui", ParameterLocation::Path, true).with_rules(
+                Some("^C[0-9]+$".to_string()),
+                Some(32),
+                false,
+            ),
+        ];
+        let mut args = serde_json::Map::new();
+        args.insert("cui".to_string(), serde_json::json!("C0018787"));
+        let resolved = HttpClient::substitute_path(&op("/CUI/{cui}/content", parameters), &args)
+            .expect("a conforming value must be accepted");
+        assert_eq!(resolved, "/CUI/C0018787/content");
+    }
+
+    /// D-10: the DECLARED pattern narrows on top of the floor.
+    #[test]
+    fn placeholder_floor_refuses_a_value_failing_its_declared_pattern() {
+        let parameters = vec![
+            Parameter::new("cui", ParameterLocation::Path, true).with_rules(
+                Some("^C[0-9]+$".to_string()),
+                None,
+                false,
+            ),
+        ];
+        let mut args = serde_json::Map::new();
+        args.insert("cui".to_string(), serde_json::json!("notacui"));
+        let err = HttpClient::substitute_path(&op("/CUI/{cui}", parameters), &args).unwrap_err();
+        assert!(err.to_string().contains("cui"), "{err}");
+        assert!(!err.to_string().contains("notacui"), "{err}");
+    }
+
+    /// Empty edge: a template with NO placeholders is returned unchanged and gains
+    /// zero new refusals. The composed check still runs, and passes.
+    #[test]
+    fn placeholder_floor_leaves_a_placeholder_free_template_untouched() {
+        let resolved = HttpClient::substitute_path(
+            &op("/Line/Mode/tube/Status", vec![]),
+            &serde_json::Map::new(),
+        )
+        .expect("a placeholder-free template must be unaffected");
+        assert_eq!(resolved, "/Line/Mode/tube/Status");
+    }
+
+    /// A refusal on the SECOND of two placeholders aborts with no
+    /// partially-substituted path in existence — the first value is rendered and
+    /// checked but nothing is applied until every value has passed.
+    #[test]
+    fn placeholder_floor_refuses_the_second_of_two_placeholders_without_substituting() {
+        let err = substitute(
+            "/a/{first}/b/{second}",
+            &[
+                ("first", serde_json::json!("ok")),
+                ("second", serde_json::json!("../escape")),
+            ],
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("second"), "{rendered}");
+        assert!(
+            !rendered.contains("/a/ok/b/"),
+            "no partially-substituted path may appear anywhere: {rendered}"
+        );
+    }
+
+    /// A path parameter ABSENT from `args` is refused, naming the parameter only —
+    /// rather than leaving the literal `{name}` in the outbound URL.
+    #[test]
+    fn placeholder_floor_refuses_an_absent_path_argument() {
+        let err = HttpClient::substitute_path(
+            &op("/users/{id}/profile", vec![path_param("id")]),
+            &serde_json::Map::new(),
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("id"), "{rendered}");
+        assert!(
+            !rendered.contains('{') && !rendered.contains('}'),
+            "the refusal must not echo the template: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/users/"),
+            "the refusal must not echo the path: {rendered}"
+        );
+    }
+
+    /// The COMPOSED check is the only mechanism that can see this: a template
+    /// literal prefix plus a value that each pass on their own compose a segment
+    /// over the cap. Spec-derived operations carry mid-segment placeholders, so
+    /// this shape is reachable without any curated config.
+    #[test]
+    fn placeholder_floor_refuses_a_composed_segment_over_the_cap() {
+        let prefix = "p".repeat(100);
+        let value = "v".repeat(200);
+        let err = substitute_one(&format!("/x/{prefix}{{id}}"), "id", &value).unwrap_err();
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+    }
+
+    /// The composed check also refuses a residual `{`/`}` arriving from a template
+    /// the curated config parser would not recognize — the spec-derived route that
+    /// config validation cannot reach.
+    #[test]
+    fn placeholder_floor_refuses_a_residual_brace_from_an_unrecognized_template() {
+        let err = HttpClient::substitute_path(&op("/x/{a}/y/{b}", vec![path_param("a")]), &{
+            let mut args = serde_json::Map::new();
+            args.insert("a".to_string(), serde_json::json!("ok"));
+            args
+        })
+        .unwrap_err();
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+    }
+
+    /// A template literal carrying traversal is refused by the composed check
+    /// alone: no per-value check ever sees a literal, so this row isolates the
+    /// composed mechanism.
+    #[test]
+    fn placeholder_floor_refuses_traversal_written_into_the_template_literal() {
+        let err = HttpClient::substitute_path(&op("/a/../b", vec![]), &serde_json::Map::new())
+            .unwrap_err();
+        assert!(matches!(err, HttpConnectorError::Backend(_)), "{err}");
+    }
+}
+
+/// The `?` narrowing inherited from plan 05, mirrored on the CURATED surface and
+/// pinned in BOTH directions.
+///
+/// A `[[tools]]` `path` is operator-authored configuration, exactly as a Code Mode
+/// script's literal path text is operator-authored script text — so the same
+/// asymmetry applies: refusing `..` from it catches a traversal bug, while refusing
+/// `?` from it rejects legitimate authoring. `substitute_path` therefore splits the
+/// composed path at the FIRST `?` and applies the full, unmodified rule set to each
+/// side. Nine of the twelve rows below assert what did NOT change, because a
+/// narrowing pinned only by accept-rows is indistinguishable from a deleted check.
+#[cfg(all(test, feature = "input-validation"))]
+mod query_separator {
+    use super::d4_support::substitute_one;
+    use super::{HttpClient, Operation};
+    use pmcp::server::schema_validation::PLACEHOLDER_MAX_LENGTH;
+
+    /// Substitute nothing — a placeholder-free template, checked as composed.
+    fn literal(path: &str) -> Result<String, super::HttpConnectorError> {
+        HttpClient::substitute_path(
+            &Operation {
+                method: "GET".to_string(),
+                path: path.to_string(),
+                parameters: vec![],
+                has_request_body: false,
+                base_url: None,
+            },
+            &serde_json::Map::new(),
+        )
+    }
+
+    // ---- ACCEPTED: the separator an operator wrote into the config ----
+
+    /// The row the narrowing exists for: a `?` in a curated `[[tools]]` path.
+    #[test]
+    fn query_separator_accepts_an_author_written_query_string() {
+        assert_eq!(
+            literal("/Line/Mode/tube/Status?detail=true").expect("author query accepted"),
+            "/Line/Mode/tube/Status?detail=true"
+        );
+    }
+
+    /// The change-request's own curated shape: an author query alongside a floored
+    /// placeholder. Both mechanisms coexist on one path.
+    #[test]
+    fn query_separator_accepts_a_literal_query_alongside_a_floored_placeholder() {
+        assert_eq!(
+            substitute_one("/content/{version}/CUI?string=x", "version", "current")
+                .expect("author query plus conforming placeholder accepted"),
+            "/content/current/CUI?string=x"
+        );
+    }
+
+    /// The Graph-style `$select` projection shape in-tree consumers author.
+    #[test]
+    fn query_separator_accepts_a_graph_style_dollar_projection() {
+        let resolved = literal(
+            "/drives/D/items/I/workbook/worksheets/C/range(address='A2:D7')?$select=values",
+        )
+        .expect("a Graph $select projection must be accepted");
+        assert!(resolved.ends_with("?$select=values"), "{resolved}");
+    }
+
+    // ---- STILL REFUSED: everything the split does not relax ----
+
+    #[test]
+    fn query_separator_still_refuses_traversal_in_the_path_portion() {
+        assert!(
+            literal("/a/../b?x=1").is_err(),
+            "appending a query must not launder a traversal"
+        );
+    }
+
+    #[test]
+    fn query_separator_still_refuses_traversal_in_the_query_portion() {
+        let err = literal("/search?next=../../etc/passwd").unwrap_err();
+        assert!(!err.to_string().contains("passwd"), "{err}");
+    }
+
+    #[test]
+    fn query_separator_still_refuses_a_control_byte_in_the_query_portion() {
+        assert!(literal("/search?x=a%00b").is_err());
+    }
+
+    #[test]
+    fn query_separator_still_refuses_an_over_cap_query_portion() {
+        let long = "z".repeat(PLACEHOLDER_MAX_LENGTH + 1);
+        assert!(literal(&format!("/search?q={long}")).is_err());
+    }
+
+    #[test]
+    fn query_separator_still_refuses_a_second_question_mark() {
+        assert!(
+            literal("/search?a=1?b=2").is_err(),
+            "only the FIRST `?` is split off; one exemption, not a licence"
+        );
+    }
+
+    #[test]
+    fn query_separator_still_refuses_an_empty_query_portion() {
+        assert!(
+            literal("/search?").is_err(),
+            "a dangling `?` is the same class as a trailing `/`"
+        );
+    }
+
+    #[test]
+    fn query_separator_still_refuses_a_fragment_marker() {
+        assert!(literal("/search#frag").is_err());
+    }
+
+    /// THE row that proves the narrowing is not a hole: the template carries an
+    /// author-written `?` (legal) AND a placeholder value carries an injected one
+    /// (still refused by the per-value floor, which is the mechanism the narrowing
+    /// relies on for its safety argument).
+    #[test]
+    fn query_separator_still_refuses_an_injected_separator_from_a_value() {
+        let payload = "2026AA?string=x";
+        let err = substitute_one("/search/{v}?detail=true", "v", payload).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains('v'), "{rendered}");
+        assert!(
+            !rendered.contains("2026AA") && !rendered.contains('?'),
+            "the refusal must carry no byte of the value: {rendered}"
+        );
+    }
+
+    /// The second value route: an injected TRAVERSAL alongside an author query.
+    #[test]
+    fn query_separator_still_refuses_an_injected_traversal_from_a_value() {
+        assert!(substitute_one("/search/{v}?detail=true", "v", "../../etc/passwd").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
