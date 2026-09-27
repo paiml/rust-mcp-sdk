@@ -334,4 +334,77 @@ pub enum ConfigValidationError {
         /// The `[[tools.parameters]]` `name` whose bound cannot be represented.
         param: String,
     },
+    /// Per Phase 128 D3 / D-07: a body-position string parameter declares no
+    /// `max_length`, and `[server.validation]` `strict = true` promotes that lint
+    /// finding into a hard failure.
+    ///
+    /// Only reachable under `strict`. With `strict = false` (the default) the same
+    /// config validates cleanly and the finding is reported by
+    /// [`crate::config::ServerConfig::lint`] instead — a running server must never
+    /// refuse to boot over an uncapped free-text field, which is the whole reason
+    /// the lint channel exists separately from `validate`.
+    #[error(
+        "[[tools]] '{tool}' parameter '{param}' is an uncapped body-position string and \
+         [server.validation] strict = true; declare a max_length or clear the strict flag"
+    )]
+    UncappedStringParam {
+        /// The `[[tools]]` `name` carrying the uncapped parameter.
+        tool: String,
+        /// The `[[tools.parameters]]` `name` with no `max_length`.
+        param: String,
+    },
+}
+
+/// One non-fatal finding from [`crate::config::ServerConfig::lint`]
+/// (Phase 128, D-07).
+///
+/// # Why this exists instead of a `validate()` variant
+///
+/// [`ConfigValidationError`] is first-error-wins `Result<(), _>` with no warning
+/// channel, so D-07's "warns" is unexpressible in that signature. A running server
+/// must NOT refuse to boot because a free-text body parameter has no `max_length`
+/// (D-05) — but the author still has to be told, and the startup log is what makes
+/// a later regression traceable. Hence a separate additive `-> Vec<ConfigWarning>`
+/// channel that leaves `validate`'s existing behaviour untouched.
+///
+/// `[server.validation] strict = true` is what promotes a finding into a
+/// [`ConfigValidationError::UncappedStringParam`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    /// The `[[tools]]` `name` the finding concerns.
+    ///
+    /// EMPTY for a server-level finding — an active `[server.validation]` opt-out
+    /// belongs to the server, not to a tool.
+    pub tool: String,
+    /// The `[[tools.parameters]]` `name` the finding concerns.
+    ///
+    /// EMPTY for a server-level finding, for the same reason as [`Self::tool`].
+    pub param: String,
+    /// Stable machine-readable rule identifier, e.g. `"uncapped-string"`.
+    ///
+    /// A `&'static str` rather than an enum so plan 07's CLI and plan 09's startup
+    /// log can group and filter on it without either taking a dependency on a
+    /// closed set that every new rule would widen.
+    pub rule: &'static str,
+    /// Human-readable explanation, including the remedy.
+    ///
+    /// Author-facing, like [`ConfigValidationError`]'s messages and unlike a
+    /// client-facing refusal: it may name config keys and declared limits. It never
+    /// contains caller data — `lint` runs at load time with no request in scope.
+    pub detail: String,
+}
+
+impl std::fmt::Display for ConfigWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.tool.is_empty() {
+            write!(f, "[{}] {}", self.rule, self.detail)
+        } else {
+            write!(
+                f,
+                "[{}] [[tools]] '{}' parameter '{}': {}",
+                self.rule, self.tool, self.param, self.detail
+            )
+        }
+    }
 }
