@@ -118,7 +118,7 @@ pub fn validate_input(
 
     let violations: Vec<InputViolation> = validator
         .iter_errors(arguments)
-        .map(|e| violation(&e))
+        .map(|e| violation(&e, schema))
         .collect();
     if violations.is_empty() {
         // `is_valid` disagreed with `iter_errors`. Refuse rather than fall through
@@ -158,14 +158,116 @@ fn effective_arguments(arguments: Option<&Value>) -> &Value {
 }
 
 /// Project one `jsonschema` error into an [`InputViolation`], value-free.
-fn violation(e: &jsonschema::ValidationError<'_>) -> InputViolation {
+///
+/// `schema` is the DECLARED schema the error came from; it is what lets
+/// `safe_pointer` tell a declared property name apart from a caller-chosen one.
+fn violation(e: &jsonschema::ValidationError<'_>, schema: &Value) -> InputViolation {
     let (keyword, expected) =
         expectation(e).unwrap_or_else(|| ("schema", GENERIC_MISMATCH.to_string()));
     InputViolation {
-        pointer: e.instance_path().to_string(),
+        pointer: safe_pointer(e, schema),
         keyword,
         expected,
     }
+}
+
+/// The fixed token a non-declared pointer segment is replaced by.
+///
+/// Carries no length and no hash of the redacted key: a length is a side channel
+/// on a value that may itself be PHI (T-128-08a).
+const REDACTED_SEGMENT: &str = "<redacted>";
+
+/// Project `e`'s instance pointer onto the DECLARED schema, redacting every
+/// segment whose name came from the instance rather than from the declaration.
+///
+/// # Why this is a projection and not a copy
+///
+/// RESEARCH Finding 1c records that `instance_path()` "is safe for declared
+/// properties" — and that qualifier is load-bearing. [`validate_input`] is public
+/// and accepts arbitrary schemas, so the qualifier does not hold in general.
+/// Measured counterexample: under
+/// `{"type":"object","additionalProperties":{"type":"integer"}}` — or under any
+/// schema using `patternProperties` — the property name is chosen by the CALLER
+/// and appears verbatim in the pointer, so
+/// `{"Jane Doe DOB 1970-01-01": "x"}` yields the pointer
+/// `/Jane Doe DOB 1970-01-01`. Copying that into a refusal violates SC-7 even
+/// though no `ValidationError` was ever `Display`-formatted, which is precisely
+/// the leak this module exists to prevent.
+///
+/// A segment is emitted VERBATIM only when it is
+///
+/// - a key of the current schema node's `properties` map (a DECLARED name), or
+/// - a base-10 integer, i.e. an array index, which carries no caller-chosen text.
+///
+/// Every other segment becomes [`REDACTED_SEGMENT`]. An `additionalProperties:
+/// false` violation keeps the empty pointer `jsonschema` already reports for it,
+/// so it never names a key at all.
+fn safe_pointer(e: &jsonschema::ValidationError<'_>, schema: &Value) -> String {
+    let raw = e.instance_path().as_str();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut node = Some(schema);
+    let mut out = String::new();
+    for token in raw.trim_start_matches('/').split('/') {
+        let (rendered, next) = project_pointer_segment(node, token);
+        out.push('/');
+        out.push_str(rendered);
+        node = next;
+    }
+    out
+}
+
+/// One step of [`safe_pointer`]'s walk: what to emit, and the schema node the
+/// next segment is resolved against.
+fn project_pointer_segment<'a>(
+    node: Option<&'a Value>,
+    token: &'a str,
+) -> (&'a str, Option<&'a Value>) {
+    if !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()) {
+        // An array index. `items` is the 2020-12 object form; array-form `items`
+        // does not compile under this module's pin (RESEARCH Finding 1h), so a
+        // single subschema is the only shape reachable here.
+        return (token, node.and_then(|n| n.get("items")));
+    }
+    let decoded = unescape_pointer_token(token);
+    match node
+        .and_then(|n| n.get("properties"))
+        .and_then(|properties| properties.get(decoded.as_ref()))
+    {
+        // Declared: emit the ORIGINAL token, so the pointer stays valid RFC 6901.
+        Some(child) => (token, Some(child)),
+        None => (REDACTED_SEGMENT, None),
+    }
+}
+
+/// Decode one RFC 6901 pointer token (`~1` -> `/`, `~0` -> `~`), in that order.
+///
+/// Only needed for the `properties` lookup — the emitted text is always the
+/// original, still-escaped token.
+fn unescape_pointer_token(token: &str) -> std::borrow::Cow<'_, str> {
+    if token.contains('~') {
+        std::borrow::Cow::Owned(token.replace("~1", "/").replace("~0", "~"))
+    } else {
+        std::borrow::Cow::Borrowed(token)
+    }
+}
+
+/// Render a SCHEMA-COMPILATION error's own text.
+///
+/// This is the ONLY place in this module where a `jsonschema` error is
+/// `Display`-formatted, and it is deliberately reachable from exactly two
+/// callers: the server-side `tracing::warn!` in [`validate_input`] and
+/// [`check_input_schema_compiles`], whose audience is a CONFIG AUTHOR.
+///
+/// The distinction is not cosmetic. A *validation* error's `Display` echoes the
+/// rejected caller value for every keyword (RESEARCH Finding 1b) and must never
+/// be rendered — that is what `expectation` exists for. A *compilation* error
+/// describes author-supplied schema text and contains no caller data at all, so
+/// rendering it is safe in both of those positions and in neither is it sent to
+/// an MCP client on a `tools/call` path.
+fn compile_error_detail(error: &jsonschema::ValidationError<'_>) -> String {
+    format!("{error}")
 }
 
 /// The DECLARED expectation behind a validation error, or `None` when this keyword
@@ -179,7 +281,9 @@ fn expectation(e: &jsonschema::ValidationError<'_>) -> Option<(&'static str, Str
     use jsonschema::error::ValidationErrorKind as K;
 
     Some(match e.kind() {
-        // NEVER read `unexpected` — it is the caller's key list.
+        // `unexpected` is the CALLER-SUPPLIED key list — it is the attacker's own
+        // text and may itself be PHI. It is read EXCLUSIVELY through `.len()`;
+        // never iterate it, never index it, never format it.
         K::AdditionalProperties { unexpected } => (
             "additionalProperties",
             format!("unknown argument(s): {}", unexpected.len()),
@@ -191,9 +295,58 @@ fn expectation(e: &jsonschema::ValidationError<'_>) -> Option<(&'static str, Str
                 property.as_str().unwrap_or(UNNAMED_PROPERTY)
             ),
         ),
+        K::MaxLength { limit } => ("maxLength", format!("at most {limit} characters")),
+        K::MinLength { limit } => ("minLength", format!("at least {limit} characters")),
+        K::Pattern { pattern } => ("pattern", format!("must match {pattern}")),
+        K::Maximum { limit } => ("maximum", format!("at most {limit}")),
+        K::Minimum { limit } => ("minimum", format!("at least {limit}")),
+        K::Enum { options } => ("enum", format!("one of {options}")),
+        K::MaxItems { limit } => ("maxItems", format!("at most {limit} items")),
+        K::Type { kind } => ("type", format!("must be {}", type_expectation(kind))),
+        // Q1 turns format ASSERTION on for inputs, so this is a kind this module
+        // actively produces rather than one it merely tolerates. The `format`
+        // name is declared config content and is safe to echo; without this arm a
+        // `format` refusal would be indistinguishable from an unknown failure and
+        // would quietly undercut the reason Q1 chose to enforce it at all.
+        K::Format { format } => ("format", format!("must be a valid {format}")),
+        // The regex engine's OWN ReDoS guard firing on caller input against a
+        // config-declared `pattern`. This is simultaneously a refusal and a
+        // signal about the declaration, so an operator needs it in the logs; the
+        // log line names the DECLARED schema position only (`schema_path`, e.g.
+        // `/properties/cui/pattern`) and never the value. That log line is the
+        // instrument for T-128-10's accepted assumption-A2 residual, and
+        // `fuzz_placeholder_pattern_redos` (plan 10) is what looks for it
+        // deliberately.
+        K::BacktrackLimitExceeded { .. } => {
+            tracing::warn!(
+                schema_path = %e.schema_path(),
+                "declared `pattern` hit the regex backtracking limit on caller input; refusing"
+            );
+            ("pattern", BACKTRACK_LIMIT.to_string())
+        },
         _ => return None,
     })
 }
+
+/// Render a `Type` violation's DECLARED type (or type union), value-free.
+fn type_expectation(kind: &jsonschema::error::TypeKind) -> String {
+    use jsonschema::error::TypeKind;
+    match kind {
+        TypeKind::Single(declared) => declared.as_str().to_owned(),
+        TypeKind::Multiple(declared) => declared
+            .iter()
+            .map(jsonschema::JsonType::as_str)
+            .collect::<Vec<&str>>()
+            .join(" or "),
+    }
+}
+
+/// What a client is told when the engine's backtracking limit fires.
+///
+/// Names neither the pattern nor the value: which of the two is at fault is not
+/// decidable from here, and the pair is exactly what an attacker probing a
+/// pathological declared pattern would want confirmed.
+const BACKTRACK_LIMIT: &str = "could not be evaluated against the declared pattern";
 
 /// Stand-in for a `Required { property }` payload that is not a JSON string. Not
 /// reachable from a well-formed schema; present so this path cannot panic.
@@ -263,23 +416,50 @@ fn cached_input_validator(
         .or_insert_with(|| {
             compile_input_2020_12(schema)
                 .map(Arc::new)
-                .map_err(|e| Arc::from(e.to_string().as_str()))
+                // `compile_error_detail` is the ONE audited Display-render site;
+                // this is a COMPILATION error, so it carries author-supplied
+                // schema text and no caller data.
+                .map_err(|error| Arc::from(compile_error_detail(&error).as_str()))
         })
         .clone()
 }
 
-/// Check that `schema` compiles as a Draft 2020-12 input schema (SC-2's
-/// config-time gate).
+/// Check that `schema` compiles as a Draft 2020-12 input schema — the
+/// CONFIG-TIME gate (SC-2).
 ///
-/// RED placeholder: accepts every schema. The GREEN commit compiles `schema`
-/// through `compile_input_2020_12` and projects the compile error's own
-/// `schema_path` into the returned violation.
+/// This exists as a separate entry point from [`validate_input`] because its
+/// audience is different. Here the schema is AUTHOR-supplied (a server's own
+/// config, or a bundled `OpenAPI` spec) and there is no caller data anywhere in
+/// scope, so echoing the compile error's own detail is exactly what the author
+/// needs. The SC-7 no-echo rule governs the client-facing `tools/call` path, and
+/// on that path a non-compiling declared schema still yields the detail-free
+/// refusal [`validate_input`] returns.
+///
+/// The returned `pointer` comes from the compile error's `schema_path`, which
+/// points straight at the offending declaration — measured as
+/// `/properties/<param>/pattern` for a nested non-compiling `pattern`
+/// (RESEARCH Finding 1e). No projection through `safe_pointer` is needed or
+/// wanted: a schema path is entirely declaration-derived.
+///
+/// # `jsonschema::meta::is_valid` is NOT the check
+///
+/// It returns `true` for a schema whose nested `pattern` does not compile
+/// (measured, RESEARCH Finding 1e), so a meta-schema validation would pass over
+/// the single most common authoring mistake this gate exists to catch. The check
+/// has to be a real Draft 2020-12 compile of the synthesized `inputSchema`.
 ///
 /// # Errors
 ///
-/// `Err(InputViolation)` when `schema` does not compile.
-pub fn check_input_schema_compiles(_schema: &Value) -> Result<(), InputViolation> {
-    Ok(())
+/// `Err(InputViolation)` with `keyword: "schema"` when `schema` does not compile.
+pub fn check_input_schema_compiles(schema: &Value) -> Result<(), InputViolation> {
+    match compile_input_2020_12(schema) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(InputViolation {
+            pointer: error.schema_path().as_str().to_string(),
+            keyword: "schema",
+            expected: compile_error_detail(&error),
+        }),
+    }
 }
 
 /// Render `violations` as ONE client-facing refusal message.
@@ -433,7 +613,7 @@ mod tests {
     // ===================================================================
 
     /// A one-property object schema, so each arm can be exercised in isolation.
-    fn one_prop(property: Value) -> Value {
+    fn one_prop(property: &Value) -> Value {
         json!({
             "type": "object",
             "properties": { "p": property },
@@ -450,7 +630,7 @@ mod tests {
 
     #[test]
     fn schema_validation_max_length_refusal_names_the_limit_not_the_value() {
-        let schema = one_prop(json!({ "type": "string", "maxLength": 8 }));
+        let schema = one_prop(&json!({ "type": "string", "maxLength": 8 }));
         let value = "x".repeat(5000);
         let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
         assert!(msg.contains('8'), "must carry the declared limit: {msg}");
@@ -463,7 +643,7 @@ mod tests {
 
     #[test]
     fn schema_validation_enum_refusal_lists_declared_options_only() {
-        let schema = one_prop(json!({ "enum": ["exact", "words"] }));
+        let schema = one_prop(&json!({ "enum": ["exact", "words"] }));
         let value = "Jane Doe DOB 1970-01-01";
         let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
         assert!(msg.contains("exact"), "must list declared options: {msg}");
@@ -473,7 +653,7 @@ mod tests {
 
     #[test]
     fn schema_validation_pattern_refusal_names_the_declared_pattern() {
-        let schema = one_prop(json!({ "type": "string", "pattern": "^C[0-9]+$" }));
+        let schema = one_prop(&json!({ "type": "string", "pattern": "^C[0-9]+$" }));
         let value = "Jane Doe DOB 1970-01-01";
         let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
         assert!(
@@ -504,14 +684,15 @@ mod tests {
             ),
         ];
         for (property, value, declared_bound) in cases {
-            let schema = one_prop(property.clone());
+            let schema = one_prop(property);
             let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
             assert!(
                 msg.contains(declared_bound),
                 "must name the declared bound {declared_bound}: {msg}"
             );
+            let rendered_value = format!("{value}");
             assert!(
-                !msg.contains(&value.to_string()),
+                !msg.contains(&rendered_value),
                 "must not echo the rejected value: {msg}"
             );
         }
@@ -519,7 +700,7 @@ mod tests {
 
     #[test]
     fn schema_validation_type_refusal_names_the_declared_type_only() {
-        let schema = one_prop(json!({ "type": "integer" }));
+        let schema = one_prop(&json!({ "type": "integer" }));
         let msg = refusal_for(&schema, &json!({ "p": "Jane Doe" }), &["p"]);
         assert!(
             msg.contains("integer"),
@@ -532,7 +713,7 @@ mod tests {
     fn schema_validation_format_refusal_names_the_declared_format_only() {
         // Q1: inputs compile through a format-ASSERTING builder, so `format` is a
         // kind this phase actively produces and must render value-free.
-        let schema = one_prop(json!({ "type": "string", "format": "uri" }));
+        let schema = one_prop(&json!({ "type": "string", "format": "uri" }));
         let value = "!!!not-a-uri!!!";
         let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
         assert!(msg.contains("uri"), "must name the declared format: {msg}");
@@ -573,7 +754,7 @@ mod tests {
 
     #[test]
     fn schema_validation_empty_rejected_value_refusal_is_value_free() {
-        let schema = one_prop(json!({ "type": "string", "minLength": 3 }));
+        let schema = one_prop(&json!({ "type": "string", "minLength": 3 }));
         let msg = refusal_for(&schema, &json!({ "p": "" }), &["p"]);
         assert!(msg.contains('3'), "must name the declared minimum: {msg}");
         assert!(
@@ -586,8 +767,12 @@ mod tests {
     fn schema_validation_astral_and_combining_value_never_reaches_the_refusal() {
         // `maxLength` counts code points (RESEARCH Finding 1d): 4 emoji + a
         // decomposed `é` is over a cap of 3.
-        let schema = one_prop(json!({ "type": "string", "maxLength": 3 }));
-        let value = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}e\u{0301}";
+        let schema = one_prop(&json!({ "type": "string", "maxLength": 3 }));
+        // Deliberately ALL non-ASCII, so a per-code-point absence assertion is
+        // meaningful: an ASCII code point from the value would also occur in the
+        // declared expectation's own English prose, which would make the
+        // assertion vacuous rather than strict.
+        let value = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{00E9}\u{0301}";
         let msg = refusal_for(&schema, &json!({ "p": value }), &["p"]);
         for ch in value.chars() {
             assert!(
@@ -595,6 +780,7 @@ mod tests {
                 "code point {ch:?} from the rejected value reached the refusal: {msg}"
             );
         }
+        assert!(!msg.contains(value), "must not echo the value: {msg}");
     }
 
     #[test]
@@ -675,7 +861,7 @@ mod tests {
     fn schema_validation_declared_property_pointer_survives_the_projection() {
         // The redaction must not be a blanket suppression: a DECLARED name is
         // still what makes a refusal actionable for the legitimate caller.
-        let schema = one_prop(json!({ "type": "string", "maxLength": 2 }));
+        let schema = one_prop(&json!({ "type": "string", "maxLength": 2 }));
         let violations = validate_input(&schema, Some(&json!({ "p": "abc" })), None)
             .expect_err("over the declared maxLength");
         assert_eq!(violations[0].pointer, "/p", "declared names stay verbatim");
