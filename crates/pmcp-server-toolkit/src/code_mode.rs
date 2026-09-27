@@ -1165,9 +1165,12 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
     /// Narrow a layer-2 `{param}` value by what the carried OpenAPI document
     /// DECLARES for it (Phase 128 D4(b)).
     ///
-    /// Delegates to [`spec_placeholder_rules`], whose rustdoc states exactly what
-    /// a schema/operation/parameter MISS costs — the floor and the cap are
-    /// retained, the spec's narrowing is lost — and what bounds that loss.
+    /// Delegates to the private `spec_placeholder_rules` helper in this module,
+    /// whose rustdoc states exactly what a schema/operation/parameter MISS costs —
+    /// the floor and the cap are retained, the spec's narrowing is lost — and what
+    /// bounds that loss. Named in plain backticks rather than as an intra-doc link
+    /// because this method is public and the helper is private, which rustdoc
+    /// (correctly) warns about.
     fn placeholder_rules(
         &self,
         method: &str,
