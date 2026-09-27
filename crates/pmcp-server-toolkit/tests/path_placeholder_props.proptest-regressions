@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# PROVENANCE (Phase 128 plan 08): this seed was NOT produced by a failure of the
+# shipping implementation. It is the counterexample proptest SHRANK to when
+# `validate_path_placeholder`'s ordering was DELIBERATELY inverted to
+# pattern-supersedes-floor, then restored byte-exact. It decodes to the value
+# "A?" checked against a declared pattern of `^.*$` -- the exact D-10 boundary --
+# so re-running it first on every future run is the cheapest possible guard
+# against that inversion returning. The same case is also pinned
+# deterministically in `path_placeholder_props_smoke_floor_refuses_cr01_payloads`,
+# so deleting this file weakens the ordering guard but does not remove it.
+cc 0fc38deefe40d77ff0a405d91f23ef6a56180f98681ce89d14e5bbe7e5970307 # shrinks to base = "A", tail = "", fragment_idx = 0, pattern_idx = 0, author_query = None

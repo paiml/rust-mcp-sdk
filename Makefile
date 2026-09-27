@@ -608,7 +608,7 @@ test-server-toolkit:
 		echo "$(RED)✗ pmcp-server-toolkit reported 0 tests — the gate is not reaching this crate$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance curated_path_injection"; \
+	REQUIRED_TEST_BINARIES="env_ref_grammar_parity base_url_expansion input_validation_acceptance curated_path_injection path_placeholder_props"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \
@@ -629,6 +629,46 @@ test-server-toolkit:
 		esac; \
 	done; \
 	echo "$(GREEN)✓ pmcp-server-toolkit tests passed ($$ran tests)$(NC)"
+	@# SECOND invocation, Phase 128 plan 08 — the `#[ignore]`d `property_` arms.
+	@#
+	@# The run above does NOT pass `--ignored`, so every `#[ignore]`d arm in the
+	@# crate is skipped by it. That is not a defect to fix by removing the markers:
+	@# `scripts/named-test-binary-count.awk` reads the PASSED count from the
+	@# `test result:` line, and an all-`#[ignore]`d binary reports `0 passed`, which
+	@# the loop above rejects. So `tests/path_placeholder_props.rs` carries BOTH a
+	@# non-ignored smoke arm (which satisfies that loop) and `#[ignore]`d property
+	@# arms — and this invocation is what actually SELECTS the property arms. Without
+	@# it they would be selectable in principle and dead weight in every gate run.
+	@#
+	@# `make test-property` cannot stand in for this: it runs
+	@# `cargo test --features "full" -- --ignored property_`, a ROOT-package
+	@# selector that never reaches a toolkit test binary (PATTERNS SP-3).
+	@#
+	@# Count-asserted independently, because `--ignored property_` is exactly the
+	@# shape of selector that silently selects ZERO: a renamed arm or a dropped
+	@# `#[ignore]` would make this print `running 0 tests` and exit 0.
+	@echo "$(BLUE)Selecting the toolkit's #[ignore]d property arms (--ignored property_)...$(NC)"
+	@pout=$$(RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) PROPTEST_CASES=$${PROPTEST_CASES:-256} $(CARGO) test -p pmcp-server-toolkit --features http,input-validation --test path_placeholder_props -- --test-threads=1 --ignored property_ 2>&1); \
+	pstatus=$$?; \
+	echo "$$pout"; \
+	if [ $$pstatus -ne 0 ]; then exit $$pstatus; fi; \
+	pn=$$(printf '%s\n' "$$pout" | awk -v want="tests/path_placeholder_props.rs" -f scripts/named-test-binary-count.awk); \
+	case "$$pn" in \
+	-1) \
+		echo "$(RED)✗ the property invocation never RAN 'tests/path_placeholder_props.rs'.$(NC)"; \
+		exit 1;; \
+	-2) \
+		echo "$(RED)✗ the property invocation printed a target line but NO 'test result:' line.$(NC)"; \
+		exit 1;; \
+	0) \
+		echo "$(RED)✗ '--ignored property_' selected ZERO property arms — a 'property_' prefix or an #[ignore] marker was dropped, so the D-10 ordering and percent-encoding-closure invariants are no longer asserted anywhere.$(NC)"; \
+		exit 1;; \
+	''|*[!0-9]*) \
+		echo "$(RED)✗ the property invocation's count extractor produced no usable reading ('$$pn').$(NC)"; \
+		exit 1;; \
+	*) \
+		echo "$(GREEN)  ✓ path_placeholder_props property arms passed $$pn tests$(NC)";; \
+	esac
 
 # Phase 128 Wave 0 gate repair, leg 1 of 2 — `pmcp-code-mode` had NO quality-gate
 # leg at all. MEASURED: `test-all` (see its prerequisite list) named `test-tester`,
