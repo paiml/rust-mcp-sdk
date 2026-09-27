@@ -613,26 +613,375 @@ impl std::fmt::Display for PlaceholderRefusal {
 
 impl std::error::Error for PlaceholderRefusal {}
 
-/// RED placeholder — accepts everything. GREEN implements the four ordered steps.
+/// The expectation a floor refusal states when `/` is denied.
+const FLOOR_EXPECTATION: &str = "must not contain a path separator, a \
+     parent-directory sequence, a query or fragment marker, a backslash or any \
+     control character — in literal or percent-encoded form — and must not be a \
+     single dot";
+
+/// The same, for a parameter that opted in to `/` (D-11).
+const FLOOR_EXPECTATION_SLASH_ALLOWED: &str = "must not contain a \
+     parent-directory sequence, a query or fragment marker, a backslash or any \
+     control character — in literal or percent-encoded form — and must not be a \
+     single dot";
+
+/// The expectation a percent-handling refusal states.
+const PERCENT_EXPECTATION: &str = "must not contain an encoded percent sign \
+     (`%25`) or a malformed percent escape";
+
+/// The fixed `param` a composed-path refusal carries.
+///
+/// [`validate_resolved_path`] is param-agnostic by construction: the composition
+/// it checks belongs to no single parameter, so there is no declared name to give
+/// and a caller-supplied one must never be substituted.
+const COMPOSED_POSITION: &str = "path segment";
+
+/// Validate ONE path-placeholder value before substitution (D4).
+///
+/// This is the single copy of the D4 character floor in the SDK. It lives in core
+/// `pmcp` — not in `pmcp-code-mode` — because BOTH HTTP surfaces must reach it:
+/// the curated single-call build resolves to the toolkit's `http` feature, whose
+/// dependency list carries no `pmcp-code-mode` edge (RESEARCH Finding 6), so a
+/// helper exported only from there would force either a new dependency edge that
+/// widens the curated graph or two copies of one security rule — the drift class
+/// this repo has already been bitten by. D-09's published-helper obligation is met
+/// by a `pub use` re-export from `pmcp-code-mode`.
+///
+/// # The four steps, and why the order is load-bearing
+///
+/// 1. **Unconditional floor**, which no declared pattern can relax (D-10). It is
+///    implemented as DECODE ONCE, THEN DENY — never as an enumerated denylist of
+///    literal and pre-encoded spellings, because an enumeration is incomplete by
+///    construction: a mixed form such as `.%2E` or `%2E.` decodes to the
+///    parent-directory sequence while matching neither the literal nor the
+///    fully-encoded spelling. Enumerating more spellings does not converge;
+///    decoding does.
+/// 2. **Always-on cap** at [`PLACEHOLDER_MAX_LENGTH`] code points (D-08).
+/// 3. **Declared pattern narrows** — evaluated through `cached_input_validator`,
+///    so a placeholder pattern and an `inputSchema` pattern resolve `\s` through
+///    the identical engine AND a repeated pattern compiles once.
+/// 4. **Declared length narrows further**; a declared length larger than the
+///    module constant never widens it.
+///
+/// Running the floor FIRST is empirically justified, not stylistic: a spec pattern
+/// of `^.*$` accepts every CR-01 payload (measured, RESEARCH Finding 5b), so
+/// pattern-supersedes-floor would have silently disabled the check.
+///
+/// This is a pure function holding no shared mutable state of its own, so two
+/// concurrent Code Mode calls on one executor cannot interleave placeholder state.
+///
+/// `value` is the value ALREADY RENDERED to a string by the caller (the toolkit's
+/// `render_scalar`), so the floor and the cap see the rendered text rather than a
+/// JSON number or bool.
+///
+/// # Not sufficient on its own
+///
+/// Per-value checks cannot establish final-path safety. Every caller MUST also run
+/// [`validate_resolved_path`] on the composed path before dispatch.
 ///
 /// # Errors
 ///
-/// `Err(PlaceholderRefusal)` when `value` is not a safe path-placeholder value.
+/// `Err(PlaceholderRefusal)` naming the DECLARED parameter and the DECLARED
+/// expectation, never the value.
 pub fn validate_path_placeholder(
-    _param: &str,
-    _value: &str,
-    _rules: &PlaceholderRules<'_>,
+    param: &str,
+    value: &str,
+    rules: &PlaceholderRules<'_>,
 ) -> Result<(), PlaceholderRefusal> {
+    // 1. UNCONDITIONAL FLOOR — before any declared narrowing (D-10).
+    placeholder_floor(param, value, rules.allow_slash)?;
+
+    // 2. ALWAYS-ON CAP (D-08), in code points to agree with `maxLength`.
+    let length = value.chars().count();
+    if length > PLACEHOLDER_MAX_LENGTH {
+        return Err(refusal(
+            param,
+            "maxLength",
+            format!("must be at most {PLACEHOLDER_MAX_LENGTH} characters"),
+        ));
+    }
+
+    // 3. DECLARED PATTERN NARROWS (never replaces).
+    if let Some(pattern) = rules.declared_pattern {
+        declared_pattern_check(param, value, pattern)?;
+    }
+
+    // 4. DECLARED LENGTH NARROWS FURTHER. A declared length larger than the
+    //    module constant cannot widen it, because step 2 already ran.
+    if let Some(declared) = rules.declared_max_length {
+        if length > declared {
+            return Err(refusal(
+                param,
+                "maxLength",
+                format!("must be at most {declared} characters"),
+            ));
+        }
+    }
     Ok(())
 }
 
-/// RED placeholder — accepts everything. GREEN implements the composed check.
+/// Validate the COMPOSED path after substitution and before dispatch.
+///
+/// # Why a per-value check is insufficient by construction
+///
+/// This is a proof, not a caution. Two values that each pass
+/// [`validate_path_placeholder`] independently can compose into a refused form
+/// across adjacent placeholders:
+///
+/// - `/search/{a}{b}` with `a` at 180 code points and `b` at 200 yields a
+///   380-code-point segment — over the cap, with neither part over it.
+/// - `/x/{a}{b}` with `a = "."` and `b = "."` yields the segment `..` — traversal
+///   — from two values neither of which contains the sequence.
+///
+/// Adjacency is reachable rather than theoretical: on the Code Mode surface the
+/// substitution is genuinely per-`{key}`, and the composed result is then parsed
+/// as a URL, which is where a composed traversal becomes a different endpoint.
+///
+/// # Contract
+///
+/// The same decode-once normalization as the per-value floor runs over the WHOLE
+/// path; then the path is split on `/` and each segment is refused when it is
+/// longer than [`PLACEHOLDER_MAX_LENGTH`] code points, equal to the
+/// parent-directory sequence, equal to a single dot, or empty other than the
+/// leading segment a path starting with `/` produces. A residual `{` or `}` is
+/// refused — an unsubstituted placeholder reaching the wire is its own defect —
+/// and `?`, `#`, a backslash and any control byte are refused anywhere.
+///
+/// The refusal is param-agnostic: it carries the fixed position `path segment`
+/// rather than a caller-supplied name, because the composition belongs to no
+/// single parameter.
 ///
 /// # Errors
 ///
-/// `Err(PlaceholderRefusal)` when the composed path is not safe.
-pub fn validate_resolved_path(_path: &str) -> Result<(), PlaceholderRefusal> {
+/// `Err(PlaceholderRefusal)` describing the position and the expectation, never
+/// the path.
+pub fn validate_resolved_path(path: &str) -> Result<(), PlaceholderRefusal> {
+    let decoded = decode_once(COMPOSED_POSITION, path)?;
+    if decoded
+        .iter()
+        .any(|byte| denied_byte(*byte, /* allow_slash */ true) || matches!(byte, b'{' | b'}'))
+    {
+        return Err(refusal(
+            COMPOSED_POSITION,
+            "pathSegment",
+            format!(
+                "{FLOOR_EXPECTATION_SLASH_ALLOWED}, and must carry no unsubstituted placeholder"
+            ),
+        ));
+    }
+    check_resolved_segments(&decoded)
+}
+
+/// Per-segment half of [`validate_resolved_path`], split out to keep both
+/// functions inside the cognitive-complexity budget.
+fn check_resolved_segments(decoded: &[u8]) -> Result<(), PlaceholderRefusal> {
+    let leading_slash = decoded.first() == Some(&b'/');
+    for (index, segment) in decoded.split(|byte| *byte == b'/').enumerate() {
+        check_one_resolved_segment(segment, index == 0 && leading_slash)?;
+    }
     Ok(())
+}
+
+/// One composed path segment. Split out from [`check_resolved_segments`] because
+/// the two together measured cognitive complexity 28 against the blocking CI cap
+/// of 25 — the same reason `output_validation.rs` carries its three-function
+/// split.
+///
+/// `leading` marks the one legitimate empty segment: the one an absolute path
+/// produces before its first `/`.
+fn check_one_resolved_segment(segment: &[u8], leading: bool) -> Result<(), PlaceholderRefusal> {
+    if segment.is_empty() {
+        // Any OTHER empty segment means a doubled or trailing `/`, which changes
+        // the endpoint shape — and is exactly what an empty placeholder value
+        // substituted at the tail of a template produces.
+        if leading {
+            return Ok(());
+        }
+        return Err(refusal(
+            COMPOSED_POSITION,
+            "pathSegment",
+            "must not be empty".to_string(),
+        ));
+    }
+    if segment == b".." || segment == b"." {
+        return Err(refusal(
+            COMPOSED_POSITION,
+            "pathSegment",
+            "must not be a relative path reference".to_string(),
+        ));
+    }
+    if String::from_utf8_lossy(segment).chars().count() > PLACEHOLDER_MAX_LENGTH {
+        return Err(refusal(
+            COMPOSED_POSITION,
+            "segmentMaxLength",
+            format!("must be at most {PLACEHOLDER_MAX_LENGTH} characters"),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a refusal. Kept as one helper so no call site can forget that the
+/// rejected value is never a field.
+fn refusal(param: &str, rule: &'static str, expected: String) -> PlaceholderRefusal {
+    PlaceholderRefusal {
+        param: param.to_owned(),
+        rule,
+        expected,
+    }
+}
+
+/// Step 1 — the unconditional floor (D-10), as decode-once-then-deny.
+fn placeholder_floor(
+    param: &str,
+    value: &str,
+    allow_slash: bool,
+) -> Result<(), PlaceholderRefusal> {
+    if value.is_empty() {
+        return Err(refusal(param, "nonEmpty", "must not be empty".to_string()));
+    }
+    let decoded = decode_once(param, value)?;
+    let floor_expectation = if allow_slash {
+        FLOOR_EXPECTATION_SLASH_ALLOWED
+    } else {
+        FLOOR_EXPECTATION
+    };
+    let denied = decoded.iter().any(|byte| denied_byte(*byte, allow_slash))
+        // The parent-directory sequence has NO escape, even with `allow_slash`
+        // (D-11).
+        || decoded.windows(2).any(|pair| pair == b"..")
+        // A single dot is a meaningful path segment (`a/./b` normalizes to
+        // `a/b`), so two adjacent placeholders each holding `.` compose to `..`.
+        // Refusing it closes that composition at the value layer as well as in
+        // `validate_resolved_path`.
+        || decoded == b".";
+    if denied {
+        return Err(refusal(
+            param,
+            "characterFloor",
+            floor_expectation.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Steps 1a-1c — refuse `%25` outright, refuse a malformed escape, then
+/// percent-decode exactly ONCE.
+///
+/// Refusing `%25` in any hex case BEFORE decoding is what makes one pass
+/// sufficient rather than the first round of an unbounded regress: with `%25`
+/// refused, no surviving input can encode a further `%`, so a single decode
+/// reaches ground truth. A malformed escape is refused because leaving it
+/// undecided would mean every downstream layer deciding for itself whether to
+/// treat it as a literal `%` or as an error.
+fn decode_once(param: &str, value: &str) -> Result<Vec<u8>, PlaceholderRefusal> {
+    if contains_ascii_case_insensitive(value, "%25") {
+        return Err(refusal(
+            param,
+            "percentEncoding",
+            PERCENT_EXPECTATION.to_string(),
+        ));
+    }
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let decoded = bytes
+                .get(index + 1)
+                .zip(bytes.get(index + 2))
+                .and_then(|(high, low)| Some(hex_nibble(*high)? * 16 + hex_nibble(*low)?));
+            let Some(byte) = decoded else {
+                return Err(refusal(
+                    param,
+                    "percentEncoding",
+                    PERCENT_EXPECTATION.to_string(),
+                ));
+            };
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// One ASCII hex digit's value, case-insensitively; `None` for a non-hex byte.
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Step 1d's denylist, over ONE decoded byte.
+///
+/// `\` is denied because IIS, some nginx rewrite configurations and AWS API
+/// Gateway normalize it toward `/` and `..\` toward traversal, so a floor that
+/// stops `../` and passes `..\` is deployment-dependent rather than sound. CR, LF
+/// and the remaining ASCII control characters are denied because an unencoded
+/// newline in a path reaching a logging or transport layer is response-splitting
+/// and request-smuggling surface — and because admitting some control characters
+/// and not others invites exactly the enumeration gap the decode-once design
+/// exists to avoid.
+const fn denied_byte(byte: u8, allow_slash: bool) -> bool {
+    match byte {
+        b'?' | b'#' | b'\\' => true,
+        b'/' => !allow_slash,
+        0x00..=0x1F | 0x7F => true,
+        _ => false,
+    }
+}
+
+/// ASCII-case-insensitive substring search.
+///
+/// `%2E` and `%2e` decode identically, so a case-SENSITIVE `contains` is a bypass
+/// (RESEARCH Finding 5b).
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Step 3 — the declared `pattern`, routed through the CACHED input validator.
+///
+/// `cached_input_validator` and not `compile_input_2020_12`: the uncached entry
+/// point would compile a fresh regex on every placeholder check on every request,
+/// which is both a per-request cost and a direct amplifier of the `ReDoS` residual
+/// T-128-10 accepts. It also means a placeholder `pattern` and an `inputSchema`
+/// `pattern` resolve `\s` through the identical engine, which matters because
+/// `\s` is not a single rule in this engine (RESEARCH Finding 1f).
+///
+/// A pattern that does not compile is itself a refusal; the cache stores that
+/// failure too, so a broken declared pattern is not recompiled per request either.
+fn declared_pattern_check(
+    param: &str,
+    value: &str,
+    pattern: &str,
+) -> Result<(), PlaceholderRefusal> {
+    let schema = serde_json::json!({ "type": "string", "pattern": pattern });
+    match cached_input_validator(&schema, None) {
+        Ok(validator) => {
+            if validator.is_valid(&Value::String(value.to_owned())) {
+                Ok(())
+            } else {
+                Err(refusal(param, "pattern", format!("must match {pattern}")))
+            }
+        },
+        // The compile DETAIL is author-supplied schema text, but this refusal is
+        // client-facing, so it stays detail-free — matching `validate_input`'s
+        // treatment of a non-compiling declared `inputSchema`.
+        Err(_) => Err(refusal(
+            param,
+            "pattern",
+            "has a declared pattern that is not a valid regular expression".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
