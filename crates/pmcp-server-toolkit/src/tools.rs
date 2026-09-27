@@ -849,8 +849,13 @@ impl ToolHandler for HttpToolHandler {
         // connector touches only declared `{params}`.
         // The connector's Display is redaction-safe (T-90-01-01); no URL/credential
         // reaches the client error.
+        //
+        // Phase 128 E1: `execute_for_tool`, not `execute`, so a registered
+        // `RequestPolicy` is told WHICH tool the call came from. An `Operation`
+        // describes an endpoint and cannot carry a tool name; the default trait
+        // body delegates to `execute`, so an out-of-repo connector is unaffected.
         self.connector
-            .execute(&self.operation, &args)
+            .execute_for_tool(&self.info.name, &self.operation, &args)
             .await
             .map_err(|e| pmcp::Error::Internal(format!("connector error: {e}")))
     }
@@ -958,7 +963,11 @@ impl ScriptToolHandler {
         let tool_info = build_tool_info(decl, validation);
         Ok(Self {
             plan,
-            http_exec,
+            // Phase 128 E1: this handler owns a per-tool CLONE of the shared
+            // executor, which is the one place a script tool's name can be
+            // attached — `HttpExecutor::execute_request` is a `pmcp-code-mode`
+            // trait method and carries no tool name.
+            http_exec: http_exec.with_tool_label(&decl.name),
             exec_config,
             tool_info,
         })

@@ -332,7 +332,14 @@ pub fn code_mode_http_tools_from_executor(
     };
     let execute_handler = tool_handlers::ExecuteCodeHandler {
         pipeline,
-        source: tool_handlers::ExecSource::PerRequestHttp { base, exec_config },
+        source: tool_handlers::ExecSource::PerRequestHttp {
+            // Phase 128 E1: label the executor with the tool it serves, so a
+            // registered `RequestPolicy` can attribute an outbound request. One
+            // `execute_code` call may issue many requests; they all carry this
+            // label.
+            base: base.with_tool_label("execute_code"),
+            exec_config,
+        },
         flavor,
     };
 
@@ -922,6 +929,32 @@ impl HttpCodeExecutor {
         self.tool_label.as_deref().unwrap_or("")
     }
 
+    /// Consult the registered E1 policy, if any, for one already-assembled
+    /// outbound request (Phase 128).
+    ///
+    /// The mirror of `http::HttpClient`'s helper of the same name. Its own
+    /// function so `execute_request` keeps ONE added statement and stays under
+    /// the cognitive-complexity 25 gate, and returns immediately when no policy
+    /// is registered.
+    async fn run_request_policy(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+    ) -> std::result::Result<(), ExecutionError> {
+        let Some(policy) = self.policy.as_ref() else {
+            return Ok(());
+        };
+        let req = crate::policy::OutboundRequest::new(self.tool_label(), method, path, query, body);
+        policy
+            .check(&req)
+            .await
+            .map_err(|refusal| ExecutionError::RuntimeError {
+                message: format!("outbound request refused by policy: {refusal}"),
+            })
+    }
+
     /// Attach the E1 [`crate::policy::RequestPolicy`] consulted before every
     /// outbound request this executor makes (Phase 128).
     ///
@@ -1279,6 +1312,39 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
         //     deliberately does not enable (Plan 01 Rule 1).
         let url = crate::http::join_url(&self.base_url, resolved_path);
 
+        // (2a) Phase 128 — the NON-AUTH half of step (4) moved ABOVE the E1 hook.
+        //      Step (4) used to run entirely after `auth.apply` at (3), which put
+        //      the remaining-body-to-query conversion after any hook placed before
+        //      auth. A policy documented to inspect the query pairs would then have
+        //      inspected an EMPTY slice while the pairs about to be sent still sat
+        //      in `body` — a security hook that is present, documented and blind,
+        //      which is worse than an absent one. D-12 is preserved exactly: only
+        //      the AUTH-supplied query additions stay behind the hook, so the
+        //      credential's contribution is still invisible to the policy.
+        //
+        //      Nothing is renumbered; the auth-supplied pairs are appended at (3a).
+        let mut query_params: Vec<(String, String)> = Vec::new();
+        let request_body = if is_get_like {
+            if let Some(serde_json::Value::Object(obj)) = &remaining_body {
+                for (key, value) in obj {
+                    // A non-scalar GET-query value is rejected (WR-03) rather than
+                    // silently JSON-stringified into the URL.
+                    query_params.push((key.clone(), Self::scalar_str(key, value)?));
+                }
+            }
+            None
+        } else {
+            remaining_body
+        };
+
+        // (2b) Phase 128 E1 / D-12 — the outbound-policy hook. AFTER `join_url` so
+        //      the policy sees the URL as it will be sent, and BEFORE `auth.apply`
+        //      so no credential exists yet in `headers` / `query`. A refusal returns
+        //      before auth and before the send. The mirror of the curated surface's
+        //      hook in `http/client.rs::execute_inner`.
+        self.run_request_policy(&upper, &url, &query_params, request_body.as_ref())
+            .await?;
+
         // (3) Apply auth, threading the per-request inbound token (H1). Auth
         //     failures map to a RuntimeError WITHOUT echoing URL/token
         //     (Pitfall 5 / T-90-04-01).
@@ -1292,22 +1358,10 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
                 message: "authentication failed for outgoing request".to_string(),
             })?;
 
-        let mut query_params: Vec<(String, String)> = auth_query.into_iter().collect();
-
-        // (4) For GET-like requests, serialize remaining body fields as query
-        //     params; otherwise keep them as the JSON body.
-        let request_body = if is_get_like {
-            if let Some(serde_json::Value::Object(obj)) = &remaining_body {
-                for (key, value) in obj {
-                    // A non-scalar GET-query value is rejected (WR-03) rather than
-                    // silently JSON-stringified into the URL.
-                    query_params.push((key.clone(), Self::scalar_str(key, value)?));
-                }
-            }
-            None
-        } else {
-            remaining_body
-        };
+        // (3a) The auth-supplied query additions — an API-key-in-query credential —
+        //      join the pairs AFTER the hook, which is what keeps them invisible to
+        //      the policy.
+        query_params.extend(auth_query);
 
         // Append query params via url::Url (reqwest 0.13's RequestBuilder::query
         // is behind the off-by-default `query` feature; Plan 01 Rule 1).

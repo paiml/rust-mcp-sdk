@@ -132,7 +132,25 @@ pub async fn dispatch(
     // Lazy (CF-2): the reqwest client is built without contacting the backend.
     // Shared by BOTH the single-call connector and the Code-Mode executor so a
     // single connection pool serves the whole binary.
-    let client = reqwest::Client::new();
+    //
+    // Phase 128 T-128-39a — redirects are DISABLED, and that is a security
+    // decision rather than a tuning one. `reqwest::Client::new()` follows up to
+    // 10 redirects by default, and every hop after the first happens INSIDE the
+    // client, after the E1 `RequestPolicy` hook has already run. An endpoint
+    // allowlist could therefore be satisfied by a request whose final destination
+    // the policy never saw. A config-driven server pointed at a declared
+    // `[backend] base_url` has no legitimate need to follow a cross-origin
+    // redirect, so `Policy::none()` makes a redirect surface as a 3xx response the
+    // caller handles rather than as an invisible hop. Do not restore the default
+    // without re-opening that bypass.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            DispatchError::Connector(HttpConnectorError::Backend(
+                "failed to build HTTP client".to_string(),
+            ))
+        })?;
 
     // Endpoint resolution (Phase 120 / PKG-03): `base_url` may be a `${VAR}` /
     // `env:VAR` reference the target environment fills, so resolve it ONCE here
@@ -351,5 +369,60 @@ base_url = "${{{VAR}}}"
                 "DispatchError Display leaked a credential: {rendered}"
             );
         }
+    }
+
+    /// T-128-39a: the shared client must NOT follow a redirect.
+    ///
+    /// Every hop after the first happens INSIDE `reqwest`, after the E1
+    /// `RequestPolicy` hook has already run — so a followed redirect is an
+    /// outbound request no policy ever saw. This asserts the 3xx surfaces as a
+    /// status the caller handles instead. It drives the connector `dispatch`
+    /// actually built, so it fails if `Policy::none()` is ever dropped.
+    #[tokio::test]
+    async fn the_dispatched_client_does_not_follow_a_redirect() {
+        use pmcp_server_toolkit::http::{HttpConnectorError, Operation};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.example/taken"),
+            )
+            .mount(&server)
+            .await;
+
+        let toml = format!(
+            r#"
+[server]
+name = "redirect-probe"
+version = "0.1.0"
+
+[backend]
+base_url = "{}"
+"#,
+            server.uri()
+        );
+        let cfg = ServerConfig::from_toml_strict_validated(&toml).expect("parse");
+        let (connector, _exec) = dispatch(&cfg).await.expect("dispatch");
+
+        let op = Operation {
+            method: "GET".to_string(),
+            path: "/start".to_string(),
+            parameters: Vec::new(),
+            has_request_body: false,
+            base_url: None,
+        };
+        let err = connector
+            .execute(&op, &serde_json::json!({}))
+            .await
+            .expect_err("a 302 is a non-success status, not a hop to follow");
+        assert!(
+            matches!(err, HttpConnectorError::Status { status: 302 }),
+            "expected the redirect to surface as a 302 status, got: {err}"
+        );
+        // The invisible hop never happened: exactly ONE request was made.
+        assert_eq!(server.received_requests().await.expect("recorded").len(), 1);
     }
 }

@@ -583,10 +583,43 @@ fn refuse_missing_path_argument(_param_name: &str) -> Result<(), HttpConnectorEr
     Ok(())
 }
 
-#[async_trait]
-impl HttpConnector for HttpClient {
-    async fn execute(
+impl HttpClient {
+    /// Consult the registered E1 policy, if any, for one already-assembled
+    /// outbound request (Phase 128).
+    ///
+    /// Its own helper so the `execute` body keeps ONE added statement and stays
+    /// well under the cognitive-complexity 25 gate. Returns `Ok(())` immediately
+    /// when no policy is registered, which is the no-allocation empty case.
+    ///
+    /// # Errors
+    ///
+    /// [`HttpConnectorError::PolicyRefused`] carrying the policy's OWN message.
+    async fn run_request_policy(
         &self,
+        tool: &str,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<(), HttpConnectorError> {
+        let Some(policy) = self.policy.as_ref() else {
+            return Ok(());
+        };
+        let req = crate::policy::OutboundRequest::new(tool, method, path, query, body);
+        policy
+            .check(&req)
+            .await
+            .map_err(|refusal| HttpConnectorError::PolicyRefused(refusal.message().to_string()))
+    }
+
+    /// The shared `execute` body, carrying the MCP tool name (Phase 128 E1).
+    ///
+    /// [`HttpConnector::execute`] passes `""` (no tool to name) and
+    /// [`HttpConnector::execute_for_tool`] passes the synthesized tool's own
+    /// name, so there is ONE request path rather than two that can drift.
+    async fn execute_inner(
+        &self,
+        tool: &str,
         operation: &Operation,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, HttpConnectorError> {
@@ -603,6 +636,34 @@ impl HttpConnector for HttpClient {
 
         let mut query = Self::build_query(operation, args_map)?;
         let mut headers = Self::build_headers(operation, args_map)?;
+        let request_body = Self::build_body(operation, args_map);
+
+        // Phase 128 E1 / D-12 — the outbound-policy hook, and its position is
+        // load-bearing rather than incidental.
+        //
+        // It sits AFTER `join_url` because the policy must see the URL as it will
+        // be sent (resolved placeholders, stage prefix applied) rather than the
+        // `[[tools]]` template. It sits BEFORE `self.auth.apply` because that call
+        // is the first moment a credential exists in `headers` / `query`, and
+        // D-12's guarantee is that third-party policy code cannot observe one. A
+        // refusal therefore returns before auth AND before the send: nothing is
+        // authenticated and nothing leaves.
+        //
+        // `query` is snapshotted SORTED so a policy sees a deterministic order
+        // (the source is a HashMap). It carries no auth pair for the reason above:
+        // an API-key-in-query credential is contributed by the call below.
+        let mut policy_query: Vec<(String, String)> =
+            query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        policy_query.sort();
+        self.run_request_policy(
+            tool,
+            &operation.method.to_uppercase(),
+            &joined,
+            &policy_query,
+            request_body.as_ref(),
+        )
+        .await?;
+        drop(policy_query);
 
         // Single-call tools have no per-request passthrough token (Plan 04/06 carry
         // it through HttpCodeExecutor); pass None here.
@@ -624,7 +685,7 @@ impl HttpConnector for HttpClient {
         let method = Self::convert_method(&operation.method)?;
         let mut request = self.client.request(method, url);
         request = request.headers(headers);
-        if let Some(body) = Self::build_body(operation, args_map) {
+        if let Some(body) = request_body {
             request = request.json(&body);
         }
 
@@ -645,6 +706,55 @@ impl HttpConnector for HttpClient {
         serde_json::from_str(&body).map_err(|_| {
             HttpConnectorError::Backend("response body was not valid JSON".to_string())
         })
+    }
+
+    /// A clone of this client carrying `policy`.
+    ///
+    /// Backs the [`HttpConnector::governed`] override — the route a policy takes
+    /// to a connector that has ALREADY been erased to `Arc<dyn HttpConnector>` by
+    /// the time the hooks value is in scope, which is exactly the situation
+    /// `pmcp-openapi-server`'s `build_server` is in.
+    fn cloned_with_policy(&self, policy: Arc<dyn crate::policy::RequestPolicy>) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            auth: Arc::clone(&self.auth),
+            http_config: self.http_config.clone(),
+            policy: Some(policy),
+        }
+    }
+}
+
+#[async_trait]
+impl HttpConnector for HttpClient {
+    async fn execute(
+        &self,
+        operation: &Operation,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpConnectorError> {
+        // No tool to name: a caller driving the connector directly rather than
+        // through a synthesized handler.
+        self.execute_inner("", operation, args).await
+    }
+
+    async fn execute_for_tool(
+        &self,
+        tool: &str,
+        operation: &Operation,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpConnectorError> {
+        self.execute_inner(tool, operation, args).await
+    }
+
+    fn has_request_policy(&self) -> bool {
+        self.policy.is_some()
+    }
+
+    fn governed(
+        &self,
+        policy: Arc<dyn crate::policy::RequestPolicy>,
+    ) -> Option<Arc<dyn HttpConnector>> {
+        Some(Arc::new(self.cloned_with_policy(policy)))
     }
 
     fn base_url(&self) -> &str {
@@ -1455,7 +1565,7 @@ mod request_policy_seam {
 
         assert_eq!(
             err.to_string(),
-            "http backend error: refused by test policy",
+            "outbound request refused by policy: refused by test policy",
             "the refusal must carry the policy's own message"
         );
         assert_eq!(

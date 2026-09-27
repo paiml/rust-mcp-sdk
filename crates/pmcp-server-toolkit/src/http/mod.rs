@@ -126,6 +126,23 @@ pub enum HttpConnectorError {
     /// (e.g. an unparseable base URL, an unknown HTTP method).
     #[error("http backend error: {0}")]
     Backend(String),
+
+    /// A registered E1 [`crate::policy::RequestPolicy`] refused the outbound
+    /// request (Phase 128). Nothing was authenticated and nothing was sent.
+    ///
+    /// Its OWN variant rather than folding into [`Self::Backend`], because a
+    /// refusal by a security control and a broken backend are different facts and
+    /// an operator tracing a rule that started refusing calls needs to tell them
+    /// apart.
+    ///
+    /// # Security
+    ///
+    /// The inner `String` is the POLICY's own message, authored outside this
+    /// crate — so unlike every other variant here, the toolkit cannot guarantee it
+    /// is value-free. That residual is documented on
+    /// [`crate::policy::PolicyRefusal`], which is where an implementor reads it.
+    #[error("outbound request refused by policy: {0}")]
+    PolicyRefused(String),
 }
 
 /// Backend-agnostic HTTP connector trait (OAPI-01).
