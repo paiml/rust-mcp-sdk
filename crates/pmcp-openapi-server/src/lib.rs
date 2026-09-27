@@ -164,7 +164,7 @@ pub fn load_config_and_spec(
 /// let connector: Arc<dyn HttpConnector> =
 ///     Arc::new(HttpClient::new(client.clone(), "https://api.example.com".into(), auth.clone())?);
 /// let http_exec = HttpCodeExecutor::new(client, "https://api.example.com".into(), auth);
-/// let server = build_server(&cfg, connector, http_exec, None)?;
+/// let server = build_server(&cfg, connector, http_exec, None, &Default::default())?;
 /// let (bound, handle) = serve(server, "127.0.0.1:0".parse()?).await?;
 /// println!("listening on http://{bound}");
 /// handle.abort();
@@ -215,7 +215,17 @@ pub async fn serve(
 pub async fn run_serving(args: &Args) -> Result<(SocketAddr, JoinHandle<()>), RunError> {
     let (cfg, spec) = load_config_and_spec(args)?;
     let (connector, http_exec) = dispatch(&cfg).await?;
-    let server = build_server(&cfg, connector, http_exec, spec)?;
+    // Phase 128: the pure-config binary path registers no Rust-side hook — there is
+    // no Rust in a Shape A deployment to register one — so it passes the empty
+    // default. A Rust embedder calls `build_server` directly with its own
+    // `ToolkitHooks`, which is the wiring E1/E2 are reachable through.
+    let server = build_server(
+        &cfg,
+        connector,
+        http_exec,
+        spec,
+        &pmcp_server_toolkit::ToolkitHooks::default(),
+    )?;
 
     let addr: SocketAddr = args.http.parse().map_err(|source| RunError::Addr {
         addr: args.http.clone(),

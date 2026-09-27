@@ -221,11 +221,11 @@ impl std::error::Error for PolicyRefusal {}
 /// # Example
 ///
 /// ```
-/// use pmcp_server_toolkit::{OutboundRequest, PolicyRefusal, RequestPolicy};
+/// use pmcp_server_toolkit::{async_trait, OutboundRequest, PolicyRefusal, RequestPolicy};
 ///
 /// struct AllowlistPrefix(&'static str);
 ///
-/// #[async_trait::async_trait]
+/// #[async_trait]
 /// impl RequestPolicy for AllowlistPrefix {
 ///     async fn check(&self, req: &OutboundRequest<'_>) -> Result<(), PolicyRefusal> {
 ///         if req.path.starts_with(self.0) {

@@ -11,6 +11,7 @@
 
 use pmcp_openapi_server::{build_server, dispatch};
 use pmcp_server_toolkit::ServerConfig;
+use pmcp_server_toolkit::ToolkitHooks;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +31,15 @@ base_url = "https://api.example.com"
     let (connector, http_exec) = dispatch(&cfg).await?;
 
     // build_server assembles the pmcp::Server (no --spec → curated-only, D-03).
-    let _server = build_server(&cfg, connector, http_exec, None)?;
+    let _server = build_server(
+        &cfg,
+        connector,
+        http_exec,
+        None,
+        // Phase 128: this example registers no E1/E2 hook, so it passes the empty
+        // default — the shape every pre-Phase-128 caller now has.
+        &ToolkitHooks::default(),
+    )?;
 
     // In production: `serve(_server, addr).await?` then await the handle. This
     // example returns WITHOUT serving so it never blocks (build-only safe).

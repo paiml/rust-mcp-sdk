@@ -37,7 +37,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{AnnotationsDecl, ParamDecl, ServerConfig, ToolDecl, ValidationSection};
 use crate::error::Result;
-use crate::policy::ToolkitHooks;
+use crate::policy::{ArgumentValidator, ToolkitHooks};
 use crate::sql::SqlConnector;
 
 #[cfg(feature = "http")]
@@ -234,8 +234,8 @@ fn enforce_input_schema(
     {
         // Phase 128 E2 — the registry lookup that replaced plan 03's
         // `let has_registered_validator = false;` placeholder.
-        let has_registered_validator = hooks.validator_for(&decl.name).is_some();
-        if !validation.enforce_input_schema && !has_registered_validator {
+        let registered_validator = hooks.validator_for(&decl.name);
+        if !validation.enforce_input_schema && registered_validator.is_none() {
             tracing::warn!(
                 tool = %decl.name,
                 "[server.validation] enforce_input_schema = false: this tool's arguments are \
@@ -243,7 +243,13 @@ fn enforce_input_schema(
             );
             return handler;
         }
-        ValidatingToolHandler::wrap(handler, info, decl, validation.enforce_input_schema)
+        ValidatingToolHandler::wrap(
+            handler,
+            info,
+            decl,
+            validation.enforce_input_schema,
+            registered_validator,
+        )
     }
     #[cfg(not(feature = "input-validation"))]
     {
@@ -281,6 +287,12 @@ struct ValidatingToolHandler {
     /// turns schema enforcement off must not silently lose an
     /// explicitly-registered validator too.
     enforce_schema: bool,
+    /// The E2 [`ArgumentValidator`] registered for this tool, if any (Phase 128).
+    ///
+    /// Looked up by tool NAME once at synthesis, so the `tools/call` path does no
+    /// map lookup. `None` is the overwhelmingly common case and costs one
+    /// `Option` discriminant test per call.
+    validator: Option<Arc<dyn ArgumentValidator>>,
 }
 
 #[cfg(feature = "input-validation")]
@@ -292,6 +304,7 @@ impl ValidatingToolHandler {
         info: &ToolInfo,
         decl: &ToolDecl,
         enforce_schema: bool,
+        validator: Option<Arc<dyn ArgumentValidator>>,
     ) -> Arc<dyn ToolHandler> {
         let input_schema = info.input_schema.clone();
         let schema_key = input_schema.to_string();
@@ -301,6 +314,7 @@ impl ValidatingToolHandler {
             schema_key,
             declared: decl.parameters.iter().map(|p| p.name.clone()).collect(),
             enforce_schema,
+            validator,
         })
     }
 
@@ -312,6 +326,16 @@ impl ValidatingToolHandler {
     /// `false` — skipping the CHECK, not the decorator, so anything else this
     /// decorator does still happens.
     fn check(&self, args: &Value) -> pmcp::Result<()> {
+        self.check_schema(args)?;
+        self.check_registered_validator(args)
+    }
+
+    /// The D1 declared-schema check.
+    ///
+    /// Returns `Ok(())` without consulting the schema when `enforce_schema` is
+    /// `false` — skipping the CHECK, not the decorator, so the E2 validator below
+    /// still runs.
+    fn check_schema(&self, args: &Value) -> pmcp::Result<()> {
         use pmcp::server::schema_validation::{render_refusal, validate_input};
 
         if !self.enforce_schema {
@@ -323,6 +347,26 @@ impl ValidatingToolHandler {
                 pmcp::Error::Validation(render_refusal(&violations, &declared))
             },
         )
+    }
+
+    /// The E2 registered-validator check (Phase 128).
+    ///
+    /// Called by [`Self::check`] STRICTLY AFTER [`Self::check_schema`] returns
+    /// `Ok`, which is the E2 ordering contract: a custom rule never sees arguments
+    /// the declared schema already refused (T-128-41). Inverting the two calls is
+    /// what `a_registered_validator_is_not_invoked_when_the_schema_refuses` fails
+    /// on.
+    ///
+    /// The refusal message is the VALIDATOR's own, authored outside this crate, so
+    /// unlike `render_refusal` above the toolkit cannot guarantee it is value-free.
+    /// That residual is documented on [`crate::policy::ArgumentRefusal`].
+    fn check_registered_validator(&self, args: &Value) -> pmcp::Result<()> {
+        let Some(validator) = self.validator.as_ref() else {
+            return Ok(());
+        };
+        validator
+            .validate(args)
+            .map_err(|refusal| pmcp::Error::Validation(refusal.message().to_string()))
     }
 }
 
@@ -1796,7 +1840,7 @@ mod tests {
 
         // (a) enforcement ON: the SCHEMA refuses before the inner handler runs, so
         //     the message is the schema refusal, not the inner one.
-        let on = ValidatingToolHandler::wrap(Arc::new(RefusingInner), &info, &decl, true);
+        let on = ValidatingToolHandler::wrap(Arc::new(RefusingInner), &info, &decl, true, None);
         let err = on
             .handle(undeclared.clone(), RequestHandlerExtra::default())
             .await
@@ -1809,7 +1853,7 @@ mod tests {
         // (b) enforcement OFF: the schema check is skipped (the undeclared argument
         //     is accepted by it), and the inner rule STILL refuses. That is the
         //     separation — A off must not silently turn B off.
-        let off = ValidatingToolHandler::wrap(Arc::new(RefusingInner), &info, &decl, false);
+        let off = ValidatingToolHandler::wrap(Arc::new(RefusingInner), &info, &decl, false, None);
         let err = off
             .handle(undeclared, RequestHandlerExtra::default())
             .await

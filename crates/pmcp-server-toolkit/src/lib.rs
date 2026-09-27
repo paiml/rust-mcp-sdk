@@ -146,6 +146,13 @@ pub use crate::tools::synthesize_from_config_with_http_connector;
 #[cfg(feature = "openapi-code-mode")]
 pub use crate::tools::synthesize_from_config_with_http_connector_and_scripts;
 
+// Phase 128 E2 — the hooks-carrying variant `pmcp-openapi-server`'s `build_server`
+// calls. Re-exported at the crate root alongside the variant above, because that
+// binary is a DIFFERENT crate and this is its only route to registering an
+// `ArgumentValidator` (T-128-39b).
+#[cfg(feature = "openapi-code-mode")]
+pub use crate::tools::synthesize_from_config_with_http_connector_and_scripts_and_hooks;
+
 // Builder extensions (TKIT-08) — Plan 08 headline re-export per D-15 + review R3.
 // The trait method set is the Shape C ≤15-line `main.rs` surface; lifting it
 // to the crate root is the binding witness of D-15 (the runnable example
@@ -170,6 +177,13 @@ pub use crate::sql::{ConnectorError, Dialect, SqlConnector};
 // always-present `ServerBuilderExt::try_tools_from_config_with`; gating it on
 // `http` would make the registration surface exist only in HTTP builds while the
 // E2 half has nothing to do with HTTP.
+/// The `#[async_trait]` attribute, re-exported so an out-of-crate implementor of
+/// [`RequestPolicy`] (or [`http::auth::HttpAuthProvider`]) does not have to add an
+/// `async-trait` dependency of its own — and, more importantly, cannot end up on a
+/// DIFFERENT version of it than the trait was declared with, which produces a
+/// signature-mismatch error that reads as a lifetime bug.
+pub use async_trait::async_trait;
+
 pub use crate::policy::{
     emit_validation_report, render_validation_report, ArgumentRefusal, ArgumentValidator,
     ArgumentValidators, OutboundRequest, PolicyRefusal, ReportLevel, ReportLine, RequestPolicy,

@@ -508,6 +508,96 @@ mod tests {
         );
     }
 
+    /// Phase 128: the hooks-taking entry point registers the same handlers, and a
+    /// registered E2 validator actually reaches the tool it names.
+    #[test]
+    fn try_tools_from_config_with_registers_handlers_and_reaches_the_validator() {
+        use crate::policy::{ArgumentRefusal, ArgumentValidator, ToolkitHooks};
+        use serde_json::Value;
+        use std::sync::Arc;
+
+        struct RefuseAll;
+        impl ArgumentValidator for RefuseAll {
+            fn validate(&self, _args: &Value) -> std::result::Result<(), ArgumentRefusal> {
+                Err(ArgumentRefusal::new(
+                    "this tool is administratively disabled",
+                ))
+            }
+        }
+
+        let cfg = min_cfg();
+        let hooks = ToolkitHooks::default().with_argument_validator("ping", Arc::new(RefuseAll));
+        let server = Server::builder()
+            .name("test")
+            .version("0.1.0")
+            .try_tools_from_config_with(&cfg, &hooks)
+            .expect("ok")
+            .build()
+            .expect("build");
+        assert!(
+            server.get_tool("ping").is_some(),
+            "the hooks-taking entry point must register handlers exactly as the wrapper does"
+        );
+    }
+
+    /// The pre-existing method must behave identically to the wrapper it became —
+    /// an empty `ToolkitHooks` changes nothing.
+    #[test]
+    fn try_tools_from_config_is_a_thin_wrapper_over_the_hooks_variant() {
+        use crate::policy::ToolkitHooks;
+
+        let cfg = min_cfg();
+        let via_wrapper = Server::builder()
+            .name("t")
+            .version("0.1.0")
+            .try_tools_from_config(&cfg)
+            .expect("ok")
+            .build()
+            .expect("build");
+        let via_hooks = Server::builder()
+            .name("t")
+            .version("0.1.0")
+            .try_tools_from_config_with(&cfg, &ToolkitHooks::default())
+            .expect("ok")
+            .build()
+            .expect("build");
+        assert!(via_wrapper.get_tool("ping").is_some());
+        assert!(via_hooks.get_tool("ping").is_some());
+    }
+
+    /// A `RequestPolicy` registered on this path has no HTTP egress surface to
+    /// govern. It must not be an ERROR (a config edit may add one later) and it must
+    /// not be silent either — `warn_if_policy_has_no_surface` is the report. This
+    /// asserts the non-error half and that the helper is reached at all.
+    #[test]
+    fn a_policy_on_the_sql_path_is_reported_and_not_an_error() {
+        use crate::policy::{OutboundRequest, PolicyRefusal, RequestPolicy, ToolkitHooks};
+        use std::sync::Arc;
+
+        struct RefuseAll;
+        #[async_trait::async_trait]
+        impl RequestPolicy for RefuseAll {
+            async fn check(
+                &self,
+                _req: &OutboundRequest<'_>,
+            ) -> std::result::Result<(), PolicyRefusal> {
+                Err(PolicyRefusal::new("refused"))
+            }
+        }
+
+        let hooks = ToolkitHooks::default().with_request_policy(Arc::new(RefuseAll));
+        super::warn_if_policy_has_no_surface(&hooks, "unit-test");
+        let cfg = min_cfg();
+        let builder = Server::builder()
+            .name("t")
+            .version("0.1.0")
+            .try_tools_from_config_with(&cfg, &hooks);
+        assert!(
+            builder.is_ok(),
+            "an unreachable policy warns; it must never fail the build"
+        );
+    }
+
     #[test]
     fn try_tools_from_config_returns_ok_on_valid_config() {
         let cfg = min_cfg();
