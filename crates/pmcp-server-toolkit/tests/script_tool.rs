@@ -7,6 +7,9 @@
 //! - (b) the london-tube multi-call chain (`filter` → per-line `api.get`) returns
 //!   the chained result,
 //! - (c) `args.maxLines` from `[[tools.parameters]]` is bound into the script,
+//! - (c2) a declared-schema VIOLATION is refused before the script runs, with the
+//!   backend observing zero requests (Phase 128 SC-6 — the T-90-05-03 claim's
+//!   failing-on-removal row; (c) asserts binding, which is a different property),
 //! - (d) an `ExecutionConfig` `max_api_calls` cap aborts an over-budget script
 //!   (the T-90-05-02 DoS bound) — no infinite loop.
 //!
@@ -226,6 +229,113 @@ async fn script_tool_args_max_lines_binding_is_honored() {
         "the client's args.maxLines must be bound into the script's `args`"
     );
     assert_eq!(out["lineCount"], json!(1));
+}
+
+/// (c2) The T-90-05-03 VALIDATION row (Phase 128 SC-6).
+///
+/// `crates/pmcp-server-toolkit/src/tools.rs`'s `ScriptToolHandler::tool_info` claims
+/// that `args` are checked against the synthesized `inputSchema` BEFORE the script
+/// runs. Until this row, the only test carrying that threat ID was (c) above, whose
+/// own doc describes argument BINDING — the caller's value being observable inside
+/// the script. Binding and validation are different properties, and (c) passes
+/// whether or not any validation happens, so the claim had no row that failed when
+/// its enforcement was removed.
+///
+/// This row supplies an argument that VIOLATES the declared schema (`maxLines` is
+/// declared `integer`; the call sends a string) and asserts three things in one
+/// arrangement:
+///
+/// 1. the call is refused — `handle` returns `Err`;
+/// 2. the script never ran, proven by the backend observing ZERO requests. The
+///    script's first statement is an `api.get`, so "the script ran" and "the mock
+///    saw a request" are the same event;
+/// 3. the PASSING CONTROL on the SAME handler and the SAME mock: a compliant call
+///    is accepted and produces exactly one upstream request. Without (3) the row
+///    would also pass against a decorator that refuses everything, which is a
+///    different defect that reads identically from the refusal alone.
+///
+/// Fails when the `ValidatingToolHandler` decorator, or its `validate_input` call,
+/// is removed from push site 2 of 3: the violating call then reaches the script,
+/// `received_requests()` returns 1, and assertion (1) fails.
+#[tokio::test]
+async fn script_tool_refuses_a_schema_violating_arg_before_the_script_runs() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Line/Mode/tube/Status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": "victoria", "name": "Victoria" }
+        ])))
+        .mount(&server)
+        .await;
+
+    let cfg = cfg_with_tools(vec![ToolDecl {
+        name: "echo_max".to_string(),
+        description: Some("Echo the bound args.maxLines alongside a backend call".to_string()),
+        script: Some(
+            "const lines = await api.get('/Line/Mode/tube/Status');\n\
+             return { received: args.maxLines, lineCount: lines.length };"
+                .to_string(),
+        ),
+        parameters: vec![ParamDecl {
+            name: "maxLines".to_string(),
+            param_type: Some("integer".to_string()),
+            required: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }]);
+    let (connector, http_exec) = backend(&server.uri());
+    let handler = one_script_handler(&cfg, connector, http_exec, ExecutionConfig::default());
+
+    // (1) A declared-schema violation is refused.
+    let err = handler
+        .handle(
+            json!({ "maxLines": "seven" }),
+            RequestHandlerExtra::default(),
+        )
+        .await
+        .expect_err("a string for an `integer` parameter must be refused before the script runs");
+
+    // (2) The script never executed, so the backend saw nothing.
+    let seen = server
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    assert!(
+        seen.is_empty(),
+        "the refusal must happen BEFORE the script's api.get; the backend observed {} request(s)",
+        seen.len()
+    );
+
+    // The refusal names the DECLARED parameter and its DECLARED type, and carries
+    // no byte of the rejected value (SC-7). Asserted here as well as in core's own
+    // unit tests because this is the surface an MCP client actually sees.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("maxLines"),
+        "the refusal must name the declared parameter, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("seven"),
+        "the refusal must not echo the rejected value, got: {rendered}"
+    );
+
+    // (3) The passing control, on the SAME handler: a compliant call is accepted
+    //     and reaches the backend exactly once.
+    let out = handler
+        .handle(json!({ "maxLines": 7 }), RequestHandlerExtra::default())
+        .await
+        .expect("a compliant call must be accepted");
+    assert_eq!(out["received"], json!(7));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .len(),
+        1,
+        "exactly one upstream request, from the compliant call only"
+    );
 }
 
 /// (d) A `max_api_calls` cap aborts an over-budget script with a bounded error

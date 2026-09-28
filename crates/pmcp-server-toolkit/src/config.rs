@@ -1018,6 +1018,14 @@ pub struct ServerSection {
 pub struct ValidationSection {
     /// Whether a declared `inputSchema` is CHECKED at `tools/call` time.
     ///
+    /// The checker is `pmcp::server::schema_validation::validate_input`, called
+    /// from the `ValidatingToolHandler` decorator in [`crate::tools`] — in THIS
+    /// crate, before the backend call. Not core `pmcp`'s `tools/call` dispatch,
+    /// which does not validate request arguments against a declared `inputSchema`
+    /// (Phase 128 D-01 defers that wiring). Naming the enforcer is this phase's
+    /// SC-6 convention; the sweep that produced it found the unqualified form of
+    /// this sentence three times in `tools.rs` alone.
+    ///
     /// Default `true`. Setting it `false` skips the schema check only — it does
     /// NOT disable an explicitly-registered argument validator. Turning off one
     /// enforcement must never silently turn off another, so the two live on

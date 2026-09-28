@@ -10,11 +10,36 @@
 //!
 //! # Invariants enforced
 //!
-//! - **JSON Schema object envelope.** Every synthesized [`ToolInfo`] carries an
-//!   `input_schema` with `"type": "object"`, an explicit `properties` map, a
-//!   `required` array, and `"additionalProperties": false`. Unknown argument
-//!   keys are rejected by pmcp's request-validation path at `tools/call` time —
-//!   defence-in-depth against arg-injection (threat T-83-05-02).
+//! - **JSON Schema object envelope, CHECKED HERE.** Every synthesized
+//!   [`ToolInfo`] carries an `input_schema` with `"type": "object"`, an explicit
+//!   `properties` map, a `required` array, and `"additionalProperties": false`
+//!   (`true` only when `[server.validation] additional_properties` opts out).
+//!   Unknown argument keys are refused by
+//!   `pmcp::server::schema_validation::validate_input`, called from the
+//!   `ValidatingToolHandler` decorator that `enforce_input_schema` wraps
+//!   around every handler this module pushes — **in the toolkit, before the
+//!   backend call**. Threat T-83-05-02.
+//!
+//!   Both halves matter, and stating only the first is what made this comment a
+//!   defect for two phases. Core `pmcp`'s `tools/call` dispatch does **not**
+//!   validate request arguments against a tool's declared `inputSchema`; that
+//!   wiring is deliberately deferred (Phase 128 D-01), so a comment locating the
+//!   enforcement "upstream" described a mitigation that did not exist. It exists
+//!   now, and it exists *here*.
+//!
+//!   Condition: the `input-validation` feature must be on (it is, by default,
+//!   via the `http`/`openapi-code-mode` umbrellas — but a
+//!   `--no-default-features` build can turn it off, and then
+//!   `enforce_input_schema` is the identity function and says so in a
+//!   `tracing::warn!`), and `[server.validation] enforce_input_schema` must not
+//!   be `false`.
+//!
+//!   Backed by `tests/input_validation_acceptance.rs`'s
+//!   `input_validation_refuses_undeclared_argument_without_contacting_upstream`
+//!   (row 10) and `input_validation_refuses_absent_arguments_when_required_declared`
+//!   (row 9), each of which fails if the `validate_input` call is removed, plus
+//!   `input_validation_accepts_compliant_call_with_one_upstream_request` (row 11)
+//!   as the passing control that catches an over-refusing decorator.
 //! - **`handler.metadata()` returns `Some(ToolInfo)`.** Phase 82's `tool_arc`
 //!   consumes `handler.metadata()` at registration; returning `None` would
 //!   silently degrade the schema enforcement to "anything goes" (RESEARCH
@@ -208,7 +233,7 @@ fn synthesize_inner(
 /// # `[server.validation] enforce_input_schema = false`
 ///
 /// That flag is an operator opt-out from the SCHEMA CHECK, not from the decorator.
-/// [`ValidatingToolHandler`] carries an `enforce_schema: bool` and skips only the
+/// `ValidatingToolHandler` carries an `enforce_schema: bool` and skips only the
 /// `validate_input` call, so a future explicitly-registered argument validator
 /// living in the same decorator keeps running. Turning off one enforcement must
 /// never silently turn off another — and losing an explicit custom validator
@@ -216,12 +241,24 @@ fn synthesize_inner(
 /// the operator turned off A and lost B without being told.
 ///
 /// The decorator is constructed when schema enforcement is ON **or** a validator is
-/// registered for this tool. No validator registry exists yet (it lands with E2),
-/// so `has_registered_validator` is `false` today and the decorator is skipped
-/// entirely when `enforce_input_schema = false` — which preserves the "no added
-/// allocation for a server that uses neither" property. When the registry arrives,
-/// only that one input changes; the separation it depends on is already in place
-/// and pinned by a test.
+/// registered for this tool. The registry is [`ToolkitHooks`], consulted below via
+/// [`ToolkitHooks::argument_validator_for`], so the decorator is skipped entirely
+/// only when `enforce_input_schema = false` AND no validator is registered for this
+/// tool name — which preserves the "no added allocation for a server that uses
+/// neither" property.
+///
+/// Until Phase 128 plan 09 this paragraph read "No validator registry exists yet
+/// (it lands with E2), so `has_registered_validator` is `false` today". That
+/// sentence outlived the registry by one plan and is kept named here rather than
+/// silently deleted: it is the documented-but-absent defect this phase exists to
+/// close, INVERTED — a comment in the very function that closes the gap still
+/// describing the machinery as absent. The binding it named no longer exists.
+///
+/// Backed by `tools::argument_validator_seam::a_registered_validator_still_runs_with_enforce_input_schema_false`,
+/// which fails if the `registered_validator.is_none()` conjunct is dropped from the
+/// early return, and by
+/// `tools::argument_validator_seam::a_registered_validator_refuses_a_combination_the_schema_permits`,
+/// which fails if the lookup is removed.
 #[allow(unused_variables)]
 fn enforce_input_schema(
     handler: Arc<dyn ToolHandler>,
@@ -628,9 +665,37 @@ struct SynthesizedToolHandler {
 }
 
 /// Extract the named `(name, value)` parameter pairs the connector binds from,
-/// filtering the caller's validated `args` against the declared parameter list
-/// (T-84-03-01: only declared parameter names reach `execute()`; extra keys are
-/// silently dropped — JSON-schema validation rejects them upstream).
+/// filtering the caller's `args` against the declared parameter list
+/// (T-84-03-01: only declared parameter names reach `execute()`; an extra key is
+/// dropped HERE, and separately refused one layer out).
+///
+/// The refusal is not "upstream". It is
+/// `pmcp::server::schema_validation::validate_input` inside the
+/// `ValidatingToolHandler` decorator that [`enforce_input_schema`] wraps around
+/// this handler at its push site, so an undeclared key normally never reaches this
+/// function at all. Conditional on the `input-validation` feature AND on
+/// `[server.validation]` leaving both `enforce_input_schema` (`true`) and
+/// `additional_properties` (`false`) at their defaults — with `additional_properties
+/// = true` an undeclared key is ADMITTED by the schema and this filter is the only
+/// thing that keeps it out of `execute()`. That is why the drop stays here rather
+/// than being replaced by an assertion: the two layers close the case under
+/// different configurations. Backed by
+/// `tests/input_validation_acceptance.rs::input_validation_refuses_undeclared_argument_without_contacting_upstream`
+/// for the schema layer; the filter layer is covered by this module's
+/// `extract_params` unit tests.
+///
+/// Found by this phase's SC-6 candidate-phrase sweep, not by the plan's named
+/// list: the phrasing "rejects them upstream" is the same defect class as
+/// the retired `HttpToolHandler::handle` claim one function-group away, which
+/// located the same envelope check "upstream" in the same way.
+///
+/// The retired phrasings are deliberately NOT quoted verbatim anywhere in `src/`.
+/// This phase's SC-6 gates grep for each retired phrase and require a count of
+/// zero, and a gate that a historical citation can satisfy is a gate that has
+/// stopped distinguishing a surviving claim from a note about one — the first
+/// draft of THIS comment quoted one of them and turned the gate red on itself,
+/// which is the cheapest possible demonstration that the gate is sensitive. The
+/// full before/after text lives in `128-10-SUMMARY.md`.
 ///
 /// When the caller omits an optional parameter that declares a `default`, the
 /// default is applied so the bound SQL sees a concrete value. Without this an
@@ -992,9 +1057,39 @@ struct HttpToolHandler {
 #[async_trait]
 impl ToolHandler for HttpToolHandler {
     async fn handle(&self, args: Value, _extra: RequestHandlerExtra) -> pmcp::Result<Value> {
-        // T-90-03-01: arg injection is bounded by the object-envelope schema
-        // (additionalProperties:false) enforced upstream; path substitution in the
-        // connector touches only declared `{params}`.
+        // T-90-03-01: arg injection is bounded by TWO checks, both of which run
+        // before this handler's connector call and both of which live in this
+        // repository rather than "upstream":
+        //
+        // (1) the object-envelope schema (additionalProperties:false) is checked by
+        //     `pmcp::server::schema_validation::validate_input`, called from the
+        //     `ValidatingToolHandler` decorator that `enforce_input_schema` wraps
+        //     around this handler at its push site — so a call carrying an
+        //     undeclared key never reaches `handle` at all. Conditional on the
+        //     `input-validation` feature and on `[server.validation]
+        //     enforce_input_schema` not being `false`. Backed by
+        //     `tests/input_validation_acceptance.rs::input_validation_refuses_undeclared_argument_without_contacting_upstream`,
+        //     which fails if the decorator or its `validate_input` call is removed.
+        //
+        // (2) path substitution touches only declared `{params}`, and EVERY
+        //     substituted value additionally faces
+        //     `pmcp::server::schema_validation::validate_path_placeholder` inside
+        //     `HttpClient::substitute_path`, with the composed result facing
+        //     `validate_resolved_path` through `check_composed_path` before
+        //     dispatch. Backed by
+        //     `tests/curated_path_injection.rs::curated_path_injection_refuses_traversal_via_a_placeholder_value`
+        //     and `..._refuses_a_query_via_a_placeholder_value`, with
+        //     `..._accepts_a_compliant_call_with_one_upstream_request` as the
+        //     passing control.
+        //
+        // Until Phase 128 this comment located the envelope check somewhere
+        // "upstream" of here (the retired phrasing is quoted in full in
+        // `128-10-SUMMARY.md` and deliberately nowhere in `src/`, so the SC-6 grep
+        // gate keeps distinguishing a surviving claim from a note about one).
+        // Core `pmcp`'s `tools/call` dispatch does not validate request arguments
+        // against a declared `inputSchema` — that wiring is deliberately deferred
+        // (D-01) — so the claim named a mitigation that did not exist. Restated
+        // rather than deleted, because as of this phase it is true and local.
         // The connector's Display is redaction-safe (T-90-01-01); no URL/credential
         // reaches the client error.
         //
@@ -1055,8 +1150,27 @@ struct ScriptToolHandler {
     /// The execution bounds (Pitfall 7 — the only limit on an admin script).
     exec_config: ExecutionConfig,
     /// The synthesized `ToolInfo` (object-envelope schema from
-    /// `[[tools.parameters]]`, `additionalProperties:false`) — `args` are
-    /// schema-validated against this BEFORE the script runs (T-90-05-03).
+    /// `[[tools.parameters]]`, `additionalProperties:false`).
+    ///
+    /// `args` are checked against THIS schema before the script runs (T-90-05-03),
+    /// by `pmcp::server::schema_validation::validate_input` inside the
+    /// `ValidatingToolHandler` decorator that [`enforce_input_schema`] wraps
+    /// around this handler at its push site — so a refusal happens before
+    /// [`ToolHandler::handle`] is entered and therefore before
+    /// `PlanExecutor::execute` makes any backend call.
+    ///
+    /// Conditional on the `input-validation` feature and on `[server.validation]
+    /// enforce_input_schema` not being `false`; with either off,
+    /// [`enforce_input_schema`] logs the opt-out and returns the handler undecorated.
+    ///
+    /// Backed by
+    /// `tests/script_tool.rs::script_tool_refuses_a_schema_violating_arg_before_the_script_runs`,
+    /// which asserts the refusal AND that the mock backend observed zero requests —
+    /// it fails if the decorator or its `validate_input` call is removed. The
+    /// sibling `script_tool_args_max_lines_binding_is_honored` asserts argument
+    /// BINDING, which is a different (also true) property; before this phase it was
+    /// the only row carrying this threat ID, and a binding assertion is not a
+    /// validation assertion.
     tool_info: ToolInfo,
 }
 
@@ -1067,9 +1181,15 @@ impl ScriptToolHandler {
     ///
     /// The `tool_info` is built from `[[tools.parameters]]` via the SAME
     /// [`build_input_schema`] / [`build_annotations`] / [`apply_widget_meta`]
-    /// helpers the single-call path uses, so a script tool's `args` are
-    /// schema-validated identically (object envelope, `additionalProperties:false`
-    /// unless `[server.validation] additional_properties` opts out).
+    /// helpers the single-call path uses, so a script tool's `args` are checked
+    /// against an identically-shaped schema (object envelope,
+    /// `additionalProperties:false` unless `[server.validation]
+    /// additional_properties` opts out) by the same enforcer — one
+    /// [`enforce_input_schema`] call per push site, one
+    /// `pmcp::server::schema_validation::validate_input` inside
+    /// `ValidatingToolHandler`. There is no second validator for script tools;
+    /// see [`ScriptToolHandler::tool_info`] for the condition and the acceptance
+    /// row.
     ///
     /// `validation` is threaded in so a script tool's schema is built under the SAME
     /// `[server.validation]` policy as every other tool kind — a script tool whose
@@ -1138,8 +1258,15 @@ impl ToolHandler for ScriptToolHandler {
             crate::code_mode::request_executor_from_extra(&self.http_exec, &extra),
             self.exec_config.clone(),
         );
-        // (2) Bind the schema-validated client args to `args` (T-90-05-03) —
-        //     byte-identical to compile_and_execute's set_variable("args", …).
+        // (2) Bind the client args to `args` (T-90-05-03) — byte-identical to
+        //     compile_and_execute's set_variable("args", …). These args have
+        //     ALREADY been checked against `self.tool_info.input_schema` by
+        //     `pmcp::server::schema_validation::validate_input`, in the
+        //     `ValidatingToolHandler` decorator wrapped around this handler — a
+        //     violating call never reaches this line. That is a fact about the
+        //     DECORATOR, not about this function: `handle` performs no validation
+        //     of its own and must not be read as if it did. Condition and
+        //     acceptance row: see `ScriptToolHandler::tool_info`.
         executor.set_variable("args", args);
 
         let result = executor
