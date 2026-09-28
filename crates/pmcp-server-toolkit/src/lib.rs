@@ -26,6 +26,28 @@
 //! `.planning/phases/83-toolkit-core-lift-pmcp-server-toolkit/` design log for
 //! the architectural responsibility map and review notes.
 
+/// This toolkit build's own version, captured at compile time.
+///
+/// # Why this is public API (Phase 128, SC-3)
+///
+/// `ServerConfig::lint()` is the ONE implementation of the input-validation
+/// review rules, and both `cargo pmcp validate config` and a running server
+/// report from it. That makes the two surfaces agree for a **same-version**
+/// pair and says nothing about a mixed one: a config that lints clean under the
+/// toolkit a reviewer's CLI was BUILT against may lint dirty under the toolkit
+/// the deployed server RUNS. A clean lint is therefore a version-scoped
+/// statement, never an absolute guarantee about production.
+///
+/// So the lint surface prints which toolkit performed it, and this constant is
+/// what it prints. It is `env!("CARGO_PKG_VERSION")` rather than a string read
+/// from a manifest on disk, so it names the crate that is actually LINKED in and
+/// cannot drift from it.
+///
+/// Deliberately NOT a hard error on mismatch: the CLI has no way to know which
+/// toolkit the deployment will run, so refusing would be refusing on a guess.
+/// The operator gets the number and can compare it to what they deploy.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod auth;
 pub mod builder_ext;
 pub mod config;

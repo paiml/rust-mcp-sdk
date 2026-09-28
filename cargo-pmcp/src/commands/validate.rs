@@ -738,6 +738,33 @@ fn render_config_lint_findings(config: &pmcp_server_toolkit::config::ServerConfi
     config.lint().iter().map(ToString::to_string).collect()
 }
 
+/// The one line that says WHICH `pmcp-server-toolkit` performed the lint.
+///
+/// # Why a lint result is version-scoped, not absolute (Phase 128, SC-3)
+///
+/// `ServerConfig::lint()` is the single implementation both this CLI and a
+/// running server report from, which makes them agree for a **same-version**
+/// pair and says nothing about a mixed one: a config that lints clean under the
+/// toolkit this binary was BUILT against may lint dirty under the toolkit the
+/// deployed server RUNS. Without the number printed, a clean `✓` reads as a
+/// guarantee about production that nothing here can make — and this phase's own
+/// prohibition is that an enforcement which is off must never read as on.
+///
+/// It is NOT a hard error on mismatch, because this command cannot know which
+/// toolkit the deployment will run; refusing would be refusing on a guess. The
+/// operator gets the number and compares it to what they deploy.
+///
+/// The value comes from `pmcp_server_toolkit::VERSION`, i.e. the crate actually
+/// LINKED into this binary, so it cannot drift from the implementation that just
+/// ran.
+fn toolkit_lint_banner() -> String {
+    format!(
+        "linted by pmcp-server-toolkit {} — a clean result is scoped to THIS toolkit \
+         version, not to whichever toolkit the deployed server runs",
+        pmcp_server_toolkit::VERSION
+    )
+}
+
 /// Print lint findings to stderr, with the same `warning:` prefix
 /// [`crate::deployment::iam::emit_warnings`] uses for the IAM document.
 fn emit_config_lint_findings(findings: &[String]) {
@@ -766,6 +793,10 @@ pub fn validate_server_config(
     if not_quiet {
         println!("\n{}", style("PMCP Server Config Validation").cyan().bold());
         println!("{}", style("━".repeat(50)).dim());
+        // SC-3: printed UNCONDITIONALLY (not behind `--verbose`) and BEFORE the
+        // result, so the version scoping is visible to a reviewer who reads only
+        // the first lines. See `toolkit_lint_banner`.
+        println!("  {}", style(toolkit_lint_banner()).dim());
         if verbose {
             println!("  Config: {}", path.display());
         }
@@ -845,18 +876,25 @@ fn emit_discovered_server_config_lint(lint: &DiscoveredConfigLint, not_quiet: bo
     }
     match lint {
         DiscoveredConfigLint::Absent => {},
+        // SC-3: both branches that report a LINT RESULT carry the version banner,
+        // for the same reason `validate config` does — a `✓` here must not read as
+        // a guarantee about the toolkit the deployed server runs. `Absent` carries
+        // no banner because it reports no lint result at all, and `Unreadable`
+        // carries none because nothing was linted.
         DiscoveredConfigLint::Findings(findings) if findings.is_empty() => {
             println!(
-                "  {} {SERVER_CONFIG_FILE} valid — no input-validation findings",
-                style("✓").green()
+                "  {} {SERVER_CONFIG_FILE} valid — no input-validation findings ({})",
+                style("✓").green(),
+                style(toolkit_lint_banner()).dim()
             );
         },
         DiscoveredConfigLint::Findings(findings) => {
             println!(
-                "  {} input-validation findings from {SERVER_CONFIG_FILE} ({} finding{}):",
+                "  {} input-validation findings from {SERVER_CONFIG_FILE} ({} finding{}) ({}):",
                 style("→").cyan(),
                 findings.len(),
-                if findings.len() == 1 { "" } else { "s" }
+                if findings.len() == 1 { "" } else { "s" },
+                style(toolkit_lint_banner()).dim()
             );
             emit_config_lint_findings(findings);
         },
@@ -1044,6 +1082,48 @@ pattern = "([unclosed"
         assert!(
             msg.contains(&missing.display().to_string()),
             "error chain must name the path it looked for, got: {msg}"
+        );
+    }
+
+    /// SC-3: the banner names the toolkit crate that is actually linked in, and
+    /// says out loud that a clean result is version-scoped.
+    ///
+    /// Asserted against `pmcp_server_toolkit::VERSION` rather than a literal, so a
+    /// toolkit bump cannot make this test stale — and a POSITIVE CONTROL below
+    /// proves the constant is not the empty string, which would make the substring
+    /// assertion vacuously true.
+    #[test]
+    fn toolkit_lint_banner_names_the_linked_toolkit_version() {
+        let version = pmcp_server_toolkit::VERSION;
+        assert!(
+            !version.is_empty(),
+            "positive control: pmcp_server_toolkit::VERSION must be non-empty, or the \
+             substring assertion below proves nothing"
+        );
+        let banner = toolkit_lint_banner();
+        assert!(
+            banner.contains(version),
+            "the banner must name the LINKED toolkit version ({version}), got: {banner}"
+        );
+        assert!(
+            banner.contains("pmcp-server-toolkit"),
+            "the banner must name the crate, got: {banner}"
+        );
+    }
+
+    /// The banner must state the SCOPING, not merely print a number — a bare
+    /// version string would leave a reviewer to infer why it is there.
+    #[test]
+    fn toolkit_lint_banner_states_that_a_clean_result_is_version_scoped() {
+        let banner = toolkit_lint_banner();
+        let lowered = banner.to_lowercase();
+        assert!(
+            lowered.contains("scoped"),
+            "the banner must say the result is version-scoped, got: {banner}"
+        );
+        assert!(
+            lowered.contains("deployed server"),
+            "the banner must name the mixed-version case it exists for, got: {banner}"
         );
     }
 

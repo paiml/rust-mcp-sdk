@@ -232,6 +232,78 @@ fn zero_tools_config_reports_no_findings_on_stdout_and_exits_zero() {
 }
 
 // -----------------------------------------------------------------------------
+// SC-3 — the toolkit-version banner (the operator's chosen resolution of the
+// mixed-version case: print which toolkit linted, never hard-error on mismatch)
+// -----------------------------------------------------------------------------
+
+/// The banner is printed for a CLEAN config, which is the case that most needs it:
+/// a bare `✓` would otherwise read as a guarantee about the deployed server.
+///
+/// Asserted on the message SHAPE, not on a version literal, so a toolkit bump
+/// cannot make this test stale. `no input-validation findings` is co-asserted so a
+/// banner printed on the wrong code path cannot satisfy it.
+#[test]
+fn clean_config_still_prints_the_toolkit_version_banner() {
+    let dir = project(Some(SERVER_HEADER), false);
+    validate_config_at(&dir.path().join("config.toml"))
+        .assert()
+        .success()
+        .stdout(contains("no input-validation findings"))
+        .stdout(contains("linted by pmcp-server-toolkit"))
+        .stdout(contains(
+            "not to whichever toolkit the deployed server runs",
+        ));
+}
+
+/// And for a config WITH findings — the banner is unconditional, not a
+/// clean-result-only decoration.
+#[test]
+fn config_with_findings_prints_the_toolkit_version_banner() {
+    let dir = project(
+        Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
+        false,
+    );
+    validate_config_at(&dir.path().join("config.toml"))
+        .assert()
+        .success()
+        .stdout(contains("linted by pmcp-server-toolkit"))
+        .stderr(contains("uncapped-string"));
+}
+
+/// `validate deploy`'s discovered-config path carries it too, for the same reason.
+#[test]
+fn validate_deploy_lint_findings_carry_the_toolkit_version_banner() {
+    let dir = project(
+        Some(&format!("{SERVER_HEADER}{UNCAPPED_BODY_STRING}")),
+        true,
+    );
+    Command::cargo_bin("cargo-pmcp")
+        .expect("cargo-pmcp binary must be available")
+        .args(["validate", "deploy", "--server"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(contains("input-validation findings from config.toml"))
+        .stdout(contains("linted by pmcp-server-toolkit"));
+}
+
+/// The banner must NOT appear when nothing was linted — a pure-IAM project stays
+/// silent, which is the `DiscoveredConfigLint::Absent` contract. Without this
+/// negative, "print it everywhere" would satisfy the three positives above.
+#[test]
+fn validate_deploy_prints_no_banner_when_there_is_no_toolkit_config() {
+    let dir = project(None, true);
+    Command::cargo_bin("cargo-pmcp")
+        .expect("cargo-pmcp binary must be available")
+        .args(["validate", "deploy", "--server"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(contains("IAM configuration valid"))
+        .stdout(contains("linted by pmcp-server-toolkit").not());
+}
+
+// -----------------------------------------------------------------------------
 // The `[backend]` parse regression — what `http` on the toolkit edge buys
 // -----------------------------------------------------------------------------
 
