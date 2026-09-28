@@ -187,6 +187,49 @@ jobs:
     - name: Wait for crates.io to index pmcp-macros
       run: sleep 30
 
+    # --- Phase 128 FORK 1: `pmcp` publishes BEFORE the code-mode crates. ---
+    #
+    # This ORDER IS LOAD-BEARING and was REVERSED by Phase 128. Do not "restore"
+    # it, and note that CLAUDE.md item 2's pre-Phase-128 rationale for the old
+    # order was measured FALSE (it attributed the order to a `pmcp` feature that
+    # does not exist in root `[features]`; the real cause was a retained dev-dep).
+    #
+    # Why `pmcp` must go first now: `crates/pmcp-code-mode/Cargo.toml` requires a
+    # `pmcp` carrying the `schema-validation` feature (D-09 / Q2 — the ONE copy of
+    # the placeholder floor lives in core and pmcp-code-mode re-exports it). A
+    # code-mode publish running first would resolve the highest ALREADY-published
+    # `pmcp`, which has no such feature, and die at this step — and every step
+    # below tolerates only an "already exists" failure, so the job would exit
+    # having published NOTHING from the release.
+    #
+    # What made this order possible: root `Cargo.toml`'s `pmcp-code-mode` and
+    # `pmcp-code-mode-derive` dev-deps are now PATH-ONLY. A dev-dep carrying both
+    # `path` and `version` is RETAINED in the published manifest and must resolve
+    # on crates.io, which is what previously forced the code-mode crates to go
+    # first. Reordering WITHOUT that change moves the failure here instead of
+    # removing it.
+    #
+    # Guarded twice: `tests/root_dev_dep_path_only.rs` fails if a `version` key
+    # comes back, and `scripts/check-release-coverage.sh`'s PHASE-128 order region
+    # fails if this order is reverted. Both run inside `make quality-gate`.
+    - name: Publish pmcp (core SDK)
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: |
+        echo "Publishing pmcp..."
+        OUTPUT=$(cargo publish -p pmcp 2>&1) && echo "$OUTPUT" || {
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "already exists"; then
+            echo "pmcp already published, continuing..."
+          else
+            echo "::error::Failed to publish pmcp"
+            exit 1
+          fi
+        }
+
+    - name: Wait for crates.io to index pmcp
+      run: sleep 30
+
     - name: Publish pmcp-code-mode
       env:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -221,24 +264,6 @@ jobs:
         }
 
     - name: Wait for crates.io to index pmcp-code-mode-derive
-      run: sleep 30
-
-    - name: Publish pmcp (core SDK)
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      run: |
-        echo "Publishing pmcp..."
-        OUTPUT=$(cargo publish -p pmcp 2>&1) && echo "$OUTPUT" || {
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q "already exists"; then
-            echo "pmcp already published, continuing..."
-          else
-            echo "::error::Failed to publish pmcp"
-            exit 1
-          fi
-        }
-
-    - name: Wait for crates.io to index pmcp
       run: sleep 30
 
     # --- v2.2 config-driven server toolkit (first published in v2.9.0) ---

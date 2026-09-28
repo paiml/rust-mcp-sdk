@@ -313,4 +313,67 @@ for consumer in pmcp-cfn-renderer pmcp-agent pmcp-team-servers cargo-pmcp; do
 done
 : 'END D-10 ORDER ASSERTION'
 
+: 'BEGIN PHASE-128 ORDER ASSERTION'
+# ^ A shell no-op sentinel, NOT a comment, for the same reason the D-10 region's
+# sentinel is: the no-allowlist check strips comments first, so a commented
+# sentinel would vanish before an excision could use it.
+#
+# THIS IS A SECOND DELIBERATELY-NAMED CLUSTER, not a widening of the scan. The
+# D-10 region above says "do NOT fix these five names into a scan" and that a
+# general topological model of all publishable crates is explicitly deferred;
+# that instruction still stands. This region names exactly TWO more crates, for
+# one edge, because Phase 128 REVERSED that edge and an unguarded reversal is a
+# release-day discovery rather than a build failure.
+#
+# Why the edge is load-bearing rather than cosmetic: `crates/pmcp-code-mode`
+# requires a `pmcp` carrying the `schema-validation` feature (Phase 128 D-09 /
+# Q2 — the one copy of the path-placeholder floor lives in core and
+# pmcp-code-mode re-exports it). If `pmcp-code-mode` published FIRST its verify
+# build would resolve the highest ALREADY-published `pmcp`, which has no such
+# feature, and the step would fail — and every publish step in the workflow
+# tolerates only an "already exists" failure, so the job would exit having
+# published NOTHING from the release.
+#
+# The order became possible only because root Cargo.toml's `pmcp-code-mode` and
+# `pmcp-code-mode-derive` dev-deps are now PATH-ONLY (a dev-dep carrying both
+# `path` and `version` is retained in the published manifest and must resolve on
+# crates.io). THIS REGION CANNOT SEE THAT HALF: it is guarded separately by
+# `tests/root_dev_dep_path_only.rs`. Reverting either half alone strands the
+# release, so both guards are required and neither is redundant.
+#
+# The `( |$)` boundary is not decoration: `pmcp` is a prefix of ten-plus crate
+# names in this workflow and `pmcp-code-mode` is a prefix of
+# `pmcp-code-mode-derive`, so a boundary-less match returns a silently WRONG
+# ordinal — the worse failure. Reuses `step_line_re` from the region above.
+core_line="$(step_line_re 'cargo publish -p pmcp( |$)')"
+cm_line="$(step_line_re 'cargo publish -p pmcp-code-mode( |$)')"
+for pair in "pmcp:${core_line}" "pmcp-code-mode:${cm_line}"; do
+  name="${pair%%:*}"
+  val="${pair##*:}"
+  if [ -z "$val" ]; then
+    echo "::error::could not locate the 'cargo publish -p ${name}' step in $WORKFLOW —"
+    echo "::error::the Phase-128 publish ORDER was NOT checked. A gate that cannot see must say so."
+    exit 1
+  fi
+done
+# `-ge`, not `-gt`: two publish steps cannot occupy one ordinal, so an EQUAL
+# reading means both patterns resolved to the same line — a matcher fault, which
+# must fail rather than pass.
+if [ "$core_line" -ge "$cm_line" ]; then
+  echo "::error::pmcp publishes AT OR AFTER pmcp-code-mode in $WORKFLOW"
+  echo "::error::(comment-stripped ordinals: pmcp=${core_line}, pmcp-code-mode=${cm_line})."
+  echo "::error::pmcp-code-mode requires a pmcp carrying the 'schema-validation' feature"
+  echo "::error::(crates/pmcp-code-mode/Cargo.toml), so a pmcp-code-mode publish running first"
+  echo "::error::resolves the highest ALREADY-published pmcp, which lacks that feature, and the"
+  echo "::error::step fails. Only an \"already exists\" failure is tolerated, so the whole release"
+  echo "::error::job dies having published nothing."
+  echo ""
+  echo "Fix by moving the 'Publish pmcp (core SDK)' step ahead of 'Publish pmcp-code-mode' in"
+  echo "$WORKFLOW. Do NOT instead give root Cargo.toml's code-mode dev-deps their version keys"
+  echo "back — tests/root_dev_dep_path_only.rs will refuse that, and it would only move the"
+  echo "failure to the pmcp step."
+  exit 1
+fi
+: 'END PHASE-128 ORDER ASSERTION'
+
 echo "release-coverage: all ${total} publishable workspace members have a publish step."

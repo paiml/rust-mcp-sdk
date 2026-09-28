@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-code-mode"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -34,12 +34,17 @@ rustdoc-args = ["--cfg", "docsrs"]
 # purpose — a security floor that a feature flag can switch off is not a floor,
 # so the cost of always compiling `jsonschema` is accepted here.
 #
-# The version requirement is deliberately NOT moved: the in-tree `path` dep
-# already carries the feature, so the workspace builds, while raising it before
-# `pmcp` is actually published at 2.21.0 would break the path-dependency version
-# check. Plan 128-11 moves it to `>=2.21.0` in the same commit that sets `pmcp`'s
-# version to 2.21.0.
-pmcp = { version = ">=2.2.0", path = "../../", default-features = false, features = [
+# The version requirement MOVED to `>=2.21.0` in plan 128-11's single release
+# commit, in the same commit that set `pmcp`'s own version to 2.21.0 — which is
+# what makes the move legal at all (raising it earlier would have broken the
+# path-dependency version check).
+#
+# The move is about HONESTY, not resolution. `>=2.2.0` is an open-ended lower
+# bound and already admits 2.21.0, so the old value would have resolved. But
+# paired with `features = ["schema-validation"]` it would let a downstream
+# consumer whose graph pins an older `pmcp` fail with a confusing "does not have
+# these features" error instead of a clear version conflict. Do NOT lower it back.
+pmcp = { version = ">=2.21.0", path = "../../", default-features = false, features = [
     "logging",
     "schema-validation",
 ] }

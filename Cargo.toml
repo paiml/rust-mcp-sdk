@@ -1,6 +1,6 @@
 [package]
 name = "pmcp"
-version = "2.20.4"
+version = "2.21.0"
 edition = "2021"
 authors = ["PAIML Team"]
 description = "High-quality Rust SDK for Model Context Protocol (MCP) with full TypeScript SDK compatibility"
@@ -268,8 +268,38 @@ clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 dashmap = "6.1"  # Already in main deps but needed for examples
 pmcp-macros = { version = "0.6.1", path = "pmcp-macros" }  # For macro examples (s23_mcp_tool_macro)
-pmcp-code-mode = { version = "0.5.3", path = "crates/pmcp-code-mode" }  # For code mode example (s41)
-pmcp-code-mode-derive = { version = "0.3.0", path = "crates/pmcp-code-mode-derive" }  # For code mode example (s41)
+# PATH-ONLY, deliberately — the same shape as the `pmcp-agent` entry below, and for
+# the same mechanical reason. Phase 128 FORK 1.
+#
+# Why (do NOT "restore the pin"): a `[dev-dependencies]` entry carrying BOTH `path`
+# and `version` is RETAINED in the published manifest — Cargo strips a dev-dep only
+# when it carries no version requirement — so `cargo publish -p pmcp` must resolve it
+# against crates.io while preparing the manifest. CLAUDE.md item 9b records the
+# measured failure that produces (exit 101, "failed to select a version for the
+# requirement").
+#
+# That retention is what USED to force `pmcp-code-mode` to publish before `pmcp`, and
+# Phase 128 made that order impossible: `crates/pmcp-code-mode/Cargo.toml` now
+# requires a `pmcp` carrying the `schema-validation` feature, so a code-mode publish
+# running FIRST would resolve the highest ALREADY-published `pmcp` (2.20.4), which has
+# no such feature, and die at the first step — `release.yml` tolerates only an
+# "already exists" failure, so the whole release would publish nothing.
+#
+# Dropping the `version` key from both entries frees `cargo publish -p pmcp` from
+# needing either crate on crates.io, which is what lets `release.yml` publish `pmcp`
+# AHEAD of `pmcp-code-mode`. Both entries must be path-only: leaving `:derive`'s key
+# would keep the publish blocked on an unpublished `pmcp-code-mode-derive 0.3.1`.
+#
+# Safe because `[[example]] s41_code_mode_graphql` carries `required-features =
+# ["full"]`, which `default = ["logging", "v1-compat"]` does NOT satisfy, so the
+# publish VERIFY build skips the example rather than failing on the stripped dep —
+# the same condition the `pmcp-agent` / `s53` comment below records.
+#
+# Guarded twice, in the same commit: `tests/root_dev_dep_path_only.rs` fails if a
+# `version` key comes back, and `scripts/check-release-coverage.sh`'s PHASE-128 order
+# region fails if `release.yml`'s order is reverted.
+pmcp-code-mode = { path = "crates/pmcp-code-mode" }  # For code mode example (s41)
+pmcp-code-mode-derive = { path = "crates/pmcp-code-mode-derive" }  # For code mode example (s41)
 # For the CLNT-03 agent example (s53_v2_agent_client): the era-aware connector
 # factory lives behind pmcp-agent's non-default `url-connector` feature.
 #

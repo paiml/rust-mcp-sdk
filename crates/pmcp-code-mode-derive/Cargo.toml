@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-code-mode-derive"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -24,7 +24,7 @@ darling = "0.23"
 
 [dev-dependencies]
 pmcp = { version = ">=2.2.0", path = "../../" }
-pmcp-code-mode = { version = "0.5.0", path = "../pmcp-code-mode" }
+pmcp-code-mode = { version = "0.6", path = "../pmcp-code-mode" }
 tokio = { version = "1", features = ["full"] }
 trybuild = "1.0"
 serde = { version = "1", features = ["derive"] }

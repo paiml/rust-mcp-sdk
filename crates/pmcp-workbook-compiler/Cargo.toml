@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-workbook-compiler"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -110,7 +110,7 @@ rust_xlsxwriter = { version = "0.99", default-features = false }
 # exercise an UNENFORCED toolkit while production is enforced. A test harness that
 # runs a weaker configuration than the shipped one is how an enforcement gap
 # survives a green suite.
-pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "input-validation"] }
+pmcp-server-toolkit = { version = "0.2", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "input-validation"] }
 # PROPERTY testing (CLAUDE.md ALWAYS: PROPERTY) — `harvest_roundtrip_prop.rs`
 # proves the §3.3 per-row harvest projection (Plan 02) is total + stable + closed
 # over arbitrary well-formed rows. Workspace-standard pin. Dev-only.

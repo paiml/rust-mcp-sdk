@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-sql-server"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -30,10 +30,10 @@ path = "src/main.rs"
 
 [dependencies]
 pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
-pmcp-server-toolkit = { version = "0.1.0", path = "../pmcp-server-toolkit", features = ["code-mode", "sqlite"] }
-pmcp-toolkit-postgres = { version = "0.1.0", path = "../pmcp-toolkit-postgres", optional = true }
-pmcp-toolkit-mysql = { version = "0.1.0", path = "../pmcp-toolkit-mysql", optional = true }
-pmcp-toolkit-athena = { version = "0.1.0", path = "../pmcp-toolkit-athena", optional = true }
+pmcp-server-toolkit = { version = "0.2", path = "../pmcp-server-toolkit", features = ["code-mode", "sqlite"] }
+pmcp-toolkit-postgres = { version = "0.2", path = "../pmcp-toolkit-postgres", optional = true }
+pmcp-toolkit-mysql = { version = "0.2", path = "../pmcp-toolkit-mysql", optional = true }
+pmcp-toolkit-athena = { version = "0.2", path = "../pmcp-toolkit-athena", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

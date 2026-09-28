@@ -70,12 +70,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pmcp = {{ version = "2.8.1", features = ["streamable-http"] }}
-pmcp-server-toolkit = {{ version = "0.1.0", features = ["openapi-code-mode"] }}
+pmcp = {{ version = "2.21", features = ["streamable-http"] }}
+pmcp-server-toolkit = {{ version = "0.2", features = ["openapi-code-mode"] }}
 # The OpenAPI assemble orchestrators (`dispatch` builds the (HttpConnector,
 # HttpCodeExecutor) pair; `build_server` assembles the pmcp::Server). Unlike the
 # SQL path there is no ServerBuilderExt http method, so this lib owns the seam.
-pmcp-openapi-server = "0.1.0"
+pmcp-openapi-server = "0.2"
 clap = {{ version = "4", features = ["derive", "env"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 tracing = "0.1"
@@ -474,6 +474,92 @@ mod tests {
         assert!(
             cargo.contains("openapi-code-mode"),
             "Cargo.toml must enable pmcp-server-toolkit with the openapi-code-mode umbrella"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 128 T-128-56 — the three emitted requirements are version emitters
+    // `cargo build` cannot see. The workspace resolves green while every project
+    // `cargo pmcp new --kind openapi-server` creates requests whatever these
+    // literals say. Until these guards existed they were `"2.8.1"` and `"0.1.0"`
+    // and nothing caught the drift; CLAUDE.md item 13 records two literals of
+    // exactly this class stale since Phase 120.
+    //
+    // Compared at MAJOR.MINOR, never exactly — see
+    // `major_minor_of_package_version`'s docs in `templates/sql_server.rs` for the
+    // measured reason an exact guard would force the scaffold to pin an unpublished
+    // patch during every release cycle.
+    // -------------------------------------------------------------------------
+
+    /// The workspace-root manifest.
+    const ROOT_CARGO_TOML: &str = include_str!("../../../Cargo.toml");
+    /// `pmcp-server-toolkit`'s manifest.
+    const TOOLKIT_CARGO_TOML: &str = include_str!("../../../crates/pmcp-server-toolkit/Cargo.toml");
+    /// `pmcp-openapi-server`'s manifest — the EIGHTH scaffold literal, and the one
+    /// no review lane enumerated.
+    const OPENAPI_SERVER_CARGO_TOML: &str =
+        include_str!("../../../crates/pmcp-openapi-server/Cargo.toml");
+
+    /// Parse the `Cargo.toml` this template actually emits.
+    fn emitted_cargo_toml() -> toml::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        generate_cargo_toml(tmp.path(), "openapi_drift_demo").expect("emit Cargo.toml");
+        let text =
+            fs::read_to_string(tmp.path().join("Cargo.toml")).expect("read emitted Cargo.toml");
+        toml::from_str(&text).expect("the emitted Cargo.toml must be valid TOML")
+    }
+
+    #[test]
+    fn emitted_pmcp_requirement_matches_workspace_major_minor_line() {
+        let expected = crate::templates::sql_server::major_minor_of_package_version(
+            ROOT_CARGO_TOML,
+            "workspace root Cargo.toml",
+        );
+        let actual =
+            crate::templates::sql_server::emitted_requirement(&emitted_cargo_toml(), "pmcp");
+        assert_eq!(
+            actual, expected,
+            "the openapi-server scaffold's emitted `pmcp` requirement `{actual}` drifted from \
+             the workspace-root MAJOR.MINOR line `{expected}` — update it in \
+             templates/openapi_server.rs"
+        );
+    }
+
+    #[test]
+    fn emitted_toolkit_requirement_matches_workspace_major_minor_line() {
+        let expected = crate::templates::sql_server::major_minor_of_package_version(
+            TOOLKIT_CARGO_TOML,
+            "pmcp-server-toolkit Cargo.toml",
+        );
+        let actual = crate::templates::sql_server::emitted_requirement(
+            &emitted_cargo_toml(),
+            "pmcp-server-toolkit",
+        );
+        assert_eq!(
+            actual, expected,
+            "the openapi-server scaffold's emitted `pmcp-server-toolkit` requirement `{actual}` \
+             drifted from the workspace MAJOR.MINOR line `{expected}` — a scaffolded server \
+             would request a toolkit that does not enforce its own declared inputSchema. Update \
+             it in templates/openapi_server.rs"
+        );
+    }
+
+    #[test]
+    fn emitted_openapi_server_requirement_matches_workspace_major_minor_line() {
+        let expected = crate::templates::sql_server::major_minor_of_package_version(
+            OPENAPI_SERVER_CARGO_TOML,
+            "pmcp-openapi-server Cargo.toml",
+        );
+        let actual = crate::templates::sql_server::emitted_requirement(
+            &emitted_cargo_toml(),
+            "pmcp-openapi-server",
+        );
+        assert_eq!(
+            actual, expected,
+            "the openapi-server scaffold's emitted `pmcp-openapi-server` requirement `{actual}` \
+             drifted from the workspace MAJOR.MINOR line `{expected}` — update it in \
+             templates/openapi_server.rs"
         );
     }
 }

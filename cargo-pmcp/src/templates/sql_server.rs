@@ -54,8 +54,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pmcp = {{ version = "2.8.1", features = ["streamable-http"] }}
-pmcp-server-toolkit = {{ version = "0.1.0", features = ["code-mode", "sqlite", "http"] }}
+pmcp = {{ version = "2.21", features = ["streamable-http"] }}
+pmcp-server-toolkit = {{ version = "0.2", features = ["code-mode", "sqlite", "http"] }}
 clap = {{ version = "4", features = ["derive", "env"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 tracing = "0.1"
@@ -287,6 +287,55 @@ include = ["config.toml", "schema.sql"]
     Ok(())
 }
 
+/// The workspace-root manifest, for the emitted-requirement drift guards below.
+#[cfg(test)]
+const ROOT_CARGO_TOML: &str = include_str!("../../../Cargo.toml");
+
+/// `pmcp-server-toolkit`'s manifest, for the emitted-requirement drift guards below.
+#[cfg(test)]
+const TOOLKIT_CARGO_TOML: &str = include_str!("../../../crates/pmcp-server-toolkit/Cargo.toml");
+
+/// `X.Y` from an `X.Y.Z` `[package].version`.
+///
+/// The emitted requirements are compared at MAJOR.MINOR, never exactly, for the
+/// reason `templates/workspace.rs`'s `PMCP_VERSION_REQ` docs already record: the
+/// in-tree version is routinely a patch ahead of crates.io during a release cycle,
+/// and an exact pin on an unpublished patch makes every scaffolded project fail to
+/// resolve (measured there: `failed to select a version for the requirement
+/// pmcp = "^2.19.3"`, exit 101).
+#[cfg(test)]
+pub(crate) fn major_minor_of_package_version(manifest: &str, what: &str) -> String {
+    let parsed: toml::Value =
+        toml::from_str(manifest).unwrap_or_else(|e| panic!("parse {what}: {e}"));
+    let version = parsed
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{what} has no [package].version"));
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or("0");
+    let minor = parts.next().unwrap_or("0");
+    format!("{major}.{minor}")
+}
+
+/// The `version` requirement the emitted `Cargo.toml` declares for `dep`, whether
+/// written in table form (`{ version = "..", features = [..] }`) or string form.
+#[cfg(test)]
+pub(crate) fn emitted_requirement(emitted: &toml::Value, dep: &str) -> String {
+    let entry = emitted
+        .get("dependencies")
+        .and_then(|d| d.get(dep))
+        .unwrap_or_else(|| panic!("the emitted Cargo.toml declares no `{dep}` dependency"));
+    match entry {
+        toml::Value::String(s) => s.clone(),
+        other => other
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("the emitted `{dep}` entry carries no `version` key"))
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +428,49 @@ mod tests {
         assert!(
             !m.contains("PMCP_ASSETS_DIR"),
             "emitted main.rs must NOT set PMCP_ASSETS_DIR (H1 — scaffold assets are cwd-local)"
+        );
+    }
+
+    /// Parse the `Cargo.toml` this template actually emits.
+    fn emitted_cargo_toml() -> toml::Value {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        generate_cargo_toml(tmp.path(), "sql_drift_demo").expect("emit Cargo.toml");
+        let text = std::fs::read_to_string(tmp.path().join("Cargo.toml"))
+            .expect("read emitted Cargo.toml");
+        toml::from_str(&text).expect("the emitted Cargo.toml must be valid TOML")
+    }
+
+    /// Phase 128 T-128-56: the emitted `pmcp` requirement is a version emitter
+    /// `cargo build` cannot see. The workspace resolves green while every project
+    /// `cargo pmcp new --kind sql-server` creates requests whatever this literal
+    /// says. Until this guard existed the literal was `"2.8.1"` — stale by twelve
+    /// minors — and nothing caught it.
+    #[test]
+    fn emitted_pmcp_requirement_matches_workspace_major_minor_line() {
+        let expected = major_minor_of_package_version(ROOT_CARGO_TOML, "workspace root Cargo.toml");
+        let actual = emitted_requirement(&emitted_cargo_toml(), "pmcp");
+        assert_eq!(
+            actual, expected,
+            "the sql-server scaffold's emitted `pmcp` requirement `{actual}` drifted from the \
+             workspace-root MAJOR.MINOR line `{expected}` — update it in templates/sql_server.rs"
+        );
+    }
+
+    /// Same class, and the one that MATTERS for Phase 128: a scaffold pinned to
+    /// `pmcp-server-toolkit ^0.1.0` resolves the last 0.1.x, which ships with input
+    /// validation UNENFORCED and fails to parse any config using the D2 parameter
+    /// keys.
+    #[test]
+    fn emitted_toolkit_requirement_matches_workspace_major_minor_line() {
+        let expected =
+            major_minor_of_package_version(TOOLKIT_CARGO_TOML, "pmcp-server-toolkit Cargo.toml");
+        let actual = emitted_requirement(&emitted_cargo_toml(), "pmcp-server-toolkit");
+        assert_eq!(
+            actual, expected,
+            "the sql-server scaffold's emitted `pmcp-server-toolkit` requirement `{actual}` \
+             drifted from the workspace MAJOR.MINOR line `{expected}` — a scaffolded server \
+             would request a toolkit that does not enforce its own declared inputSchema. Update \
+             it in templates/sql_server.rs"
         );
     }
 }
