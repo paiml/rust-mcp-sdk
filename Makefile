@@ -969,6 +969,24 @@ test-property:
 	PROPTEST_CASES=1000 RUST_LOG=$(RUST_LOG) $(CARGO) test --features "full" -- --ignored property_
 	@echo "$(GREEN)✓ Property tests passed$(NC)"
 
+# Phase 128-10 BREADCRUMB — read this before citing `make test-fuzz` as evidence.
+#
+# The recipe below pipes EVERY non-zero exit into `|| echo "… completed"`, so a
+# crash, a timeout, a missing nightly toolchain and a clean run are all reported
+# identically: green. It also invokes the PLAIN `cargo fuzz`, and `cargo fuzz`
+# passes `-Zsanitizer=address`, which stable rustc refuses — so on a machine whose
+# default toolchain is stable (this repo pins `channel = "stable"` in
+# `rust-toolchain.toml`) this target reports success having fuzzed NOTHING.
+#
+# It is left EXACTLY as it is, deliberately. The blanket swallow spans 27
+# pre-existing targets, and narrowing it could turn the gate red on a pre-existing
+# crash in an unrelated target. That would be a genuine discovery, but it is not
+# this phase's scope and it would block this phase's merge on someone else's
+# defect. All three review lanes agreed on that scope call.
+#
+# `test-fuzz-strict` below is the leg that DOES propagate a failure. It runs only
+# Phase 128's two targets, with `+nightly`, and a crash there fails the gate. The
+# residual is therefore documented rather than silently inherited.
 .PHONY: test-fuzz
 test-fuzz:
 	@echo "$(BLUE)Running fuzz tests (ALWAYS required for new features)...$(NC)"
@@ -981,6 +999,108 @@ test-fuzz:
 		echo "$(YELLOW)⚠ No fuzz directory found. Run 'cargo fuzz init' to create fuzz tests$(NC)"; \
 	fi
 	@echo "$(GREEN)✓ Fuzz testing completed$(NC)"
+
+# Phase 128-10 (SC-7 / T-128-47, T-128-48, T-128-49): a fuzz leg that can actually
+# FAIL.
+#
+# Runs ONLY this phase's two targets and PROPAGATES their exit codes. See the
+# breadcrumb above `test-fuzz` for why that target's blanket `|| echo` is left in
+# place and why this is a separate leg rather than a fix to it.
+#
+# Both targets were PROVEN able to fail before being chained (128-10-SUMMARY.md):
+# the schema target's oracle was fed a sentinel through `render_refusal`'s allowed-
+# name list and exited 1 with a written crash artifact; the ReDoS target's D-10
+# ordering assertion was pointed at a floor-ACCEPTED value and exited 1. A fuzz leg
+# that has never been seen to fail is not a gate.
+#
+# ---- Why the LOCAL bound is 5 seconds per target, not 30 ----
+#
+# `make quality-gate` is mandatory before every commit (CLAUDE.md), and two
+# 30-second runs would add a minute to the inner loop. Phase 75 D-07 already decided
+# this exact tradeoff the same way when it kept PMAT out of the local gate and ran it
+# only in CI. So: ~10 s total locally (FUZZ_STRICT_TIME=5 x 2 targets), and the long
+# campaign lives in CI — `.github/workflows/fuzz.yml`'s matrix runs both at
+# `-max_total_time=300` daily and on any PR touching `src/**` or `fuzz/**`. Override
+# for a deeper local run with `make test-fuzz-strict FUZZ_STRICT_TIME=300`.
+#
+# ---- Why a conditional skip is accepted HERE, of all places ----
+#
+# A conditional skip is normally the exact class this phase is repairing: an
+# enforcement that is off must never read as on. It is accepted here for one
+# reason — `cargo fuzz` requires a NIGHTLY toolchain (`-Zsanitizer=address` is
+# rejected by stable rustc), and a Makefile target cannot install a toolchain on a
+# developer's machine on their behalf. CI can, and does.
+#
+# The skip is therefore made as loud as a skip can be: a RED line naming BOTH
+# targets and exactly what was not run, and a non-zero exit when `CI` is set. It
+# never silently passes.
+#
+# ---- Why the CI branch can legitimately be strict (MEASURED, 2026-09-27) ----
+#
+# This leg is chained into `quality-gate`, and `.github/workflows/ci.yml`'s
+# `quality-gate` job is in the `gate` aggregate's `needs:` array. The org ruleset
+# "Green Main — unified gate enforcement" requires exactly ONE status context:
+# `gate`. So a non-zero exit here under `CI` is genuinely merge-blocking — and would
+# have failed EVERY PR immediately, because before this phase that job installed
+# `cargo-llvm-cov` and `cargo-nextest` and NO nightly toolchain and NO `cargo-fuzz`
+# (T-128-49a: the realistic outcome of a gate that is red on every run is not a
+# fixed toolchain, it is a deleted gate).
+#
+# That is provisioned in the same change: `ci.yml` now installs nightly as a
+# NON-DEFAULT toolchain plus `cargo-fuzz` in that job. Non-default matters — making
+# nightly the default would silently move the job's `fmt-check` / `lint` / `test-all`
+# onto nightly clippy, whose lint set differs from stable's, and CLAUDE.md names
+# toolchain mismatch as the #1 cause of CI failures. `cargo +nightly` overrides
+# `rust-toolchain.toml` explicitly, so the stable pin does not need removing the way
+# `fuzz.yml` removes it.
+#
+# `fuzz.yml` alone would NOT have delivered a gate: it is not a required check. That
+# was measured, not assumed, and it is why option (b) of the plan's three was
+# rejected on its own and adopted only as the deep-campaign half.
+FUZZ_STRICT_TARGETS := fuzz_input_schema_enforcement fuzz_placeholder_pattern_redos
+FUZZ_STRICT_TIME ?= 5
+FUZZ_STRICT_TIMEOUT ?= 5
+
+.PHONY: test-fuzz-strict
+test-fuzz-strict:
+	@echo "$(BLUE)Running STRICT fuzz leg (Phase 128 targets; failures PROPAGATE)...$(NC)"
+	@# ONE shell for the whole recipe, backslash-joined. This is load-bearing, not
+	@# style: make runs each recipe LINE in its own shell, so a guard that ends with
+	@# `exit 0` on its own line merely ends that line successfully and make proceeds
+	@# to the next one — the "skip" would print its RED banner and then run the fuzz
+	@# command anyway. MEASURED while building this target: with nightly and
+	@# cargo-fuzz both off PATH, the two-line form printed BOTH skip banners and then
+	@# failed at `cargo: command not found` (make exit 2). A leg that turns red for
+	@# the wrong reason is how a gate gets deleted (T-128-49a), so the guard and the
+	@# run share one shell and one exit status.
+	@set -e; \
+	miss=""; \
+	rustup toolchain list 2>/dev/null | grep -q '^nightly' || miss="a nightly toolchain"; \
+	command -v cargo-fuzz >/dev/null 2>&1 || miss="$${miss:+$$miss and }cargo-fuzz"; \
+	if [ -n "$$miss" ]; then \
+		echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+		echo "$(RED)  SKIPPED — $$miss MISSING. NOTHING WAS FUZZED.$(NC)"; \
+		echo "$(RED)  NOT RUN: fuzz_input_schema_enforcement (SC-7 no-echo)$(NC)"; \
+		echo "$(RED)  NOT RUN: fuzz_placeholder_pattern_redos (A2 ReDoS look)$(NC)"; \
+		echo "$(RED)  Why: cargo fuzz passes -Zsanitizer=address, which stable$(NC)"; \
+		echo "$(RED)  rustc refuses, and a Makefile cannot install a toolchain$(NC)"; \
+		echo "$(RED)  on your behalf. Fix:$(NC)"; \
+		echo "$(RED)    rustup toolchain install nightly && cargo install cargo-fuzz$(NC)"; \
+		echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+		if [ -n "$$CI" ]; then \
+			echo "$(RED)CI is set — this is a HARD FAILURE, not a skip.$(NC)"; \
+			exit 1; \
+		fi; \
+		exit 0; \
+	fi; \
+	cd fuzz && for t in $(FUZZ_STRICT_TARGETS); do \
+		echo "$(BLUE)  fuzzing $$t for $(FUZZ_STRICT_TIME)s (failure PROPAGATES)...$(NC)"; \
+		cargo +nightly fuzz run $$t -- \
+			-max_total_time=$(FUZZ_STRICT_TIME) \
+			-timeout=$(FUZZ_STRICT_TIMEOUT) \
+			-detect_leaks=0; \
+	done; \
+	echo "$(GREEN)✓ Strict fuzz leg passed (no crash, no timeout, no artifact)$(NC)"
 
 # Phase 119 (D-13/D-14) — BUILD every example, and FAIL when one does not
 # compile.
@@ -2142,6 +2262,16 @@ quality-gate:
 	@$(MAKE) check-todos
 	@$(MAKE) check-unwraps
 	@$(MAKE) validate-always
+	# test-fuzz-strict runs HERE because `validate-always` cannot: its FUZZ leg is
+	# `make test-fuzz`, which pipes every non-zero exit into `|| echo` and therefore
+	# CANNOT fail the gate on a crash — a target that found a counterexample and one
+	# that never ran report identically. Same framing as the doc-check / test-skills /
+	# test-oauth legs above: the gate is green on what it reaches, and until this leg
+	# existed a crash in Phase 128's SC-7 no-echo invariant lived in what it did not.
+	# Bounded to ~10s locally (Phase 75 D-07's tradeoff); the deep campaign is
+	# `fuzz.yml`. See the target's own header for the nightly guard and the measured
+	# reason its CI branch can be strict.
+	@$(MAKE) test-fuzz-strict
 	@$(MAKE) purity-check
 	@$(MAKE) no-crypto-check
 	@$(MAKE) comply

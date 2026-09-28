@@ -259,6 +259,47 @@ jobs:
         # Force install latest cargo-audit to support CVSS 4.0
         cargo install cargo-audit --force
 
+    # Phase 128-10 (T-128-49a). `make quality-gate` below chains `test-fuzz-strict`,
+    # which runs this phase's two fuzz targets with failures PROPAGATING — unlike
+    # `make test-fuzz`, whose blanket `|| echo` cannot fail anything. `cargo fuzz`
+    # passes `-Zsanitizer=address`, which stable rustc refuses, so the leg needs a
+    # nightly toolchain and `cargo-fuzz`; this job installed NEITHER before this
+    # phase, and a leg that exits non-zero under `CI` without them would have failed
+    # the org-required `gate` check on every PR. The realistic outcome of a gate
+    # that is red on every run is not a fixed toolchain — it is a deleted gate.
+    #
+    # MEASURED 2026-09-27 via the repo rulesets API: the org ruleset "Green Main —
+    # unified gate enforcement" requires exactly ONE status context, `gate`, and
+    # `gate.needs` includes this job. `.github/workflows/fuzz.yml` is NOT a required
+    # check — both targets are enrolled in its matrix for the DEEP daily campaign
+    # (`-max_total_time=300`), but that alone would deliver recurring execution and
+    # no merge gate, which is why the leg is provisioned here too.
+    #
+    # Nightly is installed NON-DEFAULT on purpose. `dtolnay/rust-toolchain@nightly`
+    # would make it the default and silently move this job's `fmt-check` / `lint` /
+    # `test-all` onto nightly clippy, whose lint set differs from the stable one
+    # installed above — CLAUDE.md names local/CI toolchain mismatch as the #1 cause
+    # of CI failures, and moving the whole gate to nightly is a far larger change
+    # than adding a fuzz leg. `cargo +nightly` (which the Makefile leg uses)
+    # overrides `rust-toolchain.toml` explicitly, so the stable pin does not need
+    # removing the way `fuzz.yml` removes it.
+    #
+    # `command -v` guarded, mirroring the cargo-nextest step above, so a warm
+    # ~/.cargo/bin cache makes repeat runs cheap. Not `--locked`: `fuzz.yml` installs
+    # cargo-fuzz without it and that form is proven on this runner image.
+    #
+    # SMOKE TEST: the first run of this job on a clean runner IS the measurement. A
+    # `cargo fuzz build` failure there is a FINDING, not a flake — it cannot be
+    # reproduced locally, because a developer machine that already has nightly takes
+    # a different branch of the Makefile guard.
+    - name: Install nightly + cargo-fuzz (quality-gate chains test-fuzz-strict)
+      run: |
+        rustup toolchain install nightly --profile minimal --no-self-update
+        if ! command -v cargo-fuzz &> /dev/null; then
+          cargo install cargo-fuzz
+        fi
+        rustup toolchain list
+
     - name: Install cargo-deny (make quality-gate chains purity-check, which needs it)
       uses: taiki-e/install-action@v2.87.11
       with:
