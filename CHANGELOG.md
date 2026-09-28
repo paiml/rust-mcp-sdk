@@ -6,6 +6,349 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.21.0] - 2026-09-28
+
+Ships with `pmcp-server-toolkit` **0.2.0**, `pmcp-code-mode` **0.6.0**,
+`pmcp-code-mode-derive` 0.3.1, `pmcp-toolkit-{postgres,mysql,athena}` 0.2.0,
+`pmcp-sql-server` 0.2.0, `pmcp-openapi-server` 0.2.0, `pmcp-workbook-server` 0.2.0,
+`pmcp-workbook-compiler` 0.2.0 and `cargo-pmcp` 0.25.0. Twelve crates move as one
+set because `pmcp-server-toolkit` 0.1.3 -> 0.2.0 is semver-INCOMPATIBLE on a 0.x
+line and every crate pinning it must move with it.
+
+### Changed — BREAKING BEHAVIOUR: a config-driven tool now enforces the input contract it always published
+
+**Read this section before upgrading a deployed config-driven server.**
+
+The toolkit has always written `max_length` / `minimum` / `maximum` / `enum` into
+each tool's `inputSchema` and always emitted `"additionalProperties": false` — and
+no layer checked any of it. `src/server/mod.rs` passed `req.arguments` straight to
+the handler. Every server team rebuilt validation by hand and missed cases. Three
+comments in `crates/pmcp-server-toolkit/src/tools.rs` asserted this enforcement
+already existed against named threat IDs (T-83-05-02, T-90-03-01, T-90-05-03); the
+test carrying T-90-05-03 asserted argument *binding*, not validation. This release
+closes the gap between documented and actual behaviour, and corrects those claims.
+
+**What that means in practice:** a server whose `enum` or `pattern` was loose and
+unenforced will start refusing some calls. A refusal names the violated rule and
+the DECLARED parameters, and never the rejected value or the rejected key — the key
+is caller-controlled and may itself be sensitive. The per-tool startup log is how
+such a regression is traced: the server logs, once, which rules each tool enforces,
+and warns once per active opt-out. See `docs/architecture/input-validation.md`.
+
+Four `[server.validation]` keys turn enforcement down, and each costs something:
+
+| Key | Default | What it turns off | What it costs you |
+|---|---|---|---|
+| `enforce_input_schema` | `true` | the whole declared-schema check (`false` skips the CHECK, not the decorator) | every `enum`, `pattern`, `maxLength`, `minLength`, `format`, `items`/`maxItems`, `required` and `additionalProperties: false` rule stops being enforced — the pre-2.21 behaviour |
+| `default_max_length` | `256` | the position-scoped default string cap (`0` disables it in every position) | an uncapped path- or query-position string is unbounded again, which is the CR-02 class. Does NOT disable the always-on 256-code-point placeholder cap (D-08) |
+| `additional_properties` | `false` | emits `additionalProperties: true` | undeclared argument keys are accepted and forwarded |
+| `strict` | `false` | n/a — it turns a warning INTO a hard config error | with `true`, an uncapped body-position string fails `ServerConfig::validate` instead of producing a lint finding |
+
+The cap is **position-scoped**, not uniform (D-05): a string in **path or query**
+position gets a hard default cap of 256 code points; a string in **body** position
+(SQL `:param` binds, script args, request bodies) gets a **warning only**. A
+uniform 256 would refuse free-text search params, SQL filter expressions, base64
+values and notes fields that work today.
+
+Everything above is gated on the toolkit's `input-validation` feature, which is in
+`default`. A consumer with `default-features = false` that does not opt back in
+ships the pre-2.21 behaviour — an explicit opt-out, and one the startup log names.
+
+### Changed — FORWARD-INCOMPATIBLE config: a 0.2.0 config does not parse on 0.1.3
+
+A config written against toolkit 0.2.0 **fails to parse** on 0.1.3. Two separate
+surfaces, not one — D-15 named only the first:
+
+1. **Any of the new `[[tools.parameters]]` keys** — `pattern`, `min_length`,
+   `format`, `items`, `max_items` — because `ParamDecl` carries
+   `#[serde(deny_unknown_fields)]`.
+2. **A `[server.validation]` section at all**, because `ServerSection` and
+   `ServerConfig` carry `deny_unknown_fields` too. Declaring an opt-out therefore
+   pins the config to 0.2.0 exactly as using a new parameter key does.
+
+A rollback to 0.1.3 with either present is a boot failure, not a silent
+degradation. Plan for it.
+
+### Changed — BREAKING: a config with a malformed path template now refuses to BOOT
+
+`ServerConfig::validate` now rejects a `[[tools]]` `path` whose segment is not a
+supported placeholder shape, with
+`ConfigValidationError::MalformedPathTemplateSegment { tool, segment }`. A
+third-party config using `/prefix-{id}` or `/search/{a}{b}` **will stop starting**.
+
+This is a loud failure replacing a silent one, not a regression: those shapes were
+already broken — the substitution sent literal braces upstream on every call. An
+operator upgrading will see a server that used to start stop starting, and that is
+the intended outcome. No in-tree config is affected (scanned, with a positive
+control).
+
+### Changed — path-injection closure on BOTH HTTP surfaces (the CR-01 class)
+
+A placeholder value is checked before substitution, and the composed path is
+checked before dispatch, on the curated single-call surface (`HttpClient`) *and*
+the Code Mode surface (`HttpCodeExecutor`). Refused with **zero upstream
+requests**:
+
+- a path separator, unless the parameter declares `allow_slash` (per-parameter
+  config opt-in only — never the OpenAPI spec's `allowReserved`, which is widely
+  copy-pasted without intent);
+- parent-directory traversal (`..`), `?`, `#`, a backslash, any ASCII control byte
+  or NUL — in literal or percent-encoded form, decode-once;
+- a bare single dot, an empty value, a value over 256 code points;
+- a value failing a `pattern` or `maxLength` declared in the OpenAPI spec. A
+  declared pattern narrows **on top of** the character floor and never replaces it
+  (D-10): a loose spec pattern such as `^.*$` must not be able to switch the
+  injection check off, and specs in the wild are full of those.
+
+**Two behaviour changes here are easy to miss and can break a working server:**
+
+- **An empty placeholder value is now refused.** `/search/{v}` with `v = ""`
+  composes to `/search/`, and a trailing or doubled `/` — or any empty interior
+  segment — is refused by the composed-path check.
+- **A path- or query-position string with no declared `max_length` now carries the
+  default cap** of 256 code points. Code points, not bytes and not grapheme
+  clusters: a single family emoji consumes 7 of the 256.
+
+Also: **a declared path parameter with no supplied argument is now an error**
+naming the parameter, instead of the literal `{name}` travelling toward the
+backend.
+
+### Changed — BREAKING API: `pmcp_code_mode::HttpExecutor::execute_request`
+
+`execute_request`'s path parameter changed from `&str` to a `ResolvedPath` newtype,
+and placeholder resolution moved AHEAD of dispatch. A second trait method
+(`placeholder_rules`) was added with a default body.
+
+**Why it had to be breaking.** `HttpCodeExecutor::execute_request` used to call
+`resolve_path` inside its own impl, so a decorator wrapping the public trait saw
+only the path *template* — blind by construction, which is exactly how the CR-01
+guard bypass got through. Resolving ahead of dispatch makes **every**
+`HttpExecutor` implementor safe by construction, including out-of-tree ones, rather
+than asking each to adopt a helper.
+
+**What a downstream implementor must do:** take `ResolvedPath<'_>` instead of
+`&str`; delete any placeholder resolution of your own (the path arrives resolved
+and already floored); optionally override `placeholder_rules` to contribute your
+spec's declared narrowing. A stale implementor gets a **compile error**, by design.
+Every downstream `MockHttpExecutor` expectation constructed against a `{key}`
+template also needs updating. `validate_path_placeholder` is re-exported from
+`pmcp-code-mode` for implementors with a non-OpenAPI template syntax.
+
+**`pmcp-openapi-server::build_server` is also breaking**: it grew a fifth
+parameter, `hooks: &ToolkitHooks`. Every in-repo caller was updated; an out-of-repo
+caller will not compile. Called out rather than widened silently.
+
+**`pmcp-code-mode` now always compiles `jsonschema`.** The `pmcp/schema-validation`
+forward is unconditional on purpose — a security floor a feature flag can switch
+off is not a floor.
+
+### Added — the three escape hatches (E1, E2, E3)
+
+- **`RequestPolicy` (E1)** — a rule about what may LEAVE the server. Registered on
+  a `ToolkitHooks` value and run on every outbound HTTP request, **before outgoing
+  auth is applied**, so third-party policy code never observes a credential. It
+  sees tool name, method, the fully resolved path, the query pairs (excluding every
+  auth-contributed pair) and the body. It governs HTTP egress only — a
+  `SqlConnector` request is a statement plus bound parameters, not a method/path,
+  and needs a different seam.
+- **`ArgumentValidator` (E2)** — a per-tool rule about a COMBINATION of values, run
+  strictly AFTER the declared-schema check. Refuse-only: normalization is out of
+  scope.
+- **`garde` on `TypedTool<T>` (E3)** — `TypedTool::new_validated` and
+  `TypedSyncTool::new_validated` (plus `*_with_schema` siblings) run
+  `garde::Validate` after deserializing, mapping errors the same value-free way.
+  Additive: types that do not implement `Validate` behave as today.
+
+A registered hook that cannot take effect **warns** at startup rather than looking
+registered — a validator named for a tool the config does not declare, or a policy
+on an assembly path with no HTTP egress surface.
+
+### Added — `cargo pmcp validate config`, and a toolkit-version banner on every lint
+
+`cargo pmcp validate config` reports every uncapped string and every active
+`[server.validation]` opt-out from the SAME `ServerConfig::lint()` the running
+server reports at startup. The CLI holds zero rule literals in production code, so
+it can only report what the toolkit decides. `cargo pmcp validate deploy` emits the
+same findings as **warnings only**, so its documented exit-code guarantee is
+unchanged.
+
+Both surfaces now print which `pmcp-server-toolkit` version performed the lint
+(`pmcp_server_toolkit::VERSION`, i.e. the crate actually linked in). It does **not**
+hard-error on a mismatch, because the CLI cannot know which toolkit the deployment
+will run — refusing would be refusing on a guess. Without the number, a clean `✓`
+would read as a guarantee about production that nothing in the CLI can make.
+
+### Deprecated — `pmcp::server::validation`
+
+`#[deprecated(since = "2.21.0")]` and `#[doc(hidden)]`. It was a third dead
+validation path: eleven public validators, a `Validator`/`FieldValidator` builder,
+**zero callers in `src/`**, and `ARCHITECTURE.md` claimed "Server can validate tool
+inputs before calling handler" — a fourth false enforcement claim, in the codebase
+map rather than in code. `validate_safe_path` was harvested as the basis for the
+character floor; the module is deprecated rather than deleted because removing a
+`pub mod` from the 2.x line is a semver break. **Removal is booked against the next
+major (3.0).**
+
+Use `pmcp::server::schema_validation::validate_input` for config-driven tools, or
+`TypedTool::new_validated` for hand-written ones.
+
+### Added — core `pmcp` surface
+
+`pmcp::server::schema_validation` with `validate_input`, `render_refusal`,
+`InputViolation`, `validate_path_placeholder`, `validate_resolved_path`,
+`PlaceholderRules`, `PlaceholderRefusal`, `PLACEHOLDER_MAX_LENGTH` and
+`check_input_schema_compiles`. Inputs compile under Draft 2020-12 on **both** eras
+(a config- or schemars-declared `$schema` must not be able to change input
+enforcement semantics), through their own compile entry point — never the output
+validator's.
+
+New feature `schema-validation = ["dep:jsonschema"]`, with
+`validation = ["schema-validation", "dep:garde"]`. Additive: existing `validation`,
+`full` and `full-v2` consumers see no change. The split exists so a curated
+single-call server does not pay for `garde` — it declares every argument in TOML
+and has no `#[derive(Validate)]` types at all. `garde`'s `derive` feature is now
+enabled (garde declares no `default` at all, so without it
+`#[derive(garde::Validate)]` does not exist); `full` was deliberately NOT enabled,
+so a consumer wanting `#[garde(pattern(..))]` enables the matching garde feature in
+its own manifest.
+
+### Deviations from this phase's own source documents
+
+Recorded here, in one place, because the change request, the ROADMAP and several
+locked decisions each describe something slightly different from what shipped. A
+reader should not have to re-derive any of it.
+
+1. **The bare-percent rule is WIDER than the change request's wording (Q3).** The
+   request says "percent-encoded forms of these". But `%252e` double-decodes to
+   `.`, so an encoded-form denylist alone is bypassable. What ships: `%25` in any
+   hex case is refused OUTRIGHT before decoding (which closes the whole
+   double-encoding family in one check), and any `%` not followed by two ASCII hex
+   digits is refused. Well-formed escapes such as `%20` still pass the `%` rule and
+   are then caught by the denylist if they decode to a denied character.
+2. **The decode-once floor is wider still.** Beyond the request's five named
+   characters (`?`, `#`, `/`, `..`, percent-encoded forms), a backslash, CR, LF,
+   NUL, every other ASCII control byte and a bare single dot are also refused. A
+   backslash because reverse proxies normalize it to `/`; CR and LF because they
+   are a response-splitting surface; a bare single dot because it is a path
+   traversal primitive. The composed-path check applies the same predicate, so
+   these are refused anywhere in the composed path, not only inside a placeholder.
+3. **The `?` rule was NARROWED after the first implementation, by operator
+   decision.** An author-written `?` in a path is **ACCEPTED**; a `?` arriving from
+   a placeholder VALUE is refused. `ResolvedPath::from_checked` splits the composed
+   path at the FIRST `?` and applies the full rule set to each side, so
+   `api.get("/Line/Mode/tube/Status?detail=true")` and
+   `api.get("…/range(address='A2:D7')?$select=values")` keep working, including
+   alongside `{placeholder}` substitution. A SECOND `?`, or a dangling `?` with an
+   empty query, is refused. **An earlier revision of this phase's notes said script
+   authors must migrate query values to body params. That is FALSE of what ships**
+   — the migration was reverted and telling authors to rewrite working scripts
+   would be a documentation defect.
+4. **SC-3's primary surface is `cargo pmcp validate config`, not
+   `validate deploy`.** D-07 and the ROADMAP name `validate deploy` verbatim. A
+   dedicated subcommand is the reviewable surface; `validate deploy` also emits the
+   findings, as warnings, so D-07's literal surface is honoured without widening
+   `validate deploy`'s exit-code contract (Q5). The ROADMAP's SC-3 is amended with
+   the original wording retained alongside it.
+5. **D-07's warnings arrive through a new `ServerConfig::lint()`, not through
+   `validate()`.** `validate()` returns `Result` and has no warning channel; a
+   warning forced through it would have to become an error. `lint()` is the
+   channel, `validate()` keeps its meaning, and both the CLI and the startup log
+   project the same `lint()` output.
+6. **`format` is ENFORCED on inputs and ANNOTATIVE on outputs (Q1).** JSON Schema
+   makes `format` an annotation by default, and the pinned `jsonschema 0.49`
+   honours that: without an opt-in, `"!!!not-a-uri!!!"` validates against
+   `format: uri`. Inputs therefore get their own format-asserting compile entry
+   point. Nineteen standard Draft 2020-12 names assert; an UNRECOGNIZED name stays
+   annotative, so a typo such as `"uid"` for `"uuid"` silently enforces nothing.
+   See the docs page for the list and the warning.
+7. **`pmcp-code-mode-derive` takes a PATCH, not a minor (Q4).** Its only change is
+   a `[dev-dependencies]` requirement. It emits no `HttpExecutor` code, and a
+   path-carrying dev-dep is stripped at publish, so the published artifact is
+   unaffected. Recorded so a future releaser does not re-derive it.
+8. **`input-validation` was deliberately NOT added to the toolkit's
+   `openapi-code-mode` feature list.** Widening a published feature's list is a
+   compatibility decision, and it is not needed: the off-half of the spec-narrowing
+   path is safe (the character floor and the 256-code-point cap still run, through
+   `pmcp-code-mode`'s unconditional `pmcp/schema-validation` forward), and
+   `input-validation` is already in the toolkit's `default`.
+9. **FORK 1 — the release-order deadlock, and the largest deviation of the phase.**
+   Root `Cargo.toml`'s `pmcp-code-mode` and `pmcp-code-mode-derive`
+   `[dev-dependencies]` entries became **path-only** (the `version` key was dropped
+   from both), and `.github/workflows/release.yml` now publishes `pmcp` **before**
+   `pmcp-code-mode` — reversing an order CLAUDE.md item 2 previously justified on a
+   mechanism that does not exist.
+
+   The deadlock, stated so it need not be re-derived from a stranded publish job:
+   `pmcp-code-mode` now requires a `pmcp` carrying `schema-validation`, so a
+   code-mode publish running first resolves the highest ALREADY-published `pmcp`,
+   which has no such feature, and dies at the first step — and every publish step
+   in the workflow tolerates only an "already exists" failure, so the job would
+   publish nothing at all. Yet `pmcp` could not go first either: a dev-dep carrying
+   BOTH `path` and `version` is RETAINED in the published manifest and must resolve
+   on crates.io when `cargo publish -p pmcp` prepares it. Neither crate could go
+   first. **No reordering alone resolves it.**
+
+   The alternative exit — leave the `features = ["schema-validation"]` edge off and
+   change no release mechanics — was **unavailable**, not merely worse. It requires
+   either a second copy of the placeholder rule inside `pmcp-code-mode` (forbidden:
+   a security rule must never exist in two copies, and this repo has a three-way
+   drift incident on record), or the floor behind a non-default feature (forbidden:
+   a validation rule must never be silently disabled by a feature flag being off,
+   and the DEFAULT code-mode build is the shipped configuration), or the floor back
+   inside `HttpCodeExecutor` (which re-creates the blind-decorator defect D-09
+   exists to fix). An exit that requires breaking a locked decision is not an exit.
+
+   **A standalone reorder would have broken the release.** With root's dev-deps
+   untouched, `cargo publish -p pmcp` would run while `pmcp-code-mode 0.6.0` and
+   `pmcp-code-mode-derive 0.3.1` are unpublished and both are retained in `pmcp`'s
+   manifest — so the job dies at the `pmcp` step instead of the code-mode step,
+   having published nothing. The path-only change is the prerequisite that makes
+   the reorder safe; the reorder is its consequence, not the fix.
+
+   Measured after the change: `cargo package -p pmcp` emits a published manifest
+   carrying `[dev-dependencies.pmcp-macros]` (retained, and correctly — it
+   publishes ahead of `pmcp`) and **no** `pmcp-code-mode`, `pmcp-code-mode-derive`
+   or `pmcp-agent` entry at all. Safe because `examples/s41_code_mode_graphql.rs`,
+   the only consumer, carries `required-features = ["full"]`, which
+   `default = ["logging", "v1-compat"]` does not satisfy, so the publish verify
+   build skips it.
+
+   Guarded twice, in the same commit: `tests/root_dev_dep_path_only.rs` fails if a
+   `version` key comes back (with a negative control that `pmcp-macros` must KEEP
+   its key — the rule is about publish ORDER, not tidiness), and
+   `scripts/check-release-coverage.sh` gained a second bounded order region
+   asserting `pmcp` precedes `pmcp-code-mode`. Reverting either half alone strands
+   the release, so both guards are required.
+
+10. **A SUPERSEDED instruction, recorded so it cannot be cited back.** An earlier
+    draft of this phase's release plan said to leave root `Cargo.toml`'s
+    `pmcp-code-mode-derive` dev-dep alone "under the caret exception". That
+    reasoning was correct about the VERSION axis — a patch bump needs no downstream
+    repin — and **irrelevant to FORK 1**, which is about the `version` key
+    EXISTING at all. That entry is the same retained-dev-dep shape as its sibling,
+    so leaving its key would have kept `cargo publish -p pmcp` blocked on an
+    unpublished `pmcp-code-mode-derive 0.3.1` and exit (b) would have unblocked
+    nothing. Both entries moved. Do not restore either pin on the strength of the
+    old note.
+
+11. **Eight scaffold-emitted version literals moved, not the nine the plan
+    counted.** Measured across the four `cargo-pmcp/src/templates/` files named by
+    the plan: three constants plus five inline literals, of which five had no drift
+    test. Five new MAJOR.MINOR drift tests now guard them. Three further template
+    files outside the plan's scope (`oauth/proxy.rs`, `oauth/authorizer.rs`,
+    `mcp_app.rs`) carry `pmcp` requirements stale by a major or more; they are
+    pre-existing, unrelated to this release, and deliberately left alone rather
+    than swept in.
+
+### Fixed — three false enforcement claims, and the mechanism that let them survive
+
+The three `tools.rs` comments asserting that argument validation already happened
+are corrected, each replaced by a statement of what the code now actually does with
+a named function behind it. A sweep over 36 candidate phrases across the toolkit,
+calibrated with a positive control before any fix, found and corrected a third
+stale claim the phase had not enumerated. Each surviving enforcement claim was
+mutation-tested: removing the named call makes a named test go red.
+
 ## [2.20.4] - 2026-09-19
 
 ### Fixed — discovery refused a conformant Cognito document (RFC 8414 §2 optional fields)

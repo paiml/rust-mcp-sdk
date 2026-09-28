@@ -240,18 +240,66 @@ cross-references stay valid.**
 1b. `pmcp-macros` (the derive crate; depends on `pmcp-macros-support`, and `pmcp`
    depends on it, so it publishes after item 1a and before item 2). **Also missing
    from this list until 2026-08-23**, same reason.
-2. `pmcp` (core SDK, depends on widget-utils). **Corrected 2026-08-23:** this list
-   put `pmcp` AHEAD of items 3 and 4, which inverts the real order —
-   `release.yml` publishes `pmcp-code-mode` and `pmcp-code-mode-derive` FIRST,
-   then `pmcp`. That is not an accident to be "fixed": `pmcp-code-mode` pins
-   `pmcp = ">=2.2.0"`, which an already-published `pmcp` satisfies, so the
-   code-mode crates can go first — and they must, because `pmcp`'s own
-   `code-mode` feature reaches them. A releaser who trusted the old prose and
-   reordered `release.yml` to publish `pmcp` first would reintroduce the class of
-   bug PR #303 fixed. The numbers stay as they are because "item 2" is
-   cross-referenced throughout this file.
-3. `pmcp-code-mode` (depends on pmcp; publishes BEFORE item 2 — see item 2's note)
-4. `pmcp-code-mode-derive` (depends on pmcp-code-mode; also publishes BEFORE item 2)
+2. `pmcp` (core SDK, depends on widget-utils). **Publishes BEFORE items 3 and 4 as
+   of Phase 128 (2026-09-28).** This entry has been corrected twice and the
+   history matters, so both corrections are kept.
+
+   **Correction 2 (Phase 128, 2026-09-28) — the ORDER changed, and the previously
+   recorded REASON for the old order was measured FALSE.** `release.yml` now
+   publishes `pmcp` first, then `pmcp-code-mode`, then `pmcp-code-mode-derive`.
+
+   The reason recorded here until now was that the code-mode crates had to go
+   first "because `pmcp`'s own code-mode-named feature reaches them". **That
+   mechanism does not exist.** Measured: grepping `code-mode` in root
+   `Cargo.toml` returns only the two `[dev-dependencies]` lines and the
+   workspace-members list — there is **no such entry in root `[features]`** at
+   all. A documented mechanism that does not exist is a defect of the same class
+   as a threat comment claiming a mitigation no function implements, so it is
+   corrected rather than quietly overwritten.
+
+   **The real mechanism was a retained dev-dep.** Root's `pmcp-code-mode` and
+   `pmcp-code-mode-derive` `[dev-dependencies]` entries each carried a `version`
+   key alongside `path`. Cargo strips a dev-dep from the published manifest ONLY
+   when it carries no version requirement; one that carries a requirement is
+   **retained in the published manifest** and must resolve on crates.io when
+   `cargo publish -p pmcp` prepares it. That — and nothing about a feature — is
+   what forced the code-mode crates ahead of `pmcp`. It is the identical
+   mechanism item 9b already documents as CR-01, and the identical mechanism
+   root `Cargo.toml`'s `pmcp-agent` dev-dep comment already explains four lines
+   below the two entries in question.
+
+   **Why Phase 128 had to reverse it.** `crates/pmcp-code-mode/Cargo.toml` now
+   requires a `pmcp` carrying the `schema-validation` feature (the single copy of
+   the path-placeholder security floor lives in core and `pmcp-code-mode`
+   re-exports it). A code-mode publish running FIRST resolves the highest
+   already-published `pmcp`, which has no such feature, and fails — and every
+   publish step tolerates only an "already exists" failure, so the job strands
+   the whole release. `pmcp` could not go first either while the retained
+   dev-deps existed. Neither could go first; no reordering ALONE resolves it.
+   Phase 128 made both entries **path-only** and then moved `pmcp` ahead.
+
+   **Do not "restore" either half.** Re-adding a `version` key fails
+   `tests/root_dev_dep_path_only.rs`; reverting the workflow order fails
+   `scripts/check-release-coverage.sh`'s `BEGIN PHASE-128 ORDER ASSERTION`
+   region. Both run inside `make quality-gate`, and reverting either half alone
+   strands the release. Note root's `pmcp-macros` dev-dep DELIBERATELY keeps its
+   `version` key — `pmcp-macros` publishes ahead of `pmcp` (item 1b), so its
+   requirement resolves; the rule is about publish ORDER, not about making every
+   dev-dep look alike, and a negative control in that test file pins the
+   distinction.
+
+   **Correction 1 (2026-08-23), retained for its lesson:** this list originally
+   put `pmcp` ahead of items 3 and 4 while `release.yml` published the code-mode
+   crates first, and a releaser who trusted the prose and reordered the workflow
+   to match would have reintroduced the class of bug PR #303 fixed. The workflow
+   was right and the prose was wrong. The numbers stay as they are because "item
+   2" is cross-referenced throughout this file. Phase 128's change is the
+   opposite situation — a deliberate, guarded order change made in the workflow
+   AND recorded here in the same commit.
+3. `pmcp-code-mode` (depends on pmcp; publishes AFTER item 2 as of Phase 128 — see
+   item 2's Correction 2)
+4. `pmcp-code-mode-derive` (depends on pmcp-code-mode; publishes after item 3, and
+   therefore also after item 2)
 4a. `pmcp-workbook-dialect` (workbook leaf; publishes between `pmcp-workbook-runtime`
    and item 5). **Missing from this list until 2026-08-23**, same class as items
    1a/1b — present in `release.yml`, absent from the prose.
@@ -374,8 +422,8 @@ cross-references stay valid.**
    external could be affected by moving to 0.3 (nor, symmetrically, would a 0.2.1
    have endangered anyone). The whole tree was a full unreleased release-cycle ahead
    of the registry: `pmcp-agent` 0.3.0 vs published 0.2.0, `pmcp-team-servers` 0.2.0
-   vs 0.1.1, `pmcp-cfn-renderer` 0.2.0 vs 0.1.0, `cargo-pmcp` 0.23.0 vs published
-   0.21.0. **A future releaser must not generalize "the bump broke no consumer" into
+   vs 0.1.1, `pmcp-cfn-renderer` 0.2.0 vs 0.1.0, and `cargo-pmcp` a minor ahead on the 0.23
+   line vs published 0.21.0. **A future releaser must not generalize "the bump broke no consumer" into
    a rule** — it was true only because of that unpublished state. Verify with the
    crates.io API (`curl -s https://crates.io/api/v1/crates/<name>/versions`), NOT
    with `cargo search`/`cargo info`, which report the in-tree path override: during
@@ -483,14 +531,42 @@ cross-references stay valid.**
    (`pmcp/streamable-http`) features are non-default, so the default publish
    build is reqwest-free and wasm-clean.
 15a. `cargo-pmcp` (depends on pmcp, mcp-tester, mcp-preview — and pins
-   `pmcp-package`, `pmcp-cfn-renderer`, `pmcp-agent` and `pmcp-team-servers`, so it
-   must publish AFTER items 13, 13a, 14 and 15 — see the authoritative statement
-   under item 13). Formerly listed as item 12, which
+   `pmcp-package`, `pmcp-cfn-renderer`, `pmcp-agent`, `pmcp-team-servers`,
+   `pmcp-workbook-compiler` and `pmcp-server-toolkit`, so it
+   must publish AFTER items 5, 11, 13, 13a, 14 and 15 — see the authoritative
+   statement under item 13). Formerly listed as item 12, which
    put it four slots too early; `release.yml` publishes it here, after
    `pmcp-team-servers`.
 
-   **Bumped 0.22.0 -> 0.23.0 by Phase 122 (2026-08-25), in the SAME commit as item
-   13's `pmcp-package` 0.2.0 -> 0.3.0.** Two reasons, both behavioural rather than
+   **Bumped to 0.25.0 by Phase 128 (2026-09-28)**, in the same single D-14 commit
+   as the twelve-crate input-validation release set. A minor: `cargo pmcp validate
+   config` is a new subcommand, and both lint surfaces now print which
+   `pmcp-server-toolkit` version performed the lint.
+
+   **This entry recorded `cargo-pmcp` at the Phase-122 version until 2026-09-28,
+   by which time the tree was three patches past it (measured: 0.24.3).** A stale
+   version here is not cosmetic — it is what a future releaser reads to know
+   whether this crate needs a bump at all.
+
+   **TWO `pmcp-server-toolkit` pins move on every toolkit release, and both are
+   recorded here as of Phase 128 because an unrecorded pin is how the ordering
+   bugs this ledger already documents happened:**
+   - `cargo-pmcp/Cargo.toml`'s DIRECT `pmcp-server-toolkit` edge, added by Phase
+     128 so `validate config` and `validate deploy` report from the toolkit's own
+     `ServerConfig::lint()` rather than the CLI re-deriving the rules. Carries
+     `default-features = false, features = ["input-validation", "http"]` — and
+     `default-features = false` is LOAD-BEARING (the toolkit's `default` includes
+     `code-mode`, which would drag the SWC/JS engine into a widely-installed CLI;
+     `cargo tree -p cargo-pmcp -e normal -i swc_common` must keep finding
+     nothing).
+   - `cargo-pmcp/Cargo.toml`'s `pmcp-workbook-compiler` pin (item 11), which is a
+     TRANSITIVE toolkit edge: the compiler pins `pmcp-server-toolkit` itself. This
+     one is pre-existing and was unrecorded anywhere until Phase 128. It also
+     means the claim that "cargo-pmcp has no dependency on `pmcp-server-toolkit`"
+     is true only DIRECTLY — the toolkit was already in the CLI's graph.
+
+   **Historical, Phase 122 (2026-08-25) — bumped from 0.22.0 to the 0.23 line, in
+   the SAME commit as item 13's `pmcp-package` 0.2.0 -> 0.3.0.** Two reasons, both behavioural rather than
    cosmetic: `cargo pmcp package inspect` now renders a package's attestation
    (three states — attested-and-matching, attested-mismatched, unattested, for both
    the server and team carrier kinds), and it **exits non-zero (measured: exactly
