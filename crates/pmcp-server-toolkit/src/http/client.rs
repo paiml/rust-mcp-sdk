@@ -151,8 +151,16 @@ impl HttpClient {
                 headers.insert(name, val);
             }
         }
+        // T-128-39a (Phase 128 security audit, W3 / review WR-02). reqwest's DEFAULT
+        // is to follow up to 10 redirects, which would carry a governed request to an
+        // endpoint `RequestPolicy` already refused — the exact bypass
+        // `pmcp-openapi-server`'s `dispatch.rs` hardens against. This constructor is
+        // `pub`, so a downstream consumer reaching for the one that honours
+        // `[backend.http]` would otherwise get the un-hardened client. Keep these two
+        // in the same shape; a redirect must be an explicit, policy-checked new request.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(http_config.timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(headers)
             .build()
             .map_err(|_| HttpConnectorError::Backend("failed to build HTTP client".to_string()))?;
