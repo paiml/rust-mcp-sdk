@@ -3520,8 +3520,30 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                             })?;
                     let rendered = shared_json_to_string_with_mode(value, JsonStringMode::Json);
                     // The refusal names the variable IDENTIFIER, which the part
-                    // carries. A script-chosen identifier is operator-shipped
-                    // content, unlike the value.
+                    // carries. This is safe because the identifier is CALLER-CHOSEN,
+                    // not because it is trusted: echoing it back discloses nothing
+                    // the caller does not already know, and the JS identifier grammar
+                    // admits no whitespace, newline or punctuation beyond `$`/`_`, so
+                    // it cannot carry a log-injection payload. The VALUE is always
+                    // redacted. T-128-21b (accept, low) — Phase 128 security audit.
+                    //
+                    // An earlier revision justified this as "a script-chosen identifier
+                    // is operator-shipped content, unlike the value". That was FALSE on
+                    // the `execute_code` surface, whose own tool definition says it
+                    // "runs caller-supplied code" (`handler.rs` `build_execute_tool`),
+                    // and it contradicted this function's own doc 25 lines above
+                    // ("Code Mode scripts are model-authored, so that was the untrusted
+                    // route"). Correcting it is the same documented-but-untrue class
+                    // Phase 128 exists to close, applied to this phase's own comment.
+                    //
+                    // Note the identifier class already reaches the client at three
+                    // other sites (the `Undefined variable in path` message just above,
+                    // and `result_var`/`temp_var` in the two `ApiCall` error wraps), so
+                    // routing ONLY this arm through a positional descriptor would be a
+                    // partial fix that reads as a complete one. The sibling
+                    // `PathPart::Expression` arm below uses a fixed descriptor for a
+                    // different reason: an expression has no name, and rendering its
+                    // body could itself echo caller DATA.
                     floor_layer_one_contribution(var, &rendered)?;
                     result.push_str(&rendered);
                 },
