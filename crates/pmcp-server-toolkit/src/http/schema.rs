@@ -103,6 +103,20 @@ impl Operation {
             .filter(|p| p.location == ParameterLocation::Header)
             .collect()
     }
+
+    /// Body parameters — the declared parameters that travel as fields of the
+    /// JSON request body (Phase 128 CR-02).
+    ///
+    /// Non-empty only when [`Self::has_request_body`] is set, because
+    /// `crate::tools::build_operation` derives both from the one
+    /// `crate::config::method_carries_request_body` predicate.
+    #[must_use]
+    pub fn body_parameters(&self) -> Vec<&Parameter> {
+        self.parameters
+            .iter()
+            .filter(|p| p.location == ParameterLocation::Body)
+            .collect()
+    }
 }
 
 /// A single OpenAPI operation parameter.
@@ -238,6 +252,14 @@ impl Parameter {
 }
 
 /// Where an [`Operation`] parameter is carried in the outgoing request.
+///
+/// Every variant has exactly one consumer in
+/// [`crate::http::HttpClient::execute`], which is what makes this enum a routing
+/// decision rather than a label: [`Self::Path`] is read by `substitute_path`,
+/// [`Self::Query`] by `build_query`, [`Self::Header`] by `build_headers` and
+/// [`Self::Body`] by `build_body`. A parameter carrying a location whose consumer
+/// does not run is a parameter that is silently dropped, which is the defect
+/// Phase 128 CR-02 recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParameterLocation {
@@ -247,6 +269,19 @@ pub enum ParameterLocation {
     Query,
     /// Sent as a request header.
     Header,
+    /// Carried as a field of the JSON request body (Phase 128 CR-02).
+    ///
+    /// Only an operation whose method carries a request body
+    /// (`POST` / `PUT` / `PATCH` — see
+    /// `crate::config::method_carries_request_body`) may place a parameter here;
+    /// `crate::tools::build_operation` reads that one predicate for BOTH this
+    /// assignment and [`Operation::has_request_body`], so a `Body`-located
+    /// parameter on a body-less request is not constructible.
+    ///
+    /// No OpenAPI `in:` value maps here — the spec models a request body as a
+    /// separate `requestBody` object, not as a parameter — so this variant is
+    /// reached only from a curated `[[tools]]` declaration.
+    Body,
 }
 
 /// A parsed OpenAPI document with its [`Operation`] values indexed by

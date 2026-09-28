@@ -972,25 +972,38 @@ fn synthesize_http_inner(
 /// Build the [`Operation`] for a single-call tool from its `path` template,
 /// `method`, declared parameters, and per-tool `base_url`.
 ///
-/// Path parameters are the `{...}` segments of the path template; every other
-/// declared `[[tools.parameters]]` becomes a query parameter (the reference
-/// `create_tool_from_config` mapping). `POST`/`PUT`/`PATCH` carry a request body
-/// so non-path/query args are sent as JSON. The per-tool `base_url` is reflected
-/// onto the [`Operation`] (Codex MEDIUM — never dropped).
+/// Path parameters are the `{...}` segments of the path template. Every other
+/// declared `[[tools.parameters]]` becomes a QUERY parameter, or — when the method
+/// carries a request body (`POST`/`PUT`/`PATCH`) — a
+/// [`ParameterLocation::Body`] parameter that
+/// [`crate::http::HttpClient`]'s `build_body` folds into the JSON payload. The
+/// per-tool `base_url` is reflected onto the [`Operation`] (Codex MEDIUM — never
+/// dropped).
 ///
-/// # Relationship to `ToolDecl::param_position` (Phase 128)
+/// # Agreement with `ToolDecl::param_position` — structural, not documentary
 ///
-/// The PATH split here and [`crate::config::ToolDecl::param_position`]'s `Path` arm
-/// read the SAME [`crate::config::path_placeholder_names`] helper, so they cannot
-/// drift — a drift would silently mis-scope the D3 cap and the D4 placeholder rules.
+/// Both splits this function performs read a shared helper, so neither can drift
+/// from [`crate::config::ToolDecl::param_position`]:
 ///
-/// The QUERY assignment below deliberately DIVERGES from `param_position`: this
-/// function marks every non-path declared parameter `ParameterLocation::Query`
-/// regardless of method (its Phase 90 behaviour, unchanged), while `param_position`
-/// classifies a `POST`/`PUT`/`PATCH` tool's non-path parameters as `Body`. The two
-/// answer different questions — where a value TRAVELS versus where LENGTH is
-/// dangerous — and capping a mutating tool's free-text payload field at 256 code
-/// points is the breakage D-05 exists to avoid. Do not "reconcile" them.
+/// - the PATH split and `param_position`'s `Path` arm both read
+///   [`crate::config::path_placeholder_names`];
+/// - the QUERY/BODY split and `param_position`'s `Query`/`Body` arms both read
+///   `crate::config::method_carries_request_body`, which is also the sole source of
+///   [`Operation::has_request_body`].
+///
+/// That second agreement is Phase 128 CR-02/CR-03. Before it, this function marked
+/// every non-path declared parameter `ParameterLocation::Query` regardless of
+/// method while `param_position` classified a mutating tool's as `Body`, and the
+/// divergence was documented here as deliberate. It was not survivable: a `POST`
+/// tool's declared parameters travelled in the URL — so the D3 cap was withheld
+/// from values that genuinely land in a request line — and `build_body`, which
+/// collects only args ABSENT from `operation.parameters`, found nothing, so no
+/// payload reached the backend at all once `additionalProperties: false` began to
+/// be enforced.
+///
+/// D-05 is still honoured, and now by the routing rather than despite it: a
+/// `Body`-located parameter really is a payload field, and
+/// `crate::config::default_cap_applies` emits no default `maxLength` for it.
 #[cfg(feature = "http")]
 fn build_operation(path: &str, method: &str, decl: &ToolDecl) -> Operation {
     let method_upper = method.to_uppercase();
@@ -1015,21 +1028,31 @@ fn build_operation(path: &str, method: &str, decl: &ToolDecl) -> Operation {
             ),
         );
     }
-    // Remaining declared params → query params.
+    // Remaining declared params → the QUERY STRING, or the JSON BODY when the
+    // method carries one (Phase 128 CR-02).
+    //
+    // `has_request_body` and this location are derived from the SAME
+    // `method_carries_request_body` predicate `ToolDecl::param_position` reads, so
+    // a `Body`-located parameter on a body-less request is not constructible and
+    // the D3 cap's scope cannot drift from the request's actual routing.
+    let has_request_body = crate::config::method_carries_request_body(&method_upper);
+    let non_path_location = if has_request_body {
+        ParameterLocation::Body
+    } else {
+        ParameterLocation::Query
+    };
     for p in &decl.parameters {
         if path_param_names.iter().any(|n| *n == p.name) {
             continue;
         }
         parameters.push(
-            Parameter::new(p.name.clone(), ParameterLocation::Query, p.required).with_rules(
+            Parameter::new(p.name.clone(), non_path_location, p.required).with_rules(
                 p.pattern.clone(),
                 p.max_length,
                 p.allow_slash,
             ),
         );
     }
-
-    let has_request_body = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH");
 
     Operation {
         method: method_upper,
@@ -2118,6 +2141,86 @@ mod build_operation {
         assert_eq!(rules.declared_pattern, Some("^[a-z/]+$"));
         assert_eq!(rules.declared_max_length, Some(128));
         assert!(rules.allow_slash);
+    }
+
+    /// Phase 128 CR-02 — a body-bearing method routes its non-path declared
+    /// parameters to [`ParameterLocation::Body`], not to the query string.
+    ///
+    /// Before the fix every one of these was `Query`, so the payload
+    /// `build_body` assembles was empty and the values travelled in the URL.
+    #[test]
+    fn build_operation_routes_a_post_non_path_param_to_the_body() {
+        for method in ["POST", "PUT", "PATCH", "post"] {
+            let mut d = decl(
+                "/issues/{id}/comments",
+                vec![
+                    ParamDecl {
+                        name: "id".to_string(),
+                        param_type: Some("string".to_string()),
+                        required: true,
+                        ..Default::default()
+                    },
+                    ParamDecl {
+                        name: "body_text".to_string(),
+                        param_type: Some("string".to_string()),
+                        required: true,
+                        ..Default::default()
+                    },
+                ],
+            );
+            d.method = Some(method.to_string());
+            let op = super::build_operation("/issues/{id}/comments", method, &d);
+            assert!(
+                op.has_request_body,
+                "{method} carries a request body by definition"
+            );
+            assert_eq!(param_named(&op, "id").location, ParameterLocation::Path);
+            assert_eq!(
+                param_named(&op, "body_text").location,
+                ParameterLocation::Body,
+                "{method}: a non-path declared parameter must be routed to the payload"
+            );
+            assert_eq!(
+                op.body_parameters().len(),
+                1,
+                "{method}: exactly the one non-path parameter is a body parameter"
+            );
+            assert!(
+                op.query_parameters().is_empty(),
+                "{method}: nothing may travel in the query string as well"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a method that carries NO request body has
+    /// nowhere but the URL to put a non-path parameter, so it stays `Query`. Without
+    /// this row the fix above is satisfiable by routing everything to the body,
+    /// which would drop a `GET` tool's parameters entirely.
+    #[test]
+    fn build_operation_keeps_a_body_less_method_non_path_param_in_the_query() {
+        for method in ["GET", "HEAD", "DELETE", "OPTIONS"] {
+            let mut d = decl(
+                "/search",
+                vec![ParamDecl {
+                    name: "q".to_string(),
+                    param_type: Some("string".to_string()),
+                    required: true,
+                    ..Default::default()
+                }],
+            );
+            d.method = Some(method.to_string());
+            let op = super::build_operation("/search", method, &d);
+            assert!(!op.has_request_body, "{method} carries no request body");
+            assert_eq!(
+                param_named(&op, "q").location,
+                ParameterLocation::Query,
+                "{method}: a non-path parameter must stay in the query string"
+            );
+            assert!(
+                op.body_parameters().is_empty(),
+                "{method}: a body-less request can have no body parameter"
+            );
+        }
     }
 }
 

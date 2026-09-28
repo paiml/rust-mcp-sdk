@@ -10,7 +10,7 @@
 //! never echo the URL or a credential (Pitfall 5).
 
 use super::auth::HttpAuthProvider;
-use super::{join_url, HttpConnector, HttpConnectorError, Operation, Parameter};
+use super::{join_url, HttpConnector, HttpConnectorError, Operation, Parameter, ParameterLocation};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -331,7 +331,32 @@ impl HttpClient {
         Ok(headers)
     }
 
-    /// Collect the request body: args that are NOT path/query/header params.
+    /// Collect the request body: every arg that is not routed somewhere else.
+    ///
+    /// An arg belongs in the payload when it is either a declared
+    /// [`ParameterLocation::Body`] parameter — which is what `build_operation`
+    /// assigns to a `POST`/`PUT`/`PATCH` tool's non-path parameters — or an
+    /// UNDECLARED key, which only reaches here when the tool's schema was built
+    /// with `[server.validation] additional_properties = true`. A `Path`, `Query`
+    /// or `Header`-located parameter is withheld, because it already travels in the
+    /// URL or the headers.
+    ///
+    /// # Phase 128 CR-02
+    ///
+    /// The `Body`-located half is the fix. Before it, `build_operation` marked every
+    /// non-path declared parameter `Query`, so the `declared` exclusion below
+    /// withheld ALL of them and the only route to a payload was an undeclared key —
+    /// which `additionalProperties: false`, enforced for the first time in this
+    /// release, refuses. A curated mutating tool could accept a payload and send
+    /// none of it.
+    ///
+    /// # The reserved `body` key (WR-10)
+    ///
+    /// `"body"` is a reserved argument name: when present it becomes the ENTIRE
+    /// payload verbatim rather than one field of it. It is no longer also appended
+    /// to the query string, because on a body-bearing method a declared parameter
+    /// named `body` is now `Body`-located and `build_query` only reads
+    /// `Query`-located ones.
     fn build_body(
         operation: &Operation,
         args: &serde_json::Map<String, serde_json::Value>,
@@ -342,14 +367,15 @@ impl HttpClient {
         if let Some(body) = args.get("body") {
             return Some(body.clone());
         }
-        let declared: std::collections::HashSet<&str> = operation
+        let routed_elsewhere: std::collections::HashSet<&str> = operation
             .parameters
             .iter()
+            .filter(|p| p.location != ParameterLocation::Body)
             .map(|p| p.name.as_str())
             .collect();
         let body: serde_json::Map<String, serde_json::Value> = args
             .iter()
-            .filter(|(k, _)| !declared.contains(k.as_str()))
+            .filter(|(k, _)| !routed_elsewhere.contains(k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if body.is_empty() {
@@ -1406,6 +1432,77 @@ mod tests {
         let args = serde_json::json!({"name": "widget"});
         let result = client.execute(&op, &args).await.unwrap();
         assert_eq!(result["ok"], true);
+    }
+
+    /// Phase 128 CR-02 — a DECLARED `Body`-located parameter reaches the JSON
+    /// payload, and does NOT also reach the query string.
+    ///
+    /// The row above proves only the UNDECLARED route (`parameters: vec![]`), which
+    /// is the route `additionalProperties: false` closed. This one declares the
+    /// parameters, which is the shape `build_operation` actually synthesizes.
+    #[tokio::test]
+    async fn http_connector_post_sends_declared_body_parameters_as_the_payload() {
+        use wiremock::matchers::{body_json, method, path, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/items"))
+            .and(body_json(
+                serde_json::json!({"name": "widget", "note": "free text"}),
+            ))
+            // The value must travel ONCE. Before CR-02 a declared parameter was
+            // `Query`-located, so it was appended here instead.
+            .and(query_param_is_missing("name"))
+            .and(query_param_is_missing("note"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let client =
+            HttpClient::new(reqwest::Client::new(), server.uri(), Arc::new(NoAuth)).unwrap();
+        let op = Operation {
+            method: "POST".to_string(),
+            path: "/items".to_string(),
+            parameters: vec![
+                Parameter::new("name", ParameterLocation::Body, true),
+                Parameter::new("note", ParameterLocation::Body, false),
+            ],
+            has_request_body: true,
+            base_url: None,
+        };
+        let args = serde_json::json!({"name": "widget", "note": "free text"});
+        let result = client.execute(&op, &args).await.unwrap();
+        assert_eq!(result["ok"], true);
+    }
+
+    /// Phase 128 CR-02 — a `Query`-located parameter on a body-bearing method is
+    /// still a query parameter and is still withheld from the payload, so the fix
+    /// is a ROUTING change rather than "everything goes in the body now".
+    #[test]
+    fn build_body_withholds_a_query_located_parameter_on_a_post() {
+        let op = Operation {
+            method: "POST".to_string(),
+            path: "/items".to_string(),
+            parameters: vec![
+                Parameter::new("dry_run", ParameterLocation::Query, false),
+                Parameter::new("name", ParameterLocation::Body, true),
+            ],
+            has_request_body: true,
+            base_url: None,
+        };
+        let args = serde_json::json!({"dry_run": "true", "name": "widget"})
+            .as_object()
+            .expect("object")
+            .clone();
+        let body = HttpClient::build_body(&op, &args).expect("a body is built");
+        assert_eq!(body, serde_json::json!({"name": "widget"}));
+        let query = HttpClient::build_query(&op, &args).expect("a query is built");
+        assert_eq!(query.get("dry_run").map(String::as_str), Some("true"));
+        assert!(
+            !query.contains_key("name"),
+            "a Body-located parameter must not reach the query string: {query:?}"
+        );
     }
 
     #[tokio::test]

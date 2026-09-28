@@ -1711,17 +1711,34 @@ impl ToolDecl {
             }
         }
         match self.method.as_deref() {
-            Some(m) if QUERY_BEARING_METHODS.contains(&m.to_uppercase().as_str()) => {
-                ParamPosition::Query
-            },
-            _ => ParamPosition::Body,
+            // A body-bearing method routes its non-path inputs into the JSON
+            // payload, so length there is D-05 free text.
+            Some(m) if method_carries_request_body(m) => ParamPosition::Body,
+            // Every OTHER HTTP method has nowhere but the URL to put them.
+            Some(_) => ParamPosition::Query,
+            // No method at all: a SQL named bind or a script-tool argument.
+            None => ParamPosition::Body,
         }
     }
 }
 
-/// HTTP methods whose non-path inputs genuinely travel in the query string, and
-/// where an unbounded value is therefore dangerous rather than merely large.
-const QUERY_BEARING_METHODS: [&str; 3] = ["GET", "HEAD", "DELETE"];
+/// HTTP methods whose non-path inputs travel as fields of the JSON request body.
+///
+/// The ONE definition of that rule. `tools.rs::build_operation` reads it through
+/// [`method_carries_request_body`] for BOTH `Operation::has_request_body` and the
+/// `ParameterLocation::Body` assignment, and [`ToolDecl::param_position`] reads the
+/// same predicate to decide where LENGTH is dangerous — so the request's routing
+/// and the D3 cap's scope cannot drift apart. Phase 128 CR-02/CR-03 is the record
+/// of what that drift cost: a `POST` tool's declared parameters were marked
+/// `ParameterLocation::Query` while being classified `ParamPosition::Body`, so they
+/// travelled in the URL uncapped and no payload ever reached the backend.
+const BODY_BEARING_METHODS: [&str; 3] = ["POST", "PUT", "PATCH"];
+
+/// Whether `method` carries a JSON request body — the one predicate behind
+/// [`BODY_BEARING_METHODS`]. Case-insensitive on the method name.
+pub(crate) fn method_carries_request_body(method: &str) -> bool {
+    BODY_BEARING_METHODS.contains(&method.to_uppercase().as_str())
+}
 
 /// The `{name}` placeholder segments of a single-call tool's `path` template.
 ///
