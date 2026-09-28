@@ -2222,6 +2222,111 @@ mod build_operation {
             );
         }
     }
+
+    /// Phase 128 CR-03 — the D3 cap's POSITION and the request's ROUTING agree for
+    /// EVERY method this connector can send, so the cap can no longer be withheld
+    /// from a value that travels in the query string.
+    ///
+    /// This is the row that would have caught the original defect: it does not
+    /// assert a particular location, it asserts the PAIRING. Before the fix
+    /// `param_position` said `Body` for `POST` while `build_operation` said `Query`,
+    /// and `apply_position_cap` emitted nothing for `Body` — so a `POST` parameter
+    /// reached the request line with no `maxLength`.
+    ///
+    /// Fails on removal: point either side at its own method list again and the
+    /// `POST`/`PUT`/`PATCH` rows (or the `OPTIONS` row) go red.
+    #[test]
+    fn param_position_agrees_with_the_built_parameter_location_for_every_method() {
+        use crate::config::ParamPosition;
+
+        // Every method `HttpClient::convert_method` accepts.
+        for method in [
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "patch",
+        ] {
+            let mut d = decl(
+                "/things/{id}",
+                vec![
+                    ParamDecl {
+                        name: "id".to_string(),
+                        param_type: Some("string".to_string()),
+                        required: true,
+                        ..Default::default()
+                    },
+                    ParamDecl {
+                        name: "note".to_string(),
+                        param_type: Some("string".to_string()),
+                        required: false,
+                        ..Default::default()
+                    },
+                ],
+            );
+            d.method = Some(method.to_string());
+            let op = super::build_operation("/things/{id}", method, &d);
+
+            for p in &op.parameters {
+                let expected_location = match d.param_position(&p.name) {
+                    ParamPosition::Path => ParameterLocation::Path,
+                    ParamPosition::Query => ParameterLocation::Query,
+                    ParamPosition::Body => ParameterLocation::Body,
+                };
+                assert_eq!(
+                    p.location,
+                    expected_location,
+                    "{method}: `{}` is {:?} for the D3 cap but {:?} on the wire — the cap's \
+                     scope and the request's routing must not disagree",
+                    p.name,
+                    d.param_position(&p.name),
+                    p.location
+                );
+            }
+
+            // And the routing is self-consistent: a Body location exists exactly
+            // when the request carries a body.
+            assert_eq!(
+                op.has_request_body,
+                !op.body_parameters().is_empty(),
+                "{method}: a Body-located parameter on a body-less request would be \
+                 silently dropped"
+            );
+        }
+    }
+
+    /// The consequence CR-03 is really about: the D3 default `maxLength` is emitted
+    /// for a parameter that travels in the query string and withheld from one that
+    /// travels in the JSON payload — checked against the BUILT location rather than
+    /// against a method list, so the two cannot drift.
+    #[test]
+    fn the_default_cap_is_emitted_exactly_where_the_value_travels_in_the_url() {
+        use crate::config::{default_cap_applies, ValidationSection};
+
+        let validation = ValidationSection::default();
+        assert_ne!(
+            validation.default_max_length, 0,
+            "the default cap must be on for this row to mean anything"
+        );
+
+        for method in ["GET", "HEAD", "DELETE", "OPTIONS", "POST", "PUT", "PATCH"] {
+            let param = ParamDecl {
+                name: "note".to_string(),
+                param_type: Some("string".to_string()),
+                required: false,
+                ..Default::default()
+            };
+            let mut d = decl("/things", vec![param.clone()]);
+            d.method = Some(method.to_string());
+            let op = super::build_operation("/things", method, &d);
+            let location = param_named(&op, "note").location;
+            let capped = default_cap_applies(&param, d.param_position("note"), &validation);
+
+            assert_eq!(
+                capped,
+                location == ParameterLocation::Query,
+                "{method}: an uncapped string in a {location:?} position is the CR-03 defect \
+                 when that position is the query string, and the D-05 requirement when it is \
+                 the payload"
+            );
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

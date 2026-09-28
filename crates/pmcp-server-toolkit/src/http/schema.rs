@@ -254,7 +254,7 @@ impl Parameter {
 /// Where an [`Operation`] parameter is carried in the outgoing request.
 ///
 /// Every variant has exactly one consumer in
-/// [`crate::http::HttpClient::execute`], which is what makes this enum a routing
+/// [`crate::http::HttpConnector::execute`], which is what makes this enum a routing
 /// decision rather than a label: [`Self::Path`] is read by `substitute_path`,
 /// [`Self::Query`] by `build_query`, [`Self::Header`] by `build_headers` and
 /// [`Self::Body`] by `build_body`. A parameter carrying a location whose consumer

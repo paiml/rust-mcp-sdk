@@ -1654,29 +1654,40 @@ impl ToolDecl {
     /// # Derivation
     ///
     /// - The name appears as a `{name}` segment of [`Self::path`] -> [`ParamPosition::Path`].
-    /// - Else [`Self::method`] is `GET`, `HEAD` or `DELETE` -> [`ParamPosition::Query`].
-    /// - Else [`ParamPosition::Body`] — which covers `POST`/`PUT`/`PATCH` payload
-    ///   fields, SQL named binds, and script-tool arguments alike.
+    /// - Else [`Self::method`] carries a request body (`method_carries_request_body`:
+    ///   `POST`, `PUT`, `PATCH`) -> [`ParamPosition::Body`].
+    /// - Else there IS a method -> [`ParamPosition::Query`]. A method with no
+    ///   request body has nowhere but the URL to carry a non-path input, `OPTIONS`
+    ///   included.
+    /// - Else (no method at all) -> [`ParamPosition::Body`]: a SQL named bind or a
+    ///   script-tool argument.
     ///
-    /// # Coupling with `tools.rs::build_operation` — and the DELIBERATE divergence
+    /// # Coupling with `tools.rs::build_operation` — structural, not documentary
     ///
-    /// The PATH arm must agree with `tools.rs::build_operation`'s `path_param_names`
-    /// derivation exactly, because a divergence there would silently mis-scope the
-    /// cap and, worse, mis-scope the D4 placeholder rules that share the same
-    /// notion of "this value lands in the URL". That agreement is structural, not
-    /// documentary: both read the same [`path_placeholder_names`] helper. A unit
-    /// test additionally asserts agreement for a single-call tool.
+    /// Both of this function's splits agree with `build_operation` because both
+    /// read the same helper, not because a comment says so:
     ///
-    /// The QUERY/BODY split for NON-path parameters deliberately does NOT match
-    /// `build_operation`, which marks every non-path declared parameter
-    /// `ParameterLocation::Query` regardless of method. That is not a bug in either
-    /// function and must not be "fixed": the two answer different questions.
-    /// `build_operation` answers *where does this value travel* — and a `POST`
-    /// tool's `Operation` has carried `Query` for its non-path parameters since
-    /// Phase 90. `param_position` answers *where is length dangerous*. Applying a
-    /// hard 256-code-point cap to a `POST` tool's `comment` or `body_text` field
-    /// would break exactly the free-text parameters D-05 exists to protect, so a
-    /// mutating method's non-path parameters are `Body` here.
+    /// - the PATH arm and `build_operation`'s `path_param_names` both read
+    ///   `path_placeholder_names`;
+    /// - the QUERY/BODY arms and `build_operation`'s `ParameterLocation` assignment
+    ///   both read `method_carries_request_body`, which is also the sole source of
+    ///   `Operation::has_request_body`.
+    ///
+    /// The second agreement is Phase 128 CR-02/CR-03, and it replaced a documented
+    /// "deliberate divergence" that did not survive measurement. `build_operation`
+    /// used to mark every non-path declared parameter `ParameterLocation::Query`
+    /// regardless of method while this function answered `Body` for a mutating tool
+    /// — justified on the grounds that the two questions ("where does the value
+    /// TRAVEL" versus "where is LENGTH dangerous") are different. They are, but the
+    /// answers were both wrong: the value travelled in the query string, so the D3
+    /// cap was withheld from a genuine request-line input on the stated grounds
+    /// that it was a payload field, and `build_body` — which collected only args
+    /// absent from `operation.parameters` — sent no payload at all.
+    ///
+    /// D-05 is still honoured, and now BY the routing rather than despite it: a
+    /// `Body` position means the value really is a JSON payload field, and
+    /// `default_cap_applies` emits no default `maxLength` for it. The escape for
+    /// a long `Query` value remains an explicit per-parameter `max_length`.
     ///
     /// # Examples
     ///
@@ -1758,27 +1769,39 @@ pub(crate) fn path_placeholder_names(path: &str) -> impl Iterator<Item = &str> {
 /// Where a declared parameter's value lands, for the purposes of the D3 default
 /// length cap (Phase 128).
 ///
-/// See [`ToolDecl::param_position`] for the derivation and for why the
-/// query/body split deliberately differs from `tools.rs::build_operation`'s
-/// `ParameterLocation`.
+/// For a single-call HTTP tool this is the SAME answer
+/// `tools.rs::build_operation` gives as a `crate::http::ParameterLocation` — both
+/// derive it from `path_placeholder_names` and `method_carries_request_body`.
+/// See [`ToolDecl::param_position`] for the derivation and for what the previous
+/// divergence between the two cost (CR-02/CR-03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamPosition {
     /// A `{name}` segment of the tool's `path` template. Capped by default: a long
     /// value here has no legitimate use and is where the path-traversal class lives.
     Path,
-    /// A non-path parameter of a `GET` / `HEAD` / `DELETE` tool, which travels in
-    /// the query string.
+    /// A non-path parameter of a tool whose method carries NO request body —
+    /// `GET`, `HEAD`, `DELETE`, `OPTIONS` — so the value travels in the query
+    /// string. `tools.rs::build_operation` gives it
+    /// `crate::http::ParameterLocation::Query` and
+    /// `crate::http::HttpClient::build_query` appends it to the URL.
     ///
-    /// Capped at `[server.validation] default_max_length` code points by default.
-    /// If a search tool starts refusing long queries after upgrading, this is why —
-    /// declare an explicit `max_length` on that parameter to raise the limit.
+    /// Capped at `[server.validation] default_max_length` code points by default,
+    /// by `default_cap_applies`, because an unbounded query value is an unbounded
+    /// request line: a 414 on some gateways, a truncation on others, and an
+    /// access-log amplification everywhere. If a search tool starts refusing long
+    /// queries after upgrading, this is why — declare an explicit `max_length` on
+    /// that parameter to raise the limit.
     Query,
-    /// Everything else: a `POST` / `PUT` / `PATCH` payload field, a SQL named bind,
-    /// a script-tool argument.
+    /// A `POST` / `PUT` / `PATCH` payload field, a SQL named bind, or a script-tool
+    /// argument.
     ///
-    /// NOT capped by default (D-05 — free text must keep working). Surfaced by
-    /// [`ServerConfig::lint`] and promotable to an error by
-    /// `[server.validation] strict`.
+    /// For a single-call HTTP tool this is a genuine JSON payload field:
+    /// `tools.rs::build_operation` gives it
+    /// `crate::http::ParameterLocation::Body` and
+    /// `crate::http::HttpClient::build_body` folds it into the request body. It
+    /// reaches no request line, which is why it is NOT capped by default
+    /// (D-05 — free text must keep working). Surfaced by [`ServerConfig::lint`] and
+    /// promotable to an error by `[server.validation] strict`.
     Body,
 }
 
@@ -3348,8 +3371,11 @@ mod tests {
             );
         }
 
-        // Deliberate divergence: a mutating method's non-path parameter is BODY
-        // here while `build_operation` still marks it `ParameterLocation::Query`.
+        // A mutating method's non-path parameter is BODY here AND
+        // `ParameterLocation::Body` in `build_operation` — the two agree by
+        // construction since CR-02/CR-03 (see
+        // `param_position_agrees_with_the_built_parameter_location_for_every_method`
+        // in `tools.rs::mod build_operation`, which asserts the pairing directly).
         let post_tool = ToolDecl {
             name: "add_comment".to_string(),
             path: Some("/issues/{id}/comments".to_string()),
@@ -3358,6 +3384,27 @@ mod tests {
         };
         assert_eq!(post_tool.param_position("id"), ParamPosition::Path);
         assert_eq!(post_tool.param_position("body_text"), ParamPosition::Body);
+
+        // A method that carries NO request body puts its non-path input in the URL,
+        // `OPTIONS` included. Before CR-03 this returned `Body` — so the D3 cap was
+        // withheld from a value `build_operation` sent in the query string.
+        let options_tool = ToolDecl {
+            name: "probe".to_string(),
+            path: Some("/issues/{id}".to_string()),
+            method: Some("OPTIONS".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(options_tool.param_position("id"), ParamPosition::Path);
+        assert_eq!(options_tool.param_position("detail"), ParamPosition::Query);
+
+        // No method at all is still BODY: a SQL named bind or a script-tool
+        // argument, neither of which has a URL to travel in.
+        let sql_tool = ToolDecl {
+            name: "q".to_string(),
+            sql: Some("SELECT :id".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(sql_tool.param_position("id"), ParamPosition::Body);
     }
 
     /// `{}` is not a placeholder, and a brace pair inside a larger segment is not
