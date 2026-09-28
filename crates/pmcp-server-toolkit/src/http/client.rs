@@ -981,6 +981,32 @@ mod placeholder_floor {
         assert_eq!(resolved, "/Line/Mode/tube/Status");
     }
 
+    /// Phase 128 CR-01 — a root operation is callable on the curated surface.
+    ///
+    /// `substitute_path` calls `check_composed_path` UNCONDITIONALLY, so before the
+    /// core fix a spec declaring `paths: { "/": { get: … } }` — a health or index
+    /// endpoint — failed every `tools/call` with `param 'path segment' must not be
+    /// empty`. This is the caller-side row for the core exemption; the trailing-slash
+    /// refusal it must not re-open is asserted immediately below.
+    #[test]
+    fn placeholder_floor_accepts_the_root_path_and_still_refuses_a_trailing_slash() {
+        let resolved = HttpClient::substitute_path(&op("/", vec![]), &serde_json::Map::new())
+            .expect("a `GET /` operation must be callable — the root is the shortest legal path");
+        assert_eq!(resolved, "/");
+
+        // An empty tail placeholder composes to a trailing `/`, which stays refused.
+        let err = substitute_one("/search/{v}", "v", "")
+            .expect_err("an empty tail placeholder must stay refused");
+        assert!(
+            matches!(err, HttpConnectorError::Backend(_)),
+            "the refusal is a Backend error naming the position: {err}"
+        );
+        assert!(
+            HttpClient::substitute_path(&op("/search/", vec![]), &serde_json::Map::new()).is_err(),
+            "a literal trailing slash in the template stays refused by decision"
+        );
+    }
+
     /// A refusal on the SECOND of two placeholders aborts with no
     /// partially-substituted path in existence — the first value is rendered and
     /// checked but nothing is applied until every value has passed.

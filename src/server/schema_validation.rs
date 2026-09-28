@@ -751,6 +751,23 @@ pub fn validate_path_placeholder(
 /// refused — an unsubstituted placeholder reaching the wire is its own defect —
 /// and `?`, `#`, a backslash and any control byte are refused anywhere.
 ///
+/// # The three empty-segment cases, decided rather than derived
+///
+/// The segment split reports an empty slice in three different situations, and
+/// they get three different answers on purpose:
+///
+/// | Path | Verdict | Why |
+/// |---|---|---|
+/// | `/` | ACCEPTED | the absolute root has no segments; it is the shortest legal absolute path and the target of a `GET /` operation |
+/// | `/a//b` | refused | a doubled separator changes the endpoint shape |
+/// | `/a/b/` | refused | this is what `/search/{v}` composes to when `v` is empty — the empty-placeholder-at-the-tail case |
+///
+/// The first was a defect until Phase 128 CR-01: it fell out of the index
+/// arithmetic (only index 0 is exempt, and a bare `/` produces empty slices at
+/// indices 0 AND 1) rather than out of a decision, so `validate_resolved_path("/")`
+/// refused and every call to a root operation failed at runtime with the
+/// param-agnostic `param 'path segment' must not be empty`.
+///
 /// The refusal is param-agnostic: it carries the fixed position `path segment`
 /// rather than a caller-supplied name, because the composition belongs to no
 /// single parameter.
@@ -779,6 +796,22 @@ pub fn validate_resolved_path(path: &str) -> Result<(), PlaceholderRefusal> {
 /// Per-segment half of [`validate_resolved_path`], split out to keep both
 /// functions inside the cognitive-complexity budget.
 fn check_resolved_segments(decoded: &[u8]) -> Result<(), PlaceholderRefusal> {
+    // The absolute root is a legal path with NO segments at all — the shortest
+    // legal absolute path, and the target of the `GET /` health/index operation
+    // every second `OpenAPI` document declares. `[b'/'].split(b'/')` reports it as
+    // TWO empty slices (before and after the separator), and only index 0 is
+    // exempt, so without this the root path is refused with the param-agnostic
+    // `must not be empty` on every single request.
+    //
+    // Deliberately an equality test on the WHOLE decoded path rather than a
+    // relaxation of the empty-segment rule: `//` and a trailing `/` stay refused,
+    // both by decision. `/a/b/` is what `/search/{v}` composes to when `v` is
+    // empty, which is the case the non-leading-empty rule exists to close, and a
+    // doubled separator changes the endpoint shape. Asserted in both directions by
+    // `resolved_path_accepts_the_absolute_root_and_still_refuses_doubled_and_trailing`.
+    if decoded == b"/" {
+        return Ok(());
+    }
     let leading_slash = decoded.first() == Some(&b'/');
     for (index, segment) in decoded.split(|byte| *byte == b'/').enumerate() {
         check_one_resolved_segment(segment, index == 0 && leading_slash)?;
@@ -1762,6 +1795,50 @@ mod tests {
         assert!(validate_resolved_path("/a/b/").is_err(), "empty trailing");
         assert!(validate_resolved_path("/a/b").is_ok(), "a clean path");
         assert!(validate_resolved_path("/content/current/CUI/C0018787").is_ok());
+    }
+
+    /// Phase 128 CR-01 — the absolute root is a legal path, and exempting it must
+    /// not re-admit either of the two empty-segment shapes that are refused BY
+    /// DECISION.
+    ///
+    /// The accept half and the two refuse halves are one test on purpose: the
+    /// accept alone is satisfiable by relaxing the non-leading-empty rule, which
+    /// would silently re-open `/a/b/` — the composed form of `/search/{v}` with an
+    /// empty `v`, i.e. the exact case that rule was written to close.
+    ///
+    /// Fails on removal: delete the `decoded == b"/"` exemption in
+    /// `check_resolved_segments` and the first assertion reports
+    /// `param 'path segment' must not be empty`.
+    #[test]
+    fn resolved_path_accepts_the_absolute_root_and_still_refuses_doubled_and_trailing() {
+        // ACCEPT: the root, in the two spellings that decode to a bare `/`.
+        for path in ["/", "%2F"] {
+            assert!(
+                validate_resolved_path(path).is_ok(),
+                "the absolute root is the shortest legal absolute path, and a `GET /` \
+                 operation must be callable: {path:?} -> {:?}",
+                validate_resolved_path(path)
+            );
+        }
+
+        // STILL REFUSED, by decision — a doubled separator changes the endpoint
+        // shape, and a trailing `/` is what an empty tail placeholder composes to.
+        for path in ["//", "///", "/a/b/", "/a//b", "/a/", "/search/"] {
+            let refusal =
+                validate_resolved_path(path).expect_err(&format!("must stay refused: {path:?}"));
+            assert_eq!(
+                refusal.rule, "pathSegment",
+                "the empty-segment refusal keeps its rule token: {path:?}"
+            );
+        }
+
+        // The exemption is an EQUALITY test on the whole decoded path, so it cannot
+        // be reached by a path that merely starts or ends with the root.
+        assert!(validate_resolved_path("/a").is_ok());
+        assert!(
+            validate_resolved_path("").is_err(),
+            "an empty composed path is not the root and has no endpoint"
+        );
     }
 
     #[test]
