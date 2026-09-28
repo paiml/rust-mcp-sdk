@@ -58,3 +58,49 @@ corpus/oauth_authorization_response/*
 corpus/oauth_credential_and_dcr/*
 !corpus/oauth_credential_and_dcr/README.md
 !corpus/oauth_credential_and_dcr/seed_*
+
+# EXCEPTION (Phase 128-10, SC-7 / T-128-47): the hand-written SEED corpus for
+# `fuzz_input_schema_enforcement`. Its input format is length-prefixed precisely
+# so seeds can be written by hand and committed — without them the target
+# overwhelmingly explores inputs where neither document parses as JSON and
+# degenerates into a JSON-parser fuzz that never reaches validation, the same
+# degeneracy `fuzz_schema_draft_pin` records above.
+#
+# Each seed additionally chooses the target's BOUNDED SCHEMA PROJECTION through
+# the keywords its own schema document declares (`additionalProperties`,
+# `maxLength`, `pattern`, `required`, `patternProperties`, `enum`, `format`,
+# array `items`), so the corpus covers every arm of the refusal renderer rather
+# than only the JSON-parse boundary. The two PHI-shaped-key seeds (`01`, `05`) are
+# the `safe_pointer` redaction cases; `09` is the uncompilable-declared-pattern
+# case, whose refusal must stay detail-free.
+#
+# MEASURED, not reasoned: the un-ignore is necessary. `git check-ignore -v
+# fuzz/corpus/fuzz_input_schema_enforcement` matched `fuzz/.gitignore:7`
+# (`corpus/*`) before these four lines existed, so the seeds this plan requires
+# would have been silently untracked — a corpus the repository cannot carry is not
+# a corpus.
+#
+# Only the README and the numbered seed files are tracked; anything else in that
+# directory is a unit libFuzzer discovered at runtime and stays ignored, so a
+# local fuzzing session never dirties the working tree.
+!corpus/fuzz_input_schema_enforcement/
+corpus/fuzz_input_schema_enforcement/*
+!corpus/fuzz_input_schema_enforcement/README.md
+!corpus/fuzz_input_schema_enforcement/[0-9][0-9]_*
+
+# EXCEPTION (Phase 128-10, T-128-48): the hand-written SEED corpus for
+# `fuzz_placeholder_pattern_redos`. Same length-prefix argument as above, plus one
+# specific to this target: the four classic catastrophic-backtracking shapes
+# (`(a+)+`, `(a|aa)+`, `([0-9]+)*`, `((a)*)*`) are vanishingly unlikely to be
+# discovered from random bytes, and they are precisely what RESEARCH assumption A2
+# is about. A LOOK for A2 that cannot reach a nested quantifier is not a look.
+#
+# `05` is the benign ACCEPT control (a real version pattern that matches), `06` is
+# the D-10 ordering control (a permissive `^.*$` must not widen the character
+# floor), and `08` is the uncompilable-pattern case.
+#
+# Only the README and the numbered seed files are tracked.
+!corpus/fuzz_placeholder_pattern_redos/
+corpus/fuzz_placeholder_pattern_redos/*
+!corpus/fuzz_placeholder_pattern_redos/README.md
+!corpus/fuzz_placeholder_pattern_redos/[0-9][0-9]_*

@@ -365,3 +365,57 @@ path = "fuzz_targets/fuzz_workflow_projection.rs"
 test = false
 doc = false
 bench = false
+
+# Phase 128-10 (SC-7, T-128-47): the `tools/call` INPUT-schema enforcement path
+# and its value-free refusal renderer. `pmcp-server-toolkit` calls
+# `validate_input` on every config-synthesized tool call and hands
+# `render_refusal`'s output back to the MCP client; callers of that module handle
+# PHI, so "the refusal contains no byte of the rejected value and no
+# attacker-supplied key" is a hard prohibition. A dozen fixtures assert it one
+# keyword at a time; this target asserts it over arbitrary bytes, which is the
+# only form that survives a future renderer edit.
+#
+# The oracle is PROVENANCE-based (a per-case sentinel), not absence-based — see
+# the target's header for the three ways a naive no-substring oracle produces
+# false failures, and why a target that cries wolf gets its assertion relaxed
+# until it asserts nothing.
+#
+# Registration only: this target adds NO dependency. It reaches
+# `pmcp::server::schema_validation` through the `validation` feature already
+# enabled on the `pmcp` dependency above (`validation` = `["schema-validation",
+# "dep:garde"]`, and the module is gated `schema-validation`). Unlike
+# `fuzz_schema_draft_pin` it needs no `fuzzing` companion: `validate_input`,
+# `render_refusal` and `check_input_schema_compiles` are all PUBLIC, so the target
+# drives the same API the toolkit does.
+#
+# It IS in `.github/workflows/fuzz.yml`'s matrix, so it is EXECUTED on the daily
+# schedule and on a PR touching `src/**` or `fuzz/**` — not merely registered. It
+# is additionally run by `make test-fuzz-strict`, which is chained into
+# `make quality-gate` and PROPAGATES a crash (unlike `make test-fuzz`, whose
+# blanket `|| echo` cannot fail anything).
+[[bin]]
+name = "fuzz_input_schema_enforcement"
+path = "fuzz_targets/fuzz_input_schema_enforcement.rs"
+test = false
+doc = false
+bench = false
+
+# Phase 128-10 (T-128-48): RESEARCH assumption A2 — a config-supplied `pattern` as
+# a ReDoS vector on the path-placeholder narrowing path. A LOOK, not a mitigation:
+# Finding 1j attempted falsification at n <= 28 on both the linear and the
+# backtracking engine and did not reproduce, which is evidence and not proof. The
+# disposition on T-128-48 is accept-instrumented, and this is the instrument. A
+# timeout from it is a finding to FILE, not a licence to hand-roll a regex guard —
+# stated at length in the target's header so the next reader does not skip the
+# measurement.
+#
+# Registration only: NO dependency added; reaches
+# `validate_path_placeholder` / `PlaceholderRules` through the same `validation`
+# feature. In `fuzz.yml`'s matrix and in `make test-fuzz-strict`, same as the
+# target above.
+[[bin]]
+name = "fuzz_placeholder_pattern_redos"
+path = "fuzz_targets/fuzz_placeholder_pattern_redos.rs"
+test = false
+doc = false
+bench = false

@@ -39,6 +39,31 @@ jobs:
           # YAML frontmatter encoder has a panic as its only failure mode, and
           # those bytes are published as a sha256 pin (D-14).
           - fuzz_workflow_projection
+          # Phase 128-10 (SC-7 / T-128-47): the `tools/call` INPUT-schema
+          # enforcement path and its value-free refusal renderer. Same reasoning
+          # as the two rows above — a registered-but-unrun target satisfies only
+          # the letter of the CLAUDE.md ALWAYS/FUZZ requirement — with one
+          # addition specific to this pair. These two are ALSO run by
+          # `make test-fuzz-strict`, which `make quality-gate` chains and which
+          # the `quality-gate` CI job provisions nightly + cargo-fuzz for. That
+          # is the PR gate; this matrix is the recurring DEEP campaign
+          # (`-max_total_time=300` versus the gate's short bound), and the two
+          # are complementary rather than redundant.
+          #
+          # MEASURED 2026-09-27: the org ruleset "Green Main — unified gate
+          # enforcement" requires exactly ONE status context, `gate`. This
+          # workflow is NOT a required check, so enrolling here alone would give
+          # recurring execution and no merge gate — which is why the leg is
+          # provisioned in `ci.yml`'s quality-gate job as well. Do not read this
+          # matrix row as the gate.
+          - fuzz_input_schema_enforcement
+          # Phase 128-10 (T-128-48): the LOOK at RESEARCH assumption A2 — a
+          # config-supplied `pattern` as a ReDoS vector. The daily schedule is
+          # most of this target's value: A2 was not falsified at n <= 28, and a
+          # recurring campaign is how a residual that needs more budget than a
+          # PR gate can spend would surface. A timeout here is a finding to FILE,
+          # not a licence to hand-roll a regex guard — see the target's header.
+          - fuzz_placeholder_pattern_redos
 
     steps:
       - uses: actions/checkout@v7
