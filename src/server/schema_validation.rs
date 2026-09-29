@@ -389,6 +389,35 @@ fn compile_input_2020_12(
         .build(&normalized)
 }
 
+type InputValidatorCache = RwLock<HashMap<String, Result<Arc<jsonschema::Validator>, Arc<str>>>>;
+
+/// The process-global memo behind [`cached_input_validator`]. Module-scope so the
+/// bound below is observable from a test.
+static INPUT_VALIDATOR_CACHE: OnceLock<InputValidatorCache> = OnceLock::new();
+
+/// Most distinct schemas [`cached_input_validator`] will remember.
+///
+/// The memo is keyed on schema TEXT and never evicts, so without a bound its size
+/// is a function of how many DISTINCT schemas the process ever sees. For a
+/// config-driven server that is the number of declared tools and patterns, which
+/// is small and fixed. But `validate_input` is `pub`, and
+/// `fuzz_placeholder_pattern_redos` drives arbitrary declared patterns through
+/// `declared_pattern_check`: measured, that target reached libFuzzer's 2048 MB RSS
+/// limit in about 130k executions (~8 KB retained per distinct pattern), both in CI
+/// and locally.
+///
+/// Once the map holds this many entries a NEW schema is compiled and returned
+/// WITHOUT being stored. That is the same shape as the toolkit's
+/// `MAX_REMEMBERED` memo in `code_mode.rs`, and for the same reason: enforcement
+/// never depends on the memo. A full cache costs a recompile per call for schemas
+/// beyond the bound; it never changes a verdict. Schemas already stored keep
+/// hitting.
+///
+/// 4096 is deliberately far above any realistic server (a 500-tool server with a
+/// patterned parameter each is ~1,500 schemas), so the ordinary case never sees the
+/// bound, while worst-case retained memory stays in the tens of megabytes.
+const MAX_CACHED_VALIDATORS: usize = 4096;
+
 /// Fetch (or compile and cache) the input validator for `schema`.
 ///
 /// Keyed on the canonical schema TEXT alone, and deliberately SEPARATE from
@@ -408,10 +437,7 @@ fn cached_input_validator(
     schema: &Value,
     schema_key: Option<&str>,
 ) -> Result<Arc<jsonschema::Validator>, Arc<str>> {
-    type Cache = RwLock<HashMap<String, Result<Arc<jsonschema::Validator>, Arc<str>>>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-
-    let cache = CACHE.get_or_init(Cache::default);
+    let cache = INPUT_VALIDATOR_CACHE.get_or_init(InputValidatorCache::default);
 
     // An `RwLock` rather than a `Mutex` because the steady state is ALL reads: the
     // map is written once per distinct schema and then hit on every `tools/call`
@@ -452,7 +478,30 @@ fn cached_input_validator(
         .map_err(|error| Arc::from(compile_error_detail(&error).as_str()));
 
     let mut map = cache.write().unwrap_or_else(PoisonError::into_inner);
-    map.entry(key.into_owned()).or_insert(compiled).clone()
+    remember_bounded(&mut map, MAX_CACHED_VALIDATORS, key.into_owned(), compiled)
+}
+
+/// Store `compiled` under `key` unless the map already holds `cap` entries, and
+/// return the entry the caller should use.
+///
+/// Split out of [`cached_input_validator`] so the bound is testable on a LOCAL map
+/// with a tiny cap. Testing it through the process-global cache would fill that
+/// cache for every other test in the binary and break the ones that assert a
+/// cache hit.
+///
+/// When full, a NEW key is returned uncached. A key already present — we lost a
+/// compile race to another thread — still resolves to the stored entry, so two
+/// racing callers never disagree about which `Arc` is canonical.
+fn remember_bounded(
+    map: &mut HashMap<String, Result<Arc<jsonschema::Validator>, Arc<str>>>,
+    cap: usize,
+    key: String,
+    compiled: Result<Arc<jsonschema::Validator>, Arc<str>>,
+) -> Result<Arc<jsonschema::Validator>, Arc<str>> {
+    if map.len() >= cap && !map.contains_key(&key) {
+        return compiled;
+    }
+    map.entry(key).or_insert(compiled).clone()
 }
 
 /// Check that `schema` compiles as a Draft 2020-12 input schema — the
@@ -1779,6 +1828,61 @@ mod tests {
                 "`PlaceholderRules::default()` must be floored and capped: {payload}"
             );
         }
+    }
+
+    /// The memo must not grow without bound. `fuzz_placeholder_pattern_redos` drove
+    /// the process to libFuzzer's 2 GB RSS limit through exactly this map, in CI
+    /// and locally, because every distinct generated pattern was stored forever.
+    ///
+    /// Run on a LOCAL map with a tiny cap: the process-global cache would be left
+    /// full for every other test in the binary.
+    #[test]
+    fn cache_stops_storing_new_schemas_once_full() {
+        let compile = |max: u64| {
+            compile_input_2020_12(&serde_json::json!({ "type": "string", "maxLength": max }))
+                .map(Arc::new)
+                .map_err(|_| Arc::<str>::from("unexpected compile failure"))
+        };
+        let mut map = HashMap::new();
+        for n in 0..3_u64 {
+            remember_bounded(&mut map, 3, format!("k{n}"), compile(n)).expect("compiles");
+        }
+        assert_eq!(map.len(), 3, "below the bound every schema is stored");
+
+        // Beyond the cap: still returns a working validator, stores nothing.
+        let overflow = remember_bounded(&mut map, 3, "k-new".to_string(), compile(99))
+            .expect("an overflow schema still compiles and validates");
+        assert_eq!(map.len(), 3, "a full cache must not grow");
+        assert!(
+            !map.contains_key("k-new"),
+            "the overflow entry must not be stored"
+        );
+        assert!(overflow.is_valid(&Value::String("x".repeat(99))));
+        assert!(!overflow.is_valid(&Value::String("x".repeat(100))));
+
+        // Entries stored before the cap keep hitting: the SAME Arc comes back.
+        let stored = map["k1"].clone().expect("stored");
+        let again = remember_bounded(&mut map, 3, "k1".to_string(), compile(1)).expect("compiles");
+        assert!(
+            Arc::ptr_eq(&stored, &again),
+            "a key already present must resolve to the stored entry, not a fresh compile"
+        );
+    }
+
+    /// The bound must not turn a compile FAILURE into a success or drop it: a
+    /// broken declared pattern past the cap is still refused.
+    #[test]
+    fn cache_bound_still_reports_compile_failures() {
+        let mut map = HashMap::new();
+        map.insert("only".to_string(), Err(Arc::<str>::from("stored")));
+        let failed = remember_bounded(
+            &mut map,
+            1,
+            "other".to_string(),
+            Err(Arc::<str>::from("does not compile")),
+        );
+        assert!(failed.is_err(), "an overflow failure must still be an Err");
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
