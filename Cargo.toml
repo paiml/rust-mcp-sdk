@@ -173,7 +173,7 @@ web-time = "1"
 
 # OAuth CLI helper dependencies (feature-gated)
 webbrowser = { version = "1", optional = true }
-dirs = { version = "6", optional = true }
+dirs = { version = "7", optional = true }
 rand = { version = "0.10", optional = true }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"], optional = true }
 
