@@ -79,11 +79,23 @@ pub struct OutboundRequest<'a> {
     pub method: &'a str,
 
     /// The FULLY RESOLVED request target: every path placeholder substituted and
-    /// the configured base URL already joined on, with no query string appended.
+    /// the configured base URL already joined on. The SDK appends no query string
+    /// to it.
     ///
     /// It is the resolved path and never the template, so an endpoint allowlist
-    /// sees the URL as it will be sent. The query pairs are carried separately in
-    /// [`Self::query`].
+    /// sees the URL as it will be sent. The query pairs the SDK will add are
+    /// carried separately in [`Self::query`].
+    ///
+    /// # An author-written `?` STAYS in `path`
+    ///
+    /// "The SDK appends no query string" is about what the SDK adds, not about what
+    /// a script author wrote. On the Code Mode surface,
+    /// `api.get('/search/current?string=x')` puts a literal `?string=x` in the path
+    /// template, and the path floor deliberately permits ONE author-written `?`
+    /// (`validate_resolved_target`), so it reaches a policy INSIDE `path` and never
+    /// appears in [`Self::query`]. A policy that must see or refuse every query pair
+    /// therefore has to look for a `?` in `path` as well as read `query`. The
+    /// object form, `api.get(path, { .. })`, is what populates `query`.
     pub path: &'a str,
 
     /// The query pairs that will be appended to [`Self::path`], EXCLUDING any

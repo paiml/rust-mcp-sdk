@@ -396,8 +396,19 @@ impl ValidatingToolHandler {
     }
 
     /// Validate `args`, mapping any violation to a value-free
-    /// `pmcp::Error::Validation`. Kept a separate helper so both trait entry
+    /// `pmcp::Error::ToolRejected`. Kept a separate helper so both trait entry
     /// points stay one-liners and well under the cog-25 gate.
+    ///
+    /// # Why a tool-level rejection and not `Error::Validation`
+    ///
+    /// A refused argument is the CALLER's to fix, and `Error::ToolRejected` is the
+    /// SDK's variant for exactly that: its own docs name "schema-mismatched input"
+    /// as an intended use, and `execute_code` already returns it for a bad approval
+    /// token. `Error::Validation` surfaces as a JSON-RPC error, which reads to a
+    /// model as a server fault and gives it nothing to retry with. Measured on the
+    /// 2.21.0 stack: 14 of 15 refusals in a 24-probe matrix reached the client as
+    /// protocol errors, and the Triarii UMLS server wrote an adapter to remap them.
+    /// The message is unchanged and stays value-free; only the channel moves.
     ///
     /// Returns `Ok(())` without consulting the schema when `enforce_schema` is
     /// `false` — skipping the CHECK, not the decorator, so anything else this
@@ -421,7 +432,7 @@ impl ValidatingToolHandler {
         validate_input(&self.input_schema, Some(args), Some(&self.schema_key)).map_err(
             |violations| {
                 let declared: Vec<&str> = self.declared.iter().map(String::as_str).collect();
-                pmcp::Error::Validation(render_refusal(&violations, &declared))
+                pmcp::Error::tool_rejected(render_refusal(&violations, &declared), None)
             },
         )
     }
@@ -443,7 +454,7 @@ impl ValidatingToolHandler {
         };
         validator
             .validate(args)
-            .map_err(|refusal| pmcp::Error::Validation(refusal.message().to_string()))
+            .map_err(|refusal| pmcp::Error::tool_rejected(refusal.message().to_string(), None))
     }
 }
 
@@ -2744,6 +2755,28 @@ required = true
             "the refusal must carry the validator's own message, got: {err}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The E2 refusal takes the same TOOL-LEVEL channel as the D1 schema refusal.
+    /// A cross-field rule is as much the caller's to fix as a bad type is, and a
+    /// model can only act on a tool result, not on a JSON-RPC error.
+    #[tokio::test]
+    async fn a_validator_refusal_is_a_tool_level_rejection_not_a_protocol_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = synthesize_from_config_and_hooks(&cfg(true), &hooks(&calls)).expect("synth");
+        let (_name, _info, handler) = &tools[0];
+        let err = handler
+            .handle(json!({ "start": 10, "end": 2 }), extra())
+            .await
+            .expect_err("the validator refuses");
+        assert!(
+            matches!(err, pmcp::Error::ToolRejected { .. }),
+            "a validator refusal must be a tool-level rejection, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("`end` must not precede `start`"),
+            "the validator's own message must survive the channel change, got: {err}"
+        );
     }
 
     #[tokio::test]

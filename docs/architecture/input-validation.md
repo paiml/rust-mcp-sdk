@@ -1,6 +1,7 @@
 # Input validation for config-driven servers
 
-**Applies to:** `pmcp` 2.21.0+, `pmcp-server-toolkit` 0.2.0+, `pmcp-code-mode` 0.6.0+.
+**Applies to:** `pmcp` 2.21.0+, `pmcp-server-toolkit` 0.2.0+ (refusals reach the client as tool
+results from 0.2.1; see §7), `pmcp-code-mode` 0.6.0+.
 
 A config-driven MCP server enforces the input contract it publishes. This page says which
 of three layers a rule belongs in, what each layer catches, what it *cannot* do, and which
@@ -88,8 +89,9 @@ pub trait RequestPolicy: Send + Sync {
 pub struct OutboundRequest<'a> {
     pub tool: &'a str,                  // the MCP tool this call came from
     pub method: &'a str,                // upper-cased
-    pub path: &'a str,                  // FULLY RESOLVED: placeholders substituted,
-                                        // base URL joined, no query
+    pub path: &'a str,                  // FULLY RESOLVED: placeholders substituted, base
+                                        // URL joined; the SDK appends no query, but an
+                                        // AUTHOR-WRITTEN `?` stays here (see below)
     pub query: &'a [(String, String)],  // EXCLUDING every auth-contributed pair
     pub body: Option<&'a serde_json::Value>,
 }
@@ -99,6 +101,18 @@ pub struct OutboundRequest<'a> {
 pairs, the body, and the tool it came from. `async`, so it can keep per-session state — a
 cap on free text spread across several calls in one session, a rate budget, an endpoint
 allowlist.
+
+**An author-written `?` stays in `path`.** The SDK appends no query string to `path`, but a
+script author can write one: `api.get('/search/current?string=x')` puts `?string=x` inside the
+path template, and layer 0 deliberately permits ONE author-written `?`. It therefore reaches your
+policy inside `path` and never in `query`. A policy that must see every query pair has to look for
+a `?` in `path` as well as read `query`; the object form, `api.get(path, { .. })`, is what fills
+`query`. A policy that refuses a `?` in the path (a reasonable free-text stop-gap) should say so in
+its refusal, because the model otherwise sees the call validate and then fail (see the gap below).
+
+**`validate_code` does not run this hook.** It runs the static `[code_mode]` rules only, so a call
+your policy refuses can still validate and receive an approval token; the refusal then arrives at
+`execute_code`. Execution-time enforcement is the authoritative one.
 
 **When it runs.** After layers 1 and 2, on every outbound HTTP request — curated tools,
 script tools and Code Mode alike — and **before outgoing auth is applied**.
@@ -447,6 +461,24 @@ This is a real tension, and it is resolved in one direction on purpose: the call
 model, and a refusal it cannot act on becomes a retry loop. The resolution is to return the
 **declared** expectations — which are yours, written in your config — and never the rejected
 input.
+
+### The channel: a tool result, not a protocol error (0.2.1+)
+
+A refusal from layer 1 (the declared schema) or layer 2 (`ArgumentValidator`) reaches the client
+as a tool-level rejection: a `tools/call` result with `isError: true` whose text is the refusal
+message. It is `pmcp::Error::ToolRejected`, the SDK's variant for "the caller can fix this", and
+the one `execute_code` already uses for a bad approval token.
+
+On 0.2.0 both were `pmcp::Error::Validation`, a JSON-RPC error. A model reads that as a server
+fault and has nothing to retry with; a probe matrix on the 2.21.0 stack measured 14 of 15 SDK
+refusals taking that channel, and a downstream server wrote an adapter to remap them. The message
+is unchanged and stays value-free; only the channel moved. A client that matched the JSON-RPC
+error code for these refusals should match `isError` instead. An adapter that remaps
+`Error::Validation` into `tool_rejected` is now a harmless no-op.
+
+**Not yet on this channel:** an `execute_code` failure, including a `RequestPolicy` or
+placeholder-floor refusal, still surfaces as an internal error. Fixing it needs a distinct
+`pmcp-code-mode` error variant, which is a breaking change, so it is tracked separately.
 
 ### The two message surfaces YOUR team owns
 

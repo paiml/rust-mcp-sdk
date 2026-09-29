@@ -215,6 +215,42 @@ async fn input_validation_refuses_undeclared_argument_without_contacting_upstrea
     );
 }
 
+/// A refused argument reaches the client as a TOOL-LEVEL rejection, not a JSON-RPC
+/// protocol error.
+///
+/// The caller can fix a refused argument, and `Error::ToolRejected` is the SDK's
+/// variant for that: the server maps it to a result with `isError: true` carrying
+/// the message, where `Error::Validation` becomes a protocol error that reads to a
+/// model as a server fault. Measured on 2.21.0, 14 of 15 SDK refusals in a probe
+/// matrix took the protocol channel and a downstream server wrote an adapter to
+/// remap them. This fails if the refusal goes back to `Error::Validation`.
+#[tokio::test]
+async fn a_schema_refusal_is_a_tool_level_rejection_not_a_protocol_error() {
+    let server = MockServer::start().await;
+    let handler = arrange(&server, vec![required_string("cui")]).await;
+
+    let err = handler
+        .handle(
+            json!({ "cui": "C0018787", "undeclared": "x" }),
+            RequestHandlerExtra::default(),
+        )
+        .await
+        .expect_err("an undeclared argument key must be refused");
+
+    assert!(
+        matches!(err, pmcp::Error::ToolRejected { .. }),
+        "a schema refusal must be a tool-level rejection the model can act on, got: {err:?}"
+    );
+    assert!(
+        !err.to_string().starts_with("Validation error"),
+        "the message must not carry the protocol-error prefix: {err}"
+    );
+    assert!(
+        observed(&server).await.is_empty(),
+        "a refused call must record ZERO upstream requests"
+    );
+}
+
 /// Row 8 — absent `arguments` on a zero-parameter tool is ACCEPTED as `{}`.
 #[tokio::test]
 async fn input_validation_accepts_absent_arguments_on_zero_param_tool() {

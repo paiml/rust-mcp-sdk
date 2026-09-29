@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.21.1] - 2026-09-29
+
+Ships `pmcp-server-toolkit` **0.2.1**. `pmcp` moves 2.21.0 -> 2.21.1 with **no code change of its
+own**, solely to mint the tag that carries the toolkit to crates.io: this repo tags on the `pmcp`
+version (the same reason as 2.19.2), and `^2.21.0` admits 2.21.1, so no pinning manifest moves.
+`cargo-pmcp` is not bumped; its workbook scaffold constants move with the versions (a drift test
+requires it) and stay inert until its next release.
+
+### Fixed — a declared-rule or validator refusal is now a tool result, not a protocol error
+
+Reported against 2.21.0 by the team running the UMLS MCP server, from a 24-probe matrix that
+checks each refusal reaches the client and never the upstream. 14 of the 15 refusals the SDK
+alone made reached the client as JSON-RPC protocol errors, which a model reads as a server fault
+and cannot retry from; they had written an adapter to remap them.
+
+- A refusal from the declared-schema check (D1) and from a registered `ArgumentValidator` (E2) is
+  now `pmcp::Error::ToolRejected`, so `tools/call` returns a result with `isError: true` carrying
+  the message. It was `pmcp::Error::Validation`. `ToolRejected` is the SDK's variant for input the
+  caller can fix (its docs name "schema-mismatched input"), and `execute_code` already used it for
+  a bad approval token.
+- **The message is unchanged and stays value-free.** Only the channel moved.
+- **Behaviour change:** a client that matched the JSON-RPC error for these refusals must match
+  `isError` instead. An adapter that remaps `Error::Validation` to `tool_rejected` is now a
+  harmless no-op and can be deleted.
+- Regression tests fail if either refusal goes back to `Error::Validation`.
+
+**Not fixed here.** An `execute_code` failure, including a `RequestPolicy` or placeholder-floor
+refusal, still surfaces as an internal error. It needs a distinct `pmcp-code-mode` error variant,
+a breaking change, and is tracked as its own issue.
+
+### Documentation
+
+- `OutboundRequest::path` said it carries "no query string". That is true of what the SDK appends,
+  not of what a script author wrote: an author-written `?` in `api.get('/search?x=1')` stays in
+  `path`, because the floor deliberately permits one. Documented on the field and in
+  `docs/architecture/input-validation.md`, along with the fact that `validate_code` does not run
+  the E1 policy, so a call the policy refuses can validate and be refused only at `execute_code`.
+
 ## [2.21.0] - 2026-09-28
 
 Ships with `pmcp-server-toolkit` **0.2.0**, `pmcp-code-mode` **0.6.0**,
