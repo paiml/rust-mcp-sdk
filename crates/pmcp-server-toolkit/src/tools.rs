@@ -27,12 +27,17 @@
 //!   enforcement "upstream" described a mitigation that did not exist. It exists
 //!   now, and it exists *here*.
 //!
-//!   Condition: the `input-validation` feature must be on (it is, by default,
-//!   via the `http`/`openapi-code-mode` umbrellas — but a
-//!   `--no-default-features` build can turn it off, and then
+//!   Condition: the `input-validation` feature must be on. It is on via this
+//!   crate's `default` feature set and by that route ALONE — measured: `http =
+//!   ["dep:reqwest", "dep:url", "dep:openapiv3", "dep:serde_yaml", "dep:base64",
+//!   "dep:regex", "dep:tokio", "pmcp/streamable-http"]` and `openapi-code-mode =
+//!   ["http", "code-mode", "pmcp-code-mode/js-runtime"]`, neither of which names
+//!   it. Those two umbrellas do NOT forward it, so a
+//!   `--no-default-features --features http` build — exactly the shape a
+//!   consumer reaches for — turns it off, and then
 //!   `enforce_input_schema` is the identity function and says so in a
-//!   `tracing::warn!`), and `[server.validation] enforce_input_schema` must not
-//!   be `false`.
+//!   `tracing::warn!`. Second condition: `[server.validation]
+//!   enforce_input_schema` must not be `false`.
 //!
 //!   Backed by `tests/input_validation_acceptance.rs`'s
 //!   `input_validation_refuses_undeclared_argument_without_contacting_upstream`
@@ -62,7 +67,14 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{AnnotationsDecl, ParamDecl, ServerConfig, ToolDecl, ValidationSection};
 use crate::error::Result;
-use crate::policy::{ArgumentValidator, ToolkitHooks};
+use crate::policy::ToolkitHooks;
+// Every use of the trait object itself lives inside a `#[cfg(feature =
+// "input-validation")]` item (`ValidatingToolHandler`'s field and `wrap`'s
+// parameter), so an ungated import is an `unused_imports` warning — and a hard
+// error — in the `--no-default-features --features http` build this module's own
+// header names as the shape a consumer reaches for.
+#[cfg(feature = "input-validation")]
+use crate::policy::ArgumentValidator;
 use crate::sql::SqlConnector;
 
 #[cfg(feature = "http")]
@@ -259,7 +271,7 @@ fn synthesize_inner(
 /// early return, and by
 /// `tools::argument_validator_seam::a_registered_validator_refuses_a_combination_the_schema_permits`,
 /// which fails if the lookup is removed.
-#[allow(unused_variables)]
+#[cfg(feature = "input-validation")]
 fn enforce_input_schema(
     handler: Arc<dyn ToolHandler>,
     info: &ToolInfo,
@@ -267,36 +279,64 @@ fn enforce_input_schema(
     validation: &ValidationSection,
     hooks: &ToolkitHooks,
 ) -> Arc<dyn ToolHandler> {
-    #[cfg(feature = "input-validation")]
-    {
-        // Phase 128 E2 — the registry lookup that replaced plan 03's
-        // `let has_registered_validator = false;` placeholder.
-        let registered_validator = hooks.argument_validator_for(&decl.name);
-        if !validation.enforce_input_schema && registered_validator.is_none() {
-            tracing::warn!(
-                tool = %decl.name,
-                "[server.validation] enforce_input_schema = false: this tool's arguments are \
-                 NOT checked against its declared inputSchema before the backend call"
-            );
-            return handler;
-        }
-        ValidatingToolHandler::wrap(
-            handler,
-            info,
-            decl,
-            validation.enforce_input_schema,
-            registered_validator,
-        )
-    }
-    #[cfg(not(feature = "input-validation"))]
-    {
+    // Phase 128 E2 — the registry lookup that replaced plan 03's
+    // `let has_registered_validator = false;` placeholder.
+    let registered_validator = hooks.argument_validator_for(&decl.name);
+    if !validation.enforce_input_schema && registered_validator.is_none() {
         tracing::warn!(
             tool = %decl.name,
-            "the `input-validation` feature is OFF: this tool's arguments are NOT checked \
-             against its declared inputSchema before the backend call"
+            "[server.validation] enforce_input_schema = false: this tool's arguments are \
+             NOT checked against its declared inputSchema before the backend call"
         );
-        handler
+        return handler;
     }
+    ValidatingToolHandler::wrap(
+        handler,
+        info,
+        decl,
+        validation.enforce_input_schema,
+        registered_validator,
+    )
+}
+
+/// The `input-validation`-off half of [`enforce_input_schema`]: the identity
+/// function, with the absence logged once per synthesized tool.
+///
+/// A `#[cfg]` SIBLING rather than one function with two inner blocks, because the
+/// off arm reads none of the schema inputs and the single-function form needed an
+/// `#[allow(unused_variables)]` — which this module's own header rules out ("No
+/// `#[allow]` annotations"). This is the same sibling-pair idiom
+/// `check_tool_input_schema_compiles`, `warn_if_pattern_checking_unavailable`,
+/// `spec_placeholder_rules` and `lint_declared_cap_above_placeholder_floor`
+/// already use in this crate for exactly this situation.
+#[cfg(not(feature = "input-validation"))]
+fn enforce_input_schema(
+    handler: Arc<dyn ToolHandler>,
+    _info: &ToolInfo,
+    decl: &ToolDecl,
+    _validation: &ValidationSection,
+    hooks: &ToolkitHooks,
+) -> Arc<dyn ToolHandler> {
+    tracing::warn!(
+        tool = %decl.name,
+        "the `input-validation` feature is OFF: this tool's arguments are NOT checked \
+         against its declared inputSchema before the backend call"
+    );
+    // `ToolkitHooks::argument_validator_for` is NOT feature-gated, so
+    // `with_argument_validator` compiles and appears to succeed in this build —
+    // while `ValidatingToolHandler`, the only thing that can RUN a registered
+    // validator, is gated away. Naming the drop is the difference between an
+    // enforcement that is off and one that silently reads as on; the schema warning
+    // above does not cover it, because a registered validator is a SEPARATE switch
+    // (see `ValidatingToolHandler::enforce_schema`).
+    if hooks.argument_validator_for(&decl.name).is_some() {
+        tracing::warn!(
+            tool = %decl.name,
+            "an E2 ArgumentValidator IS registered for this tool and is DISCARDED: \
+             running it requires the `input-validation` feature"
+        );
+    }
+    handler
 }
 
 /// Decorator that refuses a `tools/call` whose arguments violate the tool's

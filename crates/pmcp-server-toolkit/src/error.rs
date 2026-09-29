@@ -334,18 +334,27 @@ pub enum ConfigValidationError {
         /// The `[[tools.parameters]]` `name` whose bound cannot be represented.
         param: String,
     },
-    /// Per Phase 128 D3 / D-07: a body-position string parameter declares no
-    /// `max_length`, and `[server.validation]` `strict = true` promotes that lint
-    /// finding into a hard failure.
+    /// Per Phase 128 D3 / D-07: a string parameter declares no `max_length` AND no
+    /// default cap reaches it, and `[server.validation]` `strict = true` promotes
+    /// that lint finding into a hard failure.
+    ///
+    /// Deliberately NOT described as "body-position". That is the usual case but not
+    /// the only one: `[server.validation] default_max_length = 0` is a supported
+    /// opt-out that switches the D3 cap off for EVERY position, so a PATH or QUERY
+    /// parameter reaches this variant too. Naming a position the variant does not
+    /// actually pin sent the operator looking at the wrong parameter. The position
+    /// and the reason are carried by the paired
+    /// [`crate::config::ServerConfig::lint`] finding, which has both in scope.
     ///
     /// Only reachable under `strict`. With `strict = false` (the default) the same
-    /// config validates cleanly and the finding is reported by
-    /// [`crate::config::ServerConfig::lint`] instead — a running server must never
-    /// refuse to boot over an uncapped free-text field, which is the whole reason
-    /// the lint channel exists separately from `validate`.
+    /// config validates cleanly and the finding is reported by `lint` instead — a
+    /// running server must never refuse to boot over an uncapped free-text field,
+    /// which is the whole reason the lint channel exists separately from `validate`.
     #[error(
-        "[[tools]] '{tool}' parameter '{param}' is an uncapped body-position string and \
-         [server.validation] strict = true; declare a max_length or clear the strict flag"
+        "[[tools]] '{tool}' parameter '{param}' is an uncapped string — no declared \
+         max_length and no default cap reaches it — and [server.validation] strict = true; \
+         declare a max_length, or clear the strict flag (the paired lint finding names why \
+         no cap reached it)"
     )]
     UncappedStringParam {
         /// The `[[tools]]` `name` carrying the uncapped parameter.
@@ -410,7 +419,13 @@ pub struct ConfigWarning {
     pub tool: String,
     /// The `[[tools.parameters]]` `name` the finding concerns.
     ///
-    /// EMPTY for a server-level finding, for the same reason as [`Self::tool`].
+    /// EMPTY for a server-level finding, for the same reason as [`Self::tool`] —
+    /// and ALSO empty for a TOOL-level finding, one that concerns the `[[tools]]`
+    /// entry as a whole rather than any one parameter (`lint_against_spec`'s
+    /// `configured-template-not-in-spec` is the live case). So the two fields encode
+    /// three scopes, and this field alone does not distinguish server-level from
+    /// tool-level: read it together with [`Self::tool`], exactly as this type's
+    /// `Display` does. A consumer switching on scope should test BOTH.
     pub param: String,
     /// Stable machine-readable rule identifier, e.g. `"uncapped-string"`.
     ///
@@ -427,15 +442,81 @@ pub struct ConfigWarning {
 }
 
 impl std::fmt::Display for ConfigWarning {
+    /// Renders the THREE scopes the two sentinel fields encode, not two.
+    ///
+    /// `tool` and `param` are independently empty-as-sentinel, so they describe a
+    /// server-level, a tool-level, or a parameter-level finding. Branching on
+    /// `tool` alone collapsed the middle case into the parameter arm and rendered
+    /// a tool-level finding as `... 'get_cui' parameter '': ...` — reachable
+    /// today from `ServerConfig::lint_against_spec`, which emits
+    /// `configured-template-not-in-spec` with a tool name and an empty `param`,
+    /// and printed verbatim to the deploy log by `pmcp-openapi-server`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.tool.is_empty() {
-            write!(f, "[{}] {}", self.rule, self.detail)
-        } else {
-            write!(
+        match (self.tool.is_empty(), self.param.is_empty()) {
+            // Server-level: an active `[server.validation]` opt-out belongs to the
+            // server, not to any tool.
+            (true, _) => write!(f, "[{}] {}", self.rule, self.detail),
+            // Tool-level: the finding concerns the `[[tools]]` entry as a whole.
+            (false, true) => {
+                write!(
+                    f,
+                    "[{}] [[tools]] '{}': {}",
+                    self.rule, self.tool, self.detail
+                )
+            },
+            // Parameter-level.
+            (false, false) => write!(
                 f,
                 "[{}] [[tools]] '{}' parameter '{}': {}",
                 self.rule, self.tool, self.param, self.detail
-            )
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_warning_display {
+    use super::ConfigWarning;
+
+    fn warning(tool: &str, param: &str) -> ConfigWarning {
+        ConfigWarning {
+            tool: tool.to_string(),
+            param: param.to_string(),
+            rule: "a-rule",
+            detail: "a detail".to_string(),
+        }
+    }
+
+    /// The two sentinel fields encode THREE scopes. Asserted because nothing else
+    /// in the tree renders a `ConfigWarning`: `lint()`'s own tests check `.rule`
+    /// and `.detail` only, and the sole production consumer is a
+    /// `tracing::warn!("{finding}")` in `pmcp-openapi-server`'s deploy log — so a
+    /// regression in this `match` is invisible to every other test.
+    #[test]
+    fn renders_server_tool_and_parameter_scopes_distinctly() {
+        assert_eq!(warning("", "").to_string(), "[a-rule] a detail");
+        assert_eq!(
+            warning("get_cui", "").to_string(),
+            "[a-rule] [[tools]] 'get_cui': a detail"
+        );
+        assert_eq!(
+            warning("get_cui", "version").to_string(),
+            "[a-rule] [[tools]] 'get_cui' parameter 'version': a detail"
+        );
+    }
+
+    /// The specific regression the three-arm form exists to prevent: a tool-level
+    /// finding must not be rendered as a parameter-level one with an empty name.
+    #[test]
+    fn a_tool_level_finding_never_renders_an_empty_parameter_name() {
+        let rendered = warning("get_cui", "").to_string();
+        assert!(
+            !rendered.contains("parameter"),
+            "a tool-level finding must not claim a parameter: {rendered}"
+        );
+        assert!(
+            !rendered.contains("''"),
+            "no empty-name sentinel: {rendered}"
+        );
     }
 }

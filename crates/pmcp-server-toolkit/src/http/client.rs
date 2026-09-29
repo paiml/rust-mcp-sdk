@@ -180,7 +180,7 @@ impl HttpClient {
     ///    cannot leave a half-substituted path in existence anywhere;
     /// 2. only once every value has passed are the replacements applied, and the
     ///    COMPOSED result is then checked by
-    ///    `pmcp::server::schema_validation::validate_resolved_path` before the
+    ///    `pmcp::server::schema_validation::validate_resolved_target` before the
     ///    caller can dispatch it.
     ///
     /// Step 2 is not redundant with step 1. A composition belongs to no single
@@ -192,9 +192,10 @@ impl HttpClient {
     /// ## The one narrowing: an operator-written `?` is permitted
     ///
     /// `validate_resolved_path` refuses a query separator anywhere, and core keeps
-    /// that strict rule for its other callers. This function splits the composed
-    /// path at the FIRST `?` and applies the full, unmodified rule set to each
-    /// side, which exempts exactly that one separator and nothing else. It is safe
+    /// that strict rule for its other callers. Its sibling
+    /// `validate_resolved_target` — which `check_composed_path` calls — splits the
+    /// composed path at the FIRST `?` and applies the full, unmodified rule set to
+    /// each side, which exempts exactly that one separator and nothing else. It is safe
     /// rather than a hole because step 1 already refuses `?` inside a substituted
     /// value, in literal AND percent-encoded form with a decode-once pass — so a
     /// `?` surviving into the composed string can only have come from the
@@ -234,8 +235,8 @@ impl HttpClient {
     ///   narrowing on top of them);
     /// - when a declared path parameter has no supplied argument, naming that
     ///   parameter and nothing else;
-    /// - when `validate_resolved_path` refuses the composed path on either side of
-    ///   an operator-written `?`.
+    /// - when `validate_resolved_target` refuses the composed path on either side
+    ///   of an operator-written `?`.
     ///
     /// Every one of these messages names the declared parameter or the rule and
     /// carries no byte of the rejected value and no fragment of the resolved path
@@ -550,13 +551,16 @@ fn check_placeholder_value(_param: &Parameter, _value_str: &str) -> Result<(), H
 
 /// Check the COMPOSED path, exempting one operator-written `?`.
 ///
-/// The split lives HERE and deliberately not in core: `validate_resolved_path` is a
-/// general-purpose composed-path checker with other callers that want the strict
-/// `?`-anywhere rule, and relaxing it there would weaken all of them. Both sides of
-/// the first `?` face the full, unmodified rule set, so a second `?`, a fragment
-/// marker, traversal on either side, an over-cap query and an empty query portion
-/// all stay refused for free. See `HttpClient::substitute_path` for why exempting
-/// exactly that one byte is safe.
+/// The narrowing itself lives in core as
+/// `pmcp::server::schema_validation::validate_resolved_target` — a SIBLING of
+/// `validate_resolved_path`, which keeps the strict `?`-anywhere rule for its
+/// other callers. It lives there rather than here because the Code Mode surface
+/// (`pmcp_code_mode::ResolvedPath::from_checked`) needs the identical rule, and
+/// the two previously held a copy each: the one part of the floor that could
+/// drift between them. Both sides of the first `?` face the full, unmodified rule
+/// set, so a second `?`, a fragment marker, traversal on either side, an over-cap
+/// query and an empty query portion all stay refused for free. See
+/// `HttpClient::substitute_path` for why exempting exactly that one byte is safe.
 ///
 /// # Errors
 ///
@@ -564,17 +568,8 @@ fn check_placeholder_value(_param: &Parameter, _value_str: &str) -> Result<(), H
 /// and never any byte of the path.
 #[cfg(feature = "input-validation")]
 fn check_composed_path(path: &str) -> Result<(), HttpConnectorError> {
-    let checked = match path.split_once('?') {
-        // No operator-written separator: the whole string is a path.
-        None => pmcp::server::schema_validation::validate_resolved_path(path),
-        // Exactly one operator-written `?`. The separator itself is permitted;
-        // both sides still face the full, unmodified rule set.
-        Some((path_part, query_part)) => {
-            pmcp::server::schema_validation::validate_resolved_path(path_part)
-                .and_then(|()| pmcp::server::schema_validation::validate_resolved_path(query_part))
-        },
-    };
-    checked.map_err(|refusal| refusal_to_backend_error(&refusal))
+    pmcp::server::schema_validation::validate_resolved_target(path)
+        .map_err(|refusal| refusal_to_backend_error(&refusal))
 }
 
 /// The `input-validation`-off half: no composed check, so a residual `{name}` from
@@ -625,6 +620,15 @@ impl HttpClient {
     /// well under the cognitive-complexity 25 gate. Returns `Ok(())` immediately
     /// when no policy is registered, which is the no-allocation empty case.
     ///
+    /// The snapshot the policy sees is built HERE, AFTER that early return, so the
+    /// `policy == None` test exists exactly once. Building it at the call site
+    /// meant either paying for it on every request of every server — `query`'s keys
+    /// and values cloned, sorted, and the method uppercased, for the
+    /// overwhelmingly common no-policy case — or guarding the call site with a
+    /// SECOND copy of the same emptiness test, which then has to be kept in step
+    /// with this one. `query` is snapshotted SORTED so a policy sees a
+    /// deterministic order; the source is a `HashMap`.
+    ///
     /// # Errors
     ///
     /// [`HttpConnectorError::PolicyRefused`] carrying the policy's OWN message.
@@ -633,13 +637,17 @@ impl HttpClient {
         tool: &str,
         method: &str,
         path: &str,
-        query: &[(String, String)],
+        query: &std::collections::HashMap<String, String>,
         body: Option<&serde_json::Value>,
     ) -> Result<(), HttpConnectorError> {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(());
         };
-        let req = crate::policy::OutboundRequest::new(tool, method, path, query, body);
+        let mut sorted: Vec<(String, String)> =
+            query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        sorted.sort();
+        let method = method.to_uppercase();
+        let req = crate::policy::OutboundRequest::new(tool, &method, path, &sorted, body);
         policy
             .check(&req)
             .await
@@ -683,21 +691,20 @@ impl HttpClient {
         // refusal therefore returns before auth AND before the send: nothing is
         // authenticated and nothing leaves.
         //
-        // `query` is snapshotted SORTED so a policy sees a deterministic order
-        // (the source is a HashMap). It carries no auth pair for the reason above:
-        // an API-key-in-query credential is contributed by the call below.
-        let mut policy_query: Vec<(String, String)> =
-            query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        policy_query.sort();
+        // The snapshot `query` becomes (sorted, so a policy sees a deterministic
+        // order) is built inside `run_request_policy`, AFTER its `policy == None`
+        // early return — so the no-policy case, which is the overwhelmingly common
+        // one, pays nothing here and the emptiness test is not duplicated at this
+        // call site. The snapshot carries no auth pair for the reason above: an
+        // API-key-in-query credential is contributed by the call below.
         self.run_request_policy(
             tool,
-            &operation.method.to_uppercase(),
+            &operation.method,
             &joined,
-            &policy_query,
+            &query,
             request_body.as_ref(),
         )
         .await?;
-        drop(policy_query);
 
         // Single-call tools have no per-request passthrough token (Plan 04/06 carry
         // it through HttpCodeExecutor); pass None here.
@@ -858,7 +865,7 @@ mod d4_support {
 
 /// The curated surface's D4 floor: every rendered placeholder value faces
 /// `validate_path_placeholder` before ANY substitution is applied, and the
-/// composed result faces `validate_resolved_path` before dispatch.
+/// composed result faces `validate_resolved_target` before dispatch.
 #[cfg(all(test, feature = "input-validation"))]
 mod placeholder_floor {
     use super::d4_support::{op, path_param, substitute, substitute_one};

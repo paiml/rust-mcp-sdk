@@ -1,10 +1,18 @@
 //! Runtime enforcement of a tool's declared `inputSchema` (Phase 128, D-01).
 //!
-//! This is the ONE input-validation entry point in the SDK. It lives in core
-//! `pmcp` rather than in a consumer crate so that a tool's arguments and its
-//! `structuredContent` can never be checked under different dialects, and so the
-//! compiled-validator cache, the draft pin and the value-free refusal renderer
-//! exist exactly once.
+//! This is the ONE **JSON-Schema** input-validation entry point in the SDK. It
+//! lives in core `pmcp` rather than in a consumer crate so that a tool's
+//! arguments and its `structuredContent` can never be checked under different
+//! dialects, and so the compiled-validator cache, the draft pin and the
+//! value-free refusal renderer exist exactly once.
+//!
+//! The qualifier is load-bearing: `pmcp_server_toolkit::workbook::input::validate_input`
+//! is a SECOND input validator over a declared tool surface. It is not a second
+//! copy of this one and does not belong here — it checks a `CalculateInput`
+//! against a workbook `Manifest` + `CellMap` (dtype, closed-enum membership,
+//! strict-constant overrides), which is a DTO/tier rule set with no JSON Schema
+//! anywhere in it. Anything that IS a JSON Schema check on tool arguments belongs
+//! in this module.
 //!
 //! # Why this is not `super::output_validation`
 //!
@@ -34,8 +42,9 @@
 //! future `jsonschema` major bump is not a breaking `pmcp` change.
 
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 /// Refusal detail for a `tools/call` argument-schema violation.
 ///
@@ -249,11 +258,11 @@ fn project_pointer_segment<'a>(
 ///
 /// Only needed for the `properties` lookup — the emitted text is always the
 /// original, still-escaped token.
-fn unescape_pointer_token(token: &str) -> std::borrow::Cow<'_, str> {
+fn unescape_pointer_token(token: &str) -> Cow<'_, str> {
     if token.contains('~') {
-        std::borrow::Cow::Owned(token.replace("~1", "/").replace("~0", "~"))
+        Cow::Owned(token.replace("~1", "/").replace("~0", "~"))
     } else {
-        std::borrow::Cow::Borrowed(token)
+        Cow::Borrowed(token)
     }
 }
 
@@ -399,33 +408,51 @@ fn cached_input_validator(
     schema: &Value,
     schema_key: Option<&str>,
 ) -> Result<Arc<jsonschema::Validator>, Arc<str>> {
-    type Cache = Mutex<HashMap<String, Result<Arc<jsonschema::Validator>, Arc<str>>>>;
+    type Cache = RwLock<HashMap<String, Result<Arc<jsonschema::Validator>, Arc<str>>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
 
     let cache = CACHE.get_or_init(Cache::default);
-    // Why: a poisoned mutex here only means another thread panicked while
-    // inserting; the map itself is still usable — recover rather than propagate a
-    // panic out of a request-path guard.
-    let mut map = cache.lock().unwrap_or_else(PoisonError::into_inner);
 
-    // A pre-computed key lets a hit avoid re-serializing the schema entirely.
-    if let Some(hit) = schema_key.and_then(|k| map.get(k)) {
-        return hit.clone();
-    }
-    let key = match schema_key {
-        Some(k) => k.to_string(),
-        None => schema.to_string(),
+    // An `RwLock` rather than a `Mutex` because the steady state is ALL reads: the
+    // map is written once per distinct schema and then hit on every `tools/call`
+    // forever. Under a `Mutex` every validation in the process serializes against
+    // every other one, across all tools, for a lookup that mutates nothing.
+    //
+    // Why the poison recovery: a poisoned lock here only means another thread
+    // panicked while inserting; the map itself is still usable — recover rather
+    // than propagate a panic out of a request-path guard.
+    //
+    // The key is resolved BEFORE the lookup so that BOTH callers reach the read
+    // path. Gating the read probe on `schema_key.is_some()` instead would leave
+    // `declared_pattern_check` — which passes `None` and runs once per declared
+    // `pattern` per placeholder per request — taking the EXCLUSIVE write lock on
+    // every request, excluding exactly the readers an `RwLock` exists to admit.
+    // A pre-computed key additionally lets a hit avoid re-serializing the schema.
+    let key: Cow<'_, str> = match schema_key {
+        Some(k) => Cow::Borrowed(k),
+        None => Cow::Owned(schema.to_string()),
     };
-    map.entry(key)
-        .or_insert_with(|| {
-            compile_input_2020_12(schema)
-                .map(Arc::new)
-                // `compile_error_detail` is the ONE audited Display-render site;
-                // this is a COMPILATION error, so it carries author-supplied
-                // schema text and no caller data.
-                .map_err(|error| Arc::from(compile_error_detail(&error).as_str()))
-        })
-        .clone()
+
+    {
+        let map = cache.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = map.get(key.as_ref()) {
+            return hit.clone();
+        }
+    }
+
+    // Compiled OUTSIDE the write lock. Compilation builds the regex set for every
+    // declared `pattern`, and holding the exclusive lock across it stalls every
+    // reader in the process. Losing a race costs one redundant compile, which
+    // `or_insert` then discards — cheaper than serializing all readers behind it.
+    let compiled = compile_input_2020_12(schema)
+        .map(Arc::new)
+        // `compile_error_detail` is the ONE audited Display-render site; this is a
+        // COMPILATION error, so it carries author-supplied schema text and no
+        // caller data.
+        .map_err(|error| Arc::from(compile_error_detail(&error).as_str()));
+
+    let mut map = cache.write().unwrap_or_else(PoisonError::into_inner);
+    map.entry(key.into_owned()).or_insert(compiled).clone()
 }
 
 /// Check that `schema` compiles as a Draft 2020-12 input schema — the
@@ -793,6 +820,65 @@ pub fn validate_resolved_path(path: &str) -> Result<(), PlaceholderRefusal> {
     check_resolved_segments(&decoded)
 }
 
+/// [`validate_resolved_path`] widened by the single author-written query
+/// separator, for a composed path that may carry a `?`.
+///
+/// Both HTTP surfaces compose a path template with resolved placeholder values
+/// and then check the result. An operator may write a literal `?` in the
+/// template, so the composed string is a path AND a query — while
+/// [`validate_resolved_path`] denies `?` anywhere, deliberately, because a `?`
+/// arriving from a *value* silently changes the endpoint.
+///
+/// The narrowing is therefore: split at the FIRST `?` and apply the unmodified
+/// rule to each half. It lives HERE, beside the rule it widens, rather than at
+/// either call site — the curated surface (`HttpClient::check_composed_path`)
+/// and the Code Mode surface (`ResolvedPath::from_checked`) previously held one
+/// copy each, which made this the one part of the floor that could drift
+/// between them. One more sibling, never a second copy.
+///
+/// What the split does NOT relax:
+///
+/// - A SECOND `?` is still refused: only the first is split off, so the query
+///   portion faces the unmodified rule, which denies `?`.
+/// - An empty query portion is still refused — a dangling `/x?` is a trailing
+///   separator, the same class as a trailing `/`.
+/// - A `?` reaching the composed string from a placeholder VALUE never gets
+///   here; the per-value floor has already refused it.
+///
+/// # Two inherited conservatisms, stated so they are not a surprise
+///
+/// Both come from applying the unmodified rule to the query half, and both are
+/// what the two former call-site copies already did — neither is new here.
+///
+/// 1. `%25` is refused outright (it is what bounds the decode to a single pass),
+///    so a query carrying a percent-encoded percent sign is refused.
+/// 2. The query half also faces the rules about path SHAPE — no `//`, no trailing
+///    `/`, no empty segment — because `validate_resolved_path` checks bytes AND
+///    segment structure together. So `/a?redirect=https://example.com`,
+///    `/a?b=//x` and `/a?b=1&c=x/` are all refused. This is the one an operator
+///    actually hits: a query value holding a URL does not compose. Asserted by
+///    `resolved_target_applies_path_segment_structure_to_the_query_too` so it
+///    cannot change silently. Relaxing it means splitting the byte floor from the
+///    segment-structure rules and applying only the former to the query half —
+///    deliberately NOT done here, because widening a security floor is a decision
+///    for its own change, not a side effect of de-duplicating two copies.
+///
+/// # Errors
+///
+/// The [`PlaceholderRefusal`] from [`validate_resolved_path`]. It is value-free:
+/// it names the rule and the declared expectation, never a byte of the path.
+pub fn validate_resolved_target(path: &str) -> Result<(), PlaceholderRefusal> {
+    match path.split_once('?') {
+        // No author-written separator: the whole string is a path.
+        None => validate_resolved_path(path),
+        // Exactly one author-written `?`. The separator itself is permitted;
+        // both sides still face the full, unmodified rule set.
+        Some((path_part, query_part)) => {
+            validate_resolved_path(path_part).and_then(|()| validate_resolved_path(query_part))
+        },
+    }
+}
+
 /// Per-segment half of [`validate_resolved_path`], split out to keep both
 /// functions inside the cognitive-complexity budget.
 fn check_resolved_segments(decoded: &[u8]) -> Result<(), PlaceholderRefusal> {
@@ -890,7 +976,10 @@ fn placeholder_floor(
         // `a/b`), so two adjacent placeholders each holding `.` compose to `..`.
         // Refusing it closes that composition at the value layer as well as in
         // `validate_resolved_path`.
-        || decoded == b".";
+        // `&decoded[..]` and not `decoded.as_ref()`: the latter picks its target
+        // type by inference, so widening `decode_once` to another `Cow` target
+        // would silently re-resolve this comparison rather than fail to compile.
+        || &decoded[..] == b".";
     if denied {
         return Err(refusal(
             param,
@@ -910,7 +999,18 @@ fn placeholder_floor(
 /// reaches ground truth. A malformed escape is refused because leaving it
 /// undecided would mean every downstream layer deciding for itself whether to
 /// treat it as a literal `%` or as an error.
-fn decode_once(param: &str, value: &str) -> Result<Vec<u8>, PlaceholderRefusal> {
+fn decode_once<'v>(param: &str, value: &'v str) -> Result<Cow<'v, [u8]>, PlaceholderRefusal> {
+    let bytes = value.as_bytes();
+
+    // Fast path: a value with no `%` at all has nothing to decode and nothing that
+    // could be a `%25`, so it needs neither the pre-scan nor a copy. This is the
+    // overwhelmingly common case, and both callers only READ the result — the
+    // composed-path check and the per-value floor each scan it and hand it to
+    // `check_resolved_segments`. Borrow instead of allocating.
+    if !bytes.contains(&b'%') {
+        return Ok(Cow::Borrowed(bytes));
+    }
+
     if contains_ascii_case_insensitive(value, "%25") {
         return Err(refusal(
             param,
@@ -918,7 +1018,6 @@ fn decode_once(param: &str, value: &str) -> Result<Vec<u8>, PlaceholderRefusal> 
             PERCENT_EXPECTATION.to_string(),
         ));
     }
-    let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -941,7 +1040,7 @@ fn decode_once(param: &str, value: &str) -> Result<Vec<u8>, PlaceholderRefusal> 
             index += 1;
         }
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 /// One ASCII hex digit's value, case-insensitively; `None` for a non-hex byte.
@@ -1733,7 +1832,7 @@ mod tests {
         // D4 concurrency edge: no shared mutable state of its own, so two Code
         // Mode calls on one executor cannot interleave placeholder state. The
         // validator cache behind the declared-pattern step is the only shared
-        // state and it is a `Mutex<HashMap<…>>`.
+        // state and it is an `RwLock<HashMap<…>>`, read-probed before any write.
         let handles: Vec<_> = (0..8)
             .map(|worker| {
                 std::thread::spawn(move || {
@@ -1879,5 +1978,45 @@ mod tests {
             !rendered.contains("secret"),
             "must not echo the composed path: {rendered}"
         );
+    }
+
+    // `validate_resolved_target`'s guarantees are exercised end-to-end by
+    // `pmcp_server_toolkit::http::client::query_separator` and by
+    // `pmcp_code_mode::executor::query_separator` (11 rows each). These rows live
+    // HERE as well, beside the rule, so `cargo test -p pmcp` alone cannot be green
+    // against an edit to this security floor — the reason the narrowing was moved
+    // into this module in the first place.
+
+    #[test]
+    fn resolved_target_accepts_exactly_one_author_written_separator() {
+        assert!(validate_resolved_target("/a/b").is_ok());
+        assert!(validate_resolved_target("/a?b=c").is_ok());
+        assert!(validate_resolved_target("/a?b=c&d=e").is_ok());
+    }
+
+    #[test]
+    fn resolved_target_refuses_a_second_separator_and_an_empty_query() {
+        // Only the FIRST `?` is split off, so the query portion faces the
+        // unmodified rule, which denies `?`.
+        assert!(validate_resolved_target("/a?b=c?d=e").is_err());
+        // A dangling `?` is a trailing separator, the same class as a trailing `/`.
+        assert!(validate_resolved_target("/a?").is_err());
+        // And the path portion keeps every rule it had.
+        assert!(validate_resolved_target("/a/../secret?b=c").is_err());
+        assert!(validate_resolved_target("/a?b=%00").is_err());
+        assert!(validate_resolved_target("/a#frag?b=c").is_err());
+    }
+
+    #[test]
+    fn resolved_target_applies_path_segment_structure_to_the_query_too() {
+        // DOCUMENTED CONSEQUENCE, asserted so it cannot change silently: the query
+        // half faces `validate_resolved_path` whole, including the rules about path
+        // SHAPE (`//`, a trailing `/`, an empty segment). So a query value carrying
+        // a URL or a trailing slash is refused. That is inherited conservatism, not
+        // a new rule — both former call-site copies did exactly this — but it is the
+        // most surprising thing about the narrowing and the one an operator hits.
+        assert!(validate_resolved_target("/a?redirect=https://example.com").is_err());
+        assert!(validate_resolved_target("/a?b=//x").is_err());
+        assert!(validate_resolved_target("/a?b=1&c=x/").is_err());
     }
 }

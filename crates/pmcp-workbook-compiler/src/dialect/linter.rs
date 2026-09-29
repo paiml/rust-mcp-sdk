@@ -376,7 +376,7 @@ fn scan_function_token(chars: &[char], start: usize) -> (Option<String>, usize) 
     if !followed_by_open_paren(chars, next) {
         return (None, next);
     }
-    let name = strip_xlfn_prefix(&ident);
+    let name = strip_xlfn_prefix(ident);
     let token = if name.is_empty() { None } else { Some(name) };
     (token, next)
 }
@@ -424,12 +424,13 @@ fn read_identifier(chars: &[char], start: usize) -> (String, usize) {
 
 /// Strip a leading `_xlfn.` future-function prefix (case-insensitive) so the
 /// future-function form `_xlfn.CONCAT` compares as `CONCAT`.
-fn strip_xlfn_prefix(ident: &str) -> String {
-    const PREFIX: &str = "_xlfn.";
-    if ident.len() >= PREFIX.len() && ident[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-        ident[PREFIX.len()..].to_string()
-    } else {
-        ident.to_string()
+/// Takes `ident` BY VALUE so the common no-prefix case keeps the `String`
+/// `read_identifier` already allocated instead of copying it — the same shape
+/// `formula::parser::normalize_future_function_name` uses over the same helper.
+fn strip_xlfn_prefix(ident: String) -> String {
+    match super::xlfn_stripped(&ident) {
+        Some(stripped) => stripped.to_string(),
+        None => ident,
     }
 }
 

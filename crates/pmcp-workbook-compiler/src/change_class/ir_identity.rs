@@ -158,15 +158,12 @@ fn parse_a1(addr: &str) -> Option<(u32, u32)> {
 }
 
 /// Convert a 1-based column index back to A1 letters (e.g. `1 -> "A"`, `27 -> "AA"`).
-fn col_to_a1(mut col: u32) -> String {
-    let mut s = Vec::new();
-    while col > 0 {
-        let rem = (col - 1) % 26;
-        s.push(b'A' + rem as u8);
-        col = (col - 1) / 26;
-    }
-    s.reverse();
-    String::from_utf8(s).unwrap_or_default()
+///
+/// Delegates to [`crate::index_to_col`], the crate's single bijective-base-26
+/// encoder. This module and `formula::structured_ref` each held a byte-identical
+/// private copy; a future A1 fix must not have to be applied in three places.
+fn col_to_a1(col: u32) -> String {
+    crate::index_to_col(col)
 }
 
 /// The in-`visited` precedents of one IR cell key (the cell's precedents

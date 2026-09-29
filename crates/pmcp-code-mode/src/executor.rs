@@ -2466,7 +2466,7 @@ impl<'a> ResolvedPath<'a> {
     /// Check `path` as a composed request path and wrap it on success.
     ///
     /// This is the only constructor: it runs
-    /// [`validate_resolved_path`](crate::validate_resolved_path), so the
+    /// [`validate_resolved_target`](crate::validate_resolved_target), so the
     /// invariant documented on the type is established here rather than
     /// asserted.
     ///
@@ -2474,9 +2474,11 @@ impl<'a> ResolvedPath<'a> {
     ///
     /// `validate_resolved_path` refuses a query separator ANYWHERE, and core keeps
     /// that strict rule — it is a general-purpose composed-path checker and other
-    /// callers want it. This constructor splits at the FIRST `?` and applies the
-    /// full rule set to each side, which exempts exactly that one separator and
-    /// nothing else.
+    /// callers want it. Its core SIBLING `validate_resolved_target` — which this
+    /// constructor calls, and which the curated surface
+    /// (`pmcp_server_toolkit::http::HttpClient::check_composed_path`) calls too, so
+    /// the two cannot drift — splits at the FIRST `?` and applies the full rule set
+    /// to each side, which exempts exactly that one separator and nothing else.
     ///
     /// Why that is safe rather than a hole. Both per-value floors already refuse
     /// `?` in a substituted value, in literal AND percent-encoded form, with a
@@ -2508,19 +2510,10 @@ impl<'a> ResolvedPath<'a> {
     /// # Errors
     ///
     /// Returns the [`PlaceholderRefusal`](crate::PlaceholderRefusal) from
-    /// `validate_resolved_path`. The refusal is value-free: it names the rule and
+    /// `validate_resolved_target`. The refusal is value-free: it names the rule and
     /// the declared expectation, never any byte of the path it refused.
     pub fn from_checked(path: &'a str) -> Result<Self, crate::PlaceholderRefusal> {
-        match path.split_once('?') {
-            // No author-written separator: the whole string is a path.
-            None => crate::validate_resolved_path(path)?,
-            // Exactly one author-written `?`. The separator itself is permitted;
-            // both sides still face the full, unmodified rule set.
-            Some((path_part, query_part)) => {
-                crate::validate_resolved_path(path_part)?;
-                crate::validate_resolved_path(query_part)?;
-            },
-        }
+        crate::validate_resolved_target(path)?;
         Ok(Self(path))
     }
 
@@ -2953,9 +2946,9 @@ fn floor_layer_one_contribution(param: &str, rendered: &str) -> Result<(), Execu
 ///
 /// Returns [`ExecutionError::RuntimeError`] naming `key`. Per Pitfall 5 the
 /// message names the KEY only — never the value.
-fn render_path_scalar(key: &str, value: &JsonValue) -> Result<String, ExecutionError> {
+fn render_path_scalar(key: &str, value: JsonValue) -> Result<String, ExecutionError> {
     match value {
-        JsonValue::String(s) => Ok(s.clone()),
+        JsonValue::String(s) => Ok(s),
         JsonValue::Null => Ok("null".to_string()),
         JsonValue::Number(n) => Ok(n.to_string()),
         JsonValue::Bool(b) => Ok(b.to_string()),
@@ -2963,6 +2956,50 @@ fn render_path_scalar(key: &str, value: &JsonValue) -> Result<String, ExecutionE
             message: format!("path/query param '{key}' must be a scalar"),
         }),
     }
+}
+
+/// Apply PASS 1's `substitutions` to `template` in ONE left-to-right scan.
+///
+/// Deliberately NOT a sequence of `String::replace` calls over a progressively
+/// substituted string. That form re-scans text a PREVIOUS value contributed, so a
+/// value holding a literal `{other_key}` manufactures a placeholder for a later
+/// key to fill — which is exactly the invariant
+/// [`resolve_layer_two_placeholders`] documents and, before this scan existed, did
+/// not hold. Measured on the sequential form: template `/p/{a}/q/{b}` with body
+/// `{"a": "x{b}y", "b": "zzz"}` composed to `/p/xzzzy/q/zzz`, putting `b`'s value
+/// inside `a`'s segment. `ResolvedPath::from_checked` could not catch it: `{`/`}`
+/// are not on `denied_byte`'s list, so `x{b}y` passes the per-value floor, and a
+/// MANUFACTURED placeholder leaves no residual brace behind for the composed check
+/// to refuse. Scanning the template once means a substituted value is never
+/// re-examined: the `{b}` stays a LITERAL, so the composed string still carries a
+/// brace and `ResolvedPath::from_checked` refuses it as an unsubstituted
+/// placeholder. A silent injection became a refusal, which is the point. Pinned by
+/// `layer_two::layer_two_value_cannot_manufacture_a_placeholder_for_a_later_key`.
+///
+/// The longest matching placeholder wins at any position, so a key whose `{key}`
+/// token is a prefix of another's cannot shadow it.
+fn apply_substitutions(template: &str, substitutions: &[(String, String)]) -> String {
+    let mut order: Vec<(&str, &str)> = substitutions
+        .iter()
+        .map(|(placeholder, rendered)| (placeholder.as_str(), rendered.as_str()))
+        .collect();
+    order.sort_by_key(|(placeholder, _)| std::cmp::Reverse(placeholder.len()));
+
+    let mut resolved = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(ch) = rest.chars().next() {
+        match order.iter().copied().find(|(p, _)| rest.starts_with(*p)) {
+            Some((placeholder, rendered)) => {
+                resolved.push_str(rendered);
+                rest = &rest[placeholder.len()..];
+            },
+            None => {
+                resolved.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            },
+        }
+    }
+    resolved
 }
 
 /// LAYER-2 `{key}` placeholder resolution, moved ahead of
@@ -2995,31 +3032,43 @@ fn resolve_layer_two_placeholders<H: HttpExecutor + ?Sized>(
     template: &str,
     body: Option<JsonValue>,
 ) -> Result<(String, Option<JsonValue>), ExecutionError> {
-    let Some(JsonValue::Object(obj)) = body.as_ref() else {
-        return Ok((template.to_string(), body));
+    // Destructured BY VALUE: this function owns `body`, so a non-placeholder entry
+    // can be MOVED into `remaining` rather than deep-cloned. Cloning here copied
+    // essentially the whole request payload — every nested object and array — on
+    // every Code Mode HTTP call.
+    let obj = match body {
+        Some(JsonValue::Object(obj)) => obj,
+        other => return Ok((template.to_string(), other)),
     };
 
     // PASS 1 — render + check, mutating nothing.
     let mut substitutions: Vec<(String, String)> = Vec::new();
     let mut remaining = serde_json::Map::new();
+    // One reusable buffer for the containment test. Most body keys are NOT path
+    // placeholders — the `else` arm is the common one — so building a fresh
+    // `format!("{{{key}}}")` per key allocated once for every key in every request
+    // body and threw most of them away. The buffer is cloned only on a match.
+    let mut probe = String::new();
     for (key, value) in obj {
-        let placeholder = format!("{{{key}}}");
-        if template.contains(&placeholder) {
-            let rendered = render_path_scalar(key, value)?;
-            let rules = http.placeholder_rules(method, template, key);
-            crate::validate_path_placeholder(key, &rendered, &rules)
+        probe.clear();
+        probe.push('{');
+        probe.push_str(&key);
+        probe.push('}');
+        if template.contains(probe.as_str()) {
+            let rules = http.placeholder_rules(method, template, &key);
+            // `value` is owned and dropped right here, so render by value rather
+            // than cloning the `String` out of a `JsonValue::String`.
+            let rendered = render_path_scalar(&key, value)?;
+            crate::validate_path_placeholder(&key, &rendered, &rules)
                 .map_err(refusal_to_execution_error)?;
-            substitutions.push((placeholder, rendered));
+            substitutions.push((probe.clone(), rendered));
         } else {
-            remaining.insert(key.clone(), value.clone());
+            remaining.insert(key, value);
         }
     }
 
-    // PASS 2 — apply.
-    let mut resolved = template.to_string();
-    for (placeholder, rendered) in substitutions {
-        resolved = resolved.replace(&placeholder, &rendered);
-    }
+    // PASS 2 — apply, in ONE left-to-right scan over the TEMPLATE.
+    let resolved = apply_substitutions(template, &substitutions);
 
     let remaining = if remaining.is_empty() {
         None
@@ -5709,6 +5758,43 @@ mod layer_two {
         );
     }
 
+    /// The `# Ordering` invariant on [`resolve_layer_two_placeholders`], asserted
+    /// end-to-end: "a value that itself contains `{`/`}` cannot manufacture a
+    /// placeholder for a later key to fill."
+    ///
+    /// It did NOT hold while PASS 2 was a sequence of `String::replace` calls over a
+    /// progressively substituted string — `a`'s literal `{b}` was expanded by the
+    /// next iteration, composing `/p/xzzzy/q/zzz`. Nothing caught it: `{`/`}` are
+    /// not denied bytes, so `x{b}y` passes the per-value floor, and a MANUFACTURED
+    /// placeholder leaves no residual brace for `ResolvedPath::from_checked` to
+    /// refuse. `apply_substitutions`' single scan over the TEMPLATE is what makes
+    /// the claim true; this row is what keeps it true.
+    #[tokio::test]
+    async fn layer_two_value_cannot_manufacture_a_placeholder_for_a_later_key() {
+        let (result, seen) = run(
+            "/p/{a}/q/{b}",
+            serde_json::json!({"a": "x{b}y", "b": "zzz"}),
+        )
+        .await;
+        let rendered = result
+            .expect_err("a value's literal `{b}` must never be expanded as a placeholder")
+            .to_string();
+        assert!(
+            seen.is_empty(),
+            "no upstream request may be dispatched: {rendered}"
+        );
+        // `a`'s `{b}` survives PASS 2 as a LITERAL, so the composed string still
+        // carries a brace and `ResolvedPath::from_checked` refuses it as an
+        // unsubstituted placeholder. Under the old sequential `String::replace` the
+        // brace was CONSUMED — composing `/p/xzzzy/q/zzz`, with `b`'s value inside
+        // `a`'s segment and nothing left for the composed check to refuse. Turning a
+        // silent injection into a refusal is the point.
+        assert!(
+            !rendered.contains("zzz"),
+            "the refusal must carry no byte of any value: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn layer_two_conforming_call_produces_exactly_one_request() {
         let (result, seen) = run("/users/{v}", serde_json::json!({"v": "ada"})).await;
@@ -5999,8 +6085,9 @@ mod error_does_not_echo_path {
 
 /// The `?` narrowing, pinned in BOTH directions so it cannot become a hole.
 ///
-/// `ResolvedPath::from_checked` splits at the first `?` and applies the full rule
-/// set to each side, which exempts exactly one author-written query separator.
+/// `ResolvedPath::from_checked` calls core's `validate_resolved_target`, which
+/// splits at the first `?` and applies the full rule set to each side, exempting
+/// exactly one author-written query separator.
 /// These rows assert what that buys AND everything it does not relax. A narrowing
 /// with only accept-rows is indistinguishable from a deleted check.
 #[cfg(test)]

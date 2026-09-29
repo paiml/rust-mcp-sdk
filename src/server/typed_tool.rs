@@ -24,9 +24,17 @@ use schemars::JsonSchema;
 /// A stored, type-erased `garde` entry point for `T`.
 ///
 /// Exists as an alias so the field it types stays readable and so the
-/// `clippy::type_complexity` shape is named once.
+/// shape is named once.
+///
+/// A plain `fn` pointer, not a `Box<dyn Fn>`: the only value ever stored is
+/// `garde::Validate::validate`, a non-capturing fn item. Boxing it bought a
+/// heap allocation, a vtable pointer in every `TypedTool`/`TypedSyncTool`, and an
+/// indirect call per validated `tools/call`, in exchange for a capturing-closure
+/// capability nothing uses. `fn` is `Copy`, `Send + Sync` by construction, and
+/// calls directly. Widen it back to `Box<dyn Fn>` if a capturing validator is ever
+/// genuinely needed.
 #[cfg(feature = "validation")]
-type GardeValidator<T> = Box<dyn Fn(&T) -> std::result::Result<(), garde::Report> + Send + Sync>;
+type GardeValidator<T> = fn(&T) -> std::result::Result<(), garde::Report>;
 
 /// A typed tool implementation with automatic schema generation and validation.
 pub struct TypedTool<T, F>
@@ -191,7 +199,7 @@ where
     where
         T: garde::Validate<Context = ()>,
     {
-        self.validator = Some(Box::new(garde::Validate::validate));
+        self.validator = Some(garde::Validate::validate);
         self
     }
 
@@ -231,7 +239,7 @@ where
     /// A tool built through a plain constructor stores none, and this is a no-op.
     #[cfg(feature = "validation")]
     fn run_garde(&self, typed_args: &T) -> Result<()> {
-        match self.validator.as_deref() {
+        match self.validator {
             Some(validate) => {
                 validate(typed_args).map_err(|report| render_garde_refusal(&self.name, &report))
             },
@@ -671,7 +679,7 @@ where
     where
         T: garde::Validate<Context = ()>,
     {
-        self.validator = Some(Box::new(garde::Validate::validate));
+        self.validator = Some(garde::Validate::validate);
         self
     }
 
@@ -702,7 +710,7 @@ where
     /// A tool built through a plain constructor stores none, and this is a no-op.
     #[cfg(feature = "validation")]
     fn run_garde(&self, typed_args: &T) -> Result<()> {
-        match self.validator.as_deref() {
+        match self.validator {
             Some(validate) => {
                 validate(typed_args).map_err(|report| render_garde_refusal(&self.name, &report))
             },

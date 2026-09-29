@@ -190,7 +190,7 @@ fn column_range(
         .ok_or_else(|| StructuredReferenceError::InvalidTableArea {
             table: table.name.clone(),
         })?;
-    let column = column_letters(column_index);
+    let column = crate::index_to_col(column_index);
     let escaped_sheet = sheet.replace('\'', "''");
     Ok(format!(
         "'{escaped_sheet}'!{column}{body_start}:{column}{end_row}"
@@ -213,17 +213,6 @@ fn parse_a1(address: &str) -> Option<(u32, u32)> {
             .checked_add(u32::from(ch.to_ascii_uppercase() - b'A' + 1))?;
     }
     Some((column_index, row.parse().ok()?))
-}
-
-fn column_letters(mut index: u32) -> String {
-    let mut letters = Vec::new();
-    while index > 0 {
-        let remainder = ((index - 1) % 26) as u8;
-        letters.push(b'A' + remainder);
-        index = (index - 1) / 26;
-    }
-    letters.reverse();
-    String::from_utf8(letters).unwrap_or_default()
 }
 
 /// Fuzz-only hook over the scanner with a representative Table binding. The

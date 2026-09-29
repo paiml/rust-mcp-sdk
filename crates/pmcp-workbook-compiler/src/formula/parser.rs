@@ -383,17 +383,15 @@ impl Parser {
 }
 
 /// Remove Excel's OOXML future-function compatibility prefix from a function
-/// name, case-insensitively. Only a leading, dot-terminated `_xlfn.` is removed;
-/// lookalikes remain subject to the normal whitelist rejection.
+/// name, case-insensitively.
+///
+/// Delegates to [`crate::dialect::xlfn_stripped`], which the dialect LINTER also
+/// uses: the lint and the parse must not be able to disagree about what a
+/// function is named. Allocates only when a prefix was actually present.
 fn normalize_future_function_name(name: String) -> String {
-    const PREFIX: &str = "_xlfn.";
-    if name
-        .get(..PREFIX.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(PREFIX))
-    {
-        name[PREFIX.len()..].to_string()
-    } else {
-        name
+    match crate::dialect::xlfn_stripped(&name) {
+        Some(stripped) => stripped.to_string(),
+        None => name,
     }
 }
 

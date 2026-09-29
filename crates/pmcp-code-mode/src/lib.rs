@@ -131,14 +131,17 @@ pub use async_trait::async_trait;
 /// the name a third-party `HttpExecutor` implementor would look for. An
 /// implementor whose template syntax is not OpenAPI's `{key}` can call
 /// `pmcp_code_mode::validate_path_placeholder` on each value it substitutes and
-/// `pmcp_code_mode::validate_resolved_path` on the composed result, reaching the
+/// `pmcp_code_mode::validate_resolved_path` on the composed result — or
+/// `pmcp_code_mode::validate_resolved_target`, which is that rule widened by the
+/// single author-written `?` separator, and is what `ResolvedPath::from_checked`
+/// itself calls. Either reaches the
 /// same rule the SDK itself applies before calling
 /// `HttpExecutor::execute_request`. (Plain backticks, not an intra-doc link:
 /// `executor` is gated on `js-runtime` and the link would not resolve in a
 /// default-feature doc build.)
 pub use pmcp::server::schema_validation::{
-    validate_path_placeholder, validate_resolved_path, PlaceholderRefusal, PlaceholderRules,
-    PLACEHOLDER_MAX_LENGTH,
+    validate_path_placeholder, validate_resolved_path, validate_resolved_target,
+    PlaceholderRefusal, PlaceholderRules, PLACEHOLDER_MAX_LENGTH,
 };
 
 // High-level CodeExecutor trait (always available, no feature gate) (D-04)

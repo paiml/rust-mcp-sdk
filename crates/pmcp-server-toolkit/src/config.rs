@@ -505,10 +505,66 @@ pub(crate) fn default_cap_applies(
     position: ParamPosition,
     validation: &ValidationSection,
 ) -> bool {
-    is_string_param(p)
-        && p.max_length.is_none()
-        && validation.default_max_length != 0
+    is_string_param(p) && p.max_length.is_none() && cap_position_applies(position, validation)
+}
+
+/// The POSITION half of [`default_cap_applies`]: whether the D3 default cap
+/// reaches `position` at all, independent of any particular parameter.
+///
+/// Split out because the two conditions are about different things — this one is
+/// "does the cap reach here", the other two are "does this parameter need it" —
+/// and because [`is_uncapped_string`] has to negate THIS half while asserting the
+/// other two. Negating the whole of `default_cap_applies` instead is a double
+/// negative over a predicate that redundantly re-checks its own premises.
+///
+/// Private: both callers are in this module. `default_cap_applies` is the
+/// `pub(crate)` face of the same question.
+fn cap_position_applies(position: ParamPosition, validation: &ValidationSection) -> bool {
+    validation.default_max_length != 0
         && matches!(position, ParamPosition::Path | ParamPosition::Query)
+}
+
+/// Whether `p` is a string parameter that ends up with NO length bound at all —
+/// neither a declared `max_length` nor the D3 default cap.
+///
+/// The single definition behind both the `uncapped-string` `lint()` finding and
+/// the `strict`-mode [`ConfigValidationError::UncappedStringParam`] refusal, which
+/// must cover exactly the same parameters: a warning that `strict` would not
+/// refuse, or a refusal that `lint()` never warned about, is a drift defect.
+fn is_uncapped_string(
+    p: &ParamDecl,
+    position: ParamPosition,
+    validation: &ValidationSection,
+) -> bool {
+    is_string_param(p) && p.max_length.is_none() && !cap_position_applies(position, validation)
+}
+
+/// WHY a parameter ends up with no length bound. [`is_uncapped_string`] is
+/// position-BLIND — `cap_position_applies` is false either because the position is
+/// outside the cap's reach OR because `default_max_length = 0` switched the cap off
+/// for every position — and the two reasons need different prose.
+///
+/// Split out because the finding used to name only the first reason, rendering
+/// `... is in Path position, where the [server.validation] default_max_length cap
+/// deliberately does not apply` for a PATH parameter under
+/// `default_max_length = 0`. That is false twice over: the cap does reach Path, and
+/// what actually disabled it was the operator's own server-level opt-out — which
+/// emits its own [`OPT_OUT_DEFAULT_MAX_LENGTH_ZERO`] warning and is a supported
+/// configuration, not an unreachable one. A finding that misnames its own cause
+/// sends the operator to declare a `max_length` per parameter when one config key
+/// explains all of them.
+fn uncapped_reason(position: ParamPosition, validation: &ValidationSection) -> String {
+    if validation.default_max_length == 0 {
+        "[server.validation] default_max_length = 0 switches the default cap off for \
+         EVERY position on this server"
+            .to_string()
+    } else {
+        format!(
+            "it is in {position:?} position, which the [server.validation] \
+             default_max_length cap deliberately does not reach (free text must keep \
+             working)"
+        )
+    }
 }
 
 /// Per-tool `lint()` findings, appended in `[[tools.parameters]]` declaration
@@ -516,19 +572,16 @@ pub(crate) fn default_cap_applies(
 fn lint_tool(tool: &ToolDecl, validation: &ValidationSection, out: &mut Vec<ConfigWarning>) {
     for p in &tool.parameters {
         let position = tool.param_position(&p.name);
-        if is_string_param(p)
-            && p.max_length.is_none()
-            && !default_cap_applies(p, position, validation)
-        {
+        if is_uncapped_string(p, position, validation) {
             out.push(ConfigWarning {
                 tool: tool.name.clone(),
                 param: p.name.clone(),
                 rule: UNCAPPED_STRING,
                 detail: format!(
-                    "declares no max_length and is in {position:?} position, where the \
-                     [server.validation] default_max_length cap deliberately does not apply \
-                     (free text must keep working) — declare an explicit max_length, or set \
-                     [server.validation] strict = true to make this an error"
+                    "declares no max_length and no default cap reaches it, so it is \
+                     unbounded: {} — declare an explicit max_length, or set \
+                     [server.validation] strict = true to make this an error",
+                    uncapped_reason(position, validation)
                 ),
             });
         }
@@ -812,8 +865,7 @@ fn check_param_capped_under_strict(
     validation: &ValidationSection,
 ) -> std::result::Result<(), ConfigValidationError> {
     let position = tool.param_position(&p.name);
-    if is_string_param(p) && p.max_length.is_none() && !default_cap_applies(p, position, validation)
-    {
+    if is_uncapped_string(p, position, validation) {
         return Err(ConfigValidationError::UncappedStringParam {
             tool: tool.name.clone(),
             param: p.name.clone(),

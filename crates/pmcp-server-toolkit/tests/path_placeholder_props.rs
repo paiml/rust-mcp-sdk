@@ -44,10 +44,12 @@
 //!
 //! The operator narrowed the query-separator rule: an author-written query string
 //! in a path is ACCEPTED, while a `?` arriving from a placeholder VALUE is still
-//! REFUSED. Both production callers implement that by splitting the composed path
-//! at the FIRST `?` and passing BOTH sides through the UNMODIFIED core rule —
+//! REFUSED. That narrowing lives in ONE place — core's
+//! `pmcp::server::schema_validation::validate_resolved_target`, which splits the
+//! composed path at the FIRST `?` and passes BOTH sides through the UNMODIFIED
+//! `validate_resolved_path`. Both production callers reach it from there:
 //! `pmcp_code_mode::ResolvedPath::from_checked` on the Code Mode surface and
-//! `HttpClient::substitute_path` on the curated one.
+//! `HttpClient::check_composed_path` on the curated one.
 //!
 //! This binary asserts the two CORE facts that split composes, and deliberately
 //! does not re-derive the split itself (one implementation of a rule, never two):
@@ -263,14 +265,15 @@ fn property_declared_pattern_never_widens_the_floor() {
             "and must survive composition"
         );
         if let Some(query) = &author_query {
-            // Core is STRICT about `?` anywhere. This Err is precisely what the two
-            // production callers' split relaxes for an AUTHOR-written separator; it
-            // is asserted here so the property holds under the narrowing rather
-            // than claiming a rule core does not have.
+            // `validate_resolved_path` is STRICT about `?` anywhere. This Err is
+            // precisely what its sibling `validate_resolved_target` relaxes for an
+            // AUTHOR-written separator; it is asserted here so the property holds
+            // under the narrowing rather than claiming a rule this function does
+            // not have.
             prop_assert!(
                 validate_resolved_path(&format!("/api/{clean}?{query}")).is_err(),
-                "core's composed rule refuses `?` anywhere — the exemption lives in \
-                 the callers' split, not here"
+                "`validate_resolved_path` refuses `?` anywhere — the exemption lives \
+                 in its sibling `validate_resolved_target`, not here"
             );
         }
     });
