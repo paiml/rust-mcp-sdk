@@ -217,8 +217,8 @@ pub use async_trait::async_trait;
 
 pub use crate::policy::{
     emit_validation_report, render_validation_report, ArgumentRefusal, ArgumentValidator,
-    ArgumentValidators, OutboundRequest, PolicyRefusal, ReportLevel, ReportLine, RequestPhase,
-    RequestPolicy, ToolkitHooks,
+    OutboundRequest, PolicyRefusal, ReportLevel, ReportLine, RequestPhase, RequestPolicy,
+    ToolkitHooks,
 };
 
 // HTTP connector (Phase 90 OAPI-01) — crate-root re-export of the headline

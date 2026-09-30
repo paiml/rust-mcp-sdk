@@ -412,21 +412,19 @@ pub enum ConfigValidationError {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWarning {
-    /// The `[[tools]]` `name` the finding concerns.
+    /// The `[[tools]]` `name` the finding concerns; `None` for a server-level
+    /// finding — an active `[server.validation]` opt-out belongs to the server, not
+    /// to a tool.
+    pub tool: Option<String>,
+    /// The `[[tools.parameters]]` `name` the finding concerns; `None` when the
+    /// finding is not about one parameter.
     ///
-    /// EMPTY for a server-level finding — an active `[server.validation]` opt-out
-    /// belongs to the server, not to a tool.
-    pub tool: String,
-    /// The `[[tools.parameters]]` `name` the finding concerns.
-    ///
-    /// EMPTY for a server-level finding, for the same reason as [`Self::tool`] —
-    /// and ALSO empty for a TOOL-level finding, one that concerns the `[[tools]]`
-    /// entry as a whole rather than any one parameter (`lint_against_spec`'s
-    /// `configured-template-not-in-spec` is the live case). So the two fields encode
-    /// three scopes, and this field alone does not distinguish server-level from
-    /// tool-level: read it together with [`Self::tool`], exactly as this type's
-    /// `Display` does. A consumer switching on scope should test BOTH.
-    pub param: String,
+    /// A server-level finding has neither `tool` nor `param`. A TOOL-level finding,
+    /// one that concerns the `[[tools]]` entry as a whole rather than any one
+    /// parameter (`lint_against_spec`'s `configured-template-not-in-spec` is the
+    /// live case), has a `tool` and no `param`. A parameter-level finding has both.
+    /// `None` is the only "absent" value: an empty string is a name, not a scope.
+    pub param: Option<String>,
     /// Stable machine-readable rule identifier, e.g. `"uncapped-string"`.
     ///
     /// A `&'static str` rather than an enum so plan 07's CLI and plan 09's startup
@@ -442,33 +440,25 @@ pub struct ConfigWarning {
 }
 
 impl std::fmt::Display for ConfigWarning {
-    /// Renders the THREE scopes the two sentinel fields encode, not two.
-    ///
-    /// `tool` and `param` are independently empty-as-sentinel, so they describe a
-    /// server-level, a tool-level, or a parameter-level finding. Branching on
-    /// `tool` alone collapsed the middle case into the parameter arm and rendered
-    /// a tool-level finding as `... 'get_cui' parameter '': ...` — reachable
-    /// today from `ServerConfig::lint_against_spec`, which emits
-    /// `configured-template-not-in-spec` with a tool name and an empty `param`,
-    /// and printed verbatim to the deploy log by `pmcp-openapi-server`.
+    /// Renders the three scopes the two optional fields encode: server-level,
+    /// tool-level (no parameter) and parameter-level. Branching on `tool` alone
+    /// would render a tool-level finding as `... 'get_cui' parameter '': ...`,
+    /// which `lint_against_spec` can produce and `pmcp-openapi-server` prints
+    /// verbatim to the deploy log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.tool.is_empty(), self.param.is_empty()) {
+        match (self.tool.as_deref(), self.param.as_deref()) {
             // Server-level: an active `[server.validation]` opt-out belongs to the
             // server, not to any tool.
-            (true, _) => write!(f, "[{}] {}", self.rule, self.detail),
+            (None, _) => write!(f, "[{}] {}", self.rule, self.detail),
             // Tool-level: the finding concerns the `[[tools]]` entry as a whole.
-            (false, true) => {
-                write!(
-                    f,
-                    "[{}] [[tools]] '{}': {}",
-                    self.rule, self.tool, self.detail
-                )
+            (Some(tool), None) => {
+                write!(f, "[{}] [[tools]] '{tool}': {}", self.rule, self.detail)
             },
             // Parameter-level.
-            (false, false) => write!(
+            (Some(tool), Some(param)) => write!(
                 f,
-                "[{}] [[tools]] '{}' parameter '{}': {}",
-                self.rule, self.tool, self.param, self.detail
+                "[{}] [[tools]] '{tool}' parameter '{param}': {}",
+                self.rule, self.detail
             ),
         }
     }
@@ -479,9 +469,11 @@ mod config_warning_display {
     use super::ConfigWarning;
 
     fn warning(tool: &str, param: &str) -> ConfigWarning {
+        // The test helper keeps "" as shorthand for "no such scope".
+        let scope = |s: &str| (!s.is_empty()).then(|| s.to_string());
         ConfigWarning {
-            tool: tool.to_string(),
-            param: param.to_string(),
+            tool: scope(tool),
+            param: scope(param),
             rule: "a-rule",
             detail: "a detail".to_string(),
         }

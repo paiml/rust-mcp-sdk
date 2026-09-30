@@ -405,8 +405,8 @@ impl ServerConfig {
                 continue;
             }
             out.push(ConfigWarning {
-                tool: tool.name.clone(),
-                param: String::new(),
+                tool: Some(tool.name.clone()),
+                param: None,
                 rule: CONFIGURED_TEMPLATE_NOT_IN_SPEC,
                 detail: format!(
                     "declares `method = \"{method}\"` and `path = \"{path}\"`, which matches no \
@@ -431,7 +431,7 @@ impl ServerConfig {
     /// is how an operator discovers, from a deploy log alone, that a server is
     /// running with schema enforcement off or with the cap disabled.
     #[must_use]
-    pub fn validation_report(&self) -> ValidationReport {
+    pub(crate) fn validation_report(&self) -> ValidationReport {
         let validation = &self.server.validation;
         let mut opt_outs = Vec::new();
         lint_opt_outs(validation, &mut opt_outs);
@@ -452,9 +452,8 @@ impl ServerConfig {
 
 /// What [`ServerConfig::validation_report`] returns: the enforcement actually in
 /// effect, per server and per tool.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationReport {
+pub(crate) struct ValidationReport {
     /// Effective [`ValidationSection::enforce_input_schema`].
     pub enforce_input_schema: bool,
     /// Effective [`ValidationSection::default_max_length`].
@@ -470,9 +469,8 @@ pub struct ValidationReport {
 }
 
 /// One tool's row in a [`ValidationReport`].
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolValidationReport {
+pub(crate) struct ToolValidationReport {
     /// The `[[tools]]` `name`.
     pub tool: String,
     /// Rendered per-parameter rules in declaration order, e.g.
@@ -574,8 +572,8 @@ fn lint_tool(tool: &ToolDecl, validation: &ValidationSection, out: &mut Vec<Conf
         let position = tool.param_position(&p.name);
         if is_uncapped_string(p, position, validation) {
             out.push(ConfigWarning {
-                tool: tool.name.clone(),
-                param: p.name.clone(),
+                tool: Some(tool.name.clone()),
+                param: Some(p.name.clone()),
                 rule: UNCAPPED_STRING,
                 detail: format!(
                     "declares no max_length and no default cap reaches it, so it is \
@@ -617,8 +615,8 @@ fn lint_declared_cap_above_placeholder_floor(
         return;
     }
     out.push(ConfigWarning {
-        tool: tool.name.clone(),
-        param: p.name.clone(),
+        tool: Some(tool.name.clone()),
+        param: Some(p.name.clone()),
         rule: DECLARED_MAX_LENGTH_ABOVE_PLACEHOLDER_CAP,
         detail: format!(
             "declares max_length = {declared} in {position:?} position, but the always-on \
@@ -683,12 +681,11 @@ fn lint_opt_outs(validation: &ValidationSection, out: &mut Vec<ConfigWarning>) {
     }
 }
 
-/// A server-level [`ConfigWarning`] — empty `tool` / `param`, per that struct's
-/// documented convention.
+/// A server-level [`ConfigWarning`] — no `tool`, no `param`.
 fn server_warning(rule: &'static str, detail: String) -> ConfigWarning {
     ConfigWarning {
-        tool: String::new(),
-        param: String::new(),
+        tool: None,
+        param: None,
         rule,
         detail,
     }
@@ -3522,8 +3519,8 @@ mod tests {
         let findings = cfg.lint();
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert_eq!(findings[0].rule, UNCAPPED_STRING);
-        assert_eq!(findings[0].tool, "search_tracks");
-        assert_eq!(findings[0].param, "q");
+        assert_eq!(findings[0].tool.as_deref(), Some("search_tracks"));
+        assert_eq!(findings[0].param.as_deref(), Some("q"));
         // The same config must still BOOT — a non-strict finding never refuses.
         cfg.validate()
             .expect("a lint finding must not fail validate");
@@ -3555,8 +3552,8 @@ mod tests {
         );
         let findings = cfg.lint();
         assert_eq!(findings.len(), 2, "got {findings:?}");
-        assert_eq!(findings[0].param, "zebra");
-        assert_eq!(findings[1].param, "alpha");
+        assert_eq!(findings[0].param.as_deref(), Some("zebra"));
+        assert_eq!(findings[1].param.as_deref(), Some("alpha"));
     }
 
     /// D3 ordering (mixed): for a tool carrying BOTH an uncapped body string and an
@@ -3587,7 +3584,7 @@ mod tests {
         );
         let findings = cfg.lint();
         assert_eq!(findings.len(), 1, "got {findings:?}");
-        assert_eq!(findings[0].param, "body_text");
+        assert_eq!(findings[0].param.as_deref(), Some("body_text"));
         assert_eq!(findings[0].rule, UNCAPPED_STRING);
     }
 
@@ -3616,7 +3613,7 @@ mod tests {
         let findings = cfg.lint();
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert_eq!(findings[0].rule, DECLARED_MAX_LENGTH_ABOVE_PLACEHOLDER_CAP);
-        assert_eq!(findings[0].param, "line_id");
+        assert_eq!(findings[0].param.as_deref(), Some("line_id"));
         assert!(
             findings[0].detail.contains(&floor.to_string()),
             "the finding must name the effective limit: {}",
@@ -3670,8 +3667,8 @@ mod tests {
         );
         // A server-level finding names no tool or parameter.
         for w in cfg.lint() {
-            assert!(w.tool.is_empty(), "{w:?}");
-            assert!(w.param.is_empty(), "{w:?}");
+            assert!(w.tool.is_none(), "{w:?}");
+            assert!(w.param.is_none(), "{w:?}");
             assert!(!w.to_string().is_empty(), "Display must render");
         }
     }
@@ -3924,7 +3921,7 @@ mod lint_against_spec_tests {
         let findings = cfg.lint_against_spec(&spec());
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule, CONFIGURED_TEMPLATE_NOT_IN_SPEC);
-        assert_eq!(findings[0].tool, "get_cui");
+        assert_eq!(findings[0].tool.as_deref(), Some("get_cui"));
         assert!(
             findings[0].detail.contains("floor"),
             "the finding must say what a miss RETAINS, not only what it loses: {}",

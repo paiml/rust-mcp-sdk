@@ -454,17 +454,11 @@ pub trait ArgumentValidator: Send + Sync {
 /// `tracing::warn!` — a silently discarded validator is a rule the operator
 /// believes is enforced and is not.
 #[derive(Clone, Default)]
-pub struct ArgumentValidators {
+pub(crate) struct ArgumentValidators {
     map: HashMap<String, Arc<dyn ArgumentValidator>>,
 }
 
 impl ArgumentValidators {
-    /// An empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Register `validator` for the tool named `tool`, REPLACING any validator
     /// already registered under that name and warning once when it does.
     pub fn insert(&mut self, tool: impl Into<String>, validator: Arc<dyn ArgumentValidator>) {
@@ -490,12 +484,6 @@ impl ArgumentValidators {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
-    }
-
-    /// How many validators are registered.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.map.len()
     }
 
     /// Registered tool names, sorted, so the startup log is deterministic.
@@ -920,11 +908,15 @@ mod tests {
     fn validator_registration_is_last_one_wins() {
         let first = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(AtomicUsize::new(0));
-        let mut reg = ArgumentValidators::new();
+        let mut reg = ArgumentValidators::default();
         assert!(reg.is_empty());
         reg.insert("t", Arc::new(CountingValidator(Arc::clone(&first))));
         reg.insert("t", Arc::new(CountingValidator(Arc::clone(&second))));
-        assert_eq!(reg.len(), 1);
+        assert_eq!(
+            reg.names(),
+            vec!["t"],
+            "the second registration replaced the first"
+        );
         reg.get("t")
             .expect("registered")
             .validate(&json!({}))

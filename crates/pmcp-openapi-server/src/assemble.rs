@@ -286,10 +286,7 @@ fn governed_connector(
         return connector;
     };
     match connector.governed(policy) {
-        Some(governed) => {
-            debug_assert!(governed.has_request_policy());
-            governed
-        },
+        Some(governed) => governed,
         None => {
             tracing::error!(
                 target: "pmcp_openapi_server",
