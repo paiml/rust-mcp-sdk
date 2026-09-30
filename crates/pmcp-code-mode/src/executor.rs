@@ -5787,11 +5787,8 @@ mod layer_two {
     /// told a policy refusal was an internal error. Fails if the variant reverts.
     #[tokio::test]
     async fn a_refused_placeholder_is_request_refused_not_runtime_error() {
-        let (result, seen) = run(
-            "/search/{v}",
-            serde_json::json!({"v": "2026AA?string=zzz"}),
-        )
-        .await;
+        let (result, seen) =
+            run("/search/{v}", serde_json::json!({"v": "2026AA?string=zzz"})).await;
         let err = result.expect_err("a query separator in a placeholder value is refused");
         assert!(
             matches!(err, ExecutionError::RequestRefused { .. }),
