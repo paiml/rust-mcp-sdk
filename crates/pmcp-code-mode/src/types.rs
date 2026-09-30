@@ -486,7 +486,14 @@ pub enum ValidationError {
 }
 
 /// Errors that can occur during execution.
+///
+/// `#[non_exhaustive]` since 0.7: a new failure class is a new variant, and a
+/// downstream `match` must carry a wildcard arm rather than break on each one.
+/// Adding [`ExecutionError::RequestRefused`] is what made the enum non-exhaustive
+/// in the first place; it could not be added to an exhaustive enum without
+/// breaking every downstream `match`, so the two changes travel together.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExecutionError {
     #[error("Token has expired — request a new approval token via validate_code")]
     TokenExpired,
@@ -517,6 +524,23 @@ pub enum ExecutionError {
 
     #[error("Runtime error: {message}")]
     RuntimeError { message: String },
+
+    /// A request the script made was REFUSED before it was sent: by the SDK's
+    /// path-placeholder floor, by a non-scalar path or query value, or by an
+    /// embedder's outbound-request policy.
+    ///
+    /// Distinct from [`ExecutionError::RuntimeError`] because the two have
+    /// different owners. A runtime fault is the server's; a refused request is the
+    /// CALLER's to fix by changing what the script sends, so a tool handler should
+    /// report it as a tool-level rejection the model can act on and never as an
+    /// internal error. Until 0.7 both were `RuntimeError`, and a policy refusal
+    /// reached the model as `Internal error: Execution error: Runtime error: ...`.
+    ///
+    /// `message` is value-free where it is raised (it names the rule and the
+    /// declared expectation, never a rejected byte), and the plan executor keeps
+    /// it value-free when it adds the method and result variable.
+    #[error("Request refused: {message}")]
+    RequestRefused { message: String },
 }
 
 /// Supported code languages for validation and execution.

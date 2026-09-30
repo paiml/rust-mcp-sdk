@@ -2914,8 +2914,30 @@ pub struct ApiCallLog {
 /// message is safe to surface to an MCP client as-is. Kept a free function so the
 /// two `ApiCall` arms cannot drift into two different renderings.
 fn refusal_to_execution_error(refusal: crate::PlaceholderRefusal) -> ExecutionError {
-    ExecutionError::RuntimeError {
+    ExecutionError::RequestRefused {
         message: refusal.to_string(),
+    }
+}
+
+/// Convert an error from `HttpExecutor::execute_request` into what the plan
+/// executor reports, adding the method and result variable.
+///
+/// A [`ExecutionError::RequestRefused`] STAYS a `RequestRefused`. Every other
+/// error becomes a `RuntimeError`, as before. Flattening a refusal into a
+/// `RuntimeError` string here is what made a refusal indistinguishable from a
+/// fault at the tool boundary: this is the one place the variant used to be lost.
+///
+/// The resolved path is deliberately NOT formatted in (RESEARCH Pitfall 7 /
+/// SC-7): a refusal is value-free where it is raised, and re-attaching the path
+/// here is what would deliver the exact injected path to the client.
+fn api_call_error(method: &str, result_var: &str, error: ExecutionError) -> ExecutionError {
+    match error {
+        ExecutionError::RequestRefused { message } => ExecutionError::RequestRefused {
+            message: format!("{method} api call '{result_var}' was refused: {message}"),
+        },
+        other => ExecutionError::RuntimeError {
+            message: format!("{method} api call '{result_var}' failed: {other}"),
+        },
     }
 }
 
@@ -2944,15 +2966,16 @@ fn floor_layer_one_contribution(param: &str, rendered: &str) -> Result<(), Execu
 ///
 /// # Errors
 ///
-/// Returns [`ExecutionError::RuntimeError`] naming `key`. Per Pitfall 5 the
-/// message names the KEY only — never the value.
+/// Returns [`ExecutionError::RequestRefused`] naming `key`: a non-scalar path or
+/// query value is the script's to fix. Per Pitfall 5 the message names the KEY
+/// only — never the value.
 fn render_path_scalar(key: &str, value: JsonValue) -> Result<String, ExecutionError> {
     match value {
         JsonValue::String(s) => Ok(s),
         JsonValue::Null => Ok("null".to_string()),
         JsonValue::Number(n) => Ok(n.to_string()),
         JsonValue::Bool(b) => Ok(b.to_string()),
-        JsonValue::Object(_) | JsonValue::Array(_) => Err(ExecutionError::RuntimeError {
+        JsonValue::Object(_) | JsonValue::Array(_) => Err(ExecutionError::RequestRefused {
             message: format!("path/query param '{key}' must be a scalar"),
         }),
     }
@@ -3215,14 +3238,7 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                         .http
                         .execute_request(method, checked_path, resolved_body.clone())
                         .await
-                        .map_err(|e| ExecutionError::RuntimeError {
-                            // The resolved path is deliberately NOT formatted in
-                            // (RESEARCH Pitfall 7 / SC-7): a D4 refusal is
-                            // value-free where it is raised, and re-attaching the
-                            // path here is what would deliver the exact injected
-                            // path to the client.
-                            message: format!("{method} api call '{result_var}' failed: {e}"),
-                        })?;
+                        .map_err(|e| api_call_error(method, &result_var, e))?;
                     let duration_ms = call_start.elapsed().as_millis() as u64;
 
                     // Filter blocked fields from API response before scripts can access them.
@@ -3405,10 +3421,7 @@ impl<H: HttpExecutor> PlanExecutor<H> {
                             .http
                             .execute_request(method, checked_path, resolved_body.clone())
                             .await
-                            .map_err(|e| ExecutionError::RuntimeError {
-                                // No resolved path here either (Pitfall 7 / SC-7).
-                                message: format!("{method} api call '{temp_var}' failed: {e}"),
-                            })?;
+                            .map_err(|e| api_call_error(method, &temp_var, e))?;
                         let duration_ms = call_start.elapsed().as_millis() as u64;
                         let response =
                             filter_blocked_fields(raw_response, &self.config.blocked_fields);
@@ -5560,6 +5573,27 @@ mod d09_support {
         }
     }
 
+    /// An `HttpExecutor` that REFUSES every request, as an embedder's outbound
+    /// policy does. The message is a fixed constant so a test can assert it survives
+    /// the plan executor and that nothing else of the request is added to it.
+    pub(super) struct RefusingHttp;
+
+    pub(super) const REFUSAL_MESSAGE: &str = "outbound request refused by policy: fixed text";
+
+    #[async_trait::async_trait]
+    impl HttpExecutor for RefusingHttp {
+        async fn execute_request(
+            &self,
+            _method: &str,
+            _path: ResolvedPath<'_>,
+            _body: Option<JsonValue>,
+        ) -> Result<JsonValue, ExecutionError> {
+            Err(ExecutionError::RequestRefused {
+                message: REFUSAL_MESSAGE.to_string(),
+            })
+        }
+    }
+
     pub(super) fn plan(steps: Vec<PlanStep>) -> ExecutionPlan {
         ExecutionPlan {
             steps,
@@ -5743,6 +5777,86 @@ mod layer_two {
         let result = executor.execute(&plan(vec![step])).await;
         let seen = seen.lock().unwrap().clone();
         (result, seen)
+    }
+
+    /// A refused request is a `RequestRefused`, NOT a `RuntimeError`.
+    ///
+    /// The two have different owners: a runtime fault is the server's, a refused
+    /// request is the caller's to fix, and a tool handler reports them on different
+    /// channels. Until 0.7 every refusal here was a `RuntimeError`, so a model was
+    /// told a policy refusal was an internal error. Fails if the variant reverts.
+    #[tokio::test]
+    async fn a_refused_placeholder_is_request_refused_not_runtime_error() {
+        let (result, seen) = run(
+            "/search/{v}",
+            serde_json::json!({"v": "2026AA?string=zzz"}),
+        )
+        .await;
+        let err = result.expect_err("a query separator in a placeholder value is refused");
+        assert!(
+            matches!(err, ExecutionError::RequestRefused { .. }),
+            "a placeholder-floor refusal must be RequestRefused, got: {err:?}"
+        );
+        assert!(seen.is_empty(), "a refused call dispatches nothing");
+    }
+
+    #[tokio::test]
+    async fn a_non_scalar_path_value_is_request_refused() {
+        let (result, seen) = run("/x/{v}", serde_json::json!({"v": {"nested": 1}})).await;
+        let err = result.expect_err("an object cannot be a path value");
+        assert!(
+            matches!(err, ExecutionError::RequestRefused { .. }),
+            "a non-scalar path value is the script's to fix: {err:?}"
+        );
+        assert!(seen.is_empty());
+    }
+
+    /// The variant must SURVIVE the two `api call ... failed` wrappers. They are
+    /// where it used to be flattened into a `RuntimeError` string, so this is the
+    /// row that makes the whole change real: a refusal raised by an embedder's
+    /// `HttpExecutor` reaches the caller still classified as a refusal.
+    #[tokio::test]
+    async fn an_embedder_refusal_survives_the_api_call_wrapper() {
+        use super::d09_support::{RefusingHttp, REFUSAL_MESSAGE};
+        let step = get_step(literal("/anything"), None);
+        let mut executor = PlanExecutor::new(RefusingHttp, ExecutionConfig::default());
+        let err = executor
+            .execute(&plan(vec![step]))
+            .await
+            .expect_err("the executor refuses");
+        let ExecutionError::RequestRefused { message } = &err else {
+            panic!("a refusal must stay a RequestRefused through the wrapper, got: {err:?}");
+        };
+        assert!(
+            message.contains(REFUSAL_MESSAGE),
+            "the embedder's own message must be carried through: {message}"
+        );
+        assert!(
+            message.contains("GET api call") && message.contains("was refused"),
+            "the wrapper adds the method and result variable: {message}"
+        );
+        assert!(
+            !message.contains("/anything"),
+            "the resolved path must NOT be re-attached (Pitfall 7 / SC-7): {message}"
+        );
+    }
+
+    /// The other half of the same contract: a genuine transport FAULT is still a
+    /// `RuntimeError`. The variant split must not reclassify real failures as
+    /// refusals, or every backend outage would read to a model as its own mistake.
+    #[tokio::test]
+    async fn a_transport_failure_is_still_a_runtime_error() {
+        use super::d09_support::FailingHttp;
+        let step = get_step(literal("/anything"), None);
+        let mut executor = PlanExecutor::new(FailingHttp, ExecutionConfig::default());
+        let err = executor
+            .execute(&plan(vec![step]))
+            .await
+            .expect_err("the transport fails");
+        assert!(
+            matches!(err, ExecutionError::RuntimeError { .. }),
+            "a real fault must stay a RuntimeError, got: {err:?}"
+        );
     }
 
     #[tokio::test]

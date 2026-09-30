@@ -381,27 +381,38 @@ fn expand_with_context_from(
                     // Verify the approval token
                     let token_gen = self.pipeline.token_generator();
                     let token = pmcp_code_mode::ApprovalToken::decode(&input.approval_token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Invalid approval token: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Invalid approval token: {}. Call validate_code to obtain a valid token.", e),
+                            None,
                         ))?;
 
                     // Verify token signature and expiry
                     token_gen.verify(&token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Token verification failed: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Approval token is invalid or expired: {}. Call validate_code again to obtain a fresh token.", e),
+                            None,
                         ))?;
 
                     // Verify code matches the token's code hash
                     token_gen.verify_code(code, &token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Code verification failed: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Code does not match the validated code: {}. execute_code must use the exact code string that was passed to validate_code.", e),
+                            None,
                         ))?;
 
                     // Execute the validated code
                     let result = self.executor.execute(code, input.variables.as_ref()).await
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Execution error: {}", e),
-                        ))?;
+                        .map_err(|e| match e {
+                            // A refused request is the CALLER's to fix, so it is a
+                            // tool-level rejection the model can act on. Only a
+                            // genuine execution fault stays an internal error.
+                            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+                                pmcp::Error::tool_rejected(message, None)
+                            }
+                            other => pmcp::Error::Internal(
+                                format!("Execution error: {}", other),
+                            ),
+                        })?;
 
                     Ok(result)
                 }
@@ -565,27 +576,38 @@ fn expand_without_context_from(
                     // Verify the approval token
                     let token_gen = self.pipeline.token_generator();
                     let token = pmcp_code_mode::ApprovalToken::decode(&input.approval_token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Invalid approval token: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Invalid approval token: {}. Call validate_code to obtain a valid token.", e),
+                            None,
                         ))?;
 
                     // Verify token signature and expiry
                     token_gen.verify(&token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Token verification failed: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Approval token is invalid or expired: {}. Call validate_code again to obtain a fresh token.", e),
+                            None,
                         ))?;
 
                     // Verify code matches the token's code hash
                     token_gen.verify_code(code, &token)
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Code verification failed: {}", e),
+                        .map_err(|e| pmcp::Error::tool_rejected(
+                            format!("Code does not match the validated code: {}. execute_code must use the exact code string that was passed to validate_code.", e),
+                            None,
                         ))?;
 
                     // Execute the validated code
                     let result = self.executor.execute(code, input.variables.as_ref()).await
-                        .map_err(|e| pmcp::Error::Internal(
-                            format!("Execution error: {}", e),
-                        ))?;
+                        .map_err(|e| match e {
+                            // A refused request is the CALLER's to fix, so it is a
+                            // tool-level rejection the model can act on. Only a
+                            // genuine execution fault stays an internal error.
+                            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+                                pmcp::Error::tool_rejected(message, None)
+                            }
+                            other => pmcp::Error::Internal(
+                                format!("Execution error: {}", other),
+                            ),
+                        })?;
 
                     Ok(result)
                 }
