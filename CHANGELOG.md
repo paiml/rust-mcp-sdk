@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.22.1] - 2026-09-30
+
+Ships `pmcp-code-mode` **0.7.1** and `pmcp-server-toolkit` **0.3.1**. `pmcp` moves 2.22.0 -> 2.22.1
+with no code change of its own, to mint the tag that carries them (this repo tags on the `pmcp`
+version); `^2.22.0` admits it, so no pinning manifest moves. `cargo-pmcp` is not bumped; its
+workbook scaffold constants move with the versions and stay inert until its next release.
+
+### Fixed — a rejected `validate_code` no longer echoes the caller's code
+
+Found by the team running the UMLS MCP server, who measured 2.22.0 with a probe that read only the
+text content. The refusal MESSAGE was value-free, but the `structuredContent` of the same result
+repeated the literal path the script wrote, in `explanation` (`"API calls: Get /search?string=..."`)
+and in `metadata.accessed_types` / `accessed_fields`. A path can carry a sensitive literal.
+
+- A rejected validation now keeps only its `violations` (rule, message, suggestion). `explanation`
+  is empty and the accessed types and fields are empty lists.
+- **It applies to every rejected validation**, static rules included, not only the 2.22.0 policy
+  preview. The fix is in `pmcp-code-mode`'s `ValidationResponse::to_json_response`, so servers built
+  on `#[derive(CodeMode)]` are covered as well as the toolkit's.
+- An accepted validation is unchanged: its explanation is how the model confirms what it approves.
+- **Behaviour change:** a client that read `explanation` or `metadata.accessed_*` from a REJECTED
+  result now sees them empty.
+
+### Migration notes for 2.22.0 (from the same report)
+
+- A `0.x` minor is not caret-compatible. A dev-dependency on `pmcp-server-toolkit = "0.2.0"` keeps
+  a second toolkit in the lock until it moves to `"0.3.0"`.
+- `config.toml` is parsed with unknown fields denied, so a config carrying `description_notice`
+  will not load on a 0.2.x build. Move the key and the pin together.
+
 ## [2.22.0] - 2026-09-29
 
 The breaking window tracked in #389. It batches every breaking change the input-validation work

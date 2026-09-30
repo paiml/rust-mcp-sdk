@@ -101,10 +101,35 @@ impl ValidationResponse {
     /// Convert to JSON response format.
     ///
     /// Returns a tuple of (json_value, is_error).
+    ///
+    /// # A rejected validation carries no echo of the code
+    ///
+    /// When the validation failed, `explanation` is empty and
+    /// `metadata.accessed_types` / `accessed_fields` are empty. Those fields are
+    /// derived from the submitted code (`"API calls: Get /search?string=..."`, the
+    /// literal path), and a refusal must not repeat a value the caller wrote: a path
+    /// can carry a sensitive literal, and the refusal's message is already value-free.
+    /// The `violations` (rule, message, suggestion) are what the caller needs to fix
+    /// the script and are kept. An accepted validation keeps all three, because the
+    /// explanation is how the model confirms what it is about to approve.
     pub fn to_json_response(&self) -> (Value, bool) {
+        let is_valid = self.result.is_valid;
+        let explanation = if is_valid {
+            self.result.explanation.as_str()
+        } else {
+            ""
+        };
+        let (accessed_types, accessed_fields) = if is_valid {
+            (
+                self.result.metadata.accessed_types.clone(),
+                self.result.metadata.accessed_fields.clone(),
+            )
+        } else {
+            (Default::default(), Default::default())
+        };
         let response = json!({
             "valid": self.result.is_valid,
-            "explanation": self.result.explanation,
+            "explanation": explanation,
             "risk_level": format!("{}", self.result.risk_level),
             "approval_token": self.result.approval_token,
             "action": self.action.as_ref().map(|a| a.to_string()),
@@ -119,8 +144,8 @@ impl ValidationResponse {
             "validated_code_hash": self.validated_code_hash,
             "metadata": {
                 "is_read_only": self.result.metadata.is_read_only,
-                "accessed_types": self.result.metadata.accessed_types,
-                "accessed_fields": self.result.metadata.accessed_fields,
+                "accessed_types": accessed_types,
+                "accessed_fields": accessed_fields,
                 "validation_time_ms": self.result.metadata.validation_time_ms
             }
         });
@@ -474,6 +499,33 @@ mod tests {
 
         assert!(is_error);
         assert_eq!(json["valid"], false);
+    }
+
+    /// A rejection must not repeat the code the caller wrote. `explanation` and the
+    /// accessed types/fields are derived from it; the violations are kept.
+    #[test]
+    fn test_rejected_response_does_not_echo_the_code() {
+        let metadata = ValidationMetadata {
+            accessed_types: vec!["/secret/path?q=synthetic".into()],
+            accessed_fields: vec!["GET".into()],
+            ..ValidationMetadata::default()
+        };
+        let mut response = ValidationResponse::failure(
+            vec![PolicyViolation::new("policy", "rule", "message")],
+            metadata,
+        );
+        response.result.explanation = "API calls: Get /secret/path?q=synthetic".into();
+
+        let (json, is_error) = response.to_json_response();
+        assert!(is_error);
+        assert!(
+            !json.to_string().contains("secret/path"),
+            "a rejection must not echo the path: {json}"
+        );
+        assert_eq!(json["explanation"], "");
+        assert_eq!(json["metadata"]["accessed_types"], serde_json::json!([]));
+        assert_eq!(json["metadata"]["accessed_fields"], serde_json::json!([]));
+        assert_eq!(json["violations"][0]["rule"], "rule", "violations survive");
     }
 
     #[test]

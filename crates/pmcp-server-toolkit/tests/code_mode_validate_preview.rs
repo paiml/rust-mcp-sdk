@@ -344,3 +344,61 @@ async fn without_a_policy_validation_is_unchanged() {
     .expect("nothing can refuse it");
     assert!(validated["approval_token"].is_string());
 }
+
+/// A rejected validation's STRUCTURED detail is value-free too. The message was, but
+/// `explanation` and `metadata.accessed_types` repeated the literal path the script
+/// wrote (found by the UMLS team on 2.22.0). Covers both refusal sources: the
+/// policy preview and the pre-existing static rules.
+#[tokio::test]
+async fn a_rejected_validation_does_not_echo_the_path_in_its_structured_detail() {
+    let upstream = upstream().await;
+    let policy = Arc::new(Recording::default());
+    let (validate_tool, _) = handlers(&upstream, Some(policy));
+
+    for code in [
+        // refused by the outbound policy preview
+        "const r = await api.get('/blocked/SECRETPATH?string=synthetic'); return r;",
+        // refused by the static allow_mutations rule
+        "const r = await api.post('/items/SECRETPATH', { a: 1 }); return r;",
+    ] {
+        let err = validate(&validate_tool, code).await.expect_err("refused");
+        let pmcp::Error::ToolRejected { message, details } = err else {
+            panic!("expected a tool-level rejection for: {code}");
+        };
+        let details = details.expect("a rejection carries structured detail");
+        assert!(
+            !message.contains("SECRETPATH") && !details.to_string().contains("SECRETPATH"),
+            "the refusal must not echo the caller's path anywhere: {message} / {details}"
+        );
+        assert!(
+            !details.to_string().contains("synthetic"),
+            "nor its query string: {details}"
+        );
+        assert!(
+            !details["violations"]
+                .as_array()
+                .expect("violations")
+                .is_empty(),
+            "the violations must survive redaction: {details}"
+        );
+    }
+}
+
+/// The redaction is for REFUSALS only: an accepted validation keeps its explanation.
+#[tokio::test]
+async fn an_accepted_validation_keeps_its_explanation() {
+    let upstream = upstream().await;
+    let (validate_tool, _) = handlers(&upstream, None);
+    let validated = validate(
+        &validate_tool,
+        "const r = await api.get('/items/1'); return r;",
+    )
+    .await
+    .expect("validates");
+    assert!(
+        validated["explanation"]
+            .as_str()
+            .is_some_and(|e| e.contains("/items/1")),
+        "an accepted validation explains what it will do: {validated}"
+    );
+}
