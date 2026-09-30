@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.22.0] - 2026-09-29
+
+The breaking window tracked in #389. It batches every breaking change the input-validation work
+needed into ONE release, because each breaking release costs a full 12-crate publish train and
+every org team that pins the toolkit has to move on the same day.
+
+Ships `pmcp-server-toolkit` **0.3.0**, `pmcp-code-mode` **0.7.0** (with `pmcp-code-mode-derive`
+**0.3.2**), `pmcp-macros` **0.6.2** and `cargo-pmcp` **0.26.0**. `pmcp-toolkit-postgres`,
+`-mysql`, `-athena`, `pmcp-sql-server`, `pmcp-openapi-server`, `pmcp-workbook-server` and
+`pmcp-workbook-compiler` move to **0.3.0** solely to re-pin the toolkit (a `0.2` requirement does
+not admit `0.3`); none has a change of its own beyond that.
+
+### Changed — every refusal a model can act on is now a tool result
+
+Reported by the team running the UMLS MCP server: refusals that reached a model as
+`Internal error` or as a JSON-RPC error read as a server crash, so the model gave up or retried a
+call that could not succeed. 2.21.1 moved two refusals; this moves the rest.
+
+- **`execute_code` request refusals** (the path-placeholder floor, a non-scalar path or query
+  value, a registered `RequestPolicy` refusal) are `Error::ToolRejected`. They were an internal
+  error. `pmcp-code-mode` gives them their own variant, `ExecutionError::RequestRefused`, kept
+  intact through the plan executor (which used to flatten every error to a string). A backend or
+  runtime fault stays `Internal`.
+- **`TypedTool` argument refusals** (deserialize failures and `garde` rule violations),
+  `TypedToolWithOutput`, the wasm typed tools and the `#[mcp_tool]` / `#[mcp_server]` generated
+  handlers are `Error::ToolRejected`. They were `Error::Validation` / `invalid_params`, a
+  JSON-RPC error. **The message text is unchanged.**
+- **Behaviour change:** a client that matched the JSON-RPC error code for these must match
+  `isError`. An adapter that remaps `Error::Validation` into `tool_rejected` is now a no-op.
+
+### Added
+
+- **`validate_code` previews the outbound policy** (#384). A script whose call a registered
+  `RequestPolicy` would refuse used to validate, receive an approval token, and fail only at
+  `execute_code`. The calls whose whole request is known before the script runs (literal path, no
+  body or a literal one; branches, loops, `try` and `Promise.all` included) are now put to the
+  policy at validation; a refusal is a rejected validation with **no token**. Preview and send
+  share one request-assembly function. Calls built from run-time data are skipped; execution stays
+  authoritative.
+- **`OutboundRequest::call_id`** (#386): one id per `tools/call`, shared by every request one
+  `execute_code` run makes, so a policy can budget a whole run.
+- **`OutboundRequest::phase`** / `RequestPhase { Execute, Validate }` (`#[non_exhaustive]`). A
+  stateful policy must not charge a `Validate` request.
+- **`[code_mode] description_notice`** (#387): operator text appended to both Code Mode tool
+  descriptions, so the model reads what a deployment enforces before it calls.
+
+### Breaking — `pmcp-code-mode` 0.7 / `pmcp-server-toolkit` 0.3
+
+| Change | Who is affected | Migration |
+|---|---|---|
+| `ExecutionError` is `#[non_exhaustive]` and gains `RequestRefused { message }` | code that `match`es it exhaustively | add a `_` arm; treat `RequestRefused` as the caller's to fix |
+| `OutboundRequest` gains `call_id` and `phase` | it is `#[non_exhaustive]`, so only code that built one by literal (it could not) | none; use `OutboundRequest::new(..).with_call_id(..).with_phase(..)` |
+| `CodeModeSection` gains `description_notice` | code that builds one by struct literal | add `description_notice: None`, or `..Default::default()` |
+| `ConfigWarning.tool` / `.param` are `Option<String>` (was `String`, empty = none) | code that reads the fields | `w.tool.as_deref()`; `None` where it was `""` |
+| `ArgumentValidators`, `ValidationReport`, `ToolValidationReport`, `ServerConfig::validation_report()` are crate-private | nothing in-tree; they were never needed outside | use `render_validation_report` |
+| every crate pinning `pmcp-server-toolkit = "0.2"` or `pmcp-code-mode = "0.6"` | manifests | re-pin to `"0.3"` / `"0.7"` |
+
+### Not in this release
+
+Declarative Code Mode request rules (#387 item 1) are additive and need no break, so they ship
+when designed. Folding the eight `synthesize_*` entry points into four was measured at about 100
+references for a cosmetic gain and left as it is.
+
 ## [2.21.1] - 2026-09-29
 
 Ships `pmcp-server-toolkit` **0.2.1**. `pmcp` moves 2.21.0 -> 2.21.1 with **no code change of its

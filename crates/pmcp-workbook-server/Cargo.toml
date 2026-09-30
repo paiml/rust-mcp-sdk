@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-workbook-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -47,7 +47,7 @@ pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
 # workspace enforces — which is the exact silent-weakening class this phase closes.
 # It forwards only `pmcp/schema-validation`, so it does not re-admit the JS engine
 # the purity gate keeps out of the served cone.
-pmcp-server-toolkit = { version = "0.2", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "http", "input-validation"] }
+pmcp-server-toolkit = { version = "0.3", path = "../pmcp-server-toolkit", default-features = false, features = ["workbook", "http", "input-validation"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

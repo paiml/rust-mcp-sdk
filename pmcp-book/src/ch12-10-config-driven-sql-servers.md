@@ -145,6 +145,9 @@ require_limit = true        # every generated query must bound its rows
 max_limit = 1000
 token_secret = "dev-only-insecure-secret-min-16-bytes"   # DEV ONLY (see deploy)
 allow_inline_token_secret_for_dev = true
+# Optional: text appended to BOTH the validate_code and execute_code tool
+# descriptions, so the model reads what this deployment enforces before it calls.
+description_notice = "Queries are read-only and capped at 1000 rows."
 
 [[tools]]
 name = "books_by_author"

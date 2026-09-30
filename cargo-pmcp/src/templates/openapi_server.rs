@@ -70,12 +70,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pmcp = {{ version = "2.21", features = ["streamable-http"] }}
-pmcp-server-toolkit = {{ version = "0.2", features = ["openapi-code-mode"] }}
+pmcp = {{ version = "2.22", features = ["streamable-http"] }}
+pmcp-server-toolkit = {{ version = "0.3", features = ["openapi-code-mode"] }}
 # The OpenAPI assemble orchestrators (`dispatch` builds the (HttpConnector,
 # HttpCodeExecutor) pair; `build_server` assembles the pmcp::Server). Unlike the
 # SQL path there is no ServerBuilderExt http method, so this lib owns the seam.
-pmcp-openapi-server = "0.2"
+pmcp-openapi-server = "0.3"
 clap = {{ version = "4", features = ["derive", "env"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 tracing = "0.1"

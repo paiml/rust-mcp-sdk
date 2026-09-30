@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-toolkit-athena"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -25,7 +25,7 @@ default = []
 dev_mock = []
 
 [dependencies]
-pmcp-server-toolkit = { version = "0.2", path = "../pmcp-server-toolkit" }
+pmcp-server-toolkit = { version = "0.3", path = "../pmcp-server-toolkit" }
 # Why: default features enable `rustls` → aws-smithy-runtime/tls-rustls →
 # aws-smithy-http-client/legacy-rustls-ring → rustls 0.21 / rustls-webpki 0.101
 # (RUSTSEC-2026-0098/0099/0104). Opt into the modern `default-https-client`

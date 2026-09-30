@@ -543,7 +543,21 @@ cross-references stay valid.**
    config` is a new subcommand, and both lint surfaces now print which
    `pmcp-server-toolkit` version performed the lint.
 
-   **This entry recorded `cargo-pmcp` at the Phase-122 version until 2026-09-28,
+   **Bumped to 0.26.0 by the breaking window (2026-09-29, #389).** `pmcp-server-toolkit` moved
+0.2 -> 0.3 (and `pmcp-code-mode` 0.6 -> 0.7), which is semver-incompatible on a 0.x line, so the
+"0.2" toolkit requirement did not admit it. **Every crate pinning the toolkit, `pmcp-workbook-compiler`
+or the three connectors moved as one set, in one commit:** `cargo-pmcp` (both the direct toolkit edge
+and the `pmcp-workbook-compiler` pin), `pmcp-openapi-server`, `pmcp-sql-server` (toolkit AND its three
+connector pins), `pmcp-workbook-server`, `pmcp-workbook-compiler`, `pmcp-toolkit-postgres`, `-mysql`,
+`-athena`, all now `"0.3"` and themselves 0.3.0. The scaffold emitters moved with them:
+`templates/sql_server.rs` and `templates/openapi_server.rs` (`pmcp-server-toolkit` and
+`pmcp-openapi-server` `"0.3"`), `templates/workbook_server.rs` (`PMCP_VERSION` 2.22.0,
+`TOOLKIT_VERSION` 0.3.0), `templates/workspace.rs` (`PMCP_VERSION_REQ` 2.22) and the `pmcp` line in the
+two server templates (`"2.22"`; a first gate run caught these two still on `"2.21"`). The two workbook
+constants, `PMCP_VERSION_REQ` and the two server-template `pmcp` lines have drift tests; the two `"0.3"` template literals do NOT, so a
+future toolkit minor must grep for them by hand.
+
+**This entry recorded `cargo-pmcp` at the Phase-122 version until 2026-09-28,
    by which time the tree was three patches past it (measured: 0.24.3).** A stale
    version here is not cosmetic — it is what a future releaser reads to know
    whether this crate needs a bump at all.
