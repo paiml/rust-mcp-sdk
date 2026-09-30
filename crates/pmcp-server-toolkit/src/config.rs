@@ -1435,6 +1435,19 @@ pub struct CodeModeSection {
     /// `[code_mode.limits]` — query-complexity caps.
     #[serde(default)]
     pub limits: Option<CodeModeLimits>,
+    /// Operator text appended to BOTH the `validate_code` and `execute_code` tool
+    /// descriptions, after the SDK's own.
+    ///
+    /// The place to tell the model what this deployment enforces that its own
+    /// tool descriptions cannot know: "responses are de-identified", "queries
+    /// over 100 rows are refused", "paths under /admin are blocked". The model
+    /// reads a tool's description before it calls the tool, so a rule stated here
+    /// is followed instead of discovered through a refusal.
+    ///
+    /// Appended verbatim after a blank line. Unset (the default) leaves both
+    /// descriptions exactly as the SDK writes them.
+    #[serde(default)]
+    pub description_notice: Option<String>,
 }
 
 /// `[code_mode.limits]` — query-complexity caps.

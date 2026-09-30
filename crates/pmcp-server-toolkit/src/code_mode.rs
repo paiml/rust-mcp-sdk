@@ -264,6 +264,7 @@ pub fn code_mode_tools_from_executor(
         pipeline: Arc::clone(&pipeline),
         config: cm_config,
         flavor,
+        description_notice: section.description_notice.clone(),
         #[cfg(feature = "openapi-code-mode")]
         preview: None,
     };
@@ -271,6 +272,7 @@ pub fn code_mode_tools_from_executor(
         pipeline,
         source: tool_handlers::ExecSource::Static(executor),
         flavor,
+        description_notice: section.description_notice.clone(),
     };
 
     Ok(builder
@@ -346,6 +348,7 @@ pub fn code_mode_http_tools_from_executor(
         pipeline: Arc::clone(&pipeline),
         config: cm_config,
         flavor,
+        description_notice: section.description_notice.clone(),
         preview,
     };
     let execute_handler = tool_handlers::ExecuteCodeHandler {
@@ -359,6 +362,7 @@ pub fn code_mode_http_tools_from_executor(
             exec_config,
         },
         flavor,
+        description_notice: section.description_notice.clone(),
     };
 
     Ok(builder
@@ -580,6 +584,19 @@ mod tool_handlers {
         }
     }
 
+    /// Append the operator's `[code_mode] description_notice`, if any, to a tool
+    /// description, after the SDK's own text and a blank line. A blank or unset
+    /// notice leaves the description exactly as the SDK wrote it.
+    fn with_notice(mut info: pmcp::types::ToolInfo, notice: Option<&str>) -> pmcp::types::ToolInfo {
+        if let Some(notice) = notice.map(str::trim).filter(|n| !n.is_empty()) {
+            info.description = Some(match info.description.take() {
+                Some(base) => format!("{base}\n\n{notice}"),
+                None => notice.to_string(),
+            });
+        }
+        info
+    }
+
     /// Classify an `execute_code` failure for the tool boundary.
     ///
     /// A refused request ([`ExecutionError::RequestRefused`]: the path floor, a
@@ -610,6 +627,8 @@ mod tool_handlers {
         pub(super) pipeline: Arc<pmcp_code_mode::ValidationPipeline>,
         pub(super) config: pmcp_code_mode::CodeModeConfig,
         pub(super) flavor: ValidationFlavor,
+        /// `[code_mode] description_notice`, appended to the tool description.
+        pub(super) description_notice: Option<String>,
         /// The executor and limits `validate_code` previews literal calls
         /// against, when an E1 policy could refuse one. `None` on the SQL path and
         /// on any server that registered no outbound policy.
@@ -696,10 +715,11 @@ mod tool_handlers {
         }
 
         fn metadata(&self) -> Option<pmcp::types::ToolInfo> {
-            Some(
+            Some(with_notice(
                 pmcp_code_mode::CodeModeToolBuilder::new(self.flavor.code_format())
                     .build_validate_tool(),
-            )
+                self.description_notice.as_deref(),
+            ))
         }
     }
 
@@ -740,6 +760,8 @@ mod tool_handlers {
         pub(super) pipeline: Arc<pmcp_code_mode::ValidationPipeline>,
         pub(super) source: ExecSource,
         pub(super) flavor: ValidationFlavor,
+        /// `[code_mode] description_notice`, appended to the tool description.
+        pub(super) description_notice: Option<String>,
     }
 
     impl ExecuteCodeHandler {
@@ -836,10 +858,11 @@ mod tool_handlers {
         }
 
         fn metadata(&self) -> Option<pmcp::types::ToolInfo> {
-            Some(
+            Some(with_notice(
                 pmcp_code_mode::CodeModeToolBuilder::new(self.flavor.code_format())
                     .build_execute_tool(),
-            )
+                self.description_notice.as_deref(),
+            ))
         }
     }
 }
@@ -2152,6 +2175,7 @@ mod tests {
                 max_join_depth: Some(3),
                 max_subquery_depth: Some(2),
             }),
+            description_notice: None,
         }
     }
 
