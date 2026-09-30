@@ -525,16 +525,20 @@ async fn preview_policy_violation(
     let mut calls = Vec::new();
     collect_literal_calls(&plan.steps, &mut calls);
     let call_id = crate::policy::next_call_id();
-    for (method, path, body) in calls {
+    for (index, (method, path, body)) in calls.into_iter().enumerate() {
         if let Err(error) = base.preview_request(&method, &path, body, &call_id).await {
             let message = match error {
                 ExecutionError::RequestRefused { message } => message,
                 other => other.to_string(),
             };
+            // The call is named by its position, never by its method or path: those
+            // are caller-written text, and a refusal that echoes them would put a
+            // caller-supplied value (a PHI literal in a path) back into a message
+            // the SDK promises is value-free.
             return Some(pmcp_code_mode::PolicyViolation::new(
                 "outbound_request_policy",
                 "request_refused",
-                format!("{method} {path}: {message}"),
+                format!("literal api call #{}: {message}", index + 1),
             ));
         }
     }

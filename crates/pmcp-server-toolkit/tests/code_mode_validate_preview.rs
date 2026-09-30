@@ -159,6 +159,12 @@ async fn validate_code_refuses_a_literal_call_the_policy_refuses() {
         err.to_string().contains(POLICY_MESSAGE),
         "the model must read the policy's own message: {err}"
     );
+    // The refusal is value-free: it names the call by position and never echoes the
+    // path the caller wrote, which may itself carry a sensitive literal.
+    assert!(
+        !err.to_string().contains("/blocked/1"),
+        "a validation refusal must not echo the caller's path: {err}"
+    );
     assert!(
         upstream
             .received_requests()
