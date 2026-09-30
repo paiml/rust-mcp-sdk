@@ -426,6 +426,28 @@ mod tool_handlers {
         }
     }
 
+    /// Classify an `execute_code` failure for the tool boundary.
+    ///
+    /// A refused request ([`ExecutionError::RequestRefused`]: the path floor, a
+    /// non-scalar value, or an embedder's outbound policy) is the CALLER's to fix by
+    /// changing what the script sends, so it is a tool-level rejection the model can
+    /// act on. Every other error stays `Internal`: a backend or runtime fault is not
+    /// something the caller can correct by changing input.
+    ///
+    /// Until pmcp-code-mode 0.7 a refusal was indistinguishable from a fault, so a
+    /// policy refusal reached the model as `Internal error: Execution error: Runtime
+    /// error: ...` and read as a server crash.
+    ///
+    /// The wildcard arm is required: `ExecutionError` is `#[non_exhaustive]`.
+    pub(super) fn execution_failure(error: pmcp_code_mode::ExecutionError) -> pmcp::Error {
+        match error {
+            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+                pmcp::Error::tool_rejected(message, None)
+            },
+            other => pmcp::Error::Internal(format!("Execution error: {other}")),
+        }
+    }
+
     /// `validate_code` tool handler: runs the code through the policy-bearing
     /// [`ValidationPipeline`](pmcp_code_mode::ValidationPipeline) (SQL or JS per
     /// [`ValidationFlavor`]) and returns the explanation + (on success) an HMAC
@@ -634,7 +656,7 @@ mod tool_handlers {
             let result = self
                 .run_code(code, input.variables.as_ref(), &extra)
                 .await
-                .map_err(|e| pmcp::Error::Internal(format!("Execution error: {e}")))?;
+                .map_err(execution_failure)?;
             Ok(result)
         }
 
@@ -950,7 +972,7 @@ impl HttpCodeExecutor {
         policy
             .check(&req)
             .await
-            .map_err(|refusal| ExecutionError::RuntimeError {
+            .map_err(|refusal| ExecutionError::RequestRefused {
                 message: format!("outbound request refused by policy: {refusal}"),
             })
     }
@@ -1068,8 +1090,9 @@ impl HttpCodeExecutor {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutionError::RuntimeError`] naming `key` when `value` is a
-    /// non-scalar. Per Pitfall 5 the message names the KEY only — never the value.
+    /// Returns [`ExecutionError::RequestRefused`] naming `key` when `value` is a
+    /// non-scalar: a script that sends an object as a path value is the script's to
+    /// fix. Per Pitfall 5 the message names the KEY only — never the value.
     fn scalar_str(
         key: &str,
         value: &serde_json::Value,
@@ -1080,7 +1103,7 @@ impl HttpCodeExecutor {
             serde_json::Value::Number(n) => Ok(n.to_string()),
             serde_json::Value::Bool(b) => Ok(b.to_string()),
             serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                Err(ExecutionError::RuntimeError {
+                Err(ExecutionError::RequestRefused {
                     message: format!("path/query param '{key}' must be a scalar"),
                 })
             },
