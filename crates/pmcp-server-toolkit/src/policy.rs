@@ -138,6 +138,36 @@ pub struct OutboundRequest<'a> {
     /// than through a synthesized handler), the same convention as [`Self::tool`].
     /// Treat the empty string as "no grouping", never as one shared bucket.
     pub call_id: &'a str,
+
+    /// Whether this request is about to be SENT or is a validation-time preview.
+    ///
+    /// [`RequestPhase::Validate`] marks a dry run: Code Mode's `validate_code`
+    /// asks the policy about the fully literal calls in a script before any
+    /// approval token is issued, so a refusal reaches the model at validation
+    /// instead of after it has been approved. Nothing is sent.
+    ///
+    /// A **stateless** policy (an allowlist, a size cap) should ignore this: it
+    /// gives the same answer in both phases, which is the point. A **stateful**
+    /// policy (a request or byte budget, a rate limiter) MUST NOT charge a
+    /// `Validate` request, or a script validated three times would spend its
+    /// budget before it ran once.
+    pub phase: RequestPhase,
+}
+
+/// Whether an [`OutboundRequest`] is about to be sent or is only being previewed,
+/// see [`OutboundRequest::phase`].
+///
+/// `#[non_exhaustive]`: a policy must have a wildcard arm, so a later phase is
+/// not a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestPhase {
+    /// The request is about to be sent. What every request was before validation
+    /// previews existed, and the default.
+    #[default]
+    Execute,
+    /// A dry-run preview made by `validate_code`. Nothing is sent.
+    Validate,
 }
 
 impl<'a> OutboundRequest<'a> {
@@ -161,7 +191,15 @@ impl<'a> OutboundRequest<'a> {
             query,
             body,
             call_id: "",
+            phase: RequestPhase::Execute,
         }
+    }
+
+    /// Mark the request as a validation-time preview, see [`Self::phase`].
+    #[must_use]
+    pub fn with_phase(mut self, phase: RequestPhase) -> Self {
+        self.phase = phase;
+        self
     }
 
     /// Attach the per-`tools/call` identifier, see [`Self::call_id`].
@@ -950,5 +988,17 @@ mod tests {
         let ids: std::collections::HashSet<String> = (0..2000).map(|_| next_call_id()).collect();
         assert_eq!(ids.len(), 2000, "every minted id must be distinct");
         assert!(ids.iter().all(|id| !id.is_empty()));
+    }
+
+    /// A request is an `Execute` request unless a caller says otherwise, so every
+    /// existing construction keeps its meaning after `phase` was added.
+    #[test]
+    fn a_request_defaults_to_the_execute_phase_and_can_be_marked_validate() {
+        let req = OutboundRequest::new("t", "GET", "/x", &[], None);
+        assert_eq!(req.phase, super::RequestPhase::Execute);
+        assert_eq!(
+            req.with_phase(super::RequestPhase::Validate).phase,
+            super::RequestPhase::Validate
+        );
     }
 }
