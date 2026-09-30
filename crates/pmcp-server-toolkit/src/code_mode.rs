@@ -456,27 +456,32 @@ fn collect_literal_calls(steps: &[pmcp_code_mode::PlanStep], out: &mut Vec<Liter
                     push_literal_call(method, path, body.as_ref(), out);
                 }
             },
-            PlanStep::Conditional {
-                then_steps,
-                else_steps,
-                ..
-            } => {
-                collect_literal_calls(then_steps, out);
-                collect_literal_calls(else_steps, out);
-            },
-            PlanStep::BoundedLoop { body, .. } => collect_literal_calls(body, out),
-            PlanStep::TryCatch {
-                try_steps,
-                catch_steps,
-                finally_steps,
-                ..
-            } => {
-                collect_literal_calls(try_steps, out);
-                collect_literal_calls(catch_steps, out);
-                collect_literal_calls(finally_steps, out);
-            },
-            _ => {},
+            other => nested_blocks(other)
+                .into_iter()
+                .for_each(|block| collect_literal_calls(block, out)),
         }
+    }
+}
+
+/// The step lists nested inside a branch, loop or `try` step (none for any other
+/// step), so [`collect_literal_calls`] can recurse into each.
+#[cfg(feature = "openapi-code-mode")]
+fn nested_blocks(step: &pmcp_code_mode::PlanStep) -> Vec<&[pmcp_code_mode::PlanStep]> {
+    use pmcp_code_mode::PlanStep;
+    match step {
+        PlanStep::Conditional {
+            then_steps,
+            else_steps,
+            ..
+        } => vec![then_steps, else_steps],
+        PlanStep::BoundedLoop { body, .. } => vec![body],
+        PlanStep::TryCatch {
+            try_steps,
+            catch_steps,
+            finally_steps,
+            ..
+        } => vec![try_steps, catch_steps, finally_steps],
+        _ => Vec::new(),
     }
 }
 
@@ -665,6 +670,8 @@ mod tool_handlers {
                 "perms-hash",
             );
 
+            #[cfg_attr(not(feature = "openapi-code-mode"), allow(unused_mut))]
+            // Why: only the `openapi-code-mode` preview below mutates it.
             let mut result = run_flavored_validation(&self.pipeline, self.flavor, code, &context)
                 .map_err(pmcp::Error::Internal)?;
 
