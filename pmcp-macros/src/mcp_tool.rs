@@ -214,8 +214,9 @@ fn generate_tool_args_deser(args_type: Option<&Type>, tool_name: &str) -> TokenS
     };
     quote! {
         let typed_args: #at = serde_json::from_value(args)
-            .map_err(|e| pmcp::Error::invalid_params(
-                format!("Invalid arguments for tool '{}': {}", #tool_name, e)
+            .map_err(|e| pmcp::Error::tool_rejected(
+                format!("Invalid arguments for tool '{}': {}", #tool_name, e),
+                None,
             ))?;
     }
 }

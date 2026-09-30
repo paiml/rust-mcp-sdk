@@ -455,7 +455,7 @@ impl pmcp::ToolHandler for AddToolHandler {
             let _extra = _extra;
             let __ret: pmcp::Result<serde_json::Value> = {
                 let typed_args: AddArgs = serde_json::from_value(args)
-                    .map_err(|e| pmcp::Error::invalid_params(
+                    .map_err(|e| pmcp::Error::tool_rejected(
                         ::alloc::__export::must_use({
                             ::alloc::fmt::format(
                                 format_args!(
@@ -463,6 +463,7 @@ impl pmcp::ToolHandler for AddToolHandler {
                                 ),
                             )
                         }),
+                        None,
                     ))?;
                 let result = __self.server.add(typed_args).await?;
                 serde_json::to_value(result)
@@ -570,7 +571,7 @@ impl pmcp::ToolHandler for SubtractToolHandler {
             let _extra = _extra;
             let __ret: pmcp::Result<serde_json::Value> = {
                 let typed_args: AddArgs = serde_json::from_value(args)
-                    .map_err(|e| pmcp::Error::invalid_params(
+                    .map_err(|e| pmcp::Error::tool_rejected(
                         ::alloc::__export::must_use({
                             ::alloc::fmt::format(
                                 format_args!(
@@ -578,6 +579,7 @@ impl pmcp::ToolHandler for SubtractToolHandler {
                                 ),
                             )
                         }),
+                        None,
                     ))?;
                 let result = __self.server.subtract(typed_args).await?;
                 serde_json::to_value(result)

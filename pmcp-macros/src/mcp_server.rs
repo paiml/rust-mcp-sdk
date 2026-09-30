@@ -148,8 +148,9 @@ fn generate_tool_args_deser(method_info: &ToolMethodInfo) -> TokenStream {
     let tool_name_err = &method_info.tool_name;
     quote! {
         let typed_args: #at = serde_json::from_value(args)
-            .map_err(|e| pmcp::Error::invalid_params(
-                format!("Invalid arguments for tool '{}': {}", #tool_name_err, e)
+            .map_err(|e| pmcp::Error::tool_rejected(
+                format!("Invalid arguments for tool '{}': {}", #tool_name_err, e),
+                None,
             ))?;
     }
 }

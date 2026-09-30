@@ -108,7 +108,10 @@ where
     fn execute(&self, args: Value) -> Result<Value> {
         // Deserialize and validate the arguments
         let typed_args: T = serde_json::from_value(args).map_err(|e| {
-            Error::Validation(format!("Invalid arguments for tool '{}': {}", self.name, e))
+            Error::tool_rejected(
+                format!("Invalid arguments for tool '{}': {}", self.name, e),
+                None,
+            )
         })?;
 
         // Call the handler with the typed arguments
@@ -204,7 +207,10 @@ where
 {
     fn execute(&self, args: Value) -> Result<Value> {
         let typed_args: T = serde_json::from_value(args).map_err(|e| {
-            Error::Validation(format!("Invalid arguments for tool '{}': {}", self.name, e))
+            Error::tool_rejected(
+                format!("Invalid arguments for tool '{}': {}", self.name, e),
+                None,
+            )
         })?;
 
         let result = (self.handler)(typed_args)?;

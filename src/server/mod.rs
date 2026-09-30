@@ -6483,6 +6483,62 @@ mod tests {
         }
     }
 
+    /// A typed tool whose arguments do not deserialize is the caller's mistake, so
+    /// it must reach the model as a SUCCESSFUL `CallToolResult` with `isError: true`,
+    /// never as a JSON-RPC protocol error (pmcp 2.22). A protocol error reads as a
+    /// server fault and gives the model nothing to correct.
+    #[cfg(feature = "schema-generation")]
+    #[tokio::test]
+    async fn test_typed_tool_bad_arguments_is_iserror_not_protocol_error() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct Args {
+            #[allow(dead_code)]
+            count: u32,
+        }
+
+        let server = Server::builder()
+            .name("test-server")
+            .version("1.0.0")
+            .tool_typed("typed", |_args: Args, _extra| {
+                Box::pin(async move { Ok(json!({ "ok": true })) })
+            })
+            .build()
+            .unwrap();
+
+        let request = Request::Client(Box::new(ClientRequest::CallTool(CallToolRequest {
+            name: "typed".to_string(),
+            arguments: json!({ "count": "not a number" }),
+            _meta: None,
+            task: None,
+        })));
+        let response = server
+            .handle_request(RequestId::from(1i64), request, None)
+            .await;
+
+        match response.payload {
+            ResponsePayload::Result(result) => {
+                let call_result: CallToolResult = serde_json::from_value(result).unwrap();
+                assert!(call_result.is_error, "bad arguments must set isError: true");
+                let text = call_result
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        crate::types::Content::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    text.contains("Invalid arguments for tool 'typed'"),
+                    "content must carry the refusal message, got: {text}"
+                );
+            },
+            ResponsePayload::Error(e) => panic!(
+                "bad typed-tool arguments must NOT be a protocol error, got {}: {}",
+                e.code, e.message
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_call_tool_not_found() {
         let server = Server::builder()

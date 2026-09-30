@@ -36,10 +36,13 @@ fn extra(id: &str) -> RequestHandlerExtra {
 }
 
 /// Unwrap a refusal's message, failing loudly on any other error variant.
+///
+/// A refusal is a TOOL-LEVEL rejection (`isError: true`), not a protocol error:
+/// the model reads a protocol error as a server fault and has nothing to correct.
 fn refusal(err: pmcp::Error) -> String {
     match err {
-        pmcp::Error::Validation(message) => message,
-        other => panic!("expected Error::Validation, got {other:?}"),
+        pmcp::Error::ToolRejected { message, .. } => message,
+        other => panic!("expected Error::ToolRejected, got {other:?}"),
     }
 }
 

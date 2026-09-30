@@ -144,8 +144,9 @@ where
     ///
     /// # Refusal shape
     ///
-    /// A violation short-circuits the handler with [`crate::Error::Validation`]
-    /// rendered value-free — see `render_garde_refusal` for the two residual leak
+    /// A violation short-circuits the handler with [`crate::Error::ToolRejected`]
+    /// (a tool result with `isError: true`, which the model reads as its own
+    /// mistake to correct, not as a server fault) rendered value-free — see `render_garde_refusal` for the two residual leak
     /// surfaces (`#[garde(custom(..))]` messages and `#[garde(dive)]` map keys).
     /// A DESERIALIZATION failure on a tool built through this constructor is also
     /// redacted, which is the one behavioural difference from the plain
@@ -430,14 +431,18 @@ where
     }
 }
 
-/// Today's deserialization refusal, preserved byte-for-byte for every tool built
-/// through a NON-validated constructor.
+/// Today's deserialization refusal for every tool built through a NON-validated
+/// constructor. The MESSAGE is preserved byte-for-byte; the channel is now a tool
+/// result (`ToolRejected`) rather than a protocol error (pmcp 2.22).
 ///
 /// `serde_json::Error`'s `Display` can quote the caller's input. That is a known
 /// leak (T-128-17a) which is fixed only on the validated path, so that no existing
 /// consumer's error text changes.
 fn legacy_deserialize_error(tool: &str, e: &serde_json::Error) -> Error {
-    Error::Validation(format!("Invalid arguments for tool '{}': {}", tool, e))
+    Error::tool_rejected(
+        format!("Invalid arguments for tool '{}': {}", tool, e),
+        None,
+    )
 }
 
 /// The REDACTED deserialization refusal a VALIDATED tool returns (T-128-17a).
@@ -463,12 +468,13 @@ fn redacted_deserialize_error(tool: &str, e: &serde_json::Error) -> Error {
     } else {
         format!(" at line {}, column {}", e.line(), e.column())
     };
-    Error::Validation(format!(
-        "Invalid arguments for tool '{tool}': {classification}{position}"
-    ))
+    Error::tool_rejected(
+        format!("Invalid arguments for tool '{tool}': {classification}{position}"),
+        None,
+    )
 }
 
-/// Map a `garde::Report` onto a value-free [`Error::Validation`].
+/// Map a `garde::Report` onto a value-free [`Error::ToolRejected`].
 ///
 /// # Why the text is rebuilt rather than `Display`-formatted
 ///
@@ -514,7 +520,10 @@ fn render_garde_refusal(tool: &str, report: &garde::Report) -> Error {
     } else {
         detail
     };
-    Error::Validation(format!("Invalid arguments for tool '{tool}': {detail}"))
+    Error::tool_rejected(
+        format!("Invalid arguments for tool '{tool}': {detail}"),
+        None,
+    )
 }
 
 /// Project a `garde::Path` into a value-free RFC 6901-shaped pointer.
@@ -1118,7 +1127,7 @@ where
     async fn handle(&self, args: Value, extra: RequestHandlerExtra) -> Result<Value> {
         // Parse the arguments to the input type
         let typed_args: TIn = serde_json::from_value(args)
-            .map_err(|e| Error::Validation(format!("Invalid arguments: {}", e)))?;
+            .map_err(|e| Error::tool_rejected(format!("Invalid arguments: {}", e), None))?;
 
         // Call the handler
         let result = (self.handler)(typed_args, extra).await?;
@@ -1258,7 +1267,10 @@ where
     /// real verbatim path).
     async fn run(&self, args: Value, extra: RequestHandlerExtra) -> Result<CallToolResult> {
         let typed_args: TIn = serde_json::from_value(args).map_err(|e| {
-            Error::Validation(format!("Invalid arguments for tool '{}': {}", self.name, e))
+            Error::tool_rejected(
+                format!("Invalid arguments for tool '{}': {}", self.name, e),
+                None,
+            )
         })?;
         (self.handler)(typed_args, extra).await
     }

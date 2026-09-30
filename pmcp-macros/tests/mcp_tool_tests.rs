@@ -20,6 +20,33 @@ struct EchoResult {
     echoed: String,
 }
 
+// === Test 0: a malformed-arguments call is a tool-level rejection ===
+
+/// Arguments that do not deserialize are the caller's mistake to correct, so the
+/// generated handler returns `Error::ToolRejected` (an `isError: true` tool
+/// result), not a JSON-RPC protocol error a model reads as a server fault.
+/// (pmcp-macros 0.6.2.)
+#[tokio::test]
+async fn test_malformed_arguments_are_a_tool_level_rejection() {
+    let tool = echo();
+    let err = tool
+        .handle(
+            serde_json::json!({"message": 42}),
+            pmcp::RequestHandlerExtra::default(),
+        )
+        .await
+        .expect_err("a number is not a string");
+    assert!(
+        matches!(err, pmcp::Error::ToolRejected { .. }),
+        "expected ToolRejected, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("Invalid arguments for tool 'echo'"),
+        "{err}"
+    );
+}
+
 // === Test 1: Minimal async tool with typed output (D-14) ===
 
 #[mcp_tool(description = "Echo a message")]

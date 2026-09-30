@@ -406,7 +406,7 @@ impl pmcp::ToolHandler for EchoTool {
             let _extra = _extra;
             let __ret: pmcp::Result<serde_json::Value> = {
                 let typed_args: EchoArgs = serde_json::from_value(args)
-                    .map_err(|e| pmcp::Error::invalid_params(
+                    .map_err(|e| pmcp::Error::tool_rejected(
                         ::alloc::__export::must_use({
                             ::alloc::fmt::format(
                                 format_args!(
@@ -414,6 +414,7 @@ impl pmcp::ToolHandler for EchoTool {
                                 ),
                             )
                         }),
+                        None,
                     ))?;
                 let result = __echo_impl(typed_args).await?;
                 serde_json::to_value(result)
