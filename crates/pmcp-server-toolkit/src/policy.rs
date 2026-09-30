@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -117,6 +118,26 @@ pub struct OutboundRequest<'a> {
     /// `None` for a GET-like request, whose remaining fields have already been
     /// converted into [`Self::query`] by the time the policy runs.
     pub body: Option<&'a Value>,
+
+    /// An opaque identifier for the `tools/call` that produced this request.
+    ///
+    /// **Stable across every request ONE `tools/call` makes.** On the Code Mode
+    /// surface a single `execute_code` run can send many requests, and all of them
+    /// carry the same id, so a policy can budget a whole run (total bytes, request
+    /// count, distinct endpoints) instead of seeing each request in isolation. A
+    /// per-request cap alone lets a caller split free text across several requests
+    /// that each fit under it. On the curated surface a `tools/call` is one
+    /// request, so the id is simply unique per request.
+    ///
+    /// Unique across calls within a process, and with overwhelming probability
+    /// across restarts. It is NOT a secret and NOT a distributed trace id: it is
+    /// generated here, never taken from the client, and it should not be put on
+    /// the wire.
+    ///
+    /// Empty ONLY when unattributed (a caller driving a connector directly rather
+    /// than through a synthesized handler), the same convention as [`Self::tool`].
+    /// Treat the empty string as "no grouping", never as one shared bucket.
+    pub call_id: &'a str,
 }
 
 impl<'a> OutboundRequest<'a> {
@@ -139,8 +160,39 @@ impl<'a> OutboundRequest<'a> {
             path,
             query,
             body,
+            call_id: "",
         }
     }
+
+    /// Attach the per-`tools/call` identifier, see [`Self::call_id`].
+    ///
+    /// A builder rather than a sixth parameter of [`Self::new`], so existing
+    /// callers of `new` keep compiling. The type is `#[non_exhaustive]`, which is
+    /// what makes adding the field itself additive.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: &'a str) -> Self {
+        self.call_id = call_id;
+        self
+    }
+}
+
+/// Mint the identifier for ONE `tools/call`, see [`OutboundRequest::call_id`].
+///
+/// A process-wide counter under a per-process prefix taken from the clock and the
+/// process id. Dependency-free on purpose: this needs uniqueness, not
+/// unpredictability, because the id is a grouping key for a policy and is never a
+/// credential.
+pub(crate) fn next_call_id() -> String {
+    static PREFIX: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let prefix = *PREFIX.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        nanos ^ (u64::from(std::process::id()) << 32)
+    });
+    format!("{prefix:x}-{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// A [`RequestPolicy`]'s refusal of one outbound request.
@@ -772,8 +824,8 @@ fn claim_report_emission(name: &str, version: &str, lines: &[ReportLine]) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgumentRefusal, ArgumentValidator, ArgumentValidators, OutboundRequest, PolicyRefusal,
-        RequestPolicy, ToolkitHooks,
+        next_call_id, ArgumentRefusal, ArgumentValidator, ArgumentValidators, OutboundRequest,
+        PolicyRefusal, RequestPolicy, ToolkitHooks,
     };
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -879,5 +931,24 @@ mod tests {
         let rendered = format!("{hooks:?}");
         assert!(rendered.contains("request_policy: true"));
         assert!(!rendered.contains("secret-ish"));
+    }
+
+    /// `OutboundRequest::new` leaves `call_id` empty ("unattributed") and
+    /// `with_call_id` sets it, so existing five-argument callers keep compiling and
+    /// keep their old meaning.
+    #[test]
+    fn call_id_defaults_to_unattributed_and_the_builder_sets_it() {
+        let req = OutboundRequest::new("t", "GET", "/p", &[], None);
+        assert_eq!(req.call_id, "", "new() must not invent an id");
+        assert_eq!(req.with_call_id("abc").call_id, "abc");
+    }
+
+    /// A grouping key that repeats is worse than none: a budget keyed on it would
+    /// charge one caller for another's traffic.
+    #[test]
+    fn next_call_id_is_non_empty_and_never_repeats() {
+        let ids: std::collections::HashSet<String> = (0..2000).map(|_| next_call_id()).collect();
+        assert_eq!(ids.len(), 2000, "every minted id must be distinct");
+        assert!(ids.iter().all(|id| !id.is_empty()));
     }
 }

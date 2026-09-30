@@ -136,7 +136,12 @@ pub fn request_executor_from_extra(
     extra: &pmcp::RequestHandlerExtra,
 ) -> HttpCodeExecutor {
     let token = extra.auth_context().and_then(|ctx| ctx.token.clone());
-    base.clone().with_inbound_token(token)
+    // Every derivation is ONE `tools/call`, so this is where the call id is minted:
+    // every request that call makes carries the same id, and the next call gets a
+    // fresh one. Both Code Mode (`execute_code`) and script tools derive here.
+    base.clone()
+        .with_inbound_token(token)
+        .with_call_id(crate::policy::next_call_id())
 }
 
 // =============================================================================
@@ -906,6 +911,9 @@ pub struct HttpCodeExecutor {
     /// `execute_code` for the generic Code Mode tool. `Arc<str>` because the
     /// executor is cloned per request.
     tool_label: Option<Arc<str>>,
+    /// The per-`tools/call` id stamped onto every policy request this executor
+    /// makes. `None` on a base executor, set by [`request_executor_from_extra`].
+    call_id: Option<Arc<str>>,
 }
 
 #[cfg(feature = "openapi-code-mode")]
@@ -928,6 +936,7 @@ impl HttpCodeExecutor {
             schema: None,
             policy: None,
             tool_label: None,
+            call_id: None,
         }
     }
 
@@ -951,6 +960,25 @@ impl HttpCodeExecutor {
         self.tool_label.as_deref().unwrap_or("")
     }
 
+    /// Stamp the per-`tools/call` id onto every policy request this executor makes,
+    /// see [`crate::policy::OutboundRequest::call_id`].
+    ///
+    /// [`request_executor_from_extra`] calls this once per `tools/call`, so an
+    /// embedder normally never does. It is public for an embedder that derives its
+    /// own per-call executor and wants its requests grouped the same way.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl AsRef<str>) -> Self {
+        self.call_id = Some(Arc::from(call_id.as_ref()));
+        self
+    }
+
+    /// The id of the `tools/call` this executor serves, or `""` on a base executor
+    /// that no call has derived from (nothing to group by).
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        self.call_id.as_deref().unwrap_or("")
+    }
+
     /// Consult the registered E1 policy, if any, for one already-assembled
     /// outbound request (Phase 128).
     ///
@@ -968,7 +996,8 @@ impl HttpCodeExecutor {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(());
         };
-        let req = crate::policy::OutboundRequest::new(self.tool_label(), method, path, query, body);
+        let req = crate::policy::OutboundRequest::new(self.tool_label(), method, path, query, body)
+            .with_call_id(self.call_id());
         policy
             .check(&req)
             .await

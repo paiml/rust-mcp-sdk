@@ -647,7 +647,12 @@ impl HttpClient {
             query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         sorted.sort();
         let method = method.to_uppercase();
-        let req = crate::policy::OutboundRequest::new(tool, &method, path, &sorted, body);
+        // A curated `tools/call` makes exactly ONE request, so a fresh id per request
+        // is the id per call. Minted here, after the no-policy early return, so a
+        // server with no policy pays nothing.
+        let call_id = crate::policy::next_call_id();
+        let req = crate::policy::OutboundRequest::new(tool, &method, path, &sorted, body)
+            .with_call_id(&call_id);
         policy
             .check(&req)
             .await

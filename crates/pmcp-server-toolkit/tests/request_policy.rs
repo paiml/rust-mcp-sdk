@@ -94,6 +94,7 @@ struct Recorded {
     path: String,
     query: Vec<(String, String)>,
     body: Option<String>,
+    call_id: String,
 }
 
 impl Recorded {
@@ -107,12 +108,15 @@ impl Recorded {
             .collect::<Vec<_>>()
             .join("&");
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             self.tool,
             self.method,
             self.path,
             query,
-            self.body.clone().unwrap_or_default()
+            self.body.clone().unwrap_or_default(),
+            // The credential scan must cover EVERY field. `call_id` is minted here
+            // and cannot carry a secret, but "cannot" is what this row asserts.
+            self.call_id
         )
     }
 }
@@ -132,6 +136,7 @@ impl RequestPolicy for Recorder {
             path: req.path.to_string(),
             query: req.query.to_vec(),
             body: req.body.map(ToString::to_string),
+            call_id: req.call_id.to_string(),
         });
         if self.refuse {
             Err(PolicyRefusal::new(REFUSAL))
@@ -295,6 +300,40 @@ async fn request_policy_refusal_makes_zero_upstream_requests() {
         observed(&server).await.is_empty(),
         "a policy refusal must record ZERO upstream requests; got {}",
         observed(&server).await.len()
+    );
+}
+
+/// Each curated `tools/call` is one request with its OWN non-empty `call_id`.
+///
+/// A `call_id` shared between two calls would let a policy that budgets per call
+/// charge one caller for another's traffic; an empty one would silently disable
+/// grouping. Refs #386.
+#[tokio::test]
+async fn request_policy_call_id_is_unique_per_curated_call() {
+    let server = MockServer::start().await;
+    let (policy, seen) = recorder(false);
+    let handler = arrange(
+        &server,
+        Some(policy),
+        &ToolkitHooks::default(),
+        ValidationSection::default(),
+    )
+    .await;
+    for _ in 0..2 {
+        handler
+            .handle(good_args(), RequestHandlerExtra::default())
+            .await
+            .expect("allowed");
+    }
+    let seen = seen.lock().expect("lock").clone();
+    assert_eq!(seen.len(), 2, "one policy check per call");
+    assert!(
+        seen.iter().all(|r| !r.call_id.is_empty()),
+        "a synthesized handler always attributes its call: {seen:?}"
+    );
+    assert_ne!(
+        seen[0].call_id, seen[1].call_id,
+        "two tools/call invocations must not share a call id"
     );
 }
 
