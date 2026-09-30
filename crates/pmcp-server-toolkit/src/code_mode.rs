@@ -334,16 +334,15 @@ pub fn code_mode_http_tools_from_executor(
     .map_err(|e| ToolkitError::CodeMode(format!("ValidationPipeline construction failed: {e}")))?;
     let pipeline = Arc::new(pipeline);
 
-    // The preview asks the policy about a call under the label `execute_code`
-    // will use, so a policy keyed on the tool name answers identically in both
-    // phases. Only kept when a policy is registered: with none there is nothing
-    // that could refuse.
-    let preview = base.has_request_policy().then(|| {
-        (
-            base.clone().with_tool_label("execute_code"),
-            exec_config.clone(),
-        )
-    });
+    // `validate_code` compiles the script on EVERY server (a script the plan
+    // compiler rejects cannot run, so it must not receive a token), and, when a
+    // policy is registered, asks it about the calls whose request is already known.
+    // The executor carries the label `execute_code` will use, so a policy keyed on
+    // the tool name answers identically in both phases.
+    let preview = Some((
+        base.clone().with_tool_label("execute_code"),
+        exec_config.clone(),
+    ));
     let validate_handler = tool_handlers::ValidateCodeHandler {
         pipeline: Arc::clone(&pipeline),
         config: cm_config,
@@ -512,21 +511,36 @@ fn push_literal_call(
     out.push((method.to_string(), joined, body));
 }
 
-/// `validate_code`'s outbound-policy preview: the first refusal, as a
-/// `PolicyViolation`, for a call in `code` whose request is fully known.
+/// `validate_code`'s plan-level checks: the first problem, as a `PolicyViolation`.
 ///
-/// `None` when the code does not compile to a plan (validation already reported
-/// that), or when no literal call is refused. One call id is minted for the whole
-/// validation, so a policy sees the calls of one script as one run.
+/// 1. **The script must compile.** The validator accepts code the plan compiler
+///    cannot (`api.get('/x/' + id)`), so without this the model is handed a token
+///    for a script that can only fail at `execute_code`. The message is the
+///    compiler's value-free `caller_message`.
+/// 2. **A registered policy is asked about every call whose whole request is
+///    known.** A refusal is reported before a token is issued. One call id is
+///    minted for the whole validation, so a policy sees one script as one run.
+///
+/// `None` when the script compiles and no literal call is refused.
 #[cfg(feature = "openapi-code-mode")]
 async fn preview_policy_violation(
     base: &HttpCodeExecutor,
     exec_config: &ExecutionConfig,
     code: &str,
 ) -> Option<pmcp_code_mode::PolicyViolation> {
-    let plan = pmcp_code_mode::PlanCompiler::with_config(exec_config)
-        .compile_code(code)
-        .ok()?;
+    let plan = match pmcp_code_mode::PlanCompiler::with_config(exec_config).compile_code(code) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Some(pmcp_code_mode::PolicyViolation::new(
+                "script",
+                "invalid_script",
+                error.caller_message(),
+            ))
+        },
+    };
+    if !base.has_request_policy() {
+        return None;
+    }
     let mut calls = Vec::new();
     collect_literal_calls(&plan.steps, &mut calls);
     let call_id = crate::policy::next_call_id();
@@ -577,19 +591,37 @@ mod tool_handlers {
         flavor: ValidationFlavor,
         code: &str,
         context: &pmcp_code_mode::ValidationContext,
-    ) -> std::result::Result<pmcp_code_mode::ValidationResult, String> {
+    ) -> std::result::Result<pmcp_code_mode::ValidationResult, pmcp::Error> {
         match flavor {
             ValidationFlavor::Sql => pipeline
                 .validate_sql_query(code, context)
-                .map_err(|e| format!("Validation error: {e}")),
+                .map_err(validation_failure),
             #[cfg(feature = "openapi-code-mode")]
             ValidationFlavor::OpenApi => pipeline
                 .validate_javascript_code(code, context)
-                .map_err(|e| format!("Validation error: {e}")),
+                .map_err(validation_failure),
             #[cfg(not(feature = "openapi-code-mode"))]
-            ValidationFlavor::OpenApi => Err(
+            ValidationFlavor::OpenApi => Err(pmcp::Error::Internal(
                 "OpenAPI Code Mode validation requires the `openapi-code-mode` feature".to_string(),
+            )),
+        }
+    }
+
+    /// Classify a validator failure for the tool boundary.
+    ///
+    /// A script or query that does not PARSE is the caller's mistake, so it is a
+    /// tool-level rejection the model can act on. The message is fixed: the parser's
+    /// own text quotes the token it stopped at, which repeats the caller's code, and
+    /// its reported position is unreliable (line 0, column 0 for the SWC path). Any
+    /// other validator error is a fault of the server or its configuration and stays
+    /// `Internal`.
+    fn validation_failure(error: pmcp_code_mode::ValidationError) -> pmcp::Error {
+        match error {
+            pmcp_code_mode::ValidationError::ParseError { .. } => pmcp::Error::tool_rejected(
+                "the code has a syntax error and could not be parsed",
+                None,
             ),
+            other => pmcp::Error::Internal(format!("Validation error: {other}")),
         }
     }
 
@@ -609,9 +641,10 @@ mod tool_handlers {
     /// Classify an `execute_code` failure for the tool boundary.
     ///
     /// A refused request ([`ExecutionError::RequestRefused`]: the path floor, a
-    /// non-scalar value, or an embedder's outbound policy) is the CALLER's to fix by
-    /// changing what the script sends, so it is a tool-level rejection the model can
-    /// act on. Every other error stays `Internal`: a backend or runtime fault is not
+    /// non-scalar value, or an embedder's outbound policy) and a script that does not
+    /// compile ([`ExecutionError::InvalidScript`]) are the CALLER's to fix by changing
+    /// what the script sends or how it is written, so they are tool-level rejections
+    /// the model can act on. Every other error stays `Internal`: a backend or runtime fault is not
     /// something the caller can correct by changing input.
     ///
     /// Until pmcp-code-mode 0.7 a refusal was indistinguishable from a fault, so a
@@ -621,7 +654,8 @@ mod tool_handlers {
     /// The wildcard arm is required: `ExecutionError` is `#[non_exhaustive]`.
     pub(super) fn execution_failure(error: pmcp_code_mode::ExecutionError) -> pmcp::Error {
         match error {
-            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+            pmcp_code_mode::ExecutionError::RequestRefused { message }
+            | pmcp_code_mode::ExecutionError::InvalidScript { message } => {
                 pmcp::Error::tool_rejected(message, None)
             },
             other => pmcp::Error::Internal(format!("Execution error: {other}")),
@@ -638,9 +672,8 @@ mod tool_handlers {
         pub(super) flavor: ValidationFlavor,
         /// `[code_mode] description_notice`, appended to the tool description.
         pub(super) description_notice: Option<String>,
-        /// The executor and limits `validate_code` previews literal calls
-        /// against, when an E1 policy could refuse one. `None` on the SQL path and
-        /// on any server that registered no outbound policy.
+        /// The executor and limits `validate_code` compiles and previews literal
+        /// calls against. `None` on the SQL path only.
         #[cfg(feature = "openapi-code-mode")]
         pub(super) preview: Option<(super::HttpCodeExecutor, pmcp_code_mode::ExecutionConfig)>,
     }
@@ -672,8 +705,7 @@ mod tool_handlers {
 
             #[cfg_attr(not(feature = "openapi-code-mode"), allow(unused_mut))]
             // Why: only the `openapi-code-mode` preview below mutates it.
-            let mut result = run_flavored_validation(&self.pipeline, self.flavor, code, &context)
-                .map_err(pmcp::Error::Internal)?;
+            let mut result = run_flavored_validation(&self.pipeline, self.flavor, code, &context)?;
 
             // Run the outbound policy over the calls whose request is already known.
             // A refusal here reaches the model as a rejected validation, with no
@@ -2144,6 +2176,39 @@ mod test_env_guard {
 mod tests {
     use super::*;
     use crate::config::{CodeModeLimits, CodeModeSection};
+
+    /// `execute_code` maps the two caller-side failures to a tool-level rejection and
+    /// every other failure to `Internal`. The negative half matters as much as the
+    /// positive: a backend outage must not read to a model as its own mistake.
+    #[cfg(feature = "openapi-code-mode")]
+    #[test]
+    fn execution_failure_classifies_caller_errors_and_faults_apart() {
+        use pmcp_code_mode::ExecutionError;
+        for caller in [
+            ExecutionError::RequestRefused {
+                message: "m".into(),
+            },
+            ExecutionError::InvalidScript {
+                message: "m".into(),
+            },
+        ] {
+            assert!(matches!(
+                tool_handlers::execution_failure(caller),
+                pmcp::Error::ToolRejected { .. }
+            ));
+        }
+        for fault in [
+            ExecutionError::RuntimeError {
+                message: "backend down".into(),
+            },
+            ExecutionError::Timeout(5),
+        ] {
+            assert!(matches!(
+                tool_handlers::execution_failure(fault),
+                pmcp::Error::Internal(_)
+            ));
+        }
+    }
 
     /// Compile-only assertion that the headline re-exports resolve at the
     /// `code_mode::*` path (TKIT-06 + D-16 + R3).

@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.22.2] - 2026-09-30
+
+Ships `pmcp-code-mode` **0.7.2**, `pmcp-code-mode-derive` **0.3.3** and `pmcp-server-toolkit`
+**0.3.2**. `pmcp` moves 2.22.1 -> 2.22.2 with no code change of its own, to mint the tag that
+carries them; `^2.22.0` admits it. `cargo-pmcp` is not bumped. **No breaking change**: the new error
+variant lands on an enum that has been `#[non_exhaustive]` since 0.7.
+
+### Fixed — a script that does not compile is reported as the caller's mistake (F-31)
+
+Reported by the team running the UMLS MCP server on the deployed 2.22.1: `api.get('/search/' + q)`
+(string concatenation where a template literal is required) validated, received an approval token,
+and then failed at `execute_code` as `Internal error: Execution error: Runtime error: Compilation
+failed: Invalid path template: ...`. The model wrote that script, and the label told it the server had
+failed. The same was true of a plain syntax error, reported at `validate_code` as `Internal`.
+
+- **New `ExecutionError::InvalidScript { message }`** for a script the plan compiler rejects. The
+  toolkit and `#[derive(CodeMode)]` report it as a tool-level rejection (`isError: true`). A real
+  backend or runtime fault is still `Internal`.
+- **`validate_code` now compiles the script, on every server**, and refuses one that cannot run,
+  with no approval token. Before, this check only happened when an outbound policy was registered.
+- **A syntax error is a tool-level rejection at `validate_code`** (it was `Internal`), for the SQL and
+  the JavaScript flavors.
+- **The messages are value-free.** The compiler's guidance strings are static ("'while' loops are not
+  supported. Use for-of with .slice() instead"), and are kept because they tell the model how to
+  rewrite the script. A parse error is replaced by a fixed sentence: the parser's own text quotes the
+  token it stopped at, which repeats the caller's code.
+- **Behaviour change:** a client that matched `Internal` for an uncompilable script must match
+  `isError`.
+
 ## [2.22.1] - 2026-09-30
 
 Ships `pmcp-code-mode` **0.7.1** and `pmcp-server-toolkit` **0.3.1**. `pmcp` moves 2.22.0 -> 2.22.1

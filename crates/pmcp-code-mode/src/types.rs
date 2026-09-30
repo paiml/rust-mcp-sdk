@@ -541,6 +541,21 @@ pub enum ExecutionError {
     /// it value-free when it adds the method and result variable.
     #[error("Request refused: {message}")]
     RequestRefused { message: String },
+
+    /// The script itself cannot be compiled: a syntax error, a construct the
+    /// JavaScript subset does not support, or a call shape the plan compiler
+    /// rejects (`api.get('/x/' + id)` instead of a template literal).
+    ///
+    /// The CALLER wrote the script, so it is the caller's to fix, and a tool handler
+    /// should report it as a tool-level rejection the model can act on, never as an
+    /// internal error. Until 0.7.2 this was a [`ExecutionError::RuntimeError`]
+    /// reading `Compilation failed: ...`, which hid a caller mistake behind a label
+    /// for a server fault.
+    ///
+    /// `message` comes from `CompileError::caller_message`: the compiler's own
+    /// guidance for a construct, never a fragment of the submitted code.
+    #[error("Invalid script: {message}")]
+    InvalidScript { message: String },
 }
 
 /// Supported code languages for validation and execution.

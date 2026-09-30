@@ -93,8 +93,8 @@ async fn compile_and_execute<H: crate::executor::HttpExecutor + 'static>(
     let mut compiler = crate::executor::PlanCompiler::with_config(config);
     let plan = compiler
         .compile_code(code)
-        .map_err(|e| ExecutionError::RuntimeError {
-            message: format!("Compilation failed: {e}"),
+        .map_err(|e| ExecutionError::InvalidScript {
+            message: e.caller_message(),
         })?;
     let mut executor = crate::executor::PlanExecutor::new(http, config.clone());
     if let Some(vars) = variables {
@@ -317,6 +317,62 @@ mod tests {
                 "code": code,
                 "variables": variables,
             }))
+        }
+    }
+
+    /// Compile and run `code` against a dry-run backend, through the same function
+    /// every adapter uses.
+    #[cfg(feature = "js-runtime")]
+    async fn compile_and_run(code: &str) -> Result<serde_json::Value, ExecutionError> {
+        use crate::executor::{ExecutionConfig, MockHttpExecutor};
+        compile_and_execute(
+            &ExecutionConfig::default(),
+            MockHttpExecutor::new_dry_run(),
+            code,
+            None,
+            |_| {},
+            "test",
+        )
+        .await
+    }
+
+    /// A script that cannot be compiled is the CALLER's mistake: it must be its own
+    /// error variant, never `RuntimeError` (a server fault), so a tool handler can
+    /// report it as a tool-level rejection. (pmcp-code-mode 0.7.2, F-31.)
+    #[cfg(feature = "js-runtime")]
+    #[tokio::test]
+    async fn a_script_that_does_not_compile_is_invalid_script_not_a_runtime_fault() {
+        // String concatenation where a template literal is required.
+        let err = compile_and_run("const r = await api.get('/search/' + args.q); return r;")
+            .await
+            .expect_err("a concatenated path does not compile");
+        assert!(
+            matches!(err, ExecutionError::InvalidScript { .. }),
+            "a compile error is the caller's, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("template literal"),
+            "the model must read what to change: {err}"
+        );
+    }
+
+    /// A syntax error's parser message quotes the token it choked on, which repeats
+    /// the caller's code. The reported text is fixed instead.
+    #[cfg(feature = "js-runtime")]
+    #[tokio::test]
+    async fn a_syntax_error_does_not_echo_the_submitted_code() {
+        let err = compile_and_run("const SECRETTOKEN = = 1;")
+            .await
+            .expect_err("a syntax error");
+        match err {
+            ExecutionError::InvalidScript { message } => {
+                assert!(
+                    !message.contains("SECRETTOKEN"),
+                    "echoed the code: {message}"
+                );
+                assert!(message.contains("syntax error"), "{message}");
+            },
+            other => panic!("expected InvalidScript, got {other:?}"),
         }
     }
 

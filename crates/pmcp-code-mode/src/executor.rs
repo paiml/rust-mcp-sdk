@@ -679,6 +679,26 @@ pub enum CompileError {
     MissingVariableName,
 }
 
+impl CompileError {
+    /// The text to show the CALLER of a script that failed to compile.
+    ///
+    /// Every variant's message is the compiler's own static guidance ("'while' loops
+    /// are not supported. Use for-of with .slice() instead"), which is what a model
+    /// needs to rewrite the script, with one exception: [`CompileError::ParseError`]
+    /// carries the `Debug` rendering of the parser's error, which quotes the token it
+    /// choked on and so repeats the caller's own code. It is replaced by a fixed
+    /// sentence. A refusal must not echo what the caller wrote.
+    #[must_use]
+    pub fn caller_message(&self) -> String {
+        match self {
+            Self::ParseError(_) => {
+                "the script has a syntax error and could not be parsed".to_string()
+            },
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Result of extracting an API call from an AST expression.
 ///
 /// Used by `try_extract_api_call()` to return either an HTTP-mode or SDK-mode call,

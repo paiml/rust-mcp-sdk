@@ -403,10 +403,12 @@ fn expand_with_context_from(
                     // Execute the validated code
                     let result = self.executor.execute(code, input.variables.as_ref()).await
                         .map_err(|e| match e {
-                            // A refused request is the CALLER's to fix, so it is a
-                            // tool-level rejection the model can act on. Only a
-                            // genuine execution fault stays an internal error.
-                            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+                            // A refused request, or a script that does not compile,
+                            // is the CALLER's to fix, so it is a tool-level rejection
+                            // the model can act on. Only a genuine execution fault
+                            // stays an internal error.
+                            pmcp_code_mode::ExecutionError::RequestRefused { message }
+                            | pmcp_code_mode::ExecutionError::InvalidScript { message } => {
                                 pmcp::Error::tool_rejected(message, None)
                             }
                             other => pmcp::Error::Internal(
@@ -598,10 +600,12 @@ fn expand_without_context_from(
                     // Execute the validated code
                     let result = self.executor.execute(code, input.variables.as_ref()).await
                         .map_err(|e| match e {
-                            // A refused request is the CALLER's to fix, so it is a
-                            // tool-level rejection the model can act on. Only a
-                            // genuine execution fault stays an internal error.
-                            pmcp_code_mode::ExecutionError::RequestRefused { message } => {
+                            // A refused request, or a script that does not compile,
+                            // is the CALLER's to fix, so it is a tool-level rejection
+                            // the model can act on. Only a genuine execution fault
+                            // stays an internal error.
+                            pmcp_code_mode::ExecutionError::RequestRefused { message }
+                            | pmcp_code_mode::ExecutionError::InvalidScript { message } => {
                                 pmcp::Error::tool_rejected(message, None)
                             }
                             other => pmcp::Error::Internal(

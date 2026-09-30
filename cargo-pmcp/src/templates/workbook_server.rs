@@ -50,13 +50,13 @@ static EMBEDDED_XLSX: &[u8] = include_bytes!("workbook_bundle/tax-calc.xlsx");
 /// The pinned `pmcp` version the emitted `Cargo.toml` declares. A test asserts
 /// this equals the workspace-root `pmcp` version so the hardcoded pin cannot
 /// silently drift from the released crate (Codex MEDIUM).
-const PMCP_VERSION: &str = "2.22.1";
+const PMCP_VERSION: &str = "2.22.2";
 
 /// The pinned `pmcp-server-toolkit` version the emitted `Cargo.toml` declares. A
 /// test asserts this equals the workspace `pmcp-server-toolkit` package version so
 /// the hardcoded pin cannot silently drift from the released crate (ME-01) —
 /// mirroring the `PMCP_VERSION` drift guard.
-const TOOLKIT_VERSION: &str = "0.3.1";
+const TOOLKIT_VERSION: &str = "0.3.2";
 
 /// Emit the files of a single runnable `workbook-server` crate into `dir`.
 pub fn generate(dir: &Path, name: &str) -> Result<()> {

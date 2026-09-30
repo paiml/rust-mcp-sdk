@@ -402,3 +402,54 @@ async fn an_accepted_validation_keeps_its_explanation() {
         "an accepted validation explains what it will do: {validated}"
     );
 }
+
+// -- F-31 (2.22.2): a script that does not compile is the caller's mistake --------
+
+/// `validate_code` must refuse a script the plan compiler cannot compile, with NO
+/// policy registered and NO approval token. The validator alone accepts
+/// `api.get('/search/' + q)`, so before this the model was handed a token for a
+/// script that could only fail at `execute_code`, as an internal error.
+#[tokio::test]
+async fn validate_code_refuses_a_script_that_does_not_compile_even_without_a_policy() {
+    let upstream = upstream().await;
+    let (validate_tool, _) = handlers(&upstream, None);
+
+    let err = validate(
+        &validate_tool,
+        "const r = await api.get('/search/' + args.q); return r;",
+    )
+    .await
+    .expect_err("a concatenated path does not compile, so it must not validate");
+
+    let pmcp::Error::ToolRejected { message, details } = err else {
+        panic!("a compile error is the caller's, so a tool-level rejection");
+    };
+    assert!(
+        message.contains("template literal"),
+        "the model must read what to change: {message}"
+    );
+    let details = details.expect("structured detail");
+    assert_eq!(details["valid"], false);
+    assert!(details["approval_token"].is_null(), "no token: {details}");
+    assert_eq!(details["violations"][0]["rule"], "invalid_script");
+}
+
+/// A syntax error is refused at validation without quoting the code.
+#[tokio::test]
+async fn a_syntax_error_is_refused_at_validation_without_echoing_the_code() {
+    let upstream = upstream().await;
+    let (validate_tool, _) = handlers(&upstream, None);
+
+    let err = validate(&validate_tool, "const SECRETTOKEN = = 1;")
+        .await
+        .expect_err("a syntax error must not validate");
+    let pmcp::Error::ToolRejected { message, details } = err else {
+        panic!("expected a tool-level rejection");
+    };
+    let everything = format!("{message} {}", details.unwrap_or_default());
+    assert!(
+        !everything.contains("SECRETTOKEN"),
+        "the refusal must not echo the code: {everything}"
+    );
+    assert!(everything.contains("syntax error"), "{everything}");
+}
