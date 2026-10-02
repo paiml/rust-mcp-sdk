@@ -54,7 +54,7 @@ toml = "1.0"
 walkdir = "2"
 colored = "3"
 indicatif = "0.18"
-dirs = "6"
+dirs = "7"
 dotenvy = "0.15"
 glob = "0.3"
 # For load testing metrics
