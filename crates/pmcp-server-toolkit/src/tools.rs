@@ -975,6 +975,27 @@ pub fn synthesize_from_config_with_http_connector_and_scripts_and_hooks(
     )
 }
 
+/// Refuse a curated tool the `[code_mode]` class policy refuses: a script
+/// tool by its calls, a single-call tool by its `(method, path)`. A tool that
+/// is neither is left to the synthesizer's own validation. No gate (no class
+/// key set) refuses nothing.
+#[cfg(feature = "openapi-code-mode")]
+fn check_curated_tool(
+    gate: Option<&crate::code_mode::ClassGate>,
+    decl: &ToolDecl,
+) -> std::result::Result<(), crate::error::ConfigValidationError> {
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    if let Some(script) = decl.script.as_deref() {
+        return gate.check_script(&decl.name, script);
+    }
+    match (decl.method.as_deref(), decl.path.as_deref()) {
+        (Some(method), Some(path)) => gate.check_single_call(&decl.name, method, path),
+        _ => Ok(()),
+    }
+}
+
 /// Shared synthesizer body for the single-call HTTP entry points.
 ///
 /// `build_script_tool` is invoked for each `script` tool: the single-call-only
@@ -997,11 +1018,9 @@ fn synthesize_http_inner(
     let class_gate = crate::code_mode::ClassGate::for_curated_tools(config);
     let mut out = Vec::with_capacity(config.tools.len());
     for decl in &config.tools {
+        #[cfg(feature = "openapi-code-mode")]
+        check_curated_tool(class_gate.as_ref(), decl)?;
         if decl.is_script_tool() {
-            #[cfg(feature = "openapi-code-mode")]
-            if let (Some(gate), Some(script)) = (&class_gate, decl.script.as_deref()) {
-                gate.check_script(&decl.name, script)?;
-            }
             let (info, handler) = build_script_tool(decl)?;
             // Push site 2 of 3 (SCRIPT tool) — D1 enforcement. This site is
             // SEPARATE from the HTTP push below because of the `continue`; wrapping
@@ -1023,10 +1042,6 @@ fn synthesize_http_inner(
             },
         };
 
-        #[cfg(feature = "openapi-code-mode")]
-        if let Some(gate) = &class_gate {
-            gate.check_single_call(&decl.name, method, path)?;
-        }
         let operation = build_operation(path, method, decl);
         let info = build_tool_info(decl, validation);
         let handler: Arc<dyn ToolHandler> = Arc::new(HttpToolHandler {
