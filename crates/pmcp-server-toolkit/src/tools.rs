@@ -1016,6 +1016,18 @@ fn synthesize_http_inner(
     // operation-class key (see `ClassGate::for_curated_tools`).
     #[cfg(feature = "openapi-code-mode")]
     let class_gate = crate::code_mode::ClassGate::for_curated_tools(config);
+    // Without the Code Mode engine this build cannot classify a call, so a config
+    // that declares operation classes would have its curated tools served
+    // unchecked. Refuse here, where it would happen, rather than in
+    // `ServerConfig::validate`, which must give a feature-independent verdict.
+    #[cfg(not(feature = "openapi-code-mode"))]
+    if let Some(key) = config
+        .code_mode
+        .as_ref()
+        .and_then(|cm| cm.class_keys_set().first().copied())
+    {
+        return Err(crate::error::ConfigValidationError::ClassKeysUnenforceable(key).into());
+    }
     let mut out = Vec::with_capacity(config.tools.len());
     for decl in &config.tools {
         #[cfg(feature = "openapi-code-mode")]
@@ -2470,6 +2482,41 @@ mod synth_http_tests {
             },
             tools,
             ..Default::default()
+        }
+    }
+
+    /// Without the Code Mode engine, a config that declares operation classes
+    /// would have its curated tools served unchecked, so synthesis refuses it.
+    /// `ServerConfig::validate` accepts the same config in every build.
+    #[cfg(not(feature = "openapi-code-mode"))]
+    #[test]
+    fn synth_http_refuses_class_keys_it_cannot_enforce() {
+        let cfg = ServerConfig::from_toml_strict_validated(
+            r#"
+            [server]
+            name = "umls"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://uts-ws.nlm.nih.gov/rest"
+
+            [code_mode]
+            write_mode = "deny_all"
+
+            [[tools]]
+            name = "search"
+            method = "GET"
+            path = "/search/current"
+            "#,
+        )
+        .expect("class keys validate in every build");
+        let connector: Arc<dyn HttpConnector> = MockHttpConnector::new(json!({}));
+        match synthesize_from_config_with_http_connector(&cfg, connector) {
+            Err(ToolkitError::Validation(
+                crate::error::ConfigValidationError::ClassKeysUnenforceable("write_mode"),
+            )) => {},
+            Err(other) => panic!("expected ClassKeysUnenforceable, got {other:?}"),
+            Ok(_) => panic!("expected ClassKeysUnenforceable, got tools"),
         }
     }
 

@@ -6,7 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [2.22.4] - 2026-10-01
+## [2.22.5] - 2026-10-02
+
+Ships `pmcp-code-mode` **0.7.4**, `pmcp-server-toolkit` **0.4.1**, `pmcp-openapi-server` **0.4.1**
+and `cargo-pmcp` **0.27.1**. `pmcp` moves 2.22.4 -> 2.22.5 with no code change of its own, to mint
+the tag. **No breaking change.** The two binaries are bumped with no code change of their own,
+so that `cargo install --locked` resolves the fixed toolkit: a binary's published lockfile pins
+the toolkit it was released with. Reported by the UMLS team after taking 2.22.4.
+
+### Fixed — `cargo pmcp validate deploy` rejected a config using operation classes
+
+`ServerConfig::validate` refused `[code_mode]` operation-class keys whenever the toolkit was built
+without `openapi-code-mode`. `cargo-pmcp` deliberately builds it that way, to keep the SWC engine
+out of the CLI, so `cargo pmcp validate deploy` reported "`read_mode` needs the
+`openapi-code-mode` feature" for a config the server accepts, and skipped the input-validation
+lint. `validate()` now gives the same verdict in every build. The refusal moved to the HTTP tool
+synthesizer, the one place a build without the Code Mode engine would actually serve curated
+tools without enforcing the classes.
+
+### Fixed — `[code_mode.limits]` refused on an OpenAPI server (regression in 0.4.0)
+
+0.4.0 counted `[code_mode.limits]` as a SQL-only key and refused it on a server with a
+`[backend]`. `pmcp-openapi-server` maps it onto its per-run caps (`max_tables_per_query` to
+`max_api_calls`, `max_join_depth` to `max_loop_iterations`), so this removed the only config route
+to those caps, and a config that set them stopped booting. It is accepted again.
+
+### Fixed — "is a admin operation"
+
+Class-policy refusals now read "is an admin operation".
+
 
 Ships `pmcp-server-toolkit` **0.4.0** — **breaking**: `CodeModeSection` gains fields and is now
 `#[non_exhaustive]`, and configs that used to load are now refused (listed below). Every crate that

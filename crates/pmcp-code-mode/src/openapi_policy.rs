@@ -329,12 +329,13 @@ impl OpenApiClassPolicy {
         }
 
         let class_name = class_label(class);
+        let article = indefinite_article(class_name);
         match self.mode(class) {
             ClassMode::AllowAll => Ok(()),
             ClassMode::DenyAll => Err(violation(
                 "class_denied",
                 format!(
-                    "{label} is a {class_name} operation, and {class_name} operations are deny_all on this server"
+                    "{label} is {article} {class_name} operation, and {class_name} operations are deny_all on this server"
                 ),
             )
             .with_suggestion(format!(
@@ -350,7 +351,7 @@ impl OpenApiClassPolicy {
                     Err(violation(
                         "not_in_allowlist",
                         format!(
-                            "{label} is a {class_name} operation that is not in this server's {class_name} allowlist"
+                            "{label} is {article} {class_name} operation that is not in this server's {class_name} allowlist"
                         ),
                     ))
                 }
@@ -423,6 +424,16 @@ fn method_name(method: HttpMethod) -> &'static str {
         HttpMethod::Patch => "PATCH",
         HttpMethod::Head => "HEAD",
         HttpMethod::Options => "OPTIONS",
+    }
+}
+
+/// "an admin", "a read": the four class names are the only words placed after
+/// it, and only "admin" starts with a vowel sound.
+fn indefinite_article(word: &str) -> &'static str {
+    if word.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
     }
 }
 
@@ -843,7 +854,26 @@ mod tests {
             policy.check_script(&script("await api.post('/reset', {}); return 1;"), &reg);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "class_denied");
-        assert!(violations[0].message.contains("admin"));
+        assert!(
+            violations[0].message.contains("is an admin operation"),
+            "{}",
+            violations[0].message
+        );
+    }
+
+    #[test]
+    fn allowlist_refusal_uses_the_right_article() {
+        let policy = OpenApiClassPolicy::from_config(&CodeModeConfig::enabled())
+            .with_mode(UnifiedAction::Admin, ClassMode::Allowlist(set(&["other"])));
+        let reg = OperationRegistry::from_entries(&[entry("reset", "admin", "/reset")]);
+        let violations =
+            policy.check_script(&script("await api.post('/reset', {}); return 1;"), &reg);
+        assert_eq!(violations[0].rule, "not_in_allowlist");
+        assert!(
+            violations[0].message.contains("is an admin operation"),
+            "{}",
+            violations[0].message
+        );
     }
 
     #[test]

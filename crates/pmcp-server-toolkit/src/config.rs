@@ -250,7 +250,10 @@ impl ServerConfig {
     ///    operation-class key on a server without a `[backend]`; an
     ///    `allowlist`/`blocklist` class mode has its list; every
     ///    `[[code_mode.operations]]` entry has an `id` and `path` and the ids
-    ///    are unique; every `auto_approve_levels` entry is a known level. A
+    ///    are unique; every `auto_approve_levels` entry is a known level. The
+    ///    verdict does not depend on this build's features: a validator (such as
+    ///    `cargo pmcp validate deploy`) accepts exactly what the server accepts.
+    ///    A
     ///    misspelled key, mode or category already fails the parse.
     ///
     /// # Errors
@@ -386,9 +389,6 @@ impl ServerConfig {
                 hint: "operation classes apply to a server with a [backend]; a SQL server uses \
                        allow_writes, allow_deletes, allow_ddl and blocked_tables",
             });
-        }
-        if let (Some(key), false) = (class_keys.first(), cfg!(feature = "openapi-code-mode")) {
-            return Err(ConfigValidationError::ClassKeysUnenforceable(key));
         }
         for (class, mode) in cm.class_modes() {
             let needs = match mode {
@@ -1473,6 +1473,9 @@ impl BackendSection {
 ///
 /// The SQL keys (`allow_writes`, `allow_deletes`, `allow_ddl`, `require_limit`,
 /// `max_limit`, `blocked_tables`, `sensitive_columns`) apply to a SQL server.
+/// `[code_mode.limits]` applies to both: an OpenAPI server maps it onto its
+/// per-run caps (`pmcp-openapi-server`: `max_tables_per_query` to
+/// `max_api_calls`, `max_join_depth` to `max_loop_iterations`).
 /// The operation-class keys (`read_mode`, `write_mode`, `delete_mode`,
 /// `admin_mode`, `allowed_operations`, `blocked_operations`, `blocked_paths`,
 /// `[[code_mode.operations]]`) apply to an OpenAPI server (one with a
@@ -1708,9 +1711,6 @@ impl CodeModeSection {
         }
         if !self.sensitive_columns.is_empty() {
             keys.push("sensitive_columns");
-        }
-        if self.limits.is_some() {
-            keys.push("limits");
         }
         keys
     }
@@ -2584,6 +2584,55 @@ mod tests {
     /// empty / missing `base_url` is rejected at validate() time with
     /// [`ConfigValidationError::EmptyBackendBaseUrl`] — not a late opaque
     /// `DispatchError::Connector("invalid base URL")` at request time.
+    /// Class keys are a property of the CONFIG, so `validate()` accepts them in
+    /// every build. `cargo-pmcp` builds this crate without `openapi-code-mode`
+    /// (to keep the SWC engine out of the CLI), and `cargo pmcp validate deploy`
+    /// used to reject a config the server itself accepts. Where a build would
+    /// serve tools without enforcing the keys, the synthesizer refuses instead.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_accepts_class_keys_in_every_build() {
+        let toml = r#"
+            [server]
+            name = "umls"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://uts-ws.nlm.nih.gov/rest"
+
+            [code_mode]
+            read_mode = "allow_all"
+            write_mode = "deny_all"
+        "#;
+        ServerConfig::from_toml_strict_validated(toml).expect("class keys validate");
+    }
+
+    /// `[code_mode.limits]` sets an OpenAPI server's per-run caps
+    /// (`pmcp-openapi-server` maps `max_tables_per_query` to `max_api_calls` and
+    /// `max_join_depth` to `max_loop_iterations`), so it is not a SQL-only key.
+    /// 0.4.0 refused it on an OpenAPI server, which removed the only config
+    /// route to those caps.
+    #[cfg(feature = "http")]
+    #[test]
+    fn validate_accepts_limits_on_an_openapi_server() {
+        let toml = r#"
+            [server]
+            name = "umls"
+            version = "0.1.0"
+
+            [backend]
+            base_url = "https://uts-ws.nlm.nih.gov/rest"
+
+            [code_mode]
+            write_mode = "deny_all"
+
+            [code_mode.limits]
+            max_tables_per_query = 10
+            max_join_depth = 20
+        "#;
+        ServerConfig::from_toml_strict_validated(toml).expect("limits validate");
+    }
+
     #[cfg(feature = "http")]
     #[test]
     fn validate_rejects_empty_backend_base_url() {

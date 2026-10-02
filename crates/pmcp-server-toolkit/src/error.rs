@@ -432,7 +432,10 @@ pub enum ConfigValidationError {
     )]
     UnknownAutoApproveLevel(String),
     /// Operation-class keys were set, but this build cannot enforce them (the
-    /// `openapi-code-mode` feature is off).
+    /// `openapi-code-mode` feature is off). Raised by the HTTP tool synthesizer
+    /// when it would otherwise serve curated tools unchecked, never by
+    /// [`crate::config::ServerConfig::validate`], whose verdict does not depend on
+    /// build features.
     #[error(
         "[code_mode] key `{0}` needs the `openapi-code-mode` feature, which this build \
          does not have, so it could not be enforced"

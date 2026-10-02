@@ -1092,6 +1092,50 @@ pattern = "([unclosed"
     /// toolkit bump cannot make this test stale — and a POSITIVE CONTROL below
     /// proves the constant is not the empty string, which would make the substring
     /// assertion vacuously true.
+    /// `cargo pmcp validate deploy` must accept a config the server accepts. The
+    /// CLI links the toolkit without `openapi-code-mode` (no SWC engine in the
+    /// CLI), and toolkit 0.4.0 rejected `[code_mode]` operation-class keys in
+    /// such a build. Reported by the UMLS team on cargo-pmcp 0.27.0.
+    #[test]
+    fn load_server_config_accepts_operation_class_keys_and_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SERVER_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            r#"
+[server]
+name = "umls"
+version = "0.1.0"
+
+[backend]
+base_url = "https://uts-ws.nlm.nih.gov/rest"
+
+[code_mode]
+read_mode = "allow_all"
+write_mode = "deny_all"
+delete_mode = "deny_all"
+admin_mode = "deny_all"
+
+[code_mode.limits]
+max_tables_per_query = 10
+
+[[code_mode.operations]]
+id = "searchConcepts"
+category = "read"
+path = "GET /search/{version}"
+"#,
+        )
+        .expect("write config");
+        let config = load_server_config(&path).expect("the CLI accepts what the server accepts");
+        let section = config.code_mode.expect("code_mode");
+        assert_eq!(
+            section.class_keys_set().len(),
+            5,
+            "{:?}",
+            section.class_keys_set()
+        );
+    }
+
     #[test]
     fn toolkit_lint_banner_names_the_linked_toolkit_version() {
         let version = pmcp_server_toolkit::VERSION;
