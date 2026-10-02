@@ -261,6 +261,23 @@ struct WarnCapture {
     messages: Arc<Mutex<Vec<String>>>,
 }
 
+/// Install a [`WarnCapture`] for the current thread and return its message
+/// list with the guard that keeps it installed.
+///
+/// `tracing` caches each callsite's interest process-wide. Tests in this binary
+/// run in parallel, and a callsite first reached on a thread with no subscriber
+/// can stay cached as disabled while this thread-local subscriber is being
+/// registered, so the event never reaches the capture (#396). Rebuilding the
+/// interest cache after installing the capture re-asks every live subscriber,
+/// this one included.
+fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+    let capture = WarnCapture::default();
+    let messages = capture.messages.clone();
+    let guard = tracing::subscriber::set_default(capture);
+    tracing::callsite::rebuild_interest_cache();
+    (messages, guard)
+}
+
 /// Pulls the formatted `message` field out of a `tracing` event.
 struct MessageVisitor<'a>(&'a mut Vec<String>);
 
@@ -952,9 +969,7 @@ async fn an_unchanged_issuer_on_a_second_connection_neither_warns_nor_errors() {
         .await
         .expect("seeding the same issuer");
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_warnings();
 
     let (helper, opened) = helper_for(&base, &store, Some("preset-client"));
     let result = helper.authorize_with_details().await;
@@ -988,9 +1003,7 @@ async fn an_issuer_change_with_dcr_credentials_warns_naming_both_issuers_and_pro
         .await
         .expect("seeding the previous issuer");
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_warnings();
 
     // client_id is None + dcr_enabled, i.e. DCR-issued provenance.
     let (helper, opened) = helper_for(&base, &store, None);
@@ -1253,9 +1266,7 @@ async fn a_store_that_does_not_track_issuers_still_works() {
     let minimal = Arc::new(MinimalStore::default());
     let store: Arc<dyn CredentialStore> = minimal.clone();
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_warnings();
 
     let (helper, opened) = helper_for(&base, &store, Some("preset-client"));
     let result = helper
