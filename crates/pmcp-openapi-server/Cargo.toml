@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-openapi-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -44,7 +44,7 @@ pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
 # `ScriptToolHandler` + code-mode engine path (gated `openapi-code-mode` in
 # Plans 90-04/90-05) would compile out and the binary's script-tool/code-mode
 # wiring would break (RESEARCH Pitfall 4). The binary serves the full surface.
-pmcp-server-toolkit = { version = "0.3", path = "../pmcp-server-toolkit", features = ["openapi-code-mode"] }
+pmcp-server-toolkit = { version = "0.4", path = "../pmcp-server-toolkit", features = ["openapi-code-mode"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

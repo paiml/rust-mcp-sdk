@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"
@@ -72,7 +72,7 @@ mcp-tester = { version = "0.8.0", path = "../crates/mcp-tester" }
 # they would go nowhere, which is exactly the gap `--dump-wire` closes.
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 mcp-preview = { version = "0.3.1", path = "../crates/mcp-preview" }
-pmcp-workbook-compiler = { version = "0.3", path = "../crates/pmcp-workbook-compiler" }
+pmcp-workbook-compiler = { version = "0.4", path = "../crates/pmcp-workbook-compiler" }
 # Why (Phase 128 Q5): `cargo pmcp validate config` and `cargo pmcp validate deploy`
 # must report the SAME findings a running config-driven server reports at startup,
 # so both surfaces call ONE implementation — `ServerConfig::lint()` — rather than
@@ -98,7 +98,7 @@ pmcp-workbook-compiler = { version = "0.3", path = "../crates/pmcp-workbook-comp
 # `unknown field 'backend'` — and `[backend]` is present in every single-call HTTP
 # and OpenAPI config, i.e. exactly the configs this command exists to lint.
 # `input-validation` is what compiles the placeholder-floor lint arm.
-pmcp-server-toolkit = { version = "0.3", path = "../crates/pmcp-server-toolkit", default-features = false, features = ["input-validation", "http"] }
+pmcp-server-toolkit = { version = "0.4", path = "../crates/pmcp-server-toolkit", default-features = false, features = ["input-validation", "http"] }
 # Phase 110 agent/team/package verbs. Path wins locally; the version req applies
 # at publish (design §5: cargo-pmcp now publishes AFTER all three).
 # `openai-compat` enables the default `agent dev` completion source.

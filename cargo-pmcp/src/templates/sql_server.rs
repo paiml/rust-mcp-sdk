@@ -55,7 +55,7 @@ edition = "2021"
 
 [dependencies]
 pmcp = {{ version = "2.22", features = ["streamable-http"] }}
-pmcp-server-toolkit = {{ version = "0.3", features = ["code-mode", "sqlite", "http"] }}
+pmcp-server-toolkit = {{ version = "0.4", features = ["code-mode", "sqlite", "http"] }}
 clap = {{ version = "4", features = ["derive", "env"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 tracing = "0.1"

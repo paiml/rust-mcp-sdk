@@ -393,6 +393,61 @@ pub enum ConfigValidationError {
         /// The offending `/`-delimited segment, verbatim (author-written config).
         segment: String,
     },
+    /// A `[code_mode]` key that only means something on the other kind of
+    /// server: a SQL key on an OpenAPI server (one with a `[backend]`), or an
+    /// operation-class key on a server with no `[backend]`. It would be
+    /// silently ignored, so the server refuses to boot instead.
+    #[error("[code_mode] key `{key}` does not apply to {server_kind} server; {hint}")]
+    CodeModeKeyWrongBackend {
+        /// The config key.
+        key: &'static str,
+        /// `"an OpenAPI"` or `"a SQL"`.
+        server_kind: &'static str,
+        /// What to use instead.
+        hint: &'static str,
+    },
+    /// A class mode that needs a list that is empty: `allowlist` with no
+    /// `allowed_operations`, or `blocklist` with no `blocked_operations`.
+    #[error("[code_mode] `{class}_mode = \"{mode}\"` needs a non-empty `{list}`")]
+    ClassModeNeedsList {
+        /// `read`, `write`, `delete` or `admin`.
+        class: &'static str,
+        /// The mode.
+        mode: &'static str,
+        /// The list key it needs.
+        list: &'static str,
+    },
+    /// A `[[code_mode.operations]]` entry with an empty `id` or `path`
+    /// (index into the list).
+    #[error("[[code_mode.operations]] entry at index {0} has an empty id or path")]
+    EmptyOperationField(usize),
+    /// Two `[[code_mode.operations]]` entries share an `id`.
+    #[error("[[code_mode.operations]] id '{0}' is declared more than once")]
+    DuplicateOperationId(String),
+    /// A `[code_mode] auto_approve_levels` entry that is not `low`, `medium`,
+    /// `high` or `critical`. It used to be skipped, which made a typo read as
+    /// "nothing auto-approved".
+    #[error(
+        "[code_mode] auto_approve_levels entry '{0}' is not one of low, medium, high, critical"
+    )]
+    UnknownAutoApproveLevel(String),
+    /// Operation-class keys were set, but this build cannot enforce them (the
+    /// `openapi-code-mode` feature is off).
+    #[error(
+        "[code_mode] key `{0}` needs the `openapi-code-mode` feature, which this build \
+         does not have, so it could not be enforced"
+    )]
+    ClassKeysUnenforceable(&'static str),
+    /// A curated `[[tools]]` entry calls an operation the `[code_mode]` class
+    /// policy refuses. The tool could never succeed, and a reader of the policy
+    /// would assume it is blocked, so the contradiction fails the boot.
+    #[error("[[tools]] '{tool}' is refused by the [code_mode] class policy: {reason}")]
+    CuratedToolRefusedByPolicy {
+        /// The `[[tools]]` `name`.
+        tool: String,
+        /// The policy's violation message (names the class and mode).
+        reason: String,
+    },
 }
 
 /// One non-fatal finding from [`crate::config::ServerConfig::lint`]

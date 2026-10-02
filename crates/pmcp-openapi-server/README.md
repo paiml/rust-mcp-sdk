@@ -94,6 +94,42 @@ default = 5
 
 The ~80% you don't curate is Code Mode: with `[code_mode] enabled = true`, the server exposes `validate_code` / `execute_code`, and the agent writes scripts against the `api_schema` resource (your `--spec`).
 
+## Operation classes: the server's security posture, in its config
+
+Every API call a script or tool makes has a class: `read`, `write`, `delete` or `admin`. The class comes from the `[[code_mode.operations]]` catalog when the call matches an entry, and otherwise from the HTTP method (GET/HEAD/OPTIONS are `read`, POST/PUT/PATCH `write`, DELETE `delete`; only the catalog can declare `admin`). Each class has a mode.
+
+```toml
+[code_mode]
+enabled = true
+token_secret = "${CODE_MODE_SECRET}"
+
+# Defaults: read_mode = "allow_all"; write, delete and admin "deny_all".
+read_mode   = "allowlist"   # deny_all | allow_all | allowlist | blocklist
+write_mode  = "deny_all"
+delete_mode = "deny_all"
+admin_mode  = "deny_all"
+
+# Used by every `allowlist` class: catalog ids or "METHOD /path/{param}".
+allowed_operations = ["searchConcepts", "GET /content/{version}/CUI/{cui}"]
+# Refused in every class and mode. A bare method name blocks the method.
+blocked_operations = ["GET /content/{version}/CUI/{cui}/relations"]
+blocked_paths      = ["/admin"]          # `*` wildcards; no `*` = the subtree
+
+[[code_mode.operations]]
+id = "searchConcepts"
+category = "read"                       # a POST that only reads can say so
+path = "POST /search/{version}"         # method optional; {param} = one segment
+```
+
+What enforces it, with no policy evaluator:
+
+- **`validate_code`** refuses a script any of whose calls the policy refuses, with a message naming the class and mode (never the path).
+- **`execute_code`** re-checks each request once its path is resolved, so a run-time value cannot carry a call into another class.
+- **Curated `[[tools]]`**: when any class key is set, a single-call or script tool the policy refuses **fails the boot**, since it could never succeed. With no class key set, curated tools are not classified (the 0.3 behaviour).
+- **Config load** refuses a misspelled key, mode or category, an `allowlist`/`blocklist` mode with an empty list, a duplicate catalog id, and a SQL key (`allow_writes`, `blocked_tables`, ...) on an OpenAPI server, where it would do nothing.
+
+The server logs its posture once at startup: `[code_mode] operation-class policy: read=allowlist write=deny_all ...; static policy only, no policy evaluator`. A policy evaluator, such as pmcp.run's, runs after these checks and can only narrow them.
+
 ## Outgoing authentication (D-05)
 
 The `[backend.auth] type` value selects how the binary authenticates to your backend. There are six variants — `none` plus five authenticated ones — traced to `pmcp_server_toolkit::http::auth::AuthConfig`:

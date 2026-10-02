@@ -441,10 +441,17 @@ pub(crate) struct CodeModeSection {
 }
 
 /// An operation declared in config.toml for Code Mode policy enforcement.
+///
+/// Accepts both spellings of the catalog: this file's original `name` /
+/// `operation_category`, and the `id` / `category` that `pmcp-code-mode`,
+/// `pmcp-server-toolkit` and the pmcp.run platform read. Before the aliases a
+/// catalog in the second form failed the instance-config parse, and with it
+/// the deploy.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct CodeModeOperation {
     /// Operation name/identifier
+    #[serde(alias = "id")]
     pub name: String,
 
     /// Human-readable description
@@ -464,6 +471,7 @@ pub(crate) struct CodeModeOperation {
     pub destructive_hint: bool,
 
     /// Explicit category override: "read", "write", "delete", "admin"
+    #[serde(alias = "category")]
     pub operation_category: Option<String>,
 }
 
@@ -1361,5 +1369,32 @@ version = "0.1.0"
                 prop_assert!(!metadata.snapshot_baked);
             }
         }
+    }
+
+    /// The catalog loads in both spellings: `name`/`operation_category` and
+    /// the `id`/`category` that pmcp-code-mode, the toolkit and pmcp.run read.
+    #[test]
+    fn code_mode_operations_accept_both_spellings() {
+        let toml = r#"
+[server]
+name = "umls"
+
+[code_mode]
+[[code_mode.operations]]
+id = "searchConcepts"
+category = "read"
+path = "GET /search/{version}"
+
+[[code_mode.operations]]
+name = "legacyOp"
+operation_category = "write"
+path = "/legacy"
+"#;
+        let config: InstanceConfig = toml::from_str(toml).expect("both spellings parse");
+        let ops = config.code_mode.expect("code_mode").operations;
+        assert_eq!(ops[0].name, "searchConcepts");
+        assert_eq!(ops[0].operation_category.as_deref(), Some("read"));
+        assert_eq!(ops[1].name, "legacyOp");
+        assert_eq!(ops[1].operation_category.as_deref(), Some("write"));
     }
 }

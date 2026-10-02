@@ -953,6 +953,14 @@ pub fn synthesize_from_config_with_http_connector_and_scripts_and_hooks(
     hooks: &ToolkitHooks,
 ) -> Result<Vec<SynthesizedTool>> {
     let validation = &config.server.validation;
+    // Script tools re-check the class policy on every resolved request, when
+    // the config sets an operation-class key.
+    let http_exec = match config.code_mode.as_ref() {
+        Some(section) if !section.class_keys_set().is_empty() => {
+            http_exec.with_class_policy(section)
+        },
+        _ => http_exec,
+    };
     synthesize_http_inner(
         config,
         connector,
@@ -982,9 +990,18 @@ fn synthesize_http_inner(
     hooks: &ToolkitHooks,
 ) -> Result<Vec<SynthesizedTool>> {
     let validation = &config.server.validation;
+    // A curated tool the `[code_mode]` class policy refuses could never
+    // succeed, so it fails the boot. Applies only when the config sets an
+    // operation-class key (see `ClassGate::for_curated_tools`).
+    #[cfg(feature = "openapi-code-mode")]
+    let class_gate = crate::code_mode::ClassGate::for_curated_tools(config);
     let mut out = Vec::with_capacity(config.tools.len());
     for decl in &config.tools {
         if decl.is_script_tool() {
+            #[cfg(feature = "openapi-code-mode")]
+            if let (Some(gate), Some(script)) = (&class_gate, decl.script.as_deref()) {
+                gate.check_script(&decl.name, script)?;
+            }
             let (info, handler) = build_script_tool(decl)?;
             // Push site 2 of 3 (SCRIPT tool) — D1 enforcement. This site is
             // SEPARATE from the HTTP push below because of the `continue`; wrapping
@@ -1006,6 +1023,10 @@ fn synthesize_http_inner(
             },
         };
 
+        #[cfg(feature = "openapi-code-mode")]
+        if let Some(gate) = &class_gate {
+            gate.check_single_call(&decl.name, method, path)?;
+        }
         let operation = build_operation(path, method, decl);
         let info = build_tool_info(decl, validation);
         let handler: Arc<dyn ToolHandler> = Arc::new(HttpToolHandler {

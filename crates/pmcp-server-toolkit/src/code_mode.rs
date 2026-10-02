@@ -69,6 +69,10 @@ pub use pmcp_code_mode::{AvpClient, AvpConfig, AvpPolicyEvaluator};
 // reference ONE stable path for the engine types the OpenAPI flavor needs.
 #[cfg(feature = "openapi-code-mode")]
 pub use pmcp_code_mode::{ExecutionConfig, HttpExecutor, JsCodeExecutor};
+// The operation-class policy `openapi_class_policy` returns, and the path type
+// `HttpExecutor::execute_request` takes.
+#[cfg(feature = "openapi-code-mode")]
+pub use pmcp_code_mode::{openapi_policy, ResolvedPath};
 
 use std::sync::Arc;
 
@@ -200,6 +204,7 @@ pub fn validation_pipeline_from_config(config: &ServerConfig) -> Result<Validati
     let secret_value = resolve_token_secret(section)?;
     let token_secret: TokenSecret = secret_value.into(); // R6 conversion
     ValidationPipeline::from_token_secret(cm_config, &token_secret)
+        .map(|pipeline| install_class_policy(pipeline, section, ValidationFlavor::Sql))
         .map_err(|e| ToolkitError::CodeMode(format!("ValidationPipeline construction failed: {e}")))
 }
 
@@ -258,7 +263,7 @@ pub fn code_mode_tools_from_executor(
         evaluator,
     )
     .map_err(|e| ToolkitError::CodeMode(format!("ValidationPipeline construction failed: {e}")))?;
-    let pipeline = Arc::new(pipeline);
+    let pipeline = Arc::new(install_class_policy(pipeline, section, flavor));
 
     let validate_handler = tool_handlers::ValidateCodeHandler {
         pipeline: Arc::clone(&pipeline),
@@ -332,13 +337,15 @@ pub fn code_mode_http_tools_from_executor(
         evaluator,
     )
     .map_err(|e| ToolkitError::CodeMode(format!("ValidationPipeline construction failed: {e}")))?;
-    let pipeline = Arc::new(pipeline);
+    let pipeline = Arc::new(install_class_policy(pipeline, section, flavor));
 
     // `validate_code` compiles the script on EVERY server (a script the plan
     // compiler rejects cannot run, so it must not receive a token), and, when a
     // policy is registered, asks it about the calls whose request is already known.
     // The executor carries the label `execute_code` will use, so a policy keyed on
     // the tool name answers identically in both phases.
+    // `execute_code` re-checks the class policy on every resolved request.
+    let base = base.with_class_policy(section);
     let preview = Some((
         base.clone().with_tool_label("execute_code"),
         exec_config.clone(),
@@ -357,7 +364,7 @@ pub fn code_mode_http_tools_from_executor(
             // registered `RequestPolicy` can attribute an outbound request. One
             // `execute_code` call may issue many requests; they all carry this
             // label.
-            base: base.with_tool_label("execute_code"),
+            base: Box::new(base.with_tool_label("execute_code")),
             exec_config,
         },
         flavor,
@@ -788,8 +795,9 @@ mod tool_handlers {
         /// captured inbound token reaches the backend (OAPI-03 / OAPI-05).
         #[cfg(feature = "openapi-code-mode")]
         PerRequestHttp {
-            /// The base executor (cloned + token-threaded per request).
-            base: super::HttpCodeExecutor,
+            /// The base executor (cloned + token-threaded per request). Boxed:
+            /// it is far larger than the `Static` variant.
+            base: Box<super::HttpCodeExecutor>,
             /// The execution bounds for the per-request `JsCodeExecutor`.
             exec_config: super::ExecutionConfig,
         },
@@ -1152,6 +1160,81 @@ pub struct HttpCodeExecutor {
     /// The per-`tools/call` id stamped onto every policy request this executor
     /// makes. `None` on a base executor, set by [`request_executor_from_extra`].
     call_id: Option<Arc<str>>,
+    /// The `[code_mode]` operation-class policy, re-checked on every resolved
+    /// request. `None` when none was attached with
+    /// [`HttpCodeExecutor::with_class_policy`].
+    class_gate: Option<Arc<ClassGate>>,
+}
+
+/// An operation-class policy with its catalog, as the executor checks it.
+#[cfg(feature = "openapi-code-mode")]
+#[derive(Debug)]
+pub(crate) struct ClassGate {
+    policy: pmcp_code_mode::openapi_policy::OpenApiClassPolicy,
+    registry: pmcp_code_mode::config::OperationRegistry,
+}
+
+#[cfg(feature = "openapi-code-mode")]
+impl ClassGate {
+    fn new(section: &CodeModeSection) -> Self {
+        Self {
+            policy: openapi_class_policy(section),
+            registry: pmcp_code_mode::config::OperationRegistry::from_entries(&operation_entries(
+                section,
+            )),
+        }
+    }
+
+    /// The gate for curated `[[tools]]`: present only when the operator set an
+    /// operation-class key. With none set, curated tools are not classified, as
+    /// before 0.4; Code Mode scripts are always classified.
+    pub(crate) fn for_curated_tools(config: &ServerConfig) -> Option<Self> {
+        let section = config.code_mode.as_ref()?;
+        if section.class_keys_set().is_empty() {
+            None
+        } else {
+            Some(Self::new(section))
+        }
+    }
+
+    /// Refuse a single-call tool whose `(method, path)` the policy refuses.
+    pub(crate) fn check_single_call(
+        &self,
+        tool: &str,
+        method: &str,
+        path: &str,
+    ) -> std::result::Result<(), ConfigValidationError> {
+        self.policy
+            .check_request(method, path, &self.registry)
+            .map_err(|v| ConfigValidationError::CuratedToolRefusedByPolicy {
+                tool: tool.to_string(),
+                reason: v.message,
+            })
+    }
+
+    /// Refuse a script tool any of whose calls the policy refuses. A script
+    /// that does not parse is left to the script tool's own compile step.
+    pub(crate) fn check_script(
+        &self,
+        tool: &str,
+        script: &str,
+    ) -> std::result::Result<(), ConfigValidationError> {
+        let Ok(info) = pmcp_code_mode::JavaScriptValidator::default().validate(script) else {
+            return Ok(());
+        };
+        match self
+            .policy
+            .check_script(&info, &self.registry)
+            .into_iter()
+            .next()
+        {
+            Some(v) => Err(ConfigValidationError::CuratedToolRefusedByPolicy {
+                tool: tool.to_string(),
+                reason: v.message,
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(feature = "openapi-code-mode")]
@@ -1175,6 +1258,7 @@ impl HttpCodeExecutor {
             policy: None,
             tool_label: None,
             call_id: None,
+            class_gate: None,
         }
     }
 
@@ -1208,6 +1292,27 @@ impl HttpCodeExecutor {
     pub fn with_call_id(mut self, call_id: impl AsRef<str>) -> Self {
         self.call_id = Some(Arc::from(call_id.as_ref()));
         self
+    }
+
+    /// Re-check every request this executor sends against the `[code_mode]`
+    /// operation-class policy, once its path is resolved (see
+    /// [`openapi_class_policy`]). Validation sees a dynamic path only as a
+    /// template; this is the check that sees where the request goes. A refusal
+    /// is [`ExecutionError::RequestRefused`] and never names the path.
+    ///
+    /// [`code_mode_http_tools_from_executor`] attaches it for `execute_code`,
+    /// and the script-tool synthesizer attaches it when the config sets an
+    /// operation-class key.
+    #[must_use]
+    pub fn with_class_policy(mut self, section: &CodeModeSection) -> Self {
+        self.class_gate = Some(Arc::new(ClassGate::new(section)));
+        self
+    }
+
+    /// Whether a class policy is attached (see [`Self::with_class_policy`]).
+    #[must_use]
+    pub fn has_class_policy(&self) -> bool {
+        self.class_gate.is_some()
     }
 
     /// The id of the `tools/call` this executor serves, or `""` on a base executor
@@ -1680,6 +1785,13 @@ impl pmcp_code_mode::HttpExecutor for HttpCodeExecutor {
         let resolved_path = path;
         let remaining_body = body;
 
+        // The operation-class policy, against the path the request goes to.
+        if let Some(gate) = &self.class_gate {
+            gate.policy
+                .check_request(&upper, resolved_path, &gate.registry)
+                .map_err(|v| ExecutionError::RequestRefused { message: v.message })?;
+        }
+
         // (2)+(2a) join_url + the non-auth remaining-body-to-query conversion. ONE
         //      helper shared with `preview_request`, so what `validate_code` asks the
         //      policy about is assembled by the same code that assembles what is
@@ -1835,7 +1947,125 @@ fn build_cm_config(section: &CodeModeSection) -> CodeModeConfig {
         let _gap_max_join = limits.max_join_depth;
         let _gap_max_subquery = limits.max_subquery_depth;
     }
+    map_openapi_class_keys(section, &mut cfg);
     cfg
+}
+
+/// The OpenAPI operation-class keys onto `CodeModeConfig`'s `openapi_*` fields
+/// and catalog.
+///
+/// The `openapi_*` fields cannot express every mode (a read allowlist, an
+/// `admin` mode), so the pipeline and executor enforce the exact policy from
+/// [`openapi_class_policy`]. This mapping keeps the `CodeModeConfig` — and the
+/// Cedar entity a policy evaluator would build from it — describing the same
+/// policy as closely as those fields allow.
+fn map_openapi_class_keys(section: &CodeModeSection, cfg: &mut CodeModeConfig) {
+    use crate::config::{ClassModeName, OperationCategory};
+    let allowed: std::collections::HashSet<String> =
+        section.allowed_operations.iter().cloned().collect();
+    for (class, mode) in section.class_modes() {
+        let enabled = mode != ClassModeName::DenyAll;
+        let list = if mode == ClassModeName::Allowlist {
+            allowed.clone()
+        } else {
+            std::collections::HashSet::new()
+        };
+        match class {
+            OperationCategory::Read => cfg.openapi_reads_enabled = enabled,
+            OperationCategory::Write => {
+                cfg.openapi_allow_writes = enabled;
+                cfg.openapi_allowed_writes = list;
+            },
+            OperationCategory::Delete => {
+                cfg.openapi_allow_deletes = enabled;
+                cfg.openapi_allowed_deletes = list;
+            },
+            _ => {},
+        }
+    }
+    cfg.openapi_blocked_writes = section.blocked_operations.iter().cloned().collect();
+    cfg.openapi_blocked_paths = section.blocked_paths.iter().cloned().collect();
+    cfg.operations = operation_entries(section);
+}
+
+/// `[[code_mode.operations]]` as `pmcp-code-mode` catalog entries.
+fn operation_entries(section: &CodeModeSection) -> Vec<pmcp_code_mode::config::OperationEntry> {
+    section
+        .operations
+        .iter()
+        .map(|op| pmcp_code_mode::config::OperationEntry {
+            id: op.id.clone(),
+            category: op.category.as_str().to_string(),
+            description: op.description.clone(),
+            path: Some(op.path.clone()),
+        })
+        .collect()
+}
+
+/// The exact OpenAPI operation-class policy a `[code_mode]` block declares.
+///
+/// Each class takes its mode (defaults: read `allow_all`, write, delete and
+/// admin `deny_all`). An `allowlist` class admits the `allowed_operations`
+/// of its class; `blocklist` is `allow_all`, because `blocked_operations` and
+/// `blocked_paths` are refused in every mode. This is what `validate_code`,
+/// `execute_code` and (when a class key is set) curated tools enforce, with no
+/// policy evaluator.
+#[cfg(feature = "openapi-code-mode")]
+#[must_use]
+pub fn openapi_class_policy(
+    section: &CodeModeSection,
+) -> pmcp_code_mode::openapi_policy::OpenApiClassPolicy {
+    use crate::config::{ClassModeName, OperationCategory};
+    use pmcp_code_mode::openapi_policy::{ClassMode, OpenApiClassPolicy};
+    use pmcp_code_mode::UnifiedAction;
+    let allowed: std::collections::HashSet<String> =
+        section.allowed_operations.iter().cloned().collect();
+    let mut policy = OpenApiClassPolicy::from_config(&CodeModeConfig::default())
+        .with_blocked_operations(&section.blocked_operations)
+        .with_blocked_paths(&section.blocked_paths);
+    for (class, mode) in section.class_modes() {
+        let action = match class {
+            OperationCategory::Read => UnifiedAction::Read,
+            OperationCategory::Write => UnifiedAction::Write,
+            OperationCategory::Delete => UnifiedAction::Delete,
+            _ => UnifiedAction::Admin,
+        };
+        let mode = match mode {
+            ClassModeName::DenyAll => ClassMode::DenyAll,
+            ClassModeName::Allowlist => ClassMode::Allowlist(allowed.clone()),
+            _ => ClassMode::AllowAll,
+        };
+        policy = policy.with_mode(action, mode);
+    }
+    policy
+}
+
+/// Install the `[code_mode]` class policy on a pipeline and log it once, so
+/// the posture is visible without reading the config: the class modes, and
+/// that no policy evaluator narrows them.
+#[cfg(feature = "openapi-code-mode")]
+fn install_class_policy(
+    pipeline: ValidationPipeline,
+    section: &CodeModeSection,
+    flavor: ValidationFlavor,
+) -> ValidationPipeline {
+    let policy = openapi_class_policy(section);
+    if flavor == ValidationFlavor::OpenApi {
+        tracing::info!(
+            target: "pmcp_server_toolkit::code_mode",
+            "[code_mode] operation-class policy: {policy}; static policy only, no policy evaluator"
+        );
+    }
+    pipeline.with_openapi_class_policy(policy)
+}
+
+#[cfg(not(feature = "openapi-code-mode"))]
+fn install_class_policy(
+    pipeline: ValidationPipeline,
+    _section: &CodeModeSection,
+    _flavor: ValidationFlavor,
+) -> ValidationPipeline {
+    pipeline
 }
 
 /// Decompose auto-approve-level parsing to keep [`build_cm_config`] under
@@ -2254,6 +2484,7 @@ mod tests {
                 max_subquery_depth: Some(2),
             }),
             description_notice: None,
+            ..CodeModeSection::default()
         }
     }
 

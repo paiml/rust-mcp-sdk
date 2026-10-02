@@ -557,6 +557,14 @@ two server templates (`"2.22"`; a first gate run caught these two still on `"2.2
 constants, `PMCP_VERSION_REQ` and the two server-template `pmcp` lines have drift tests; the two `"0.3"` template literals do NOT, so a
 future toolkit minor must grep for them by hand.
 
+**Bumped to 0.27.0 with toolkit 0.4.0 (2026-10-01, OpenAPI operation classes).** The same one-set move
+as #389: `CodeModeSection` gained the class keys and became `#[non_exhaustive]`, so toolkit 0.3 -> 0.4,
+and `pmcp-openapi-server`, `pmcp-sql-server` (toolkit + three connector pins), `pmcp-workbook-server`,
+`pmcp-workbook-compiler` and the three connectors moved to 0.4.0 in one commit, with
+`templates/sql_server.rs`, `templates/openapi_server.rs` (`"0.4"`) and `templates/workbook_server.rs`
+(`TOOLKIT_VERSION` 0.4.0). Because `CodeModeSection` is now `#[non_exhaustive]`, the NEXT `[code_mode]`
+key is additive and needs no such cascade.
+
 **This entry recorded `cargo-pmcp` at the Phase-122 version until 2026-09-28,
    by which time the tree was three patches past it (measured: 0.24.3).** A stale
    version here is not cosmetic — it is what a future releaser reads to know

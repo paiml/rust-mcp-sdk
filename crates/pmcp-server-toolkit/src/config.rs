@@ -245,6 +245,13 @@ impl ServerConfig {
     ///    requires the `input-validation` feature; on a build without it the check
     ///    is skipped and a `tracing::warn!` says so once, because an enforcement
     ///    that is off must never read as on.
+    /// 9. The `[code_mode]` block, when present, says nothing that would be
+    ///    silently ignored: no SQL key on an OpenAPI server and no
+    ///    operation-class key on a server without a `[backend]`; an
+    ///    `allowlist`/`blocklist` class mode has its list; every
+    ///    `[[code_mode.operations]]` entry has an `id` and `path` and the ids
+    ///    are unique; every `auto_approve_levels` entry is a known level. A
+    ///    misspelled key, mode or category already fails the parse.
     ///
     /// # Errors
     ///
@@ -325,6 +332,89 @@ impl ServerConfig {
             // that failure visible at all.
             if let Some(field) = backend.auth.malformed_env_ref_field() {
                 return Err(ConfigValidationError::MalformedBackendAuthRef(field));
+            }
+        }
+        self.validate_code_mode()
+    }
+
+    /// Whether this config declares an OpenAPI `[backend]`. Always `false` on
+    /// a build without the `http` feature, which has no backend section.
+    #[must_use]
+    pub fn has_http_backend(&self) -> bool {
+        #[cfg(feature = "http")]
+        {
+            self.backend.is_some()
+        }
+        #[cfg(not(feature = "http"))]
+        {
+            false
+        }
+    }
+
+    /// Rule 9 of [`Self::validate`]: the `[code_mode]` block says nothing that
+    /// would be silently ignored. Every key applies to this kind of server,
+    /// every class mode has the list it needs, the operation catalog is
+    /// well-formed, and every `auto_approve_levels` entry is a known level.
+    fn validate_code_mode(&self) -> std::result::Result<(), ConfigValidationError> {
+        let Some(cm) = &self.code_mode else {
+            return Ok(());
+        };
+        for level in &cm.auto_approve_levels {
+            if !matches!(
+                level.to_ascii_lowercase().as_str(),
+                "low" | "medium" | "high" | "critical"
+            ) {
+                return Err(ConfigValidationError::UnknownAutoApproveLevel(
+                    level.clone(),
+                ));
+            }
+        }
+        let class_keys = cm.class_keys_set();
+        if self.has_http_backend() {
+            if let Some(key) = cm.sql_keys_set().first() {
+                return Err(ConfigValidationError::CodeModeKeyWrongBackend {
+                    key,
+                    server_kind: "an OpenAPI",
+                    hint: "an OpenAPI server uses write_mode, delete_mode, read_mode, admin_mode, \
+                           allowed_operations, blocked_operations and blocked_paths",
+                });
+            }
+        } else if let Some(key) = class_keys.first() {
+            return Err(ConfigValidationError::CodeModeKeyWrongBackend {
+                key,
+                server_kind: "a SQL",
+                hint: "operation classes apply to a server with a [backend]; a SQL server uses \
+                       allow_writes, allow_deletes, allow_ddl and blocked_tables",
+            });
+        }
+        if let (Some(key), false) = (class_keys.first(), cfg!(feature = "openapi-code-mode")) {
+            return Err(ConfigValidationError::ClassKeysUnenforceable(key));
+        }
+        for (class, mode) in cm.class_modes() {
+            let needs = match mode {
+                ClassModeName::Allowlist if cm.allowed_operations.is_empty() => {
+                    Some("allowed_operations")
+                },
+                ClassModeName::Blocklist if cm.blocked_operations.is_empty() => {
+                    Some("blocked_operations")
+                },
+                _ => None,
+            };
+            if let Some(list) = needs {
+                return Err(ConfigValidationError::ClassModeNeedsList {
+                    class: class.as_str(),
+                    mode: mode.as_str(),
+                    list,
+                });
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        for (i, op) in cm.operations.iter().enumerate() {
+            if op.id.trim().is_empty() || op.path.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyOperationField(i));
+            }
+            if !ids.insert(op.id.as_str()) {
+                return Err(ConfigValidationError::DuplicateOperationId(op.id.clone()));
             }
         }
         Ok(())
@@ -1378,10 +1468,23 @@ impl BackendSection {
 /// The toolkit uses **unprefixed** field names (REF-01 invariant); the mapping
 /// to `pmcp_code_mode::CodeModeConfig`'s prefixed names (`sql_allow_writes`,
 /// etc.) is handled by Plan 06's executor wiring.
+///
+/// # Keys by backend
+///
+/// The SQL keys (`allow_writes`, `allow_deletes`, `allow_ddl`, `require_limit`,
+/// `max_limit`, `blocked_tables`, `sensitive_columns`) apply to a SQL server.
+/// The operation-class keys (`read_mode`, `write_mode`, `delete_mode`,
+/// `admin_mode`, `allowed_operations`, `blocked_operations`, `blocked_paths`,
+/// `[[code_mode.operations]]`) apply to an OpenAPI server (one with a
+/// `[backend]`). [`ServerConfig::validate`] refuses a key set on the wrong kind
+/// of server, because it would otherwise be silently ignored.
+///
+/// `#[non_exhaustive]` since 0.4: build one with `Default` and assign fields.
 #[allow(clippy::struct_excessive_bools)]
 // Why: REF-01 superset — these bools mirror the reference servers' [code_mode] block 1:1 (CONTEXT.md D-13). Grouping into a sub-struct would break REF-01.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CodeModeSection {
     /// Master enable flag for code-mode.
     #[serde(default)]
@@ -1445,6 +1548,217 @@ pub struct CodeModeSection {
     /// descriptions exactly as the SDK writes them.
     #[serde(default)]
     pub description_notice: Option<String>,
+
+    /// OpenAPI: how `read` operations are governed. Default `allow_all`.
+    #[serde(default)]
+    pub read_mode: Option<ClassModeName>,
+    /// OpenAPI: how `write` operations (POST/PUT/PATCH unless the catalog
+    /// says otherwise) are governed. Default `deny_all`.
+    #[serde(default)]
+    pub write_mode: Option<ClassModeName>,
+    /// OpenAPI: how `delete` operations are governed. Default `deny_all`.
+    #[serde(default)]
+    pub delete_mode: Option<ClassModeName>,
+    /// OpenAPI: how `admin` operations (only ever declared in
+    /// `[[code_mode.operations]]`) are governed. Default `deny_all`.
+    #[serde(default)]
+    pub admin_mode: Option<ClassModeName>,
+    /// OpenAPI: the operations an `allowlist` class admits. Each entry is a
+    /// catalog `id` or an operation (`"GET /items/{id}"`). Required, and
+    /// non-empty, when any class is `allowlist`.
+    #[serde(default)]
+    pub allowed_operations: Vec<String>,
+    /// OpenAPI: operations refused in every class and mode. An HTTP method
+    /// name (`"PATCH"`) blocks the method. Required, and non-empty, when any
+    /// class is `blocklist`.
+    #[serde(default)]
+    pub blocked_operations: Vec<String>,
+    /// OpenAPI: path patterns refused in every class (`*` matches any run of
+    /// characters; a pattern without `*` covers the path and everything below
+    /// it). Case is ignored.
+    #[serde(default)]
+    pub blocked_paths: Vec<String>,
+    /// OpenAPI: `[[code_mode.operations]]` — the operation catalog. Its
+    /// `category` classifies a call before the HTTP method does.
+    #[serde(default)]
+    pub operations: Vec<OperationDecl>,
+}
+
+/// A class mode name in `[code_mode]` (`read_mode = "allow_all"`).
+///
+/// Closed: a misspelled mode fails the parse, it never falls back to a mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ClassModeName {
+    /// No operation of the class is allowed.
+    DenyAll,
+    /// Every operation of the class is allowed, except `blocked_operations`
+    /// and `blocked_paths`.
+    AllowAll,
+    /// Only the class's operations listed in `allowed_operations`.
+    Allowlist,
+    /// Every operation of the class except `blocked_operations`. The same
+    /// verdicts as `allow_all` (a block applies in every mode); accepted
+    /// because it is the platform's name, and it requires a non-empty
+    /// `blocked_operations`.
+    Blocklist,
+}
+
+impl ClassModeName {
+    /// The config spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyAll => "deny_all",
+            Self::AllowAll => "allow_all",
+            Self::Allowlist => "allowlist",
+            Self::Blocklist => "blocklist",
+        }
+    }
+}
+
+/// An operation class in `[[code_mode.operations]]`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum OperationCategory {
+    /// Retrieves data.
+    Read,
+    /// Creates or changes data.
+    Write,
+    /// Removes data.
+    Delete,
+    /// Changes the system itself. No HTTP method maps here; only a catalog
+    /// entry can declare it.
+    Admin,
+}
+
+impl OperationCategory {
+    /// The config spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Delete => "delete",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// One `[[code_mode.operations]]` entry. Same field names as
+/// `pmcp_code_mode::config::OperationEntry` and the pmcp.run platform, so a
+/// catalog loads unchanged on both.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OperationDecl {
+    /// Canonical operation id. Unique within the catalog.
+    pub id: String,
+    /// The operation's class.
+    pub category: OperationCategory,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// The path calls are matched against, optionally prefixed by a method
+    /// (`"GET /items/{id}"`). A `{param}` segment matches any one segment.
+    pub path: String,
+}
+
+impl OperationDecl {
+    /// Build an entry (the struct is `#[non_exhaustive]`).
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        category: OperationCategory,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            category,
+            description: String::new(),
+            path: path.into(),
+        }
+    }
+}
+
+impl CodeModeSection {
+    /// The SQL-only keys this section sets, by config name.
+    #[must_use]
+    pub fn sql_keys_set(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.allow_writes {
+            keys.push("allow_writes");
+        }
+        if self.allow_deletes {
+            keys.push("allow_deletes");
+        }
+        if self.allow_ddl {
+            keys.push("allow_ddl");
+        }
+        if self.require_limit {
+            keys.push("require_limit");
+        }
+        if self.max_limit.is_some() {
+            keys.push("max_limit");
+        }
+        if !self.blocked_tables.is_empty() {
+            keys.push("blocked_tables");
+        }
+        if !self.sensitive_columns.is_empty() {
+            keys.push("sensitive_columns");
+        }
+        if self.limits.is_some() {
+            keys.push("limits");
+        }
+        keys
+    }
+
+    /// The OpenAPI operation-class keys this section sets, by config name.
+    #[must_use]
+    pub fn class_keys_set(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        for (name, set) in [
+            ("read_mode", self.read_mode.is_some()),
+            ("write_mode", self.write_mode.is_some()),
+            ("delete_mode", self.delete_mode.is_some()),
+            ("admin_mode", self.admin_mode.is_some()),
+            ("allowed_operations", !self.allowed_operations.is_empty()),
+            ("blocked_operations", !self.blocked_operations.is_empty()),
+            ("blocked_paths", !self.blocked_paths.is_empty()),
+            ("operations", !self.operations.is_empty()),
+        ] {
+            if set {
+                keys.push(name);
+            }
+        }
+        keys
+    }
+
+    /// The effective mode of each class: `[read, write, delete, admin]`,
+    /// with the defaults applied (read `allow_all`, the rest `deny_all`).
+    #[must_use]
+    pub fn class_modes(&self) -> [(OperationCategory, ClassModeName); 4] {
+        [
+            (
+                OperationCategory::Read,
+                self.read_mode.unwrap_or(ClassModeName::AllowAll),
+            ),
+            (
+                OperationCategory::Write,
+                self.write_mode.unwrap_or(ClassModeName::DenyAll),
+            ),
+            (
+                OperationCategory::Delete,
+                self.delete_mode.unwrap_or(ClassModeName::DenyAll),
+            ),
+            (
+                OperationCategory::Admin,
+                self.admin_mode.unwrap_or(ClassModeName::DenyAll),
+            ),
+        ]
+    }
 }
 
 /// `[code_mode.limits]` — query-complexity caps.
