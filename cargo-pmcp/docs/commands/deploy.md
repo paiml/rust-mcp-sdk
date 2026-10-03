@@ -58,8 +58,29 @@ For AWS Lambda targets, `cargo pmcp deploy` runs:
 1. Loads `.pmcp/deploy.toml` via `DeployConfig::load`.
 2. **Validates the `[iam]` section** — runs the same gate as [`cargo pmcp validate deploy`](validate.md#validate-deploy) and fails fast before any AWS API call if validation errors are present. Warnings print to stderr but don't block.
 3. Builds the Lambda binary.
-4. **Regenerates `deploy/lib/stack.ts` from the loaded config** — splices the `[iam]` and `[metadata]` declarations into the CDK template at single seams. Changes to `.pmcp/deploy.toml` therefore take effect on the next `cargo pmcp deploy` without manual re-init. **Guard:** if `deploy/lib/stack.ts` already exists, it is **preserved** (the write is skipped and a one-line `preserved existing deploy/lib/stack.ts` notice prints) so an operator-curated stack is never silently overwritten. Pass `--regenerate-stack` (alias `--force`) to overwrite it. A missing file is always scaffolded flag-free.
-5. Runs `cdk deploy` with `--require-approval never`.
+4. **Checks the stack identity** on the `npx cdk deploy` path — see [Stack-identity guard](#stack-identity-guard). This runs before step 5 can overwrite an existing `stack.ts`. A missing `stack.ts` is scaffolded first, because the CDK app cannot be listed without it, and is removed again if the guard refuses.
+5. **Regenerates `deploy/lib/stack.ts` from the loaded config** — splices the `[iam]` and `[metadata]` declarations into the CDK template at single seams. Changes to `.pmcp/deploy.toml` therefore take effect on the next `cargo pmcp deploy` without manual re-init. **Guard:** if `deploy/lib/stack.ts` already exists, it is **preserved** (the write is skipped and a one-line `preserved existing deploy/lib/stack.ts` notice prints) so an operator-curated stack is never silently overwritten. Pass `--regenerate-stack` (alias `--force`) to overwrite it. A missing file is always scaffolded flag-free.
+6. Runs `cdk deploy {[server] name}-stack --require-approval never`, naming the stack explicitly.
+
+### Stack-identity guard
+
+cargo-pmcp names, reports, reads outputs for, and destroys an `aws-lambda` deployment as `{[server] name}-stack`. The stack `npx cdk` acts on is whatever `deploy/bin/app.ts` declares, and `deploy init` writes the server name into `app.ts` once, as a literal (`const serverName = '...'`). After a `[server] name` rename the two disagree. Before this guard, `cdk deploy` silently updated the **old** stack in place, and `cdk destroy` matched no stack and still exited 0.
+
+Before `cdk deploy` and before `cdk destroy`, cargo-pmcp now runs `npx cdk list` in `deploy/`, with the same environment the deploy uses, and refuses unless the app declares `{[server] name}-stack`. When `cdk list` also prints a CloudFormation name (`id (stackName)`), that name must match too. If `cdk list` itself fails, the operation is refused (the stack cannot be verified). A refusal happens before any CloudFormation change and before `--regenerate-stack` rewrites `stack.ts`, and it names both stacks:
+
+```
+refusing to run `cdk deploy`: deploy/bin/app.ts does not declare the stack cargo-pmcp targets.
+  expected: acme-stack  (from `[server] name = "acme"` in .pmcp/deploy.toml)
+  declared: old-server-stack
+Nothing was deployed; CloudFormation is unchanged.
+```
+
+To recover, choose one:
+
+- **Keep deploying the existing stack:** set `[server] name` back to the name the declared stack was created with (the error suggests it, e.g. `[server] name = "old-server"`).
+- **Deploy under the new name:** set `const serverName = '<new name>';` in `deploy/bin/app.ts` and re-run with `--regenerate-stack` (if you customized `deploy/lib/stack.ts`, update its `serverName` by hand instead). This creates a **new** stack; the old one keeps running until you delete it (`aws cloudformation delete-stack --stack-name <old>-stack --region <region>`).
+
+The guard applies only to the `npx cdk` path. The native CloudFormation engine (used for an unmodified scaffold) deploys `{[server] name}-stack` directly from `.pmcp/deploy.toml` and never reads `app.ts`. The `pmcp-run` target runs `cdk synth`, never `cdk deploy`, and keys the deployment on `[server] name`, so it is not affected.
 
 > Both generated stacks (`pmcp-run` and `aws-lambda`) emit a stable `McpRoleArn` CFN output with `exportName: pmcp-${serverName}-McpRoleArn` — consume it from external stacks via `Fn::ImportValue` instead of looking up the role by its CFN-generated name.
 
@@ -308,6 +329,8 @@ cargo pmcp deploy destroy [OPTIONS]
 | `--yes` | Skip confirmation prompt |
 | `--clean` | Remove all deployment files (CDK project, Lambda wrapper, config) |
 | `--no-wait` | Don't wait for async operations (pmcp-run only) |
+
+On `aws-lambda`, `destroy` runs `cdk destroy {[server] name}-stack` and is protected by the [stack-identity guard](#stack-identity-guard): if `deploy/bin/app.ts` does not declare that stack, `destroy` refuses instead of reporting success. (`cdk destroy` matches no stack for an undeclared name and still exits 0, so without the guard the stack kept running and `--clean` deleted the local deploy files.) The refusal prints the direct recovery command, `aws cloudformation delete-stack --stack-name <name>-stack --region <region>`, which also removes a stack the native CloudFormation engine deployed.
 
 ---
 

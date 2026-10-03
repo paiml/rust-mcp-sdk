@@ -1,5 +1,7 @@
+use crate::deployment::cdk_stack_guard::{expected_stack_name, CdkOperation};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
@@ -17,6 +19,10 @@ pub struct DeployExecutor {
     /// the flag is threaded onto the executor instead and re-applied to the
     /// freshly-loaded config before the stack.ts write.
     regenerate_stack: bool,
+    /// The program every CDK child process is spawned through. Always `npx`
+    /// in production; tests point it at a recording stand-in so the exact
+    /// `cdk` argv can be asserted without Node.js or AWS.
+    npx_program: OsString,
 }
 
 impl DeployExecutor {
@@ -25,7 +31,15 @@ impl DeployExecutor {
             project_root,
             extra_env: HashMap::new(),
             regenerate_stack: false,
+            npx_program: OsString::from("npx"),
         }
+    }
+
+    /// Spawn CDK through `program` instead of `npx` (test seam only).
+    #[cfg(test)]
+    fn with_npx_program(mut self, program: impl Into<OsString>) -> Self {
+        self.npx_program = program.into();
+        self
     }
 
     /// Set transient environment variables to pass to the CDK child process.
@@ -71,10 +85,31 @@ impl DeployExecutor {
         builder.build()?;
         println!();
 
-        // Regenerate stack.ts from the loaded config so user-declared [iam]
-        // permissions land in the CDK template. `init` scaffolds with an empty
-        // IamConfig; the source of truth at deploy time is .pmcp/deploy.toml.
-        self.regenerate_stack_ts(&config)?;
+        self.deploy_after_build(&config)?;
+        println!();
+
+        let stack_name = expected_stack_name(&config.server.name);
+        let outputs = crate::deployment::load_cdk_outputs(
+            &self.project_root,
+            &config.aws().region,
+            &stack_name,
+        )?;
+
+        let elapsed = start.elapsed();
+        println!("✅ Deployment complete in {:.1}s", elapsed.as_secs_f64());
+        println!();
+
+        outputs.display();
+
+        Ok(())
+    }
+
+    /// Everything between the binary build and reading the stack outputs:
+    /// the stack-identity guard, `stack.ts` regeneration, the `[server]`
+    /// sizing warning, and `cdk deploy`. Split out of [`Self::execute`] so the
+    /// CDK-facing half is testable without a cargo-lambda build.
+    fn deploy_after_build(&self, config: &crate::deployment::config::DeployConfig) -> Result<()> {
+        self.guard_and_regenerate_stack_ts(config)?;
 
         // `[server]` sizing divergence (debug session
         // `deploy-server-memory-timeout`). This is the ONLY route to
@@ -98,22 +133,54 @@ impl DeployExecutor {
             println!();
         }
 
-        self.run_cdk_deploy(&config)?;
-        println!();
+        self.run_cdk_deploy(config)
+    }
 
-        let stack_name = format!("{}-stack", config.server.name);
-        let outputs = crate::deployment::load_cdk_outputs(
-            &self.project_root,
-            &config.aws().region,
-            &stack_name,
-        )?;
+    /// Stack-identity guard (debug session `cargo-pmcp-deploy-targets`), then
+    /// `stack.ts` regeneration.
+    ///
+    /// Refuses unless deploy/bin/app.ts declares `{[server] name}-stack`, so a
+    /// rename can never silently update a different stack. The guard runs
+    /// after the binary build (the CDK app's asset dir must exist to
+    /// synthesize) and BEFORE `--regenerate-stack` may overwrite an existing
+    /// stack.ts, so a refused deploy changes nothing locally either. A MISSING
+    /// stack.ts is scaffolded first, because the app cannot be listed without
+    /// it, and is removed again if the guard then refuses.
+    fn guard_and_regenerate_stack_ts(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+    ) -> Result<()> {
+        let stack_ts = self
+            .project_root
+            .join("deploy")
+            .join("lib")
+            .join("stack.ts");
+        let stack_ts_existed = stack_ts.exists();
+        if stack_ts_existed {
+            self.ensure_app_declares_expected_stack(config)?;
+        }
 
-        let elapsed = start.elapsed();
-        println!("✅ Deployment complete in {:.1}s", elapsed.as_secs_f64());
-        println!();
+        // Regenerate stack.ts from the loaded config so user-declared [iam]
+        // permissions land in the CDK template. `init` scaffolds with an empty
+        // IamConfig; the source of truth at deploy time is .pmcp/deploy.toml.
+        self.regenerate_stack_ts(config)?;
 
-        outputs.display();
-
+        if stack_ts_existed {
+            return Ok(());
+        }
+        if let Err(refusal) = self.ensure_app_declares_expected_stack(config) {
+            // Undo the scaffold: a stack.ts rendered for the refused name
+            // would otherwise be deployed later, under a restored name, into
+            // the old stack (replacing its function).
+            std::fs::remove_file(&stack_ts).with_context(|| {
+                format!(
+                    "{refusal:#}\n(also failed to remove the deploy/lib/stack.ts \
+                     scaffolded for this refused deploy: {})",
+                    stack_ts.display()
+                )
+            })?;
+            return Err(refusal);
+        }
         Ok(())
     }
 
@@ -158,24 +225,21 @@ impl DeployExecutor {
         Ok(())
     }
 
-    fn run_cdk_deploy(&self, config: &crate::deployment::config::DeployConfig) -> Result<()> {
-        println!("☁️  Deploying CloudFormation stack...");
-
-        let deploy_dir = self.project_root.join("deploy");
-
-        // Set environment variables for CDK app
-        let mut cmd = Command::new("npx");
-        cmd.args(&[
-            "cdk",
-            "deploy",
-            "--require-approval",
-            "never",
-            "--outputs-file",
-            "outputs.json",
-        ])
-        .current_dir(&deploy_dir)
-        .env("SERVER_NAME", &config.server.name)
-        .env("AWS_REGION", &config.aws().region);
+    /// A `npx cdk <args>` child in deploy/, carrying the environment every CDK
+    /// step of this deploy shares. The stack guard's `cdk list` is built here
+    /// too, so an app.ts that derives its stack id from this environment
+    /// answers the guard exactly as it answers `cdk deploy`.
+    fn cdk_command(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+        args: &[&str],
+    ) -> Command {
+        let mut cmd = Command::new(&self.npx_program);
+        cmd.arg("cdk")
+            .args(args)
+            .current_dir(self.project_root.join("deploy"))
+            .env("SERVER_NAME", &config.server.name)
+            .env("AWS_REGION", &config.aws().region);
 
         // If account ID is specified, set it
         if let Some(account_id) = &config.aws().account_id {
@@ -190,6 +254,41 @@ impl DeployExecutor {
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }
+        cmd
+    }
+
+    /// Refuse unless the CDK app declares `{[server] name}-stack` (see
+    /// [`crate::deployment::cdk_stack_guard`]).
+    fn ensure_app_declares_expected_stack(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+    ) -> Result<()> {
+        crate::deployment::cdk_stack_guard::ensure_app_declares_stack(
+            self.cdk_command(config, &["list"]),
+            &config.server.name,
+            CdkOperation::Deploy,
+            &config.aws().region,
+        )
+    }
+
+    fn run_cdk_deploy(&self, config: &crate::deployment::config::DeployConfig) -> Result<()> {
+        println!("☁️  Deploying CloudFormation stack...");
+
+        // Name the stack explicitly: with no stack argument `cdk deploy`
+        // deploys whatever single stack app.ts declares, which after a rename
+        // is the OLD deployment.
+        let stack_name = expected_stack_name(&config.server.name);
+        let mut cmd = self.cdk_command(
+            config,
+            &[
+                "deploy",
+                &stack_name,
+                "--require-approval",
+                "never",
+                "--outputs-file",
+                "outputs.json",
+            ],
+        );
 
         print!("   Synthesizing template...");
         std::io::Write::flush(&mut std::io::stdout())?;
@@ -306,5 +405,225 @@ mod tests {
             after, curated,
             "stack.ts must be overwritten when regenerate_stack is true"
         );
+    }
+
+    /// Stack-identity guard (debug session `cargo-pmcp-deploy-targets`, guard
+    /// PR). These drive `deploy_after_build` through a recording `npx`
+    /// stand-in, so they assert the exact `cdk` argv and that `cdk deploy`
+    /// is never spawned when deploy/bin/app.ts declares a different stack.
+    #[cfg(unix)]
+    mod stack_guard {
+        use super::*;
+        use crate::deployment::fake_npx::FakeNpx;
+
+        /// The `[server] name` every guard test deploys under.
+        const NAME: &str = "acme";
+        /// The stack the CLI reports, outputs and destroys for [`NAME`].
+        const EXPECTED: &str = "acme-stack";
+        /// The stack a stale, init-time deploy/bin/app.ts still declares.
+        const STALE: &str = "old-server-stack";
+
+        /// A project root with a `deploy/` dir and a `[server] name = acme`
+        /// aws-lambda config.
+        fn project(
+            regenerate_stack: bool,
+        ) -> (tempfile::TempDir, crate::deployment::config::DeployConfig) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join("deploy")).expect("create deploy/");
+            let mut cfg = aws_lambda_cfg(tmp.path().to_path_buf(), regenerate_stack);
+            cfg.server.name = NAME.to_string();
+            (tmp, cfg)
+        }
+
+        fn executor(root: &std::path::Path, npx: &FakeNpx) -> DeployExecutor {
+            DeployExecutor::new(root.to_path_buf()).with_npx_program(npx.program())
+        }
+
+        /// The reported bug: after a `[server] name` rename, app.ts still
+        /// declares the old stack and `cdk deploy` updated it in place. The
+        /// deploy must be refused before `cdk deploy` runs, and the error must
+        /// name both stacks.
+        #[test]
+        fn rename_refuses_cdk_deploy_when_app_declares_another_stack() {
+            let (tmp, cfg) = project(false);
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{STALE}\n"), "", 0);
+
+            let result = executor(tmp.path(), &npx).deploy_after_build(&cfg);
+
+            let err = format!(
+                "{:#}",
+                result.expect_err("a stack mismatch must refuse the deploy")
+            );
+            assert!(
+                err.contains(EXPECTED),
+                "error must name the expected stack: {err}"
+            );
+            assert!(
+                err.contains(STALE),
+                "error must name the declared stack: {err}"
+            );
+            assert!(
+                !npx.ran("cdk deploy"),
+                "cdk deploy must never run on a mismatch; calls: {:?}",
+                npx.calls()
+            );
+        }
+
+        /// When app.ts declares the expected stack, `cdk deploy` runs and
+        /// names that stack explicitly instead of deploying whatever single
+        /// stack the app happens to declare.
+        #[test]
+        fn deploy_names_the_expected_stack_when_app_declares_it() {
+            let (tmp, cfg) = project(false);
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{EXPECTED}\n"), "", 0);
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("matching stack deploys");
+
+            assert_eq!(
+                npx.argv_lines(),
+                vec![
+                    "cdk list".to_string(),
+                    format!(
+                        "cdk deploy {EXPECTED} --require-approval never --outputs-file outputs.json"
+                    ),
+                ],
+                "full call log: {:?}",
+                npx.calls()
+            );
+        }
+
+        /// A refused deploy changes nothing locally either: `--regenerate-stack`
+        /// must not rewrite an existing stack.ts (and so its functionName)
+        /// for a deploy the guard refuses.
+        #[test]
+        fn refused_regenerate_stack_rename_leaves_stack_ts_untouched() {
+            let (tmp, cfg) = project(true);
+            let (path, curated) = seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{STALE}\n"), "", 0);
+
+            let result = executor(tmp.path(), &npx).deploy_after_build(&cfg);
+
+            assert!(result.is_err(), "a stack mismatch must refuse the deploy");
+            let after = std::fs::read_to_string(&path).expect("read stack.ts back");
+            assert_eq!(after, curated, "a refused deploy must not rewrite stack.ts");
+            assert!(!npx.ran("cdk deploy"), "calls: {:?}", npx.calls());
+        }
+
+        /// A MISSING stack.ts is scaffolded first (the CDK app cannot be
+        /// listed without it), the guard still refuses the mismatch, and the
+        /// scaffold is removed again so the refusal leaves no trace.
+        #[test]
+        fn missing_stack_ts_is_scaffolded_then_guarded() {
+            let (tmp, cfg) = project(false);
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{STALE}\n"), "", 0);
+
+            let result = executor(tmp.path(), &npx).deploy_after_build(&cfg);
+
+            assert!(result.is_err(), "a stack mismatch must refuse the deploy");
+            assert!(
+                npx.calls().contains(&"probe stack.ts=present".to_string()),
+                "cdk list must run after the missing stack.ts is scaffolded: {:?}",
+                npx.calls()
+            );
+            assert!(!npx.ran("cdk deploy"), "calls: {:?}", npx.calls());
+            assert!(
+                !tmp.path().join("deploy/lib/stack.ts").exists(),
+                "a refused deploy must remove the stack.ts it scaffolded"
+            );
+        }
+
+        /// A MISSING stack.ts that passes the guard is kept and deployed.
+        #[test]
+        fn missing_stack_ts_is_scaffolded_and_kept_when_guard_passes() {
+            let (tmp, cfg) = project(false);
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{EXPECTED}\n"), "", 0);
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("matching stack deploys");
+
+            assert!(tmp.path().join("deploy/lib/stack.ts").exists());
+            assert!(
+                npx.ran(&format!("cdk deploy {EXPECTED} ")),
+                "{:?}",
+                npx.calls()
+            );
+        }
+
+        /// An existing stack.ts is guarded BEFORE any regeneration: `cdk list`
+        /// sees the operator's file, not a freshly rendered one.
+        #[test]
+        fn existing_stack_ts_is_guarded_before_regeneration() {
+            let (tmp, cfg) = project(true);
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{EXPECTED}\n"), "", 0);
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("matching stack deploys");
+
+            let calls = npx.calls();
+            assert_eq!(
+                calls.first().map(String::as_str),
+                Some("cdk list"),
+                "{calls:?}"
+            );
+            assert!(
+                calls.contains(&"probe stack.ts=present".to_string()),
+                "{calls:?}"
+            );
+        }
+
+        /// If the CDK app cannot be listed, the guard cannot verify the stack
+        /// and refuses (fail closed), surfacing cdk's own stderr.
+        #[test]
+        fn cdk_list_failure_refuses_deploy() {
+            let (tmp, cfg) = project(false);
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(
+                &tmp.path().join("bin"),
+                "",
+                "Error: Cannot find module '../lib/stack'\n",
+                1,
+            );
+
+            let result = executor(tmp.path(), &npx).deploy_after_build(&cfg);
+
+            let err = format!("{:#}", result.expect_err("an unlistable app must refuse"));
+            assert!(
+                err.contains("cdk list"),
+                "error must name the failed step: {err}"
+            );
+            assert!(
+                err.contains("Cannot find module"),
+                "error must carry cdk's stderr: {err}"
+            );
+            assert!(!npx.ran("cdk deploy"), "calls: {:?}", npx.calls());
+        }
+
+        /// `cdk list` runs with the same env as `cdk deploy`, so an app.ts
+        /// that derives its stack id from `SERVER_NAME` answers the guard the
+        /// same way it would answer the deploy.
+        #[test]
+        fn cdk_list_sees_the_deploy_env() {
+            let (tmp, cfg) = project(false);
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{EXPECTED}\n"), "", 0);
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("matching stack deploys");
+
+            assert!(
+                npx.calls()
+                    .contains(&format!("probe SERVER_NAME={NAME} AWS_REGION=us-east-1")),
+                "{:?}",
+                npx.calls()
+            );
+        }
     }
 }

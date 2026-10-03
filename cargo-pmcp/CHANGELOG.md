@@ -5,6 +5,44 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.2] - 2026-10-02
+
+### Fixed
+
+- **A `[server] name` rename can no longer silently update a different
+  aws-lambda stack.** `deploy init` writes the server name into
+  `deploy/bin/app.ts` once, as a literal, and nothing regenerates it, while the
+  CLI reports, reads outputs for and destroys `{[server] name}-stack`. After a
+  rename, `npx cdk deploy` (run with no stack argument) deployed whatever stack
+  `app.ts` still declared, so it updated the OLD stack in place, and with
+  `--regenerate-stack` it also replaced the old function. Before `cdk deploy`,
+  cargo-pmcp now runs `npx cdk list` in `deploy/`, with the deploy's own
+  environment, and refuses unless the app declares `{[server] name}-stack`. The
+  refusal happens before any CloudFormation change and before
+  `--regenerate-stack` rewrites an existing `stack.ts`. It names the expected
+  and the declared stack and says how to recover (keep the old name, or point
+  `app.ts` at the new one, which creates a new stack). `cdk deploy` now names
+  the stack explicitly. If `cdk list` fails, the deploy is refused, because the
+  stack cannot be verified. Field report against 0.27.0 (forecast-coach).
+
+- **`deploy destroy` on aws-lambda no longer reports success for a stack it did
+  not destroy.** `cdk destroy <name>` matches no stack and still exits 0 when the
+  CDK app does not declare `<name>` (aws-cdk #27179), so after a rename `destroy`
+  printed "destroyed successfully", and `--clean` deleted `deploy/` and
+  `.pmcp/deploy.toml`, while the stack kept running. The same guard now refuses
+  first and prints the direct recovery,
+  `aws cloudformation delete-stack --stack-name <name>-stack --region <region>`.
+
+### Changed
+
+- The `npx cdk` legacy path of an aws-lambda deploy, and every aws-lambda
+  `destroy`, now runs one extra `cdk list` synth (a few seconds). A hand-written
+  `deploy/bin/app.ts` that declares a stack under a name other than
+  `{[server] name}-stack` is now refused rather than deployed. That shape was
+  already inconsistent with what `deploy outputs` and `deploy destroy` target.
+  The unmodified-scaffold path (native CloudFormation engine) and the `pmcp-run`
+  target are unaffected.
+
 ## [0.24.3] - 2026-09-18
 
 ### Fixed

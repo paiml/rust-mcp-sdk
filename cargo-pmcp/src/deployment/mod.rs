@@ -1,5 +1,8 @@
 pub mod builder;
+pub mod cdk_stack_guard;
 pub mod config;
+#[cfg(test)]
+pub(crate) mod fake_npx;
 pub mod iam;
 pub mod metadata;
 pub mod naming;
