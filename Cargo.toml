@@ -217,7 +217,7 @@ glob-match = { version = "0.2", optional = true }
 # jsonschema's defaults are ["resolve-http", "resolve-file", "tls-aws-lc-rs"], which pull
 # reqwest + rustls, break the wasm build, and turn an external `$ref` from a hard error
 # into a live network fetch (SEP-2106).
-jsonschema = { version = "0.49", optional = true, default-features = false }
+jsonschema = { version = "0.58", optional = true, default-features = false }
 # `derive` is NOT a garde default feature — garde declares no `default` at all —
 # so without naming it here `#[derive(garde::Validate)]` does not exist and E3's
 # `TypedTool::new_validated` would be a constructor no consumer could satisfy
