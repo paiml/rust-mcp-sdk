@@ -1,5 +1,4 @@
-//! Stack-identity guard for the aws-lambda `npx cdk deploy` / `cdk destroy`
-//! paths.
+//! Stack-identity guard for the aws-lambda `npx cdk deploy` path.
 //!
 //! cargo-pmcp names, reports, reads outputs for, and destroys an aws-lambda
 //! deployment as `{[server] name}-stack`. But the stack `npx cdk` acts on is
@@ -14,28 +13,16 @@
 //! with the same environment as the deploy) and refuses before any
 //! `CloudFormation` change unless the expected stack is among them. The deploy
 //! then names that stack explicitly. Debug session `cargo-pmcp-deploy-targets`.
+//!
+//! Since cargo-pmcp 0.28.0 an unmodified `deploy/bin/app.ts` follows
+//! `[server] name` on its own (when `deploy/lib/stack.ts` is unmodified too),
+//! so this guard refuses only hand-edited app.ts/stack.ts combinations, and
+//! `destroy` no longer goes through `npx cdk` at all: it deletes the stack
+//! with `CloudFormation` directly (`targets::aws_lambda::teardown`).
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::process::Command;
-
-/// The CDK operation a guard check protects. Selects the refusal text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdkOperation {
-    /// `cdk deploy`.
-    Deploy,
-    /// `cdk destroy`.
-    Destroy,
-}
-
-impl CdkOperation {
-    const fn verb(self) -> &'static str {
-        match self {
-            Self::Deploy => "deploy",
-            Self::Destroy => "destroy",
-        }
-    }
-}
 
 /// One stack as `cdk list` reports it.
 ///
@@ -171,80 +158,45 @@ fn deploy_recovery(server_name: &str, declared: &[DeclaredStack], region: &str) 
          To recover, choose one:\n  \
          - Keep deploying the existing stack: {keep}.\n  \
          - Deploy under the new name: set `const serverName = '{server_name}';` in \
-         deploy/bin/app.ts, and re-run with --regenerate-stack (if you customized \
-         deploy/lib/stack.ts, update its serverName by hand instead). This creates a NEW \
+         deploy/bin/app.ts, and the same serverName in deploy/lib/stack.ts if you customized \
+         it (an unmodified stack.ts is regenerated for you), then re-run. This creates a NEW \
          stack, `{expected}`.{old_stack_note}",
-        keep = keep_existing_hint(declared),
-    )
-}
-
-fn destroy_recovery(server_name: &str, declared: &[DeclaredStack], region: &str) -> String {
-    let expected = expected_stack_name(server_name);
-    format!(
-        "Nothing was destroyed. `cdk destroy` matches no stack for an undeclared name and \
-         still exits 0, so the stack would have kept running while this command reported \
-         success.\n\
-         To recover, choose one:\n  \
-         - If `{expected}` exists (for example, the native CloudFormation engine deployed \
-         it), delete it directly: aws cloudformation delete-stack --stack-name {expected} \
-         --region {region}\n  \
-         - Destroy the declared stack instead: {keep}, then re-run.\n  \
-         - Make deploy/bin/app.ts declare `{expected}` (set `const serverName = \
-         '{server_name}';`), then re-run.",
         keep = keep_existing_hint(declared),
     )
 }
 
 /// The refusal text for a mismatch: names the expected and the declared
 /// stacks and says how to recover.
-pub fn mismatch_message(
-    server_name: &str,
-    declared: &[DeclaredStack],
-    operation: CdkOperation,
-    region: &str,
-) -> String {
+pub fn mismatch_message(server_name: &str, declared: &[DeclaredStack], region: &str) -> String {
     let expected = expected_stack_name(server_name);
-    let recovery = match operation {
-        CdkOperation::Deploy => deploy_recovery(server_name, declared, region),
-        CdkOperation::Destroy => destroy_recovery(server_name, declared, region),
-    };
     format!(
-        "refusing to run `cdk {verb}`: deploy/bin/app.ts does not declare the stack \
+        "refusing to run `cdk deploy`: deploy/bin/app.ts does not declare the stack \
          cargo-pmcp targets.\n  \
          expected: {expected}  (from `[server] name = \"{server_name}\"` in .pmcp/deploy.toml)\n  \
          declared: {declared}\n\
          {recovery}",
-        verb = operation.verb(),
         declared = declared_list(declared),
+        recovery = deploy_recovery(server_name, declared, region),
     )
 }
 
 /// Pure guard predicate: `Ok` iff the declared stacks include
 /// `{server_name}-stack`, otherwise an error carrying [`mismatch_message`].
-pub fn check_declared(
-    server_name: &str,
-    declared: &[DeclaredStack],
-    operation: CdkOperation,
-    region: &str,
-) -> Result<()> {
+pub fn check_declared(server_name: &str, declared: &[DeclaredStack], region: &str) -> Result<()> {
     let expected = expected_stack_name(server_name);
     if declared.iter().any(|stack| stack.is(&expected)) {
         return Ok(());
     }
-    bail!(
-        "{}",
-        mismatch_message(server_name, declared, operation, region)
-    )
+    bail!("{}", mismatch_message(server_name, declared, region))
 }
 
 /// Run `list_cmd` (a `cdk list` child in deploy/, built with the same
-/// environment as the CDK operation it guards) and refuse unless the app
+/// environment as the `cdk deploy` it guards) and refuse unless the app
 /// declares `{server_name}-stack`. Fails closed: if `cdk list` cannot run or
-/// exits non-zero, the stack cannot be verified and the operation is refused.
+/// exits non-zero, the stack cannot be verified and the deploy is refused.
 pub fn ensure_app_declares_stack(
     mut list_cmd: Command,
     server_name: &str,
-    operation: CdkOperation,
     region: &str,
 ) -> Result<()> {
     let expected = expected_stack_name(server_name);
@@ -262,18 +214,17 @@ pub fn ensure_app_declares_stack(
     if !output.status.success() {
         println!(" ❌");
         bail!(
-            "refusing to run `cdk {verb}`: could not verify which stacks deploy/bin/app.ts \
+            "refusing to run `cdk deploy`: could not verify which stacks deploy/bin/app.ts \
              declares (`npx cdk list` failed: {status}).\n\
              cdk list stderr:\n{stderr}\n\
              CloudFormation is unchanged. Make `npx cdk list` succeed in deploy/, then re-run.",
-            verb = operation.verb(),
             status = output.status,
             stderr = String::from_utf8_lossy(&output.stderr).trim(),
         );
     }
 
     let declared = parse_cdk_list_output(&String::from_utf8_lossy(&output.stdout));
-    let verdict = check_declared(server_name, &declared, operation, region);
+    let verdict = check_declared(server_name, &declared, region);
     println!("{}", if verdict.is_ok() { " ✅" } else { " ❌" });
     verdict
 }
@@ -336,7 +287,7 @@ mod tests {
     #[test]
     fn check_accepts_exact_match_among_several() {
         let declared = vec![stack("shared-vpc"), stack("acme-stack")];
-        assert!(check_declared("acme", &declared, CdkOperation::Deploy, "us-east-1").is_ok());
+        assert!(check_declared("acme", &declared, "us-east-1").is_ok());
     }
 
     /// Boundary neighbors of the expected name: one character more, one
@@ -354,7 +305,7 @@ mod tests {
         ] {
             let declared = vec![stack(near)];
             assert!(
-                check_declared("acme", &declared, CdkOperation::Deploy, "us-east-1").is_err(),
+                check_declared("acme", &declared, "us-east-1").is_err(),
                 "{near} must not satisfy acme-stack"
             );
         }
@@ -366,7 +317,7 @@ mod tests {
             id: "acme-stack".to_string(),
             stack_name: Some("old-server-stack".to_string()),
         }];
-        assert!(check_declared("acme", &declared, CdkOperation::Deploy, "us-east-1").is_err());
+        assert!(check_declared("acme", &declared, "us-east-1").is_err());
     }
 
     #[test]
@@ -375,57 +326,35 @@ mod tests {
             id: "acme-stack".to_string(),
             stack_name: Some("acme-stack".to_string()),
         }];
-        assert!(check_declared("acme", &declared, CdkOperation::Deploy, "us-east-1").is_ok());
+        assert!(check_declared("acme", &declared, "us-east-1").is_ok());
     }
 
     #[test]
     fn check_refuses_when_nothing_is_declared() {
-        let err = check_declared("acme", &[], CdkOperation::Deploy, "us-east-1")
-            .expect_err("no declared stacks must refuse");
+        let err =
+            check_declared("acme", &[], "us-east-1").expect_err("no declared stacks must refuse");
         assert!(err.to_string().contains("none reported"), "{err}");
     }
 
     #[test]
     fn deploy_message_names_both_stacks_and_both_recoveries() {
-        let msg = mismatch_message(
-            "acme",
-            &[stack("old-server-stack")],
-            CdkOperation::Deploy,
-            "us-east-1",
-        );
+        let msg = mismatch_message("acme", &[stack("old-server-stack")], "us-east-1");
         assert!(msg.contains("refusing to run `cdk deploy`"), "{msg}");
         assert!(msg.contains("expected: acme-stack"), "{msg}");
         assert!(msg.contains("declared: old-server-stack"), "{msg}");
         assert!(msg.contains("CloudFormation is unchanged"), "{msg}");
         assert!(msg.contains("`[server] name = \"old-server\"`"), "{msg}");
         assert!(msg.contains("const serverName = 'acme';"), "{msg}");
-        assert!(msg.contains("--regenerate-stack"), "{msg}");
+        assert!(
+            !msg.contains("--regenerate-stack"),
+            "must not advise overwriting a customized stack.ts: {msg}"
+        );
         assert!(
             msg.contains(
                 "aws cloudformation delete-stack --stack-name old-server-stack --region us-east-1"
             ),
             "{msg}"
         );
-    }
-
-    #[test]
-    fn destroy_message_explains_the_silent_exit_and_the_direct_delete() {
-        let msg = mismatch_message(
-            "acme",
-            &[stack("old-server-stack")],
-            CdkOperation::Destroy,
-            "eu-west-2",
-        );
-        assert!(msg.contains("refusing to run `cdk destroy`"), "{msg}");
-        assert!(msg.contains("Nothing was destroyed"), "{msg}");
-        assert!(msg.contains("still exits 0"), "{msg}");
-        assert!(
-            msg.contains(
-                "aws cloudformation delete-stack --stack-name acme-stack --region eu-west-2"
-            ),
-            "{msg}"
-        );
-        assert!(msg.contains("`[server] name = \"old-server\"`"), "{msg}");
     }
 
     /// When CDK prints a `CloudFormation` name that differs from the construct
@@ -436,7 +365,7 @@ mod tests {
             id: "acme-stack".to_string(),
             stack_name: Some("old-server-stack".to_string()),
         }];
-        let msg = mismatch_message("acme", &declared, CdkOperation::Deploy, "us-east-1");
+        let msg = mismatch_message("acme", &declared, "us-east-1");
         assert!(
             msg.contains("declared: acme-stack (old-server-stack)"),
             "{msg}"
@@ -492,17 +421,16 @@ mod proptests {
             }
             let stdout = ids.join("\n");
             let declared = parse_cdk_list_output(&stdout);
-            let verdict = check_declared(&name, &declared, CdkOperation::Deploy, "us-east-1");
+            let verdict = check_declared(&name, &declared, "us-east-1");
             prop_assert_eq!(verdict.is_ok(), include);
         }
 
         /// A refusal always names the expected stack and every declared
-        /// stack, for both operations.
+        /// stack.
         #[test]
         fn refusal_names_expected_and_every_declared_stack(
             name in arb_server_name(),
             others in proptest::collection::vec("[a-zA-Z][a-zA-Z0-9-]{0,40}", 0..6),
-            destroy in any::<bool>(),
         ) {
             let expected = expected_stack_name(&name);
             let declared: Vec<DeclaredStack> = others
@@ -510,8 +438,7 @@ mod proptests {
                 .filter(|o| *o != expected)
                 .map(|id| DeclaredStack { id, stack_name: None })
                 .collect();
-            let operation = if destroy { CdkOperation::Destroy } else { CdkOperation::Deploy };
-            let err = check_declared(&name, &declared, operation, "us-east-1")
+            let err = check_declared(&name, &declared, "us-east-1")
                 .expect_err("expected stack is absent");
             let msg = err.to_string();
             let expected_line = format!("expected: {}", expected);
@@ -545,7 +472,7 @@ mod proptests {
             for neighbor in neighbors {
                 let declared = parse_cdk_list_output(&neighbor);
                 prop_assert!(
-                    check_declared(&name, &declared, CdkOperation::Deploy, "us-east-1").is_err(),
+                    check_declared(&name, &declared, "us-east-1").is_err(),
                     "{} must not satisfy {}", neighbor, expected
                 );
             }

@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod cdk_stack_guard;
 pub mod config;
+pub mod deploy_toml_edit;
 #[cfg(test)]
 pub(crate) mod fake_npx;
 pub mod iam;
@@ -10,6 +11,8 @@ pub mod operations;
 pub mod outputs;
 pub mod post_deploy_tests;
 pub mod registry;
+pub mod scaffold_provenance;
+pub mod server_name;
 pub(crate) mod stack_routing;
 pub mod targets;
 pub mod r#trait;

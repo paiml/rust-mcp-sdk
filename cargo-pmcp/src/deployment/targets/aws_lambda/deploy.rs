@@ -213,13 +213,14 @@ async fn try_render_and_deploy(
         s3_key,
         bucket,
         project_root: config.project_root.clone(),
+        function_name: config.server.name.clone(),
     };
 
-    let outputs = engine::deploy_stack(&template, engine_params)
+    // Returned, not printed: `cargo pmcp deploy` prints the outputs exactly
+    // once (A2 — this used to print them a second time).
+    engine::deploy_stack(&template, engine_params)
         .await
-        .map_err(RenderOrDeployError::Deploy)?;
-    outputs.display();
-    Ok(outputs)
+        .map_err(RenderOrDeployError::Deploy)
 }
 
 /// `RenderParams::runtime_adapter` for `shape` (T8 review fix wiring, Task
@@ -326,15 +327,47 @@ async fn deploy_legacy(
         crate::commands::deploy::deploy::DeployExecutor::new(config.project_root.clone())
             .with_extra_env(extra_env)
             .with_regenerate_stack(config.regenerate_stack);
-    executor.execute()?;
+    if legacy_rebuilds_binary(&detect_shape(config)?) {
+        executor.execute()
+    } else {
+        executor.execute_prebuilt()
+    }
+}
 
-    let stack_name = format!("{}-stack", config.server.name);
-    crate::deployment::load_cdk_outputs(&config.project_root, &config.aws().region, &stack_name)
+/// Whether the legacy `npx cdk deploy` fallback must build the Lambda binary
+/// itself (debug session `cargo-pmcp-deploy-targets`, A5).
+///
+/// A custom-Rust project was already built into `deploy/.build/` by this same
+/// `cargo pmcp deploy` (`target.build()` runs before routing), so building it
+/// again only doubled the build. A built-in server's artifact is a downloaded
+/// zip and `deploy/.build/` holds no `bootstrap` for `cdk deploy` to package,
+/// so that shape keeps the executor's own build step, unchanged.
+fn legacy_rebuilds_binary(shape: &ServerShape) -> bool {
+    matches!(shape, ServerShape::BuiltIn { .. })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A5: `cargo pmcp deploy` already built the custom-Rust binary into
+    /// deploy/.build (`target.build()`) before routing; the legacy fallback
+    /// must deploy that binary, not build it a second time.
+    #[test]
+    fn legacy_fallback_reuses_the_custom_rust_binary() {
+        assert!(!legacy_rebuilds_binary(&ServerShape::CustomRust));
+    }
+
+    /// A built-in server's artifact is a downloaded zip, and deploy/.build
+    /// holds no `bootstrap` for `cdk deploy` to package, so the legacy path
+    /// keeps its own build step there (unchanged: it fails loudly, rather
+    /// than deploying an asset with no bootstrap).
+    #[test]
+    fn legacy_fallback_still_builds_for_a_builtin_server() {
+        assert!(legacy_rebuilds_binary(&ServerShape::BuiltIn {
+            server_type: "sql-server".to_string()
+        }));
+    }
 
     #[test]
     fn scaffold_fixed_environment_matches_the_golden_fixture_shape() {

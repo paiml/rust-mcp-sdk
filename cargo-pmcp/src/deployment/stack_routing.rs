@@ -12,8 +12,9 @@
 //!
 //! # Routing rule
 //!
-//! `deploy/lib/stack.ts` on disk must byte-match what `cargo pmcp` itself
-//! would (re)generate for the current `.pmcp/deploy.toml` for the pure
+//! `deploy/lib/stack.ts` on disk must still be the scaffold `cargo pmcp`
+//! itself last wrote (recorded in `deploy/.pmcp-scaffold.toml`, see
+//! [`crate::deployment::scaffold_provenance`]) for the pure
 //! `pmcp-cfn-renderer` path to even be attempted — see
 //! [`custom_stack_ts_reason`]. A hand-modified stack.ts always falls back to
 //! the target's legacy (CDK-based) deploy path so operator customizations
@@ -29,41 +30,33 @@ use crate::deployment::config::DeployConfig;
 use crate::deployment::metadata::McpMetadata;
 use pmcp_package::package::DeployDescriptor;
 
-/// `Some(reason)` naming `deploy/lib/stack.ts` when it no longer matches
-/// what [`crate::commands::deploy::init::render_stack_ts_for_deploy`] would
-/// generate for the current `.pmcp/deploy.toml` — `None` when it still
-/// matches the scaffold, or the file is absent (before any synth/deploy has
-/// ever run; the caller's own stack.ts-regeneration guard always writes it
-/// first in practice, but this stays total).
+/// `Some(reason)` naming `deploy/lib/stack.ts` when it was hand-modified —
+/// `None` when it is still cargo-pmcp's own, unmodified scaffold, or the file
+/// is absent (before any synth/deploy has ever run; the caller's own
+/// stack.ts-regeneration guard always writes it first in practice, but this
+/// stays total).
 ///
-/// Reuses `render_stack_ts_for_deploy` — the SAME function every target's
-/// stack.ts-regeneration guard already calls to (re)write the file — rather
-/// than re-deriving stack.ts content; this only adds the byte-equality
-/// comparison on top.
+/// "Hand-modified" means the file differs from the stack.ts cargo-pmcp last
+/// WROTE (recorded in `deploy/.pmcp-scaffold.toml`), NOT from what the current
+/// `.pmcp/deploy.toml` would render. A `[server] name` rename, an `[iam]` or
+/// `[metadata]` change, or a newer cargo-pmcp template therefore no longer
+/// reclassifies an untouched scaffold as hand-modified (debug session
+/// `cargo-pmcp-deploy-targets`, finding #4). See
+/// [`crate::deployment::scaffold_provenance::classify_stack_ts`], which also
+/// covers projects initialized before the record existed.
 pub(crate) fn custom_stack_ts_reason(config: &DeployConfig) -> Result<Option<String>> {
-    let stack_ts_path = config
-        .project_root
-        .join("deploy")
-        .join("lib")
-        .join("stack.ts");
-    if !stack_ts_path.exists() {
-        return Ok(None);
-    }
-    let on_disk = std::fs::read_to_string(&stack_ts_path)
-        .with_context(|| format!("Failed to read {}", stack_ts_path.display()))?;
-    let expected = crate::commands::deploy::init::render_stack_ts_for_deploy(
-        &config.target.target_type,
-        &config.server.name,
-        &config.iam,
-        &config.metadata,
-    );
-    if on_disk == expected {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "{} was hand-modified (no longer matches the regenerated scaffold)",
-            stack_ts_path.display()
-        )))
+    use crate::deployment::scaffold_provenance::{classify_stack_ts, StackTsState};
+    match classify_stack_ts(config)? {
+        StackTsState::Missing | StackTsState::Untouched => Ok(None),
+        StackTsState::HandModified => Ok(Some(format!(
+            "{} was hand-modified (it no longer matches the scaffold cargo-pmcp last wrote)",
+            config
+                .project_root
+                .join("deploy")
+                .join("lib")
+                .join("stack.ts")
+                .display()
+        ))),
     }
 }
 
@@ -234,6 +227,37 @@ mod tests {
             .expect("check succeeds")
             .expect("hand-modified stack.ts must be detected");
         assert!(reason.contains(&path.display().to_string()));
+    }
+
+    /// Finding #4: renaming `[server] name` after `deploy init` must not send
+    /// the untouched scaffold to the legacy path. Before the provenance record,
+    /// the byte comparison against a render for the NEW name failed, so every
+    /// renamed project deployed through `npx cdk deploy`, built the binary
+    /// twice, and dropped `[server] memory_mb`/`timeout_seconds`.
+    #[test]
+    fn custom_stack_ts_reason_none_after_renaming_an_untouched_scaffold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lib_dir = tmp.path().join("deploy").join("lib");
+        std::fs::create_dir_all(&lib_dir).expect("create deploy/lib");
+        let init_time = crate::commands::deploy::init::render_stack_ts_for_deploy(
+            "aws-lambda",
+            "forecast-coach-lambda",
+            &IamConfig::default(),
+            &crate::deployment::config::MetadataConfig::default(),
+        );
+        std::fs::write(lib_dir.join("stack.ts"), &init_time).expect("write stack.ts");
+        crate::deployment::scaffold_provenance::record_stack_ts(tmp.path(), &init_time)
+            .expect("record");
+
+        let mut renamed =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "aws-lambda", IamConfig::default());
+        renamed.server.name = "forecast-coach-acme".to_string();
+
+        assert_eq!(
+            custom_stack_ts_reason(&renamed).expect("check succeeds"),
+            None,
+            "a renamed but untouched scaffold must stay on the renderer path"
+        );
     }
 
     #[test]

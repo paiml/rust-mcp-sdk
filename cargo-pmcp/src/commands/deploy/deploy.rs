@@ -1,4 +1,6 @@
-use crate::deployment::cdk_stack_guard::{expected_stack_name, CdkOperation};
+use crate::deployment::cdk_stack_guard::expected_stack_name;
+use crate::deployment::scaffold_provenance::{self, StackTsState};
+use crate::deployment::DeploymentOutputs;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -60,9 +62,34 @@ impl DeployExecutor {
         self
     }
 
-    pub fn execute(&self) -> Result<()> {
+    /// Build the Lambda binary, deploy it with `npx cdk deploy`, and return
+    /// the stack's outputs. The caller prints them (once).
+    pub fn execute(&self) -> Result<DeploymentOutputs> {
         let start = Instant::now();
+        let config = self.load_validated_config()?;
 
+        let builder = crate::deployment::builder::BinaryBuilder::new(self.project_root.clone());
+        builder.build()?;
+        println!();
+
+        self.deploy_and_read_outputs(&config, start)
+    }
+
+    /// [`Self::execute`] without the build: deploy the binary this same
+    /// `cargo pmcp deploy` run already built into `deploy/.build/` (debug
+    /// session `cargo-pmcp-deploy-targets`, A5 — the legacy fallback used to
+    /// build it a second time).
+    pub fn execute_prebuilt(&self) -> Result<DeploymentOutputs> {
+        let start = Instant::now();
+        let config = self.load_validated_config()?;
+        println!("🔨 Using the Lambda binary already built for this deploy (deploy/.build)");
+        println!();
+        self.deploy_and_read_outputs(&config, start)
+    }
+
+    /// Load `.pmcp/deploy.toml`, re-apply the runtime flags, and run the
+    /// fail-closed IAM gate.
+    fn load_validated_config(&self) -> Result<crate::deployment::config::DeployConfig> {
         println!("🚀 Deploying to AWS Lambda...");
         println!();
 
@@ -80,12 +107,17 @@ impl DeployExecutor {
         println!("📋 Server: {}", config.server.name);
         println!("🌍 Region: {}", config.aws().region);
         println!();
+        Ok(config)
+    }
 
-        let builder = crate::deployment::builder::BinaryBuilder::new(self.project_root.clone());
-        builder.build()?;
-        println!();
-
-        self.deploy_after_build(&config)?;
+    /// Deploy, then read the outputs of `{[server] name}-stack` back from
+    /// `deploy/outputs.json`.
+    fn deploy_and_read_outputs(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+        start: Instant,
+    ) -> Result<DeploymentOutputs> {
+        self.deploy_after_build(config)?;
         println!();
 
         let stack_name = expected_stack_name(&config.server.name);
@@ -99,9 +131,9 @@ impl DeployExecutor {
         println!("✅ Deployment complete in {:.1}s", elapsed.as_secs_f64());
         println!();
 
-        outputs.display();
-
-        Ok(())
+        // Not printed here: `cargo pmcp deploy` prints the outputs it gets
+        // back exactly once (A2 — this used to print them a second time).
+        Ok(outputs)
     }
 
     /// Everything between the binary build and reading the stack outputs:
@@ -146,16 +178,53 @@ impl DeployExecutor {
     /// stack.ts, so a refused deploy changes nothing locally either. A MISSING
     /// stack.ts is scaffolded first, because the app cannot be listed without
     /// it, and is removed again if the guard then refuses.
+    ///
+    /// When cargo-pmcp owns both scaffold files (stack.ts unmodified or
+    /// missing, app.ts unmodified), app.ts is first pointed at the current
+    /// `[server] name` (finding #1), so a rename deploys a NEW stack instead of
+    /// being refused. A hand-modified stack.ts leaves app.ts alone: its own
+    /// `serverName` would still name the old function, so creating a new stack
+    /// from it would collide with the old one. On a refusal, app.ts is put
+    /// back as it was.
     fn guard_and_regenerate_stack_ts(
         &self,
         config: &crate::deployment::config::DeployConfig,
+    ) -> Result<()> {
+        let state = scaffold_provenance::classify_stack_ts(config)?;
+        let app_ts_before = if state == StackTsState::HandModified {
+            None
+        } else {
+            scaffold_provenance::sync_app_ts_with_server_name(
+                &self.project_root,
+                &config.server.name,
+            )?
+        };
+
+        let result = self.guard_then_regenerate(config, state);
+        if let (Err(_), Some(before)) = (&result, app_ts_before) {
+            let app_ts = self.project_root.join("deploy").join("bin").join("app.ts");
+            std::fs::write(&app_ts, before).with_context(|| {
+                format!(
+                    "failed to restore {} after the refused deploy",
+                    app_ts.display()
+                )
+            })?;
+        }
+        result
+    }
+
+    /// The guard + regeneration body of [`Self::guard_and_regenerate_stack_ts`].
+    fn guard_then_regenerate(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+        state: StackTsState,
     ) -> Result<()> {
         let stack_ts = self
             .project_root
             .join("deploy")
             .join("lib")
             .join("stack.ts");
-        let stack_ts_existed = stack_ts.exists();
+        let stack_ts_existed = state != StackTsState::Missing;
         if stack_ts_existed {
             self.ensure_app_declares_expected_stack(config)?;
         }
@@ -163,7 +232,7 @@ impl DeployExecutor {
         // Regenerate stack.ts from the loaded config so user-declared [iam]
         // permissions land in the CDK template. `init` scaffolds with an empty
         // IamConfig; the source of truth at deploy time is .pmcp/deploy.toml.
-        self.regenerate_stack_ts(config)?;
+        Self::regenerate_stack_ts(config)?;
 
         if stack_ts_existed {
             return Ok(());
@@ -179,27 +248,24 @@ impl DeployExecutor {
                     stack_ts.display()
                 )
             })?;
+            scaffold_provenance::forget_stack_ts(&self.project_root)?;
             return Err(refusal);
         }
         Ok(())
     }
 
-    fn regenerate_stack_ts(&self, config: &crate::deployment::config::DeployConfig) -> Result<()> {
-        let lib_dir = self.project_root.join("deploy").join("lib");
+    fn regenerate_stack_ts(config: &crate::deployment::config::DeployConfig) -> Result<()> {
         let stack_ts = crate::commands::deploy::init::render_stack_ts_for_deploy(
             &config.target.target_type,
             &config.server.name,
             &config.iam,
             &config.metadata,
         );
-        // DSTK-01: preserve an operator-curated stack.ts unless
-        // `--regenerate-stack`/`--force` was passed. IAM validation already ran
-        // in `execute()`, so the guard never disables validation.
-        let wrote = crate::deployment::config::write_stack_ts_guarded(
-            &lib_dir,
-            &stack_ts,
-            config.regenerate_stack,
-        )?;
+        // DSTK-01: preserve an operator-curated (hand-modified) stack.ts
+        // unless `--regenerate-stack`/`--force` was passed; an unmodified
+        // scaffold is cargo-pmcp's own output and is regenerated. IAM
+        // validation already ran, so the guard never disables validation.
+        let wrote = scaffold_provenance::write_scaffold_stack_ts(config, &stack_ts)?;
         if !wrote {
             println!("{}", crate::deployment::config::STACK_TS_PRESERVED_NOTICE);
             // FIX #1 (deploy-toml-inert-for-preserved-stack): warn loudly when
@@ -266,7 +332,6 @@ impl DeployExecutor {
         crate::deployment::cdk_stack_guard::ensure_app_declares_stack(
             self.cdk_command(config, &["list"]),
             &config.server.name,
-            CdkOperation::Deploy,
             &config.aws().region,
         )
     }
@@ -375,10 +440,7 @@ mod tests {
         let (path, curated) = seed_curated_stack_ts(tmp.path());
 
         let config = aws_lambda_cfg(tmp.path().to_path_buf(), false);
-        let executor = DeployExecutor::new(tmp.path().to_path_buf());
-        executor
-            .regenerate_stack_ts(&config)
-            .expect("guard succeeds");
+        DeployExecutor::regenerate_stack_ts(&config).expect("guard succeeds");
 
         let after = std::fs::read_to_string(&path).expect("read stack.ts back");
         assert_eq!(
@@ -395,10 +457,7 @@ mod tests {
         let (path, curated) = seed_curated_stack_ts(tmp.path());
 
         let config = aws_lambda_cfg(tmp.path().to_path_buf(), true);
-        let executor = DeployExecutor::new(tmp.path().to_path_buf());
-        executor
-            .regenerate_stack_ts(&config)
-            .expect("regenerate succeeds");
+        DeployExecutor::regenerate_stack_ts(&config).expect("regenerate succeeds");
 
         let after = std::fs::read_to_string(&path).expect("read stack.ts back");
         assert_ne!(
@@ -603,6 +662,140 @@ mod tests {
                 "error must carry cdk's stderr: {err}"
             );
             assert!(!npx.ran("cdk deploy"), "calls: {:?}", npx.calls());
+        }
+
+        /// Seed the two init-time scaffold files for `name`: app.ts and an
+        /// unmodified, recorded stack.ts.
+        fn seed_init_scaffolds(root: &std::path::Path, name: &str) {
+            let bin = root.join("deploy").join("bin");
+            std::fs::create_dir_all(&bin).expect("create deploy/bin");
+            std::fs::write(
+                bin.join("app.ts"),
+                crate::commands::deploy::init::render_app_ts(name),
+            )
+            .expect("write app.ts");
+            let lib = root.join("deploy").join("lib");
+            std::fs::create_dir_all(&lib).expect("create deploy/lib");
+            let stack_ts = crate::commands::deploy::init::render_stack_ts_for_deploy(
+                "aws-lambda",
+                name,
+                &crate::deployment::config::IamConfig::default(),
+                &crate::deployment::config::MetadataConfig::default(),
+            );
+            std::fs::write(lib.join("stack.ts"), &stack_ts).expect("write stack.ts");
+            scaffold_provenance::record_stack_ts(root, &stack_ts).expect("record");
+        }
+
+        fn read(root: &std::path::Path, rel: &str) -> String {
+            std::fs::read_to_string(root.join(rel)).expect("read scaffold file")
+        }
+
+        /// Finding #1, end to end on the legacy path: with both scaffold files
+        /// still cargo-pmcp's own, a `[server] name` rename deploys a NEW
+        /// stack named from deploy.toml. app.ts and stack.ts follow the name.
+        #[test]
+        fn rename_with_untouched_scaffolds_deploys_a_new_stack() {
+            let (tmp, cfg) = project(false);
+            seed_init_scaffolds(tmp.path(), "old-server");
+            let npx = FakeNpx::listing_scaffold_app_ts(&tmp.path().join("bin"));
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("a rename of untouched scaffolds deploys");
+
+            assert!(
+                npx.ran(&format!("cdk deploy {EXPECTED} ")),
+                "{:?}",
+                npx.calls()
+            );
+            assert_eq!(
+                read(tmp.path(), "deploy/bin/app.ts"),
+                crate::commands::deploy::init::render_app_ts(NAME)
+            );
+            assert_eq!(
+                read(tmp.path(), "deploy/lib/stack.ts"),
+                crate::commands::deploy::init::render_stack_ts_for_deploy(
+                    "aws-lambda",
+                    NAME,
+                    &cfg.iam,
+                    &cfg.metadata
+                )
+            );
+        }
+
+        /// A hand-modified stack.ts still bakes the OLD function name, so a
+        /// new stack built from it would collide with the old one: app.ts is
+        /// left alone and the guard refuses, as before.
+        #[test]
+        fn rename_with_a_hand_modified_stack_ts_is_still_refused() {
+            let (tmp, cfg) = project(false);
+            seed_init_scaffolds(tmp.path(), "old-server");
+            seed_curated_stack_ts(tmp.path());
+            let npx = FakeNpx::listing_scaffold_app_ts(&tmp.path().join("bin"));
+
+            let err = executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect_err("must refuse");
+
+            assert!(format!("{err:#}").contains(STALE), "{err:#}");
+            assert!(!npx.ran("cdk deploy"), "{:?}", npx.calls());
+            assert_eq!(
+                read(tmp.path(), "deploy/bin/app.ts"),
+                crate::commands::deploy::init::render_app_ts("old-server")
+            );
+        }
+
+        /// A refused deploy changes nothing locally: an app.ts that was
+        /// pointed at the new name is put back.
+        #[test]
+        fn refused_deploy_restores_a_synced_app_ts() {
+            let (tmp, cfg) = project(false);
+            seed_init_scaffolds(tmp.path(), "old-server");
+            let npx = FakeNpx::new(&tmp.path().join("bin"), "", "Error: synth failed\n", 1);
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect_err("an unlistable app must refuse");
+
+            assert_eq!(
+                read(tmp.path(), "deploy/bin/app.ts"),
+                crate::commands::deploy::init::render_app_ts("old-server")
+            );
+            assert!(!npx.ran("cdk deploy"), "{:?}", npx.calls());
+        }
+
+        /// A2: the legacy executor returns the outputs and leaves printing
+        /// them to the CLI, which prints them once. It used to print them as
+        /// well, so a legacy deploy showed "Deployment Outputs" twice.
+        #[test]
+        fn legacy_deploy_returns_outputs_without_printing_them() {
+            let (tmp, cfg) = project(false);
+            seed_curated_stack_ts(tmp.path());
+            std::fs::create_dir_all(tmp.path().join(".pmcp")).expect("create .pmcp");
+            std::fs::write(
+                tmp.path().join(".pmcp/deploy.toml"),
+                toml::to_string_pretty(&cfg).expect("serialize config"),
+            )
+            .expect("write deploy.toml");
+            std::fs::write(
+                tmp.path().join("deploy/outputs.json"),
+                format!("{{\"{EXPECTED}\": {{\"ApiUrl\": \"https://acme.example.com\"}}}}"),
+            )
+            .expect("write outputs.json");
+            let npx = FakeNpx::new(&tmp.path().join("bin"), &format!("{EXPECTED}\n"), "", 0);
+            crate::deployment::r#trait::DISPLAY_CALLS.with(|c| c.set(0));
+
+            let outputs = executor(tmp.path(), &npx)
+                .execute_prebuilt()
+                .expect("legacy deploy succeeds");
+
+            assert_eq!(outputs.url.as_deref(), Some("https://acme.example.com"));
+            assert_eq!(outputs.stack_name.as_deref(), Some(EXPECTED));
+            assert_eq!(
+                crate::deployment::r#trait::DISPLAY_CALLS.with(std::cell::Cell::get),
+                0,
+                "the legacy executor must not print the outputs; the CLI does"
+            );
         }
 
         /// `cdk list` runs with the same env as `cdk deploy`, so an app.ts

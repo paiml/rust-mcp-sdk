@@ -232,8 +232,8 @@ pub(crate) enum SynthPath {
 /// # Routing rule
 ///
 /// `deploy/lib/stack.ts` on disk (post `validate_and_regenerate_stack_ts`,
-/// which already ran by the time this is called) must byte-match what
-/// `cargo pmcp` itself would (re)generate for the renderer path to even be
+/// which already ran by the time this is called) must still be the scaffold
+/// `cargo pmcp` itself last wrote for the renderer path to even be
 /// attempted — see [`custom_stack_ts_reason`]. A hand-modified stack.ts
 /// always falls back to `cdk synth` so operator customizations keep
 /// working, and is additionally tainted via [`mark_custom_stack`] so the
@@ -382,7 +382,7 @@ fn run_legacy_synth(
     reason: String,
 ) -> Result<SynthOutput> {
     run_cdk_synth(deploy_dir, metadata, &config.environment)?;
-    let template_path = find_template_file(cdk_out)?;
+    let template_path = find_template_file(cdk_out, &config.server.name)?;
     println!("   Template: {}", template_path.display());
     let template_json = std::fs::read_to_string(&template_path)
         .context("Failed to read CloudFormation template")?;
@@ -910,30 +910,57 @@ async fn poll_deployment_status(
     }
 }
 
-/// Find the CloudFormation template file in cdk.out directory
-fn find_template_file(cdk_out: &Path) -> Result<PathBuf> {
+/// The synthesized template for `{server_name}-stack` in `cdk_out`.
+///
+/// Prefers `{server_name}-stack.template.json`, the file the scaffold app.ts
+/// synthesizes. `cdk synth` never removes another stack's template, so after
+/// the app's stack id changed (e.g. `deploy init --name`), cdk.out can hold a
+/// stale template from the old id; this used to return whichever
+/// `*.template.json` the directory listing happened to yield first (debug
+/// session `cargo-pmcp-deploy-targets`, A8). Without the expected file (a
+/// hand-written app.ts with another id), it falls back to the first template
+/// in name order and says so when there are several.
+fn find_template_file(cdk_out: &Path, server_name: &str) -> Result<PathBuf> {
+    let preferred = cdk_out.join(format!(
+        "{}.template.json",
+        crate::deployment::cdk_stack_guard::expected_stack_name(server_name)
+    ));
+    if preferred.is_file() {
+        return Ok(preferred);
+    }
+
     let entries = std::fs::read_dir(cdk_out).with_context(|| {
         format!(
             "CDK output directory not found or unreadable: {}",
             cdk_out.display()
         )
     })?;
-
+    let mut templates = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() {
-            if let Some(file_name) = path.file_name() {
-                let file_name_str = file_name.to_string_lossy();
-                if file_name_str.ends_with(".template.json") {
-                    return Ok(path);
-                }
-            }
+        let path = entry?.path();
+        let is_template = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".template.json"));
+        if path.is_file() && is_template {
+            templates.push(path);
         }
     }
-
-    bail!("No CloudFormation template found in {}", cdk_out.display());
+    templates.sort();
+    let Some(first) = templates.first().cloned() else {
+        bail!("No CloudFormation template found in {}", cdk_out.display());
+    };
+    if templates.len() > 1 {
+        eprintln!(
+            "  {} {} holds {} templates and none is {}; using {}. Delete deploy/cdk.out to \
+             drop templates left by an earlier stack id.",
+            console::style("warning:").yellow(),
+            cdk_out.display(),
+            templates.len(),
+            preferred.display(),
+            first.display()
+        );
+    }
+    Ok(first)
 }
 
 /// Apply every post-synth CloudFormation template merge, in order, to the
@@ -966,8 +993,8 @@ fn find_template_file(cdk_out: &Path) -> Result<PathBuf> {
 /// 2. `[server]` sizing — `Properties.MemorySize`/`Timeout` on the MCP
 ///    function ONLY (debug session `deploy-server-memory-timeout`). Threading
 ///    these into the stack.ts template instead was measured and rejected; see
-///    `init::AWS_LAMBDA_SCAFFOLD_MEMORY_MB`'s doc comment for the byte-match
-///    fallout. Unlike (1) this one must NOT touch every Lambda: an
+///    `init::AWS_LAMBDA_SCAFFOLD_MEMORY_MB`'s doc comment for the (then)
+///    byte-match fallout. Unlike (1) this one must NOT touch every Lambda: an
 ///    OAuth-enabled stack renders three functions at three different sizings,
 ///    and resizing the 10-second authorizer would be a regression.
 fn apply_post_synth_merges(template: String, config: &DeployConfig) -> Result<String> {
@@ -1387,21 +1414,18 @@ fn validate_and_regenerate_stack_ts(config: &DeployConfig) -> Result<()> {
         .context("IAM validation failed — fix .pmcp/deploy.toml before deploying")?;
     crate::deployment::iam::emit_warnings(&warnings);
 
-    let lib_dir = config.project_root.join("deploy").join("lib");
     let stack_ts = crate::commands::deploy::init::render_stack_ts_for_deploy(
         &config.target.target_type,
         &config.server.name,
         &config.iam,
         &config.metadata,
     );
-    // DSTK-01: skip the write (preserving an operator-curated stack.ts) unless
-    // `--regenerate-stack`/`--force` was passed. IAM validation above always
+    // DSTK-01: skip the write (preserving an operator-curated, hand-modified
+    // stack.ts) unless `--regenerate-stack`/`--force` was passed; an
+    // unmodified scaffold is cargo-pmcp's own output and is regenerated (debug
+    // session `cargo-pmcp-deploy-targets`, #4). IAM validation above always
     // runs, so the guard never disables validation.
-    let wrote = crate::deployment::config::write_stack_ts_guarded(
-        &lib_dir,
-        &stack_ts,
-        config.regenerate_stack,
-    )?;
+    let wrote = crate::deployment::scaffold_provenance::write_scaffold_stack_ts(config, &stack_ts)?;
     if !wrote {
         println!("{}", crate::deployment::config::STACK_TS_PRESERVED_NOTICE);
         // FIX #1 (deploy-toml-inert-for-preserved-stack): warn loudly when the
@@ -1665,6 +1689,37 @@ mod tests {
                 .any(|c| c.contains("mcp:customStack=true")),
             "the taint must reach the cdk synth context args"
         );
+    }
+
+    /// A8: a stale template from an earlier app.ts stack id must not be
+    /// uploaded in place of the current one.
+    #[test]
+    fn find_template_file_prefers_the_expected_stack_over_a_stale_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for name in ["aaa-old-stack", "acme-stack", "zzz-other-stack"] {
+            std::fs::write(tmp.path().join(format!("{name}.template.json")), "{}")
+                .expect("write template");
+        }
+        assert_eq!(
+            find_template_file(tmp.path(), "acme").expect("found"),
+            tmp.path().join("acme-stack.template.json")
+        );
+    }
+
+    #[test]
+    fn find_template_file_falls_back_to_the_first_template_by_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for name in ["b-custom", "a-custom"] {
+            std::fs::write(tmp.path().join(format!("{name}.template.json")), "{}")
+                .expect("write template");
+        }
+        std::fs::write(tmp.path().join("manifest.json"), "{}").expect("write manifest");
+        assert_eq!(
+            find_template_file(tmp.path(), "acme").expect("found"),
+            tmp.path().join("a-custom.template.json")
+        );
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(find_template_file(empty.path(), "acme").is_err());
     }
 
     /// `mark_custom_stack` is a no-op on `None` — a project with no

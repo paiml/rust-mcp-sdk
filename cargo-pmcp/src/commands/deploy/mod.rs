@@ -39,7 +39,95 @@ fn try_detect_name_from_cargo(project_root: &Path) -> Result<Option<String>> {
         }
     }
 
-    Ok(read_root_package_name(&cargo_toml))
+    Ok(read_root_package_name(&cargo_toml)
+        .map(|package| crate::deployment::server_name::default_server_name(&package)))
+}
+
+/// The `[server] name` a `deploy init` that does not go through
+/// `InitCommand` directly (pmcp-run, cloudflare-workers) works with (debug
+/// session `cargo-pmcp-deploy-targets`, finding #3).
+///
+/// An existing `.pmcp/deploy.toml` keeps its name (re-init never resets it);
+/// `--name` renames it there, as a verified one-line edit. Without a
+/// deploy.toml: `--name`, else the package default.
+fn init_server_name(project_root: &Path, explicit: Option<&str>) -> Result<String> {
+    if project_root.join(".pmcp/deploy.toml").exists() {
+        let kept = crate::deployment::DeployConfig::load(project_root)?;
+        return match explicit.filter(|name| *name != kept.server.name) {
+            Some(name) => Ok(
+                rename_server_in_deploy_toml(project_root, &kept.server.name, name)?
+                    .server
+                    .name,
+            ),
+            None => Ok(kept.server.name),
+        };
+    }
+    explicit.map_or_else(
+        || detect_server_name(project_root),
+        |name| Ok(name.to_string()),
+    )
+}
+
+/// The config `deploy init --target-type google-cloud-run` scaffolds from.
+///
+/// An existing `.pmcp/deploy.toml` is kept (Cloud Run init never rewrites
+/// it); `--name` renames its server in place, as a verified one-line edit.
+/// A new one defaults the name to the package name with `-lambda` stripped.
+fn cloud_run_init_config(
+    project_root: &Path,
+    region: &str,
+    explicit_name: Option<&str>,
+) -> Result<crate::deployment::DeployConfig> {
+    let deploy_toml_path = project_root.join(".pmcp/deploy.toml");
+    if deploy_toml_path.exists() {
+        let kept = crate::deployment::DeployConfig::load(project_root)?;
+        return match explicit_name.filter(|name| *name != kept.server.name) {
+            Some(name) => rename_server_in_deploy_toml(project_root, &kept.server.name, name),
+            None => Ok(kept),
+        };
+    }
+    let server_name = match explicit_name {
+        Some(name) => name.to_string(),
+        None => detect_server_name(project_root)?,
+    };
+    let region_str = if region.is_empty() {
+        "us-central1".to_string()
+    } else {
+        region.to_string()
+    };
+    Ok(
+        crate::deployment::DeployConfig::default_for_cloud_run_server(
+            server_name,
+            "your-gcp-project-id".to_string(),
+            region_str,
+            project_root.to_path_buf(),
+        ),
+    )
+}
+
+/// Rename `[server] name` in an existing `.pmcp/deploy.toml`, editing only
+/// that line, and return the reloaded config.
+fn rename_server_in_deploy_toml(
+    project_root: &Path,
+    old: &str,
+    new: &str,
+) -> Result<crate::deployment::DeployConfig> {
+    let path = project_root.join(".pmcp/deploy.toml");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let edited =
+        crate::deployment::deploy_toml_edit::set_string_in_table(&text, "server", "name", new)
+            .with_context(|| {
+                format!(
+                    "could not set `name` in the [server] table of {} automatically (it is not a \
+                     plain `name = \"...\"` line). Set `name = \"{new}\"` under [server] by hand, \
+                     then re-run. Nothing was changed.",
+                    path.display()
+                )
+            })?;
+    std::fs::write(&path, edited).with_context(|| format!("Failed to write {}", path.display()))?;
+    println!("📝 .pmcp/deploy.toml: [server] name \"{old}\" -> \"{new}\"");
+    crate::deployment::DeployConfig::load(project_root)
 }
 
 /// Scan `<project_root>/core-workspace/*/Cargo.toml` for a package name,
@@ -329,6 +417,15 @@ pub enum DeployAction {
         /// Enable social login providers (comma-separated: github,google,apple)
         #[arg(long, value_name = "PROVIDERS", value_delimiter = ',')]
         social_providers: Option<Vec<String>>,
+
+        /// Server name: `[server] name` in .pmcp/deploy.toml. It names the
+        /// deployment (on aws-lambda the stack is `<NAME>-stack` and the
+        /// function `<NAME>`). On an existing deploy.toml it renames the server
+        /// and keeps every other setting. Default for a new deploy.toml: the
+        /// Cargo package name with one trailing `-lambda` removed. Without
+        /// this flag, an existing deploy.toml's name is kept.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
 
     /// View deployment logs
@@ -647,7 +744,11 @@ impl DeployCommand {
                         cognito_user_pool_id,
                         cognito_pool_name,
                         social_providers,
+                        name,
                     } => {
+                        if let Some(name) = name {
+                            crate::deployment::server_name::validate_server_name(name)?;
+                        }
                         // For init, route through InitCommand for aws-lambda and
                         // container targets (azure-container-apps). InitCommand
                         // dispatches on target_type at the top of execute():
@@ -659,6 +760,9 @@ impl DeployCommand {
                                 .with_region(region)
                                 .with_credentials_check(!skip_credentials_check)
                                 .with_target_type(&target_id);
+                            if let Some(name) = name {
+                                cmd = cmd.with_server_name(name);
+                            }
 
                             // Configure OAuth if specified
                             if let Some(provider) = oauth {
@@ -698,23 +802,8 @@ impl DeployCommand {
                             // instead of silently falling back to a default
                             // scaffold (which would mask a malformed
                             // deploy.toml as "no file present").
-                            let deploy_toml_path = project_root.join(".pmcp/deploy.toml");
-                            let config = if deploy_toml_path.exists() {
-                                crate::deployment::DeployConfig::load(&project_root)?
-                            } else {
-                                let server_name = detect_server_name(&project_root)?;
-                                let region_str = if region.is_empty() {
-                                    "us-central1".to_string()
-                                } else {
-                                    region.clone()
-                                };
-                                crate::deployment::DeployConfig::default_for_cloud_run_server(
-                                    server_name,
-                                    "your-gcp-project-id".to_string(),
-                                    region_str,
-                                    project_root.clone(),
-                                )
-                            };
+                            let config =
+                                cloud_run_init_config(&project_root, region, name.as_deref())?;
                             target.init(&config).await
                         } else {
                             // For other targets (pmcp-run, google-cloud-run, …), use the
@@ -723,7 +812,7 @@ impl DeployCommand {
                             // this, a google-cloud-run init wrote an AWS-shape deploy.toml
                             // (no [gcp], required [aws]/memory_mb), then save_if_missing
                             // cemented it on every re-init (n51 follow-up #1).
-                            let server_name = detect_server_name(&project_root)?;
+                            let server_name = init_server_name(&project_root, name.as_deref())?;
                             let mut config = default_config_for_target(
                                 &target_id,
                                 server_name,
@@ -2162,5 +2251,135 @@ mod target_resolution_tests {
         // A wholly-unrelated value yields no hint (so the message has no
         // misleading suggestion).
         assert!(near_miss_hint("totally-bogus", VALID).is_none());
+    }
+}
+
+/// `deploy init` name handling for the targets that do not go through
+/// `InitCommand` (debug session `cargo-pmcp-deploy-targets`, finding #3).
+#[cfg(test)]
+mod init_server_name_tests {
+    use super::*;
+
+    fn project(package: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("Cargo.toml");
+        tmp
+    }
+
+    fn write_deploy_toml(root: &Path, text: &str) {
+        std::fs::create_dir_all(root.join(".pmcp")).expect("mkdir .pmcp");
+        std::fs::write(root.join(".pmcp/deploy.toml"), text).expect("write deploy.toml");
+    }
+
+    const CLOUD_RUN_TOML: &str = "\
+[target]
+type = \"google-cloud-run\"
+version = \"1.0.0\"
+
+[gcp]
+project_id = \"acme-prod\"
+region = \"europe-west2\"
+
+[server]
+name = \"acme-forecast\"
+binary = \"serve\"
+
+[environment]
+RUST_LOG = \"info\"
+";
+
+    /// #3 on Cloud Run: a NEW deploy.toml defaults the name to the package
+    /// name with one trailing `-lambda` removed.
+    #[test]
+    fn cloud_run_fresh_init_strips_a_trailing_lambda() {
+        let tmp = project("forecast-coach-lambda");
+        let config = cloud_run_init_config(tmp.path(), "us-central1", None).expect("config");
+        assert_eq!(config.server.name, "forecast-coach");
+    }
+
+    #[test]
+    fn cloud_run_fresh_init_with_name_uses_it() {
+        let tmp = project("forecast-coach-lambda");
+        let config =
+            cloud_run_init_config(tmp.path(), "us-central1", Some("acme")).expect("config");
+        assert_eq!(config.server.name, "acme");
+    }
+
+    /// `--name` on an existing Cloud Run deploy.toml renames the server in
+    /// the file (Cloud Run init otherwise never rewrites an existing file)
+    /// and keeps everything else.
+    #[test]
+    fn cloud_run_reinit_with_name_renames_in_place() {
+        let tmp = project("forecast-coach-lambda");
+        write_deploy_toml(tmp.path(), CLOUD_RUN_TOML);
+
+        let config =
+            cloud_run_init_config(tmp.path(), "us-central1", Some("acme")).expect("config");
+
+        assert_eq!(config.server.name, "acme");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".pmcp/deploy.toml")).expect("read"),
+            CLOUD_RUN_TOML.replace("name = \"acme-forecast\"", "name = \"acme\"")
+        );
+    }
+
+    #[test]
+    fn cloud_run_reinit_without_name_keeps_the_file() {
+        let tmp = project("forecast-coach-lambda");
+        write_deploy_toml(tmp.path(), CLOUD_RUN_TOML);
+        let config = cloud_run_init_config(tmp.path(), "us-central1", None).expect("config");
+        assert_eq!(config.server.name, "acme-forecast");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".pmcp/deploy.toml")).expect("read"),
+            CLOUD_RUN_TOML
+        );
+    }
+
+    /// pmcp-run / cloudflare: the package default for a new deploy.toml, an
+    /// existing deploy.toml's name otherwise, and `--name` renames it there.
+    #[test]
+    fn other_targets_prefer_explicit_then_existing_then_default() {
+        let tmp = project("forecast-coach-lambda");
+        assert_eq!(
+            init_server_name(tmp.path(), None).expect("default"),
+            "forecast-coach"
+        );
+        assert_eq!(
+            init_server_name(tmp.path(), Some("acme")).expect("explicit"),
+            "acme"
+        );
+        write_deploy_toml(tmp.path(), CLOUD_RUN_TOML);
+        assert_eq!(
+            init_server_name(tmp.path(), None).expect("kept"),
+            "acme-forecast"
+        );
+        assert_eq!(
+            init_server_name(tmp.path(), Some("acme")).expect("explicit"),
+            "acme"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".pmcp/deploy.toml")).expect("read"),
+            CLOUD_RUN_TOML.replace("name = \"acme-forecast\"", "name = \"acme\""),
+            "--name renames the kept file in place, nothing else"
+        );
+    }
+
+    /// A kept deploy.toml whose name the `--name` rule would reject (an
+    /// underscore) is still kept: validation applies to `--name` only.
+    #[test]
+    fn an_existing_name_is_never_validated() {
+        let tmp = project("forecast-coach-lambda");
+        write_deploy_toml(
+            tmp.path(),
+            &CLOUD_RUN_TOML.replace("name = \"acme-forecast\"", "name = \"acme_forecast\""),
+        );
+        assert_eq!(
+            init_server_name(tmp.path(), None).expect("kept"),
+            "acme_forecast"
+        );
     }
 }

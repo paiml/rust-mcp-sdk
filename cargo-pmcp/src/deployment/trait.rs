@@ -51,9 +51,21 @@ pub struct DeploymentOutputs {
     pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`DeploymentOutputs::display`] ran on this thread. Lets
+    /// a test assert that a deploy path leaves printing the outputs to the
+    /// CLI, which prints them exactly once (debug session
+    /// `cargo-pmcp-deploy-targets`, A2).
+    pub(crate) static DISPLAY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl DeploymentOutputs {
     /// Display outputs in human-readable format
     pub fn display(&self) {
+        #[cfg(test)]
+        DISPLAY_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         println!("📊 Deployment Outputs:");
         println!();
 

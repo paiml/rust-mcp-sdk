@@ -5,43 +5,121 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [0.27.2] - 2026-10-02
+## [0.28.0] - 2026-10-02
+
+The `aws-lambda` deployment's identity follows `[server] name`, and a rename can
+no longer silently replace a running deployment. Field report against 0.27.0
+(forecast-coach), findings #1-#4 and the adjacent defects found while fixing
+them. (0.27.2 was never published; its stack guard ships here.)
 
 ### Fixed
 
 - **A `[server] name` rename can no longer silently update a different
-  aws-lambda stack.** `deploy init` writes the server name into
-  `deploy/bin/app.ts` once, as a literal, and nothing regenerates it, while the
-  CLI reports, reads outputs for and destroys `{[server] name}-stack`. After a
-  rename, `npx cdk deploy` (run with no stack argument) deployed whatever stack
-  `app.ts` still declared, so it updated the OLD stack in place, and with
-  `--regenerate-stack` it also replaced the old function. Before `cdk deploy`,
-  cargo-pmcp now runs `npx cdk list` in `deploy/`, with the deploy's own
-  environment, and refuses unless the app declares `{[server] name}-stack`. The
-  refusal happens before any CloudFormation change and before
-  `--regenerate-stack` rewrites an existing `stack.ts`. It names the expected
-  and the declared stack and says how to recover (keep the old name, or point
-  `app.ts` at the new one, which creates a new stack). `cdk deploy` now names
-  the stack explicitly. If `cdk list` fails, the deploy is refused, because the
-  stack cannot be verified. Field report against 0.27.0 (forecast-coach).
-
-- **`deploy destroy` on aws-lambda no longer reports success for a stack it did
-  not destroy.** `cdk destroy <name>` matches no stack and still exits 0 when the
-  CDK app does not declare `<name>` (aws-cdk #27179), so after a rename `destroy`
-  printed "destroyed successfully", and `--clean` deleted `deploy/` and
-  `.pmcp/deploy.toml`, while the stack kept running. The same guard now refuses
-  first and prints the direct recovery,
-  `aws cloudformation delete-stack --stack-name <name>-stack --region <region>`.
+  `aws-lambda` stack.** `deploy init` wrote the server name into
+  `deploy/bin/app.ts` once, as a literal, while the CLI reports, reads outputs
+  for and destroys `{[server] name}-stack`. After a rename, `npx cdk deploy`
+  (run with no stack argument) deployed whatever stack `app.ts` still
+  declared: it updated the OLD stack in place, and with `--regenerate-stack`
+  it also replaced the old function. Now:
+  - an unmodified `app.ts` follows `[server] name`: on the `npx cdk deploy`
+    path, when `app.ts` and `stack.ts` are both still cargo-pmcp's own, the
+    deploy rewrites `app.ts` for the current name, so a rename deploys a NEW
+    stack;
+  - before `cdk deploy`, cargo-pmcp runs `npx cdk list` in `deploy/` with the
+    deploy's own environment and refuses unless the app declares
+    `{[server] name}-stack` (a hand-edited `app.ts`, or one next to a
+    hand-modified `stack.ts` whose `serverName` still names the old function).
+    The refusal happens before any CloudFormation change and before
+    `--regenerate-stack` rewrites a `stack.ts`; it names the expected and the
+    declared stack and how to recover, and a refused deploy restores `app.ts`.
+    If `cdk list` fails, the deploy is refused, because the stack cannot be
+    verified;
+  - `cdk deploy` names the stack explicitly.
+- **`deploy destroy` on `aws-lambda` removes what deploy created.** It used to
+  run `npx cdk destroy`, which reaches only a stack the CDK app declares and
+  exits 0 when none matches (aws-cdk #27179): after a rename it printed
+  "destroyed successfully", and `--clean` deleted `deploy/` and
+  `.pmcp/deploy.toml`, while the stack kept running. A stack the native
+  CloudFormation engine created was not reachable at all once `app.ts`
+  disagreed, and destroy ran in the shell's region rather than `[aws] region`.
+  Destroy now deletes `{[server] name}-stack` through CloudFormation
+  (`DeleteStack` in `[aws] region`, then waits), whichever engine created it,
+  with no Node.js. If that stack does not exist it reports "nothing to
+  delete", unless `deploy/outputs.json` records another stack that still
+  exists: then it refuses, naming both stacks and the recovery, so `--clean`
+  cannot remove the files of a running deployment. A `DELETE_FAILED` stack
+  fails the command with its recent failure events.
+- **`deploy outputs` and the deploy summary read the outputs of
+  `{[server] name}-stack` by name.** They took the first stack in
+  `deploy/outputs.json` and labelled it with the configured name, so after a
+  rename the old stack's URL was shown as the new stack's.
+- **Deployment outputs are printed once.** The `aws-lambda` target printed
+  them, and then the CLI printed them again.
+- **The `npx cdk deploy` fallback no longer builds the Lambda binary a second
+  time.** It deploys the binary `cargo pmcp deploy` already built.
+- **The native CloudFormation engine recognizes CloudFormation's own error
+  messages.** It classified errors with `to_string()`, which for AWS SDK
+  errors is only "service error" / "unhandled error (ValidationError)", so a
+  first deploy (stack not yet created) failed with "DescribeStacks failed"
+  and a no-change redeploy failed with "UpdateStack failed". It now reads the
+  service message.
+- **`pmcp-run`: the synthesized template of the current stack is uploaded.**
+  `cdk synth` leaves templates of earlier stack ids in `deploy/cdk.out`, and
+  the first `*.template.json` in directory order was used. It now prefers
+  `{[server] name}-stack.template.json`.
 
 ### Changed
 
-- The `npx cdk` legacy path of an aws-lambda deploy, and every aws-lambda
-  `destroy`, now runs one extra `cdk list` synth (a few seconds). A hand-written
-  `deploy/bin/app.ts` that declares a stack under a name other than
-  `{[server] name}-stack` is now refused rather than deployed. That shape was
+- **`deploy init` keeps an existing `.pmcp/deploy.toml`.** On `aws-lambda`,
+  `azure-container-apps` and `pmcp-run`, re-running `deploy init` used to
+  rewrite the whole file from defaults: `[server] name` went back to the
+  package name, and `[environment]`, `[iam]`, `[secrets]`, `[metadata]` and
+  sizing were dropped. Now the file is kept byte for byte, comments included.
+  Init changes only what is asked for, each as a one-line edit that is
+  re-parsed and checked: `--name` renames the server, an explicit
+  `--target-type` that differs updates `[target] type`, and a missing `[aws]`
+  section is appended on the AWS targets. The kept `[aws] region` wins over
+  `--region`/`AWS_REGION`, and init says so. A `deploy.toml` that does not
+  parse now stops init instead of being replaced. OAuth flags that would
+  change a kept `[auth]` are refused; without flags, a kept Cognito `[auth]`
+  drives the scaffold (re-init no longer swaps an OAuth `stack.ts` for the
+  plain one).
+- **New default server name: the package name with one trailing `-lambda`
+  removed** (`forecast-coach-lambda` deploys as `forecast-coach`), on every
+  target, for NEW deploy.toml files only. When the project root itself is the
+  `<name>-lambda` package, init no longer scaffolds a wrapper package of the
+  same name.
+- **"Hand-modified `stack.ts`" now means "differs from what cargo-pmcp last
+  wrote".** `deploy init` and every deploy that writes `deploy/lib/stack.ts`
+  record its SHA-256 in `deploy/.pmcp-scaffold.toml` (commit it with
+  `deploy/`). It used to mean "differs from what the current deploy.toml would
+  render", so a `[server] name` rename, an `[iam]`/`[metadata]` change, or a
+  newer template sent an untouched scaffold to `npx cdk deploy`, which built
+  the binary twice and ignored `[server]` sizing. An unmodified scaffold is
+  now regenerated on deploy without `--regenerate-stack`; a hand-modified one
+  is preserved, as before. Projects initialized earlier are recognized on
+  their first deploy (current-config or init-time render, including the name
+  in the file's own `serverName` literal) and recorded. The OAuth (Cognito)
+  `stack.ts` is never recorded and keeps deploying through `npx cdk deploy`.
+- The `npx cdk deploy` path runs one extra `cdk list` synth (a few seconds). A
+  hand-written `deploy/bin/app.ts` that declares a stack under a name other
+  than `{[server] name}-stack` is refused rather than deployed; that shape was
   already inconsistent with what `deploy outputs` and `deploy destroy` target.
-  The unmodified-scaffold path (native CloudFormation engine) and the `pmcp-run`
-  target are unaffected.
+
+### Added
+
+- **`deploy init --name <NAME>`** sets `[server] name` (validated: ASCII
+  letters, digits and hyphens, starting with a letter, at most 64
+  characters). On an existing deploy.toml it renames the server and keeps
+  everything else.
+- **Before CREATING a stack, the native CloudFormation engine checks that no
+  other live stack owns the Lambda function name.** A rename that an earlier
+  cargo-pmcp deployed with `--regenerate-stack` renamed the function inside
+  the old stack; creating `{new}-stack` then failed with "already exists" and
+  left it in `ROLLBACK_COMPLETE`. The deploy now refuses first, naming the
+  owning stack and the two ways out (rename back, or delete the old stack).
+  The check is advisory: if `DescribeStackResources` is not allowed, the
+  deploy proceeds.
 
 ## [0.24.3] - 2026-09-18
 

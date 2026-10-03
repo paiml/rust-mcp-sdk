@@ -88,12 +88,20 @@ fn render_aws_lambda_metadata_block(meta: &StackMetadata) -> String {
     lines
 }
 
+#[derive(Clone)]
 pub struct InitCommand {
     project_root: PathBuf,
     region: String,
     check_credentials: bool,
     oauth_options: OAuthOptions,
     target_type: String,
+    /// `--name`: the `[server] name` to use. `None` keeps an existing
+    /// deploy.toml's name, or derives the default for a new one.
+    server_name: Option<String>,
+    /// A name the caller already resolved, used only for a NEW deploy.toml in
+    /// place of [`Self::get_server_name`]'s package default. Never validated
+    /// (it may be the package default) and never renames an existing file.
+    default_server_name: Option<String>,
 }
 
 impl InitCommand {
@@ -106,11 +114,29 @@ impl InitCommand {
             check_credentials: true,
             oauth_options: OAuthOptions::default(),
             target_type: "aws-lambda".to_string(),
+            server_name: None,
+            default_server_name: None,
         }
     }
 
     pub fn with_region(mut self, region: &str) -> Self {
         self.region = region.to_string();
+        self
+    }
+
+    /// Set `[server] name` explicitly (`deploy init --name`). On an existing
+    /// `.pmcp/deploy.toml` this renames the server; everything else in the
+    /// file is kept.
+    pub fn with_server_name(mut self, name: &str) -> Self {
+        self.server_name = Some(name.to_string());
+        self
+    }
+
+    /// Use `name` for a NEW `.pmcp/deploy.toml` instead of deriving it from
+    /// Cargo.toml. An existing deploy.toml keeps its own name. For callers
+    /// that resolved the name themselves (the `pmcp-run` init path).
+    pub fn with_default_server_name(mut self, name: &str) -> Self {
+        self.default_server_name = Some(name.to_string());
         self
     }
 
@@ -165,30 +191,31 @@ impl InitCommand {
             self.check_aws_credentials()?;
         }
 
-        // 2. Get server name from Cargo.toml
-        let server_name = self.get_server_name()?;
-
-        // 3. Determine OAuth configuration
-        let oauth_enabled = self.oauth_options.provider.as_deref() == Some("cognito")
-            || self.oauth_options.shared.is_some();
-
+        // 2. Create (or keep) .pmcp/deploy.toml. It decides the server name
+        //    and, when kept, the OAuth setup the scaffold follows.
+        let config = self.resolve_deploy_config()?;
+        let server_name = config.server.name.clone();
+        let init = self.with_effective_oauth(&config);
+        let oauth_enabled = init.oauth_flags_enabled();
         if oauth_enabled {
             println!("🔐 OAuth authentication enabled");
         }
 
-        // 4. Create .pmcp/deploy.toml
-        self.create_config(&server_name)?;
+        // 3. Create deploy/ directory with CDK templates
+        init.create_cdk_project(&server_name)?;
 
-        // 5. Create deploy/ directory with CDK templates
-        self.create_cdk_project(&server_name)?;
-
-        // 6. Install CDK dependencies
-        self.install_cdk_deps()?;
+        // 4. Install CDK dependencies
+        init.install_cdk_deps()?;
 
         println!();
         println!("✅ AWS Lambda deployment initialized!");
         println!();
+        init.print_next_steps(&server_name, oauth_enabled);
+        Ok(())
+    }
 
+    /// The closing summary of [`Self::execute`].
+    fn print_next_steps(&self, server_name: &str, oauth_enabled: bool) {
         if oauth_enabled {
             println!("OAuth Configuration:");
             if let Some(ref provider) = self.oauth_options.provider {
@@ -222,8 +249,6 @@ impl InitCommand {
             println!("  Authorization: <api-url>/oauth2/authorize");
             println!("  Token:         <api-url>/oauth2/token");
         }
-
-        Ok(())
     }
 
     /// Initialise a container deploy target (e.g. Azure Container Apps).
@@ -238,15 +263,13 @@ impl InitCommand {
         println!("🚀 Initializing {target_id} deployment...");
         println!();
 
-        // 1. Resolve the server name and write the deploy.toml stub.
-        //    `create_config` sets `config.target.target_type = self.target_type`.
-        let server_name = self.get_server_name()?;
-        self.create_config(&server_name)?;
+        // 1. Write the deploy.toml stub, or keep an existing one.
+        //    Either way `[target] type` ends up as `self.target_type`.
+        let config = self.resolve_deploy_config()?;
 
         // 2. Resolve the target and run its own init() (Dockerfile + .dockerignore).
         let registry = crate::deployment::TargetRegistry::new();
         let target = registry.get(target_id)?;
-        let config = crate::deployment::config::DeployConfig::load(&self.project_root)?;
 
         // `execute()` is sync but is itself invoked from inside the tokio runtime
         // started by `DeployCommand::execute` (block_on). Creating a *new* runtime
@@ -305,7 +328,7 @@ impl InitCommand {
             .and_then(|p| p.get("name"))
             .and_then(|n| n.as_str())
         {
-            return Ok(name.to_string());
+            return Ok(crate::deployment::server_name::default_server_name(name));
         }
 
         // Otherwise, check if this is a workspace
@@ -376,6 +399,163 @@ impl InitCommand {
         }
 
         anyhow::bail!("Could not find package name or workspace members in Cargo.toml")
+    }
+
+    /// `true` when OAuth flags (`--oauth cognito`, `--oauth-shared`) were given.
+    fn oauth_flags_enabled(&self) -> bool {
+        self.oauth_options.provider.as_deref() == Some("cognito")
+            || self.oauth_options.shared.is_some()
+    }
+
+    /// This command with the OAuth options the scaffold must follow: the
+    /// flags when given, otherwise a kept deploy.toml's Cognito `[auth]`.
+    ///
+    /// Without the second half, re-running `deploy init` (no flags) on an
+    /// OAuth project would keep `[auth] enabled = true` in deploy.toml while
+    /// rewriting stack.ts as the plain, OAuth-less scaffold.
+    fn with_effective_oauth(&self, config: &crate::deployment::config::DeployConfig) -> Self {
+        let mut effective = self.clone();
+        let auth = &config.auth;
+        if self.oauth_flags_enabled() || !(auth.enabled && auth.provider == "cognito") {
+            return effective;
+        }
+        let cognito = auth.cognito.as_ref();
+        effective.oauth_options = OAuthOptions {
+            provider: Some("cognito".to_string()),
+            shared: None,
+            cognito_user_pool_id: cognito
+                .and_then(|c| c.user_pool_id.clone())
+                .or_else(|| auth.user_pool_id.clone()),
+            cognito_pool_name: cognito.and_then(|c| c.user_pool_name.clone()),
+            social_providers: cognito
+                .map(|c| c.social_providers.clone())
+                .unwrap_or_default(),
+        };
+        effective
+    }
+
+    /// The deploy config this init works with: an existing
+    /// `.pmcp/deploy.toml` is KEPT (debug session `cargo-pmcp-deploy-targets`,
+    /// findings #3/A4), otherwise a new one is written.
+    ///
+    /// Re-running `deploy init` used to rewrite the whole file from defaults,
+    /// resetting `[server] name` to the package name and dropping
+    /// `[environment]`, `[iam]`, `[secrets]`, `[metadata]` and sizing.
+    pub(crate) fn resolve_deploy_config(&self) -> Result<crate::deployment::config::DeployConfig> {
+        if let Some(name) = &self.server_name {
+            crate::deployment::server_name::validate_server_name(name)?;
+        }
+        if self.project_root.join(".pmcp/deploy.toml").exists() {
+            return self.keep_existing_config();
+        }
+        let server_name = match self
+            .server_name
+            .as_ref()
+            .or(self.default_server_name.as_ref())
+        {
+            Some(name) => name.clone(),
+            None => self.get_server_name()?,
+        };
+        self.create_config(&server_name)?;
+        crate::deployment::config::DeployConfig::load(&self.project_root)
+    }
+
+    /// Keep an existing `.pmcp/deploy.toml`. Only what this init explicitly
+    /// asks for changes, each as a verified in-place edit: `--name`, a
+    /// different `--target-type`, and an `[aws]` section the AWS targets need
+    /// when the file has none. Everything else (comments included) stays
+    /// byte-for-byte. Refuses, before writing anything, OAuth flags that
+    /// contradict the kept `[auth]`.
+    fn keep_existing_config(&self) -> Result<crate::deployment::config::DeployConfig> {
+        let path = self.project_root.join(".pmcp/deploy.toml");
+        let kept = crate::deployment::config::DeployConfig::load(&self.project_root).context(
+            "`deploy init` keeps an existing .pmcp/deploy.toml, so it must parse: fix it, or move \
+             it aside to scaffold a new one",
+        )?;
+        self.ensure_oauth_flags_match(&kept.auth)?;
+
+        let original = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let (edited, changes) = self.planned_config_edits(&original, &kept)?;
+        if edited != original {
+            std::fs::write(&path, &edited)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+        println!("📝 Keeping existing deployment configuration (.pmcp/deploy.toml)... ✅");
+        for change in &changes {
+            println!("   • {change}");
+        }
+        self.note_kept_region(&kept);
+
+        crate::deployment::config::DeployConfig::load(&self.project_root)
+    }
+
+    /// The in-place edits [`Self::keep_existing_config`] applies, and a
+    /// human-readable line for each.
+    fn planned_config_edits(
+        &self,
+        original: &str,
+        kept: &crate::deployment::config::DeployConfig,
+    ) -> Result<(String, Vec<String>)> {
+        let mut text = original.to_string();
+        let mut changes = Vec::new();
+        if let Some(name) = self
+            .server_name
+            .as_deref()
+            .filter(|n| *n != kept.server.name)
+        {
+            text = edit_deploy_toml(&text, "server", "name", name)?;
+            changes.push(format!(
+                "[server] name: \"{}\" -> \"{name}\"",
+                kept.server.name
+            ));
+        }
+        if kept.target.target_type != self.target_type {
+            text = edit_deploy_toml(&text, "target", "type", &self.target_type)?;
+            changes.push(format!(
+                "[target] type: \"{}\" -> \"{}\"",
+                kept.target.target_type, self.target_type
+            ));
+        }
+        if needs_aws_section(&self.target_type) && kept.aws.is_none() {
+            let section = format!(
+                "[aws]\nregion = {}\n",
+                crate::deployment::deploy_toml_edit::toml_string_literal(&self.region)
+            );
+            text = crate::deployment::deploy_toml_edit::append_section(&text, &section);
+            changes.push(format!("added [aws] region = \"{}\"", self.region));
+        }
+        Ok((text, changes))
+    }
+
+    /// Refuse OAuth flags that would change a kept `[auth]`: applying them
+    /// would overwrite the operator's section, and ignoring them would
+    /// scaffold an OAuth stack the config does not describe.
+    fn ensure_oauth_flags_match(&self, auth: &crate::deployment::config::AuthConfig) -> Result<()> {
+        if !self.oauth_flags_enabled() || (auth.enabled && auth.provider == "cognito") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "refusing to change [auth] in the existing .pmcp/deploy.toml: it has \
+             `enabled = {}`, `provider = \"{}\"`, and --oauth/--oauth-shared asks for Cognito \
+             OAuth. `deploy init` keeps an existing deploy.toml. Set `[auth] enabled = true` and \
+             `provider = \"cognito\"` there (see `cargo pmcp deploy init --help`), or move the file \
+             aside to scaffold a new one, then re-run. Nothing was changed.",
+            auth.enabled,
+            auth.provider
+        )
+    }
+
+    /// Say so when `--region` / `AWS_REGION` differs from the kept `[aws]
+    /// region`, which wins.
+    fn note_kept_region(&self, kept: &crate::deployment::config::DeployConfig) {
+        if let Some(aws) = kept.aws.as_ref().filter(|aws| aws.region != self.region) {
+            println!(
+                "   • kept [aws] region = \"{}\" (--region / AWS_REGION is \"{}\"; edit \
+                 .pmcp/deploy.toml to change it)",
+                aws.region, self.region
+            );
+        }
     }
 
     fn create_config(&self, server_name: &str) -> Result<()> {
@@ -563,33 +743,7 @@ impl InitCommand {
     fn create_app_ts(&self, deploy_dir: &PathBuf, server_name: &str) -> Result<()> {
         let bin_dir = deploy_dir.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
-
-        let app_ts = format!(
-            r#"#!/usr/bin/env node
-import * as cdk from 'aws-cdk-lib';
-import {{ McpServerStack }} from '../lib/stack';
-
-const app = new cdk.App();
-
-// Stack name is hardcoded from config
-const serverName = '{}';
-const region = process.env.AWS_REGION || process.env.CDK_DEFAULT_REGION || 'us-east-1';
-
-new McpServerStack(app, `${{serverName}}-stack`, {{
-  env: {{
-    account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: region,
-  }},
-  description: `MCP Server: ${{serverName}}`,
-}});
-
-app.synth();
-"#,
-            server_name
-        );
-
-        std::fs::write(bin_dir.join("app.ts"), app_ts)?;
-
+        std::fs::write(bin_dir.join("app.ts"), render_app_ts(server_name))?;
         Ok(())
     }
 
@@ -598,7 +752,11 @@ app.synth();
         std::fs::create_dir_all(&lib_dir)?;
         let iam = crate::deployment::config::IamConfig::default();
         let stack_ts = self.render_stack_ts(server_name, &iam, &StackMetadata::default());
-        std::fs::write(lib_dir.join("stack.ts"), stack_ts)?;
+        std::fs::write(lib_dir.join("stack.ts"), &stack_ts)?;
+        // Provenance (debug session `cargo-pmcp-deploy-targets`, #4): record
+        // what was written, so a later `[server] name` rename still sees this
+        // file as cargo-pmcp's own, unmodified scaffold.
+        crate::deployment::scaffold_provenance::record_stack_ts(&self.project_root, &stack_ts)?;
         Ok(())
     }
 
@@ -913,6 +1071,17 @@ export class McpServerStack extends cdk.Stack {{
         Ok(())
     }
 
+    /// `[package] name` of the project root's Cargo.toml, if it has one.
+    fn root_package_name(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.project_root.join("Cargo.toml")).ok()?;
+        let cargo_toml: toml::Value = toml::from_str(&text).ok()?;
+        cargo_toml
+            .get("package")?
+            .get("name")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     /// Find an existing Lambda wrapper package in the workspace.
     /// Returns the first *-lambda package that has a 'bootstrap' binary.
     fn find_existing_lambda_wrapper(
@@ -939,6 +1108,17 @@ export class McpServerStack extends cdk.Stack {{
         if lambda_wrapper_dir.exists() {
             println!(
                 "   ℹ️  Lambda wrapper '{}' already exists, skipping creation",
+                new_package_name
+            );
+            return Ok(());
+        }
+
+        // The project root may itself be the `<server>-lambda` package: the
+        // default server name is the package name with `-lambda` stripped.
+        // Creating a wrapper package of the same name would break the build.
+        if self.root_package_name().as_deref() == Some(new_package_name.as_str()) {
+            println!(
+                "   ℹ️  The project package '{}' is the Lambda package, skipping wrapper creation",
                 new_package_name
             );
             return Ok(());
@@ -1788,6 +1968,14 @@ export class McpServerStack extends cdk.Stack {{
         );
 
         std::fs::write(lib_dir.join("stack.ts"), stack_ts)?;
+        // Deliberately NOT recorded as an unmodified scaffold. `cargo pmcp
+        // deploy` regenerates an unmodified stack.ts from
+        // `render_stack_ts_for_deploy`, which has no Cognito branch, so a
+        // recorded OAuth stack.ts would be replaced by the plain one. Left
+        // unrecorded it stays "hand-modified": preserved, and deployed through
+        // `npx cdk deploy`, exactly as before. Drop any record an earlier
+        // non-OAuth init left behind.
+        crate::deployment::scaffold_provenance::forget_stack_ts(&self.project_root)?;
 
         Ok(())
     }
@@ -1899,18 +2087,80 @@ export class McpServerStack extends cdk.Stack {{
 /// fails if the two ever disagree.
 ///
 /// Threading the config value into the template instead was measured and
-/// REJECTED: `stack_routing::custom_stack_ts_reason` routes on a strict
-/// byte-match between the on-disk stack.ts and a fresh render, while
-/// `write_stack_ts_guarded` keeps the on-disk file frozen — so changing the
-/// template would make EVERY existing project (pristine scaffolds included)
-/// fail the byte-match, silently fall back to `npx cdk synth`, and be falsely
-/// tainted as hand-modified via `mcp:customStack`.
+/// REJECTED at the time: `stack_routing::custom_stack_ts_reason` then routed
+/// on a strict byte-match between the on-disk stack.ts and a fresh render,
+/// while `write_stack_ts_guarded` kept the on-disk file frozen — so changing
+/// the template would have made EVERY existing project (pristine scaffolds
+/// included) fail the byte-match, silently fall back to `npx cdk synth`, and
+/// be falsely tainted as hand-modified via `mcp:customStack`. Since 0.28.0
+/// routing compares against the stack.ts cargo-pmcp last WROTE
+/// (`deployment::scaffold_provenance`) and an unmodified scaffold is
+/// regenerated on deploy, so a template change no longer has that fallout.
 pub(crate) const AWS_LAMBDA_SCAFFOLD_MEMORY_MB: u32 = 512;
 
 /// The `cdk.Duration.seconds(...)` literal the `aws-lambda` scaffold writes
 /// into `deploy/lib/stack.ts` for the MCP function. See
 /// [`AWS_LAMBDA_SCAFFOLD_MEMORY_MB`].
 pub(crate) const AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS: u32 = 30;
+
+/// Whether `target_type` deploys through AWS and so needs `[aws] region`.
+fn needs_aws_section(target_type: &str) -> bool {
+    matches!(target_type, "aws-lambda" | "pmcp-run")
+}
+
+/// Set `[table] key = "value"` in an existing deploy.toml text, or explain why
+/// it cannot be done safely (nothing is written in that case).
+fn edit_deploy_toml(text: &str, table: &str, key: &str, value: &str) -> Result<String> {
+    crate::deployment::deploy_toml_edit::set_string_in_table(text, table, key, value).with_context(
+        || {
+            format!(
+                "could not set `{key}` in the [{table}] table of .pmcp/deploy.toml automatically \
+                 (it is not a plain `{key} = \"...\"` line). Set `{key} = \"{value}\"` under \
+                 [{table}] by hand, then re-run. Nothing was changed."
+            )
+        },
+    )
+}
+
+/// The literal prefix of the `serverName` line in the `deploy/bin/app.ts`
+/// scaffold. [`app_ts_scaffold_name`] parses the name back out of it.
+const APP_TS_SERVER_NAME_PREFIX: &str = "const serverName = '";
+
+/// Render the `deploy/bin/app.ts` scaffold: a CDK app declaring the single
+/// stack `{server_name}-stack`.
+pub fn render_app_ts(server_name: &str) -> String {
+    format!(
+        r"#!/usr/bin/env node
+import * as cdk from 'aws-cdk-lib';
+import {{ McpServerStack }} from '../lib/stack';
+
+const app = new cdk.App();
+
+// Stack name is hardcoded from config
+{APP_TS_SERVER_NAME_PREFIX}{server_name}';
+const region = process.env.AWS_REGION || process.env.CDK_DEFAULT_REGION || 'us-east-1';
+
+new McpServerStack(app, `${{serverName}}-stack`, {{
+  env: {{
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: region,
+  }},
+  description: `MCP Server: ${{serverName}}`,
+}});
+
+app.synth();
+"
+    )
+}
+
+/// The server name an UNMODIFIED `deploy/bin/app.ts` scaffold was rendered
+/// for, or `None` when `content` is not exactly [`render_app_ts`]'s output for
+/// any name (a hand-edited app.ts, or one from a much older cargo-pmcp).
+pub fn app_ts_scaffold_name(content: &str) -> Option<String> {
+    let start = content.find(APP_TS_SERVER_NAME_PREFIX)? + APP_TS_SERVER_NAME_PREFIX.len();
+    let name = &content[start..start + content[start..].find('\'')?];
+    (render_app_ts(name) == content).then(|| name.to_string())
+}
 
 /// Render `deploy/lib/stack.ts` for an already-loaded `DeployConfig`.
 ///
@@ -1932,6 +2182,8 @@ pub(crate) fn render_stack_ts_for_deploy(
         check_credentials: false,
         oauth_options: OAuthOptions::default(),
         target_type: target_type.to_string(),
+        server_name: None,
+        default_server_name: None,
     };
     init.render_stack_ts(server_name, iam, &stack_meta)
 }
@@ -1955,6 +2207,8 @@ mod wave1_stack_ts_tests {
             check_credentials: false,
             oauth_options: OAuthOptions::default(),
             target_type: target_type.to_string(),
+            server_name: None,
+            default_server_name: None,
         }
     }
 
@@ -2404,6 +2658,8 @@ mod azure_container_init_tests {
             check_credentials: false,
             oauth_options: OAuthOptions::default(),
             target_type: "azure-container-apps".to_string(),
+            server_name: None,
+            default_server_name: None,
         }
     }
 
@@ -2448,5 +2704,323 @@ mod azure_container_init_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `deploy init` and an existing deployment's identity (debug session
+/// `cargo-pmcp-deploy-targets`, findings #3/A4 and the #4 provenance record).
+#[cfg(test)]
+mod deploy_identity_init_tests {
+    use super::*;
+    use crate::deployment::scaffold_provenance::{content_digest, recorded_stack_ts_digest};
+
+    /// The reporter's crate shape: one package named `*-lambda`.
+    const PACKAGE_CARGO_TOML: &str =
+        "[package]\nname = \"forecast-coach-lambda\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+    /// A deploy.toml an operator has tuned: custom name, region, sizing,
+    /// environment, IAM, and a comment.
+    const EXISTING: &str = "\
+# hand-tuned for the forecast-coach private deployment
+[target]
+type = \"aws-lambda\"
+version = \"1.0.0\"
+
+[aws]
+region = \"eu-west-2\"
+
+[server]
+name = \"acme-forecast\"
+memory_mb = 1769
+timeout_seconds = 60
+
+[environment]
+MODEL_URL = \"s3://models/forecast\"
+RUST_LOG = \"debug\"
+
+[[iam.tables]]
+name = \"Forecasts\"
+actions = [\"read\"]
+";
+
+    fn project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), PACKAGE_CARGO_TOML).expect("Cargo.toml");
+        tmp
+    }
+
+    fn init(root: &std::path::Path, target: &str) -> InitCommand {
+        InitCommand::new(root.to_path_buf())
+            .with_region("us-east-1")
+            .with_credentials_check(false)
+            .with_target_type(target)
+    }
+
+    fn write_deploy_toml(root: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(root.join(".pmcp")).expect("mkdir .pmcp");
+        std::fs::write(root.join(".pmcp/deploy.toml"), text).expect("write deploy.toml");
+    }
+
+    fn read_deploy_toml(root: &std::path::Path) -> String {
+        std::fs::read_to_string(root.join(".pmcp/deploy.toml")).expect("read deploy.toml")
+    }
+
+    /// #3 / A4, the reported case: re-running `deploy init` reset
+    /// `[server] name` to the package name and dropped every other section.
+    /// It must keep the file, byte for byte.
+    #[test]
+    fn reinit_keeps_an_existing_deploy_toml_byte_for_byte() {
+        let tmp = project();
+        write_deploy_toml(tmp.path(), EXISTING);
+
+        let config = init(tmp.path(), "aws-lambda")
+            .resolve_deploy_config()
+            .expect("re-init succeeds");
+
+        assert_eq!(read_deploy_toml(tmp.path()), EXISTING);
+        assert_eq!(config.server.name, "acme-forecast");
+        assert_eq!(config.aws().region, "eu-west-2");
+        assert_eq!(config.server.memory_mb, Some(1769));
+        assert_eq!(
+            config.environment.get("MODEL_URL").map(String::as_str),
+            Some("s3://models/forecast")
+        );
+        assert_eq!(config.iam.tables.len(), 1);
+    }
+
+    /// `--name` renames the server on an existing deploy.toml and changes
+    /// nothing else.
+    #[test]
+    fn reinit_with_name_renames_and_keeps_everything_else() {
+        let tmp = project();
+        write_deploy_toml(tmp.path(), EXISTING);
+
+        let config = init(tmp.path(), "aws-lambda")
+            .with_server_name("acme")
+            .resolve_deploy_config()
+            .expect("rename succeeds");
+
+        assert_eq!(config.server.name, "acme");
+        assert_eq!(
+            read_deploy_toml(tmp.path()),
+            EXISTING.replace("name = \"acme-forecast\"", "name = \"acme\"")
+        );
+    }
+
+    #[test]
+    fn reinit_rejects_an_invalid_name_and_changes_nothing() {
+        let tmp = project();
+        write_deploy_toml(tmp.path(), EXISTING);
+
+        let err = init(tmp.path(), "aws-lambda")
+            .with_server_name("acme forecast")
+            .resolve_deploy_config()
+            .expect_err("an invalid name must be refused");
+
+        assert!(err.to_string().contains("--name"), "{err:#}");
+        assert_eq!(read_deploy_toml(tmp.path()), EXISTING);
+    }
+
+    /// #3: a NEW deploy.toml defaults the name to the package name with one
+    /// trailing `-lambda` removed.
+    #[test]
+    fn fresh_init_strips_a_trailing_lambda_from_the_package_name() {
+        let tmp = project();
+        let config = init(tmp.path(), "aws-lambda")
+            .resolve_deploy_config()
+            .expect("fresh init succeeds");
+        assert_eq!(config.server.name, "forecast-coach");
+        assert!(read_deploy_toml(tmp.path()).contains("name = \"forecast-coach\""));
+    }
+
+    #[test]
+    fn fresh_init_with_name_uses_it() {
+        let tmp = project();
+        let config = init(tmp.path(), "aws-lambda")
+            .with_server_name("acme")
+            .resolve_deploy_config()
+            .expect("fresh init succeeds");
+        assert_eq!(config.server.name, "acme");
+    }
+
+    /// The pmcp-run path hands `InitCommand` the name it already resolved: it
+    /// names a NEW deploy.toml (even one the `--name` rule would reject,
+    /// such as a package default with an underscore) and never renames an
+    /// existing one.
+    #[test]
+    fn a_caller_resolved_default_name_never_renames_or_validates() {
+        let fresh = project();
+        let config = init(fresh.path(), "pmcp-run")
+            .with_default_server_name("my_server")
+            .resolve_deploy_config()
+            .expect("fresh init succeeds");
+        assert_eq!(config.server.name, "my_server");
+
+        let kept = project();
+        write_deploy_toml(kept.path(), EXISTING);
+        let config = init(kept.path(), "aws-lambda")
+            .with_default_server_name("something-else")
+            .resolve_deploy_config()
+            .expect("re-init succeeds");
+        assert_eq!(config.server.name, "acme-forecast");
+        assert_eq!(read_deploy_toml(kept.path()), EXISTING);
+    }
+
+    /// An explicit target type that differs from the kept file updates only
+    /// `[target] type`.
+    #[test]
+    fn reinit_for_another_target_updates_only_the_type() {
+        let tmp = project();
+        write_deploy_toml(tmp.path(), EXISTING);
+
+        let config = init(tmp.path(), "pmcp-run")
+            .resolve_deploy_config()
+            .expect("re-init succeeds");
+
+        assert_eq!(config.target.target_type, "pmcp-run");
+        assert_eq!(
+            read_deploy_toml(tmp.path()),
+            EXISTING.replace("type = \"aws-lambda\"", "type = \"pmcp-run\"")
+        );
+    }
+
+    /// "Only add missing target sections": a kept deploy.toml without
+    /// `[aws]` gets one (the aws-lambda deploy path needs it), and keeps the
+    /// rest, including sections another target uses.
+    #[test]
+    fn reinit_adds_a_missing_aws_section_and_keeps_the_rest() {
+        let tmp = project();
+        let cloud_run = "[target]\ntype = \"google-cloud-run\"\nversion = \"1.0.0\"\n\n\
+                         [gcp]\nproject_id = \"acme-prod\"\nregion = \"europe-west2\"\n\n\
+                         [server]\nname = \"acme-forecast\"\n\n[environment]\nRUST_LOG = \"info\"\n";
+        write_deploy_toml(tmp.path(), cloud_run);
+
+        let config = init(tmp.path(), "aws-lambda")
+            .resolve_deploy_config()
+            .expect("re-init succeeds");
+
+        let text = read_deploy_toml(tmp.path());
+        assert!(text.contains("project_id = \"acme-prod\""), "{text}");
+        assert!(
+            text.ends_with("\n\n[aws]\nregion = \"us-east-1\"\n"),
+            "{text}"
+        );
+        assert_eq!(config.server.name, "acme-forecast");
+        assert_eq!(config.aws().region, "us-east-1");
+        assert_eq!(config.target.target_type, "aws-lambda");
+    }
+
+    /// Flags that would change a kept `[auth]` are refused rather than
+    /// silently ignored (the scaffold would otherwise disagree with the
+    /// config) or silently applied (overwriting the operator's section).
+    #[test]
+    fn reinit_refuses_oauth_flags_that_contradict_the_kept_auth() {
+        let tmp = project();
+        write_deploy_toml(tmp.path(), EXISTING);
+
+        let err = init(tmp.path(), "aws-lambda")
+            .with_oauth_provider("cognito")
+            .resolve_deploy_config()
+            .expect_err("must refuse");
+
+        assert!(format!("{err:#}").contains("[auth]"), "{err:#}");
+        assert_eq!(read_deploy_toml(tmp.path()), EXISTING);
+    }
+
+    /// Re-init without OAuth flags on a project whose kept deploy.toml has
+    /// Cognito OAuth scaffolds the OAuth stack again, from the kept settings,
+    /// instead of replacing it with the plain one.
+    #[test]
+    fn kept_cognito_auth_drives_the_oauth_scaffold() {
+        let tmp = project();
+        let with_auth = format!(
+            "{EXISTING}\n[auth]\nenabled = true\nprovider = \"cognito\"\n\n\
+             [auth.cognito]\nuser_pool_name = \"acme-users\"\nsocial_providers = [\"github\"]\n"
+        );
+        write_deploy_toml(tmp.path(), &with_auth);
+        let cmd = init(tmp.path(), "aws-lambda");
+        let config = cmd.resolve_deploy_config().expect("re-init succeeds");
+
+        let effective = cmd.with_effective_oauth(&config);
+
+        assert_eq!(effective.oauth_options.provider.as_deref(), Some("cognito"));
+        assert_eq!(
+            effective.oauth_options.cognito_pool_name.as_deref(),
+            Some("acme-users")
+        );
+        assert_eq!(
+            effective.oauth_options.social_providers,
+            vec!["github".to_string()]
+        );
+    }
+
+    /// Azure goes through the same config step (`init_container_target`).
+    #[test]
+    fn azure_reinit_keeps_the_existing_server_name() {
+        let tmp = project();
+        write_deploy_toml(
+            tmp.path(),
+            &EXISTING.replace("type = \"aws-lambda\"", "type = \"azure-container-apps\""),
+        );
+        let config = init(tmp.path(), "azure-container-apps")
+            .resolve_deploy_config()
+            .expect("re-init succeeds");
+        assert_eq!(config.server.name, "acme-forecast");
+    }
+
+    /// #4: init records the stack.ts it writes, so a later rename still sees
+    /// an unmodified scaffold.
+    #[test]
+    fn init_records_the_scaffold_stack_ts() {
+        let tmp = project();
+        let deploy_dir = tmp.path().join("deploy");
+        init(tmp.path(), "aws-lambda")
+            .create_stack_ts(&deploy_dir, "acme")
+            .expect("write stack.ts");
+        let written =
+            std::fs::read_to_string(deploy_dir.join("lib/stack.ts")).expect("read stack.ts");
+        assert_eq!(
+            recorded_stack_ts_digest(tmp.path()),
+            Some(content_digest(&written))
+        );
+    }
+
+    /// The Cognito stack.ts is not what a deploy regenerates, so it must never
+    /// be recorded as an unmodified scaffold (a deploy would replace it).
+    #[test]
+    fn oauth_init_leaves_the_stack_ts_unrecorded() {
+        let tmp = project();
+        let deploy_dir = tmp.path().join("deploy");
+        let cmd = init(tmp.path(), "aws-lambda");
+        cmd.create_stack_ts(&deploy_dir, "acme").expect("plain");
+        cmd.create_oauth_stack_ts(&deploy_dir, "acme")
+            .expect("oauth");
+        assert_eq!(recorded_stack_ts_digest(tmp.path()), None);
+    }
+
+    /// With the stripped default, the root package `forecast-coach-lambda` IS
+    /// the `<server>-lambda` package for server `forecast-coach`: init must
+    /// not scaffold a second package of the same name inside it.
+    #[test]
+    fn init_does_not_create_a_wrapper_named_like_the_root_package() {
+        let tmp = project();
+        init(tmp.path(), "aws-lambda")
+            .create_lambda_wrapper("forecast-coach")
+            .expect("the root package is the wrapper");
+        assert!(!tmp.path().join("forecast-coach-lambda").exists());
+    }
+
+    #[test]
+    fn app_ts_scaffold_name_round_trips_and_rejects_edits() {
+        for name in ["acme", "forecast-coach-lambda", "a"] {
+            assert_eq!(
+                app_ts_scaffold_name(&render_app_ts(name)).as_deref(),
+                Some(name)
+            );
+        }
+        let edited = render_app_ts("acme").replace("us-east-1", "eu-west-2");
+        assert_eq!(app_ts_scaffold_name(&edited), None);
+        assert_eq!(app_ts_scaffold_name("const serverName = 'x"), None);
+        assert_eq!(app_ts_scaffold_name(""), None);
     }
 }

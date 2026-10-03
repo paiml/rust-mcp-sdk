@@ -7,6 +7,8 @@
 //! status, and records whether `lib/stack.ts` existed (relative to the child's
 //! working directory, which is the project's `deploy/` directory) and which
 //! `SERVER_NAME` / `AWS_REGION` it saw. Every other invocation exits 0.
+//! [`FakeNpx::listing_scaffold_app_ts`] instead answers `cdk list` from the
+//! project's current `bin/app.ts`, the way CDK would for the scaffold.
 
 use std::path::{Path, PathBuf};
 
@@ -21,10 +23,37 @@ impl FakeNpx {
     /// stdout and `list_stderr` on stderr, then exits with `list_exit`.
     pub fn new(dir: &Path, list_stdout: &str, list_stderr: &str, list_exit: i32) -> Self {
         std::fs::create_dir_all(dir).expect("create fake-npx dir");
-        let log = dir.join("calls.log");
         let out = dir.join("list.out");
-        let err = dir.join("list.err");
         std::fs::write(&out, list_stdout).expect("write list.out");
+        Self::with_list_command(
+            dir,
+            &format!("cat '{}'", out.display()),
+            list_stderr,
+            list_exit,
+        )
+    }
+
+    /// Like [`Self::new`], but `cdk list` answers the way CDK would for the
+    /// `deploy/bin/app.ts` scaffold: it prints `<serverName>-stack`, parsed
+    /// from the `const serverName = '...';` line of the CURRENT `bin/app.ts`.
+    pub fn listing_scaffold_app_ts(dir: &Path) -> Self {
+        Self::with_list_command(
+            dir,
+            "sed -n \"s/^const serverName = '\\(.*\\)';\\$/\\1-stack/p\" bin/app.ts",
+            "",
+            0,
+        )
+    }
+
+    fn with_list_command(
+        dir: &Path,
+        list_stdout_cmd: &str,
+        list_stderr: &str,
+        list_exit: i32,
+    ) -> Self {
+        std::fs::create_dir_all(dir).expect("create fake-npx dir");
+        let log = dir.join("calls.log");
+        let err = dir.join("list.err");
         std::fs::write(&err, list_stderr).expect("write list.err");
         let script = dir.join("npx");
         let body = format!(
@@ -34,13 +63,12 @@ impl FakeNpx {
              \x20 if [ -f lib/stack.ts ]; then echo 'probe stack.ts=present' >> '{log}'; \
              else echo 'probe stack.ts=missing' >> '{log}'; fi\n\
              \x20 echo \"probe SERVER_NAME=$SERVER_NAME AWS_REGION=$AWS_REGION\" >> '{log}'\n\
-             \x20 cat '{out}'\n\
+             \x20 {list_stdout_cmd}\n\
              \x20 cat '{err}' >&2\n\
              \x20 exit {list_exit}\n\
              fi\n\
              exit 0\n",
             log = log.display(),
-            out = out.display(),
             err = err.display(),
         );
         std::fs::write(&script, body).expect("write fake npx");

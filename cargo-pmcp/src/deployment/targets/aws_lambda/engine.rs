@@ -49,13 +49,14 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use aws_sdk_cloudformation::error::ProvideErrorMetadata;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::deployment::r#trait::DeploymentOutputs;
 
 /// Poll interval for `describe_stacks` while waiting for a terminal status.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How many trailing hex characters of the artifact's SHA-256 digest to use
 /// in its S3 key (`{server}/bootstrap-{prefix}.zip`) — 12 hex chars = 48
@@ -90,6 +91,9 @@ pub struct EngineParams {
     pub bucket: String,
     /// Project root, for writing `deploy/outputs.json` (step 5).
     pub project_root: PathBuf,
+    /// The MCP function's `FunctionName` (`[server] name`), checked by
+    /// [`preflight_create`] before a stack is CREATED.
+    pub function_name: String,
 }
 
 /// Deploy an already-rendered CloudFormation `template_json` per the flow
@@ -111,7 +115,12 @@ pub async fn deploy_stack(template_json: &str, params: EngineParams) -> Result<D
     upload_artifact(&s3, &params.bucket, &params.s3_key, params.artifact_bytes).await?;
 
     let describer = AwsStackDescriber { client: &cfn };
-    apply_stack(&cfn, &params.stack_name, template_json, &describer).await?;
+    let target = StackTarget {
+        stack_name: &params.stack_name,
+        function_name: &params.function_name,
+        region: &params.region,
+    };
+    apply_stack(&cfn, &target, template_json, &describer).await?;
 
     let raw_outputs = poll_to_terminal(&describer, &params.stack_name, POLL_INTERVAL).await?;
 
@@ -145,7 +154,7 @@ pub(crate) async fn resolve_account_id(region: &str) -> Result<String> {
 
 /// Load the AWS SDK config for `region` (standard credential/region chain
 /// via `aws-config`).
-async fn load_aws_config(region: &str) -> aws_config::SdkConfig {
+pub(super) async fn load_aws_config(region: &str) -> aws_config::SdkConfig {
     aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()))
         .load()
@@ -295,7 +304,7 @@ async fn upload_artifact(
 
 /// Result of describing a stack by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StackLookup {
+pub(super) enum StackLookup {
     /// No stack with this name exists yet (CREATE path).
     NotFound,
     /// A stack exists; carries its current status and (if any) outputs.
@@ -308,17 +317,17 @@ enum StackLookup {
 /// One CloudFormation stack event, reduced to the three fields
 /// [`format_failure_events`] reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StackEvent {
-    logical_id: String,
-    status: String,
-    reason: Option<String>,
+pub(super) struct StackEvent {
+    pub(super) logical_id: String,
+    pub(super) status: String,
+    pub(super) reason: Option<String>,
 }
 
 /// Describe/poll operations, abstracted away from `aws_sdk_cloudformation`
 /// types so the classification/poll-loop logic is unit-testable via a
 /// scripted stub (T8 `Downloader`-trait precedent).
 #[async_trait]
-trait StackDescriber: Send + Sync {
+pub(super) trait StackDescriber: Send + Sync {
     async fn describe(&self, stack_name: &str) -> Result<StackLookup>;
     /// The most recent (up to [`MAX_FAILURE_EVENTS`]) failure-classified
     /// events for `stack_name`, newest first.
@@ -365,20 +374,161 @@ fn classify_terminal_status(status: &str) -> Option<TerminalOutcome> {
     }
 }
 
-/// `true` when a CloudFormation API error's displayed message indicates the
-/// stack does not exist. CloudFormation models this as an untyped/generic
-/// error (`DescribeStacksError` has no dedicated "not found" variant), so
-/// this is a documented substring match on the message CloudFormation
-/// itself uses (`"<name> does not exist"`), not a typed error match.
-fn is_stack_not_found_error(msg: &str) -> bool {
+/// The service's own message for an AWS SDK error, which is what
+/// [`is_stack_not_found_error`] and [`is_no_updates_error`] must be given.
+///
+/// NOT `err.to_string()`: an `SdkError` displays as just "service error", and
+/// a `CloudFormation` operation error as "unhandled error (<code>)". Neither
+/// carries `CloudFormation`'s message, so classifying `to_string()` never
+/// matched: a first deploy (the stack does not exist yet) failed with
+/// "DescribeStacks failed", a no-change redeploy failed with "UpdateStack
+/// failed", and a destroy could not see the deletion finish (debug session
+/// `cargo-pmcp-deploy-targets`, A9).
+pub(super) fn aws_error_message(err: &impl ProvideErrorMetadata) -> &str {
+    err.message().unwrap_or_default()
+}
+
+/// `true` when a `CloudFormation` API error's message (see
+/// [`aws_error_message`]) indicates the stack does not exist. `CloudFormation`
+/// models this as an untyped/generic error (`DescribeStacksError` has no
+/// dedicated "not found" variant), so this is a documented substring match on
+/// the message `CloudFormation` itself uses (`"<name> does not exist"`), not a
+/// typed error match.
+pub(super) fn is_stack_not_found_error(msg: &str) -> bool {
     msg.contains("does not exist")
 }
 
-/// `true` when an `UpdateStack` error's displayed message is CloudFormation's
-/// "nothing changed" response — brief: "treat `No updates are to be
+/// `true` when an `UpdateStack` error's message (see [`aws_error_message`]) is
+/// `CloudFormation`'s "nothing changed" response — brief: "treat `No updates are to be
 /// performed` as success".
 fn is_no_updates_error(msg: &str) -> bool {
     msg.contains("No updates are to be performed")
+}
+
+/// Which live `CloudFormation` stack owns a Lambda function, abstracted away
+/// from `aws_sdk_cloudformation` so [`preflight_create`] is unit-testable.
+#[async_trait]
+pub(super) trait FunctionOwnerLookup: Send + Sync {
+    /// The live stack owning the `AWS::Lambda::Function` whose physical id
+    /// (function name) is `function_name`, or `None` when no live stack owns
+    /// one.
+    async fn function_owner(&self, function_name: &str) -> Result<Option<String>>;
+}
+
+/// Before CREATING `stack_name`, refuse when its function name already
+/// belongs to another live stack (debug session `cargo-pmcp-deploy-targets`,
+/// A6).
+///
+/// The create would fail with "already exists" and leave `stack_name` in
+/// `ROLLBACK_COMPLETE`, which blocks every later deploy until it is deleted.
+/// The known way into this state: a cargo-pmcp before 0.28.0 deployed a
+/// `[server] name` rename with `--regenerate-stack` while deploy/bin/app.ts
+/// still declared the old stack, renaming the function INSIDE the old stack.
+///
+/// Advisory, not a gate: if the owner cannot be looked up (e.g. no
+/// `cloudformation:DescribeStackResources` permission), the deploy proceeds.
+pub(super) async fn preflight_create(
+    lookup: &dyn FunctionOwnerLookup,
+    stack_name: &str,
+    function_name: &str,
+    region: &str,
+) -> Result<()> {
+    let owner = match lookup.function_owner(function_name).await {
+        Ok(owner) => owner,
+        Err(err) => {
+            eprintln!(
+                "  {} could not check whether Lambda function `{function_name}` already belongs \
+                 to another CloudFormation stack ({err:#}); continuing.",
+                console::style("warning:").yellow()
+            );
+            return Ok(());
+        },
+    };
+    match owner {
+        Some(owner) if owner != stack_name => bail!(
+            "{}",
+            function_owned_elsewhere_message(stack_name, function_name, &owner, region)
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The refusal [`preflight_create`] prints, with the two ways out.
+fn function_owned_elsewhere_message(
+    stack_name: &str,
+    function_name: &str,
+    owner: &str,
+    region: &str,
+) -> String {
+    let keep = owner
+        .strip_suffix("-stack")
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || format!("set `[server] name` in .pmcp/deploy.toml to the name `{owner}` was deployed with"),
+            |name| format!("set `[server] name = \"{name}\"` in .pmcp/deploy.toml"),
+        );
+    format!(
+        "refusing to create CloudFormation stack `{stack_name}`: its Lambda function \
+         `{function_name}` already exists and belongs to stack `{owner}`.\n\
+         Creating `{stack_name}` would fail with \"already exists\" and leave it in \
+         ROLLBACK_COMPLETE. This typically follows a `[server] name` rename that a cargo-pmcp \
+         before 0.28.0 deployed with `--regenerate-stack`: the function was renamed inside \
+         `{owner}`.\n\
+         Nothing was deployed. To recover, choose one:\n  \
+         - Keep the existing deployment: {keep}, then re-run. The function gets its old name \
+         back.\n  \
+         - Replace it with `{stack_name}`: delete it first, \
+         aws cloudformation delete-stack --stack-name {owner} --region {region}\n    \
+         then re-run once the deletion has finished."
+    )
+}
+
+/// [`FunctionOwnerLookup`] against `CloudFormation`: `DescribeStackResources`
+/// by physical id returns the resources of the stack that owns it.
+struct AwsFunctionOwnerLookup<'a> {
+    client: &'a aws_sdk_cloudformation::Client,
+}
+
+#[async_trait]
+impl FunctionOwnerLookup for AwsFunctionOwnerLookup<'_> {
+    async fn function_owner(&self, function_name: &str) -> Result<Option<String>> {
+        match self
+            .client
+            .describe_stack_resources()
+            .physical_resource_id(function_name)
+            .send()
+            .await
+        {
+            Ok(output) => Ok(output
+                .stack_resources()
+                .iter()
+                .find(|resource| is_live_function_named(resource, function_name))
+                .and_then(|resource| resource.stack_name().map(str::to_string))),
+            Err(err) if is_stack_not_found_error(aws_error_message(&err)) => Ok(None),
+            Err(err) => Err(err).context("CloudFormation DescribeStackResources failed"),
+        }
+    }
+}
+
+/// A not-deleted `AWS::Lambda::Function` whose physical id is `name`.
+/// `DescribeStackResources` also reports resources of stacks deleted in the
+/// last 90 days, which no longer own anything.
+fn is_live_function_named(
+    resource: &aws_sdk_cloudformation::types::StackResource,
+    name: &str,
+) -> bool {
+    resource.physical_resource_id() == Some(name)
+        && resource.resource_type() == Some("AWS::Lambda::Function")
+        && resource
+            .resource_status()
+            .is_none_or(|status| status.as_str() != "DELETE_COMPLETE")
+}
+
+/// Which stack [`apply_stack`] creates or updates, and what a create checks.
+struct StackTarget<'a> {
+    stack_name: &'a str,
+    function_name: &'a str,
+    region: &'a str,
 }
 
 /// Create-or-update `stack_name` from `template_json`, classifying via
@@ -386,13 +536,21 @@ fn is_no_updates_error(msg: &str) -> bool {
 /// treated as success, not an error.
 async fn apply_stack(
     cfn: &aws_sdk_cloudformation::Client,
-    stack_name: &str,
+    target: &StackTarget<'_>,
     template_json: &str,
     describer: &dyn StackDescriber,
 ) -> Result<()> {
+    let stack_name = target.stack_name;
     let lookup = describer.describe(stack_name).await?;
     match classify_action(&lookup) {
         StackAction::Create => {
+            preflight_create(
+                &AwsFunctionOwnerLookup { client: cfn },
+                stack_name,
+                target.function_name,
+                target.region,
+            )
+            .await?;
             cfn.create_stack()
                 .stack_name(stack_name)
                 .template_body(template_json)
@@ -410,7 +568,7 @@ async fn apply_stack(
                 .send()
                 .await;
             if let Err(err) = result {
-                if !is_no_updates_error(&err.to_string()) {
+                if !is_no_updates_error(aws_error_message(&err)) {
                     return Err(err).context("CloudFormation UpdateStack failed");
                 }
             }
@@ -446,7 +604,11 @@ async fn poll_to_terminal(
 
 /// Build the bail message for a failed stack: status + up to
 /// [`MAX_FAILURE_EVENTS`] recent failure events.
-fn format_failure_events(stack_name: &str, status: &str, events: &[StackEvent]) -> String {
+pub(super) fn format_failure_events(
+    stack_name: &str,
+    status: &str,
+    events: &[StackEvent],
+) -> String {
     let mut msg = format!(
         "CloudFormation stack '{stack_name}' failed (status: {status}). Recent failure events:\n"
     );
@@ -464,8 +626,8 @@ fn format_failure_events(stack_name: &str, status: &str, events: &[StackEvent]) 
     msg
 }
 
-struct AwsStackDescriber<'a> {
-    client: &'a aws_sdk_cloudformation::Client,
+pub(super) struct AwsStackDescriber<'a> {
+    pub(super) client: &'a aws_sdk_cloudformation::Client,
 }
 
 #[async_trait]
@@ -496,7 +658,7 @@ impl StackDescriber for AwsStackDescriber<'_> {
                 Ok(StackLookup::Found { status, outputs })
             },
             Err(err) => {
-                if is_stack_not_found_error(&err.to_string()) {
+                if is_stack_not_found_error(aws_error_message(&err)) {
                     Ok(StackLookup::NotFound)
                 } else {
                     Err(err).context("CloudFormation DescribeStacks failed")
@@ -710,6 +872,50 @@ mod tests {
             "Stack with id my-stack does not exist"
         ));
         assert!(!is_stack_not_found_error("Access denied"));
+    }
+
+    /// A9: the classifiers must see `CloudFormation`'s message. The SDK error
+    /// types display WITHOUT it (an operation error shows only
+    /// `unhandled error (ValidationError)`, and `SdkError` only `service
+    /// error`), so `to_string()` never matched and a first deploy failed with
+    /// `DescribeStacks failed` instead of creating the stack.
+    #[test]
+    fn stack_not_found_is_recognized_from_the_service_message() {
+        let err = aws_sdk_cloudformation::operation::describe_stacks::DescribeStacksError::generic(
+            aws_sdk_cloudformation::error::ErrorMetadata::builder()
+                .code("ValidationError")
+                .message("Stack with id acme-stack does not exist")
+                .build(),
+        );
+        assert!(
+            !is_stack_not_found_error(&err.to_string()),
+            "Display carries no message: {err}"
+        );
+        assert!(is_stack_not_found_error(aws_error_message(&err)));
+    }
+
+    #[test]
+    fn no_updates_is_recognized_from_the_service_message() {
+        let err = aws_sdk_cloudformation::operation::update_stack::UpdateStackError::generic(
+            aws_sdk_cloudformation::error::ErrorMetadata::builder()
+                .code("ValidationError")
+                .message("No updates are to be performed.")
+                .build(),
+        );
+        assert!(!is_no_updates_error(&err.to_string()), "{err}");
+        assert!(is_no_updates_error(aws_error_message(&err)));
+    }
+
+    #[test]
+    fn an_error_without_a_message_classifies_as_neither() {
+        let err = aws_sdk_cloudformation::operation::describe_stacks::DescribeStacksError::generic(
+            aws_sdk_cloudformation::error::ErrorMetadata::builder()
+                .code("Throttling")
+                .build(),
+        );
+        assert_eq!(aws_error_message(&err), "");
+        assert!(!is_stack_not_found_error(aws_error_message(&err)));
+        assert!(!is_no_updates_error(aws_error_message(&err)));
     }
 
     #[test]
@@ -989,6 +1195,81 @@ mod tests {
             .await
             .expect("must poll through in-progress ticks to success");
         assert!(!outputs.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // preflight_create (A6: function already owned by another stack)
+    // -----------------------------------------------------------------
+
+    struct StubOwner(Result<Option<String>, String>);
+
+    #[async_trait]
+    impl FunctionOwnerLookup for StubOwner {
+        async fn function_owner(&self, _function_name: &str) -> Result<Option<String>> {
+            match &self.0 {
+                Ok(owner) => Ok(owner.clone()),
+                Err(msg) => bail!("{msg}"),
+            }
+        }
+    }
+
+    /// A6: a rename deployed with `--regenerate-stack` by cargo-pmcp before
+    /// 0.28 renamed the function INSIDE the old stack. Creating
+    /// `{new}-stack` would then fail with "already exists" and leave a stack
+    /// in `ROLLBACK_COMPLETE`. Refuse first, naming the owner and the recovery.
+    #[tokio::test]
+    async fn create_refuses_when_the_function_belongs_to_another_stack() {
+        let lookup = StubOwner(Ok(Some("forecast-coach-lambda-stack".to_string())));
+
+        let err = preflight_create(
+            &lookup,
+            "forecast-coach-acme-stack",
+            "forecast-coach-acme",
+            "us-east-1",
+        )
+        .await
+        .expect_err("a function owned by another stack must refuse the create");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("forecast-coach-acme-stack"), "{msg}");
+        assert!(msg.contains("forecast-coach-lambda-stack"), "{msg}");
+        assert!(msg.contains("`forecast-coach-acme`"), "{msg}");
+        assert!(
+            msg.contains(
+                "aws cloudformation delete-stack --stack-name forecast-coach-lambda-stack --region us-east-1"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("[server] name = \"forecast-coach-lambda\""),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_proceeds_when_no_live_stack_owns_the_function() {
+        preflight_create(&StubOwner(Ok(None)), "acme-stack", "acme", "us-east-1")
+            .await
+            .expect("no owner, no conflict");
+    }
+
+    #[tokio::test]
+    async fn create_proceeds_when_the_owner_is_the_stack_itself() {
+        let lookup = StubOwner(Ok(Some("acme-stack".to_string())));
+        preflight_create(&lookup, "acme-stack", "acme", "us-east-1")
+            .await
+            .expect("own function is no conflict");
+    }
+
+    /// The check is advisory: a lookup failure (e.g. a deployer without
+    /// `cloudformation:DescribeStackResources`) must not block a deploy that
+    /// would otherwise succeed.
+    #[tokio::test]
+    async fn a_failed_lookup_does_not_block_the_create() {
+        let lookup = StubOwner(Err("AccessDenied".to_string()));
+        preflight_create(&lookup, "acme-stack", "acme", "us-east-1")
+            .await
+            .expect("lookup failure is not a refusal");
     }
 
     #[tokio::test]

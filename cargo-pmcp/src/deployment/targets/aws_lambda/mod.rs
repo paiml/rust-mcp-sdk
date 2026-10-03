@@ -2,14 +2,13 @@ pub mod artifact;
 mod deploy;
 pub(crate) mod engine;
 pub mod init;
+mod teardown;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::ffi::OsStr;
-use std::process::Command;
 
 use crate::deployment::{
-    cdk_stack_guard::{ensure_app_declares_stack, expected_stack_name, CdkOperation},
+    cdk_stack_guard::expected_stack_name,
     r#trait::{
         BuildArtifact, DeploymentOutputs, DeploymentTarget, MetricsData, SecretsAction, TestResults,
     },
@@ -22,41 +21,6 @@ impl AwsLambdaTarget {
     pub fn new() -> Self {
         Self
     }
-}
-
-/// Run `cdk destroy {[server] name}-stack --force` in the project's `deploy/`
-/// directory, spawned through `npx` (`npx` is a parameter only so tests can
-/// substitute a recording stand-in for it).
-///
-/// Guarded first: `cdk destroy` matches no stack and still exits 0 when the
-/// CDK app does not declare the name (aws-cdk issue #27179), which made this
-/// command report success, and `--clean` delete the local deploy files, while
-/// the stack kept running. See [`crate::deployment::cdk_stack_guard`].
-fn destroy_stack(npx: &OsStr, config: &DeployConfig) -> Result<()> {
-    let deploy_dir = config.project_root.join("deploy");
-    let stack_name = expected_stack_name(&config.server.name);
-
-    // Same environment as the `cdk destroy` below (none added), so the guard
-    // lists exactly the app that destroy would synthesize.
-    let mut list = Command::new(npx);
-    list.args(["cdk", "list"]).current_dir(&deploy_dir);
-    ensure_app_declares_stack(
-        list,
-        &config.server.name,
-        CdkOperation::Destroy,
-        &config.aws().region,
-    )?;
-
-    let status = Command::new(npx)
-        .args(["cdk", "destroy", &stack_name, "--force"])
-        .current_dir(&deploy_dir)
-        .status()
-        .context("Failed to run CDK destroy")?;
-
-    if !status.success() {
-        bail!("CDK destroy failed");
-    }
-    Ok(())
 }
 
 /// Build Lambda binary - can be reused by other targets
@@ -171,19 +135,27 @@ impl DeploymentTarget for AwsLambdaTarget {
 
     async fn destroy(&self, config: &DeployConfig, clean: bool) -> Result<()> {
         let deploy_dir = config.project_root.join("deploy");
-
-        if !deploy_dir.exists() {
-            println!("⚠️  No deployment found (deploy/ directory missing)");
-            return Ok(());
-        }
+        let stack_name = expected_stack_name(&config.server.name);
 
         println!("🗑️  Destroying AWS resources...");
         println!();
 
-        destroy_stack(OsStr::new("npx"), config)?;
-
-        println!();
-        println!("✅ AWS resources destroyed successfully");
+        // Through CloudFormation directly, so a stack the native engine
+        // created is removed as surely as one `cdk deploy` created (see
+        // `teardown`'s module docs).
+        match teardown::destroy_stack(config).await? {
+            teardown::DestroyOutcome::Deleted => {
+                println!();
+                println!("✅ CloudFormation stack {stack_name} deleted");
+            },
+            teardown::DestroyOutcome::NothingToDelete => {
+                println!(
+                    "ℹ️  No CloudFormation stack named {stack_name} exists in {}; nothing to \
+                     delete.",
+                    config.aws().region
+                );
+            },
+        }
 
         if clean {
             println!();
@@ -221,8 +193,11 @@ impl DeploymentTarget for AwsLambdaTarget {
     }
 
     async fn outputs(&self, config: &DeployConfig) -> Result<DeploymentOutputs> {
-        let stack_name = format!("{}-stack", config.server.name);
-        crate::deployment::load_cdk_outputs(&config.project_root, &config.aws().region, &stack_name)
+        crate::deployment::load_cdk_outputs(
+            &config.project_root,
+            &config.aws().region,
+            &expected_stack_name(&config.server.name),
+        )
     }
 
     async fn logs(&self, _config: &DeployConfig, _tail: bool, _lines: usize) -> Result<()> {
@@ -264,79 +239,5 @@ impl DeploymentTarget for AwsLambdaTarget {
             version.unwrap_or("previous")
         );
         Ok(())
-    }
-}
-
-/// Stack-identity guard on `destroy` (debug session `cargo-pmcp-deploy-targets`,
-/// guard PR). `cdk destroy <name>` matches no stack and exits 0 when the CDK app
-/// does not declare `<name>` (aws-cdk issue #27179), so without the guard
-/// `destroy` reported success, and `--clean` deleted the local deploy files,
-/// while the stack kept running.
-#[cfg(all(test, unix))]
-mod destroy_guard_tests {
-    use super::*;
-    use crate::deployment::fake_npx::FakeNpx;
-
-    fn config(root: &std::path::Path) -> DeployConfig {
-        let mut cfg = DeployConfig::default_for_server(
-            "acme".to_string(),
-            "eu-west-2".to_string(),
-            root.to_path_buf(),
-        );
-        cfg.target.target_type = "aws-lambda".to_string();
-        cfg
-    }
-
-    #[test]
-    fn destroy_refuses_when_app_declares_another_stack() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("deploy")).expect("create deploy/");
-        let npx = FakeNpx::new(&tmp.path().join("bin"), "old-server-stack\n", "", 0);
-
-        let result = destroy_stack(npx.program().as_os_str(), &config(tmp.path()));
-
-        let err = format!(
-            "{:#}",
-            result.expect_err("a stack mismatch must refuse destroy")
-        );
-        assert!(
-            err.contains("acme-stack"),
-            "error must name the expected stack: {err}"
-        );
-        assert!(
-            err.contains("old-server-stack"),
-            "error must name the declared stack: {err}"
-        );
-        assert!(
-            err.contains(
-                "aws cloudformation delete-stack --stack-name acme-stack --region eu-west-2"
-            ),
-            "error must give the direct recovery command: {err}"
-        );
-        assert!(
-            !npx.ran("cdk destroy"),
-            "cdk destroy must never run on a mismatch; calls: {:?}",
-            npx.calls()
-        );
-    }
-
-    #[test]
-    fn destroy_runs_cdk_destroy_for_the_declared_stack() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("deploy")).expect("create deploy/");
-        let npx = FakeNpx::new(&tmp.path().join("bin"), "acme-stack\n", "", 0);
-
-        destroy_stack(npx.program().as_os_str(), &config(tmp.path()))
-            .expect("matching stack destroys");
-
-        assert_eq!(
-            npx.argv_lines(),
-            vec![
-                "cdk list".to_string(),
-                "cdk destroy acme-stack --force".to_string()
-            ],
-            "full call log: {:?}",
-            npx.calls()
-        );
     }
 }

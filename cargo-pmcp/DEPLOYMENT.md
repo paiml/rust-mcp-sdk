@@ -68,6 +68,7 @@ my-mcp-server/
 ├── .pmcp/
 │   └── deploy.toml              # Single config file
 └── deploy/                      # Created by `deploy init`
+    ├── .pmcp-scaffold.toml      # SHA-256 of the stack.ts cargo-pmcp last wrote (commit it)
     ├── cdk.json
     ├── package.json
     ├── tsconfig.json
