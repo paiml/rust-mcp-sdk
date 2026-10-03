@@ -61,30 +61,7 @@ pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutp
     println!();
 
     // Step 3: Path-dep sanity.
-    //
-    // For multi-crate-isolated layouts, `project_root` is intentionally a
-    // parent directory of the primary crate (so multiple sibling crates can
-    // be COPY'd into the Docker build context) and has no `Cargo.toml` of
-    // its own. Sanity-check the primary crate's manifest instead.
-    let cargo_toml_path = match config
-        .layout
-        .as_ref()
-        .filter(|l| l.is_multi_crate_isolated())
-    {
-        Some(layout) => config.project_root.join(&layout.primary).join("Cargo.toml"),
-        None => config.project_root.join("Cargo.toml"),
-    };
-    let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
-        .with_context(|| format!("Failed to read {}", cargo_toml_path.display()))?;
-
-    if cargo_toml.contains("path = \"/") || cargo_toml.contains("path = \"~") {
-        println!("   ⚠ Warning: Detected absolute path dependencies in Cargo.toml");
-        println!("   These will not work inside Docker build context.");
-        bail!(
-            "Cannot deploy with absolute path dependencies. \
-             Use crates.io dependencies or relative paths."
-        );
-    }
+    ensure_no_absolute_path_deps(config)?;
 
     // Step 4: docker buildx.
     println!("🔨 Building Docker image for linux/amd64...");
@@ -255,6 +232,45 @@ pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutp
     })
 }
 
+/// Refuse the deploy when a dependency the Docker build would load has an
+/// absolute `path` (it does not exist inside the build context).
+///
+/// Debug session `cargo-pmcp-deploy-targets`, finding #9: this used to be a
+/// substring match (`path = "/`) over the primary manifest's raw text, which
+/// refused a project for a commented-out `[patch]` line and missed
+/// `path="/x"`, target-specific tables and member manifests. The manifests
+/// are now parsed (see [`super::manifest::absolute_path_dependencies_in`]).
+///
+/// For multi-crate-isolated layouts, `project_root` is intentionally a
+/// parent directory of the primary crate (so multiple sibling crates can
+/// be COPY'd into the Docker build context) and has no `Cargo.toml` of
+/// its own. The walk starts at the primary crate's manifest instead.
+fn ensure_no_absolute_path_deps(config: &DeployConfig) -> Result<()> {
+    let primary = match config
+        .layout
+        .as_ref()
+        .filter(|l| l.is_multi_crate_isolated())
+    {
+        Some(layout) => config.project_root.join(&layout.primary).join("Cargo.toml"),
+        None => config.project_root.join("Cargo.toml"),
+    };
+    let findings = super::manifest::absolute_path_dependencies_in(&primary, &config.project_root)?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = findings
+        .iter()
+        .map(|f| format!("  {}: {}", f.manifest.display(), f.dependency))
+        .collect();
+    bail!(
+        "Cannot deploy: these path dependencies are absolute, so they do not exist inside the \
+         Docker build context:\n{}\nUse crates.io or git dependencies, or paths relative to the \
+         manifest that stay inside {}.",
+        lines.join("\n"),
+        config.project_root.display()
+    );
+}
+
 /// Resolved deployment parameters with deploy.toml-then-env-var precedence.
 ///
 /// `config.server.*` is the new source of truth (issue #260). Env vars
@@ -349,5 +365,116 @@ mod tests {
         assert!(params.allow_unauth);
         assert_eq!(params.ingress.as_deref(), Some("all"));
         assert_eq!(params.service_name, "test-server");
+    }
+
+    // ---------- Absolute-path guard (debug session cargo-pmcp-deploy-targets, #9) ----------
+
+    use super::super::fixture;
+    use crate::deployment::config::LayoutConfig;
+
+    fn config_at(root: &std::path::Path) -> DeployConfig {
+        DeployConfig::default_for_cloud_run_server(
+            "x".to_string(),
+            "p".to_string(),
+            "us-central1".to_string(),
+            root.to_path_buf(),
+        )
+    }
+
+    /// The field report's run 1 failed in 1 s on this manifest: the only
+    /// absolute path is on a commented-out `[patch]` line.
+    #[test]
+    fn a_commented_out_absolute_patch_line_does_not_block_the_deploy() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fixture::write_x_lambda(tmp.path());
+        ensure_no_absolute_path_deps(&config_at(tmp.path())).expect("nothing absolute");
+    }
+
+    /// `path="/x"` (no spaces) was missed by the substring match.
+    #[test]
+    fn an_unspaced_absolute_path_dependency_blocks_the_deploy_naming_it() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fixture::write_crate(
+            tmp.path(),
+            "svc",
+            &["serve"],
+            "[dependencies]\nshared = { path=\"/opt/src/shared\" }\n",
+        );
+        let message = format!(
+            "{:#}",
+            ensure_no_absolute_path_deps(&config_at(tmp.path())).expect_err("absolute")
+        );
+        assert!(
+            message.contains("[dependencies] shared = { path = \"/opt/src/shared\" }"),
+            "{message}"
+        );
+    }
+
+    /// Member manifests were never read: only the root Cargo.toml was.
+    #[test]
+    fn an_absolute_path_in_a_workspace_member_blocks_the_deploy() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .expect("root");
+        fixture::write_crate(
+            &tmp.path().join("crates/server"),
+            "server",
+            &["serve"],
+            "[target.'cfg(unix)'.dependencies]\nghost = { path = \"/opt/ghost\" }\n",
+        );
+        let message = format!(
+            "{:#}",
+            ensure_no_absolute_path_deps(&config_at(tmp.path())).expect_err("absolute")
+        );
+        assert!(message.contains("crates/server/Cargo.toml"), "{message}");
+        assert!(message.contains("ghost"), "{message}");
+    }
+
+    #[test]
+    fn relative_path_dependencies_pass() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fixture::write_crate(&tmp.path().join("core"), "core", &[], "");
+        std::fs::write(tmp.path().join("core/src/lib.rs"), "").expect("lib");
+        fixture::write_crate(
+            tmp.path(),
+            "svc",
+            &["serve"],
+            "[dependencies]\ncore = { path = \"core\" }\n\n[workspace]\n",
+        );
+        ensure_no_absolute_path_deps(&config_at(tmp.path())).expect("relative is fine");
+    }
+
+    /// Multi-crate isolated layout: the primary crate's manifest is the
+    /// entry point (the project root has no Cargo.toml).
+    #[test]
+    fn the_isolated_layout_checks_the_primary_crate() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fixture::write_crate(
+            &tmp.path().join("gcp"),
+            "gcp",
+            &["server"],
+            "[dependencies]\ncore = { path = \"../core\" }\n",
+        );
+        fixture::write_crate(
+            &tmp.path().join("core"),
+            "core",
+            &[],
+            "[dependencies]\nghost = { path = \"~/ghost\" }\n",
+        );
+        let mut config = config_at(tmp.path());
+        config.layout = Some(LayoutConfig {
+            kind: "multi-crate-isolated".to_string(),
+            primary: "gcp".to_string(),
+            path_deps: vec!["core".to_string()],
+        });
+        let message = format!(
+            "{:#}",
+            ensure_no_absolute_path_deps(&config).expect_err("absolute in a path dep")
+        );
+        assert!(message.contains("core/Cargo.toml"), "{message}");
+        assert!(message.contains("~/ghost"), "{message}");
     }
 }

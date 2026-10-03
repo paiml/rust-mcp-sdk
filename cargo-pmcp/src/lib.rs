@@ -42,12 +42,21 @@ pub mod deployment {
     /// these two leaf files via `#[path]` lets the env-gated
     /// `cloud_run_local_build` integration test render the multi-crate-isolated
     /// Dockerfile via the real generator (issue #258) without pulling in the
-    /// command layer.
+    /// command layer. `binary` (which binary the Dockerfile builds) is a leaf
+    /// the generator uses; `manifest` (absolute path-dependency detection) is
+    /// a pure leaf mounted for the `fuzz_cloud_run_manifest` fuzz target.
     #[path = "../deployment/targets/google_cloud_run"]
     pub mod google_cloud_run {
         pub mod env;
 
+        pub mod binary;
+
         pub mod dockerfile;
+
+        pub mod manifest;
+
+        #[cfg(test)]
+        pub mod fixture;
     }
 
     // Phase 79 Wave 1: schema types required by `config.rs` so the lib

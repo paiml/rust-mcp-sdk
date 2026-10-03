@@ -9,7 +9,8 @@
 //! ```bash
 //! # 1. Scaffold the deployment artifacts (Dockerfile, .dockerignore,
 //! #    cloudbuild.yaml, .pmcp/deploy.toml). Idempotent — re-running
-//! #    preserves existing files.
+//! #    keeps every existing file (delete one to regenerate it). New files
+//! #    get [gcp] region = "us-central1" unless --region says otherwise.
 //! cargo pmcp deploy init --target-type google-cloud-run
 //!
 //! # 2. Edit .pmcp/deploy.toml to fill in the GCP project, region, and
@@ -41,6 +42,17 @@
 //! EXPECTED_AUDIENCE = "abc.apps.googleusercontent.com"
 //! RUST_LOG = "info"
 //! ```
+//!
+//! ## Which binary the image runs
+//!
+//! The workspace and single-crate Dockerfiles build ONE binary and copy it
+//! by name (`cargo build --release [-p <package>] --bin <binary>`, then
+//! `cp target/release/<binary>`). `<binary>` is `[server] binary`; when it
+//! is unset, `deploy init` picks the project's only non-Lambda binary (not
+//! `bootstrap`, no `lambda` word in its name) from `cargo metadata
+//! --no-deps`, records it in a new deploy.toml, and otherwise stops with the
+//! candidates (see `binary.rs`). A crate shaped like package `x-lambda` with
+//! bins `bootstrap` + `serve` builds `serve`.
 //!
 //! ## Multi-crate isolated layout (issue #258)
 //!
@@ -92,12 +104,20 @@
 //! sourced from `deploy.toml`. The previous workflow of patching
 //! env vars via `gcloud run services update --set-env-vars` after
 //! every deploy is no longer required (#260).
+//!
+//! Before building, the deploy refuses a dependency with an absolute `path`
+//! (it does not exist inside the Docker build context). The manifests are
+//! parsed, so comments never count (see `manifest.rs`).
 
 mod auth;
+mod binary;
 mod deploy;
 mod dockerfile;
 mod env;
+#[cfg(test)]
+pub mod fixture;
 mod init;
+mod manifest;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;

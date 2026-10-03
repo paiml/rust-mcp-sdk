@@ -299,7 +299,7 @@ cargo pmcp deploy init [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--region <REGION>` | `us-east-1` / `AWS_REGION` env | AWS region for deployment |
+| `--region <REGION>` | AWS targets: `AWS_REGION` env, else `us-east-1`. `google-cloud-run`: `us-central1` | AWS targets: the AWS region. `google-cloud-run`: the `[gcp] region` of a new `deploy.toml` (`AWS_REGION` is not consulted) |
 | `--skip-credentials-check` | - | Skip credentials check |
 | `--oauth <PROVIDER>` | - | OAuth provider: `cognito`, `oidc`, `none` |
 | `--oauth-shared <NAME>` | - | Use shared OAuth infrastructure |
@@ -316,6 +316,39 @@ On `aws-lambda`, OAuth flags (`--oauth cognito`, `--oauth-shared`) that would ch
 
 The default name for a **new** `deploy.toml` is the Cargo package name with one trailing `-lambda` removed (`forecast-coach-lambda` deploys as `forecast-coach`); `-lambda` is a packaging convention, not a service name. Before 0.28.0 the package name was used as is, and `aws-lambda`/`azure-container-apps` init rewrote the whole file from defaults.
 
+### Google Cloud Run (`--target-type google-cloud-run`)
+
+`deploy init` writes four files, each only when it is missing: `.pmcp/deploy.toml`, `Dockerfile`, `.dockerignore` and `cloudbuild.yaml`. An existing file is kept byte for byte, and init says which ones it kept. To regenerate one from `.pmcp/deploy.toml` (for example `cloudbuild.yaml` after changing `[server]` or `[environment]`, which it bakes in), delete it and re-run init. Before 0.28.0, init overwrote the Dockerfile, `.dockerignore` and `cloudbuild.yaml`.
+
+**Which binary the image runs.** The generated Dockerfile builds one binary and copies it by name:
+
+| Layout | Build step |
+|---|---|
+| Root `Cargo.toml` has a `[workspace]` table | `cargo build --release -p <package> --bin <binary>` |
+| Single crate | `cargo build --release --bin <binary>` |
+| `[layout] kind = "multi-crate-isolated"` | unchanged: `--manifest-path <primary>/Cargo.toml --bin <binary>`, where `<binary>` is `[server] binary`, else `[server] name` |
+
+For the first two, `<binary>` is `[server] binary` when it is set (it must be a binary of a package in the project). Otherwise init lists the project's binaries (`cargo metadata --no-deps`, no network) and picks the only one that is not a Lambda binary. A Lambda binary is `bootstrap`, or a name with the word `lambda` in it. Init records the choice as `[server] binary` in a new `deploy.toml`. If there is no such binary, or more than one, init names the candidates and stops:
+
+```
+Error: Cannot tell which binary is the MCP server; candidates: `local` (package `forecast-coach-lambda`), `serve` (package `forecast-coach-lambda`). Set `binary = "<name>"` under [server] in .pmcp/deploy.toml, then re-run `cargo pmcp deploy init --target-type google-cloud-run`.
+```
+
+The new `deploy.toml` is written before init stops, so the line has a file to go into. The binary must serve MCP over HTTP on `0.0.0.0:$PORT`. A kept Dockerfile is yours: init does not choose a binary for it.
+
+Before 0.28.0, the workspace template built every package except those a text search over `cargo metadata` output matched for `lambda`. That search also matched dependency names (`lambda_http`) and the project's own `*-lambda` package, so cargo stopped with "no packages to compile" (issue #258). Both templates then copied whichever executable `find target/release` reached last, and `[workspace]` was detected by substring, so a commented-out `# [workspace]` counted.
+
+**Region.** A new `deploy.toml` gets `[gcp] region` from `--region`, else `us-central1`. `AWS_REGION` is not consulted. Before 0.28.0, the AWS default (`us-east-1`, or `$AWS_REGION`) was written into `[gcp]`. An existing `deploy.toml` keeps its region.
+
+**`.dockerignore`.** The builder stage compiles from source, so the whole host `target/` is ignored (and each crate's `target/` for the multi-crate isolated layout), as are `.git/`, `**/node_modules/`, `deploy/`, `cdk.out/`, `.pmcp/` and `.env` files. Paths `cargo build` reads stay in the build context: `tests/` and `benches/` (a declared `[[test]]` or `[[bench]]` whose file is missing fails the build), `README.md` (`#![doc = include_str!("../README.md")]`) and `vendor/` (a `.cargo/config.toml` source replacement). Before 0.28.0 only some `target/release` subdirectories were ignored, and a field report's build context carried 899 MB of host binaries.
+
+**Absolute path dependencies.** `cargo pmcp deploy --target google-cloud-run` refuses to build when a dependency the build loads has an absolute `path`, because that path does not exist inside the Docker build context. The check parses the manifests: `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, the same tables under `[target.<cfg>]`, `[patch.<source>]`, `[replace]` and `[workspace.dependencies]`. It reads the root (or `[layout]` primary) manifest, the workspace members, and the crates that relative path dependencies inside the project point at. Comments are not dependencies, so a commented-out `[patch]` line no longer blocks the deploy. The error names each manifest and dependency:
+
+```
+Cannot deploy: these path dependencies are absolute, so they do not exist inside the Docker build context:
+  /work/acme/crates/server/Cargo.toml: [dependencies] shared = { path = "/opt/src/shared" }
+```
+
 ### Example
 
 ```bash
@@ -325,7 +358,7 @@ cargo pmcp deploy init --target aws-lambda --oauth cognito
 # Without OAuth (add later)
 cargo pmcp deploy init --target aws-lambda
 
-# Google Cloud Run
+# Google Cloud Run (in us-central1 unless --region says otherwise)
 cargo pmcp deploy init --target google-cloud-run
 
 # Rename the server of an existing deployment config (everything else is kept)

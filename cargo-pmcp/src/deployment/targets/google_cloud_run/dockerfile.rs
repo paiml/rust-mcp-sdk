@@ -1,23 +1,31 @@
+use super::binary::{self, BuildTarget};
 use crate::deployment::{DeployConfig, LayoutConfig};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 /// Generate the Cloud Run Dockerfile for `config.project_root`.
 ///
 /// Layout selection precedence:
 /// 1. `[layout].kind = "multi-crate-isolated"` (issue #258) — surgical
 ///    per-crate `COPY` lines + `cargo build --manifest-path`.
-/// 2. Root `Cargo.toml` contains `[workspace]` — workspace template
-///    (`COPY . .` + workspace build).
-/// 3. Otherwise — simple binary crate template.
+/// 2. Root `Cargo.toml` has a `[workspace]` table — workspace template
+///    (`COPY . .`, then `cargo build -p <package> --bin <binary>`).
+/// 3. Otherwise — simple binary crate template (`--bin <binary>`).
+///
+/// For 2 and 3 the binary is resolved by [`resolve_build_target`], and the
+/// builder stage copies exactly that binary by name.
 ///
 /// Issue #259's distroless default applies to all three layouts; see
-/// [`runtime_stage`].
+/// `runtime_stage`.
 ///
 /// # Errors
 ///
-/// Returns an error if the project `Cargo.toml` cannot be read (non
-/// multi-crate-isolated layouts) or the rendered Dockerfile cannot be
-/// written to disk.
+/// Returns an error if the project `Cargo.toml` cannot be read or parsed
+/// (non multi-crate-isolated layouts), no binary can be chosen, or the
+/// rendered Dockerfile cannot be written to disk.
+// Why: lib API (the `cloud_run_local_build` integration test drives it through
+// lib.rs). The bin's `deploy init` writes through the `render_*` functions so
+// it can keep an existing file, which leaves this unused in the bin target.
+#[allow(dead_code)]
 pub fn generate_dockerfile(config: &DeployConfig) -> Result<()> {
     let dockerfile_content = render_dockerfile(config)?;
     let dockerfile_path = config.project_root.join("Dockerfile");
@@ -26,33 +34,85 @@ pub fn generate_dockerfile(config: &DeployConfig) -> Result<()> {
     Ok(())
 }
 
-/// Render the Dockerfile contents without writing to disk.
-///
-/// Exposed for unit tests so the asserts can target the rendered text
-/// directly without touching the filesystem.
-pub(super) fn render_dockerfile(config: &DeployConfig) -> Result<String> {
-    let multi_crate = config
+/// The multi-crate isolated layout, when `[layout]` selects it.
+fn multi_crate_layout(config: &DeployConfig) -> Option<&LayoutConfig> {
+    config
         .layout
         .as_ref()
-        .filter(|l| l.is_multi_crate_isolated());
+        .filter(|l| l.is_multi_crate_isolated())
+}
 
-    let builder = if let Some(layout) = multi_crate {
-        builder_stage_multi_crate_isolated(layout, &resolve_binary_name(config))
-    } else {
-        let cargo_toml_path = config.project_root.join("Cargo.toml");
-        let cargo_toml =
-            std::fs::read_to_string(&cargo_toml_path).context("Failed to read Cargo.toml")?;
-        if cargo_toml.contains("[workspace]") {
-            builder_stage_workspace()
-        } else {
-            builder_stage_simple()
-        }
+/// The binary the workspace and simple-crate templates build.
+///
+/// `[server] binary` when set, else the project's single non-Lambda binary
+/// (debug session `cargo-pmcp-deploy-targets`, findings #5/#6; see
+/// [`binary::resolve_build_target`]).
+///
+/// `None` for the multi-crate isolated layout, which keeps its own rule
+/// (`[server] binary`, else `[server] name`).
+///
+/// # Errors
+///
+/// Returns an error naming the project's binaries when none, or more than
+/// one, could be the server, or when `[server] binary` is not one of them.
+pub fn resolve_build_target(config: &DeployConfig) -> Result<Option<BuildTarget>> {
+    if multi_crate_layout(config).is_some() {
+        return Ok(None);
+    }
+    binary::resolve_build_target(&config.project_root, config.server.binary.as_deref()).map(Some)
+}
+
+/// Render the Dockerfile contents without writing to disk.
+///
+/// # Errors
+///
+/// As [`resolve_build_target`] and [`render_dockerfile_for`].
+pub fn render_dockerfile(config: &DeployConfig) -> Result<String> {
+    let target = resolve_build_target(config)?;
+    render_dockerfile_for(config, target.as_ref())
+}
+
+/// Render the Dockerfile for an already-resolved build target (`deploy init`
+/// resolves it once, to record it in a new deploy.toml as well).
+///
+/// # Errors
+///
+/// Returns an error if the project `Cargo.toml` cannot be read or parsed, or
+/// when `target` is `None` (or holds a name that is not safe in a `RUN`
+/// line) for a layout other than multi-crate isolated.
+pub fn render_dockerfile_for(
+    config: &DeployConfig,
+    target: Option<&BuildTarget>,
+) -> Result<String> {
+    let builder = match (multi_crate_layout(config), target) {
+        (Some(layout), _) => {
+            builder_stage_multi_crate_isolated(layout, &resolve_binary_name(config))
+        },
+        (None, Some(target)) if is_workspace_root(&config.project_root)? => {
+            builder_stage_workspace(target)?
+        },
+        (None, Some(target)) => builder_stage_simple(target)?,
+        (None, None) => bail!(
+            "no binary was chosen for the Dockerfile; set `binary = \"<name>\"` under [server] \
+             in .pmcp/deploy.toml"
+        ),
     };
 
     Ok(format!(
         "{builder}\n{runtime}",
         runtime = runtime_stage(config)
     ))
+}
+
+/// True when the project's root `Cargo.toml` has a `[workspace]` table. A
+/// parsed check, not a substring one: a commented-out `# [workspace]` does not
+/// count.
+fn is_workspace_root(project_root: &std::path::Path) -> Result<bool> {
+    let path = project_root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&path).context("Failed to read Cargo.toml")?;
+    let manifest: toml::Table =
+        toml::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(manifest.contains_key("workspace"))
 }
 
 /// Resolve the binary name for `cargo build --bin <name>` and the runtime
@@ -75,20 +135,39 @@ RUN apt-get update && apt-get install -y \\
     libssl-dev \\
     && rm -rf /var/lib/apt/lists/*";
 
-/// Shared post-build step for the workspace and simple-crate layouts:
-/// locate the produced binary in `target/release` (excluding any
-/// lambda binaries that may have been built alongside it) and copy it
-/// to a stable path the runtime stage expects.
-const FIND_AND_COPY_BINARY: &str = "# Copy the server binary (exclude Lambda binaries)
-RUN find target/release -maxdepth 1 -type f -executable \\
-    ! -name \"*lambda*\" ! -name \"*-lambda\" \\
-    ! -name \"*.so\" ! -name \"*.d\" ! -name \"build-script-*\" \\
-    -exec cp {} /app/mcp-server \\; || \\
-    (echo \"No server binary found in target/release\" && exit 1)";
+/// Shared build-and-copy step for the workspace and simple-crate layouts:
+/// build exactly the chosen binary (`-p <package>` only when `with_package`
+/// and the package is known) and copy it BY NAME to the path the runtime
+/// stage expects. (The step used to build every non-`lambda` package and copy
+/// whichever executable `find target/release` met last.)
+fn build_and_copy(target: &BuildTarget, with_package: bool) -> Result<String> {
+    let names = std::iter::once(target.binary.as_str()).chain(target.package.as_deref());
+    for name in names {
+        if !binary::is_safe_name(name) {
+            bail!(
+                "`{name}` cannot be used in the generated Dockerfile: binary and package names \
+                 must be ASCII letters, digits, `-` or `_`."
+            );
+        }
+    }
+    let package = match &target.package {
+        Some(package) if with_package => format!(" -p {package}"),
+        _ => String::new(),
+    };
+    Ok(format!(
+        "# Build the server binary ([server] binary, resolved at `cargo pmcp deploy init`)
+RUN cargo build --release{package} --bin {bin}
 
-fn builder_stage_workspace() -> String {
-    format!(
-        r#"# Multi-stage Dockerfile for Rust MCP Server on Google Cloud Run
+# Copy it by name to the path the runtime stage expects
+RUN cp target/release/{bin} /app/mcp-server",
+        bin = target.binary
+    ))
+}
+
+fn builder_stage_workspace(target: &BuildTarget) -> Result<String> {
+    let build = build_and_copy(target, true)?;
+    Ok(format!(
+        r"# Multi-stage Dockerfile for Rust MCP Server on Google Cloud Run
 # Workspace project structure - builds inside Docker to handle path dependencies
 
 # Stage 1: Build the Rust binary
@@ -102,21 +181,15 @@ WORKDIR /app
 # Copy the entire project (including path dependencies)
 COPY . .
 
-# Build the release binary (exclude Lambda packages to avoid binary name collisions)
-# Find all packages with 'lambda' in the name and exclude them
-RUN LAMBDA_PKGS=$(cargo metadata --no-deps --format-version=1 2>/dev/null | \
-    grep -o '"name":"[^"]*lambda[^"]*"' | \
-    sed 's/"name":"\([^"]*\)"/--exclude \1/g' || echo ""); \
-    cargo build --release --workspace $LAMBDA_PKGS
-
-{FIND_AND_COPY_BINARY}
-"#,
-    )
+{build}
+",
+    ))
 }
 
-fn builder_stage_simple() -> String {
-    format!(
-        r#"# Multi-stage Dockerfile for Rust MCP Server on Google Cloud Run
+fn builder_stage_simple(target: &BuildTarget) -> Result<String> {
+    let build = build_and_copy(target, false)?;
+    Ok(format!(
+        r"# Multi-stage Dockerfile for Rust MCP Server on Google Cloud Run
 # Simple binary crate - builds inside Docker
 
 # Stage 1: Build the Rust binary
@@ -131,12 +204,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
-# Build the release binary
-RUN cargo build --release
-
-{FIND_AND_COPY_BINARY}
-"#,
-    )
+{build}
+",
+    ))
 }
 
 /// Surgical builder for the multi-crate isolated layout (issue #258).
@@ -336,18 +406,54 @@ CMD ["/usr/local/bin/mcp-server"]
 /// # Errors
 ///
 /// Returns an error if the `.dockerignore` file cannot be written.
+// Why: lib API, see `generate_dockerfile`.
+#[allow(dead_code)]
 pub fn generate_dockerignore(config: &DeployConfig) -> Result<()> {
-    let dockerignore_content = r#"# Rust build artifacts
-target/debug/
-target/release/.fingerprint/
-target/release/build/
-target/release/deps/
-target/release/examples/
-target/release/incremental/
-target/release/*.d
-target/release/*.rlib
-**/*.rs.bk
+    let dockerignore_content = render_dockerignore(config);
+    let dockerignore_path = config.project_root.join(".dockerignore");
+    std::fs::write(&dockerignore_path, dockerignore_content)
+        .context("Failed to write .dockerignore")?;
+
+    println!("   ✓ Generated .dockerignore");
+
+    Ok(())
+}
+
+/// Render `.dockerignore` for `config` without writing it.
+///
+/// The builder stage compiles from source, so the host's build output is
+/// never needed: `target/` is ignored wholesale (debug session
+/// `cargo-pmcp-deploy-targets`, finding #11 — only some `target/release`
+/// subdirectories used to be ignored, and the field report's build context
+/// carried 899 MB of host binaries). For the multi-crate isolated layout each
+/// crate's own `target/` is ignored too.
+///
+/// Paths `cargo build` itself reads are NOT ignored, because the workspace
+/// template copies the whole context: `tests/` and `benches/` (a declared
+/// `[[test]]`/`[[bench]]` whose file is missing fails manifest parsing),
+/// `README.md` (`#![doc = include_str!("../README.md")]`) and `vendor/` (a
+/// `.cargo/config.toml` source replacement).
+#[must_use]
+pub fn render_dockerignore(config: &DeployConfig) -> String {
+    let mut crate_targets = String::new();
+    if let Some(layout) = multi_crate_layout(config) {
+        let crates = std::iter::once(&layout.primary).chain(&layout.path_deps);
+        for name in crates.filter(|name| binary::is_safe_name(name)) {
+            crate_targets.push_str(&format!("{name}/target/\n"));
+        }
+    }
+    format!(
+        r"# Generated by `cargo pmcp deploy init --target-type google-cloud-run`.
+# Init keeps an existing file; delete it and re-run init to regenerate it.
+
+# Build output: the Dockerfile compiles from source, so nothing under the
+# host's target/ is needed (it can be gigabytes).
+target/
+{crate_targets}**/*.rs.bk
 *.pdb
+
+# Node.js dependencies (e.g. widget builds); cargo never reads them
+**/node_modules/
 
 # IDE files
 .vscode/
@@ -361,12 +467,7 @@ target/release/*.rlib
 .gitignore
 
 # Documentation
-README.md
 docs/
-
-# Test files
-tests/
-benches/
 
 # CI/CD
 .github/
@@ -378,9 +479,6 @@ cdk.out/
 .pmcp/
 bootstrap
 
-# Vendored dependencies (not needed with crates.io)
-vendor/
-
 # OS files
 .DS_Store
 Thumbs.db
@@ -391,15 +489,8 @@ Thumbs.db
 # Environment files
 .env
 .env.local
-"#;
-
-    let dockerignore_path = config.project_root.join(".dockerignore");
-    std::fs::write(&dockerignore_path, dockerignore_content)
-        .context("Failed to write .dockerignore")?;
-
-    println!("   ✓ Generated .dockerignore");
-
-    Ok(())
+"
+    )
 }
 
 /// Generate `cloudbuild.yaml` from `DeployConfig`.
@@ -414,7 +505,22 @@ Thumbs.db
 /// # Errors
 ///
 /// Returns an error if the `cloudbuild.yaml` file cannot be written.
+// Why: lib API, see `generate_dockerfile`.
+#[allow(dead_code)]
 pub fn generate_cloudbuild(config: &DeployConfig) -> Result<()> {
+    let cloudbuild_content = render_cloudbuild(config);
+    let cloudbuild_path = config.project_root.join("cloudbuild.yaml");
+    std::fs::write(&cloudbuild_path, cloudbuild_content)
+        .context("Failed to write cloudbuild.yaml")?;
+
+    println!("   ✓ Generated cloudbuild.yaml");
+
+    Ok(())
+}
+
+/// Render `cloudbuild.yaml` from `config` without writing it.
+#[must_use]
+pub fn render_cloudbuild(config: &DeployConfig) -> String {
     let region = config
         .gcp
         .as_ref()
@@ -449,7 +555,7 @@ pub fn generate_cloudbuild(config: &DeployConfig) -> Result<()> {
         "--no-allow-unauthenticated"
     };
 
-    let cloudbuild_content = format!(
+    format!(
         r#"# Cloud Build configuration for automated deployments
 # Build and deploy Rust MCP server to Cloud Run
 #
@@ -457,10 +563,10 @@ pub fn generate_cloudbuild(config: &DeployConfig) -> Result<()> {
 #
 # Or set up a trigger in Cloud Build to auto-deploy on git push.
 #
-# This file is regenerated by `cargo pmcp deploy init --target-type
-# google-cloud-run`. Edits to fields that are sourced from
-# .pmcp/deploy.toml ([gcp].region, [server].*, [environment].*) will be
-# overwritten on the next init. Edit deploy.toml instead.
+# Generated by `cargo pmcp deploy init --target-type google-cloud-run` from
+# .pmcp/deploy.toml ([gcp].region, [server].*, [environment].*). Init keeps
+# an existing file: after changing deploy.toml, delete this file and re-run
+# init to regenerate it.
 
 steps:
   # Build the Docker image
@@ -519,15 +625,7 @@ options:
 "#,
         name = config.server.name,
         tail = steps_tail,
-    );
-
-    let cloudbuild_path = config.project_root.join("cloudbuild.yaml");
-    std::fs::write(&cloudbuild_path, cloudbuild_content)
-        .context("Failed to write cloudbuild.yaml")?;
-
-    println!("   ✓ Generated cloudbuild.yaml");
-
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -544,12 +642,16 @@ mod tests {
         )
     }
 
+    /// A simple binary crate (`src/main.rs`, so its one binary is
+    /// `auth-echo-cloud-run`) that `cargo metadata` can load.
     fn write_cargo_toml(tmp: &TempDir) {
         std::fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname = \"auth-echo-cloud-run\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"auth-echo-cloud-run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .expect("write cargo.toml");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
     }
 
     /// cloudbuild.yaml splices [server].memory / cpu / max_instances /
@@ -654,11 +756,206 @@ mod tests {
             "[workspace]\nmembers = [\"crate-a\"]\n",
         )
         .expect("write cargo");
+        super::super::fixture::write_crate(&tmp.path().join("crate-a"), "crate-a", &["a"], "");
         let config = make_config(&tmp);
 
         let dockerfile = render_dockerfile(&config).expect("render");
         assert!(dockerfile.contains("Workspace project structure"));
         assert!(dockerfile.contains("COPY . ."));
+    }
+
+    // ---------- Binary selection (debug session cargo-pmcp-deploy-targets, #5/#6) ----------
+
+    use super::super::fixture;
+
+    fn directive_lines(dockerfile: &str) -> Vec<&str> {
+        dockerfile
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect()
+    }
+
+    /// The field report's acceptance shape: package `x-lambda`, bins
+    /// `bootstrap` + `serve`, a `lambda_http` dependency, a `[workspace]`
+    /// table. The workspace template used to `--exclude` every name a grep
+    /// matched (`x-lambda` itself and `lambda_http`) -> "no packages to
+    /// compile", then copy whichever executable `find` met last.
+    #[test]
+    fn x_lambda_workspace_builds_and_copies_serve_by_name() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda(tmp.path());
+        let config = make_config(&tmp);
+
+        let dockerfile = render_dockerfile(&config).expect("render");
+        let directives = directive_lines(&dockerfile).join("\n");
+        assert!(
+            directives.contains("RUN cargo build --release -p x-lambda --bin serve\n"),
+            "{dockerfile}"
+        );
+        assert!(
+            directives.contains("RUN cp target/release/serve /app/mcp-server\n"),
+            "{dockerfile}"
+        );
+        for gone in [
+            "--exclude",
+            "cargo metadata",
+            "grep",
+            "find target/release",
+            "--workspace",
+        ] {
+            assert!(
+                !directives.contains(gone),
+                "`{gone}` must not be in: {dockerfile}"
+            );
+        }
+    }
+
+    /// `[server] binary` is honoured by the simple-crate template too.
+    #[test]
+    fn a_declared_binary_is_built_by_name_in_the_simple_template() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_crate(tmp.path(), "svc", &["api", "worker"], "");
+        let mut config = make_config(&tmp);
+        config.server.binary = Some("api".to_string());
+
+        let dockerfile = render_dockerfile(&config).expect("render");
+        assert!(dockerfile.contains("Simple binary crate"), "{dockerfile}");
+        let directives = directive_lines(&dockerfile).join("\n");
+        assert!(
+            directives.contains("RUN cargo build --release --bin api\n"),
+            "{dockerfile}"
+        );
+        assert!(directives.contains("RUN cp target/release/api /app/mcp-server\n"));
+        assert!(!directives.contains("worker"), "{dockerfile}");
+    }
+
+    /// forecast-coach's real shape (`bootstrap`, `local`, `serve`): no
+    /// silent pick; the error names both candidates and the fix.
+    #[test]
+    fn several_candidate_binaries_fail_naming_them() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda_with_local(tmp.path());
+        let config = make_config(&tmp);
+
+        let err = render_dockerfile(&config).expect_err("ambiguous");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("`local` (package `x-lambda`)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`serve` (package `x-lambda`)"),
+            "{message}"
+        );
+        assert!(message.contains("binary = \"<name>\""), "{message}");
+    }
+
+    #[test]
+    fn a_declared_binary_that_does_not_exist_fails() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda(tmp.path());
+        let mut config = make_config(&tmp);
+        config.server.binary = Some("x-lambda".to_string());
+
+        let message = format!("{:#}", render_dockerfile(&config).expect_err("not a bin"));
+        assert!(
+            message.contains("is not a binary of this project"),
+            "{message}"
+        );
+    }
+
+    /// `render_dockerfile_for` is public: a build target handed to it directly
+    /// is checked again before any name reaches a `RUN` line.
+    #[test]
+    fn an_unsafe_build_target_is_refused_before_rendering() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda(tmp.path());
+        let config = make_config(&tmp);
+        for (binary, package) in [("serve; rm -rf /", None), ("serve", Some("x $(id)"))] {
+            let target = BuildTarget {
+                binary: binary.to_string(),
+                package: package.map(str::to_string),
+            };
+            let err = render_dockerfile_for(&config, Some(&target)).expect_err("unsafe");
+            assert!(err.to_string().contains("cannot be used"), "{err}");
+        }
+        assert!(
+            render_dockerfile_for(&config, None).is_err(),
+            "no target, no Dockerfile"
+        );
+    }
+
+    /// `[workspace]` is a table, not a substring: a commented-out header does
+    /// not switch to the workspace template.
+    #[test]
+    fn a_commented_out_workspace_header_is_not_a_workspace() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_crate(tmp.path(), "svc", &["serve"], "# [workspace]\n");
+        let dockerfile = render_dockerfile(&make_config(&tmp)).expect("render");
+        assert!(dockerfile.contains("Simple binary crate"), "{dockerfile}");
+    }
+
+    // ---------- .dockerignore (debug session cargo-pmcp-deploy-targets, #11) ----------
+
+    fn ignore_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    }
+
+    /// The builder stage compiles from source, so nothing under the host's
+    /// `target/` belongs in the build context (899 MB in the field report).
+    #[test]
+    fn dockerignore_excludes_target_wholesale() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let text = render_dockerignore(&make_config(&tmp));
+        let lines = ignore_lines(&text);
+        assert!(lines.contains(&"target/"), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("target/") && *l != "target/"),
+            "partial target/ entries are redundant: {lines:?}"
+        );
+        for kept in [".git/", "**/node_modules/", ".env", "deploy/", ".pmcp/"] {
+            assert!(lines.contains(&kept), "{kept} must be ignored: {lines:?}");
+        }
+    }
+
+    /// Paths `cargo build` reads must stay in the context: a declared
+    /// `[[test]]`/`[[bench]]` whose file is missing fails manifest parsing,
+    /// `#![doc = include_str!("../README.md")]` needs the README, and a
+    /// `.cargo/config.toml` source replacement needs `vendor/`.
+    #[test]
+    fn dockerignore_keeps_what_cargo_build_reads() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let text = render_dockerignore(&make_config(&tmp));
+        let lines = ignore_lines(&text);
+        for needed in ["tests/", "benches/", "README.md", "vendor/"] {
+            assert!(
+                !lines.contains(&needed),
+                "{needed} must not be ignored: {lines:?}"
+            );
+        }
+    }
+
+    /// Multi-crate isolated layout: each crate keeps its own `target/`.
+    #[test]
+    fn dockerignore_excludes_each_isolated_crate_target() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let mut config = make_config(&tmp);
+        config.layout = Some(LayoutConfig {
+            kind: "multi-crate-isolated".to_string(),
+            primary: "gcp-cloud-run".to_string(),
+            path_deps: vec!["auth-echo-core".to_string(), "../escape".to_string()],
+        });
+        let text = render_dockerignore(&config);
+        let lines = ignore_lines(&text);
+        for expected in ["target/", "gcp-cloud-run/target/", "auth-echo-core/target/"] {
+            assert!(lines.contains(&expected), "{expected}: {lines:?}");
+        }
+        assert!(!lines.iter().any(|l| l.contains("..")), "{lines:?}");
     }
 
     /// Multi-crate isolated layout (#258): per-crate COPY pairs for

@@ -87,3 +87,13 @@ path = "fuzz_targets/fuzz_package_artifact.rs"
 doc = false
 test = false
 bench = false
+
+# Debug session cargo-pmcp-deploy-targets (finding #9): the Cloud Run
+# absolute-path guard parses operator Cargo.toml files, reached through the
+# lib-mounted `google_cloud_run::manifest` leaf (`cargo-pmcp/src/lib.rs`).
+[[bin]]
+name = "fuzz_cloud_run_manifest"
+path = "fuzz_targets/fuzz_cloud_run_manifest.rs"
+doc = false
+test = false
+bench = false

@@ -6,15 +6,20 @@
 //! outputs.
 //!
 //! Idempotent: re-running `cargo pmcp deploy init --target-type
-//! google-cloud-run` in a project directory that already has a deploy.toml
-//! preserves the existing one (so operators' filled-in `project_id`,
+//! google-cloud-run` in a project directory keeps every file that already
+//! exists — `.pmcp/deploy.toml` (so operators' filled-in `project_id`,
 //! environment values, and any `[layout]` / `[runtime]` opt-ins are not
-//! clobbered). Files that are missing are written; files that exist are
-//! left untouched.
+//! clobbered) and, since the debug session `cargo-pmcp-deploy-targets`
+//! (finding A1), also `Dockerfile`, `.dockerignore` and `cloudbuild.yaml`,
+//! which init used to overwrite. Files that are missing are written; files
+//! that exist are left untouched, and init says which.
 
+use std::path::Path;
+
+use super::binary::BuildTarget;
 use super::dockerfile;
 use crate::deployment::DeployConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Initialise a Google Cloud Run deployment for `config.project_root`.
 ///
@@ -26,21 +31,103 @@ use anyhow::Result;
 ///
 /// Pre-existing files are preserved verbatim.
 ///
+/// When the Dockerfile is generated, its binary is resolved first (see
+/// [`dockerfile::resolve_build_target`]) and recorded as `[server] binary` in
+/// a NEW deploy.toml. If no binary can be chosen, the new deploy.toml is
+/// still written (it is where `[server] binary` goes) and init stops before
+/// any other file, with the candidates in the error.
+///
 /// # Errors
 ///
-/// Returns an error if any of the deploy.toml / Dockerfile / .dockerignore /
-/// cloudbuild.yaml artifacts cannot be written.
+/// Returns an error if no binary can be chosen for a generated Dockerfile, or
+/// if any of the deploy.toml / Dockerfile / .dockerignore / cloudbuild.yaml
+/// artifacts cannot be written.
 pub fn init_google_cloud_run(config: &DeployConfig) -> Result<()> {
     println!("🚀 Initializing Google Cloud Run deployment...");
     println!();
 
-    write_deploy_toml(config)?;
-    dockerfile::generate_dockerfile(config)?;
-    dockerfile::generate_dockerignore(config)?;
-    dockerfile::generate_cloudbuild(config)?;
+    let root = &config.project_root;
+    let build_target = if root.join("Dockerfile").exists() {
+        Ok(None)
+    } else {
+        dockerfile::resolve_build_target(config)
+    };
+    let resolved = build_target.as_ref().ok().and_then(Option::as_ref);
+    write_deploy_toml(&with_recorded_binary(config, resolved))?;
+    let build_target = build_target?;
 
+    let mut kept = Vec::new();
+    let dockerfile_rendered = scaffold(root, "Dockerfile", &mut kept, || {
+        dockerfile::render_dockerfile_for(config, build_target.as_ref())
+    })?;
+    if dockerfile_rendered {
+        if let Some(target) = &build_target {
+            println!(
+                "     builds binary `{}`{}",
+                target.binary,
+                package_note(target)
+            );
+        }
+    }
+    scaffold(root, ".dockerignore", &mut kept, || {
+        Ok(dockerfile::render_dockerignore(config))
+    })?;
+    scaffold(root, "cloudbuild.yaml", &mut kept, || {
+        Ok(dockerfile::render_cloudbuild(config))
+    })?;
+
+    print_next_steps(&kept);
+    Ok(())
+}
+
+fn package_note(target: &BuildTarget) -> String {
+    target
+        .package
+        .as_ref()
+        .map(|package| format!(" of package `{package}`"))
+        .unwrap_or_default()
+}
+
+/// `config` with the resolved binary recorded as `[server] binary` when it
+/// declares none. Only written when the deploy.toml is new (an existing one
+/// is kept byte for byte).
+fn with_recorded_binary(config: &DeployConfig, target: Option<&BuildTarget>) -> DeployConfig {
+    let mut config = config.clone();
+    if config.server.binary.is_none() {
+        config.server.binary = target.map(|t| t.binary.clone());
+    }
+    config
+}
+
+/// Write `root/file` from `render` when it does not exist; record it in
+/// `kept` otherwise. Returns whether the file was written.
+fn scaffold(
+    root: &Path,
+    file: &'static str,
+    kept: &mut Vec<&'static str>,
+    render: impl FnOnce() -> Result<String>,
+) -> Result<bool> {
+    let path = root.join(file);
+    if path.exists() {
+        println!("   ⏭  {file} already exists — preserving");
+        kept.push(file);
+        return Ok(false);
+    }
+    std::fs::write(&path, render()?).with_context(|| format!("Failed to write {file}"))?;
+    println!("   ✓ Generated {file}");
+    Ok(true)
+}
+
+fn print_next_steps(kept: &[&str]) {
     println!();
     println!("✅ Google Cloud Run deployment initialized!");
+    if !kept.is_empty() {
+        println!();
+        println!(
+            "ℹ️  Kept existing {}. To regenerate one from .pmcp/deploy.toml, delete it and re-run init.",
+            kept.join(", ")
+        );
+    }
     println!();
     println!("📝 Next steps:");
     println!("   1. Edit .pmcp/deploy.toml: set [gcp].project_id, [server].name,");
@@ -49,13 +136,11 @@ pub fn init_google_cloud_run(config: &DeployConfig) -> Result<()> {
     println!("   3. Set project: gcloud config set project PROJECT_ID");
     println!("   4. Deploy: cargo pmcp deploy --target google-cloud-run");
     println!();
-    println!("💡 Generated files:");
+    println!("💡 Files:");
     println!("   • .pmcp/deploy.toml - IaC source of truth");
-    println!("   • Dockerfile - Multi-stage Rust build");
+    println!("   • Dockerfile - Multi-stage Rust build of [server] binary");
     println!("   • .dockerignore - Optimize build context");
     println!("   • cloudbuild.yaml - Optional Cloud Build configuration");
-
-    Ok(())
 }
 
 /// Write `.pmcp/deploy.toml` only when it doesn't already exist.
@@ -66,6 +151,9 @@ pub fn init_google_cloud_run(config: &DeployConfig) -> Result<()> {
 fn write_deploy_toml(config: &DeployConfig) -> Result<()> {
     if config.save_if_missing(&config.project_root)? {
         println!("   ✓ Generated .pmcp/deploy.toml");
+        if let Some(binary) = &config.server.binary {
+            println!("     [server] binary = \"{binary}\"");
+        }
     } else {
         println!("   ⏭  .pmcp/deploy.toml already exists — preserving");
     }
@@ -135,5 +223,125 @@ mod tests {
         let after =
             std::fs::read_to_string(tmp.path().join(".pmcp/deploy.toml")).expect("read back");
         assert_eq!(after, sentinel, "existing deploy.toml must be preserved");
+    }
+
+    // ---------- Debug session cargo-pmcp-deploy-targets (PR-C) ----------
+
+    use super::super::fixture;
+
+    fn read(root: &std::path::Path, file: &str) -> String {
+        std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"))
+    }
+
+    /// The acceptance shape inits cleanly: the Dockerfile builds `serve` by
+    /// name, and a NEW deploy.toml records the chosen binary.
+    #[test]
+    fn x_lambda_init_scaffolds_a_dockerfile_for_serve_and_records_it() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda(tmp.path());
+        let config = make_cloud_run_config(tmp.path().to_path_buf());
+
+        init_google_cloud_run(&config).expect("init");
+
+        let dockerfile = read(tmp.path(), "Dockerfile");
+        assert!(
+            dockerfile.contains("RUN cargo build --release -p x-lambda --bin serve\n"),
+            "{dockerfile}"
+        );
+        assert!(dockerfile.contains("RUN cp target/release/serve /app/mcp-server\n"));
+        let saved = crate::deployment::DeployConfig::load(tmp.path()).expect("deploy.toml");
+        assert_eq!(saved.server.binary.as_deref(), Some("serve"));
+        assert!(read(tmp.path(), ".dockerignore")
+            .lines()
+            .any(|l| l == "target/"));
+        assert!(read(tmp.path(), "cloudbuild.yaml").contains("'auth-echo-cloud-run'"));
+    }
+
+    /// A1: re-running init keeps an existing Dockerfile, .dockerignore and
+    /// cloudbuild.yaml byte for byte, like deploy.toml.
+    #[test]
+    fn reinit_keeps_existing_dockerfile_dockerignore_and_cloudbuild() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda(tmp.path());
+        let curated = [
+            ("Dockerfile", "FROM scratch\n# curated\n"),
+            (".dockerignore", "# curated\nsecret/\n"),
+            ("cloudbuild.yaml", "# curated\nsteps: []\n"),
+        ];
+        for (file, text) in curated {
+            std::fs::write(tmp.path().join(file), text).expect("seed");
+        }
+
+        init_google_cloud_run(&make_cloud_run_config(tmp.path().to_path_buf())).expect("init");
+
+        for (file, text) in curated {
+            assert_eq!(read(tmp.path(), file), text, "{file} must be kept");
+        }
+    }
+
+    /// A kept Dockerfile is the operator's: init does not need (or try) to
+    /// choose a binary for it, even when the choice would be ambiguous.
+    #[test]
+    fn a_kept_dockerfile_needs_no_binary_choice() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda_with_local(tmp.path());
+        std::fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").expect("seed");
+
+        init_google_cloud_run(&make_cloud_run_config(tmp.path().to_path_buf())).expect("init");
+
+        assert_eq!(read(tmp.path(), "Dockerfile"), "FROM scratch\n");
+        let saved = crate::deployment::DeployConfig::load(tmp.path()).expect("deploy.toml");
+        assert_eq!(saved.server.binary, None);
+    }
+
+    /// Two candidate binaries: init writes the new deploy.toml (where the
+    /// fix goes), refuses to guess, and writes no Dockerfile. After
+    /// `[server] binary` is set, the re-run builds that binary.
+    #[test]
+    fn ambiguous_binaries_stop_init_until_server_binary_is_set() {
+        let tmp = TempDir::new().expect("tmpdir");
+        fixture::write_x_lambda_with_local(tmp.path());
+        let config = make_cloud_run_config(tmp.path().to_path_buf());
+
+        let message = format!(
+            "{:#}",
+            init_google_cloud_run(&config).expect_err("ambiguous")
+        );
+        assert!(
+            message.contains("`local` (package `x-lambda`)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`serve` (package `x-lambda`)"),
+            "{message}"
+        );
+        assert!(tmp.path().join(".pmcp/deploy.toml").exists());
+        assert!(!tmp.path().join("Dockerfile").exists());
+
+        let path = tmp.path().join(".pmcp/deploy.toml");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let edited = text.replacen("[server]\n", "[server]\nbinary = \"serve\"\n", 1);
+        assert_ne!(
+            edited, text,
+            "the [server] header is in the scaffolded file"
+        );
+        std::fs::write(&path, edited).expect("write");
+        let kept = crate::deployment::DeployConfig::load(tmp.path()).expect("reload");
+
+        init_google_cloud_run(&kept).expect("re-init");
+        assert!(read(tmp.path(), "Dockerfile").contains("--bin serve\n"));
+    }
+
+    /// cloudbuild.yaml no longer claims init regenerates it.
+    #[test]
+    fn cloudbuild_header_tells_how_to_regenerate() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let config = make_cloud_run_config(tmp.path().to_path_buf());
+        let text = dockerfile::render_cloudbuild(&config);
+        assert!(
+            !text.contains("will be\n# overwritten on the next init"),
+            "{text}"
+        );
+        assert!(text.contains("delete this file"), "{text}");
     }
 }

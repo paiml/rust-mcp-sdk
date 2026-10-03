@@ -91,6 +91,41 @@ release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
   `cdk synth` leaves templates of earlier stack ids in `deploy/cdk.out`, and
   the first `*.template.json` in directory order was used. It now prefers
   `{[server] name}-stack.template.json`.
+- **`google-cloud-run`: the generated Dockerfile builds the server binary by
+  name** (findings #5/#6, issue #258). The workspace template built every
+  package except those a text search over `cargo metadata` output matched for
+  `lambda`; the search also matched dependency names (`lambda_http`) and the
+  project's own `*-lambda` package, so cargo stopped with "no packages to
+  compile". Both templates then copied whichever executable `find
+  target/release` reached last, and `[server] binary` was ignored outside the
+  multi-crate isolated layout. Now the workspace template runs
+  `cargo build --release -p <package> --bin <binary>`, the single-crate one
+  `cargo build --release --bin <binary>`, and both copy
+  `target/release/<binary>`. `[workspace]` is detected by parsing
+  `Cargo.toml` (a commented-out header no longer counts).
+- **`google-cloud-run`: a commented-out absolute path no longer blocks the
+  deploy** (finding #9). The absolute-path guard was a substring match over
+  the raw manifest: it refused a commented-out `[patch]` line and missed
+  `path="/x"`, `[target.<cfg>]` tables and member manifests. It now parses
+  the dependency, `[patch]`, `[replace]` and `[workspace.dependencies]` tables
+  of the root (or `[layout]` primary) manifest, the workspace members, and
+  the crates relative path dependencies point at, and names each offending
+  manifest and dependency.
+- **`google-cloud-run`: `deploy init` writes `[gcp] region = "us-central1"`
+  by default** (finding #10). `--region` defaulted to `AWS_REGION` or
+  `us-east-1` for every target, so a new Cloud Run `deploy.toml` got an AWS
+  region and the `us-central1` default was unreachable. The AWS targets keep
+  `--region`, then `AWS_REGION`, then `us-east-1`.
+- **`google-cloud-run`: `.dockerignore` ignores the host's `target/`
+  wholesale** (finding #11); a field report's build context carried 899 MB
+  of host binaries. It no longer ignores paths `cargo build` reads:
+  `tests/` and `benches/` (a declared `[[test]]`/`[[bench]]` whose file is
+  missing fails the build), `README.md` and `vendor/`. It now ignores
+  `**/node_modules/`.
+- **`google-cloud-run`: `deploy init` keeps an existing `Dockerfile`,
+  `.dockerignore` and `cloudbuild.yaml`** (finding A1), as its docs said and
+  as it already did for `.pmcp/deploy.toml`. It overwrote them. Init now says
+  which files it kept; delete one and re-run init to regenerate it.
 
 ### Changed
 
@@ -113,6 +148,16 @@ release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
   target, for NEW deploy.toml files only. When the project root itself is the
   `<name>-lambda` package, init no longer scaffolds a wrapper package of the
   same name.
+- **`google-cloud-run`: `deploy init` chooses the server binary when
+  `[server] binary` is unset.** It picks the project's only binary that is
+  not a Lambda binary (`bootstrap`, or a name with the word `lambda` in it),
+  read with `cargo metadata --no-deps`, and records it as `[server] binary` in
+  a new `deploy.toml` (package `x-lambda` with bins `bootstrap` + `serve`
+  builds `serve`). With no such binary, or several, init writes the new
+  `deploy.toml`, names the candidates, and stops before writing the
+  Dockerfile. A declared `[server] binary` must be a binary of the project.
+  A kept Dockerfile needs no choice. The multi-crate isolated layout keeps its
+  rule (`[server] binary`, else `[server] name`).
 - **"Hand-modified `stack.ts`" now means "differs from what cargo-pmcp last
   wrote".** `deploy init` and every deploy that writes `deploy/lib/stack.ts`
   record its SHA-256 in `deploy/.pmcp-scaffold.toml` (commit it with

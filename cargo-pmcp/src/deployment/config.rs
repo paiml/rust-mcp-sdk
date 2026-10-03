@@ -676,9 +676,11 @@ pub struct ServerConfig {
     /// Cloud Run autoscaler min instances. `None` → `0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_instances: Option<u32>,
-    /// Binary name to build (passed as `cargo build --bin <binary>`).
-    /// Used by the multi-crate isolated layout; falls back to
-    /// [`Self::name`] when absent.
+    /// Binary name to build (passed as `cargo build --bin <binary>`) by every
+    /// Cloud Run Dockerfile template. When absent, `deploy init` picks the
+    /// project's only non-Lambda binary and records it here in a new
+    /// deploy.toml (the multi-crate isolated layout falls back to
+    /// [`Self::name`] instead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
 }

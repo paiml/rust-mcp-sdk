@@ -68,11 +68,51 @@ fn init_server_name(project_root: &Path, explicit: Option<&str>) -> Result<Strin
     )
 }
 
+/// The `[gcp] region` a new Cloud Run deploy.toml gets without `--region`.
+const CLOUD_RUN_DEFAULT_REGION: &str = "us-central1";
+
+/// `deploy init`'s region for `target_id` (debug session
+/// `cargo-pmcp-deploy-targets`, finding #10).
+///
+/// - `google-cloud-run`: `--region`, else `us-central1`. `AWS_REGION` is never
+///   consulted: an AWS region is not a GCP region. (clap used to fill
+///   `--region` from `AWS_REGION` or `us-east-1` for every target, so the
+///   Cloud Run default was unreachable and `[gcp] region = "us-east-1"` was
+///   scaffolded.)
+/// - every other target: unchanged — `--region`, else `$AWS_REGION` (even
+///   when empty, as clap's `env` did), else `us-east-1`.
+fn default_init_region(target_id: &str, explicit: Option<&str>) -> String {
+    if target_id == "google-cloud-run" {
+        return explicit
+            .filter(|region| !region.is_empty())
+            .unwrap_or(CLOUD_RUN_DEFAULT_REGION)
+            .to_string();
+    }
+    explicit.map_or_else(
+        || std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        str::to_string,
+    )
+}
+
+/// The Cloud Run arm of the `deploy init` dispatch: the config
+/// `init_google_cloud_run` scaffolds from, for the parsed `--region` and
+/// `--name` flags.
+fn cloud_run_init_from_flags(
+    project_root: &Path,
+    region: Option<&str>,
+    explicit_name: Option<&str>,
+) -> Result<crate::deployment::DeployConfig> {
+    let region = default_init_region("google-cloud-run", region);
+    cloud_run_init_config(project_root, &region, explicit_name)
+}
+
 /// The config `deploy init --target-type google-cloud-run` scaffolds from.
 ///
 /// An existing `.pmcp/deploy.toml` is kept (Cloud Run init never rewrites
 /// it); `--name` renames its server in place, as a verified one-line edit.
-/// A new one defaults the name to the package name with `-lambda` stripped.
+/// A new one is [`default_config_for_target`]'s Cloud Run shape, with the
+/// name defaulting to the package name with `-lambda` stripped and `region`
+/// (already resolved by [`default_init_region`]) as its `[gcp] region`.
 fn cloud_run_init_config(
     project_root: &Path,
     region: &str,
@@ -90,19 +130,12 @@ fn cloud_run_init_config(
         Some(name) => name.to_string(),
         None => detect_server_name(project_root)?,
     };
-    let region_str = if region.is_empty() {
-        "us-central1".to_string()
-    } else {
-        region.to_string()
-    };
-    Ok(
-        crate::deployment::DeployConfig::default_for_cloud_run_server(
-            server_name,
-            "your-gcp-project-id".to_string(),
-            region_str,
-            project_root.to_path_buf(),
-        ),
-    )
+    Ok(default_config_for_target(
+        "google-cloud-run",
+        server_name,
+        region.to_string(),
+        project_root.to_path_buf(),
+    ))
 }
 
 /// Rename `[server] name` in an existing `.pmcp/deploy.toml`, editing only
@@ -208,9 +241,13 @@ pub(crate) fn is_config_driven_project(project_root: &Path) -> bool {
 /// `memory_mb`), which save_if_missing then cemented into the operator's
 /// `.pmcp/deploy.toml` (n51 follow-up #1).
 ///
-/// `project_id` is left empty for the google-cloud-run shape; the operator
-/// fills it in via `[gcp].project_id`, and `deploy::resolve_params` falls back
-/// to `gcloud config get-value project` when the field is empty/placeholder.
+/// The google-cloud-run shape is what `deploy init --target-type
+/// google-cloud-run` writes for a new deploy.toml ([`cloud_run_init_config`]
+/// builds it here; debug session `cargo-pmcp-deploy-targets`, finding A3 —
+/// this arm used to be unreachable and differed from what init wrote).
+/// `project_id` is the `your-gcp-project-id` placeholder for the operator to
+/// replace via `[gcp].project_id`; `deploy::resolve_params` treats it like an
+/// empty value and falls back to `gcloud config get-value project`.
 pub(crate) fn default_config_for_target(
     target_id: &str,
     server_name: String,
@@ -220,7 +257,7 @@ pub(crate) fn default_config_for_target(
     if target_id == "google-cloud-run" {
         crate::deployment::DeployConfig::default_for_cloud_run_server(
             server_name,
-            String::new(),
+            "your-gcp-project-id".to_string(),
             region,
             project_root,
         )
@@ -390,9 +427,12 @@ fn parse_on_test_failure_flag(
 pub enum DeployAction {
     /// Initialize deployment configuration
     Init {
-        /// AWS region for deployment (uses AWS_REGION or AWS_DEFAULT_REGION env vars if set)
-        #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
-        region: String,
+        /// Region. AWS targets: the AWS region (default: the `AWS_REGION`
+        /// environment variable, else `us-east-1`). google-cloud-run: the
+        /// `[gcp] region` of a new deploy.toml (default: `us-central1`;
+        /// `AWS_REGION` is not consulted).
+        #[arg(long)]
+        region: Option<String>,
 
         /// Skip credentials check
         #[arg(long)]
@@ -749,6 +789,7 @@ impl DeployCommand {
                         if let Some(name) = name {
                             crate::deployment::server_name::validate_server_name(name)?;
                         }
+                        let init_region = default_init_region(&target_id, region.as_deref());
                         // For init, route through InitCommand for aws-lambda and
                         // container targets (azure-container-apps). InitCommand
                         // dispatches on target_type at the top of execute():
@@ -757,7 +798,7 @@ impl DeployCommand {
                         if target_id == "aws-lambda" || target_id == "azure-container-apps" {
                             emit_target_banner_if_resolved(global_flags, &project_root, None);
                             let mut cmd = InitCommand::new(project_root)
-                                .with_region(region)
+                                .with_region(&init_region)
                                 .with_credentials_check(!skip_credentials_check)
                                 .with_target_type(&target_id);
                             if let Some(name) = name {
@@ -802,21 +843,25 @@ impl DeployCommand {
                             // instead of silently falling back to a default
                             // scaffold (which would mask a malformed
                             // deploy.toml as "no file present").
-                            let config =
-                                cloud_run_init_config(&project_root, region, name.as_deref())?;
+                            let config = cloud_run_init_from_flags(
+                                &project_root,
+                                region.as_deref(),
+                                name.as_deref(),
+                            )?;
                             target.init(&config).await
                         } else {
-                            // For other targets (pmcp-run, google-cloud-run, …), use the
-                            // new modular approach. Branch on target_id so the saved
-                            // deploy.toml has the correct SHAPE for the target — without
-                            // this, a google-cloud-run init wrote an AWS-shape deploy.toml
-                            // (no [gcp], required [aws]/memory_mb), then save_if_missing
-                            // cemented it on every re-init (n51 follow-up #1).
+                            // For other targets (pmcp-run, cloudflare-workers, …), use the
+                            // new modular approach. default_config_for_target picks the
+                            // SHAPE for the target (google-cloud-run reaches it through
+                            // cloud_run_init_config above) — without the branch, a
+                            // non-AWS init wrote an AWS-shape deploy.toml (no [gcp],
+                            // required [aws]/memory_mb), then save_if_missing cemented
+                            // it on every re-init (n51 follow-up #1).
                             let server_name = init_server_name(&project_root, name.as_deref())?;
                             let mut config = default_config_for_target(
                                 &target_id,
                                 server_name,
-                                region.clone(),
+                                init_region,
                                 project_root.clone(),
                             );
 
@@ -2094,14 +2139,20 @@ mod default_config_for_target_tests {
     use super::default_config_for_target;
     use std::path::PathBuf;
 
+    /// Exercises the REAL init path: `cloud_run_init_from_flags` (what the
+    /// `deploy init --target-type google-cloud-run` dispatch calls) with no
+    /// `--region`, on a project without a deploy.toml. It used to test
+    /// `default_config_for_target`'s Cloud Run arm directly, an arm init never
+    /// reached (debug session `cargo-pmcp-deploy-targets`, finding A3).
     #[test]
     fn google_cloud_run_target_produces_gcp_shape() {
-        let cfg = default_config_for_target(
-            "google-cloud-run",
-            "test-server".to_string(),
-            "us-central1".to_string(),
-            PathBuf::from("/tmp/test"),
-        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"test-server\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo.toml");
+        let cfg = super::cloud_run_init_from_flags(tmp.path(), None, None).expect("config");
         assert!(
             cfg.gcp.is_some(),
             "google-cloud-run init MUST produce a config with [gcp] set"
@@ -2112,10 +2163,11 @@ mod default_config_for_target_tests {
         );
         assert_eq!(cfg.target.target_type, "google-cloud-run");
         assert_eq!(cfg.server.name, "test-server");
-        // `default_for_cloud_run_server` is called with empty project_id;
-        // operator fills [gcp].project_id, deploy::resolve_params falls back to
-        // `gcloud config get-value project` if still empty.
-        assert_eq!(cfg.gcp.unwrap().region, "us-central1");
+        let gcp = cfg.gcp.expect("[gcp]");
+        // The operator replaces the placeholder via [gcp].project_id;
+        // deploy::resolve_params treats it as unset (gcloud's project).
+        assert_eq!(gcp.project_id, "your-gcp-project-id");
+        assert_eq!(gcp.region, "us-central1");
     }
 
     #[test]
@@ -2381,5 +2433,161 @@ RUST_LOG = \"info\"
             init_server_name(tmp.path(), None).expect("kept"),
             "acme_forecast"
         );
+    }
+}
+
+/// `deploy init --target-type google-cloud-run` from parsed CLI flags (debug
+/// session `cargo-pmcp-deploy-targets`, findings #10 and A3).
+///
+/// These tests set and restore `AWS_REGION`; cargo-pmcp's bin tests run with
+/// `--test-threads=1`.
+#[cfg(test)]
+mod cloud_run_init_tests {
+    use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let saved = std::env::var_os(key);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// `(region, name)` of `cargo pmcp deploy init <args>`, as clap parses it.
+    fn init_flags(args: &[&str]) -> (Option<String>, Option<String>) {
+        let command_line = ["deploy", "init"].iter().chain(args.iter());
+        let command = DeployCommand::try_parse_from(command_line).expect("parses");
+        match command.action {
+            Some(DeployAction::Init { region, name, .. }) => (region, name),
+            other => panic!("not init: {other:?}"),
+        }
+    }
+
+    fn project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        crate::deployment::targets::google_cloud_run::fixture::write_x_lambda(tmp.path());
+        tmp
+    }
+
+    fn cloud_run_config_from_cli(root: &Path, args: &[&str]) -> crate::deployment::DeployConfig {
+        let (region, name) = init_flags(args);
+        cloud_run_init_from_flags(root, region.as_deref(), name.as_deref()).expect("config")
+    }
+
+    /// #10: without `--region`, a new Cloud Run deploy.toml gets
+    /// `us-central1`, never the AWS default `us-east-1`.
+    #[test]
+    fn cloud_run_init_defaults_the_gcp_region_to_us_central1() {
+        let _env = EnvGuard::set("AWS_REGION", None);
+        let tmp = project();
+        let config = cloud_run_config_from_cli(tmp.path(), &["--target-type", "google-cloud-run"]);
+        assert_eq!(config.gcp.as_ref().expect("[gcp]").region, "us-central1");
+        assert!(config.aws.is_none());
+    }
+
+    /// #10: the operator's `AWS_REGION` is an AWS region; it never becomes
+    /// the `[gcp] region`.
+    #[test]
+    fn aws_region_in_the_environment_does_not_leak_into_gcp() {
+        let _env = EnvGuard::set("AWS_REGION", Some("eu-west-3"));
+        let tmp = project();
+        let config = cloud_run_config_from_cli(tmp.path(), &["--target-type", "google-cloud-run"]);
+        assert_eq!(config.gcp.as_ref().expect("[gcp]").region, "us-central1");
+    }
+
+    #[test]
+    fn an_explicit_region_is_the_gcp_region() {
+        let _env = EnvGuard::set("AWS_REGION", Some("eu-west-3"));
+        let tmp = project();
+        let config = cloud_run_config_from_cli(
+            tmp.path(),
+            &[
+                "--target-type",
+                "google-cloud-run",
+                "--region",
+                "europe-west2",
+            ],
+        );
+        assert_eq!(config.gcp.as_ref().expect("[gcp]").region, "europe-west2");
+    }
+
+    /// The AWS targets keep the old resolution: `--region`, else
+    /// `$AWS_REGION`, else `us-east-1`.
+    #[test]
+    fn aws_targets_keep_flag_then_aws_region_then_us_east_1() {
+        for target in [
+            "aws-lambda",
+            "pmcp-run",
+            "azure-container-apps",
+            "cloudflare-workers",
+        ] {
+            {
+                let _env = EnvGuard::set("AWS_REGION", None);
+                assert_eq!(default_init_region(target, None), "us-east-1", "{target}");
+            }
+            {
+                let _env = EnvGuard::set("AWS_REGION", Some("eu-west-3"));
+                assert_eq!(default_init_region(target, None), "eu-west-3", "{target}");
+                assert_eq!(
+                    default_init_region(target, Some("ap-south-1")),
+                    "ap-south-1",
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    /// clap no longer fills `--region` from `AWS_REGION` or a default, so the
+    /// dispatch can tell "not given" from "given".
+    #[test]
+    fn the_region_flag_is_never_filled_in_by_clap() {
+        let _env = EnvGuard::set("AWS_REGION", Some("eu-west-3"));
+        assert_eq!(init_flags(&[]).0, None);
+        assert_eq!(
+            init_flags(&["--region", "us-west-2"]).0.as_deref(),
+            Some("us-west-2")
+        );
+    }
+
+    /// A3: the Cloud Run init path IS `default_config_for_target`'s Cloud Run
+    /// arm (the arm used to be unreachable, and differed: empty project id).
+    #[test]
+    fn cloud_run_init_uses_the_cloud_run_defaults() {
+        let _env = EnvGuard::set("AWS_REGION", None);
+        let tmp = project();
+        let from_cli = cloud_run_config_from_cli(
+            tmp.path(),
+            &["--target-type", "google-cloud-run", "--name", "acme"],
+        );
+        let defaults = default_config_for_target(
+            "google-cloud-run",
+            "acme".to_string(),
+            "us-central1".to_string(),
+            tmp.path().to_path_buf(),
+        );
+        assert_eq!(
+            toml::to_string(&from_cli).expect("ser"),
+            toml::to_string(&defaults).expect("ser")
+        );
+        let gcp = defaults.gcp.expect("[gcp]");
+        assert_eq!(gcp.project_id, "your-gcp-project-id");
+        assert_eq!(gcp.region, "us-central1");
     }
 }
