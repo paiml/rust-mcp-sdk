@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.22.6] - 2026-10-03
+
+Ships `cargo-pmcp` **0.28.0**: the deploy-target fixes from the forecast-coach field report
+(#399, #400, #401, #402, #403). `pmcp` moves 2.22.5 -> 2.22.6 with no code change of its own, to
+mint the tag. No library crate changes. The full notes are in `cargo-pmcp/CHANGELOG.md`.
+
+Verified end to end against real AWS (us-east-1) and GCP (us-central1) before tagging:
+- aws-lambda: first deploy through the native CloudFormation engine, no-change redeploy, rename,
+  outputs, destroy, and the `npx cdk deploy` fallback.
+- google-cloud-run: fresh init, Artifact Registry create and push, verification on `/mcp`, and
+  the `warn`/`fail` exit codes.
+
+### Breaking (cargo-pmcp)
+
+- `cargo pmcp deploy init` keeps an existing `.pmcp/deploy.toml` instead of resetting it, and
+  gains `--name`.
+- New projects default `[server] name` to the package name with one trailing `-lambda`
+  stripped.
+
+### Fixed (cargo-pmcp)
+
+- **aws-lambda: a rename could silently replace a running deployment.**
+  - `deploy` and `destroy` now refuse when the CDK app declares a different stack.
+  - `app.ts` follows `[server] name`, so a rename creates a second stack.
+  - `destroy` deletes `{name}-stack` directly through CloudFormation.
+- **aws-lambda: the native CloudFormation engine could not create a stack.** AWS SDK errors were
+  matched by their display text ("service error"), so "does not exist" was never recognised.
+- **aws-lambda: the native path ignored `deploy.toml`.** It now honours `[server] memory_mb`,
+  `timeout_seconds`, the new `ephemeral_storage_mb`, `[environment]` and the new `[build]`
+  features on both deploy paths.
+- **google-cloud-run: the generated Dockerfile could not build a `*-lambda` package.** It now
+  builds `[server] binary` by name.
+- **google-cloud-run: deploy defaults and checks.**
+  - The absolute-path check reads the parsed manifest, so commented-out lines no longer block a
+    deploy.
+  - `[gcp] region` defaults to `us-central1`.
+  - `.dockerignore` excludes all of `target/`.
+  - New inits push to Artifact Registry.
+  - Verification probes `[server] mcp_path`, which defaults to `/mcp`.
+- **`--on-test-failure warn` exits 0**, as documented, on every target.
+
 ## [2.22.5] - 2026-10-02
 
 Ships `pmcp-code-mode` **0.7.4**, `pmcp-server-toolkit` **0.4.1**, `pmcp-openapi-server` **0.4.1**
