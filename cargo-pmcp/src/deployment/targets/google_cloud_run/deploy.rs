@@ -1,6 +1,52 @@
 use super::auth;
+use super::image::ImageRegistry;
 use crate::deployment::{r#trait::DeploymentOutputs, DeployConfig};
 use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+
+/// The programs the Cloud Run deploy runs. A seam: tests substitute recording
+/// stand-ins (`fake_cloud`) and assert the argv, with no live GCP call.
+pub(super) struct CloudTools {
+    /// `docker`.
+    pub docker: PathBuf,
+    /// `gcloud`.
+    pub gcloud: PathBuf,
+}
+
+impl CloudTools {
+    /// The programs on `PATH`.
+    fn system() -> Self {
+        Self {
+            docker: PathBuf::from("docker"),
+            gcloud: PathBuf::from("gcloud"),
+        }
+    }
+}
+
+/// Run `program args` (in `dir` when given) and return its output.
+fn run(program: &Path, args: &[String], dir: Option<&Path>) -> Result<std::process::Output> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    command
+        .output()
+        .with_context(|| format!("Failed to run {} {}", program.display(), args.join(" ")))
+}
+
+/// Run `program args` and fail with `what` and its stderr unless it succeeds.
+fn run_ok(program: &Path, args: &[String], dir: Option<&Path>, what: &str) -> Result<String> {
+    let output = run(program, args, dir)?;
+    if !output.status.success() {
+        bail!("{what}:\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(ToString::to_string).collect()
+}
 
 /// Deploy Rust MCP server to Google Cloud Run.
 ///
@@ -9,38 +55,80 @@ use anyhow::{bail, Context, Result};
 /// 2. Resolve deployment parameters from `.pmcp/deploy.toml`
 ///    (`[gcp]`, `[server]`, `[environment]`), with legacy env-var fallback
 ///    for projects that pre-date the schema. Closes upstream issue #260.
-/// 3. Build the Docker image (`docker buildx --platform linux/amd64`).
-/// 4. Push to Google Container Registry.
-/// 5. `gcloud run deploy` with `--set-env-vars` populated from
+/// 3. Refuse absolute path dependencies.
+/// 4. With `[gcp] repository`: create the Artifact Registry repository when
+///    it does not exist (debug session `cargo-pmcp-deploy-targets`, #7).
+/// 5. Build the Docker image (`docker buildx --platform linux/amd64`).
+/// 6. Push it: Artifact Registry with `[gcp] repository`, else `gcr.io`.
+/// 7. `gcloud run deploy` with `--set-env-vars` populated from
 ///    `[environment]`.
-/// 6. Return the deployment URL.
+/// 8. Return the service URL (the CLI appends `[server] mcp_path`).
 ///
 /// # Errors
 ///
-/// Returns an error if authentication fails, the primary crate's
-/// `Cargo.toml` cannot be read, absolute path dependencies are detected,
-/// or any of the `docker` / `gcloud` subprocess invocations fail.
+/// Returns an error if authentication fails, `[gcp] repository` is not a
+/// valid repository id, absolute path dependencies are detected, or any of
+/// the `docker` / `gcloud` subprocess invocations fail.
 pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutputs> {
+    deploy_with(config, &CloudTools::system())
+}
+
+/// [`deploy_to_cloud_run`] with the programs it runs given.
+fn deploy_with(config: &DeployConfig, tools: &CloudTools) -> Result<DeploymentOutputs> {
     println!("🚀 Deploying to Google Cloud Run...");
     println!();
 
-    // Step 1: Authentication. The deploy.toml carries the *expected* project
-    // id; the actual project id is whatever the operator has gcloud
-    // configured for. We prefer the deploy.toml value when present so the
-    // CLI is reproducible across machines.
+    let project_id = verify_auth_and_project(config, tools)?;
+    let params = resolve_params(config);
+    print_configuration(config, &params);
+
+    ensure_no_absolute_path_deps(config)?;
+    let registry = image_registry(config, &params)?;
+    let image_tag = registry.image(&project_id, &params.service_name);
+    ensure_repository(tools, &registry, &project_id)?;
+
+    build_image(tools, config, &image_tag)?;
+    push_image(tools, &registry, &image_tag)?;
+    deploy_service(tools, config, &params, &image_tag, &project_id)?;
+    let url = service_url(tools, &params, &project_id)?;
+    print_details(&params, &project_id, &url);
+
+    Ok(DeploymentOutputs {
+        url: Some(url),
+        additional_urls: vec![],
+        regions: vec![params.region],
+        stack_name: Some(params.service_name),
+        version: None,
+        custom: {
+            let mut custom = std::collections::HashMap::new();
+            custom.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(project_id),
+            );
+            custom.insert("image".to_string(), serde_json::Value::String(image_tag));
+            custom
+        },
+    })
+}
+
+/// Step 1: authentication. The deploy.toml carries the *expected* project id;
+/// the actual one is whatever gcloud is configured for. The deploy.toml value
+/// wins when present so the CLI is reproducible across machines.
+fn verify_auth_and_project(config: &DeployConfig, tools: &CloudTools) -> Result<String> {
     println!("🔐 Verifying authentication...");
-    auth::check_gcloud_auth().context("Not authenticated with Google Cloud")?;
+    auth::check_gcloud_auth_with(&tools.gcloud).context("Not authenticated with Google Cloud")?;
     let project_id = config
         .gcp
         .as_ref()
         .map(|g| g.project_id.clone())
         .filter(|p| !p.is_empty() && p != "your-gcp-project-id")
-        .map_or_else(auth::get_project_id, Ok)?;
+        .map_or_else(|| auth::get_project_id_with(&tools.gcloud), Ok)?;
     println!("   ✓ Project: {project_id}");
     println!();
+    Ok(project_id)
+}
 
-    let params = resolve_params(config);
-
+fn print_configuration(config: &DeployConfig, params: &CloudRunParams) {
     println!("📋 Deployment configuration:");
     println!("   Region: {}", params.region);
     println!("   Service: {}", params.service_name);
@@ -59,77 +147,119 @@ pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutp
         );
     }
     println!();
+}
 
-    // Step 3: Path-dep sanity.
-    ensure_no_absolute_path_deps(config)?;
-
-    // Step 4: docker buildx.
-    println!("🔨 Building Docker image for linux/amd64...");
-    let image_tag = format!("gcr.io/{}/{}:latest", project_id, params.service_name);
-
-    let build_output = std::process::Command::new("docker")
-        .current_dir(&config.project_root)
-        .args([
-            "buildx",
-            "build",
-            "--platform",
-            "linux/amd64",
-            "-t",
-            &image_tag,
-            "--load",
-            ".",
-        ])
-        .output()
-        .context("Failed to run docker buildx")?;
-
-    if !build_output.status.success() {
-        let stderr = String::from_utf8_lossy(&build_output.stderr);
-        bail!("Docker build failed:\n{}", stderr);
+/// Where the image goes: the Artifact Registry repository `[gcp] repository`
+/// (validated), else gcr.io as before 0.28.0, with a note on how to move.
+fn image_registry(config: &DeployConfig, params: &CloudRunParams) -> Result<ImageRegistry> {
+    let repository = config.gcp.as_ref().and_then(|g| g.repository.as_deref());
+    if let Some(repository) = repository {
+        super::image::validate_repository(repository).context("invalid .pmcp/deploy.toml")?;
+    } else {
+        println!(
+            "ℹ️  [gcp] repository is not set, so the image goes to gcr.io (as before 0.28.0). \
+             Container Registry stopped taking writes on 2025-03-18; gcr.io pushes need an \
+             Artifact Registry gcr.io repository in the project. To push to Artifact Registry \
+             instead, add `repository = \"{}\"` under [gcp] (the deploy creates it).\n",
+            super::image::DEFAULT_REPOSITORY
+        );
     }
+    Ok(ImageRegistry::for_config(repository, &params.region))
+}
 
+/// Create the Artifact Registry repository unless it exists ("already
+/// exists" counts as success). Nothing to do for `gcr.io`.
+fn ensure_repository(tools: &CloudTools, registry: &ImageRegistry, project: &str) -> Result<()> {
+    let Some(args) = registry.create_repository_args(project) else {
+        return Ok(());
+    };
+    println!("📦 Ensuring the {} repository exists...", registry.label());
+    let output = run(&tools.gcloud, &args, None)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        println!(
+            "   ✓ Created {}",
+            registry.image_name(project, "").trim_end_matches('/')
+        );
+    } else if super::image::is_already_exists(&stderr) {
+        println!(
+            "   ✓ Exists: {}",
+            registry.image_name(project, "").trim_end_matches('/')
+        );
+    } else {
+        bail!(
+            "Could not create the Artifact Registry repository ({}). Creating it needs \
+             roles/artifactregistry.admin (or create it once yourself: gcloud {}):\n{stderr}",
+            registry.image_name(project, "").trim_end_matches('/'),
+            args.join(" ")
+        );
+    }
+    println!();
+    Ok(())
+}
+
+fn build_image(tools: &CloudTools, config: &DeployConfig, image_tag: &str) -> Result<()> {
+    println!("🔨 Building Docker image for linux/amd64...");
+    let args = strings(&[
+        "buildx",
+        "build",
+        "--platform",
+        "linux/amd64",
+        "-t",
+        image_tag,
+        "--load",
+        ".",
+    ]);
+    run_ok(
+        &tools.docker,
+        &args,
+        Some(&config.project_root),
+        "Docker build failed",
+    )?;
     println!("   ✓ Image built: {image_tag}");
     println!();
+    Ok(())
+}
 
-    // Step 5: Push to GCR.
-    println!("📤 Pushing image to Google Container Registry...");
-    let auth_output = std::process::Command::new("gcloud")
-        .args(["auth", "configure-docker", "--quiet"])
-        .output()
-        .context("Failed to configure docker authentication")?;
-    if !auth_output.status.success() {
-        let stderr = String::from_utf8_lossy(&auth_output.stderr);
-        bail!("Failed to configure Docker authentication:\n{}", stderr);
-    }
-
-    let push_output = std::process::Command::new("docker")
-        .args(["push", &image_tag])
-        .output()
-        .context("Failed to push docker image")?;
-    if !push_output.status.success() {
-        let stderr = String::from_utf8_lossy(&push_output.stderr);
-        bail!("Docker push failed:\n{}", stderr);
-    }
-    println!("   ✓ Image pushed to GCR");
+fn push_image(tools: &CloudTools, registry: &ImageRegistry, image_tag: &str) -> Result<()> {
+    println!("📤 Pushing image to {}...", registry.label());
+    run_ok(
+        &tools.gcloud,
+        &registry.configure_docker_args(),
+        None,
+        "Failed to configure Docker authentication",
+    )?;
+    run_ok(
+        &tools.docker,
+        &strings(&["push", image_tag]),
+        None,
+        "Docker push failed",
+    )?;
+    println!("   ✓ Image pushed");
     println!();
+    Ok(())
+}
 
-    // Step 6: gcloud run deploy with --set-env-vars populated from
-    // config.environment (closes the env-var-drift gap in #260).
+/// `gcloud run deploy` with `--set-env-vars` populated from
+/// `config.environment` (closes the env-var-drift gap in #260).
+fn deploy_service(
+    tools: &CloudTools,
+    config: &DeployConfig,
+    params: &CloudRunParams,
+    image_tag: &str,
+    project_id: &str,
+) -> Result<()> {
     println!("🚀 Deploying to Cloud Run...");
-
-    let max_instances_str = params.max_instances.to_string();
-    let min_instances_str = params.min_instances.to_string();
-    let env_vars_arg = super::env::render_set_env_vars(&config.environment);
-
-    let mut deploy_args = vec![
+    let mut args = strings(&[
         "run",
         "deploy",
         &params.service_name,
         "--image",
-        &image_tag,
+        image_tag,
         "--region",
         &params.region,
         "--project",
-        &project_id,
+        project_id,
         "--platform",
         "managed",
         "--memory",
@@ -137,73 +267,59 @@ pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutp
         "--cpu",
         &params.cpu,
         "--max-instances",
-        &max_instances_str,
+        &params.max_instances.to_string(),
         "--min-instances",
-        &min_instances_str,
+        &params.min_instances.to_string(),
         "--port",
         "8080",
         "--quiet",
-    ];
-
+    ]);
     if let Some(ingress) = &params.ingress {
-        deploy_args.push("--ingress");
-        deploy_args.push(ingress);
+        args.extend(strings(&["--ingress", ingress]));
     }
-
+    let env_vars_arg = super::env::render_set_env_vars(&config.environment);
     if !env_vars_arg.is_empty() {
-        deploy_args.push("--set-env-vars");
-        deploy_args.push(&env_vars_arg);
+        args.extend(strings(&["--set-env-vars", &env_vars_arg]));
     }
-
-    if params.allow_unauth {
-        deploy_args.push("--allow-unauthenticated");
-    } else {
-        deploy_args.push("--no-allow-unauthenticated");
-    }
-
-    let deploy_output = std::process::Command::new("gcloud")
-        .args(&deploy_args)
-        .output()
-        .context("Failed to deploy to Cloud Run")?;
-
-    if !deploy_output.status.success() {
-        let stderr = String::from_utf8_lossy(&deploy_output.stderr);
-        bail!("Cloud Run deployment failed:\n{}", stderr);
-    }
+    args.push(
+        if params.allow_unauth {
+            "--allow-unauthenticated"
+        } else {
+            "--no-allow-unauthenticated"
+        }
+        .to_string(),
+    );
+    run_ok(&tools.gcloud, &args, None, "Cloud Run deployment failed")?;
     println!("   ✓ Service deployed successfully");
     println!();
+    Ok(())
+}
 
-    // Step 7: URL.
+fn service_url(tools: &CloudTools, params: &CloudRunParams, project_id: &str) -> Result<String> {
     println!("🔍 Getting service URL...");
-    let url_output = std::process::Command::new("gcloud")
-        .args([
-            "run",
-            "services",
-            "describe",
-            &params.service_name,
-            "--region",
-            &params.region,
-            "--project",
-            &project_id,
-            "--format",
-            "value(status.url)",
-        ])
-        .output()
-        .context("Failed to get service URL")?;
-    if !url_output.status.success() {
-        bail!("Failed to retrieve service URL");
-    }
-    let url = String::from_utf8_lossy(&url_output.stdout)
-        .trim()
-        .to_string();
+    let args = strings(&[
+        "run",
+        "services",
+        "describe",
+        &params.service_name,
+        "--region",
+        &params.region,
+        "--project",
+        project_id,
+        "--format",
+        "value(status.url)",
+    ]);
+    run_ok(&tools.gcloud, &args, None, "Failed to retrieve service URL")
+}
 
+fn print_details(params: &CloudRunParams, project_id: &str, url: &str) {
     println!("🎉 Deployment successful!");
     println!();
     println!("📊 Deployment Details:");
     println!("   Project: {project_id}");
     println!("   Region: {}", params.region);
     println!("   Service: {}", params.service_name);
-    println!("   URL: {url}");
+    println!("   Service URL: {url}");
 
     if !params.allow_unauth {
         println!();
@@ -213,23 +329,6 @@ pub async fn deploy_to_cloud_run(config: &DeployConfig) -> Result<DeploymentOutp
             params.service_name, params.region
         );
     }
-
-    Ok(DeploymentOutputs {
-        url: Some(url),
-        additional_urls: vec![],
-        regions: vec![params.region],
-        stack_name: Some(params.service_name),
-        version: None,
-        custom: {
-            let mut custom = std::collections::HashMap::new();
-            custom.insert(
-                "project_id".to_string(),
-                serde_json::Value::String(project_id),
-            );
-            custom.insert("image".to_string(), serde_json::Value::String(image_tag));
-            custom
-        },
-    })
 }
 
 /// Refuse the deploy when a dependency the Docker build would load has an
@@ -476,5 +575,181 @@ mod tests {
         );
         assert!(message.contains("core/Cargo.toml"), "{message}");
         assert!(message.contains("~/ghost"), "{message}");
+    }
+
+    // ---------- Image registry (debug session cargo-pmcp-deploy-targets, #7) ----------
+
+    use super::super::fake_cloud::{self, FakeCloud, Reply};
+
+    fn tools(fake: &FakeCloud) -> CloudTools {
+        CloudTools {
+            docker: fake.docker().to_path_buf(),
+            gcloud: fake.gcloud().to_path_buf(),
+        }
+    }
+
+    /// A deployable project: a crate at `root/app` and the config for it.
+    fn deployable(root: &std::path::Path, repository: Option<&str>) -> DeployConfig {
+        let app = root.join("app");
+        fixture::write_crate(&app, "svc", &["serve"], "");
+        let mut config = DeployConfig::default_for_cloud_run_server(
+            "svc".to_string(),
+            "acme-prod".to_string(),
+            "us-central1".to_string(),
+            app,
+        );
+        config.gcp.as_mut().expect("[gcp]").repository = repository.map(str::to_string);
+        config
+    }
+
+    fn standard_replies() -> Vec<Reply> {
+        vec![fake_cloud::ACTIVE_ACCOUNT, fake_cloud::DESCRIBE_URL]
+    }
+
+    /// The `gcloud run deploy` line, which only differs in the image.
+    fn run_deploy_line(image: &str) -> String {
+        format!(
+            "gcloud run deploy svc --image {image} --region us-central1 --project acme-prod \
+             --platform managed --memory 256Mi --cpu 1 --max-instances 10 --min-instances 0 \
+             --port 8080 --quiet --ingress all --set-env-vars RUST_LOG=info --allow-unauthenticated"
+        )
+    }
+
+    /// A deploy.toml with `[gcp] repository` (what a 0.28.0 `deploy init`
+    /// writes): the repository is created, docker authenticates to the
+    /// regional host, and the image is pushed and deployed from there.
+    #[cfg(unix)]
+    #[test]
+    fn artifact_registry_deploy_creates_the_repository_and_pushes_there() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = FakeCloud::new(&tmp.path().join("bin"), &standard_replies());
+        let config = deployable(tmp.path(), Some("pmcp"));
+
+        let outputs = deploy_with(&config, &tools(&fake)).expect("deploys");
+
+        let image = "us-central1-docker.pkg.dev/acme-prod/pmcp/svc:latest";
+        assert_eq!(
+            fake.calls(),
+            [
+                "gcloud auth list --filter=status:ACTIVE --format=value(account)".to_string(),
+                "gcloud artifacts repositories create pmcp --repository-format=docker \
+                 --location=us-central1 --project=acme-prod \
+                 --description=MCP server images deployed by cargo pmcp --quiet"
+                    .to_string(),
+                format!("docker buildx build --platform linux/amd64 -t {image} --load ."),
+                "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet".to_string(),
+                format!("docker push {image}"),
+                run_deploy_line(image),
+                "gcloud run services describe svc --region us-central1 --project acme-prod \
+                 --format value(status.url)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(outputs.url.as_deref(), Some(fake_cloud::SERVICE_URL));
+        assert_eq!(
+            outputs.custom.get("image"),
+            Some(&serde_json::Value::String(image.to_string()))
+        );
+    }
+
+    /// Re-deploys find the repository already there: "already exists" is
+    /// success, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_repository_is_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut replies = standard_replies();
+        replies.push(Reply {
+            program: "gcloud",
+            prefix: "artifacts repositories create",
+            stdout: "",
+            stderr: "ERROR: (gcloud.artifacts.repositories.create) ALREADY_EXISTS: the repository already exists\n",
+            exit: 1,
+        });
+        let fake = FakeCloud::new(&tmp.path().join("bin"), &replies);
+        let config = deployable(tmp.path(), Some("pmcp"));
+
+        deploy_with(&config, &tools(&fake)).expect("an existing repository is fine");
+        assert!(fake.ran("docker push us-central1-docker.pkg.dev/acme-prod/pmcp/svc:latest"));
+    }
+
+    /// Any other create failure (permissions) stops the deploy before the
+    /// image is built, naming the repository and the command.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_that_cannot_be_created_stops_the_deploy_before_the_build() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut replies = standard_replies();
+        replies.push(Reply {
+            program: "gcloud",
+            prefix: "artifacts repositories create",
+            stdout: "",
+            stderr: "ERROR: (gcloud.artifacts.repositories.create) PERMISSION_DENIED: denied\n",
+            exit: 1,
+        });
+        let fake = FakeCloud::new(&tmp.path().join("bin"), &replies);
+        let config = deployable(tmp.path(), Some("pmcp"));
+
+        let message = format!(
+            "{:#}",
+            deploy_with(&config, &tools(&fake)).expect_err("cannot create")
+        );
+        assert!(message.contains("PERMISSION_DENIED"), "{message}");
+        assert!(
+            message.contains("us-central1-docker.pkg.dev/acme-prod/pmcp"),
+            "{message}"
+        );
+        assert!(
+            !fake.ran("docker"),
+            "nothing may be built: {:?}",
+            fake.calls()
+        );
+    }
+
+    /// `[gcp] repository` is checked before any gcloud write or build.
+    #[cfg(unix)]
+    #[test]
+    fn an_invalid_repository_is_refused_before_anything_runs_but_auth() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = FakeCloud::new(&tmp.path().join("bin"), &standard_replies());
+        let config = deployable(tmp.path(), Some("Bad_Repo"));
+
+        let message = format!(
+            "{:#}",
+            deploy_with(&config, &tools(&fake)).expect_err("bad")
+        );
+        assert!(message.contains("\"Bad_Repo\""), "{message}");
+        assert_eq!(
+            fake.calls(),
+            ["gcloud auth list --filter=status:ACTIVE --format=value(account)"]
+        );
+    }
+
+    /// A deploy.toml from before 0.28.0 (no `[gcp] repository`) keeps the
+    /// exact gcr.io argv it always ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_deploy_toml_without_repository_keeps_the_gcr_io_argv() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = FakeCloud::new(&tmp.path().join("bin"), &standard_replies());
+        let config = deployable(tmp.path(), None);
+
+        let outputs = deploy_with(&config, &tools(&fake)).expect("deploys");
+
+        let image = "gcr.io/acme-prod/svc:latest";
+        assert_eq!(
+            fake.calls(),
+            [
+                "gcloud auth list --filter=status:ACTIVE --format=value(account)".to_string(),
+                format!("docker buildx build --platform linux/amd64 -t {image} --load ."),
+                "gcloud auth configure-docker --quiet".to_string(),
+                format!("docker push {image}"),
+                run_deploy_line(image),
+                "gcloud run services describe svc --region us-central1 --project acme-prod \
+                 --format value(status.url)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(outputs.url.as_deref(), Some(fake_cloud::SERVICE_URL));
     }
 }

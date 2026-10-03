@@ -97,3 +97,14 @@ path = "fuzz_targets/fuzz_cloud_run_manifest.rs"
 doc = false
 test = false
 bench = false
+
+# Debug session cargo-pmcp-deploy-targets (findings #7/#8): `[server] mcp_path`
+# validation + endpoint joining and the `[gcp] repository` id check, both
+# operator input, reached through the lib-mounted `deployment::mcp_endpoint`
+# and `google_cloud_run::image` leaves (`cargo-pmcp/src/lib.rs`).
+[[bin]]
+name = "fuzz_mcp_path"
+path = "fuzz_targets/fuzz_mcp_path.rs"
+doc = false
+test = false
+bench = false

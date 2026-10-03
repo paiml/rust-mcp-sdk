@@ -30,9 +30,11 @@
 //! [gcp]
 //! project_id = "my-gcp-project"
 //! region = "us-central1"
+//! repository = "pmcp"          # Artifact Registry; absent = gcr.io (pre-0.28.0 files)
 //!
 //! [server]
 //! name = "auth-echo-cloud-run"
+//! mcp_path = "/mcp"            # the default; "/" for a server mounted at the root
 //! memory = "256Mi"
 //! cpu = "1"
 //! ingress = "all"
@@ -108,6 +110,11 @@
 //! Before building, the deploy refuses a dependency with an absolute `path`
 //! (it does not exist inside the Docker build context). The manifests are
 //! parsed, so comments never count (see `manifest.rs`).
+//!
+//! The image goes to the Artifact Registry repository `[gcp] repository`,
+//! created on first deploy, or to `gcr.io` when the key is absent (see
+//! `image.rs`). The post-deploy verification probes `<service URL>/mcp`
+//! unless `[server] mcp_path` says otherwise (`deployment::mcp_endpoint`).
 
 mod auth;
 mod binary;
@@ -115,12 +122,17 @@ mod deploy;
 mod dockerfile;
 mod env;
 #[cfg(test)]
+mod fake_cloud;
+#[cfg(test)]
 pub mod fixture;
+mod image;
 mod init;
 mod manifest;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+
+pub use image::validate_repository;
 
 use crate::deployment::{
     r#trait::{

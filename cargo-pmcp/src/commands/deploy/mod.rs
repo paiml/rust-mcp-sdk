@@ -266,6 +266,62 @@ pub(crate) fn default_config_for_target(
     }
 }
 
+/// The deploy's outputs with `url` set to the MCP endpoint: the URL the
+/// target reported plus `[server] mcp_path`, per target (debug session
+/// `cargo-pmcp-deploy-targets`, finding #8; see
+/// `deployment::mcp_endpoint`). The post-deploy verification probes this URL
+/// and the CLI prints it. When a path was appended, the reported URL is kept
+/// as the `service_url` custom output.
+fn with_mcp_endpoint(
+    target_id: &str,
+    config: &crate::deployment::DeployConfig,
+    mut outputs: crate::deployment::DeploymentOutputs,
+) -> crate::deployment::DeploymentOutputs {
+    let Some(service_url) = outputs.url.clone().filter(|url| !url.is_empty()) else {
+        return outputs;
+    };
+    let endpoint = crate::deployment::mcp_endpoint::endpoint_url(
+        target_id,
+        config.server.mcp_path.as_deref(),
+        &service_url,
+    );
+    if endpoint != service_url {
+        outputs.custom.insert(
+            "service_url".to_string(),
+            serde_json::Value::String(service_url),
+        );
+        outputs.url = Some(endpoint);
+    }
+    outputs
+}
+
+/// Refuse a deploy whose endpoint settings are invalid, before anything is
+/// built (`[server] mcp_path`; `cargo pmcp validate deploy` runs the same
+/// check).
+fn validate_endpoint_settings(config: &crate::deployment::DeployConfig) -> Result<()> {
+    if let Some(path) = config.server.mcp_path.as_deref() {
+        crate::deployment::mcp_endpoint::validate_mcp_path(path)
+            .context("invalid .pmcp/deploy.toml")?;
+    }
+    Ok(())
+}
+
+/// [`validate_endpoint_settings`], plus a note when `target_id` ignores a
+/// declared `[server] mcp_path` (pmcp-run). Runs before the deploy builds.
+fn check_endpoint_settings(
+    target_id: &str,
+    config: &crate::deployment::DeployConfig,
+) -> Result<()> {
+    validate_endpoint_settings(config)?;
+    if let Some(note) = crate::deployment::mcp_endpoint::ignored_mcp_path_note(
+        target_id,
+        config.server.mcp_path.as_deref(),
+    ) {
+        eprintln!("   ⚠ {note}");
+    }
+    Ok(())
+}
+
 pub mod deploy;
 pub mod init;
 
@@ -370,9 +426,10 @@ pub struct DeployCommand {
     /// Override [post_deploy_tests].on_failure from deploy.toml.
     ///
     /// Values:
-    ///   warn      Print failure banner; CLI exits 0; pipeline continues
-    ///   fail      Print failure banner with IS-LIVE warning; CLI exits 3
-    ///             (REVISION 3 HIGH-2)
+    ///   warn      Print failure banner; CLI exits 0 (also when a check hit an
+    ///             infrastructure error); pipeline continues
+    ///   fail      Print failure banner with IS-LIVE warning; CLI exits 3, or
+    ///             2 when a check hit an infrastructure error (REVISION 3 HIGH-2)
     ///   rollback  REJECTED. Auto-rollback support will land in a future
     ///             phase that verifies the existing DeployTarget::rollback()
     ///             trait implementations. Use 'fail' (default) or 'warn'.
@@ -997,8 +1054,10 @@ impl DeployCommand {
                     },
                     DeployAction::Outputs { format } => {
                         let config = crate::deployment::DeployConfig::load(&project_root)?;
+                        validate_endpoint_settings(&config)?;
                         emit_target_banner_if_resolved(global_flags, &project_root, Some(&config));
-                        let outputs = target.outputs(&config).await?;
+                        let outputs =
+                            with_mcp_endpoint(&target_id, &config, target.outputs(&config).await?);
 
                         match format {
                             FormatValue::Json => {
@@ -1105,6 +1164,7 @@ impl DeployCommand {
                 );
 
                 let mut config = crate::deployment::DeployConfig::load(&project_root)?;
+                check_endpoint_settings(&target_id, &config)?;
 
                 // DSTK-01: carry the --regenerate-stack/--force opt-in via the
                 // config carrier (the #[serde(skip)] runtime field), mirroring
@@ -1185,7 +1245,8 @@ impl DeployCommand {
                 }
 
                 let artifact = target.build(&config).await?;
-                let outputs = target.deploy(&config, artifact).await?;
+                let outputs =
+                    with_mcp_endpoint(&target_id, &config, target.deploy(&config, artifact).await?);
 
                 // Step 4.5: Post-deploy verification (Phase 79 — Failure Mode C
                 // mitigation). Subprocess-spawn `cargo pmcp test {check, conformance,
@@ -2589,5 +2650,167 @@ mod cloud_run_init_tests {
         let gcp = defaults.gcp.expect("[gcp]");
         assert_eq!(gcp.project_id, "your-gcp-project-id");
         assert_eq!(gcp.region, "us-central1");
+    }
+
+    /// #7: a NEW Cloud Run deploy.toml pushes to Artifact Registry: it records
+    /// `[gcp] repository = "pmcp"`.
+    #[test]
+    fn cloud_run_fresh_init_records_the_artifact_registry_repository() {
+        let _env = EnvGuard::set("AWS_REGION", None);
+        let tmp = project();
+        let config = cloud_run_config_from_cli(tmp.path(), &["--target-type", "google-cloud-run"]);
+        assert_eq!(
+            config.gcp.as_ref().expect("[gcp]").repository.as_deref(),
+            Some("pmcp")
+        );
+        let written = toml::to_string(&config).expect("ser");
+        assert!(written.contains("repository = \"pmcp\""), "{written}");
+    }
+
+    /// #7: an existing deploy.toml without `[gcp] repository` is kept as is,
+    /// so its deploys keep pushing to gcr.io.
+    #[test]
+    fn cloud_run_reinit_keeps_a_gcr_io_deploy_toml() {
+        let _env = EnvGuard::set("AWS_REGION", None);
+        let tmp = project();
+        std::fs::create_dir_all(tmp.path().join(".pmcp")).expect("mkdir");
+        let existing = "[target]\ntype = \"google-cloud-run\"\nversion = \"1.0.0\"\n\n\
+                        [gcp]\nproject_id = \"acme\"\nregion = \"europe-west1\"\n\n\
+                        [server]\nname = \"svc\"\n\n[environment]\nRUST_LOG = \"info\"\n";
+        std::fs::write(tmp.path().join(".pmcp/deploy.toml"), existing).expect("seed");
+        let config = cloud_run_config_from_cli(tmp.path(), &["--target-type", "google-cloud-run"]);
+        assert_eq!(config.gcp.as_ref().expect("[gcp]").repository, None);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".pmcp/deploy.toml")).expect("read"),
+            existing
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_endpoint_cli_tests {
+    //! Debug session `cargo-pmcp-deploy-targets`, finding #8: the URL the
+    //! post-deploy verification probes and the CLI prints.
+    use super::{validate_endpoint_settings, with_mcp_endpoint};
+    use crate::deployment::{DeployConfig, DeploymentOutputs};
+
+    const SERVICE: &str = "https://svc-abc123-uc.a.run.app";
+
+    fn outputs(url: &str) -> DeploymentOutputs {
+        DeploymentOutputs {
+            url: Some(url.to_string()),
+            ..DeploymentOutputs::default()
+        }
+    }
+
+    fn cloud_run(mcp_path: Option<&str>) -> DeployConfig {
+        let mut config = DeployConfig::default_for_cloud_run_server(
+            "svc".to_string(),
+            "p".to_string(),
+            "us-central1".to_string(),
+            std::path::PathBuf::from("/tmp/x"),
+        );
+        config.server.mcp_path = mcp_path.map(str::to_string);
+        config
+    }
+
+    fn lambda(mcp_path: Option<&str>) -> DeployConfig {
+        let mut config = DeployConfig::default_for_server(
+            "svc".to_string(),
+            "us-east-1".to_string(),
+            std::path::PathBuf::from("/tmp/x"),
+        );
+        config.server.mcp_path = mcp_path.map(str::to_string);
+        config
+    }
+
+    /// The field report: a healthy service mounted at /mcp failed verification
+    /// because the bare service URL was probed. Default: `<service URL>/mcp`.
+    #[test]
+    fn cloud_run_verifies_and_prints_slash_mcp_by_default() {
+        let out = with_mcp_endpoint("google-cloud-run", &cloud_run(None), outputs(SERVICE));
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://svc-abc123-uc.a.run.app/mcp")
+        );
+        assert_eq!(
+            out.custom.get("service_url"),
+            Some(&serde_json::Value::String(SERVICE.to_string()))
+        );
+    }
+
+    #[test]
+    fn cloud_run_honours_a_declared_path() {
+        let out = with_mcp_endpoint(
+            "google-cloud-run",
+            &cloud_run(Some("/api/mcp")),
+            outputs(&format!("{SERVICE}/")),
+        );
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://svc-abc123-uc.a.run.app/api/mcp")
+        );
+    }
+
+    /// `"/"`: a server mounted at the root keeps the service URL, as before.
+    #[test]
+    fn a_root_mounted_server_keeps_the_service_url() {
+        let out = with_mcp_endpoint("google-cloud-run", &cloud_run(Some("/")), outputs(SERVICE));
+        assert_eq!(out.url.as_deref(), Some(SERVICE));
+        assert!(!out.custom.contains_key("service_url"));
+    }
+
+    /// pmcp-run's URL already ends in /mcp: never appended (no /mcp/mcp).
+    #[test]
+    fn pmcp_run_outputs_are_left_alone() {
+        let url = "https://api.pmcp.run/dep-1/mcp";
+        let out = with_mcp_endpoint("pmcp-run", &lambda(Some("/mcp")), outputs(url));
+        assert_eq!(out.url.as_deref(), Some(url));
+        assert!(out.custom.is_empty());
+    }
+
+    /// aws-lambda (and azure) keep their reported URL unless a path is
+    /// declared.
+    #[test]
+    fn other_targets_append_only_a_declared_path() {
+        let api = "https://abc.execute-api.us-east-1.amazonaws.com";
+        let out = with_mcp_endpoint("aws-lambda", &lambda(None), outputs(api));
+        assert_eq!(out.url.as_deref(), Some(api));
+        let out = with_mcp_endpoint("aws-lambda", &lambda(Some("/mcp")), outputs(api));
+        assert_eq!(
+            out.url.as_deref(),
+            Some("https://abc.execute-api.us-east-1.amazonaws.com/mcp")
+        );
+        let fqdn = "https://app.azurecontainerapps.io/";
+        let out = with_mcp_endpoint("azure-container-apps", &lambda(None), outputs(fqdn));
+        assert_eq!(out.url.as_deref(), Some(fqdn));
+    }
+
+    #[test]
+    fn no_url_stays_no_url() {
+        let out = with_mcp_endpoint(
+            "google-cloud-run",
+            &cloud_run(None),
+            DeploymentOutputs::default(),
+        );
+        assert_eq!(out.url, None);
+        let out = with_mcp_endpoint("google-cloud-run", &cloud_run(None), outputs(""));
+        assert_eq!(out.url.as_deref(), Some(""));
+        assert!(out.custom.is_empty());
+    }
+
+    /// An invalid `[server] mcp_path` stops the deploy before anything is built.
+    #[test]
+    fn an_invalid_mcp_path_is_refused_before_the_build() {
+        for bad in ["mcp", "/mcp?x=1", "/mcp#a", "/m cp"] {
+            let message = format!(
+                "{:#}",
+                validate_endpoint_settings(&cloud_run(Some(bad))).expect_err(bad)
+            );
+            assert!(message.contains("mcp_path"), "{bad}: {message}");
+        }
+        validate_endpoint_settings(&cloud_run(Some("/mcp"))).expect("valid");
+        validate_endpoint_settings(&cloud_run(None)).expect("unset");
+        validate_endpoint_settings(&lambda(Some("/"))).expect("root");
     }
 }

@@ -1326,6 +1326,56 @@ TLS-terminated MCP server; locking it down to an audience is the explicit next s
 
 ---
 
+## Google Cloud Run (`google-cloud-run` target)
+
+The container target that builds locally (`docker buildx --platform linux/amd64`), pushes
+the image, and runs `gcloud run deploy` with every flag taken from `.pmcp/deploy.toml`. The
+full option reference is [docs/commands/deploy.md](./docs/commands/deploy.md#google-cloud-run---target-type-google-cloud-run).
+
+```bash
+cargo pmcp deploy init --target-type google-cloud-run   # deploy.toml, Dockerfile, .dockerignore, cloudbuild.yaml
+gcloud auth login && gcloud config set project my-project
+cargo pmcp deploy --target google-cloud-run
+```
+
+### Where the image goes (`[gcp] repository`)
+
+A `deploy.toml` written by `deploy init` (0.28.0 and later) carries
+`[gcp] repository = "pmcp"`. The image is pushed to Artifact Registry as
+`<region>-docker.pkg.dev/<project_id>/<repository>/<[server] name>:latest`, and the deploy
+creates the repository in `[gcp] region` the first time (`gcloud artifacts repositories
+create <repository> --repository-format=docker`; "already exists" is success). Creating it
+needs `roles/artifactregistry.admin` once; pushing needs `roles/artifactregistry.writer`.
+Set `repository` to another id to use a different repository (lowercase letters, digits and
+`-`, starting with a letter, at most 63 characters).
+
+A `deploy.toml` without the key (written before 0.28.0) keeps pushing to
+`gcr.io/<project_id>/<[server] name>`, exactly as before; the deploy prints how to move.
+Container Registry stopped taking writes on 2025-03-18: `gcr.io` pushes land in an Artifact
+Registry `gcr.io` repository, which a new project may not have. `cloudbuild.yaml` follows
+the same key.
+
+### Two server requirements behind the Cloud Run ingress
+
+Same traps as [Azure](#two-server-requirements-the-scaffold-ships-the-spike-007-traps):
+bind `0.0.0.0:$PORT` (Cloud Run sets `PORT=8080`), and set
+`allowed_origins: Some(AllowedOrigins::any())` (or an explicit list naming the service URL).
+`pmcp::axum::router_with_config` with `allowed_origins: None` accepts only localhost
+`Host`/`Origin` headers, so every request through the ingress is a `403`. The SDK default is
+deliberately not changed (it is the DNS-rebinding protection for local servers).
+`deploy init` prints this warning; a post-deploy verification that gets a `403` repeats it,
+together with Cloud Run's own `403` for `[server] allow_unauthenticated = false`.
+
+### The MCP endpoint (`[server] mcp_path`)
+
+The post-deploy verification probes, and the deploy prints as the endpoint,
+`<service URL><mcp_path>`. On Cloud Run `mcp_path` defaults to `"/mcp"` (the pmcp.run
+convention); set `mcp_path = "/"` for a server that serves MCP at the root. `deploy init`
+records `mcp_path = "/"` in a new `deploy.toml` when the server binary is a `cargo pmcp new`
+server (its package depends on `server-common`, whose `run_http` serves at `/`).
+
+---
+
 ## IAM Declarations (`[iam]` section)
 
 > **Looking for a task-oriented guide?** See [docs/IAM.md](./docs/IAM.md) for workflow, recipes (DynamoDB + GSI, S3, SecretsManager, KMS, cross-Lambda invoke), troubleshooting, and migration from hand-written bolt-on stacks. This section is the schema reference.

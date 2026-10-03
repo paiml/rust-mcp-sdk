@@ -53,6 +53,8 @@ pub mod deployment {
 
         pub mod dockerfile;
 
+        pub mod image;
+
         pub mod manifest;
 
         #[cfg(test)]
@@ -68,6 +70,11 @@ pub mod deployment {
 
     #[path = "../deployment/post_deploy_tests.rs"]
     pub mod post_deploy_tests;
+
+    // `[server] mcp_path` validation and endpoint joining (pure leaf), for the
+    // `fuzz_mcp_path` fuzz target; `post_deploy_tests` reads its target table.
+    #[path = "../deployment/mcp_endpoint.rs"]
+    pub mod mcp_endpoint;
 
     // `widgets::enumerate_workspace_bin_crates` delegates here.
     #[path = "../deployment/naming.rs"]

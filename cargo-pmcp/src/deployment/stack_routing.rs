@@ -90,13 +90,20 @@ pub(crate) fn load_deploy_descriptor(config: &DeployConfig) -> Result<DeployDesc
     toml::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
-/// The `.pmcp/deploy.toml` keys cargo-pmcp applies itself on the renderer
-/// deploy path, outside the [`DeployDescriptor`]: `[build]` drives
-/// `cargo lambda build`, and `[server] ephemeral_storage_mb` is merged into the
-/// rendered template (`deployment::template_merge`). `(table, key)`; a `None`
-/// key names the whole table.
-pub const CLI_APPLIED_KEYS: [(&str, Option<&str>); 2] =
-    [("build", None), ("server", Some("ephemeral_storage_mb"))];
+/// The `.pmcp/deploy.toml` keys cargo-pmcp applies itself, outside the
+/// [`DeployDescriptor`]: `[build]` drives `cargo lambda build`,
+/// `[server] ephemeral_storage_mb` is merged into the rendered template
+/// (`deployment::template_merge`), `[server] mcp_path` is the endpoint path
+/// the CLI verifies and prints (`deployment::mcp_endpoint`), and
+/// `[gcp] repository` is the Cloud Run image repository (a `[gcp]` table
+/// survives a re-init for another target). `(table, key)`; a `None` key names
+/// the whole table.
+pub const CLI_APPLIED_KEYS: [(&str, Option<&str>); 4] = [
+    ("build", None),
+    ("server", Some("ephemeral_storage_mb")),
+    ("server", Some("mcp_path")),
+    ("gcp", Some("repository")),
+];
 
 /// [`load_deploy_descriptor`] for the deploy RENDERER path: the keys in
 /// [`CLI_APPLIED_KEYS`] are removed before parsing, because the closed-set
@@ -415,12 +422,79 @@ mod tests {
         assert!(load_render_descriptor(&config).is_err());
     }
 
+    /// An aws-lambda config that also carries a `[gcp]` table, as a project
+    /// re-inited from google-cloud-run keeps it.
+    fn lambda_with_kept_gcp(root: std::path::PathBuf) -> DeployConfig {
+        let mut config = cfg_with_target_and_iam(root, "aws-lambda", IamConfig::default());
+        config.gcp = Some(crate::deployment::GcpConfig {
+            project_id: "acme".to_string(),
+            region: "us-central1".to_string(),
+            repository: None,
+        });
+        config
+    }
+
+    /// Debug session `cargo-pmcp-deploy-targets` (PR-D): `[server] mcp_path`
+    /// (any target) and `[gcp] repository` (kept across a target switch) are
+    /// applied by cargo-pmcp itself; the renderer path must not fall back to
+    /// `npx cdk` because of them.
+    #[test]
+    fn render_descriptor_accepts_mcp_path_and_a_kept_gcp_repository() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain = lambda_with_kept_gcp(tmp.path().to_path_buf());
+        write_deploy_toml(&plain);
+        let expected = load_deploy_descriptor(&plain).expect("plain file parses");
+
+        let mut extended = plain.clone();
+        extended.server.mcp_path = Some("/mcp".to_string());
+        extended.gcp.as_mut().expect("[gcp]").repository = Some("pmcp".to_string());
+        write_deploy_toml(&extended);
+
+        assert_eq!(
+            load_render_descriptor(&extended).expect("render path accepts the PR-D keys"),
+            expected
+        );
+    }
+
+    /// `package save` stays strict for the PR-D keys too (as for PR-B's): the
+    /// descriptor cannot carry `mcp_path`, so the save stops rather than drop it.
+    #[test]
+    fn strict_descriptor_refuses_mcp_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "aws-lambda", IamConfig::default());
+        config.server.mcp_path = Some("/mcp".to_string());
+        write_deploy_toml(&config);
+        let message = format!("{:#}", load_deploy_descriptor(&config).expect_err("strict"));
+        assert!(message.contains("mcp_path"), "{message}");
+    }
+
     mod render_descriptor_proptests {
         use super::*;
         use proptest::prelude::*;
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// For any `[server] mcp_path` / `[gcp] repository` declaration,
+            /// the render-path descriptor equals the file's without them.
+            #[test]
+            fn endpoint_keys_never_change_the_descriptor(
+                mcp_path in prop::option::of("/[a-z0-9/]{0,10}"),
+                repository in prop::option::of("[a-z][a-z0-9-]{0,10}[a-z0-9]"),
+            ) {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let plain = lambda_with_kept_gcp(tmp.path().to_path_buf());
+                write_deploy_toml(&plain);
+                let expected = load_deploy_descriptor(&plain).expect("plain file parses");
+
+                let mut extended = plain.clone();
+                extended.server.mcp_path = mcp_path;
+                extended.gcp.as_mut().expect("[gcp]").repository = repository;
+                write_deploy_toml(&extended);
+
+                prop_assert_eq!(load_render_descriptor(&extended).expect("parses"), expected);
+            }
 
             /// For any `[build]` / `ephemeral_storage_mb` declaration, the
             /// render-path descriptor equals the descriptor of the same file

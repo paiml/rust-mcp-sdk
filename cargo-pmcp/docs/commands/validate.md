@@ -54,6 +54,11 @@ It also runs the Lambda-settings check `cargo pmcp deploy` runs before building 
 - **Hard error** — `[server] ephemeral_storage_mb` outside Lambda's 512-10240 MB range.
 - **Hard error** — A `[build] features` entry that is empty, starts with `-`, or contains a comma or whitespace.
 
+And the endpoint checks `cargo pmcp deploy` runs before building (see [deploy § Post-deploy verification](deploy.md#post-deploy-verification-and-exit-codes)):
+
+- **Hard error** — `[server] mcp_path` that does not start with `/`, or contains `?`, `#`, whitespace or a control character.
+- **Hard error** — On `google-cloud-run`, a `[gcp] repository` that is not an Artifact Registry repository id (lowercase letters, digits and `-`, starting with a letter, ending with a letter or digit, at most 63 characters).
+
 Hard errors return non-zero; warnings print to stderr but return zero.
 
 ### Examples

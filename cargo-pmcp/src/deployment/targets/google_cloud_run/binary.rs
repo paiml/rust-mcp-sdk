@@ -283,6 +283,22 @@ pub fn project_binaries(project_root: &Path) -> Result<Vec<BinTarget>> {
     Ok(bins)
 }
 
+/// True when package `package` of the project at `project_root` declares a
+/// dependency named `dependency` (`cargo metadata --no-deps`, no network).
+/// `false` when cargo cannot read the project.
+#[must_use]
+pub fn package_depends_on(project_root: &Path, package: &str, dependency: &str) -> bool {
+    cargo_metadata::MetadataCommand::new()
+        .manifest_path(project_root.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+        .is_ok_and(|metadata| {
+            metadata.packages.iter().any(|p| {
+                p.name.as_str() == package && p.dependencies.iter().any(|d| d.name == dependency)
+            })
+        })
+}
+
 /// Resolve the binary for the workspace / simple-crate Dockerfile templates.
 ///
 /// When cargo cannot list the binaries, a declared `[server] binary` is

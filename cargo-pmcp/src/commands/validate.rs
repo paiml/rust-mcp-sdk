@@ -603,6 +603,25 @@ fn print_test_guidance(not_quiet: bool) {
     }
 }
 
+/// `[server] mcp_path` (every target) and, on google-cloud-run,
+/// `[gcp] repository` — the checks `cargo pmcp deploy` runs before it builds.
+fn validate_endpoint_settings(config: &crate::deployment::config::DeployConfig) -> Result<()> {
+    if let Some(path) = config.server.mcp_path.as_deref() {
+        crate::deployment::mcp_endpoint::validate_mcp_path(path)
+            .context("invalid .pmcp/deploy.toml")?;
+    }
+    let repository = config
+        .gcp
+        .as_ref()
+        .and_then(|gcp| gcp.repository.as_deref())
+        .filter(|_| config.target.target_type == "google-cloud-run");
+    if let Some(repository) = repository {
+        crate::deployment::targets::google_cloud_run::validate_repository(repository)
+            .context("invalid .pmcp/deploy.toml")?;
+    }
+    Ok(())
+}
+
 /// Validate the deployment configuration (`.pmcp/deploy.toml`) — IAM focus.
 ///
 /// This is the pre-flight equivalent of the same validation that runs inside
@@ -647,6 +666,12 @@ pub fn validate_deploy(server: Option<String>, verbose: bool) -> Result<()> {
     // (`[server] ephemeral_storage_mb`, `[build]`), so the contract above —
     // a failing `validate deploy` guarantees a failing `deploy` — keeps holding.
     crate::deployment::lambda_function::validate_lambda_settings(&config)?;
+
+    // The endpoint settings `cargo pmcp deploy` checks before building:
+    // `[server] mcp_path` on every target, `[gcp] repository` where it is used
+    // (google-cloud-run), so a failing `validate deploy` still guarantees a
+    // failing `deploy`.
+    validate_endpoint_settings(&config)?;
 
     if not_quiet {
         crate::deployment::iam::emit_warnings(&warnings);
@@ -1442,6 +1467,50 @@ create_dashboard = false
             "timeout_seconds = 30\nephemeral_storage_mb = 2048\n",
         );
         let (_dir, project_root) = write_fixture(&good);
+        let result = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// An invalid `[server] mcp_path` fails `validate deploy`, as it fails
+    /// `deploy` before the build (debug session `cargo-pmcp-deploy-targets`,
+    /// #8); a valid one passes.
+    #[test]
+    fn validate_deploy_rejects_an_invalid_mcp_path() {
+        std::env::set_var("PMCP_QUIET", "1");
+        let with_path = |path: &str| {
+            COMMON_FIXTURE_HEADER.replace(
+                "timeout_seconds = 30\n",
+                &format!("timeout_seconds = 30\nmcp_path = \"{path}\"\n"),
+            )
+        };
+        let (_dir, project_root) = write_fixture(&with_path("mcp?x=1"));
+        let err = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false)
+            .expect_err("an invalid mcp_path must be refused");
+        assert!(format!("{err:#}").contains("mcp_path"), "{err:#}");
+
+        let (_dir, project_root) = write_fixture(&with_path("/mcp"));
+        let result = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// An invalid `[gcp] repository` fails `validate deploy` on
+    /// google-cloud-run, where the deploy uses (and refuses) it (#7).
+    #[test]
+    fn validate_deploy_rejects_an_invalid_gcp_repository_on_cloud_run() {
+        std::env::set_var("PMCP_QUIET", "1");
+        let cloud_run = |repository: &str| {
+            format!(
+                "[target]\ntype = \"google-cloud-run\"\nversion = \"1.0.0\"\n\n[gcp]\n\
+                 project_id = \"acme\"\nregion = \"us-central1\"\nrepository = \"{repository}\"\n\n\
+                 [server]\nname = \"svc\"\n\n[environment]\n"
+            )
+        };
+        let (_dir, project_root) = write_fixture(&cloud_run("Bad_Repo"));
+        let err = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false)
+            .expect_err("an invalid repository must be refused");
+        assert!(format!("{err:#}").contains("repository"), "{err:#}");
+
+        let (_dir, project_root) = write_fixture(&cloud_run("pmcp"));
         let result = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false);
         assert!(result.is_ok(), "{:?}", result.err());
     }

@@ -6,6 +6,7 @@ pub mod deploy_toml_edit;
 pub(crate) mod fake_npx;
 pub mod iam;
 pub mod lambda_function;
+pub mod mcp_endpoint;
 pub mod metadata;
 pub mod naming;
 pub mod operations;

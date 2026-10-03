@@ -137,7 +137,9 @@ async fn run_check_fails_consumes_json() {
             label,
             summary,
             recipes,
+            messages,
         } => {
+            assert_eq!(messages, ["503 Service Unavailable"]);
             assert_eq!(label, "Connectivity");
             assert!(summary.is_none());
             assert_eq!(recipes.len(), 1);
@@ -306,6 +308,7 @@ fn failure_banner_verbatim_shape_from_report() {
                         "cargo pmcp test apps --url http://x --mode claude-desktop --tool get_spend_summary"
                             .to_string(),
                 }],
+                messages: vec![],
             },
             Some(120),
         ),
@@ -621,6 +624,45 @@ async fn infra_error_distinct_exit_code_2() {
     assert!(matches!(failure, OrchestrationFailure::InfraError { .. }));
 }
 
+/// Debug session `cargo-pmcp-deploy-targets` #14: `warn` exits 0 even when a
+/// step reports an infrastructure error (it returned exit 2 before the
+/// `on_failure` policy was consulted). The banner is still produced.
+#[tokio::test]
+#[serial]
+async fn on_failure_warn_with_an_infra_error_returns_ok() {
+    let _guard = EnvGuard::new(&[]);
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", MOCK_BIN);
+    std::env::set_var("MOCK_OUTCOME", "infra-error");
+    std::env::set_var("MOCK_FAILURE_MESSAGE", "connection refused");
+    std::env::set_var("MOCK_FAILURE_REPRODUCE", "cargo pmcp test check http://x");
+
+    let mut config = baseline_config();
+    config.on_failure = OnFailure::Warn;
+    let result = run_post_deploy_tests("http://x", "google-cloud-run", true, &config, true).await;
+    assert!(
+        result.is_ok(),
+        "OnFailure::Warn must produce Ok(()) for an infra error, got exit {:?}",
+        result.err().map(|e| e.exit_code())
+    );
+}
+
+/// The same infra error under `fail` keeps its documented exit code 2.
+#[tokio::test]
+#[serial]
+async fn on_failure_fail_with_an_infra_error_keeps_exit_code_2() {
+    let _guard = EnvGuard::new(&[]);
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", MOCK_BIN);
+    std::env::set_var("MOCK_OUTCOME", "infra-error");
+    std::env::set_var("MOCK_FAILURE_MESSAGE", "connection refused");
+    std::env::set_var("MOCK_FAILURE_REPRODUCE", "cargo pmcp test check http://x");
+
+    let config = baseline_config();
+    let failure = run_post_deploy_tests("http://x", "google-cloud-run", true, &config, true)
+        .await
+        .expect_err("fail + infra error");
+    assert_eq!(failure.exit_code(), 2);
+}
+
 /// Test 2.8 (env_inheritance_to_subprocesses — HIGH-C2): with parent
 /// `MCP_API_KEY=test-token` set before calling the orchestrator, every
 /// subprocess sees that env var.
@@ -714,6 +756,7 @@ fn format_failure_banner_with_empty_target_id() {
             label: "Connectivity".to_string(),
             summary: None,
             recipes: vec![],
+            messages: vec![],
         },
         Some(200),
     )];

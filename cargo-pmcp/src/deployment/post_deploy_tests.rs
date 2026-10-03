@@ -150,8 +150,10 @@ pub enum OnFailure {
     #[default]
     Fail,
 
-    /// CLI prints a warning and exits zero. The (potentially broken) revision
-    /// stays live; pipeline continues.
+    /// CLI prints the failure banner and exits zero, whatever failed: a test
+    /// verdict or an infrastructure error (spawn failure, timeout, unreachable
+    /// endpoint). The (potentially broken) revision stays live; pipeline
+    /// continues. (Before 0.28.0 an infrastructure error still exited 2.)
     Warn,
 }
 
@@ -224,6 +226,11 @@ pub enum TestOutcome {
         /// Per-failure reproduction commands extracted from JSON
         /// `PostDeployReport.failures[].reproduce`.
         recipes: Vec<FailureRecipe>,
+        /// Per-failure messages from JSON `PostDeployReport.failures[].message`
+        /// (e.g. `... Request failed with status: 403 Forbidden`). The banner
+        /// reads them for its hints (debug session
+        /// `cargo-pmcp-deploy-targets`, findings #8 and #12).
+        messages: Vec<String>,
     },
     /// Subprocess failed at the infrastructure level — child failed to spawn,
     /// timed out, or reported a network/auth error via the JSON outcome.
@@ -449,10 +456,12 @@ fn parse_subprocess_result(
                     command: f.reproduce.clone(),
                 })
                 .collect();
+            let messages = report.failures.iter().map(|f| f.message.clone()).collect();
             TestOutcome::TestFailed {
                 label: label.to_string(),
                 summary,
                 recipes,
+                messages,
             }
         },
         JsonOutcome::InfraError => {
@@ -613,12 +622,12 @@ fn write_ci_annotation<W: std::io::Write>(
 // Top-level orchestrator (Task 2 of Plan 79-03)
 // ============================================================================
 
-/// Result of the orchestrator. Exit-code mapping:
+/// Result of the orchestrator. Exit-code mapping (see [`verdict_exit_code`]):
 ///
 /// - [`OrchestrationFailure::BrokenButLive`] (test failed against live revision): exit 3
-///   (REVISION 3 HIGH-2)
-/// - [`OrchestrationFailure::InfraError`]: exit 2
-/// - `Ok(())`: exit 0
+///   (REVISION 3 HIGH-2), `on_failure = fail` only
+/// - [`OrchestrationFailure::InfraError`]: exit 2, `on_failure = fail` only
+/// - `Ok(())`: exit 0 — every check passed, or `on_failure = warn`
 ///
 /// REVISION 3 HIGH-2 rename: `TestFailed` → `BrokenButLive` to reflect that
 /// post-deploy failures are inherently against a live revision (deploy already
@@ -730,49 +739,144 @@ async fn invoke_step(
     .await
 }
 
-/// Interpret the per-step outcomes into the final orchestrator verdict + emit
-/// the SOLE failure-banner eprintln (F-6 mitigation). Cog ≤10.
+/// One post-deploy step's result: label, typed command, outcome, duration.
+pub type StepOutcome = (String, JsonTestCommand, TestOutcome, Option<u64>);
+
+/// The CLI exit code the verification maps to, or `None` for exit 0.
 ///
-/// REVISION 3 HIGH-2: emits CI annotation alongside the banner.
-fn interpret_outcomes(
-    target_id: &str,
-    outcomes: &[(String, JsonTestCommand, TestOutcome, Option<u64>)],
-    on_failure: OnFailure,
-    quiet: bool,
-) -> std::result::Result<(), OrchestrationFailure> {
+/// | `on_failure` | all passed | a test failed | an infrastructure error |
+/// |---|---|---|---|
+/// | `fail` | 0 | 3 | 2 (wins over 3) |
+/// | `warn` | 0 | 0 | 0 |
+///
+/// `warn` is consulted FIRST (debug session `cargo-pmcp-deploy-targets`, #14):
+/// an infrastructure error in a check used to return 2 before the policy was
+/// read, so `--on-test-failure warn` exited 2 although it is documented to
+/// exit 0. The failure is still printed (see [`failure_banner`]).
+#[must_use]
+pub fn verdict_exit_code(outcomes: &[StepOutcome], on_failure: OnFailure) -> Option<i32> {
+    if on_failure == OnFailure::Warn {
+        return None;
+    }
     let any_infra = outcomes
         .iter()
         .any(|(_, _, o, _)| matches!(o, TestOutcome::InfraError(..)));
     let any_test_failed = outcomes
         .iter()
         .any(|(_, _, o, _)| matches!(o, TestOutcome::TestFailed { .. }));
+    if any_infra {
+        Some(2)
+    } else if any_test_failed {
+        Some(3)
+    } else {
+        None
+    }
+}
 
-    if !any_infra && !any_test_failed {
+/// The failure banner the orchestrator prints: the per-step report, hints for
+/// failures it recognizes (a 403 behind a container target's ingress, a 404),
+/// and under `warn` a note that the deploy exits 0 anyway.
+#[must_use]
+pub fn failure_banner(target_id: &str, outcomes: &[StepOutcome], on_failure: OnFailure) -> String {
+    let mut banner = format_failure_banner_from_report(target_id, outcomes);
+    if any_status(outcomes, "403") && is_container_target(target_id) {
+        banner.push_str(&origin_policy_hint(target_id));
+    }
+    if any_status(outcomes, "404") && target_id != "pmcp-run" {
+        banner.push_str(MCP_PATH_HINT);
+    }
+    if on_failure == OnFailure::Warn {
+        banner.push_str(
+            "  on_failure = warn: the failure is reported and the deploy continues (exit 0).\n",
+        );
+    }
+    banner
+}
+
+/// Targets that run the server's own HTTP listener behind a platform ingress,
+/// which forwards the public `Host` header to it.
+fn is_container_target(target_id: &str) -> bool {
+    matches!(target_id, "google-cloud-run" | "azure-container-apps")
+}
+
+/// The failure messages of every failed step.
+fn failure_messages(outcomes: &[StepOutcome]) -> impl Iterator<Item = &str> {
+    outcomes.iter().flat_map(|(_, _, outcome, _)| -> Vec<&str> {
+        match outcome {
+            TestOutcome::TestFailed { messages, .. } => {
+                messages.iter().map(String::as_str).collect()
+            },
+            TestOutcome::InfraError(_, message) => vec![message.as_str()],
+            TestOutcome::Passed { .. } => Vec::new(),
+        }
+    })
+}
+
+/// True when a failed step's message reports HTTP `status` (the client's
+/// `Request failed with status: 403 Forbidden` form).
+fn any_status(outcomes: &[StepOutcome], status: &str) -> bool {
+    let needle = format!("status: {status}");
+    failure_messages(outcomes).any(|message| message.contains(&needle))
+}
+
+/// Why a container target answers 403 (debug session
+/// `cargo-pmcp-deploy-targets`, #12): the SDK's localhost-only origin default.
+fn origin_policy_hint(target_id: &str) -> String {
+    let mut hint = String::from(
+        "\n  The endpoint answered 403 Forbidden. A pmcp server built with \
+         pmcp::axum::router_with_config\n  and `allowed_origins: None` accepts only \
+         localhost Host/Origin headers (DNS-rebinding\n  protection), so behind the \
+         platform ingress every request is refused. Set\n  \
+         `allowed_origins: Some(AllowedOrigins::any())` in RouterConfig (or \
+         StreamableHttpServerConfig),\n  or an explicit list naming the service URL.\n",
+    );
+    if target_id == "google-cloud-run" {
+        hint.push_str(
+            "  Cloud Run also answers 403 to unauthenticated requests when \
+             [server] allow_unauthenticated = false.\n",
+        );
+    }
+    hint
+}
+
+/// Why an endpoint answers 404 (debug session `cargo-pmcp-deploy-targets`,
+/// #8): the probe used a path the server does not serve.
+const MCP_PATH_HINT: &str =
+    "\n  The endpoint answered 404 Not Found. Set `mcp_path` under [server] in \
+     .pmcp/deploy.toml to the\n  path your server serves MCP at (google-cloud-run probes \
+     \"/mcp\" when it is unset; \"/\" for the root).\n";
+
+/// Interpret the per-step outcomes into the final orchestrator verdict + emit
+/// the SOLE failure-banner eprintln (F-6 mitigation). Cog ≤10.
+///
+/// REVISION 3 HIGH-2: emits CI annotation alongside the banner.
+fn interpret_outcomes(
+    target_id: &str,
+    outcomes: &[StepOutcome],
+    on_failure: OnFailure,
+    quiet: bool,
+) -> std::result::Result<(), OrchestrationFailure> {
+    let any_failed = outcomes
+        .iter()
+        .any(|(_, _, o, _)| !matches!(o, TestOutcome::Passed { .. }));
+    if !any_failed {
         return Ok(());
     }
 
-    let banner = format_failure_banner_from_report(target_id, outcomes);
+    let banner = failure_banner(target_id, outcomes, on_failure);
     if !quiet {
         eprintln!("{banner}");
     }
 
-    if any_infra {
-        // REVISION 3 HIGH-2: emit CI annotation for infra failures too.
-        emit_ci_annotation(target_id, 2);
-        return Err(OrchestrationFailure::InfraError {
-            exit_code: 2,
-            banner,
-        });
-    }
-    // any_test_failed must be true here (early-returned above otherwise).
-    match on_failure {
-        OnFailure::Warn => Ok(()),
-        OnFailure::Fail => {
-            // REVISION 3 HIGH-2: exit code 3 (broken-but-live) + CI annotation.
-            emit_ci_annotation(target_id, 3);
-            Err(OrchestrationFailure::BrokenButLive {
-                exit_code: 3,
-                banner,
+    match verdict_exit_code(outcomes, on_failure) {
+        None => Ok(()),
+        Some(exit_code) => {
+            // REVISION 3 HIGH-2: CI annotation alongside the banner.
+            emit_ci_annotation(target_id, exit_code);
+            Err(if exit_code == 3 {
+                OrchestrationFailure::BrokenButLive { exit_code, banner }
+            } else {
+                OrchestrationFailure::InfraError { exit_code, banner }
             })
         },
     }
@@ -805,7 +909,7 @@ pub async fn run_post_deploy_tests(
         sleep(Duration::from_millis(config.warmup_grace_ms)).await;
     }
 
-    let mut outcomes: Vec<(String, JsonTestCommand, TestOutcome, Option<u64>)> = Vec::new();
+    let mut outcomes: Vec<StepOutcome> = Vec::new();
 
     let runs = build_run_plan(config, widgets_present);
     for step in runs {
@@ -941,8 +1045,8 @@ warmup_grace_ms = 2000
     }
 
     /// Test 2.7 (test_outcome_test_failed_struct_payload_constructs):
-    /// `TestFailed { label, summary, recipes }` constructs and a match on it
-    /// binds all three fields.
+    /// `TestFailed { label, summary, recipes, messages }` constructs and a
+    /// match on it binds every field.
     #[test]
     fn test_outcome_test_failed_struct_payload_constructs() {
         let outcome = TestOutcome::TestFailed {
@@ -955,13 +1059,16 @@ warmup_grace_ms = 2000
                 command: "cargo pmcp test apps --url http://x --mode claude-desktop --tool foo"
                     .to_string(),
             }],
+            messages: vec!["widget foo has no onteardown".to_string()],
         };
         match &outcome {
             TestOutcome::TestFailed {
                 label,
                 summary,
                 recipes,
+                messages,
             } => {
+                assert_eq!(messages, &["widget foo has no onteardown"]);
                 assert_eq!(label, "apps");
                 assert_eq!(summary.unwrap().passed, 7);
                 assert_eq!(summary.unwrap().total, 8);
@@ -1013,6 +1120,203 @@ warmup_grace_ms = 2000
         match &connectivity {
             TestOutcome::Passed { summary: None } => {},
             other => panic!("expected Passed{{None}}, got {other:?}"),
+        }
+    }
+
+    // ---------- Debug session cargo-pmcp-deploy-targets, PR-D ----------
+
+    fn step(outcome: TestOutcome) -> StepOutcome {
+        (
+            "Connectivity".to_string(),
+            JsonTestCommand::Check,
+            outcome,
+            Some(10),
+        )
+    }
+
+    fn passed() -> TestOutcome {
+        TestOutcome::Passed { summary: None }
+    }
+
+    fn test_failed(message: &str) -> TestOutcome {
+        TestOutcome::TestFailed {
+            label: "Connectivity".to_string(),
+            summary: None,
+            recipes: vec![],
+            messages: vec![message.to_string()],
+        }
+    }
+
+    fn infra(message: &str) -> TestOutcome {
+        TestOutcome::InfraError(InfraErrorKind::AuthOrNetwork, message.to_string())
+    }
+
+    /// #14: the exit-code table, every `on_failure` x outcome mix. `warn`
+    /// always exits 0 (the field report: Connectivity and Conformance
+    /// test-failed, Apps infra-error, `--on-test-failure warn` -> exit 2).
+    #[test]
+    fn exit_code_matrix() {
+        /// `(name, outcomes, exit code under fail, exit code under warn)`.
+        type Case = (&'static str, Vec<TestOutcome>, Option<i32>, Option<i32>);
+        let cases: [Case; 6] = [
+            ("no steps", vec![], None, None),
+            ("all passed", vec![passed(), passed()], None, None),
+            (
+                "a test failed",
+                vec![passed(), test_failed("x")],
+                Some(3),
+                None,
+            ),
+            ("infra error", vec![infra("x"), passed()], Some(2), None),
+            (
+                "the 017/019 shape",
+                vec![test_failed("x"), test_failed("y"), infra("z")],
+                Some(2),
+                None,
+            ),
+            ("infra only", vec![infra("x")], Some(2), None),
+        ];
+        for (name, outcomes, fail, warn) in cases {
+            let steps: Vec<StepOutcome> = outcomes.into_iter().map(step).collect();
+            assert_eq!(
+                verdict_exit_code(&steps, OnFailure::Fail),
+                fail,
+                "fail: {name}"
+            );
+            assert_eq!(
+                verdict_exit_code(&steps, OnFailure::Warn),
+                warn,
+                "warn: {name}"
+            );
+        }
+    }
+
+    /// #14 through the orchestrator's own verdict path (quiet, so nothing is
+    /// printed): `warn` returns Ok for an infrastructure error.
+    #[test]
+    fn warn_turns_an_infrastructure_error_into_success() {
+        let steps = vec![step(test_failed("x")), step(infra("y"))];
+        assert!(interpret_outcomes("google-cloud-run", &steps, OnFailure::Warn, true).is_ok());
+        let failure = interpret_outcomes("google-cloud-run", &steps, OnFailure::Fail, true)
+            .expect_err("fail keeps its code");
+        assert_eq!(failure.exit_code(), 2);
+    }
+
+    /// The failure is still reported under `warn`, and the banner says the
+    /// deploy exits 0 anyway.
+    #[test]
+    fn the_warn_banner_reports_the_failure_and_the_exit_code() {
+        let steps = vec![step(infra("connection refused"))];
+        let banner = failure_banner("google-cloud-run", &steps, OnFailure::Warn);
+        assert!(banner.contains("✗ Connectivity"), "{banner}");
+        assert!(banner.contains("IS LIVE"), "{banner}");
+        assert!(banner.contains("on_failure = warn"), "{banner}");
+        assert!(banner.contains("exit 0"), "{banner}");
+        let banner = failure_banner("google-cloud-run", &steps, OnFailure::Fail);
+        assert!(!banner.contains("on_failure = warn"), "{banner}");
+    }
+
+    const FORBIDDEN: &str =
+        "Transport error: Request error: Request failed with status: 403 Forbidden";
+    const NOT_FOUND: &str =
+        "Transport error: Request error: Request failed with status: 404 Not Found";
+
+    /// #12: a 403 behind a container target's ingress names the origin-policy
+    /// fix (and Cloud Run's own authentication).
+    #[test]
+    fn a_403_on_a_container_target_names_the_origin_policy_fix() {
+        for target in ["google-cloud-run", "azure-container-apps"] {
+            let banner = failure_banner(target, &[step(test_failed(FORBIDDEN))], OnFailure::Fail);
+            assert!(banner.contains("403"), "{target}: {banner}");
+            assert!(
+                banner.contains("AllowedOrigins::any()"),
+                "{target}: {banner}"
+            );
+            assert!(banner.contains("allowed_origins"), "{target}: {banner}");
+        }
+        let banner = failure_banner(
+            "google-cloud-run",
+            &[step(test_failed(FORBIDDEN))],
+            OnFailure::Fail,
+        );
+        assert!(banner.contains("allow_unauthenticated"), "{banner}");
+        // An infra-error message carries the status too.
+        let banner = failure_banner(
+            "google-cloud-run",
+            &[step(infra(FORBIDDEN))],
+            OnFailure::Fail,
+        );
+        assert!(banner.contains("AllowedOrigins::any()"), "{banner}");
+    }
+
+    /// The origin hint is for container targets only (on a Lambda the SDK sees
+    /// the loopback proxy's Host, so a 403 there is not the origin policy).
+    #[test]
+    fn a_403_elsewhere_and_other_failures_get_no_origin_hint() {
+        let banner = failure_banner(
+            "aws-lambda",
+            &[step(test_failed(FORBIDDEN))],
+            OnFailure::Fail,
+        );
+        assert!(!banner.contains("AllowedOrigins"), "{banner}");
+        let banner = failure_banner(
+            "google-cloud-run",
+            &[step(test_failed("503 Service Unavailable"))],
+            OnFailure::Fail,
+        );
+        assert!(!banner.contains("AllowedOrigins"), "{banner}");
+        assert!(!banner.contains("mcp_path"), "{banner}");
+    }
+
+    /// #8: a 404 points at `[server] mcp_path` (not on pmcp-run, whose URL
+    /// is the platform's).
+    #[test]
+    fn a_404_names_mcp_path() {
+        for target in ["google-cloud-run", "aws-lambda", "azure-container-apps"] {
+            let banner = failure_banner(target, &[step(test_failed(NOT_FOUND))], OnFailure::Warn);
+            assert!(banner.contains("mcp_path"), "{target}: {banner}");
+            assert!(banner.contains("\"/\""), "{target}: {banner}");
+        }
+        let banner = failure_banner("pmcp-run", &[step(test_failed(NOT_FOUND))], OnFailure::Fail);
+        assert!(!banner.contains("mcp_path"), "{banner}");
+    }
+
+    fn any_outcome() -> impl proptest::strategy::Strategy<Value = TestOutcome> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(passed()),
+            "[a-z0-9 ]{0,8}".prop_map(|m| test_failed(&m)),
+            "[a-z0-9 ]{0,8}".prop_map(|m| infra(&m)),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// #14: the verdict follows the documented table for any mix of step
+        /// outcomes; `warn` never yields a nonzero exit.
+        #[test]
+        fn exit_code_follows_the_documented_table(
+            outcomes in proptest::collection::vec(any_outcome(), 0..6),
+            warn in proptest::bool::ANY,
+        ) {
+            let steps: Vec<StepOutcome> = outcomes.into_iter().map(step).collect();
+            let on_failure = if warn { OnFailure::Warn } else { OnFailure::Fail };
+            let infra = steps.iter().any(|(_, _, o, _)| matches!(o, TestOutcome::InfraError(..)));
+            let failed = steps.iter().any(|(_, _, o, _)| matches!(o, TestOutcome::TestFailed { .. }));
+            let expected = match on_failure {
+                OnFailure::Warn => None,
+                OnFailure::Fail if infra => Some(2),
+                OnFailure::Fail if failed => Some(3),
+                OnFailure::Fail => None,
+            };
+            proptest::prop_assert_eq!(verdict_exit_code(&steps, on_failure), expected);
+            proptest::prop_assert_eq!(
+                interpret_outcomes("google-cloud-run", &steps, on_failure, true)
+                    .err()
+                    .map(|f| f.exit_code()),
+                expected
+            );
         }
     }
 

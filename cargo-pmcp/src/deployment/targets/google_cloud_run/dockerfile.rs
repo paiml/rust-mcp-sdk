@@ -518,7 +518,36 @@ pub fn generate_cloudbuild(config: &DeployConfig) -> Result<()> {
     Ok(())
 }
 
+/// The registry-specific lines of `cloudbuild.yaml`: a header note, and the
+/// push / store comments. For gcr.io they are the 0.27 text, unchanged.
+fn cloudbuild_registry_text(
+    registry: &super::image::ImageRegistry,
+) -> (String, &'static str, &'static str) {
+    match registry {
+        super::image::ImageRegistry::ArtifactRegistry {
+            location,
+            repository,
+        } => (
+            format!(
+                "#\n# Images go to the Artifact Registry repository `{repository}` in {location}, \
+                 which must exist\n# (`cargo pmcp deploy` creates it), or create it once:\n\
+                 #   gcloud artifacts repositories create {repository} \
+                 --repository-format=docker --location={location}\n"
+            ),
+            "Artifact Registry",
+            "Artifact Registry",
+        ),
+        super::image::ImageRegistry::ContainerRegistry => {
+            (String::new(), "Google Container Registry", "GCR")
+        },
+    }
+}
+
 /// Render `cloudbuild.yaml` from `config` without writing it.
+///
+/// Images go to the Artifact Registry repository `[gcp] repository` when it is
+/// set (a 0.28.0 `deploy init` sets it), else to gcr.io as before (debug
+/// session `cargo-pmcp-deploy-targets`, #7).
 #[must_use]
 pub fn render_cloudbuild(config: &DeployConfig) -> String {
     let region = config
@@ -554,6 +583,12 @@ pub fn render_cloudbuild(config: &DeployConfig) -> String {
     } else {
         "--no-allow-unauthenticated"
     };
+    let registry = super::image::ImageRegistry::for_config(
+        config.gcp.as_ref().and_then(|g| g.repository.as_deref()),
+        &region,
+    );
+    let image = registry.image_name("$PROJECT_ID", &config.server.name);
+    let (registry_note, push_comment, store_comment) = cloudbuild_registry_text(&registry);
 
     format!(
         r#"# Cloud Build configuration for automated deployments
@@ -567,23 +602,23 @@ pub fn render_cloudbuild(config: &DeployConfig) -> String {
 # .pmcp/deploy.toml ([gcp].region, [server].*, [environment].*). Init keeps
 # an existing file: after changing deploy.toml, delete this file and re-run
 # init to regenerate it.
-
+{registry_note}
 steps:
   # Build the Docker image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/{name}:$COMMIT_SHA'
+      - '{image}:$COMMIT_SHA'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/{name}:latest'
+      - '{image}:latest'
       - '.'
 
-  # Push the Docker image to Google Container Registry
+  # Push the Docker image to {push_comment}
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'gcr.io/$PROJECT_ID/{name}:$COMMIT_SHA'
+      - '{image}:$COMMIT_SHA'
 
   # Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -593,7 +628,7 @@ steps:
       - 'deploy'
       - '{name}'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/{name}:$COMMIT_SHA'
+      - '{image}:$COMMIT_SHA'
       - '--region'
       - '{region}'
       - '--platform'
@@ -610,10 +645,10 @@ steps:
       - '--port'
       - '8080'
 {tail}
-# Store images in GCR
+# Store images in {store_comment}
 images:
-  - 'gcr.io/$PROJECT_ID/{name}:$COMMIT_SHA'
-  - 'gcr.io/$PROJECT_ID/{name}:latest'
+  - '{image}:$COMMIT_SHA'
+  - '{image}:latest'
 
 # Build timeout
 timeout: '1200s'
@@ -726,6 +761,55 @@ mod tests {
         let cb = std::fs::read_to_string(tmp.path().join("cloudbuild.yaml")).expect("read");
         assert!(cb.contains("'--ingress'"));
         assert!(cb.contains("'internal'"));
+    }
+
+    // ---------- Image registry (debug session cargo-pmcp-deploy-targets, #7) ----------
+
+    /// A config with `[gcp] repository` builds, pushes and deploys the
+    /// Artifact Registry image, and says the repository must exist.
+    #[test]
+    fn cloudbuild_pushes_to_artifact_registry_when_a_repository_is_set() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let mut config = make_config(&tmp);
+        config.gcp.as_mut().expect("[gcp]").repository = Some("pmcp".to_string());
+
+        let cb = render_cloudbuild(&config);
+        let image = "us-central1-docker.pkg.dev/$PROJECT_ID/pmcp/auth-echo-cloud-run";
+        assert_eq!(
+            cb.matches(&format!("'{image}:$COMMIT_SHA'")).count(),
+            4,
+            "{cb}"
+        );
+        assert_eq!(cb.matches(&format!("'{image}:latest'")).count(), 2, "{cb}");
+        assert!(!cb.contains("gcr.io/$PROJECT_ID"), "{cb}");
+        assert!(
+            !cb.contains("GCR") && !cb.contains("Container Registry"),
+            "{cb}"
+        );
+        assert!(cb.contains("# Store images in Artifact Registry\n"), "{cb}");
+        assert!(
+            cb.contains("gcloud artifacts repositories create pmcp --repository-format=docker --location=us-central1"),
+            "{cb}"
+        );
+    }
+
+    /// Without `[gcp] repository` the file is the gcr.io one, unchanged.
+    #[test]
+    fn cloudbuild_without_repository_keeps_gcr_io() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let mut config = make_config(&tmp);
+        config.gcp.as_mut().expect("[gcp]").repository = None;
+
+        let cb = render_cloudbuild(&config);
+        let image = "gcr.io/$PROJECT_ID/auth-echo-cloud-run";
+        assert_eq!(
+            cb.matches(&format!("'{image}:$COMMIT_SHA'")).count(),
+            4,
+            "{cb}"
+        );
+        assert_eq!(cb.matches(&format!("'{image}:latest'")).count(), 2, "{cb}");
+        assert!(!cb.contains("pkg.dev"), "{cb}");
+        assert!(cb.contains("# Store images in GCR\n"), "{cb}");
     }
 
     // ---------- Layout / Dockerfile tests (issue #258) ----------

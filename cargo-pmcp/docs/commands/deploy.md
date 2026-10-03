@@ -22,6 +22,10 @@ Deploy to AWS Lambda, Google Cloud Run, Cloudflare Workers, or pmcp.run. Include
 | `--shared-pool <POOL>` | Use shared OAuth pool for SSO (pmcp-run only) |
 | `--no-oauth` | Skip OAuth configuration during deployment |
 | `--regenerate-stack` (alias `--force`) | Overwrite a **hand-modified** `deploy/lib/stack.ts`. By default a hand-modified file is **preserved** (so an operator-curated stack is never silently clobbered); an unmodified scaffold is regenerated from the loaded config without this flag. See [Unmodified vs hand-modified `stack.ts`](#unmodified-vs-hand-modified-stackts). |
+| `--no-post-deploy-test` | Skip the [post-deploy verification](#post-deploy-verification-and-exit-codes) |
+| `--post-deploy-tests <CHECKS>` | Run only these checks, comma-separated: `connectivity`, `conformance`, `apps` |
+| `--on-test-failure <MODE>` | `fail` (default) or `warn`; overrides `[post_deploy_tests] on_failure`. See [exit codes](#post-deploy-verification-and-exit-codes) |
+| `--apps-mode <MODE>` | `standard`, `chatgpt` or `claude-desktop` (default) for the `apps` check |
 
 ## Subcommands
 
@@ -285,6 +289,39 @@ instead of being ignored. The container targets (`google-cloud-run`,
 > `cargo lambda build --target-dir <dir>` fails upstream (cargo-lambda passes the
 > flag on to `cargo metadata`, which rejects it).
 
+### Post-deploy verification and exit codes
+
+After a successful deploy, `cargo pmcp deploy` runs `cargo pmcp test check`, `test conformance` and (when the project has widgets) `test apps` against the MCP endpoint of the new deployment. Configure it with `[post_deploy_tests]` in `.pmcp/deploy.toml` or the flags above.
+
+**The endpoint** is the URL the target reports plus `[server] mcp_path`:
+
+| Target | URL verified and printed |
+|---|---|
+| `google-cloud-run` | `<service URL><mcp_path>`; `mcp_path` defaults to `"/mcp"` |
+| `pmcp-run` | the platform URL, which already ends in `/mcp` (`mcp_path` is ignored, with a note when it differs) |
+| `aws-lambda`, `azure-container-apps`, `cloudflare-workers` | the reported URL; `<URL><mcp_path>` when `mcp_path` is set |
+
+```toml
+[server]
+mcp_path = "/mcp"   # or "/" for a server that serves MCP at the root
+```
+
+`mcp_path` must start with `/` and carry no query (`?`), fragment (`#`), whitespace or control characters; anything else fails the deploy before the build and fails `cargo pmcp validate deploy`. When a path is appended, `deploy outputs` and the deploy summary print the endpoint as the URL and keep the reported one as `service_url`. Before 0.28.0 every target verified the reported URL, so a Cloud Run server mounted at `/mcp` failed every check.
+
+**Exit codes.** The deploy itself has already succeeded when the checks run: the new revision is live either way.
+
+| `on_failure` | every check passed | a check failed | a check hit an infrastructure error |
+|---|---|---|---|
+| `fail` (default) | 0 | 3 | 2 (also when another check failed) |
+| `warn` | 0 | 0 | 0 |
+
+An infrastructure error is a check that could not produce a verdict: the child process failed to start, timed out, or could not reach the endpoint. The failure banner is printed in every failing case; under `warn` it ends with a line saying the deploy continues. With `CI` set, `fail` also prints a `::error::` annotation. Before 0.28.0 an infrastructure error exited 2 even under `warn`.
+
+The banner adds a hint when a check's error names an HTTP status it recognizes:
+
+- **403 on `google-cloud-run` or `azure-container-apps`**: the server rejected the public `Host`. A pmcp server built with `pmcp::axum::router_with_config` and `allowed_origins: None` accepts only localhost (DNS-rebinding protection); set `allowed_origins: Some(AllowedOrigins::any())` or an explicit list naming the service URL. On Cloud Run, `[server] allow_unauthenticated = false` also answers 403 to the unauthenticated probe.
+- **404** (any target but `pmcp-run`): the probed path is not the server's; set `[server] mcp_path`.
+
 ---
 
 ## deploy init
@@ -337,6 +374,10 @@ Error: Cannot tell which binary is the MCP server; candidates: `local` (package 
 The new `deploy.toml` is written before init stops, so the line has a file to go into. The binary must serve MCP over HTTP on `0.0.0.0:$PORT`. A kept Dockerfile is yours: init does not choose a binary for it.
 
 Before 0.28.0, the workspace template built every package except those a text search over `cargo metadata` output matched for `lambda`. That search also matched dependency names (`lambda_http`) and the project's own `*-lambda` package, so cargo stopped with "no packages to compile" (issue #258). Both templates then copied whichever executable `find target/release` reached last, and `[workspace]` was detected by substring, so a commented-out `# [workspace]` counted.
+
+**Image registry.** A new `deploy.toml` records `[gcp] repository = "pmcp"`, and `cargo pmcp deploy` pushes the image to Artifact Registry as `<region>-docker.pkg.dev/<project_id>/<repository>/<[server] name>:latest`. Before building, the deploy creates the repository in `[gcp] region` (`gcloud artifacts repositories create <repository> --repository-format=docker --location=<region>`); "already exists" counts as success, and any other failure (typically a missing `roles/artifactregistry.admin`) stops the deploy before the build, naming the command. Docker is authenticated to `<region>-docker.pkg.dev` only. Set `repository` to another id to use a different repository (lowercase letters, digits and `-`, starting with a letter, ending with a letter or digit, at most 63 characters; anything else is refused before the build and by `cargo pmcp validate deploy`). A `deploy.toml` without the key (written before 0.28.0) keeps pushing to `gcr.io/<project_id>/<[server] name>` with the same commands as before, and the deploy prints how to move: Container Registry stopped taking writes on 2025-03-18, and `gcr.io` pushes now need an Artifact Registry `gcr.io` repository. A generated `cloudbuild.yaml` uses the same image name (it does not create the repository; its header shows the command).
+
+**Serving behind the Cloud Run ingress.** The server must listen on `0.0.0.0:$PORT` (Cloud Run sets `PORT=8080`) and accept the service's public `Host`: with `pmcp::axum::router_with_config`, set `allowed_origins: Some(AllowedOrigins::any())` or an explicit list naming the service URL. `allowed_origins: None` is localhost-only, so the DNS-rebinding guard answers 403 to every request through the ingress. `deploy init` prints this, and so does a [post-deploy check](#post-deploy-verification-and-exit-codes) that gets a 403. The post-deploy checks and the printed endpoint use `<service URL>/mcp` unless `[server] mcp_path` says otherwise; a new `deploy.toml` for a `cargo pmcp new` server (whose package depends on `server-common`; its `run_http` serves MCP at `/`) records `mcp_path = "/"`.
 
 **Region.** A new `deploy.toml` gets `[gcp] region` from `--region`, else `us-central1`. `AWS_REGION` is not consulted. Before 0.28.0, the AWS default (`us-east-1`, or `$AWS_REGION`) was written into `[gcp]`. An existing `deploy.toml` keeps its region.
 
@@ -468,7 +509,7 @@ cargo pmcp deploy secrets <ACTION>
 
 ## deploy outputs
 
-Show deployment outputs. On `aws-lambda` they are read from `deploy/outputs.json` for `{[server] name}-stack` by name; if the file records only other stacks (for example after a rename, before the first deploy under the new name), the command says which ones instead of showing another stack's outputs under this name.
+Show deployment outputs. The URL is the MCP endpoint, as the deploy verifies it (see [`[server] mcp_path`](#post-deploy-verification-and-exit-codes)); when a path was appended, the URL the target reports is shown as `service_url`. On `aws-lambda` they are read from `deploy/outputs.json` for `{[server] name}-stack` by name; if the file records only other stacks (for example after a rename, before the first deploy under the new name), the command says which ones instead of showing another stack's outputs under this name.
 
 ```
 cargo pmcp deploy outputs [OPTIONS]

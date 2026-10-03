@@ -443,6 +443,12 @@ pub struct AwsConfig {
     pub account_id: Option<String>,
 }
 
+/// The Artifact Registry repository a new `deploy init --target-type
+/// google-cloud-run` records as `[gcp] repository` (debug session
+/// `cargo-pmcp-deploy-targets`, finding #7): one repository per project and
+/// region, shared by every server cargo-pmcp deploys there.
+pub const DEFAULT_GCP_REPOSITORY: &str = "pmcp";
+
 /// Google Cloud configuration for the `google-cloud-run` target.
 ///
 /// Mirrors [`AwsConfig`] in shape (project + region) and is required when
@@ -454,6 +460,19 @@ pub struct GcpConfig {
     pub project_id: String,
     /// Cloud Run region (e.g. `"us-central1"`).
     pub region: String,
+    /// Artifact Registry Docker repository the image is pushed to:
+    /// `<region>-docker.pkg.dev/<project_id>/<repository>/<[server] name>`.
+    /// `cargo pmcp deploy` creates the repository (in `region`) when it does
+    /// not exist yet.
+    ///
+    /// A new `deploy init` writes `repository = "pmcp"`. When the key is
+    /// absent (a deploy.toml from before 0.28.0) the image goes to
+    /// `gcr.io/<project_id>/<[server] name>` as it always has: Container
+    /// Registry stopped taking writes on 2025-03-18, and gcr.io pushes now land
+    /// in Artifact Registry `gcr.io` repositories, which a new project may not
+    /// have (debug session `cargo-pmcp-deploy-targets`, finding #7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// Cargo layout descriptor for the multi-crate isolated pattern.
@@ -683,6 +702,18 @@ pub struct ServerConfig {
     /// [`Self::name`] instead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// The URL path the server serves MCP at, appended to the deployed
+    /// service URL for the post-deploy verification and the printed endpoint
+    /// (`"/mcp"`, or `"/"` for a server mounted at the root). Must start with
+    /// `/`; no query, fragment, whitespace or control characters.
+    ///
+    /// Per target (`deployment::mcp_endpoint::endpoint_path`):
+    /// `google-cloud-run` uses it, `"/mcp"` when unset; `aws-lambda`,
+    /// `azure-container-apps` and `cloudflare-workers` use it only when set
+    /// (their URL is the endpoint otherwise, as before); `pmcp-run` ignores it
+    /// (the platform URL already ends in `/mcp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_path: Option<String>,
 }
 
 /// The `[server] memory_mb` value a freshly scaffolded `.pmcp/deploy.toml`
@@ -1167,6 +1198,7 @@ impl DeployConfig {
                 max_instances: None,
                 min_instances: None,
                 binary: None,
+                mcp_path: None,
             },
             environment,
             secrets: HashMap::new(),
@@ -1218,7 +1250,13 @@ impl DeployConfig {
                 version: "1.0.0".to_string(),
             },
             aws: None,
-            gcp: Some(GcpConfig { project_id, region }),
+            // A NEW Cloud Run deploy.toml pushes to Artifact Registry. A file
+            // without the key (from before 0.28.0) keeps gcr.io.
+            gcp: Some(GcpConfig {
+                project_id,
+                region,
+                repository: Some(DEFAULT_GCP_REPOSITORY.to_string()),
+            }),
             server: ServerConfig {
                 name: server_name,
                 // memory_mb / timeout_seconds are AWS-specific and never read
@@ -1236,6 +1274,7 @@ impl DeployConfig {
                 max_instances: Some(10),
                 min_instances: Some(0),
                 binary: None,
+                mcp_path: None,
             },
             environment,
             secrets: HashMap::new(),

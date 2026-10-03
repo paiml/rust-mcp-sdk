@@ -13,7 +13,9 @@ no longer silently replace a running deployment. Field report against 0.27.0
 them. (0.27.2 was never published; its stack guard ships here.) The same
 release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
 `[server]` sizing, `[environment]`, `[server] ephemeral_storage_mb` and
-`[build]` cargo features (findings #13, #15, #16).
+`[build]` cargo features (findings #13, #15, #16). Cloud Run deploys build the
+declared binary, push to Artifact Registry and verify the MCP endpoint, and
+`--on-test-failure warn` exits 0 as documented (#5-#12, #14).
 
 ### Fixed
 
@@ -126,6 +128,26 @@ release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
   `.dockerignore` and `cloudbuild.yaml`** (finding A1), as its docs said and
   as it already did for `.pmcp/deploy.toml`. It overwrote them. Init now says
   which files it kept; delete one and re-run init to regenerate it.
+- **`--on-test-failure warn` exits 0** (finding #14), as its help and docs
+  say, on every target. When a post-deploy check reported an infrastructure
+  error (an unreachable endpoint, a timeout, a child that could not start) the
+  verdict returned exit 2 before the `on_failure` policy was read; a Cloud Run
+  deploy whose checks failed therefore exited 2 under `warn`. The failure is
+  still printed, with a line saying the deploy continues. `fail` keeps its
+  codes: 3 when a check failed, 2 when one hit an infrastructure error.
+- **`google-cloud-run`: post-deploy verification and the printed endpoint use
+  the MCP endpoint, not the bare service URL** (finding #8). A healthy server
+  serving MCP at `/mcp` failed every check. The endpoint is now
+  `<service URL><[server] mcp_path>`; see *Changed* for the default.
+- **`google-cloud-run`: the server's origin policy is called out** (finding
+  #12). `pmcp::axum::router_with_config` with `allowed_origins: None` accepts
+  only localhost `Host` headers, so behind the Cloud Run ingress every request
+  is a 403. `deploy init` now prints the requirement (bind `0.0.0.0:$PORT`, set
+  `allowed_origins: Some(AllowedOrigins::any())` or an explicit list), as the
+  `azure-container-apps` init already did, and when a post-deploy check gets a
+  403 on a container target the failure banner names the fix (and, on Cloud
+  Run, `allow_unauthenticated = false`). A 404 names `[server] mcp_path`. The
+  SDK's default is unchanged.
 
 ### Changed
 
@@ -185,7 +207,29 @@ release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
   of failing to parse `deploy.toml` and silently falling back to
   `npx cdk deploy`. `cargo pmcp package save` still refuses a `deploy.toml`
   whose keys the package's descriptor cannot carry, so nothing is dropped
-  from a package silently.
+  from a package silently. The same holds for `[server] mcp_path` and
+  `[gcp] repository` (below).
+- **`google-cloud-run`: a new `deploy init` pushes images to Artifact
+  Registry** (finding #7). The image went to `gcr.io/<project>/<name>`;
+  Container Registry stopped taking writes on 2025-03-18, and `gcr.io` pushes
+  now need an Artifact Registry `gcr.io` repository, which a new project may
+  not have. A new `deploy.toml` records `[gcp] repository = "pmcp"`, and the
+  image is `<region>-docker.pkg.dev/<project>/pmcp/<name>:latest`. The deploy
+  creates the repository in `[gcp] region` when it is missing ("already
+  exists" is success; creating it needs `roles/artifactregistry.admin` once)
+  and authenticates docker to `<region>-docker.pkg.dev`. A `deploy.toml`
+  without the key keeps the exact `gcr.io` commands, and the deploy prints how
+  to move. A new `cloudbuild.yaml` follows the key.
+- **`google-cloud-run`: the post-deploy verification probes `<service
+  URL>/mcp` by default** (finding #8, the pmcp.run convention). A server that
+  serves MCP at the root needs `mcp_path = "/"` under `[server]`; a 404 in the
+  failure banner says so. `deploy init` records `mcp_path = "/"` in a new
+  `deploy.toml` when the binary is a `cargo pmcp new` server (its package
+  depends on `server-common`, whose `run_http` serves at `/`). The other
+  targets keep their URL: `aws-lambda`, `azure-container-apps` and
+  `cloudflare-workers` append `mcp_path` only when it is set, and `pmcp-run`
+  never does (its URL already ends in `/mcp`; a different `mcp_path` there is
+  ignored with a note).
 
 ### Added
 
@@ -210,6 +254,15 @@ release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
   `aws-lambda` and `pmcp-run`. Feature names cargo would misread (empty,
   leading `-`, a comma or whitespace) are refused before the build, and a
   misspelled `[build]` key fails to load instead of being ignored.
+- **`[server] mcp_path`**: the URL path the server serves MCP at, appended to
+  the deployed URL for the post-deploy verification and the printed endpoint
+  (`deploy outputs` too; the URL the target reported stays in the
+  `service_url` output). It must start with `/` and carry no query, fragment,
+  whitespace or control characters; an invalid value fails the deploy before
+  the build, and fails `cargo pmcp validate deploy`.
+- **`[gcp] repository`**: the Artifact Registry repository Cloud Run images
+  go to (lowercase letters, digits and `-`, starting with a letter, at most 63
+  characters; checked before anything is built and by `validate deploy`).
 
 ## [0.24.3] - 2026-09-18
 

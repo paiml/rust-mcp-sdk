@@ -1,9 +1,15 @@
 use anyhow::{bail, Context, Result};
+use std::path::Path;
 
 /// Check if gcloud is authenticated
 pub fn check_gcloud_auth() -> Result<()> {
-    let output = std::process::Command::new("gcloud")
-        .args(&[
+    check_gcloud_auth_with(Path::new("gcloud"))
+}
+
+/// [`check_gcloud_auth`] with the `gcloud` program given (a test seam).
+pub fn check_gcloud_auth_with(gcloud: &Path) -> Result<()> {
+    let output = std::process::Command::new(gcloud)
+        .args([
             "auth",
             "list",
             "--filter=status:ACTIVE",
@@ -53,8 +59,13 @@ pub fn login() -> Result<()> {
 
 /// Get the current gcloud project ID
 pub fn get_project_id() -> Result<String> {
-    let output = std::process::Command::new("gcloud")
-        .args(&["config", "get-value", "project"])
+    get_project_id_with(Path::new("gcloud"))
+}
+
+/// [`get_project_id`] with the `gcloud` program given (a test seam).
+pub fn get_project_id_with(gcloud: &Path) -> Result<String> {
+    let output = std::process::Command::new(gcloud)
+        .args(["config", "get-value", "project"])
         .output()
         .context("Failed to get gcloud project")?;
 
