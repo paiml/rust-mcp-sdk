@@ -5,7 +5,7 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [0.28.0] - 2026-10-02
+## [0.28.0] - 2026-10-03
 
 The `aws-lambda` deployment's identity follows `[server] name`, and a rename can
 no longer silently replace a running deployment. Field report against 0.27.0
