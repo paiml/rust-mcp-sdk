@@ -60,7 +60,7 @@ For AWS Lambda targets, `cargo pmcp deploy` runs:
 3. Builds the Lambda binary (once: the `npx cdk deploy` fallback deploys the binary this step built).
 4. **Routes the deploy.** An unmodified `deploy/lib/stack.ts` scaffold is deployed by the native CloudFormation engine (no Node.js), as `{[server] name}-stack`, straight from `.pmcp/deploy.toml`. A hand-modified one goes through `npx cdk deploy` (steps 5-7). See [Unmodified vs hand-modified `stack.ts`](#unmodified-vs-hand-modified-stackts).
 5. On the `npx cdk deploy` path, when both scaffold files are still cargo-pmcp's own (`stack.ts` unmodified or missing, `deploy/bin/app.ts` unmodified), **points `app.ts` at the current `[server] name`**. Then it **checks the stack identity** — see [Stack-identity guard](#stack-identity-guard). This runs before step 6 can overwrite a hand-modified `stack.ts`. A missing `stack.ts` is scaffolded first, because the CDK app cannot be listed without it, and is removed again if the guard refuses (as is an `app.ts` change).
-6. **Regenerates `deploy/lib/stack.ts` from the loaded config** — splices the `[iam]` and `[metadata]` declarations into the CDK template at single seams. Changes to `.pmcp/deploy.toml` therefore take effect on the next `cargo pmcp deploy` without manual re-init. **Guard:** a **hand-modified** `stack.ts` is **preserved** (the write is skipped and a one-line `preserved existing deploy/lib/stack.ts` notice prints) so an operator-curated stack is never silently overwritten. Pass `--regenerate-stack` (alias `--force`) to overwrite it. An unmodified scaffold, or a missing file, is written flag-free.
+6. **Regenerates `deploy/lib/stack.ts` from the loaded config** — splices the `[iam]` and `[metadata]` declarations, and the function's `[server]` sizing and `[environment]`, into the CDK template at single seams. Changes to `.pmcp/deploy.toml` therefore take effect on the next `cargo pmcp deploy` without manual re-init. **Guard:** a **hand-modified** `stack.ts` is **preserved** (the write is skipped and a one-line `preserved existing deploy/lib/stack.ts` notice prints) so an operator-curated stack is never silently overwritten. Pass `--regenerate-stack` (alias `--force`) to overwrite it. An unmodified scaffold, or a missing file, is written flag-free.
 7. Runs `cdk deploy {[server] name}-stack --require-approval never`, naming the stack explicitly.
 
 The deploy prints the stack outputs once, at the end.
@@ -148,51 +148,69 @@ GRAPHRAG_ENDPOINT = "https://graphrag.internal"
 How `[environment]` reaches the deployed Lambda depends on the target:
 
 - **`pmcp-run`** — after `cdk synth`, `cargo pmcp deploy` merges every `[environment]` key **directly into each `AWS::Lambda::Function`'s `Environment.Variables`** in the synthesized CloudFormation template before upload. This is **construct-agnostic**: it lands the keys regardless of how the `stack.ts` was authored, including shared/managed constructs (e.g. `OpenApiMcpServerStack`) that hardcode `environment: {}` and read no `process.env`. Secrets are **excluded** from this merge (they keep their server-side injection path) and never enter the template.
-- **`aws-lambda`** — deploys via `cdk deploy` (no pre-upload template file), so `[environment]` is passed as env vars onto the CDK child process (the **same transient path** resolved `[secrets]` use) and reaches the Lambda only when `stack.ts` reads it via `process.env.<KEY>` inside its `environment: {}` block.
+- **`aws-lambda`, unmodified `stack.ts` scaffold** (both engines) — `[environment]` is rendered into the MCP function's environment, on top of a `RUST_LOG = "info"` default. The native CloudFormation engine renders it into the template; the `npx cdk deploy` path regenerates `deploy/lib/stack.ts` with the values as literals in its `environment: {}` block (the same way it carries `[iam]`). On an OAuth (Cognito) stack rendered by the native engine, the OAuth proxy and authorizer functions get the same variables.
+- **`aws-lambda`, hand-modified `stack.ts`** — the file is authoritative. `[environment]` is passed as env vars onto the CDK child process (the **same transient path** resolved `[secrets]` use) and reaches the Lambda only when `stack.ts` reads it via `process.env.<KEY>` inside its `environment: {}` block.
 
-Either way, `[environment]` values are **never written back to disk** and are immune to the `stack.ts` preserve guard.
+Before cargo-pmcp 0.28.0 neither `aws-lambda` engine read `[environment]`: the native engine and the scaffold both fixed the function's environment to `RUST_LOG=info`, so runtime configuration meant editing `stack.ts`, which then made it hand-modified.
+
+`[environment]` values are **never written back to `deploy.toml`**.
 
 **Precedence:**
 
 - **`pmcp-run` (template merge):** a declared `[environment]` entry **OVERRIDES** the construct's hardcoded value on key collision — e.g. `RUST_LOG = "warn"` beats a construct default of `info`. This is a locked product decision so `deploy.toml` is the single source of truth for runtime configuration.
-- **`aws-lambda` (process.env pass-through):** a hardcoded literal in the `stack.ts` `environment: {}` block wins over a same-key `[environment]` entry unless the stack reads `process.env.<KEY>` — the mechanism is *additive-fill* on that target.
-- **Secrets always win:** if a key appears in **both** `[environment]` and `[secrets]`, the resolved **secret wins** (it is excluded from the `pmcp-run` merge and injected as the authoritative sensitive value).
+- **`aws-lambda`, unmodified scaffold:** `[environment]` overrides the `RUST_LOG = "info"` default. Variables the native engine sets to wire the runtime win over a same-named `[environment]` key, and the deploy names any such key in a warning: the AWS Lambda Web Adapter's `AWS_LAMBDA_EXEC_WRAPPER`, `PORT` and `AWS_LWA_READINESS_CHECK_PATH` for a built-in (config-only) server, and `COGNITO_REGION`, `COGNITO_USER_POOL_ID` and `DCR_TABLE_NAME` on an OAuth stack.
+- **`aws-lambda`, hand-modified `stack.ts`:** a hardcoded literal in the `stack.ts` `environment: {}` block wins over a same-key `[environment]` entry unless the stack reads `process.env.<KEY>` — the mechanism is *additive-fill* there.
+- **Secrets always win:** if a key appears in **both** `[environment]` and `[secrets]`, the resolved **secret wins**: it is excluded from the `pmcp-run` merge and injected as the authoritative sensitive value. On `aws-lambda` the `[environment]` entry is left out of the template and `stack.ts` (the deploy says so), so it can never shadow the secret. No resolved secret value is ever written to a template or to `stack.ts`. Delivering resolved `[secrets]` to an `aws-lambda` function whose `stack.ts` does not read `process.env` is not implemented.
 
 **Fail-loud (`pmcp-run`).** If `[environment]` is non-empty but the synthesized template contains **no** `AWS::Lambda::Function` resource to inject into, `cargo pmcp deploy` prints a prominent stderr warning naming the affected keys instead of silently dropping them.
 
-> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (an operator-curated stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`). For `[environment]`, the `pmcp-run` target now applies it construct-agnostically via the post-synth template merge (a preserved stack.ts no longer blocks it); the `aws-lambda` target still needs the curated `stack.ts` to read the matching `process.env.<KEY>`. On `aws-lambda` the warning also covers declared `[server] memory_mb`/`timeout_seconds` (see [Lambda sizing](#lambda-sizing-server-memory_mb--timeout_seconds)), because that target's `cdk deploy` path has no template to inject them into; `pmcp-run` does **not** warn about sizing, since its post-synth merge honors it there. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
+> **Preserved-stack warning.** When `deploy/lib/stack.ts` is preserved (a hand-modified stack.ts already exists) and `.pmcp/deploy.toml` declares a non-empty `[iam]` and/or `[environment]` section, `cargo pmcp deploy` prints a prominent stderr warning. `[iam]` is spliced only when `stack.ts` is (re)generated (`--regenerate-stack`). For `[environment]`, the `pmcp-run` target applies it construct-agnostically via the post-synth template merge (a preserved stack.ts does not block it); on `aws-lambda` a preserved `stack.ts` must read the matching `process.env.<KEY>`. On `aws-lambda` the warning also covers declared `[server] memory_mb`/`timeout_seconds`/`ephemeral_storage_mb` (see [Lambda sizing](#lambda-sizing-server-memory_mb--timeout_seconds--ephemeral_storage_mb)), because the `cdk deploy` path uploads no template to merge them into, so a preserved `stack.ts`'s own literals are authoritative; `pmcp-run` does **not** warn about sizing, since its post-synth merge honors it there. This makes the previously-silent no-op loud at deploy time instead of surfacing as a runtime `500`.
 
-### Lambda sizing (`[server] memory_mb` / `timeout_seconds`)
+### Lambda sizing (`[server] memory_mb` / `timeout_seconds` / `ephemeral_storage_mb`)
 
 ```toml
 [server]
 name = "okf-demo"
-memory_mb = 1024        # Lambda MemorySize
-timeout_seconds = 60    # Lambda Timeout
+memory_mb = 1024              # Lambda MemorySize
+timeout_seconds = 60          # Lambda Timeout
+ephemeral_storage_mb = 4096   # Lambda EphemeralStorage (/tmp), 512-10240
 ```
 
-Both keys are **optional**. Omitting one means "leave whatever the deploy path's
-own default is" — it does **not** mean "512"/"30". That distinction is
+All three keys are **optional**. Omitting one means "leave whatever the deploy
+path's own default is" — it does **not** mean "512"/"30". That distinction is
 deliberate: with a parse-time default there is no way to tell an omitted key
 from an explicit one, and materializing 512 over the `pmcp-run` engine's
-built-in 256 would silently resize every function that never asked.
+built-in 256 would silently resize every function that never asked. An omitted
+`ephemeral_storage_mb` leaves Lambda's 512 MB `/tmp`.
+
+`ephemeral_storage_mb` must be within Lambda's 512-10240 MB range. A value
+outside it fails the deploy before the build starts, and fails
+[`cargo pmcp validate deploy`](validate.md#validate-deploy).
 
 Which paths honor them:
 
-| Deploy path | `memory_mb` | `timeout_seconds` |
-|---|---|---|
-| **`pmcp-run`** (both the `pmcp-cfn-renderer` and `npx cdk synth` engines) | ✅ applied | ✅ applied |
-| **`aws-lambda`** via the native CloudFormation engine | ⚠️ warns — memory is pinned by the renderer | ✅ applied |
-| **`aws-lambda`** via `npx cdk deploy` | ⚠️ warns — the `stack.ts` literal is authoritative | ⚠️ warns |
-| **`google-cloud-run`** | n/a — uses `[server] memory` | n/a |
+| Deploy path | `memory_mb` | `timeout_seconds` | `ephemeral_storage_mb` |
+|---|---|---|---|
+| **`pmcp-run`** (both the `pmcp-cfn-renderer` and `npx cdk synth` engines) | ✅ applied | ✅ applied | ✅ applied |
+| **`aws-lambda`** via the native CloudFormation engine | ✅ applied | ✅ applied | ✅ applied |
+| **`aws-lambda`** via `npx cdk deploy`, unmodified `stack.ts` | ✅ rendered into `stack.ts` | ✅ rendered into `stack.ts` | ✅ rendered into `stack.ts` |
+| **`aws-lambda`** via `npx cdk deploy`, hand-modified `stack.ts` | ⚠️ warns — the `stack.ts` literal is authoritative | ⚠️ warns | ⚠️ warns |
+| **`google-cloud-run`** | n/a — uses `[server] memory` | n/a | n/a |
 
 On `pmcp-run`, `cargo pmcp deploy` rewrites `Properties.MemorySize` /
-`Properties.Timeout` **in the synthesized CloudFormation template**, after
-engine routing and before upload — the same post-synth seam `[environment]`
-uses. Because it runs after routing it works for a **hand-edited, preserved
-`stack.ts`** too (those always route through `npx cdk synth`), which is the
-case that matters: the sizing literal a human once patched into `stack.ts` no
-longer has to be kept in sync by hand.
+`Properties.Timeout` / `Properties.EphemeralStorage.Size` **in the synthesized
+CloudFormation template**, after engine routing and before upload — the same
+post-synth seam `[environment]` uses. Because it runs after routing it works
+for a **hand-edited, preserved `stack.ts`** too (those always route through
+`npx cdk synth`), which is the case that matters: the sizing literal a human
+once patched into `stack.ts` no longer has to be kept in sync by hand.
+
+On `aws-lambda`, the native CloudFormation engine applies the same merge to the
+template it renders (the renderer itself pins the memory to 512 MB and renders
+no ephemeral storage). On the `npx cdk deploy` path there is no template to
+merge into: an unmodified scaffold is regenerated with `memorySize`, `timeout`
+and `ephemeralStorageSize` from `deploy.toml`, while a hand-modified `stack.ts`
+is preserved and its own literals win.
 
 Unlike the `[environment]` merge, this one targets **only the MCP function** —
 the `AWS::Lambda::Function` whose `FunctionName` equals `[server] name`. An
@@ -203,6 +221,7 @@ resizing the 10-second authorizer would be a regression, not a fix.
 The merge is **loud**. It prints what it changed, per property:
 
 ```
+   ✅ Applied [server] sizing — McpFunction: EphemeralStorage.Size (unset) -> 4096
    ✅ Applied [server] sizing — McpFunction: MemorySize 256 -> 1024
    ✅ Applied [server] sizing — McpFunction: Timeout 30 -> 60
 ```
@@ -221,17 +240,12 @@ is the defect this behavior exists to fix. If you want a different size on
 prominent stderr warning naming the expected function and the declared values
 instead of dropping them.
 
-**Divergence warnings on `aws-lambda`.** Neither `aws-lambda` engine has a seam
-to inject sizing through, so `cargo pmcp deploy` says so rather than staying
-silent — but only when the declared value actually differs from what will be
-deployed, so a pristine scaffold (which declares exactly its own `stack.ts`
-literals) stays quiet:
-
-```
-⚠️  [server] sizing in .pmcp/deploy.toml is NOT applied on the aws-lambda `npx cdk deploy` path:
-   • memory_mb = 1024 declared, but 512 MB will be deployed
-   Edit deploy/lib/stack.ts's memorySize/timeout literals, or deploy to the pmcp-run target, which honors the declared sizing.
-```
+**Hand-modified `stack.ts` on `aws-lambda`.** A preserved `stack.ts` keeps its
+own `memorySize`/`timeout`/`ephemeralStorageSize`, so a declared sizing is not
+applied there; the [preserved-stack warning](#environment-variables-environment)
+says so. Edit the literals in `deploy/lib/stack.ts`, or pass
+`--regenerate-stack` to re-render it from `deploy.toml` (this discards the hand
+edits).
 
 > **History.** Before this behavior existed, `memory_mb` was parsed and read by
 > **zero** production code paths on every target, while its own schema doc
@@ -240,7 +254,36 @@ literals) stays quiet:
 > request with nothing in the logs. `timeout_seconds` had a subtler form of the
 > same problem: the CFN renderer honored it while the TypeScript scaffold did
 > not, so the same `deploy.toml` produced a different Timeout depending on
-> whether a human had ever touched `stack.ts`.
+> whether a human had ever touched `stack.ts`. Until 0.28.0 the `aws-lambda`
+> target still dropped `memory_mb` on both of its engines (the native engine
+> pinned 512 MB and warned; the scaffold hardcoded 512) — a CPU-bound tool
+> measured 6.1 s at 512 MB and 2.1 s at 1769 MB.
+
+### Build options (`[build]`)
+
+```toml
+[build]
+features = ["remote-model"]     # cargo features of the Lambda package
+no_default_features = true      # build without its default features
+```
+
+Both keys are optional. On the `aws-lambda` and `pmcp-run` targets, which build
+the Lambda binary with `cargo lambda build --release --arm64` in the Lambda
+package's directory, `cargo pmcp deploy` adds `--no-default-features` and
+`--features=<list>`. The features are that package's own; enable a
+dependency's feature as `dep/feature`. Use this when the deployable binary
+needs a different feature set than a local build, for example a server that
+fetches its model weights at runtime instead of embedding them.
+
+Each entry is one feature name. A name that is empty, starts with `-`, or
+contains a comma or whitespace is refused before the build (and by
+`cargo pmcp validate deploy`), and a misspelled key in `[build]` fails to load
+instead of being ignored. The container targets (`google-cloud-run`,
+`azure-container-apps`) build from their Dockerfile and do not read `[build]`.
+
+> To build into a different target directory, set `CARGO_TARGET_DIR`;
+> `cargo lambda build --target-dir <dir>` fails upstream (cargo-lambda passes the
+> flag on to `cargo metadata`, which rejects it).
 
 ---
 

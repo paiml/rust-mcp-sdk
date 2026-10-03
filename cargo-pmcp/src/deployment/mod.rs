@@ -5,6 +5,7 @@ pub mod deploy_toml_edit;
 #[cfg(test)]
 pub(crate) mod fake_npx;
 pub mod iam;
+pub mod lambda_function;
 pub mod metadata;
 pub mod naming;
 pub mod operations;
@@ -15,6 +16,7 @@ pub mod scaffold_provenance;
 pub mod server_name;
 pub(crate) mod stack_routing;
 pub mod targets;
+pub mod template_merge;
 pub mod r#trait;
 pub mod widgets;
 

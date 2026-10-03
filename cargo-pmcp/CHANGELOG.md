@@ -10,9 +10,33 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 The `aws-lambda` deployment's identity follows `[server] name`, and a rename can
 no longer silently replace a running deployment. Field report against 0.27.0
 (forecast-coach), findings #1-#4 and the adjacent defects found while fixing
-them. (0.27.2 was never published; its stack guard ships here.)
+them. (0.27.2 was never published; its stack guard ships here.) The same
+release makes `.pmcp/deploy.toml` configure the `aws-lambda` function itself:
+`[server]` sizing, `[environment]`, `[server] ephemeral_storage_mb` and
+`[build]` cargo features (findings #13, #15, #16).
 
 ### Fixed
+
+- **`[server] memory_mb` is applied on `aws-lambda`.** The native
+  CloudFormation engine pinned the function to 512 MB (and printed a warning
+  saying so), and the `stack.ts` scaffold hardcoded 512 MB and a 30 s timeout,
+  whatever `deploy.toml` declared. The engine now merges the declared
+  `memory_mb`/`timeout_seconds` into the rendered template (the merge the
+  `pmcp-run` target already used, now shared), and an unmodified scaffold is
+  regenerated with them. A hand-modified `stack.ts` keeps its own literals and
+  the preserved-stack warning says so; the old divergence warnings are gone.
+- **`[environment]` reaches the `aws-lambda` function.** Both engines fixed
+  the function's environment to `RUST_LOG=info`, so runtime configuration
+  meant editing `stack.ts` (which then made it hand-modified). Now the native
+  engine renders `[environment]` into the function's environment and the
+  unmodified scaffold carries it as literals; `RUST_LOG=info` stays as a
+  default that `[environment]` overrides. Variables the native engine sets to
+  wire the runtime (the Lambda Web Adapter's for a built-in server, the
+  Cognito wiring on an OAuth stack) win over a same-named key, with a warning.
+  An `[environment]` key that is also a secret name is left out, with a
+  warning, so it can never shadow the secret; no secret value is written to a
+  template or `stack.ts`. (Delivering resolved `[secrets]` to an `aws-lambda`
+  function is unchanged and still needs its own design.)
 
 - **A `[server] name` rename can no longer silently update a different
   `aws-lambda` stack.** `deploy init` wrote the server name into
@@ -105,6 +129,18 @@ them. (0.27.2 was never published; its stack guard ships here.)
   hand-written `deploy/bin/app.ts` that declares a stack under a name other
   than `{[server] name}-stack` is refused rather than deployed; that shape was
   already inconsistent with what `deploy outputs` and `deploy destroy` target.
+- **The `aws-lambda` `stack.ts` scaffold renders `[server]` sizing and
+  `[environment]`.** With the default sizing (512 MB, 30 s, no ephemeral
+  storage) and `RUST_LOG=info` it renders byte-for-byte as before, and a
+  scaffold written by 0.27.x or earlier 0.28.0 builds is still recognized as
+  cargo-pmcp's own (recorded or not), so no project moves to the
+  hand-modified path.
+- **The deploy renderer path accepts `[build]` and
+  `[server] ephemeral_storage_mb`** (cargo-pmcp applies them itself) instead
+  of failing to parse `deploy.toml` and silently falling back to
+  `npx cdk deploy`. `cargo pmcp package save` still refuses a `deploy.toml`
+  whose keys the package's descriptor cannot carry, so nothing is dropped
+  from a package silently.
 
 ### Added
 
@@ -120,6 +156,15 @@ them. (0.27.2 was never published; its stack guard ships here.)
   owning stack and the two ways out (rename back, or delete the old stack).
   The check is advisory: if `DescribeStackResources` is not allowed, the
   deploy proceeds.
+- **`[server] ephemeral_storage_mb`** sets the function's `/tmp` size
+  (`EphemeralStorage`, 512-10240 MB) on `aws-lambda` (both engines) and
+  `pmcp-run`. A value outside the range fails the deploy before the build
+  starts, and fails `cargo pmcp validate deploy`.
+- **`[build] features = [...]` / `no_default_features = true`** are passed to
+  `cargo lambda build` (`--features=<list>`, `--no-default-features`) on
+  `aws-lambda` and `pmcp-run`. Feature names cargo would misread (empty,
+  leading `-`, a comma or whitespace) are refused before the build, and a
+  misspelled `[build]` key fails to load instead of being ignored.
 
 ## [0.24.3] - 2026-09-18
 

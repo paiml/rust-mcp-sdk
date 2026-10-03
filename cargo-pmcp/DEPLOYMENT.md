@@ -101,9 +101,14 @@ region = "us-east-1"
 name = "calculator-server"
 memory_mb = 512
 timeout_seconds = 30
+# ephemeral_storage_mb = 2048   # /tmp size, 512-10240 (default 512)
 
 [environment]
-RUST_LOG = "info"
+RUST_LOG = "info"               # the default; [environment] overrides it
+
+# [build]                       # passed to `cargo lambda build`
+# features = ["remote-model"]
+# no_default_features = true
 
 [secrets]
 # Managed via: cargo pmcp deploy secrets set <key>
@@ -123,6 +128,14 @@ create_dashboard = true
 error_threshold = 10
 latency_threshold_ms = 5000
 ```
+
+On `aws-lambda`, `[server]` sizing (`memory_mb`, `timeout_seconds`,
+`ephemeral_storage_mb`) and `[environment]` reach the function on both deploy
+engines while `deploy/lib/stack.ts` is cargo-pmcp's unmodified scaffold; a
+hand-modified `stack.ts` is authoritative. `[build]` applies to the targets that
+build with `cargo lambda` (`aws-lambda`, `pmcp-run`). See
+[docs/commands/deploy.md](docs/commands/deploy.md#environment-variables-environment)
+for precedence, secrets, and the per-path table.
 
 ---
 

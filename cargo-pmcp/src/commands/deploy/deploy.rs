@@ -2,7 +2,7 @@ use crate::deployment::cdk_stack_guard::expected_stack_name;
 use crate::deployment::scaffold_provenance::{self, StackTsState};
 use crate::deployment::DeploymentOutputs;
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,6 +25,12 @@ pub struct DeployExecutor {
     /// in production; tests point it at a recording stand-in so the exact
     /// `cdk` argv can be asserted without Node.js or AWS.
     npx_program: OsString,
+    /// Names (never values) of the secrets resolved for this deploy. Their
+    /// `[environment]` entries are left out of the regenerated `stack.ts`, so
+    /// an `[environment]` value never shadows a secret. `execute()` reloads
+    /// `DeployConfig` from disk, which carries only the declared `[secrets]`
+    /// names, so the CLI's resolved names travel on the executor.
+    secret_keys: BTreeSet<String>,
 }
 
 impl DeployExecutor {
@@ -34,7 +40,26 @@ impl DeployExecutor {
             extra_env: HashMap::new(),
             regenerate_stack: false,
             npx_program: OsString::from("npx"),
+            secret_keys: BTreeSet::new(),
         }
+    }
+
+    /// Set the names of the secrets resolved for this deploy (see
+    /// [`Self::secret_keys`]).
+    pub fn with_secret_keys(mut self, secret_keys: BTreeSet<String>) -> Self {
+        self.secret_keys = secret_keys;
+        self
+    }
+
+    /// The secret names to keep out of `stack.ts`: the resolved ones plus the
+    /// `[secrets]` names `config` declares.
+    fn secret_keys_for(
+        &self,
+        config: &crate::deployment::config::DeployConfig,
+    ) -> BTreeSet<String> {
+        let mut keys = crate::deployment::lambda_function::secret_keys(config);
+        keys.extend(self.secret_keys.iter().cloned());
+        keys
     }
 
     /// Spawn CDK through `program` instead of `npx` (test seam only).
@@ -137,34 +162,16 @@ impl DeployExecutor {
     }
 
     /// Everything between the binary build and reading the stack outputs:
-    /// the stack-identity guard, `stack.ts` regeneration, the `[server]`
-    /// sizing warning, and `cdk deploy`. Split out of [`Self::execute`] so the
-    /// CDK-facing half is testable without a cargo-lambda build.
+    /// the stack-identity guard, `stack.ts` regeneration, and `cdk deploy`.
+    /// Split out of [`Self::execute`] so the CDK-facing half is testable
+    /// without a cargo-lambda build.
+    ///
+    /// `[server]` sizing and `[environment]` reach the function through the
+    /// regenerated scaffold (debug session `cargo-pmcp-deploy-targets`,
+    /// #13/#16); a hand-modified, preserved `stack.ts` is authoritative, and
+    /// [`Self::regenerate_stack_ts`] says so.
     fn deploy_after_build(&self, config: &crate::deployment::config::DeployConfig) -> Result<()> {
         self.guard_and_regenerate_stack_ts(config)?;
-
-        // `[server]` sizing divergence (debug session
-        // `deploy-server-memory-timeout`). This is the ONLY route to
-        // `npx cdk deploy` — reached both directly and via
-        // `targets::aws_lambda::deploy::deploy_legacy`'s fallback — and it
-        // uploads no template file, so unlike the pmcp-run target there is no
-        // post-synth seam to merge the declared sizing into. Stay quiet when
-        // the declaration already matches the scaffold literals (the pristine
-        // case), and say so loudly when it does not.
-        if let Some(warning) = crate::deployment::config::sizing_divergence_warning(
-            "aws-lambda `npx cdk deploy`",
-            (config.server.memory_mb, config.server.timeout_seconds),
-            (
-                Some(crate::commands::deploy::init::AWS_LAMBDA_SCAFFOLD_MEMORY_MB),
-                Some(crate::commands::deploy::init::AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS),
-            ),
-            "Edit deploy/lib/stack.ts's memorySize/timeout literals, or deploy to the pmcp-run \
-             target, which honors the declared sizing.",
-        ) {
-            eprintln!("{warning}");
-            println!();
-        }
-
         self.run_cdk_deploy(config)
     }
 
@@ -230,9 +237,10 @@ impl DeployExecutor {
         }
 
         // Regenerate stack.ts from the loaded config so user-declared [iam]
-        // permissions land in the CDK template. `init` scaffolds with an empty
-        // IamConfig; the source of truth at deploy time is .pmcp/deploy.toml.
-        Self::regenerate_stack_ts(config)?;
+        // permissions, [server] sizing and [environment] land in the CDK
+        // template. `init` scaffolds with init-time defaults; the source of
+        // truth at deploy time is .pmcp/deploy.toml.
+        Self::regenerate_stack_ts(config, &self.secret_keys_for(config))?;
 
         if stack_ts_existed {
             return Ok(());
@@ -254,13 +262,12 @@ impl DeployExecutor {
         Ok(())
     }
 
-    fn regenerate_stack_ts(config: &crate::deployment::config::DeployConfig) -> Result<()> {
-        let stack_ts = crate::commands::deploy::init::render_stack_ts_for_deploy(
-            &config.target.target_type,
-            &config.server.name,
-            &config.iam,
-            &config.metadata,
-        );
+    fn regenerate_stack_ts(
+        config: &crate::deployment::config::DeployConfig,
+        secret_keys: &BTreeSet<String>,
+    ) -> Result<()> {
+        let stack_ts =
+            crate::commands::deploy::init::render_stack_ts_for_config(config, secret_keys);
         // DSTK-01: preserve an operator-curated (hand-modified) stack.ts
         // unless `--regenerate-stack`/`--force` was passed; an unmodified
         // scaffold is cargo-pmcp's own output and is regenerated. IAM
@@ -274,12 +281,14 @@ impl DeployExecutor {
             // runtime 500.
             // `sizing_inert`: TRUE whenever `[server]` sizing is declared. This
             // path ends in `npx cdk deploy`, which uploads no template file, so
-            // there is no post-synth seam to inject `Properties.MemorySize`/
-            // `Timeout` through — the preserved stack.ts literals are
-            // authoritative and the declared values cannot be honored
-            // (debug session `deploy-server-memory-timeout`).
-            let sizing_inert =
-                config.server.memory_mb.is_some() || config.server.timeout_seconds.is_some();
+            // the declared values reach the function only through a scaffold
+            // cargo-pmcp renders — a preserved stack.ts's own literals are
+            // authoritative (debug sessions `deploy-server-memory-timeout`,
+            // `cargo-pmcp-deploy-targets`).
+            let server = &config.server;
+            let sizing_inert = server.memory_mb.is_some()
+                || server.timeout_seconds.is_some()
+                || server.ephemeral_storage_mb.is_some();
             if let Some(warning) = crate::deployment::config::stack_ts_preserved_inert_warning(
                 config.iam.is_empty(),
                 config.environment.is_empty(),
@@ -440,7 +449,7 @@ mod tests {
         let (path, curated) = seed_curated_stack_ts(tmp.path());
 
         let config = aws_lambda_cfg(tmp.path().to_path_buf(), false);
-        DeployExecutor::regenerate_stack_ts(&config).expect("guard succeeds");
+        DeployExecutor::regenerate_stack_ts(&config, &BTreeSet::new()).expect("guard succeeds");
 
         let after = std::fs::read_to_string(&path).expect("read stack.ts back");
         assert_eq!(
@@ -457,7 +466,8 @@ mod tests {
         let (path, curated) = seed_curated_stack_ts(tmp.path());
 
         let config = aws_lambda_cfg(tmp.path().to_path_buf(), true);
-        DeployExecutor::regenerate_stack_ts(&config).expect("regenerate succeeds");
+        DeployExecutor::regenerate_stack_ts(&config, &BTreeSet::new())
+            .expect("regenerate succeeds");
 
         let after = std::fs::read_to_string(&path).expect("read stack.ts back");
         assert_ne!(
@@ -795,6 +805,81 @@ mod tests {
                 crate::deployment::r#trait::DISPLAY_CALLS.with(std::cell::Cell::get),
                 0,
                 "the legacy executor must not print the outputs; the CLI does"
+            );
+        }
+
+        /// #13/#16 on the `npx cdk deploy` path (debug session
+        /// `cargo-pmcp-deploy-targets`, PR-B): an unmodified scaffold is
+        /// regenerated with the declared `[server]` sizing and `[environment]`
+        /// before `cdk deploy` runs. The scaffold used to hardcode 512 MB, 30 s
+        /// and `RUST_LOG: 'info'` whatever deploy.toml said.
+        #[test]
+        fn regenerated_stack_ts_carries_the_declared_function_settings() {
+            let (tmp, mut cfg) = project(false);
+            cfg.server.memory_mb = Some(1769);
+            cfg.server.timeout_seconds = Some(60);
+            cfg.server.ephemeral_storage_mb = Some(4096);
+            cfg.environment.insert(
+                "MODEL_URL".to_string(),
+                "s3://models/forecast.bin".to_string(),
+            );
+            seed_init_scaffolds(tmp.path(), NAME);
+            let npx = FakeNpx::listing_scaffold_app_ts(&tmp.path().join("bin"));
+
+            executor(tmp.path(), &npx)
+                .deploy_after_build(&cfg)
+                .expect("an untouched scaffold deploys");
+
+            let stack_ts = read(tmp.path(), "deploy/lib/stack.ts");
+            assert!(stack_ts.contains("memorySize: 1769,"), "{stack_ts}");
+            assert!(
+                stack_ts.contains("timeout: cdk.Duration.seconds(60),"),
+                "{stack_ts}"
+            );
+            assert!(
+                stack_ts.contains("ephemeralStorageSize: cdk.Size.mebibytes(4096),"),
+                "{stack_ts}"
+            );
+            assert!(
+                stack_ts.contains("MODEL_URL: 's3://models/forecast.bin',"),
+                "{stack_ts}"
+            );
+            assert!(
+                npx.ran(&format!("cdk deploy {EXPECTED} ")),
+                "{:?}",
+                npx.calls()
+            );
+        }
+
+        /// No secret reaches the regenerated stack.ts: an `[environment]`
+        /// entry named like a resolved secret is left out, and the resolved
+        /// value (which only travels in the cdk child's environment) is never
+        /// written.
+        #[test]
+        fn resolved_secrets_stay_out_of_the_regenerated_stack_ts() {
+            let (tmp, mut cfg) = project(false);
+            cfg.environment
+                .insert("API_TOKEN".to_string(), "env-value".to_string());
+            cfg.environment
+                .insert("PUBLIC_URL".to_string(), "https://acme.example".to_string());
+            seed_init_scaffolds(tmp.path(), NAME);
+            let npx = FakeNpx::listing_scaffold_app_ts(&tmp.path().join("bin"));
+
+            executor(tmp.path(), &npx)
+                .with_extra_env(HashMap::from([(
+                    "API_TOKEN".to_string(),
+                    "s3cr3t-value".to_string(),
+                )]))
+                .with_secret_keys(BTreeSet::from(["API_TOKEN".to_string()]))
+                .deploy_after_build(&cfg)
+                .expect("deploys");
+
+            let stack_ts = read(tmp.path(), "deploy/lib/stack.ts");
+            assert!(!stack_ts.contains("API_TOKEN"), "{stack_ts}");
+            assert!(!stack_ts.contains("s3cr3t-value"), "{stack_ts}");
+            assert!(
+                stack_ts.contains("PUBLIC_URL: 'https://acme.example',"),
+                "{stack_ts}"
             );
         }
 

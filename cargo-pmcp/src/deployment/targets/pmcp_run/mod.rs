@@ -188,6 +188,10 @@ impl DeploymentTarget for PmcpRunTarget {
     }
 
     async fn build(&self, config: &DeployConfig) -> Result<BuildArtifact> {
+        // `[server] ephemeral_storage_mb` / `[build]`: refuse a bad value before
+        // the (multi-minute) build, not after it.
+        crate::deployment::lambda_function::validate_lambda_settings(config)?;
+
         println!("🔨 Building Lambda binary for pmcp.run...");
 
         // Reuse AWS Lambda build logic

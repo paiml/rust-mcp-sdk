@@ -49,6 +49,11 @@ Full rule catalog lives in [DEPLOYMENT.md § IAM Declarations → Validation rul
 - **Warning** — Unknown service prefix (not in the curated 40-service list).
 - **Warning** — Cross-account ARN pins (12-digit account segment).
 
+It also runs the Lambda-settings check `cargo pmcp deploy` runs before building (see [deploy § Lambda sizing](deploy.md#lambda-sizing-server-memory_mb--timeout_seconds--ephemeral_storage_mb) and [deploy § Build options](deploy.md#build-options-build)):
+
+- **Hard error** — `[server] ephemeral_storage_mb` outside Lambda's 512-10240 MB range.
+- **Hard error** — A `[build] features` entry that is empty, starts with `-`, or contains a comma or whitespace.
+
 Hard errors return non-zero; warnings print to stderr but return zero.
 
 ### Examples

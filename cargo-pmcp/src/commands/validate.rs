@@ -643,6 +643,11 @@ pub fn validate_deploy(server: Option<String>, verbose: bool) -> Result<()> {
     let warnings = crate::deployment::iam::validate(&config.iam)
         .context("IAM validation failed — fix .pmcp/deploy.toml before deploying")?;
 
+    // The same Lambda-settings check `cargo pmcp deploy` runs before building
+    // (`[server] ephemeral_storage_mb`, `[build]`), so the contract above —
+    // a failing `validate deploy` guarantees a failing `deploy` — keeps holding.
+    crate::deployment::lambda_function::validate_lambda_settings(&config)?;
+
     if not_quiet {
         crate::deployment::iam::emit_warnings(&warnings);
         if warnings.is_empty() {
@@ -1412,6 +1417,33 @@ create_dashboard = false
         std::fs::write(pmcp_dir.join("deploy.toml"), toml_str).expect("write deploy.toml");
         let project_root = dir.path().to_path_buf();
         (dir, project_root)
+    }
+
+    /// `[server] ephemeral_storage_mb` outside Lambda's 512-10240 MB range
+    /// fails `validate deploy`, as it fails `deploy` (debug session
+    /// `cargo-pmcp-deploy-targets`, #16); an in-range value passes.
+    #[test]
+    fn validate_deploy_rejects_out_of_range_ephemeral_storage() {
+        std::env::set_var("PMCP_QUIET", "1");
+        let bad = COMMON_FIXTURE_HEADER.replace(
+            "timeout_seconds = 30\n",
+            "timeout_seconds = 30\nephemeral_storage_mb = 100\n",
+        );
+        let (_dir, project_root) = write_fixture(&bad);
+        let err = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false)
+            .expect_err("ephemeral_storage_mb = 100 must be refused");
+        assert!(
+            format!("{err:#}").contains("ephemeral_storage_mb"),
+            "{err:#}"
+        );
+
+        let good = COMMON_FIXTURE_HEADER.replace(
+            "timeout_seconds = 30\n",
+            "timeout_seconds = 30\nephemeral_storage_mb = 2048\n",
+        );
+        let (_dir, project_root) = write_fixture(&good);
+        let result = validate_deploy(Some(project_root.to_string_lossy().into_owned()), false);
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]

@@ -109,6 +109,14 @@ pub struct DeployConfig {
     #[serde(default, skip_serializing_if = "MetadataConfig::is_empty")]
     pub metadata: MetadataConfig,
 
+    /// Cargo options for building the Lambda binary (`[build]`). See
+    /// [`BuildConfig`].
+    ///
+    /// The `skip_serializing_if` guard keeps configs without a `[build]`
+    /// section byte-identical on save (the `IamConfig` D-05 contract).
+    #[serde(default, skip_serializing_if = "BuildConfig::is_empty")]
+    pub build: BuildConfig,
+
     /// Runtime opt-out carrier for the `stack.ts` regeneration guard
     /// (Phase 98, DSTK-01). When `true`, the deploy path overwrites an
     /// existing `deploy/lib/stack.ts`; when `false` (the default) an
@@ -167,6 +175,53 @@ impl MetadataConfig {
     pub fn is_empty(&self) -> bool {
         self.server_type.is_none() && self.snapshot_baked.is_none()
     }
+}
+
+/// Cargo options for building the Lambda binary: the `[build]` table of
+/// `.pmcp/deploy.toml`.
+///
+/// ```toml
+/// [build]
+/// features = ["remote-model"]
+/// no_default_features = true
+/// ```
+///
+/// Passed to `cargo lambda build` (as `--features=<list>` and
+/// `--no-default-features`), which runs in the Lambda package's directory,
+/// so the features are that package's own; enable a dependency's feature with
+/// `dep/feature`. Read by the `aws-lambda` and `pmcp-run` targets, the two
+/// that build with `cargo lambda` (debug session `cargo-pmcp-deploy-targets`,
+/// #15).
+///
+/// `deny_unknown_fields`: a misspelled key (`feature = [...]`) fails
+/// `DeployConfig::load` instead of silently building with the default
+/// feature set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildConfig {
+    /// Cargo features to enable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Build without the package's default features.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_default_features: bool,
+}
+
+impl BuildConfig {
+    /// `true` when no build option is declared (the cargo defaults apply).
+    ///
+    /// Used by `DeployConfig`'s `skip_serializing_if` so configs without a
+    /// `[build]` section stay byte-identical on save.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.features.is_empty() && !self.no_default_features
+    }
+}
+
+/// `skip_serializing_if` helper for `false` booleans.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes the field by reference
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One-line notice printed by both deploy targets when an existing
@@ -228,13 +283,16 @@ pub(crate) fn write_stack_ts_guarded(
 /// and/or `[environment]` sections whose delivery depends on the stack.ts.
 ///
 /// `sizing_inert` extends the same signal to `[server] memory_mb`/
-/// `timeout_seconds` (debug session `deploy-server-memory-timeout`): a caller
+/// `timeout_seconds`/`ephemeral_storage_mb` (debug sessions
+/// `deploy-server-memory-timeout`, `cargo-pmcp-deploy-targets`): a caller
 /// passes `true` when its deploy path cannot honor declared sizing, and
 /// `false` when it can. The pmcp-run target passes `false` — its post-synth
-/// sizing merge rewrites `Properties.MemorySize`/`Timeout` on BOTH synth
-/// engines, so a preserved stack.ts no longer blocks sizing there either. The
-/// aws-lambda target passes whether sizing was declared, because neither of
-/// its engines reads the field.
+/// sizing merge rewrites the MCP function's sizing on BOTH synth engines, so a
+/// preserved stack.ts no longer blocks sizing there either. The aws-lambda
+/// target passes whether sizing was declared: its `npx cdk deploy` path
+/// uploads no template, so a PRESERVED stack.ts's own literals are
+/// authoritative (an unmodified scaffold is re-rendered with the declared
+/// values and never reaches this warning).
 ///
 /// Returns `None` when nothing is inert (nothing surprising to warn about).
 /// Callers only invoke this on the preserve path, so a `Some` result always
@@ -299,117 +357,37 @@ pub(crate) fn stack_ts_preserved_inert_warning(
                 .to_string(),
         );
         lines.push(
-            "     defaults). On the aws-lambda target it still reaches the Lambda only if stack.ts"
+            "     defaults). On the aws-lambda target a preserved stack.ts is authoritative: it"
                 .to_string(),
         );
-        lines.push("     reads it via process.env.<KEY> in its environment:{} block.".to_string());
+        lines.push(
+            "     reaches the Lambda only if stack.ts reads it via process.env.<KEY> in its"
+                .to_string(),
+        );
+        lines.push(
+            "     environment:{} block (`--regenerate-stack` re-renders stack.ts from deploy.toml)."
+                .to_string(),
+        );
     }
     if sizing_inert {
         lines.push(
-            "   • [server] memory_mb / timeout_seconds: NOT applied on this target — the"
+            "   • [server] memory_mb / timeout_seconds / ephemeral_storage_mb: NOT applied on this"
                 .to_string(),
         );
         lines.push(
-            "     stack.ts memorySize/timeout literals are authoritative for `npx cdk deploy`."
+            "     target — the preserved stack.ts literals are authoritative for `npx cdk deploy`."
                 .to_string(),
         );
         lines.push(
-            "     Edit deploy/lib/stack.ts, or deploy to the pmcp-run target, which merges the"
+            "     Edit deploy/lib/stack.ts, pass `--regenerate-stack` to re-render it from"
                 .to_string(),
         );
-        lines.push("     declared sizing into the synthesized template post-synth.".to_string());
+        lines.push(
+            "     deploy.toml, or deploy to the pmcp-run target, which merges the declared sizing"
+                .to_string(),
+        );
+        lines.push("     into the synthesized template post-synth.".to_string());
     }
-    Some(lines.join("\n"))
-}
-
-/// One divergence row for one sizing property, or `None` when there is nothing
-/// to say about it.
-///
-/// Silent unless BOTH sides are known AND they disagree: a property the caller
-/// did not declare has no intent to be diverged from, and a property the path
-/// does not report cannot be compared. `Option::zip` expresses exactly that
-/// pair-or-nothing rule, so neither case needs its own branch.
-///
-/// Free-standing rather than nested inside [`sizing_divergence_warning`]: its
-/// `declared`/`actual` parameters would otherwise shadow that function's
-/// same-named 2-tuples, leaving one body where each identifier means a
-/// different type depending on which brace the reader is inside.
-fn sizing_divergence_row(
-    label: &str,
-    unit: &str,
-    declared: Option<u32>,
-    actual: Option<u32>,
-) -> Option<String> {
-    declared
-        .zip(actual)
-        .filter(|(want, got)| want != got)
-        .map(|(want, got)| {
-            format!("   • {label} = {want} declared, but {got} {unit} will be deployed")
-        })
-}
-
-/// Build the divergence warning for AWS deploy paths that CANNOT honor a
-/// declared `[server] memory_mb` / `timeout_seconds`.
-///
-/// Returns `None` when nothing was declared, or when every declared value
-/// already equals what the path will actually deploy (`actual_memory_mb` /
-/// `actual_timeout_seconds`) — a pristine scaffold declares exactly the
-/// literals its own `stack.ts` carries, so the common case stays quiet
-/// instead of training operators to ignore the warning.
-///
-/// Why this exists (debug session `deploy-server-memory-timeout`): the
-/// reporter's core complaint was SILENCE — `.pmcp/deploy.toml` documented an
-/// intent that was dropped with no warning, no log line and no synth error,
-/// surfacing only as an OOM on the first request. The pmcp-run target fixes
-/// that by honoring the value; the paths below have no post-synth template
-/// seam to inject through (`npx cdk deploy` uploads no template file at all,
-/// and the native `pmcp-cfn-renderer` engine pins memory to a module const),
-/// so the best available remedy there is to say so loudly.
-///
-/// Pass `None` for a property the calling path DOES honor — e.g. the native
-/// renderer engine threads `timeout_seconds` from the descriptor, so it
-/// passes `None` for `actual_timeout_seconds`' counterpart declaration.
-//
-// Why allow(dead_code): identical rationale to
-// `stack_ts_preserved_inert_warning` — production callers live in the bin-only
-// tree while config.rs is also mounted into the lib via `#[path]`.
-#[allow(dead_code)]
-pub(crate) fn sizing_divergence_warning(
-    path_label: &str,
-    declared: (Option<u32>, Option<u32>),
-    actual: (Option<u32>, Option<u32>),
-    remedy: &str,
-) -> Option<String> {
-    let (declared_memory, declared_timeout) = declared;
-    let (actual_memory, actual_timeout) = actual;
-
-    // One row per sizing property, built by the shared
-    // [`sizing_divergence_row`] rather than by a copy of the nest per property.
-    //
-    // Adding a THIRD property (reserved concurrency, ephemeral storage) is a new
-    // array entry PLUS a signature change: `declared` and `actual` are
-    // fixed-arity 2-tuples, so a third value has nowhere to travel and both
-    // callers have to be updated. Said plainly because the shape invites the
-    // opposite assumption — the row builder generalizes, the parameter list does
-    // not. Whoever adds the third property should take that as the cue to move
-    // both tuples to a slice of (label, unit, declared, actual), which would also
-    // retire the positional correspondence this signature relies on today.
-    let diverged: Vec<String> = [
-        sizing_divergence_row("memory_mb", "MB", declared_memory, actual_memory),
-        sizing_divergence_row("timeout_seconds", "s", declared_timeout, actual_timeout),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if diverged.is_empty() {
-        return None;
-    }
-
-    let mut lines = vec![format!(
-        "⚠️  [server] sizing in .pmcp/deploy.toml is NOT applied on the {path_label} path:"
-    )];
-    lines.extend(diverged);
-    lines.push(format!("   {remedy}"));
     Some(lines.join("\n"))
 }
 
@@ -642,8 +620,9 @@ pub struct ServerConfig {
     /// | Deploy path | Honors `memory_mb`? |
     /// |---|---|
     /// | `pmcp-run` (both the `pmcp-cfn-renderer` and `npx cdk synth` engines) | YES — merged into `Properties.MemorySize` post-synth |
-    /// | `aws-lambda` via the native `pmcp-cfn-renderer` + CFN engine | NO — memory is pinned to `AWS_LAMBDA_MEMORY_SIZE_MB`; a divergence warning is printed |
-    /// | `aws-lambda` via `npx cdk deploy` | NO — the `deploy/lib/stack.ts` literal is authoritative; a divergence warning is printed |
+    /// | `aws-lambda` via the native `pmcp-cfn-renderer` + CFN engine | YES — merged into the rendered template (since 0.28.0; it used to be pinned to `AWS_LAMBDA_MEMORY_SIZE_MB`) |
+    /// | `aws-lambda` via `npx cdk deploy`, unmodified scaffold | YES — rendered into the regenerated `deploy/lib/stack.ts` (since 0.28.0) |
+    /// | `aws-lambda` via `npx cdk deploy`, hand-modified `stack.ts` | NO — its literal is authoritative; the preserved-stack warning says so |
     /// | `google-cloud-run` | N/A — uses [`Self::memory`] |
     ///
     /// `None` (key omitted) means "leave the target's built-in default alone",
@@ -665,6 +644,15 @@ pub struct ServerConfig {
     /// on both. `None` (key omitted) leaves the engine default in place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
+    /// Lambda ephemeral storage (`/tmp`) in MB, 512-10240. `None` (key
+    /// omitted) leaves the Lambda default (512 MB).
+    ///
+    /// Applied to the MCP function by every AWS deploy path that applies
+    /// [`Self::memory_mb`] (see that field's table). Validated before the
+    /// build (`deployment::lambda_function::validate_function_settings`) and
+    /// by `cargo pmcp validate deploy`. Ignored by Cloud Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_storage_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved_concurrency: Option<u32>,
     /// Cloud Run memory limit in `Mi`/`Gi` form (e.g. `"256Mi"`, `"1Gi"`).
@@ -1168,6 +1156,7 @@ impl DeployConfig {
                 // writes.
                 memory_mb: Some(SCAFFOLD_MEMORY_MB),
                 timeout_seconds: Some(SCAFFOLD_TIMEOUT_SECONDS),
+                ephemeral_storage_mb: None,
                 reserved_concurrency: None,
                 memory: None,
                 cpu: None,
@@ -1199,6 +1188,7 @@ impl DeployConfig {
             runtime: None,
             azure: AzureConfig::default(),
             metadata: MetadataConfig::default(),
+            build: BuildConfig::default(),
             regenerate_stack: false,
             project_root,
         }
@@ -1235,6 +1225,7 @@ impl DeployConfig {
                 // pre-`Option` cargo-pmcp wrote.
                 memory_mb: Some(SCAFFOLD_MEMORY_MB),
                 timeout_seconds: Some(SCAFFOLD_TIMEOUT_SECONDS),
+                ephemeral_storage_mb: None,
                 reserved_concurrency: None,
                 memory: Some("256Mi".to_string()),
                 cpu: Some("1".to_string()),
@@ -1265,6 +1256,7 @@ impl DeployConfig {
             runtime: None,
             azure: AzureConfig::default(),
             metadata: MetadataConfig::default(),
+            build: BuildConfig::default(),
             regenerate_stack: false,
             project_root,
         }
@@ -2580,89 +2572,6 @@ mod stack_ts_guard_tests {
         );
     }
 
-    /// Nothing declared → no divergence to report.
-    #[test]
-    fn divergence_warning_silent_when_nothing_declared() {
-        assert!(
-            sizing_divergence_warning("x", (None, None), (Some(512), Some(30)), "r").is_none(),
-            "an undeclared sizing cannot diverge from anything"
-        );
-    }
-
-    /// A pristine scaffold declares exactly the literals its own stack.ts
-    /// carries (512/30). The warning MUST stay quiet there — one that fires on
-    /// every deploy trains operators to ignore it, which recreates the silence
-    /// it exists to break.
-    #[test]
-    fn divergence_warning_silent_when_declared_matches_actual() {
-        assert!(
-            sizing_divergence_warning(
-                "aws-lambda `npx cdk deploy`",
-                (Some(SCAFFOLD_MEMORY_MB), Some(SCAFFOLD_TIMEOUT_SECONDS)),
-                (Some(SCAFFOLD_MEMORY_MB), Some(SCAFFOLD_TIMEOUT_SECONDS)),
-                "remedy",
-            )
-            .is_none(),
-            "a pristine scaffold declaration must not warn"
-        );
-    }
-
-    /// The reported case: `memory_mb = 1024` declared, 512 actually deployed.
-    /// The warning must quote BOTH numbers — "your config says X, you will get
-    /// Y" is the whole point.
-    #[test]
-    fn divergence_warning_quotes_declared_and_actual_memory() {
-        let w = sizing_divergence_warning(
-            "aws-lambda `npx cdk deploy`",
-            (Some(1024), Some(30)),
-            (Some(512), Some(30)),
-            "Edit deploy/lib/stack.ts.",
-        )
-        .expect("a memory divergence must warn");
-        assert!(w.contains("memory_mb = 1024"), "names the declared value");
-        assert!(
-            w.contains("512 MB will be deployed"),
-            "names the actual value"
-        );
-        assert!(
-            !w.contains("timeout_seconds"),
-            "a matching timeout must not be reported as diverged"
-        );
-        assert!(
-            w.contains("Edit deploy/lib/stack.ts."),
-            "carries the remedy"
-        );
-        assert!(
-            w.contains("aws-lambda `npx cdk deploy`"),
-            "names the deploy path that cannot honor it"
-        );
-    }
-
-    /// The masked half: `timeout_seconds = 60` against the hardcoded 30.
-    #[test]
-    fn divergence_warning_quotes_declared_and_actual_timeout() {
-        let w = sizing_divergence_warning("path", (None, Some(60)), (Some(512), Some(30)), "r")
-            .expect("a timeout divergence must warn");
-        assert!(w.contains("timeout_seconds = 60"));
-        assert!(w.contains("30 s will be deployed"));
-    }
-
-    /// A property the calling path DOES honor is passed as `None` on the
-    /// `actual` side and must never be reported — the native aws-lambda
-    /// renderer threads `timeout_seconds` from the descriptor, so only its
-    /// pinned memory diverges.
-    #[test]
-    fn divergence_warning_ignores_properties_the_path_honors() {
-        let w =
-            sizing_divergence_warning("renderer", (Some(1024), Some(600)), (Some(512), None), "r")
-                .expect("the pinned memory still diverges");
-        assert!(w.contains("memory_mb = 1024"));
-        assert!(
-            !w.contains("timeout_seconds"),
-            "a property with no `actual` value is honored by the path and must not warn"
-        );
-    }
-
     // ── FIX #2: [environment] threaded into the CDK env-injection path ───────
 
     #[test]
@@ -2683,6 +2592,61 @@ mod stack_ts_guard_tests {
         );
         // Built-in RUST_LOG from default_for_server survives the merge.
         assert_eq!(env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    // ── [build] + [server] ephemeral_storage_mb (debug session
+    //    `cargo-pmcp-deploy-targets`, #15/#16) ──────────────────────────────
+
+    fn parse(text: &str) -> Result<DeployConfig, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    const MINIMAL: &str = "[target]\ntype = \"aws-lambda\"\nversion = \"1.0.0\"\n\n\
+                           [aws]\nregion = \"us-east-1\"\n\n\
+                           [server]\nname = \"demo\"\n\n[environment]\n";
+
+    #[test]
+    fn build_section_and_ephemeral_storage_parse() {
+        let text = MINIMAL.replace(
+            "name = \"demo\"\n",
+            "name = \"demo\"\nephemeral_storage_mb = 4096\n",
+        ) + "\n[build]\nfeatures = [\"remote-model\"]\nno_default_features = true\n";
+        let config = parse(&text).expect("parses");
+        assert_eq!(config.server.ephemeral_storage_mb, Some(4096));
+        assert_eq!(config.build.features, vec!["remote-model".to_string()]);
+        assert!(config.build.no_default_features);
+    }
+
+    /// A misspelled `[build]` key fails the load instead of silently building
+    /// with the default feature set.
+    #[test]
+    fn misspelled_build_key_is_refused() {
+        let text = format!("{MINIMAL}\n[build]\nfeature = [\"x\"]\n");
+        assert!(parse(&text).is_err());
+    }
+
+    /// Absent keys keep a saved deploy.toml byte-identical (no `[build]`, no
+    /// `ephemeral_storage_mb` line), and present ones round-trip.
+    #[test]
+    fn new_keys_are_omitted_when_absent_and_round_trip_when_present() {
+        let mut config = DeployConfig::default_for_server(
+            "demo".to_string(),
+            "us-east-1".to_string(),
+            std::path::PathBuf::from("/tmp/build-round-trip"),
+        );
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        assert!(!text.contains("[build]"), "{text}");
+        assert!(!text.contains("ephemeral_storage_mb"), "{text}");
+
+        config.server.ephemeral_storage_mb = Some(10_240);
+        config.build = BuildConfig {
+            features: vec!["a".to_string(), "dep/b".to_string()],
+            no_default_features: true,
+        };
+        let back: DeployConfig =
+            toml::from_str(&toml::to_string_pretty(&config).expect("serialize")).expect("parse");
+        assert_eq!(back.server.ephemeral_storage_mb, Some(10_240));
+        assert_eq!(back.build, config.build);
     }
 
     #[test]

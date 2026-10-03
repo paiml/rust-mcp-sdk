@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::deployment::config::CognitoConfig;
+use crate::deployment::lambda_function::ScaffoldFunction;
 use crate::templates::oauth::{authorizer, proxy};
 
 /// OAuth provider configuration
@@ -760,6 +761,18 @@ impl InitCommand {
         Ok(())
     }
 
+    /// Render the CDK `stack.ts` as a string, without touching the filesystem,
+    /// with the scaffold's default Lambda function settings (what `deploy
+    /// init` writes). See [`Self::render_stack_ts_with`].
+    pub(crate) fn render_stack_ts(
+        &self,
+        server_name: &str,
+        iam: &crate::deployment::config::IamConfig,
+        meta: &StackMetadata,
+    ) -> String {
+        self.render_stack_ts_with(server_name, iam, meta, &ScaffoldFunction::default())
+    }
+
     /// Render the CDK `stack.ts` as a string, without touching the filesystem.
     ///
     /// Operator-declared `[iam]` is spliced in at a single `{iam_block}` seam
@@ -768,11 +781,19 @@ impl InitCommand {
     /// (`meta`) overrides the `mcp:serverType` default and bakes
     /// `mcp:snapshotBaked` (Phase 98, DSTK-02/DSTK-03); an empty carrier renders
     /// byte-identically to the pre-Phase-98 template.
-    pub(crate) fn render_stack_ts(
+    ///
+    /// `function` (`[server]` sizing and `[environment]`) is spliced into the
+    /// `aws-lambda` branch at a single `{function_props}` seam (debug session
+    /// `cargo-pmcp-deploy-targets`, #13/#16); [`ScaffoldFunction::default`]
+    /// renders byte-identically to the template before that seam existed. The
+    /// `pmcp-run` branch ignores it: that target merges sizing and
+    /// `[environment]` into the synthesized template instead.
+    pub(crate) fn render_stack_ts_with(
         &self,
         server_name: &str,
         iam: &crate::deployment::config::IamConfig,
         meta: &StackMetadata,
+        function: &ScaffoldFunction,
     ) -> String {
         let iam_block = crate::deployment::render_iam_block(iam);
         // DSTK-02: the JS fallback for mcpServerType (config override or 'custom').
@@ -791,6 +812,7 @@ impl InitCommand {
         // passes no `-c` flags (see run_cdk_deploy), so the literals are baked
         // directly here from the config carrier.
         let aws_metadata_block = render_aws_lambda_metadata_block(meta);
+        let function_props = function.render_cdk_props();
 
         // For pmcp-run target: Lambda-only stack (no API Gateway)
         // The shared pmcp.run API Gateway handles all routing
@@ -981,11 +1003,7 @@ export class McpServerStack extends cdk.Stack {{
       handler: 'bootstrap',
       code: lambda.Code.fromAsset('.build'),
       architecture: lambda.Architecture.ARM_64,
-      memorySize: 512,
-      timeout: cdk.Duration.seconds(30),
-      environment: {{
-        RUST_LOG: 'info',
-      }},
+{function_props}
       tracing: lambda.Tracing.ACTIVE,
       // Structured JSON logging so CloudWatch correctly parses log levels
       loggingFormat: lambda.LoggingFormat.JSON,
@@ -2074,32 +2092,23 @@ export class McpServerStack extends cdk.Stack {{
     }
 }
 
-/// The `memorySize:` literal the `aws-lambda` scaffold writes into
-/// `deploy/lib/stack.ts` for the MCP function.
+/// The `memorySize:` the `aws-lambda` scaffold renders for the MCP function
+/// when `[server] memory_mb` is omitted: the default of
+/// [`ScaffoldFunction`], and the literal every cargo-pmcp up to 0.28.0
+/// hardcoded. `scaffold_sizing_literals_match_the_rendered_template` pins it.
 ///
-/// `render_stack_ts_for_deploy` has no sizing parameter — the literal is baked
-/// into the template text — so this const is a MIRROR, not the source. It
-/// exists so the deploy-time divergence warning
-/// (`deployment::config::sizing_divergence_warning`) can name the value the
-/// `npx cdk deploy` path will actually deploy, instead of hardcoding a second
-/// copy that could silently drift from the template.
-/// `scaffold_sizing_literals_match_the_rendered_template` is the tripwire that
-/// fails if the two ever disagree.
-///
-/// Threading the config value into the template instead was measured and
-/// REJECTED at the time: `stack_routing::custom_stack_ts_reason` then routed
-/// on a strict byte-match between the on-disk stack.ts and a fresh render,
-/// while `write_stack_ts_guarded` kept the on-disk file frozen — so changing
-/// the template would have made EVERY existing project (pristine scaffolds
-/// included) fail the byte-match, silently fall back to `npx cdk synth`, and
-/// be falsely tainted as hand-modified via `mcp:customStack`. Since 0.28.0
-/// routing compares against the stack.ts cargo-pmcp last WROTE
-/// (`deployment::scaffold_provenance`) and an unmodified scaffold is
-/// regenerated on deploy, so a template change no longer has that fallout.
+/// Rendering the config value into the template was once measured and
+/// REJECTED: routing then byte-matched the on-disk stack.ts against a fresh
+/// render, so any template change made every pristine scaffold look
+/// hand-modified. Since 0.28.0 routing compares against the stack.ts
+/// cargo-pmcp last WROTE (`deployment::scaffold_provenance`), an unmodified
+/// scaffold is regenerated on deploy, and the defaults render byte-for-byte
+/// as before — so the scaffold now renders `[server]` sizing and
+/// `[environment]` (debug session `cargo-pmcp-deploy-targets`, #13/#16).
 pub(crate) const AWS_LAMBDA_SCAFFOLD_MEMORY_MB: u32 = 512;
 
-/// The `cdk.Duration.seconds(...)` literal the `aws-lambda` scaffold writes
-/// into `deploy/lib/stack.ts` for the MCP function. See
+/// The `cdk.Duration.seconds(...)` the `aws-lambda` scaffold renders for the
+/// MCP function when `[server] timeout_seconds` is omitted. See
 /// [`AWS_LAMBDA_SCAFFOLD_MEMORY_MB`].
 pub(crate) const AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS: u32 = 30;
 
@@ -2162,18 +2171,36 @@ pub fn app_ts_scaffold_name(content: &str) -> Option<String> {
     (render_app_ts(name) == content).then(|| name.to_string())
 }
 
-/// Render `deploy/lib/stack.ts` for an already-loaded `DeployConfig`.
+/// Render `deploy/lib/stack.ts` with the scaffold's DEFAULT Lambda function
+/// settings ([`ScaffoldFunction::default`]: what `deploy init` writes, and
+/// what every cargo-pmcp up to 0.28.0 baked whatever `.pmcp/deploy.toml`
+/// said). A deploy regenerates with [`render_stack_ts_for_config`] instead.
 ///
-/// Used by `cargo pmcp deploy` to regenerate the stack file from the user's
-/// current `.pmcp/deploy.toml` before handing off to `cdk deploy`, so declared
-/// `[iam]` permissions land in the synthesised template. Operator `[metadata]`
-/// (`meta`) reproduces curated `mcp:serverType` / `mcp:snapshotBaked` literals
-/// from config so a regeneration is safe (Phase 98, DSTK-02/DSTK-03).
+/// Operator `[metadata]` (`meta`) reproduces curated `mcp:serverType` /
+/// `mcp:snapshotBaked` literals from config so a regeneration is safe (Phase
+/// 98, DSTK-02/DSTK-03).
 pub(crate) fn render_stack_ts_for_deploy(
     target_type: &str,
     server_name: &str,
     iam: &crate::deployment::config::IamConfig,
     meta: &crate::deployment::config::MetadataConfig,
+) -> String {
+    render_stack_ts_with_function(
+        target_type,
+        server_name,
+        iam,
+        meta,
+        &ScaffoldFunction::default(),
+    )
+}
+
+/// [`render_stack_ts_for_deploy`] with explicit Lambda function settings.
+pub fn render_stack_ts_with_function(
+    target_type: &str,
+    server_name: &str,
+    iam: &crate::deployment::config::IamConfig,
+    meta: &crate::deployment::config::MetadataConfig,
+    function: &ScaffoldFunction,
 ) -> String {
     let stack_meta = StackMetadata::from_config(meta);
     let init = InitCommand {
@@ -2185,7 +2212,28 @@ pub(crate) fn render_stack_ts_for_deploy(
         server_name: None,
         default_server_name: None,
     };
-    init.render_stack_ts(server_name, iam, &stack_meta)
+    init.render_stack_ts_with(server_name, iam, &stack_meta, function)
+}
+
+/// Render `deploy/lib/stack.ts` from an already-loaded `DeployConfig`.
+///
+/// Used by `cargo pmcp deploy` to regenerate the stack file from the user's
+/// current `.pmcp/deploy.toml` before handing off to `cdk`, so declared
+/// `[iam]` permissions, `[metadata]`, and (on `aws-lambda`) `[server]` sizing
+/// and `[environment]` land in the synthesised template. `secret_keys` are the
+/// secret NAMES whose `[environment]` entries must not be rendered (see
+/// [`crate::deployment::lambda_function`]); no secret value is read.
+pub fn render_stack_ts_for_config(
+    config: &crate::deployment::config::DeployConfig,
+    secret_keys: &std::collections::BTreeSet<String>,
+) -> String {
+    render_stack_ts_with_function(
+        &config.target.target_type,
+        &config.server.name,
+        &config.iam,
+        &config.metadata,
+        &ScaffoldFunction::from_config(config, secret_keys),
+    )
 }
 
 #[cfg(test)]
@@ -2213,13 +2261,9 @@ mod wave1_stack_ts_tests {
     }
 
     /// Drift tripwire for [`AWS_LAMBDA_SCAFFOLD_MEMORY_MB`] /
-    /// [`AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS`].
-    ///
-    /// Those consts MIRROR literals baked into the stack.ts template text; the
-    /// deploy-time divergence warning quotes them as "what will actually be
-    /// deployed" on the `npx cdk deploy` path. If someone edits the template
-    /// literal without editing the const, the warning starts lying — this test
-    /// is the only thing that would notice.
+    /// [`AWS_LAMBDA_SCAFFOLD_TIMEOUT_SECONDS`]: the default render (what
+    /// `deploy init` writes, and what pre-record migration recognizes) must
+    /// keep carrying exactly those literals.
     #[test]
     fn scaffold_sizing_literals_match_the_rendered_template() {
         let ts = render_stack_ts_for_deploy(

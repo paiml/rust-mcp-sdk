@@ -18,9 +18,10 @@
 //! Projects initialized before the record existed have none. For them the old
 //! comparison runs, widened to the renders `deploy init` itself could have
 //! produced (the name the file's own `serverName` literal carries, with the
-//! init-time empty `[iam]`/`[metadata]`). A match is adopted and recorded, so
-//! from then on the record decides; a file that matches nothing stays
-//! hand-modified, exactly as before.
+//! init-time empty `[iam]`/`[metadata]`, and the scaffold's default Lambda
+//! function settings that every cargo-pmcp up to 0.28.0 baked). A match is
+//! adopted and recorded, so from then on the record decides; a file that
+//! matches nothing stays hand-modified, exactly as before.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,9 +29,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::commands::deploy::init::{
-    app_ts_scaffold_name, render_app_ts, render_stack_ts_for_deploy,
+    app_ts_scaffold_name, render_app_ts, render_stack_ts_with_function,
 };
 use crate::deployment::config::{DeployConfig, IamConfig, MetadataConfig};
+use crate::deployment::lambda_function::ScaffoldFunction;
 
 /// Where the provenance record lives, relative to the project root.
 pub const RECORD_RELATIVE: &str = "deploy/.pmcp-scaffold.toml";
@@ -187,18 +189,46 @@ pub fn classify_stack_ts(config: &DeployConfig) -> Result<StackTsState> {
 
 /// The pre-record fallback: `on_disk` is a render cargo-pmcp produced, either
 /// for the current config or at init time (empty `[iam]`/`[metadata]`), for
-/// the configured name or the name the file's own literal carries.
+/// the configured name or the name the file's own literal carries, with the
+/// config's Lambda function settings or the scaffold defaults. The defaults
+/// are what every cargo-pmcp up to 0.28.0 baked whatever `.pmcp/deploy.toml`
+/// declared, so without them a project initialized by 0.27.x that declares
+/// `[server]` sizing or `[environment]` would read as hand-modified.
 fn is_a_scaffold_rendering(on_disk: &str, config: &DeployConfig) -> bool {
     let on_disk = on_disk.replace("\r\n", "\n");
     let (init_iam, init_meta) = (IamConfig::default(), MetadataConfig::default());
     let inputs = [(&config.iam, &config.metadata), (&init_iam, &init_meta)];
+    let functions = scaffold_function_candidates(config);
     scaffold_name_candidates(&on_disk, &config.server.name)
         .iter()
         .any(|name| {
             inputs.iter().any(|(iam, meta)| {
-                render_stack_ts_for_deploy(&config.target.target_type, name, iam, meta) == on_disk
+                functions.iter().any(|function| {
+                    render_stack_ts_with_function(
+                        &config.target.target_type,
+                        name,
+                        iam,
+                        meta,
+                        function,
+                    ) == on_disk
+                })
             })
         })
+}
+
+/// Lambda function settings `stack.ts` may have been rendered with: the
+/// config's, then the scaffold defaults (when they differ).
+fn scaffold_function_candidates(config: &DeployConfig) -> Vec<ScaffoldFunction> {
+    let declared = ScaffoldFunction::from_config(
+        config,
+        &crate::deployment::lambda_function::secret_keys(config),
+    );
+    let defaults = ScaffoldFunction::default();
+    if declared == defaults {
+        vec![defaults]
+    } else {
+        vec![declared, defaults]
+    }
 }
 
 /// Names `stack_ts` may have been rendered for: the configured one, then any
@@ -521,6 +551,111 @@ mod tests {
         assert_eq!(
             classify_stack_ts(&cfg).expect("classify"),
             StackTsState::Untouched
+        );
+    }
+
+    /// The aws-lambda `stack.ts` that cargo-pmcp 0.27.x and 0.28.0 wrote for
+    /// `demo-server` with empty `[iam]`/`[metadata]`, frozen as a fixture (a
+    /// byte copy of `tests/golden/aws-lambda-empty.ts` at the 0.28.0 release,
+    /// unchanged since 0.27.0). It hardcodes `memorySize: 512`, a 30 s timeout
+    /// and `RUST_LOG: 'info'`, whatever deploy.toml said.
+    const STACK_TS_0_28_0: &str =
+        include_str!("../../tests/fixtures/scaffold/aws-lambda-stack-ts-0.28.0-demo-server.ts");
+
+    /// A config whose `[server]` sizing and `[environment]` differ from what a
+    /// 0.28.0 scaffold baked (debug session `cargo-pmcp-deploy-targets`, PR-B).
+    fn config_with_function_settings(root: &Path, name: &str) -> DeployConfig {
+        let mut cfg = config(root, "aws-lambda", name);
+        cfg.server.memory_mb = Some(1769);
+        cfg.server.timeout_seconds = Some(60);
+        cfg.server.ephemeral_storage_mb = Some(4096);
+        cfg.environment.insert(
+            "MODEL_URL".to_string(),
+            "s3://models/forecast.bin".to_string(),
+        );
+        cfg
+    }
+
+    fn seed_0_28_0_stack_ts(root: &Path) {
+        std::fs::create_dir_all(root.join("deploy/lib")).expect("mkdir");
+        std::fs::write(stack_ts_path(root), STACK_TS_0_28_0).expect("write stack.ts");
+    }
+
+    /// An untouched scaffold written AND recorded by 0.28.0 stays cargo-pmcp's
+    /// own after the scaffold started rendering `[server]` sizing and
+    /// `[environment]`: the record holds what was written, not a render.
+    #[test]
+    fn a_recorded_0_28_0_scaffold_stays_untouched_with_declared_function_settings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_stack_ts(tmp.path());
+        record_stack_ts(tmp.path(), STACK_TS_0_28_0).expect("record");
+        for name in ["demo-server", "renamed"] {
+            let cfg = config_with_function_settings(tmp.path(), name);
+            assert_eq!(
+                classify_stack_ts(&cfg).expect("classify"),
+                StackTsState::Untouched,
+                "{name}"
+            );
+        }
+    }
+
+    /// The pre-record migration (projects initialized by 0.27.x) still
+    /// recognizes the 0.27.x/0.28.0 scaffold when deploy.toml declares sizing
+    /// and `[environment]` the old template never rendered — also after a
+    /// rename and with `[iam]` declared — and records it. Without this the
+    /// change would push every such project to the hand-modified path.
+    #[test]
+    fn a_pre_record_0_27_scaffold_is_recognized_with_declared_function_settings() {
+        for (name, iam) in [
+            ("demo-server", IamConfig::default()),
+            ("renamed", IamConfig::default()),
+            ("renamed", users_table()),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            seed_0_28_0_stack_ts(tmp.path());
+            let mut cfg = config_with_function_settings(tmp.path(), name);
+            cfg.iam = iam;
+
+            assert_eq!(
+                classify_stack_ts(&cfg).expect("classify"),
+                StackTsState::Untouched,
+                "{name}"
+            );
+            assert_eq!(
+                recorded_stack_ts_digest(tmp.path()),
+                Some(content_digest(STACK_TS_0_28_0)),
+                "an adopted scaffold must be recorded"
+            );
+        }
+    }
+
+    /// ... and the next deploy regenerates it with the declared settings, and
+    /// records the new content.
+    #[test]
+    fn a_0_28_0_scaffold_is_regenerated_with_the_declared_function_settings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_stack_ts(tmp.path());
+        let cfg = config_with_function_settings(tmp.path(), "demo-server");
+        let rendered = crate::commands::deploy::init::render_stack_ts_for_config(
+            &cfg,
+            &std::collections::BTreeSet::new(),
+        );
+
+        assert!(write_scaffold_stack_ts(&cfg, &rendered).expect("write"));
+
+        let on_disk = std::fs::read_to_string(stack_ts_path(tmp.path())).expect("read");
+        assert!(on_disk.contains("memorySize: 1769,"), "{on_disk}");
+        assert!(
+            on_disk.contains("ephemeralStorageSize: cdk.Size.mebibytes(4096),"),
+            "{on_disk}"
+        );
+        assert!(
+            on_disk.contains("MODEL_URL: 's3://models/forecast.bin',"),
+            "{on_disk}"
+        );
+        assert_eq!(
+            recorded_stack_ts_digest(tmp.path()),
+            Some(content_digest(&rendered))
         );
     }
 

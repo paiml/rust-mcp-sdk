@@ -104,6 +104,10 @@ impl DeploymentTarget for AwsLambdaTarget {
         // so adding an `aws-lambda`-only shape field would ripple into all
         // of them. Recomputing is cheap (two file-existence checks over an
         // immutable `config`), so the duplication is intentional.
+        //
+        // `[server] ephemeral_storage_mb` / `[build]` are validated first, so a
+        // bad value fails before the (multi-minute) build, not after it.
+        crate::deployment::lambda_function::validate_lambda_settings(config)?;
         let shape = artifact::detect_shape(config)?;
         let zip_path = artifact::acquire_artifact(&shape, config).await?;
         let size = std::fs::metadata(&zip_path)
@@ -126,10 +130,10 @@ impl DeploymentTarget for AwsLambdaTarget {
         // through so the renderer+engine path can deploy it directly without
         // a second (and, for a `ServerShape::BuiltIn` project, IMPOSSIBLE —
         // no Cargo.toml to rebuild from) build. `deploy_env_vars()` (merged
-        // `[environment]` + resolved `[secrets]`, secrets win) is still
-        // threaded through for the legacy `DeployExecutor` fallback branch
-        // ONLY — see `deploy::deploy_aws_lambda`'s doc comment for why the
-        // renderer path does not use it.
+        // `[environment]` + resolved `[secrets]`, secrets win) is threaded
+        // through for the legacy `DeployExecutor` fallback's `cdk` child
+        // process ONLY; both engines deliver `[environment]` to the function
+        // themselves — see `deploy::deploy_aws_lambda`'s doc comment.
         deploy::deploy_aws_lambda(config, artifact, config.deploy_env_vars()).await
     }
 
@@ -239,5 +243,39 @@ impl DeploymentTarget for AwsLambdaTarget {
             version.unwrap_or("previous")
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An out-of-range `[server] ephemeral_storage_mb` is refused before the
+    /// build starts, on both targets that build with `cargo lambda` (debug
+    /// session `cargo-pmcp-deploy-targets`, #16).
+    #[tokio::test]
+    async fn build_refuses_out_of_range_ephemeral_storage_before_building() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = DeployConfig::default_for_server(
+            "demo".to_string(),
+            "us-east-1".to_string(),
+            tmp.path().to_path_buf(),
+        );
+        config.server.ephemeral_storage_mb = Some(64);
+
+        for target in [
+            Box::new(AwsLambdaTarget::new()) as Box<dyn DeploymentTarget>,
+            Box::new(crate::deployment::targets::pmcp_run::PmcpRunTarget::new()),
+        ] {
+            let err = target
+                .build(&config)
+                .await
+                .expect_err("ephemeral_storage_mb = 64 must be refused");
+            assert!(
+                format!("{err:#}").contains("ephemeral_storage_mb"),
+                "{}: {err:#}",
+                target.id()
+            );
+        }
     }
 }

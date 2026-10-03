@@ -90,6 +90,46 @@ pub(crate) fn load_deploy_descriptor(config: &DeployConfig) -> Result<DeployDesc
     toml::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
+/// The `.pmcp/deploy.toml` keys cargo-pmcp applies itself on the renderer
+/// deploy path, outside the [`DeployDescriptor`]: `[build]` drives
+/// `cargo lambda build`, and `[server] ephemeral_storage_mb` is merged into the
+/// rendered template (`deployment::template_merge`). `(table, key)`; a `None`
+/// key names the whole table.
+pub const CLI_APPLIED_KEYS: [(&str, Option<&str>); 2] =
+    [("build", None), ("server", Some("ephemeral_storage_mb"))];
+
+/// [`load_deploy_descriptor`] for the deploy RENDERER path: the keys in
+/// [`CLI_APPLIED_KEYS`] are removed before parsing, because the closed-set
+/// descriptor does not model them and cargo-pmcp applies them itself. Without
+/// this, declaring one would silently send an unmodified scaffold to the
+/// legacy `npx cdk` path (debug session `cargo-pmcp-deploy-targets`).
+///
+/// `cargo pmcp package save` keeps the strict [`load_deploy_descriptor`]: a
+/// package carries the descriptor alone, so a key it cannot carry must stop
+/// the save rather than vanish from the artifact.
+pub fn load_render_descriptor(config: &DeployConfig) -> Result<DeployDescriptor> {
+    let path = config.project_root.join(".pmcp").join("deploy.toml");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut table: toml::Table =
+        toml::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))?;
+    for (section, key) in CLI_APPLIED_KEYS {
+        match key {
+            None => {
+                table.remove(section);
+            },
+            Some(key) => {
+                if let Some(section) = table.get_mut(section).and_then(toml::Value::as_table_mut) {
+                    section.remove(key);
+                }
+            },
+        }
+    }
+    table
+        .try_into()
+        .with_context(|| format!("Failed to parse {}", path.display()))
+}
+
 /// Call `pmcp_cfn_renderer::resources::iam::validate`/`cognito::validate`
 /// directly on the descriptor and print every advisory finding — the fix
 /// for the tracked T4/T6 gap where `pmcp_cfn_renderer::render` discards
@@ -307,6 +347,108 @@ mod tests {
     #[test]
     fn cloudformation_metadata_from_none_is_empty() {
         assert!(cloudformation_metadata_from(None).is_empty());
+    }
+
+    /// Write `config` as `.pmcp/deploy.toml` (as `deploy init` would).
+    fn write_deploy_toml(config: &DeployConfig) {
+        let dir = config.project_root.join(".pmcp");
+        std::fs::create_dir_all(&dir).expect("mkdir .pmcp");
+        std::fs::write(
+            dir.join("deploy.toml"),
+            toml::to_string_pretty(config).expect("serialize"),
+        )
+        .expect("write deploy.toml");
+    }
+
+    /// Debug session `cargo-pmcp-deploy-targets`: declaring `[build]` or
+    /// `[server] ephemeral_storage_mb` must not make the renderer path's
+    /// descriptor parse fail (that silently sends an unmodified scaffold to
+    /// `npx cdk deploy`). The keys are removed; everything else is the same
+    /// descriptor the file would parse to without them.
+    #[test]
+    fn render_descriptor_accepts_the_keys_cargo_pmcp_applies_itself() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "aws-lambda", IamConfig::default());
+        write_deploy_toml(&plain);
+        let expected = load_deploy_descriptor(&plain).expect("plain file parses");
+
+        let mut extended = plain.clone();
+        extended.server.ephemeral_storage_mb = Some(4096);
+        extended.build.features = vec!["remote-model".to_string()];
+        extended.build.no_default_features = true;
+        write_deploy_toml(&extended);
+
+        assert_eq!(
+            load_render_descriptor(&extended).expect("render path accepts the new keys"),
+            expected
+        );
+    }
+
+    /// `package save` keeps the strict loader: a package carries the
+    /// descriptor alone, so a key it cannot carry stops the save.
+    #[test]
+    fn strict_descriptor_still_refuses_keys_it_cannot_carry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "aws-lambda", IamConfig::default());
+        config.server.ephemeral_storage_mb = Some(4096);
+        write_deploy_toml(&config);
+        assert!(load_deploy_descriptor(&config).is_err());
+    }
+
+    /// Only the listed keys are removed: any other unknown key still fails the
+    /// closed-set descriptor (and so still falls back to the legacy path).
+    #[test]
+    fn render_descriptor_still_refuses_other_unknown_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config =
+            cfg_with_target_and_iam(tmp.path().to_path_buf(), "aws-lambda", IamConfig::default());
+        write_deploy_toml(&config);
+        let path = tmp.path().join(".pmcp/deploy.toml");
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(
+            &path,
+            text.replace("[server]\n", "[server]\nunknown_knob = 1\n"),
+        )
+        .expect("write");
+        assert!(load_render_descriptor(&config).is_err());
+    }
+
+    mod render_descriptor_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// For any `[build]` / `ephemeral_storage_mb` declaration, the
+            /// render-path descriptor equals the descriptor of the same file
+            /// without them.
+            #[test]
+            fn cli_applied_keys_never_change_the_descriptor(
+                ephemeral in prop::option::of(any::<u32>()),
+                features in prop::collection::vec("[a-z][a-z0-9_-]{0,10}", 0..4),
+                no_default in any::<bool>(),
+            ) {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let plain = cfg_with_target_and_iam(
+                    tmp.path().to_path_buf(),
+                    "aws-lambda",
+                    IamConfig::default(),
+                );
+                write_deploy_toml(&plain);
+                let expected = load_deploy_descriptor(&plain).expect("plain file parses");
+
+                let mut extended = plain.clone();
+                extended.server.ephemeral_storage_mb = ephemeral;
+                extended.build.features = features;
+                extended.build.no_default_features = no_default;
+                write_deploy_toml(&extended);
+
+                prop_assert_eq!(load_render_descriptor(&extended).expect("parses"), expected);
+            }
+        }
     }
 
     #[test]

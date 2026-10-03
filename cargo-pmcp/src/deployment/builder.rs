@@ -45,6 +45,49 @@ pub fn bootstrap_path(project_root: &Path) -> PathBuf {
 /// [`bootstrap_path`]'s project-relative form, for messages that name it.
 pub const BOOTSTRAP_RELATIVE: &str = "deploy/.build/bootstrap";
 
+/// The `cargo` argv that builds the MCP Lambda binary: `cargo lambda build
+/// --release --arm64`, plus `[build]`'s `--no-default-features` and
+/// `--features=<list>` (debug session `cargo-pmcp-deploy-targets`, #15).
+///
+/// No `--target-dir`: `cargo lambda build --target-dir X` fails upstream
+/// (cargo-lambda passes it on to `cargo metadata`, which rejects it); the
+/// target directory is resolved from `CARGO_TARGET_DIR` and cargo's own
+/// config instead (see `BinaryBuilder::resolve_target_dir`).
+pub fn lambda_build_args(build: &crate::deployment::config::BuildConfig) -> Result<Vec<String>> {
+    validate_build_config(build)?;
+    let mut args: Vec<String> = ["lambda", "build", "--release", "--arm64"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if build.no_default_features {
+        args.push("--no-default-features".to_string());
+    }
+    if !build.features.is_empty() {
+        // One `--features=` argument (not `--features <list>`), so the list can
+        // never be read as a separate flag.
+        args.push(format!("--features={}", build.features.join(",")));
+    }
+    Ok(args)
+}
+
+/// Refuse `[build]` feature names cargo would split or read as a flag: empty,
+/// containing whitespace or a comma, or starting with `-`.
+pub fn validate_build_config(build: &crate::deployment::config::BuildConfig) -> Result<()> {
+    let misread = |feature: &&String| {
+        feature.is_empty()
+            || feature.starts_with('-')
+            || feature.contains(|c: char| c == ',' || c.is_whitespace())
+    };
+    if let Some(feature) = build.features.iter().find(misread) {
+        bail!(
+            "[build] features in .pmcp/deploy.toml lists {feature:?}, which is not a cargo \
+             feature name (empty, starts with '-', or contains a comma or whitespace). List one \
+             feature per string, e.g. features = [\"a\", \"b\"]; nothing was built."
+        );
+    }
+    Ok(())
+}
+
 impl BinaryBuilder {
     pub fn new(project_root: PathBuf) -> Self {
         // Check if OAuth is enabled in config and if we should build local OAuth lambdas
@@ -134,11 +177,18 @@ impl BinaryBuilder {
     }
 
     fn build_lambda_binary(&self) -> Result<()> {
+        // Load config to get server name and `[build]`
+        let config = crate::deployment::config::DeployConfig::load(&self.project_root)?;
+        if !config.build.is_empty() {
+            println!(
+                "   [build]: features = [{}], no_default_features = {}",
+                config.build.features.join(", "),
+                config.build.no_default_features
+            );
+        }
+
         print!("   Building Lambda binary (this may take a few minutes)...");
         std::io::Write::flush(&mut std::io::stdout())?;
-
-        // Load config to get server name
-        let config = crate::deployment::config::DeployConfig::load(&self.project_root)?;
 
         // Use cargo lambda build with --arm64 for cross-compilation.
         // ARM64 is cheaper and faster on Lambda than x86_64.
@@ -152,9 +202,10 @@ impl BinaryBuilder {
         // - CC_aarch64_unknown_linux_gnu=zigcc wrapper: ring's cc crate uses the
         //   wrapper which handles the --target triple Zig can't parse
         let lambda_pkg_dir = self.find_lambda_package_dir(&config.server.name)?;
+        let args = lambda_build_args(&config.build)?;
 
         let status = Command::new("cargo")
-            .args(["lambda", "build", "--release", "--arm64"])
+            .args(&args)
             .current_dir(&lambda_pkg_dir)
             // Force aws-lc-sys to use cmake builder (bypasses cc crate target conflict)
             .env("AWS_LC_SYS_CMAKE_BUILDER", "1")
@@ -756,6 +807,100 @@ impl BinaryBuilder {
             Some(toml_files[0].path())
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_args_tests {
+    //! #15 (debug session `cargo-pmcp-deploy-targets`): `[build]` reaches
+    //! `cargo lambda build`.
+    use super::*;
+    use crate::deployment::config::BuildConfig;
+
+    fn build(features: &[&str], no_default_features: bool) -> BuildConfig {
+        BuildConfig {
+            features: features.iter().map(|f| (*f).to_string()).collect(),
+            no_default_features,
+        }
+    }
+
+    /// Nothing declared: exactly the argv every cargo-pmcp has run.
+    #[test]
+    fn no_build_section_keeps_the_historical_argv() {
+        assert_eq!(
+            lambda_build_args(&BuildConfig::default()).expect("args"),
+            vec!["lambda", "build", "--release", "--arm64"]
+        );
+    }
+
+    /// The reported case: a server that keeps model weights out of the binary
+    /// behind a feature.
+    #[test]
+    fn features_and_no_default_features_are_passed() {
+        assert_eq!(
+            lambda_build_args(&build(&["remote-model", "server/metrics"], true)).expect("args"),
+            vec![
+                "lambda",
+                "build",
+                "--release",
+                "--arm64",
+                "--no-default-features",
+                "--features=remote-model,server/metrics",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_default_features_alone() {
+        assert_eq!(
+            lambda_build_args(&build(&[], true)).expect("args"),
+            vec![
+                "lambda",
+                "build",
+                "--release",
+                "--arm64",
+                "--no-default-features"
+            ]
+        );
+    }
+
+    /// Feature names cargo would split, or read as a flag, are refused.
+    #[test]
+    fn feature_names_cargo_would_misread_are_refused() {
+        for bad in ["", "a b", "a,b", "-x", "--all-features"] {
+            let err = lambda_build_args(&build(&[bad], false))
+                .expect_err("a feature name cargo would misread must be refused");
+            assert!(format!("{err:#}").contains("[build] features"), "{err:#}");
+            assert!(validate_build_config(&build(&[bad], false)).is_err());
+        }
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Valid feature names reach cargo intact and in order, in one
+            /// `--features=` argument.
+            #[test]
+            fn valid_features_reach_cargo_intact(
+                features in prop::collection::vec("[a-z][a-z0-9_+./-]{0,12}", 1..5),
+                no_default in any::<bool>(),
+            ) {
+                let refs: Vec<&str> = features.iter().map(String::as_str).collect();
+                let args = lambda_build_args(&build(&refs, no_default)).expect("args");
+                let joined = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--features="))
+                    .expect("--features= present");
+                let back: Vec<String> = joined.split(',').map(String::from).collect();
+                prop_assert_eq!(back, features);
+                prop_assert_eq!(args.contains(&"--no-default-features".to_string()), no_default);
+                prop_assert_eq!(&args[..4], &["lambda", "build", "--release", "--arm64"]);
+            }
         }
     }
 }
