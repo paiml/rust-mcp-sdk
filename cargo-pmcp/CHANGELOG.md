@@ -5,7 +5,7 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [0.28.1] - 2026-10-03
+## [0.28.1] - 2026-10-04
 
 Fixes from the live re-check of 0.28.0 against real AWS and GCP
 (forecast-coach spike 021): an unchanged redeploy is a CloudFormation no-op

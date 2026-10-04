@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.22.7] - 2026-10-04
+
+Ships `cargo-pmcp` **0.28.1** (#413), with the follow-ups found by the 0.28.0 live check against
+real AWS and GCP. `pmcp` moves 2.22.6 -> 2.22.7 with no code change of its own, to mint the tag.
+No library crate changes. The full notes are in `cargo-pmcp/CHANGELOG.md`.
+
+### Fixed (cargo-pmcp)
+
+- **Lambda zips are deterministic** (#405), so an unchanged aws-lambda redeploy no longer updates
+  the function.
+- **aws-lambda `destroy` cleans up after itself.** It removes the server's uploaded
+  `{server}/bootstrap-*.zip` artifacts (#406) and the function's `/aws/lambda/<fn>` log group
+  (#407). If either cleanup fails, it warns and prints the command to run by hand.
+- **A passing post-deploy check prints a one-line summary** (#408), and a skipped check says why.
+- **A native-path rename regenerates untouched `stack.ts` and `app.ts`**, and `app.ts` is now
+  recorded in the scaffold record (#409).
+- **Post-deploy exit codes** (#410). An endpoint that answers with a 4xx is a failed check (exit 3
+  under `--on-test-failure fail`). 5xx, connection errors and timeouts are infrastructure errors
+  (exit 2). `warn` still exits 0.
+- **`cargo install cargo-pmcp` no longer installs the `mock_test_binary` test helper** (#412).
+
 ## [2.22.6] - 2026-10-03
 
 Ships `cargo-pmcp` **0.28.0**: the deploy-target fixes from the forecast-coach field report
