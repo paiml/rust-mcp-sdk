@@ -256,26 +256,48 @@ async fn settle() {
 /// effect (the flow proceeded), which a version that never warned at all would
 /// also satisfy — the same shape as 116-10's "a presence assertion is not a
 /// detector" finding.
-#[derive(Debug, Default)]
-struct WarnCapture {
-    messages: Arc<Mutex<Vec<String>>>,
+///
+/// ONE process-wide subscriber, installed once, routes each WARN to the buffer
+/// of the thread that emitted it. A per-test `set_default` subscriber was flaky
+/// (#396): `tracing` caches each callsite's interest process-wide, and tests in
+/// this binary run in parallel. When another thread with no subscriber reached
+/// the issuer-change `warn!` first, the callsite could be cached as disabled,
+/// and the event was skipped while `record_issuer` beside it still ran. This
+/// failed only under coverage instrumentation, and `rebuild_interest_cache()`
+/// did not prevent it. The global subscriber reports every WARN-or-higher
+/// callsite as `Interest::always`, so no callsite can be cached as disabled.
+#[derive(Debug)]
+struct WarnCapture;
+
+thread_local! {
+    /// The capture buffer for the test running on this thread, if any.
+    static THREAD_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Install a [`WarnCapture`] for the current thread and return its message
-/// list with the guard that keeps it installed.
+/// Clears this thread's capture buffer when the test's guard drops.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Start capturing WARN messages emitted on the current thread, and return the
+/// message list with the guard that keeps the capture active.
 ///
-/// `tracing` caches each callsite's interest process-wide. Tests in this binary
-/// run in parallel, and a callsite first reached on a thread with no subscriber
-/// can stay cached as disabled while this thread-local subscriber is being
-/// registered, so the event never reaches the capture (#396). Rebuilding the
-/// interest cache after installing the capture re-asks every live subscriber,
-/// this one included.
-fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let guard = tracing::subscriber::set_default(capture);
-    tracing::callsite::rebuild_interest_cache();
-    (messages, guard)
+/// The `#[tokio::test]` runtime is current-thread, so the client code under test
+/// runs on this thread too.
+fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, CaptureGuard) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(WarnCapture)
+            .expect("no other global subscriber in this test binary");
+    });
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(messages.clone()));
+    (messages, CaptureGuard)
 }
 
 /// Pulls the formatted `message` field out of a `tracing` event.
@@ -290,6 +312,17 @@ impl tracing::field::Visit for MessageVisitor<'_> {
 }
 
 impl tracing::Subscriber for WarnCapture {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if *metadata.level() <= tracing::Level::WARN {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         *metadata.level() <= tracing::Level::WARN
     }
@@ -306,8 +339,12 @@ impl tracing::Subscriber for WarnCapture {
         if *event.metadata().level() != tracing::Level::WARN {
             return;
         }
-        let mut held = self.messages.lock().expect("captured warnings");
-        event.record(&mut MessageVisitor(&mut held));
+        THREAD_CAPTURE.with(|slot| {
+            if let Some(messages) = slot.borrow().as_ref() {
+                let mut held = messages.lock().expect("captured warnings");
+                event.record(&mut MessageVisitor(&mut held));
+            }
+        });
     }
 
     fn enter(&self, _span: &tracing::span::Id) {}
