@@ -1,9 +1,8 @@
 use anyhow::{bail, Context, Result};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zip::write::SimpleFileOptions;
-use zip::ZipWriter;
+
+use crate::deployment::lambda_zip::{write_zip, ZipEntry};
 
 #[allow(dead_code)]
 pub struct BinaryBuilder {
@@ -598,20 +597,10 @@ impl BinaryBuilder {
             println!("   Found {} asset file(s)", asset_files.len());
         }
 
-        // Create deployment package directory
-        let package_dir = self.project_root.join("deploy/.build");
-        std::fs::create_dir_all(&package_dir)
-            .context("Failed to create deployment package directory")?;
-
-        // Create zip file
-        let zip_path = package_dir.join("deployment.zip");
-        let zip_file =
-            std::fs::File::create(&zip_path).context("Failed to create deployment.zip")?;
-        let mut zip = ZipWriter::new(zip_file);
-
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(0o755);
+        // The deployment package (one deterministic writer for every Lambda
+        // zip, #405: see `deployment::lambda_zip`).
+        let zip_path = self.project_root.join("deploy/.build/deployment.zip");
+        let mut entries: Vec<ZipEntry> = Vec::with_capacity(asset_files.len() + 2);
 
         // Add bootstrap binary
         print!("   Adding bootstrap binary...");
@@ -619,15 +608,8 @@ impl BinaryBuilder {
 
         let bootstrap_data =
             std::fs::read(binary_path).context("Failed to read bootstrap binary")?;
-        zip.start_file("bootstrap", options)
-            .context("Failed to add bootstrap to zip")?;
-        zip.write_all(&bootstrap_data)
-            .context("Failed to write bootstrap to zip")?;
+        entries.push(ZipEntry::executable("bootstrap", bootstrap_data));
         println!(" ✅");
-
-        let file_options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(0o644);
 
         // H4 (Phase 86 Plan 05): for a config-driven project, the BUNDLED config's
         // inline DEV `token_secret` MUST be replaced with the `${CODE_MODE_SECRET}`
@@ -636,12 +618,10 @@ impl BinaryBuilder {
         let config_driven = crate::commands::deploy::is_config_driven_project(&self.project_root);
 
         // Add config.toml if found (for Code Mode operation extraction by pmcp.run)
-        let config_toml_included = self.add_config_toml_to_zip(
-            &mut zip,
-            file_options,
-            config_toml_path.as_deref(),
-            config_driven,
-        )?;
+        let config_toml_entry =
+            Self::config_toml_entry(config_toml_path.as_deref(), config_driven)?;
+        let config_toml_included = config_toml_entry.is_some();
+        entries.extend(config_toml_entry);
 
         // Add assets to assets/ subdirectory in the zip
         // Lambda will extract to $LAMBDA_TASK_ROOT/assets/
@@ -658,7 +638,7 @@ impl BinaryBuilder {
                 .unwrap_or_else(|| asset_path.file_name().unwrap().into());
 
             // Put assets in assets/ subdirectory
-            let zip_path = format!("assets/{}", relative_path.display());
+            let entry_name = format!("assets/{}", relative_path.display());
 
             print!("   Adding {}...", relative_path.display());
             std::io::Write::flush(&mut std::io::stdout())?;
@@ -675,15 +655,12 @@ impl BinaryBuilder {
             } else {
                 asset_data
             };
-            zip.start_file(&zip_path, file_options)
-                .context(format!("Failed to add {} to zip", zip_path))?;
-            zip.write_all(&asset_data)
-                .context(format!("Failed to write {} to zip", zip_path))?;
+            entries.push(ZipEntry::file(entry_name, asset_data));
 
             println!(" ✅");
         }
 
-        zip.finish().context("Failed to finalize zip file")?;
+        write_zip(&zip_path, &entries).context("Failed to create deployment.zip")?;
 
         let zip_size = std::fs::metadata(&zip_path)
             .context("Failed to get zip size")?
@@ -699,25 +676,22 @@ impl BinaryBuilder {
         Ok(Some(zip_path))
     }
 
-    /// Add config.toml to the deploy ZIP for Code Mode operation extraction.
+    /// The zip-root `config.toml` entry for Code Mode operation extraction, or
+    /// `None` when there is no config.
     ///
     /// Takes a pre-resolved config path (from `resolve_config_toml`) to avoid
-    /// redundant filesystem scanning. Returns true if a config file was added.
+    /// redundant filesystem scanning.
     ///
     /// When `config_driven` is true the bundled bytes are passed through
     /// [`Self::sanitize_config_bytes_for_deploy`] so the inline DEV `token_secret`
     /// is replaced with the `${CODE_MODE_SECRET}` env ref (H4). The on-disk source
     /// file is never modified.
-    fn add_config_toml_to_zip<W: std::io::Write + std::io::Seek>(
-        &self,
-        zip: &mut ZipWriter<W>,
-        options: SimpleFileOptions,
+    fn config_toml_entry(
         config_path: Option<&Path>,
         config_driven: bool,
-    ) -> Result<bool> {
-        let config_path = match config_path {
-            Some(path) => path,
-            None => return Ok(false),
+    ) -> Result<Option<ZipEntry>> {
+        let Some(config_path) = config_path else {
+            return Ok(None);
         };
 
         print!("   Adding config.toml...");
@@ -729,12 +703,8 @@ impl BinaryBuilder {
         } else {
             config_data
         };
-        zip.start_file("config.toml", options)
-            .context("Failed to add config.toml to zip")?;
-        zip.write_all(&config_data)
-            .context("Failed to write config.toml to zip")?;
         println!(" ✅ ({})", config_path.display());
-        Ok(true)
+        Ok(Some(ZipEntry::file("config.toml", config_data)))
     }
 
     /// Rewrite a bundled `config.toml`'s inline DEV `token_secret` to the
@@ -1005,6 +975,62 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #405 on the bundled-assets path (`deploy/.build/deployment.zip`, which
+    /// `aws-lambda` deploys, `pmcp-run` uploads and `npx cdk deploy` packages
+    /// again from `.build`): the same inputs give the same bytes, entries are
+    /// in name order, and none carries the build time.
+    #[test]
+    fn the_bundled_deployment_zip_is_deterministic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        write(
+            &root.join(".pmcp/deploy.toml"),
+            "[target]\ntype = \"aws-lambda\"\nversion = \"1.0.0\"\n\n\
+             [aws]\nregion = \"us-east-1\"\n\n\
+             [server]\nname = \"demo\"\nmemory_mb = 512\ntimeout_seconds = 30\n\n\
+             [environment]\nRUST_LOG = \"info\"\n\n\
+             [auth]\nenabled = false\nprovider = \"none\"\n\n\
+             [observability]\nlog_retention_days = 30\nenable_xray = false\ncreate_dashboard = false\n\n\
+             [assets]\ninclude = [\"static/z.txt\", \"static/a.txt\"]\n",
+        );
+        write(&root.join("static/z.txt"), "z");
+        write(&root.join("static/a.txt"), "a");
+        let bootstrap = root.join("bootstrap-bin");
+        write(&bootstrap, "ELF-PLACEHOLDER");
+        let b = builder_for(root.clone());
+
+        let zip_path = b
+            .bundle_assets_if_configured(&bootstrap)
+            .expect("bundle")
+            .expect("a deployment.zip (assets are configured)");
+        let first = std::fs::read(&zip_path).expect("read");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(first.clone())).expect("parse zip");
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).expect("entry");
+            assert_eq!(
+                entry.last_modified(),
+                Some(zip::DateTime::DEFAULT),
+                "{} carries the build time",
+                entry.name()
+            );
+            names.push(entry.name().to_string());
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries must be in name order");
+
+        let zip_path = b
+            .bundle_assets_if_configured(&bootstrap)
+            .expect("bundle")
+            .expect("zip");
+        assert!(
+            std::fs::read(&zip_path).expect("read") == first,
+            "the same inputs must give the same deployment.zip"
+        );
     }
 
     /// H4 (Phase 86 Plan 05) — NON-CLOUD packaging + secret-posture test.

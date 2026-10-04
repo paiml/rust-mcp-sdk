@@ -68,7 +68,7 @@ my-mcp-server/
 ├── .pmcp/
 │   └── deploy.toml              # Single config file
 └── deploy/                      # Created by `deploy init`
-    ├── .pmcp-scaffold.toml      # SHA-256 of the stack.ts cargo-pmcp last wrote (commit it)
+    ├── .pmcp-scaffold.toml      # SHA-256 of the stack.ts and app.ts cargo-pmcp last wrote (commit it)
     ├── cdk.json
     ├── package.json
     ├── tsconfig.json
@@ -414,6 +414,18 @@ cargo pmcp deploy destroy
 # 🗑️  Destroying deployment...
 # ✅ Deployment destroyed
 ```
+
+> **What `destroy` removes on `aws-lambda` today** (the transcript above is the
+> original MVP sketch): the CloudFormation stack `{[server] name}-stack`, then —
+> since 0.28.1, and only after the stack is gone — the deploy artifacts the
+> native engine uploaded (`pmcp-deploy-<account>-<region>/{[server] name}/bootstrap-<digest>.zip`,
+> never the shared bucket or another server's prefix) and any
+> `/aws/lambda/<function>` log group Lambda re-created for the stack's functions.
+> A cleanup step that cannot run prints the exact `aws` command instead of failing
+> the destroy. See [deploy destroy](docs/commands/deploy.md#deploy-destroy).
+>
+> The artifact zip is deterministic (sorted entries, fixed mtime and permissions),
+> so redeploying an unchanged binary is a CloudFormation no-op.
 
 ---
 
@@ -1373,6 +1385,12 @@ The post-deploy verification probes, and the deploy prints as the endpoint,
 convention); set `mcp_path = "/"` for a server that serves MCP at the root. `deploy init`
 records `mcp_path = "/"` in a new `deploy.toml` when the server binary is a `cargo pmcp new`
 server (its package depends on `server-common`, whose `run_http` serves at `/`).
+
+A wrong `mcp_path` makes the endpoint answer `404`: the banner names `mcp_path`, and since
+0.28.1 the deploy exits **3** under `--on-test-failure fail` (a reachable endpoint answering
+an HTTP 4xx is a failed check; an unreachable one, a timeout or a 5xx exits 2). A passing
+verification prints `✓ Verified <endpoint>: <checks>`. See
+[exit codes](docs/commands/deploy.md#post-deploy-verification-and-exit-codes).
 
 ---
 

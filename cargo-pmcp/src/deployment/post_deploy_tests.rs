@@ -742,12 +742,110 @@ async fn invoke_step(
 /// One post-deploy step's result: label, typed command, outcome, duration.
 pub type StepOutcome = (String, JsonTestCommand, TestOutcome, Option<u64>);
 
+/// What a failed post-deploy step counts as for the exit code (#410).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The endpoint was reached and the check failed, including an endpoint
+    /// that answered an HTTP 4xx (401, 403, 404, 405, ...): exit 3 under
+    /// `fail`.
+    FailedCheck,
+    /// No verdict on the deployed code could be reached: the endpoint was
+    /// unreachable (a connect, DNS or TLS error), a check timed out, the
+    /// endpoint answered an HTTP 5xx, or the child process failed: exit 2
+    /// under `fail`.
+    Infrastructure,
+}
+
+/// The phrase the pmcp HTTP client puts before the status of a non-2xx
+/// answer (`Request failed with status: 404 Not Found`).
+const HTTP_STATUS_PREFIX: &str = "Request failed with status: ";
+
+/// Lower-case fragments of the client errors for an endpoint that could not
+/// be reached. A closed port and an unresolvable host both surface as
+/// `client error (Connect)` (measured); the others are the remaining
+/// connect/DNS/TLS/timeout wordings of the HTTP stack.
+const UNREACHABLE_MARKERS: [&str; 8] = [
+    "client error (",
+    "error sending request",
+    "error trying to connect",
+    "connection refused",
+    "connection reset",
+    "dns error",
+    "failed to lookup address",
+    "timed out",
+];
+
+/// The HTTP status a failure message reports the endpoint answered, if any.
+#[must_use]
+pub fn http_status(message: &str) -> Option<u16> {
+    let start = message.find(HTTP_STATUS_PREFIX)? + HTTP_STATUS_PREFIX.len();
+    let digits = message.get(start..start + 3)?;
+    let followed_by_digit = message[start + 3..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit());
+    if followed_by_digit || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// What one failure message says about the endpoint, or `None` when it says
+/// nothing about reachability (an ordinary check failure).
+fn message_class(message: &str) -> Option<FailureClass> {
+    match http_status(message) {
+        Some(400..=499) => return Some(FailureClass::FailedCheck),
+        Some(500..=599) => return Some(FailureClass::Infrastructure),
+        _ => {},
+    }
+    let lower = message.to_ascii_lowercase();
+    UNREACHABLE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then_some(FailureClass::Infrastructure)
+}
+
+/// How a step counts for the exit code, or `None` when it passed (#410).
+///
+/// The children disagree about the same answer: `test check` and `test
+/// conformance` report an HTTP 404 (and a connection refused) as a failed
+/// test, while `test apps` reports any failed connectivity check as an
+/// infrastructure error. So the class comes from what the step's messages say
+/// about the endpoint — an HTTP 4xx is a failed check, a 5xx or a connect/
+/// DNS/TLS/timeout error is infrastructure, and infrastructure wins within a
+/// step — and only when they say nothing does the child's own verdict stand.
+#[must_use]
+pub fn classify_failure(outcome: &TestOutcome) -> Option<FailureClass> {
+    let (messages, reported): (Vec<&str>, FailureClass) = match outcome {
+        TestOutcome::Passed { .. } => return None,
+        TestOutcome::TestFailed { messages, .. } => (
+            messages.iter().map(String::as_str).collect(),
+            FailureClass::FailedCheck,
+        ),
+        TestOutcome::InfraError(_, message) => {
+            (vec![message.as_str()], FailureClass::Infrastructure)
+        },
+    };
+    let signals: Vec<FailureClass> = messages.into_iter().filter_map(message_class).collect();
+    Some(if signals.contains(&FailureClass::Infrastructure) {
+        FailureClass::Infrastructure
+    } else if signals.contains(&FailureClass::FailedCheck) {
+        FailureClass::FailedCheck
+    } else {
+        reported
+    })
+}
+
 /// The CLI exit code the verification maps to, or `None` for exit 0.
 ///
-/// | `on_failure` | all passed | a test failed | an infrastructure error |
+/// | `on_failure` | all passed | a check failed (incl. HTTP 4xx) | infrastructure (unreachable, timeout, HTTP 5xx) |
 /// |---|---|---|---|
 /// | `fail` | 0 | 3 | 2 (wins over 3) |
 /// | `warn` | 0 | 0 | 0 |
+///
+/// Each failed step is classified by [`classify_failure`] (#410: a clean 404
+/// from a deployed service used to exit 2 because `test apps` reports it as
+/// an infrastructure error).
 ///
 /// `warn` is consulted FIRST (debug session `cargo-pmcp-deploy-targets`, #14):
 /// an infrastructure error in a check used to return 2 before the policy was
@@ -758,15 +856,13 @@ pub fn verdict_exit_code(outcomes: &[StepOutcome], on_failure: OnFailure) -> Opt
     if on_failure == OnFailure::Warn {
         return None;
     }
-    let any_infra = outcomes
+    let classes: Vec<FailureClass> = outcomes
         .iter()
-        .any(|(_, _, o, _)| matches!(o, TestOutcome::InfraError(..)));
-    let any_test_failed = outcomes
-        .iter()
-        .any(|(_, _, o, _)| matches!(o, TestOutcome::TestFailed { .. }));
-    if any_infra {
+        .filter_map(|(_, _, outcome, _)| classify_failure(outcome))
+        .collect();
+    if classes.contains(&FailureClass::Infrastructure) {
         Some(2)
-    } else if any_test_failed {
+    } else if classes.contains(&FailureClass::FailedCheck) {
         Some(3)
     } else {
         None
@@ -882,12 +978,101 @@ fn interpret_outcomes(
     }
 }
 
+/// What a post-deploy verification that did not fail the deploy did (#408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationReport {
+    /// `cargo pmcp deploy --no-post-deploy-test`: nothing ran.
+    SkippedByFlag,
+    /// `[post_deploy_tests] enabled = false`: nothing ran.
+    Disabled,
+    /// No configured check applied (`checks` empty, or only `apps` for a
+    /// project without widgets): nothing ran.
+    NothingToRun,
+    /// Every check that ran passed.
+    Passed {
+        /// The endpoint the checks ran against.
+        url: String,
+        /// The checks that ran, in order (`connectivity`, `conformance`,
+        /// `apps`).
+        checks: Vec<&'static str>,
+    },
+    /// A check failed under `on_failure = warn`; the failure banner said so.
+    FailedUnderWarn,
+}
+
+impl VerificationReport {
+    /// The line `cargo pmcp deploy` prints for this outcome, or `None` when
+    /// the failure banner already said it. Before 0.28.1 a verification that
+    /// passed (or did not run) printed nothing, so success could not be told
+    /// apart from verification not running at all.
+    #[must_use]
+    pub fn summary_line(&self) -> Option<String> {
+        Some(match self {
+            Self::Passed { url, checks } => format!("✓ Verified {url}: {}", checks.join(", ")),
+            Self::SkippedByFlag => {
+                "Post-deploy verification skipped (--no-post-deploy-test).".to_string()
+            },
+            Self::Disabled => {
+                "Post-deploy verification skipped ([post_deploy_tests] enabled = false)."
+                    .to_string()
+            },
+            Self::NothingToRun => "Post-deploy verification skipped: no configured check \
+                                   applies ([post_deploy_tests] checks; `apps` runs only when \
+                                   the project has widgets)."
+                .to_string(),
+            Self::FailedUnderWarn => return None,
+        })
+    }
+}
+
+/// The `[post_deploy_tests] checks` name of a step's command.
+const fn check_name(command: JsonTestCommand) -> &'static str {
+    match command {
+        JsonTestCommand::Check => "connectivity",
+        JsonTestCommand::Conformance => "conformance",
+        JsonTestCommand::Apps => "apps",
+    }
+}
+
+/// The report for a verification that ran `outcomes` against `url` and did
+/// not fail the deploy.
+fn verification_report(url: &str, outcomes: &[StepOutcome]) -> VerificationReport {
+    if outcomes.is_empty() {
+        return VerificationReport::NothingToRun;
+    }
+    if outcomes
+        .iter()
+        .any(|(_, _, outcome, _)| !matches!(outcome, TestOutcome::Passed { .. }))
+    {
+        return VerificationReport::FailedUnderWarn;
+    }
+    VerificationReport::Passed {
+        url: url.to_string(),
+        checks: outcomes
+            .iter()
+            .map(|(_, command, _, _)| check_name(*command))
+            .collect(),
+    }
+}
+
+/// Write `report`'s summary line to `out`, unless `quiet`.
+fn announce<W: std::io::Write + ?Sized>(out: &mut W, report: &VerificationReport, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if let Some(line) = report.summary_line() {
+        let _ = writeln!(out, "{line}");
+    }
+}
+
 /// Top-level lifecycle: warmup → check → conformance → apps (apps optional).
 /// Cog ≤10.
 ///
 /// `widgets_present` controls whether the `apps` step runs when configured.
 /// `quiet` suppresses the failure-banner eprintln (banner is still returned in
-/// the [`OrchestrationFailure`] for callers that want to log it differently).
+/// the [`OrchestrationFailure`] for callers that want to log it differently)
+/// and the one-line summary of a verification that did not fail (#408),
+/// which goes to stdout.
 ///
 /// REVISION 3 HIGH-C2: no `auth_token` parameter. Subprocesses inherit env via
 /// Tokio Command default and self-resolve auth via the existing
@@ -898,10 +1083,32 @@ pub async fn run_post_deploy_tests(
     widgets_present: bool,
     config: &PostDeployTestsConfig,
     quiet: bool,
-) -> std::result::Result<(), OrchestrationFailure> {
+) -> std::result::Result<VerificationReport, OrchestrationFailure> {
+    run_post_deploy_tests_to(
+        &mut std::io::stdout(),
+        url,
+        target_id,
+        widgets_present,
+        config,
+        quiet,
+    )
+    .await
+}
+
+/// [`run_post_deploy_tests`], writing the summary line to `out` instead of
+/// stdout (the failure banner still goes to stderr).
+pub async fn run_post_deploy_tests_to<W: std::io::Write + Send + ?Sized>(
+    out: &mut W,
+    url: &str,
+    target_id: &str,
+    widgets_present: bool,
+    config: &PostDeployTestsConfig,
+    quiet: bool,
+) -> std::result::Result<VerificationReport, OrchestrationFailure> {
     if !config.enabled {
         // Master plan locked decision #4: skip warmup too when disabled.
-        return Ok(());
+        announce(out, &VerificationReport::Disabled, quiet);
+        return Ok(VerificationReport::Disabled);
     }
 
     // Warmup grace.
@@ -919,7 +1126,10 @@ pub async fn run_post_deploy_tests(
         outcomes.push((step.label, step.json_command, outcome, Some(dur)));
     }
 
-    interpret_outcomes(target_id, &outcomes, config.on_failure, quiet)
+    interpret_outcomes(target_id, &outcomes, config.on_failure, quiet)?;
+    let report = verification_report(url, &outcomes);
+    announce(out, &report, quiet);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1151,14 +1361,46 @@ warmup_grace_ms = 2000
         TestOutcome::InfraError(InfraErrorKind::AuthOrNetwork, message.to_string())
     }
 
+    /// Measured 2026-10-03 from `cargo pmcp test {check,conformance,apps}
+    /// --format=json` against local stand-ins (a closed port, an unresolvable
+    /// host, servers answering 401/403/404/405/500/503): these are the
+    /// children's real failure messages (#410).
+    const SERVER_ERROR: &str =
+        "Transport error: Request error: Request failed with status: 500 Internal Server Error";
+    const UNAVAILABLE: &str =
+        "Transport error: Request error: Request failed with status: 503 Service Unavailable";
+    const METHOD_NOT_ALLOWED: &str =
+        "Transport error: Request error: Request failed with status: 405 Method Not Allowed";
+    const UNAUTHORIZED: &str =
+        "Transport error: Request error: Request failed with status: 401 Unauthorized";
+    /// A closed port and an unresolvable host both read like this.
+    const CONNECT: &str = "Transport error: Request error: client error (Connect)";
+    /// `test apps` reports a failed connectivity check as an infrastructure
+    /// error; since 0.28.1 its message carries the check's own error.
+    const APPS_404: &str = "Server connectivity check failed - cannot validate App metadata: \
+         Transport error: Request error: Request failed with status: 404 Not Found";
+    const APPS_CONNECT: &str = "Server connectivity check failed - cannot validate App \
+         metadata: Transport error: Request error: client error (Connect)";
+
+    fn timed_out() -> TestOutcome {
+        TestOutcome::InfraError(
+            InfraErrorKind::Timeout,
+            "Connectivity exceeded 60s timeout".to_string(),
+        )
+    }
+
     /// #14: the exit-code table, every `on_failure` x outcome mix. `warn`
     /// always exits 0 (the field report: Connectivity and Conformance
     /// test-failed, Apps infra-error, `--on-test-failure warn` -> exit 2).
+    ///
+    /// #410: a reachable endpoint that answers an HTTP 4xx is a FAILED CHECK
+    /// (3), whichever step reports it and however; an unreachable endpoint
+    /// (connect/DNS/TLS error), a timeout or a 5xx is INFRASTRUCTURE (2).
     #[test]
     fn exit_code_matrix() {
         /// `(name, outcomes, exit code under fail, exit code under warn)`.
         type Case = (&'static str, Vec<TestOutcome>, Option<i32>, Option<i32>);
-        let cases: [Case; 6] = [
+        let cases: [Case; 16] = [
             ("no steps", vec![], None, None),
             ("all passed", vec![passed(), passed()], None, None),
             (
@@ -1175,6 +1417,64 @@ warmup_grace_ms = 2000
                 None,
             ),
             ("infra only", vec![infra("x")], Some(2), None),
+            (
+                "#410: the 021 shape, a clean 404 (apps reports it as infra)",
+                vec![
+                    test_failed(NOT_FOUND),
+                    test_failed(NOT_FOUND),
+                    infra(APPS_404),
+                ],
+                Some(3),
+                None,
+            ),
+            (
+                "a 404 seen only by apps",
+                vec![infra(APPS_404)],
+                Some(3),
+                None,
+            ),
+            ("a 403", vec![infra(FORBIDDEN)], Some(3), None),
+            ("a 401", vec![test_failed(UNAUTHORIZED)], Some(3), None),
+            (
+                "a 405",
+                vec![test_failed(METHOD_NOT_ALLOWED)],
+                Some(3),
+                None,
+            ),
+            (
+                "a 500 is infrastructure",
+                vec![test_failed(SERVER_ERROR), test_failed(SERVER_ERROR)],
+                Some(2),
+                None,
+            ),
+            (
+                "a 503 is infrastructure",
+                vec![test_failed(UNAVAILABLE)],
+                Some(2),
+                None,
+            ),
+            (
+                "an unreachable endpoint is infrastructure",
+                vec![
+                    test_failed(CONNECT),
+                    test_failed(CONNECT),
+                    infra(APPS_CONNECT),
+                ],
+                Some(2),
+                None,
+            ),
+            (
+                "a timeout is infrastructure",
+                vec![timed_out()],
+                Some(2),
+                None,
+            ),
+            (
+                "infrastructure still wins over a 4xx elsewhere",
+                vec![test_failed(NOT_FOUND), test_failed(CONNECT)],
+                Some(2),
+                None,
+            ),
         ];
         for (name, outcomes, fail, warn) in cases {
             let steps: Vec<StepOutcome> = outcomes.into_iter().map(step).collect();
@@ -1189,6 +1489,135 @@ warmup_grace_ms = 2000
                 "warn: {name}"
             );
         }
+    }
+
+    /// #408: every outcome that does not fail the deploy has a line, except
+    /// a failure under `warn`, which the banner already reported.
+    #[test]
+    fn summary_lines_name_what_ran_or_why_nothing_did() {
+        let passed = VerificationReport::Passed {
+            url: "https://abc.execute-api.us-east-1.amazonaws.com/mcp".to_string(),
+            checks: vec!["connectivity", "conformance"],
+        };
+        assert_eq!(
+            passed.summary_line().as_deref(),
+            Some("✓ Verified https://abc.execute-api.us-east-1.amazonaws.com/mcp: connectivity, conformance")
+        );
+        let flag = VerificationReport::SkippedByFlag
+            .summary_line()
+            .expect("a line");
+        assert!(
+            flag.contains("skipped") && flag.contains("--no-post-deploy-test"),
+            "{flag}"
+        );
+        let disabled = VerificationReport::Disabled.summary_line().expect("a line");
+        assert!(
+            disabled.contains("skipped") && disabled.contains("enabled = false"),
+            "{disabled}"
+        );
+        let none = VerificationReport::NothingToRun
+            .summary_line()
+            .expect("a line");
+        assert!(none.contains("skipped"), "{none}");
+        assert_eq!(VerificationReport::FailedUnderWarn.summary_line(), None);
+    }
+
+    /// The summary is built from what ran, in order; a failed step makes it a
+    /// warned failure, and an empty run is "nothing to run".
+    #[test]
+    fn verification_report_reflects_the_steps() {
+        let run = |commands: &[(JsonTestCommand, TestOutcome)]| {
+            let steps: Vec<StepOutcome> = commands
+                .iter()
+                .map(|(c, o)| ("x".to_string(), *c, o.clone(), None))
+                .collect();
+            verification_report("u", &steps)
+        };
+        assert_eq!(run(&[]), VerificationReport::NothingToRun);
+        assert_eq!(
+            run(&[
+                (JsonTestCommand::Check, passed()),
+                (JsonTestCommand::Apps, passed())
+            ]),
+            VerificationReport::Passed {
+                url: "u".to_string(),
+                checks: vec!["connectivity", "apps"]
+            }
+        );
+        assert_eq!(
+            run(&[
+                (JsonTestCommand::Check, passed()),
+                (JsonTestCommand::Conformance, test_failed("x"))
+            ]),
+            VerificationReport::FailedUnderWarn
+        );
+    }
+
+    #[test]
+    fn http_status_reads_the_clients_status_phrase_only() {
+        assert_eq!(http_status(NOT_FOUND), Some(404));
+        assert_eq!(http_status(FORBIDDEN), Some(403));
+        assert_eq!(http_status(SERVER_ERROR), Some(500));
+        assert_eq!(http_status(APPS_404), Some(404));
+        for not_a_status in [
+            CONNECT,
+            "",
+            "status: 404",
+            "Request failed with status: ",
+            "Request failed with status: 40",
+            "Request failed with status: 4040 x",
+            "Request failed with status: abc",
+        ] {
+            assert_eq!(http_status(not_a_status), None, "{not_a_status:?}");
+        }
+    }
+
+    #[test]
+    fn classify_failure_follows_the_decision_table() {
+        assert_eq!(classify_failure(&passed()), None);
+        assert_eq!(
+            classify_failure(&infra(APPS_404)),
+            Some(FailureClass::FailedCheck)
+        );
+        assert_eq!(
+            classify_failure(&test_failed(SERVER_ERROR)),
+            Some(FailureClass::Infrastructure)
+        );
+        assert_eq!(
+            classify_failure(&test_failed(CONNECT)),
+            Some(FailureClass::Infrastructure)
+        );
+        assert_eq!(
+            classify_failure(&timed_out()),
+            Some(FailureClass::Infrastructure)
+        );
+        // No signal: the child's own verdict stands.
+        assert_eq!(
+            classify_failure(&test_failed("widget has no onteardown")),
+            Some(FailureClass::FailedCheck)
+        );
+        assert_eq!(
+            classify_failure(&infra("spawn failed")),
+            Some(FailureClass::Infrastructure)
+        );
+        // Within one step, infrastructure wins.
+        let mixed = TestOutcome::TestFailed {
+            label: "Conformance".to_string(),
+            summary: None,
+            recipes: vec![],
+            messages: vec![NOT_FOUND.to_string(), CONNECT.to_string()],
+        };
+        assert_eq!(classify_failure(&mixed), Some(FailureClass::Infrastructure));
+    }
+
+    /// #410: the existing 404 hint (naming `mcp_path`) still prints when the
+    /// 404 is classified as a failed check.
+    #[test]
+    fn the_404_hint_survives_the_reclassification() {
+        let steps = vec![step(test_failed(NOT_FOUND)), step(infra(APPS_404))];
+        let banner = failure_banner("aws-lambda", &steps, OnFailure::Fail);
+        assert!(banner.contains("mcp_path"), "{banner}");
+        assert_eq!(verdict_exit_code(&steps, OnFailure::Fail), Some(3));
     }
 
     /// #14 through the orchestrator's own verdict path (quiet, so nothing is
@@ -1281,6 +1710,43 @@ warmup_grace_ms = 2000
         assert!(!banner.contains("mcp_path"), "{banner}");
     }
 
+    /// Every failure-message shape #410 classifies, with the class it must
+    /// get: `Some(true)` = infrastructure, `Some(false)` = failed check,
+    /// `None` = no signal (the child's own verdict stands).
+    const SHAPES: [(&str, Option<bool>); 12] = [
+        (NOT_FOUND, Some(false)),
+        (FORBIDDEN, Some(false)),
+        (UNAUTHORIZED, Some(false)),
+        (METHOD_NOT_ALLOWED, Some(false)),
+        (APPS_404, Some(false)),
+        (SERVER_ERROR, Some(true)),
+        (UNAVAILABLE, Some(true)),
+        (CONNECT, Some(true)),
+        (APPS_CONNECT, Some(true)),
+        ("widget foo has no onteardown handler", None),
+        (
+            "Server connectivity check failed - cannot validate App metadata",
+            None,
+        ),
+        ("expected 3 tools, got 2", None),
+    ];
+
+    /// A step outcome built from one of [`SHAPES`], with the class the
+    /// decision table assigns it (`true` = infrastructure).
+    fn shaped_outcome() -> impl proptest::strategy::Strategy<Value = (TestOutcome, bool)> {
+        use proptest::prelude::*;
+        (proptest::sample::select(SHAPES.to_vec()), any::<bool>()).prop_map(
+            |((message, class), as_infra)| {
+                let outcome = if as_infra {
+                    infra(message)
+                } else {
+                    test_failed(message)
+                };
+                (outcome, class.unwrap_or(as_infra))
+            },
+        )
+    }
+
     fn any_outcome() -> impl proptest::strategy::Strategy<Value = TestOutcome> {
         use proptest::prelude::*;
         prop_oneof![
@@ -1317,6 +1783,32 @@ warmup_grace_ms = 2000
                     .map(|f| f.exit_code()),
                 expected
             );
+        }
+
+        /// #410: for any mix of the measured failure shapes, `fail` exits 2
+        /// when any failed step is infrastructure (unreachable, timeout, 5xx),
+        /// else 3 when any step failed (including a 4xx answer, whichever
+        /// child reported it and however); `warn` always exits 0.
+        #[test]
+        fn exit_code_follows_the_http_status_classification(
+            shaped in proptest::collection::vec(shaped_outcome(), 1..6),
+            passes in 0usize..3,
+            warn in proptest::bool::ANY,
+        ) {
+            let any_infra = shaped.iter().any(|(_, infra)| *infra);
+            let steps: Vec<StepOutcome> = shaped
+                .into_iter()
+                .map(|(o, _)| o)
+                .chain(std::iter::repeat_with(passed).take(passes))
+                .map(step)
+                .collect();
+            let on_failure = if warn { OnFailure::Warn } else { OnFailure::Fail };
+            let expected = match (on_failure, any_infra) {
+                (OnFailure::Warn, _) => None,
+                (OnFailure::Fail, true) => Some(2),
+                (OnFailure::Fail, false) => Some(3),
+            };
+            proptest::prop_assert_eq!(verdict_exit_code(&steps, on_failure), expected);
         }
     }
 

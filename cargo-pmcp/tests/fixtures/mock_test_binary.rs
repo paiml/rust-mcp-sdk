@@ -30,9 +30,12 @@
 //!   empty per `MOCK_OUTCOME`).
 //! - exit code: per `MOCK_EXIT_CODE` or `MOCK_OUTCOME`.
 //!
-//! NOT shipped — `[[bin]]` declaration in `cargo-pmcp/Cargo.toml` lives under a
-//! comment, but tests resolve it via `env!("CARGO_BIN_EXE_mock_test_binary")`
-//! which Cargo builds automatically because the `[[bin]]` target is declared.
+//! Test-only. Its `[[bin]]` entry in `cargo-pmcp/Cargo.toml` carries
+//! `required-features = ["test-fixtures"]`, so a default build — and therefore
+//! `cargo install cargo-pmcp` — skips it (#412: before 0.28.1 it was installed
+//! into `~/.cargo/bin`). The `post_deploy_orchestrator` test, which resolves it
+//! via `env!("CARGO_BIN_EXE_mock_test_binary")`, needs the same feature:
+//! `cargo test -p cargo-pmcp --features test-fixtures --test post_deploy_orchestrator`.
 
 use std::io::Write;
 

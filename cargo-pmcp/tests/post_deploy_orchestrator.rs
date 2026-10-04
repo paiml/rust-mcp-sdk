@@ -8,6 +8,12 @@
 //! mock binary's behaviour is controlled by env vars (see
 //! `tests/fixtures/mock_test_binary.rs`).
 //!
+//! Both this test and the mock binary require the non-default `test-fixtures`
+//! feature (#412 — so `cargo install cargo-pmcp` no longer installs the mock):
+//! `cargo test -p cargo-pmcp --features test-fixtures --test post_deploy_orchestrator -- --test-threads=1`.
+//! `make test-cargo-pmcp-integration` runs it that way and fails if it reports
+//! zero tests.
+//!
 //! Tests are forced to run sequentially via `serial_test::serial` because they
 //! mutate process-wide env vars (`PMCP_TEST_FIXTURE_EXE` + the `MOCK_*`
 //! controls + the parent's `CI` / `MCP_API_KEY` env for inheritance tests).
@@ -16,8 +22,9 @@
 
 use cargo_pmcp::deployment::post_deploy_tests::{
     emit_ci_annotation, format_failure_banner_from_report, run_apps, run_check, run_conformance,
-    run_post_deploy_tests, AppsMode, FailureRecipe, InfraErrorKind, OnFailure,
-    OrchestrationFailure, PostDeployTestsConfig, TestOutcome, TestSummary,
+    run_post_deploy_tests, run_post_deploy_tests_to, AppsMode, FailureRecipe, InfraErrorKind,
+    OnFailure, OrchestrationFailure, PostDeployTestsConfig, TestOutcome, TestSummary,
+    VerificationReport,
 };
 use mcp_tester::post_deploy_report::TestCommand as JsonTestCommand;
 use serial_test::serial;
@@ -762,4 +769,258 @@ fn format_failure_banner_with_empty_target_id() {
     )];
     let banner = format_failure_banner_from_report("", &outcomes);
     assert!(banner.contains("To roll back: cargo pmcp deploy rollback --target "));
+}
+
+// ============================================================================
+// #408 — a verification that did not fail says what it did
+// ============================================================================
+
+/// Run the orchestrator with the mock armed by the caller; the report and
+/// what it printed to its output.
+async fn run_capturing(
+    widgets: bool,
+    config: &PostDeployTestsConfig,
+    quiet: bool,
+) -> (Option<VerificationReport>, String) {
+    let mut out: Vec<u8> = Vec::new();
+    let report = run_post_deploy_tests_to(
+        &mut out,
+        "http://x/mcp",
+        "aws-lambda",
+        widgets,
+        config,
+        quiet,
+    )
+    .await
+    .ok();
+    (report, String::from_utf8(out).expect("utf-8"))
+}
+
+/// #408, the reported case: a passing verification printed nothing, so it
+/// could not be told apart from one that never ran. It prints one line
+/// naming the endpoint and the checks that ran.
+#[tokio::test]
+#[serial]
+async fn a_passing_verification_prints_one_summary_line() {
+    let _guard = EnvGuard::new(&[]);
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", MOCK_BIN);
+    std::env::set_var("MOCK_OUTCOME", "passed");
+    let (report, printed) = run_capturing(true, &baseline_config(), false).await;
+    assert_eq!(
+        printed,
+        "✓ Verified http://x/mcp: connectivity, conformance, apps\n"
+    );
+    assert_eq!(
+        report,
+        Some(VerificationReport::Passed {
+            url: "http://x/mcp".to_string(),
+            checks: vec!["connectivity", "conformance", "apps"],
+        })
+    );
+}
+
+/// Only the checks that ran are listed: `apps` runs only with widgets.
+#[tokio::test]
+#[serial]
+async fn the_summary_lists_only_the_checks_that_ran() {
+    let _guard = EnvGuard::new(&[]);
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", MOCK_BIN);
+    std::env::set_var("MOCK_OUTCOME", "passed");
+    let (_, printed) = run_capturing(false, &baseline_config(), false).await;
+    assert_eq!(
+        printed,
+        "✓ Verified http://x/mcp: connectivity, conformance\n"
+    );
+}
+
+/// `--quiet` keeps its meaning: nothing is printed (the report still says
+/// what ran).
+#[tokio::test]
+#[serial]
+async fn quiet_prints_no_summary() {
+    let _guard = EnvGuard::new(&[]);
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", MOCK_BIN);
+    std::env::set_var("MOCK_OUTCOME", "passed");
+    let (report, printed) = run_capturing(true, &baseline_config(), true).await;
+    assert_eq!(printed, "");
+    assert!(matches!(report, Some(VerificationReport::Passed { .. })));
+}
+
+/// A verification that does not run says it was skipped, and why.
+#[tokio::test]
+#[serial]
+async fn a_skipped_verification_says_so() {
+    let _guard = EnvGuard::new(&[]);
+    // Nothing may be spawned: a nonexistent fixture would fail any step.
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", "/definitely/does/not/exist/408");
+    let mut disabled = baseline_config();
+    disabled.enabled = false;
+    let (report, printed) = run_capturing(true, &disabled, false).await;
+    assert_eq!(report, Some(VerificationReport::Disabled));
+    assert!(printed.contains("skipped"), "{printed}");
+    assert!(printed.contains("enabled = false"), "{printed}");
+
+    let mut apps_only = baseline_config();
+    apps_only.checks = vec!["apps".to_string()];
+    let (report, printed) = run_capturing(false, &apps_only, false).await;
+    assert_eq!(report, Some(VerificationReport::NothingToRun));
+    assert!(printed.contains("skipped"), "{printed}");
+    assert!(printed.contains("widgets"), "{printed}");
+}
+
+/// A failure under `warn` prints the failure banner (stderr) and no success
+/// line.
+#[tokio::test]
+#[serial]
+async fn a_failure_under_warn_prints_no_success_line() {
+    let _guard = EnvGuard::new(&[]);
+    arm_test_failed_check("boom", "cargo pmcp test check http://x/mcp");
+    let mut config = baseline_config();
+    config.on_failure = OnFailure::Warn;
+    let (report, printed) = run_capturing(true, &config, true).await;
+    assert_eq!(report, Some(VerificationReport::FailedUnderWarn));
+    assert_eq!(printed, "");
+}
+
+// ============================================================================
+// #410 — end to end through the REAL `cargo pmcp test` children
+// ============================================================================
+//
+// These drive the orchestrator against the real cargo-pmcp binary (not the
+// mock) and in-process HTTP stand-ins, so the classification is checked
+// against the children's actual messages, not hand-written ones. No network
+// beyond 127.0.0.1.
+
+const CARGO_PMCP_BIN: &str = env!("CARGO_BIN_EXE_cargo-pmcp");
+
+/// Read one HTTP/1.1 request (headers, then a `Content-Length` body) off
+/// `stream`, so the response is not sent onto unread input.
+fn read_request(stream: &mut std::net::TcpStream) {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream);
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    let _ = reader.read_exact(&mut body);
+}
+
+/// An MCP endpoint URL on 127.0.0.1 whose server answers every request with
+/// `status_line` (e.g. `"404 Not Found"`). The server thread lives until the
+/// test process exits.
+fn status_endpoint(status_line: &'static str) -> String {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            read_request(&mut stream);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// An MCP endpoint URL on 127.0.0.1 where nothing listens.
+fn unreachable_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}/mcp")
+}
+
+/// Run the post-deploy verification (all three checks, apps only when
+/// `widgets`) through the real children; the exit code, or `None` for Ok.
+async fn real_children_exit_code(url: &str, widgets: bool, on_failure: OnFailure) -> Option<i32> {
+    std::env::set_var("PMCP_TEST_FIXTURE_EXE", CARGO_PMCP_BIN);
+    let mut config = baseline_config();
+    config.timeout_seconds = 60;
+    config.on_failure = on_failure;
+    run_post_deploy_tests(url, "aws-lambda", widgets, &config, true)
+        .await
+        .err()
+        .map(|failure| failure.exit_code())
+}
+
+/// #410, the reported case (forecast-coach spike 021 step 9): `mcp_path =
+/// "/nope"`, the endpoint answers a clean 404. Connectivity and Conformance
+/// fail on it; Apps reports it as an infrastructure error. The service is up
+/// and answering, so it is a failed check: exit 3, not 2.
+#[tokio::test]
+#[serial]
+async fn real_children_a_clean_404_is_a_failed_check_exit_3() {
+    let _guard = EnvGuard::new(&[]);
+    let url = status_endpoint("404 Not Found");
+    assert_eq!(
+        real_children_exit_code(&url, true, OnFailure::Fail).await,
+        Some(3)
+    );
+    assert_eq!(
+        real_children_exit_code(&url, true, OnFailure::Warn).await,
+        None,
+        "warn still exits 0"
+    );
+}
+
+/// 401/403/405 are answers from a reachable endpoint too: exit 3.
+#[tokio::test]
+#[serial]
+async fn real_children_a_4xx_answer_is_a_failed_check_exit_3() {
+    let _guard = EnvGuard::new(&[]);
+    for status in [
+        "403 Forbidden",
+        "401 Unauthorized",
+        "405 Method Not Allowed",
+    ] {
+        let url = status_endpoint(status);
+        assert_eq!(
+            real_children_exit_code(&url, true, OnFailure::Fail).await,
+            Some(3),
+            "{status}"
+        );
+    }
+}
+
+/// A 5xx is infrastructure: exit 2 (the children report it as a failed
+/// check, which exited 3 before 0.28.1 when no widgets ran `test apps`).
+#[tokio::test]
+#[serial]
+async fn real_children_a_5xx_is_infrastructure_exit_2() {
+    let _guard = EnvGuard::new(&[]);
+    for status in ["500 Internal Server Error", "503 Service Unavailable"] {
+        let url = status_endpoint(status);
+        assert_eq!(
+            real_children_exit_code(&url, false, OnFailure::Fail).await,
+            Some(2),
+            "{status}"
+        );
+    }
+}
+
+/// An unreachable endpoint is infrastructure: exit 2, with or without the
+/// apps step.
+#[tokio::test]
+#[serial]
+async fn real_children_an_unreachable_endpoint_is_infrastructure_exit_2() {
+    let _guard = EnvGuard::new(&[]);
+    let url = unreachable_endpoint();
+    for widgets in [false, true] {
+        assert_eq!(
+            real_children_exit_code(&url, widgets, OnFailure::Fail).await,
+            Some(2),
+            "widgets = {widgets}"
+        );
+    }
 }

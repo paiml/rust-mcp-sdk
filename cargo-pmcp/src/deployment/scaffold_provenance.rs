@@ -22,6 +22,14 @@
 //! function settings that every cargo-pmcp up to 0.28.0 baked). A match is
 //! adopted and recorded, so from then on the record decides; a file that
 //! matches nothing stays hand-modified, exactly as before.
+//!
+//! `deploy/bin/app.ts` is recorded the same way since 0.28.1 (#409), under
+//! `bin/app.ts`. A record written by 0.28.0 holds `lib/stack.ts` only; for it
+//! (and for no record at all) app.ts is unmodified when it is exactly the
+//! scaffold `deploy init` renders for some name, and is then adopted. Both
+//! scaffolds follow `.pmcp/deploy.toml` on BOTH engines: the `npx cdk deploy`
+//! path regenerates them before deploying, and the native engine after a
+//! successful deploy ([`sync_scaffolds_after_native_deploy`]).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -39,6 +47,13 @@ pub const RECORD_RELATIVE: &str = "deploy/.pmcp-scaffold.toml";
 
 /// The record's key for `deploy/lib/stack.ts` (relative to `deploy/`).
 const STACK_TS_ENTRY: &str = "lib/stack.ts";
+
+/// The record's key for `deploy/bin/app.ts` (relative to `deploy/`). Records
+/// written before 0.28.1 have no such entry; see [`classify_app_ts`].
+const APP_TS_ENTRY: &str = "bin/app.ts";
+
+/// The literal before the server name in the `deploy/bin/app.ts` scaffold.
+const APP_TS_NAME_LITERAL: &str = "const serverName = '";
 
 /// Comment written at the top of the record.
 const RECORD_HEADER: &str = "\
@@ -272,38 +287,155 @@ pub fn write_scaffold_stack_ts(config: &DeployConfig, rendered: &str) -> Result<
     Ok(wrote)
 }
 
+/// Record `content` as the `deploy/bin/app.ts` cargo-pmcp just wrote (#409).
+pub fn record_app_ts(project_root: &Path, content: &str) -> Result<()> {
+    let mut entries = read_entries(project_root);
+    entries.insert(APP_TS_ENTRY.to_string(), content_digest(content));
+    write_entries(project_root, entries)
+}
+
+/// What `deploy/bin/app.ts` is, relative to what cargo-pmcp wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppTsState {
+    /// No app.ts on disk.
+    Missing,
+    /// cargo-pmcp's own output, unmodified. `declared` is the server name its
+    /// `serverName` literal carries, when there is one.
+    Untouched {
+        /// The name the file declares its stack for.
+        declared: Option<String>,
+    },
+    /// Edited (or written) by someone other than cargo-pmcp.
+    HandModified,
+}
+
+/// The name an app.ts's `serverName` literal carries, whatever else the file
+/// says.
+fn declared_name_literal(content: &str) -> Option<String> {
+    let start = content.find(APP_TS_NAME_LITERAL)? + APP_TS_NAME_LITERAL.len();
+    let rest = &content[start..];
+    rest.find('\'').map(|end| rest[..end].to_string())
+}
+
+/// Classify `deploy/bin/app.ts` (#409), like [`classify_stack_ts`]: when the
+/// record holds an app.ts digest, "unmodified" means "matches it". Records
+/// written before 0.28.1 hold stack.ts only, and a project initialized before
+/// 0.28.0 has none; then app.ts is unmodified when it is exactly the scaffold
+/// `deploy init` renders for some name (the check 0.28.0 used), and such a
+/// file is adopted into the record.
+pub fn classify_app_ts(project_root: &Path) -> Result<AppTsState> {
+    let path = app_ts_path(project_root);
+    if !path.exists() {
+        return Ok(AppTsState::Missing);
+    }
+    let on_disk = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    if let Some(recorded) = read_entries(project_root).remove(APP_TS_ENTRY) {
+        return Ok(if content_digest(&on_disk) == recorded {
+            AppTsState::Untouched {
+                declared: declared_name_literal(&on_disk),
+            }
+        } else {
+            AppTsState::HandModified
+        });
+    }
+    let Some(declared) = app_ts_scaffold_name(&on_disk.replace("\r\n", "\n")) else {
+        return Ok(AppTsState::HandModified);
+    };
+    if let Err(err) = record_app_ts(project_root, &on_disk) {
+        eprintln!(
+            "  {} could not record {} as cargo-pmcp's unmodified scaffold: {err:#}",
+            console::style("warning:").yellow(),
+            path.display()
+        );
+    }
+    Ok(AppTsState::Untouched {
+        declared: Some(declared),
+    })
+}
+
 /// Point an unmodified `deploy/bin/app.ts` scaffold at `server_name`
 /// (finding #1). app.ts names the stack `npx cdk` deploys; `deploy init`
 /// writes the name into it as a literal, so after a `[server] name` rename it
-/// still declared the old stack.
+/// still declared the old stack. A rewritten file is recorded (#409).
 ///
 /// Returns the previous content when the file was rewritten (so a refused
-/// deploy can put it back), `None` when there was nothing to do: no app.ts,
-/// a hand-modified one (left for the stack guard to judge), or one that
-/// already declares `{server_name}-stack`.
+/// deploy can put it back with [`restore_app_ts`]), `None` when there was
+/// nothing to do: no app.ts, a hand-modified one (left for the stack guard to
+/// judge), or one that is already the scaffold for `server_name`.
 pub fn sync_app_ts_with_server_name(
     project_root: &Path,
     server_name: &str,
 ) -> Result<Option<String>> {
-    let path = app_ts_path(project_root);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let before = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let Some(declared) = app_ts_scaffold_name(&before.replace("\r\n", "\n")) else {
+    let AppTsState::Untouched { declared } = classify_app_ts(project_root)? else {
         return Ok(None);
     };
-    if declared == server_name {
+    let path = app_ts_path(project_root);
+    let before = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let rendered = render_app_ts(server_name);
+    if before.replace("\r\n", "\n") == rendered {
         return Ok(None);
     }
-    std::fs::write(&path, render_app_ts(server_name))
+    std::fs::write(&path, &rendered)
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    println!(
-        "   deploy/bin/app.ts now declares {server_name}-stack (was {declared}-stack): the \
-         unmodified scaffold follows [server] name"
-    );
+    record_app_ts(project_root, &rendered)?;
+    match declared.filter(|declared| declared != server_name) {
+        Some(declared) => println!(
+            "   deploy/bin/app.ts now declares {server_name}-stack (was {declared}-stack): the \
+             unmodified scaffold follows [server] name"
+        ),
+        None => {
+            println!("   regenerated deploy/bin/app.ts (it was cargo-pmcp's unmodified scaffold)");
+        },
+    }
     Ok(Some(before))
+}
+
+/// Put back the app.ts [`sync_app_ts_with_server_name`] replaced, and record
+/// it, so the restored file is still cargo-pmcp's unmodified scaffold.
+pub fn restore_app_ts(project_root: &Path, before: &str) -> Result<()> {
+    let path = app_ts_path(project_root);
+    std::fs::write(&path, before).with_context(|| {
+        format!(
+            "failed to restore {} after the refused deploy",
+            path.display()
+        )
+    })?;
+    record_app_ts(project_root, before)
+}
+
+/// After the native `CloudFormation` engine deployed `config`, bring
+/// cargo-pmcp's own, unmodified scaffolds in line with it (#409).
+///
+/// The engine deploys `{[server] name}-stack` from `.pmcp/deploy.toml` and
+/// never reads deploy/lib/stack.ts or deploy/bin/app.ts, so before 0.28.1 a
+/// rename left both naming the old server: a later fallback to `npx cdk
+/// deploy` (a hand edit, or a descriptor the renderer cannot render yet)
+/// would have targeted the old stack, and the stack guard refused it. Now an
+/// unmodified stack.ts is regenerated from the config, exactly as the `npx
+/// cdk deploy` path regenerates it, and an unmodified app.ts follows `[server]
+/// name`; both are recorded. A hand-modified stack.ts (and the app.ts beside
+/// it) is never touched, and a project with no scaffold gets none.
+pub fn sync_scaffolds_after_native_deploy(config: &DeployConfig) -> Result<()> {
+    let state = classify_stack_ts(config)?;
+    if state == StackTsState::HandModified {
+        return Ok(());
+    }
+    if state == StackTsState::Untouched {
+        let rendered = crate::commands::deploy::init::render_stack_ts_for_config(
+            config,
+            &crate::deployment::lambda_function::secret_keys(config),
+        );
+        let current = std::fs::read_to_string(stack_ts_path(&config.project_root))
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        if current != rendered {
+            write_scaffold_stack_ts(config, &rendered)?;
+        }
+    }
+    sync_app_ts_with_server_name(&config.project_root, &config.server.name)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -562,6 +694,31 @@ mod tests {
     const STACK_TS_0_28_0: &str =
         include_str!("../../tests/fixtures/scaffold/aws-lambda-stack-ts-0.28.0-demo-server.ts");
 
+    /// 0.28.1 leaves the scaffold's default render byte-identical to what
+    /// 0.27.x/0.28.0 wrote (#407 needed no template change: every scaffold
+    /// log group already carries `removalPolicy: DESTROY`), so an untouched
+    /// 0.28.0 scaffold without a record is still recognised by the pre-record
+    /// comparison. A future template change must keep this fixture
+    /// recognised some other way (see `is_a_scaffold_rendering`).
+    #[test]
+    fn the_default_render_is_still_the_frozen_0_28_0_scaffold() {
+        assert_eq!(
+            render_stack_ts_for_deploy(
+                "aws-lambda",
+                "demo-server",
+                &IamConfig::default(),
+                &MetadataConfig::default()
+            ),
+            STACK_TS_0_28_0
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_stack_ts(tmp.path());
+        assert_eq!(
+            classify_stack_ts(&config(tmp.path(), "aws-lambda", "renamed")).expect("classify"),
+            StackTsState::Untouched
+        );
+    }
+
     /// A config whose `[server]` sizing and `[environment]` differ from what a
     /// 0.28.0 scaffold baked (debug session `cargo-pmcp-deploy-targets`, PR-B).
     fn config_with_function_settings(root: &Path, name: &str) -> DeployConfig {
@@ -656,6 +813,278 @@ mod tests {
         assert_eq!(
             recorded_stack_ts_digest(tmp.path()),
             Some(content_digest(&rendered))
+        );
+    }
+
+    // ---------- #409: the native engine keeps the scaffolds in line ----------
+
+    fn app_ts_path(root: &Path) -> std::path::PathBuf {
+        root.join("deploy").join("bin").join("app.ts")
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("read")
+    }
+
+    /// What `deploy init` of cargo-pmcp 0.28.0 left: app.ts and stack.ts for
+    /// `name`, and a record holding stack.ts only.
+    fn seed_0_28_0_init(root: &Path, name: &str) {
+        init_scaffold(root, "aws-lambda", name);
+        std::fs::create_dir_all(root.join("deploy/bin")).expect("mkdir");
+        std::fs::write(app_ts_path(root), render_app_ts(name)).expect("write app.ts");
+    }
+
+    /// #409, the reported case (forecast-coach spike 021 step 4): a rename
+    /// deployed by the native engine left deploy/lib/stack.ts and
+    /// deploy/bin/app.ts naming the OLD server, so a later `npx cdk deploy`
+    /// fallback would target the old stack (and the stack guard refuse it).
+    /// Both untouched files now follow the deployed config, and app.ts is
+    /// recorded beside stack.ts — reading a 0.28.0 record that has only
+    /// stack.ts.
+    #[test]
+    fn a_native_deploy_after_a_rename_regenerates_both_untouched_scaffolds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "fc-cp028-a");
+        let cfg = config(tmp.path(), "aws-lambda", "fc-cp028-b");
+
+        sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+
+        let stack_ts = crate::commands::deploy::init::render_stack_ts_for_config(
+            &cfg,
+            &crate::deployment::lambda_function::secret_keys(&cfg),
+        );
+        assert_eq!(read(&stack_ts_path(tmp.path())), stack_ts);
+        assert_eq!(read(&app_ts_path(tmp.path())), render_app_ts("fc-cp028-b"));
+        let entries = read_entries(tmp.path());
+        assert_eq!(
+            entries.get(STACK_TS_ENTRY),
+            Some(&content_digest(&stack_ts))
+        );
+        assert_eq!(
+            entries.get("bin/app.ts"),
+            Some(&content_digest(&render_app_ts("fc-cp028-b"))),
+            "app.ts must be recorded beside stack.ts"
+        );
+    }
+
+    /// The regenerated stack.ts carries what deploy.toml declares, as the
+    /// legacy path's regeneration does, so a later fallback deploys the same
+    /// function settings.
+    #[test]
+    fn a_native_deploy_regenerates_stack_ts_with_the_declared_settings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "demo-server");
+        let cfg = config_with_function_settings(tmp.path(), "demo-server");
+
+        sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+
+        let on_disk = read(&stack_ts_path(tmp.path()));
+        assert!(on_disk.contains("memorySize: 1769,"), "{on_disk}");
+        assert!(
+            on_disk.contains("MODEL_URL: 's3://models/forecast.bin',"),
+            "{on_disk}"
+        );
+        assert_eq!(read(&app_ts_path(tmp.path())), render_app_ts("demo-server"));
+    }
+
+    /// A hand-modified app.ts is preserved (the stack guard judges it on the
+    /// legacy path); the untouched stack.ts is still regenerated.
+    #[test]
+    fn a_native_deploy_keeps_a_hand_modified_app_ts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "old-server");
+        let curated = render_app_ts("old-server").replace("app.synth();", "// x\napp.synth();");
+        std::fs::write(app_ts_path(tmp.path()), &curated).expect("edit app.ts");
+        let cfg = config(tmp.path(), "aws-lambda", "acme");
+
+        sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+
+        assert_eq!(read(&app_ts_path(tmp.path())), curated);
+        assert!(read(&stack_ts_path(tmp.path())).contains("const serverName = 'acme';"));
+    }
+
+    /// A hand-modified stack.ts is never rewritten, and its app.ts is left
+    /// alone with it (its own `serverName` still names the old function).
+    #[test]
+    fn a_native_deploy_keeps_a_hand_modified_stack_ts_and_its_app_ts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "old-server");
+        std::fs::write(stack_ts_path(tmp.path()), "// curated\n").expect("edit stack.ts");
+        let cfg = config(tmp.path(), "aws-lambda", "acme");
+
+        sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+
+        assert_eq!(read(&stack_ts_path(tmp.path())), "// curated\n");
+        assert_eq!(read(&app_ts_path(tmp.path())), render_app_ts("old-server"));
+    }
+
+    /// The deploy/bin/app.ts cargo-pmcp 0.28.0 wrote for `demo-server`, frozen
+    /// (a byte copy of that release's `render_app_ts("demo-server")`).
+    const APP_TS_0_28_0: &str =
+        include_str!("../../tests/fixtures/scaffold/aws-lambda-app-ts-0.28.0-demo-server.ts");
+
+    /// Untouched scaffolds written by 0.28.0 — whether or not that release
+    /// recorded the stack.ts, and with a record that never holds app.ts —
+    /// are recognised as cargo-pmcp's own and follow a rename on a native
+    /// deploy.
+    #[test]
+    fn a_native_deploy_regenerates_the_frozen_0_28_0_scaffolds() {
+        for recorded in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            seed_0_28_0_stack_ts(tmp.path());
+            if recorded {
+                record_stack_ts(tmp.path(), STACK_TS_0_28_0).expect("record");
+            }
+            std::fs::create_dir_all(tmp.path().join("deploy/bin")).expect("mkdir");
+            std::fs::write(app_ts_path(tmp.path()), APP_TS_0_28_0).expect("write app.ts");
+            let cfg = config_with_function_settings(tmp.path(), "renamed");
+
+            sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+
+            assert_eq!(
+                read(&app_ts_path(tmp.path())),
+                render_app_ts("renamed"),
+                "recorded = {recorded}"
+            );
+            let stack_ts = read(&stack_ts_path(tmp.path()));
+            assert!(
+                stack_ts.contains("const serverName = 'renamed';"),
+                "{stack_ts}"
+            );
+            assert!(stack_ts.contains("memorySize: 1769,"), "{stack_ts}");
+        }
+    }
+
+    /// A project with no CDK scaffold (a built-in server, say) gets none.
+    #[test]
+    fn a_native_deploy_creates_no_scaffolds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config(tmp.path(), "aws-lambda", "acme");
+        sync_scaffolds_after_native_deploy(&cfg).expect("sync");
+        assert!(!tmp.path().join("deploy").exists());
+    }
+
+    // ---------- #409: app.ts provenance ----------
+
+    #[test]
+    fn a_missing_app_ts_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::Missing
+        );
+    }
+
+    /// A 0.28.0 record (stack.ts only) is read as before: an app.ts that is
+    /// exactly a scaffold render is cargo-pmcp's own, and is adopted.
+    #[test]
+    fn a_0_28_0_record_without_app_ts_adopts_an_unmodified_app_ts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "acme");
+        assert_eq!(read_entries(tmp.path()).get(APP_TS_ENTRY), None);
+
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::Untouched {
+                declared: Some("acme".to_string())
+            }
+        );
+        assert_eq!(
+            read_entries(tmp.path()).get(APP_TS_ENTRY),
+            Some(&content_digest(&render_app_ts("acme"))),
+            "an adopted app.ts must be recorded"
+        );
+        assert!(
+            read_entries(tmp.path()).contains_key(STACK_TS_ENTRY),
+            "adopting app.ts must keep the stack.ts entry"
+        );
+    }
+
+    /// The frozen 0.28.0 app.ts is recognised (and not as hand-modified).
+    #[test]
+    fn the_frozen_0_28_0_app_ts_is_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("deploy/bin")).expect("mkdir");
+        std::fs::write(app_ts_path(tmp.path()), APP_TS_0_28_0).expect("write");
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::Untouched {
+                declared: Some("demo-server".to_string())
+            }
+        );
+    }
+
+    /// Without a record, an edited app.ts is hand-modified and NOT adopted.
+    #[test]
+    fn an_unrecorded_edited_app_ts_is_hand_modified() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("deploy/bin")).expect("mkdir");
+        std::fs::write(app_ts_path(tmp.path()), "// curated app\n").expect("write");
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::HandModified
+        );
+        assert_eq!(read_entries(tmp.path()).get(APP_TS_ENTRY), None);
+    }
+
+    /// Once recorded, the record decides: any edit is hand-modified — even
+    /// one that leaves a scaffold render for ANOTHER name (an operator who
+    /// changed the name literal by hand meant it).
+    #[test]
+    fn a_recorded_app_ts_is_hand_modified_after_any_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("deploy/bin")).expect("mkdir");
+        std::fs::write(app_ts_path(tmp.path()), render_app_ts("acme")).expect("write");
+        record_app_ts(tmp.path(), &render_app_ts("acme")).expect("record");
+        std::fs::write(app_ts_path(tmp.path()), render_app_ts("other")).expect("edit");
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::HandModified
+        );
+        assert_eq!(
+            sync_app_ts_with_server_name(tmp.path(), "acme").expect("sync"),
+            None
+        );
+        assert_eq!(read(&app_ts_path(tmp.path())), render_app_ts("other"));
+    }
+
+    /// A CRLF checkout of a recorded app.ts is still unmodified.
+    #[test]
+    fn a_crlf_checkout_of_a_recorded_app_ts_is_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("deploy/bin")).expect("mkdir");
+        record_app_ts(tmp.path(), &render_app_ts("acme")).expect("record");
+        std::fs::write(
+            app_ts_path(tmp.path()),
+            render_app_ts("acme").replace('\n', "\r\n"),
+        )
+        .expect("write");
+        assert!(matches!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::Untouched { .. }
+        ));
+    }
+
+    /// A synced app.ts is recorded, and restoring it (a refused deploy)
+    /// records the restored content, so it stays cargo-pmcp's own.
+    #[test]
+    fn sync_records_and_restore_keeps_the_app_ts_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_0_28_0_init(tmp.path(), "old-server");
+        let before = sync_app_ts_with_server_name(tmp.path(), "acme")
+            .expect("sync")
+            .expect("rewritten");
+        assert_eq!(
+            read_entries(tmp.path()).get(APP_TS_ENTRY),
+            Some(&content_digest(&render_app_ts("acme")))
+        );
+        restore_app_ts(tmp.path(), &before).expect("restore");
+        assert_eq!(read(&app_ts_path(tmp.path())), render_app_ts("old-server"));
+        assert_eq!(
+            classify_app_ts(tmp.path()).expect("classify"),
+            AppTsState::Untouched {
+                declared: Some("old-server".to_string())
+            }
         );
     }
 

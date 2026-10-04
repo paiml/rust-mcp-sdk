@@ -87,7 +87,10 @@ pub async fn deploy_aws_lambda(
     emit_descriptor_warnings(&descriptor);
 
     match try_render_and_deploy(config, &artifact, &descriptor).await {
-        Ok(outputs) => Ok(outputs),
+        Ok(outputs) => {
+            keep_scaffolds_in_line(config);
+            Ok(outputs)
+        },
         Err(RenderOrDeployError::Render(reason)) => {
             warn_falling_back_to_legacy(&format!(
                 "pmcp-cfn-renderer cannot render this descriptor yet: {reason}"
@@ -99,6 +102,25 @@ pub async fn deploy_aws_lambda(
         // totally different deploy mechanism (`cdk deploy`) mid-deploy could
         // leave the SAME stack name in a confusing double-managed state.
         Err(RenderOrDeployError::Deploy(e)) => Err(e),
+    }
+}
+
+/// After a native-engine deploy, regenerate cargo-pmcp's own, unmodified
+/// `deploy/lib/stack.ts` and `deploy/bin/app.ts` from the config just
+/// deployed (#409): the engine never reads them, but a later fallback to `npx
+/// cdk deploy` does, and after a rename the stack guard would refuse a stale
+/// `app.ts`. The deploy has already succeeded, so a failure here is a
+/// warning, never a failed deploy.
+fn keep_scaffolds_in_line(config: &DeployConfig) {
+    if let Err(err) =
+        crate::deployment::scaffold_provenance::sync_scaffolds_after_native_deploy(config)
+    {
+        eprintln!(
+            "  {} could not regenerate the unmodified deploy/ scaffolds for `{}` ({err:#}); a later \
+             `npx cdk deploy` fallback may refuse until they name the deployed stack.",
+            console::style("warning:").yellow(),
+            config.server.name
+        );
     }
 }
 
@@ -644,6 +666,38 @@ mod tests {
 
             assert_eq!(function["MemorySize"], 1769);
             assert_eq!(function["Timeout"], 60);
+        }
+
+        /// #407, the native half: the stack owns the MCP function's
+        /// `/aws/lambda/<function>` log group and `CloudFormation` deletes it
+        /// with the stack (no `Retain` `DeletionPolicy`; the default is
+        /// Delete). What it cannot own is a group Lambda re-creates after
+        /// that deletion; `deploy destroy` removes that one (`teardown`).
+        #[test]
+        fn the_native_stack_owns_the_function_log_group() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let template = render(&config(tmp.path()), None);
+            let resources = template["Resources"].as_object().expect("Resources");
+            let (function_id, _) = resources
+                .iter()
+                .find(|(_, r)| {
+                    r["Type"] == "AWS::Lambda::Function" && r["Properties"]["FunctionName"] == NAME
+                })
+                .expect("the MCP function");
+            let log_group = resources
+                .values()
+                .find(|r| {
+                    r["Type"] == "AWS::Logs::LogGroup"
+                        && r["Properties"]["LogGroupName"]
+                            == serde_json::json!({
+                                "Fn::Join": ["", ["/aws/lambda/", { "Ref": function_id }]]
+                            })
+                })
+                .expect("the stack declares the function's log group");
+            assert!(
+                matches!(log_group["DeletionPolicy"].as_str(), None | Some("Delete")),
+                "{log_group}"
+            );
         }
 
         /// #16: `[server] ephemeral_storage_mb` sets the function's `/tmp`.

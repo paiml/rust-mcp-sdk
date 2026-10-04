@@ -1,6 +1,6 @@
 [package]
 name = "cargo-pmcp"
-version = "0.28.0"
+version = "0.28.1"
 edition = "2021"
 authors = ["PMCP SDK Contributors"]
 description = "Production-grade MCP server development toolkit"
@@ -20,17 +20,32 @@ path = "src/main.rs"
 
 # Phase 79 Wave 3 (Plan 79-03): test-only mock binary used by the
 # `post_deploy_orchestrator` integration tests via the `PMCP_TEST_FIXTURE_EXE`
-# env-var injection point. NOT shipped — the binary has no production purpose
-# and exists solely so `env!("CARGO_BIN_EXE_mock_test_binary")` resolves under
-# `cargo test`. Cargo always builds declared `[[bin]]` targets, so this adds
-# ~1s to `cargo build`; the implementation is dep-free (no serde, no clap) to
-# minimise that.
+# env-var injection point, so `env!("CARGO_BIN_EXE_mock_test_binary")`
+# resolves. It has no production purpose.
+#
+# `cargo install` installs EVERY `[[bin]]` target whose `required-features`
+# are enabled, so from 0.13.0 through 0.28.0 `cargo install cargo-pmcp` put
+# this helper into ~/.cargo/bin (#412; an earlier comment here said "NOT
+# shipped", which was false). It is now gated behind the non-default
+# `test-fixtures` feature, the same mechanism `capture_contract` uses below:
+# a default build, and so `cargo install`, skips it. The test that needs it
+# carries the same `required-features` (its `[[test]]` entry below), so a
+# plain `cargo test -p cargo-pmcp` skips that test instead of failing to
+# compile. `make test-cargo-pmcp-integration` runs it with
+# `--features test-fixtures` and asserts a nonzero count for it.
 [[bin]]
 name = "mock_test_binary"
 path = "tests/fixtures/mock_test_binary.rs"
 test = false
 bench = false
 doctest = false
+required-features = ["test-fixtures"]
+
+# The only consumer of `mock_test_binary` (see its `[[bin]]` entry above).
+[[test]]
+name = "post_deploy_orchestrator"
+path = "tests/post_deploy_orchestrator.rs"
+required-features = ["test-fixtures"]
 
 # Package-capture contract seam (Finding 1, final-review fix wave): internal
 # M2M-auth introspection dev tool, NOT meant to ship to end users. Without an
@@ -194,6 +209,13 @@ aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
 aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-cloudformation = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# `deploy destroy` on aws-lambda deletes a function's `/aws/lambda/<name>` log
+# group after the stack is gone (#407): CloudFormation deletes the stack's own
+# log group BEFORE the function (its name refers to the function), and Lambda
+# can re-create it from the function's last log delivery in between. Same
+# SDK family, client and features as the three above; 1.156 resolves to the
+# smithy crates those already use (no second copy in the graph).
+aws-sdk-cloudwatchlogs = { version = "1.156", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # For security penetration testing
 serde-sarif = "0.8"
@@ -219,3 +241,7 @@ aws-secrets = ["aws-sdk-secretsmanager"]
 # above and its module doc) — a manual M2M-auth GraphQL introspection aid,
 # not intended for end-user installs.
 capture-contract-tool = []
+# Builds the `mock_test_binary` test helper and the `post_deploy_orchestrator`
+# integration test that execs it (see their entries above). Test-only; never
+# enable it for an install (#412).
+test-fixtures = []

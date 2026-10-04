@@ -114,12 +114,10 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use zip::write::SimpleFileOptions;
-use zip::ZipWriter;
 
 use crate::deployment::config::DeployConfig;
+use crate::deployment::lambda_zip::{write_zip, ZipEntry};
 use crate::deployment::r#trait::BuildArtifact;
 
 /// Which shape an `aws-lambda` project is.
@@ -218,7 +216,7 @@ fn zip_single_bootstrap(config: &DeployConfig, bootstrap_path: &Path) -> Result<
     let zip_path = config
         .project_root
         .join("deploy/.build/lambda-artifact.zip");
-    write_zip(&zip_path, &[("bootstrap".to_string(), bytes, 0o755)])?;
+    write_zip(&zip_path, &[ZipEntry::executable("bootstrap", bytes)])?;
     Ok(zip_path)
 }
 
@@ -469,8 +467,8 @@ async fn acquire_builtin_artifact(
     let script = bootstrap_script(binary_name, baked)?;
 
     let mut entries: Vec<ZipEntry> = vec![
-        ("bootstrap".to_string(), script.into_bytes(), 0o755),
-        (binary_name.to_string(), binary_bytes, 0o755),
+        ZipEntry::executable("bootstrap", script.into_bytes()),
+        ZipEntry::executable(binary_name, binary_bytes),
     ];
     if baked {
         entries.extend(collect_baked_files(binary_name, config)?);
@@ -655,10 +653,6 @@ fn bootstrap_script_workbook() -> String {
 // baked-config file collection
 // ===========================================================================
 
-/// One entry to write into a zip archive: (path within the zip, file
-/// contents, unix permission bits).
-type ZipEntry = (String, Vec<u8>, u32);
-
 /// Collect the files to bundle beside `bootstrap` when `snapshot_baked =
 /// true`, per `binary_name`'s config-loading convention (see module docs).
 fn collect_baked_files(binary_name: &str, config: &DeployConfig) -> Result<Vec<ZipEntry>> {
@@ -687,7 +681,7 @@ fn read_required_entry(project_root: &Path, name: &str) -> Result<ZipEntry> {
             path.display()
         )
     })?;
-    Ok((name.to_string(), bytes, 0o644))
+    Ok(ZipEntry::file(name, bytes))
 }
 
 /// Recursively collect every FILE under `bundle_dir`, zipped under
@@ -712,36 +706,9 @@ fn collect_bundle_dir(bundle_dir: &Path) -> Result<Vec<ZipEntry>> {
         let zip_name = format!("bundle/{}", rel.display());
         let bytes = std::fs::read(dent.path())
             .with_context(|| format!("failed to read {}", dent.path().display()))?;
-        entries.push((zip_name, bytes, 0o644));
+        entries.push(ZipEntry::file(zip_name, bytes));
     }
     Ok(entries)
-}
-
-// ===========================================================================
-// zip assembly
-// ===========================================================================
-
-/// Write `entries` into a fresh zip at `zip_path`, creating parent
-/// directories as needed.
-fn write_zip(zip_path: &Path, entries: &[ZipEntry]) -> Result<()> {
-    if let Some(parent) = zip_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let file = std::fs::File::create(zip_path)
-        .with_context(|| format!("failed to create {}", zip_path.display()))?;
-    let mut zip = ZipWriter::new(file);
-    for (name, bytes, mode) in entries {
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .unix_permissions(*mode);
-        zip.start_file(name, options)
-            .with_context(|| format!("failed to add {name} to zip"))?;
-        zip.write_all(bytes)
-            .with_context(|| format!("failed to write {name} to zip"))?;
-    }
-    zip.finish().context("failed to finalize zip")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1429,6 +1396,82 @@ mod tests {
             .expect("bootstrap entry must exist");
         assert_eq!(bytes, b"ELF-PLACEHOLDER");
         assert_eq!(mode & 0o111, 0o111, "bootstrap must be executable");
+    }
+
+    /// Every entry's mtime in the zip at `zip_path`.
+    fn entry_mtimes(zip_path: &Path) -> Vec<Option<zip::DateTime>> {
+        let file = std::fs::File::open(zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("parse zip");
+        (0..archive.len())
+            .map(|i| archive.by_index(i).expect("entry").last_modified())
+            .collect()
+    }
+
+    /// #405 on the native engine's custom-Rust path: the same bootstrap
+    /// gives the same zip bytes, so the same S3 key and digest, so an
+    /// unchanged redeploy is a `CloudFormation` no-op.
+    #[test]
+    fn the_custom_rust_zip_is_deterministic() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let bootstrap_path = project.path().join("raw-bootstrap");
+        std::fs::write(&bootstrap_path, b"ELF-PLACEHOLDER").unwrap();
+        let config = base_config(project.path());
+
+        let zip_path = zip_single_bootstrap(&config, &bootstrap_path).expect("must zip");
+        let first = std::fs::read(&zip_path).expect("read");
+        assert!(
+            entry_mtimes(&zip_path)
+                .iter()
+                .all(|m| *m == Some(zip::DateTime::DEFAULT)),
+            "no entry may carry the build time"
+        );
+        let zip_path = zip_single_bootstrap(&config, &bootstrap_path).expect("must zip");
+        let second = std::fs::read(&zip_path).expect("read");
+        assert!(first == second, "the same bootstrap must give the same zip");
+        assert_eq!(
+            super::super::engine::artifact_s3_key("demo", &first),
+            super::super::engine::artifact_s3_key("demo", &second)
+        );
+    }
+
+    /// #405 on the built-in path: the bundle directory's walk order is the
+    /// filesystem's, and must not reach the zip.
+    #[tokio::test]
+    async fn the_builtin_workbook_zip_is_deterministic() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let project = tempfile::tempdir().expect("tempdir");
+        let _env = ScopedHome::set(home.path());
+        for (rel, body) in [
+            ("bundle/z.json", "z"),
+            ("bundle/a.json", "a"),
+            ("bundle/nested/m.bin", "m"),
+        ] {
+            let path = project.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let mut config = base_config(project.path());
+        config.target.version = "v1.0.0".to_string();
+        config.metadata = MetadataConfig {
+            server_type: Some("workbook-server".to_string()),
+            snapshot_baked: Some(true),
+        };
+        let downloader = stub_release("pmcp-workbook-server", "v1.0.0", b"bin");
+
+        let zip_path = acquire_builtin_artifact("workbook-server", &config, &downloader)
+            .await
+            .expect("acquire");
+        let file = std::fs::File::open(&zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("parse zip");
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).expect("entry").name().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries must be in name order");
+        assert!(entry_mtimes(&zip_path)
+            .iter()
+            .all(|m| *m == Some(zip::DateTime::DEFAULT)));
     }
 
     // -----------------------------------------------------------------

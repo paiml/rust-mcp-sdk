@@ -5,6 +5,88 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-10-03
+
+Fixes from the live re-check of 0.28.0 against real AWS and GCP
+(forecast-coach spike 021): an unchanged redeploy is a CloudFormation no-op
+again, `deploy destroy` leaves nothing behind, a passing post-deploy
+verification says so, and a clean HTTP 404 from the deployed service is a
+failed check. `cargo install cargo-pmcp` no longer installs a test helper.
+
+### Fixed
+
+- **The `aws-lambda` zip is deterministic, so an unchanged redeploy is a
+  no-op (#405).** Every zip entry carried the build time, so each deploy
+  uploaded a zip with a new digest: a new `{server}/bootstrap-<digest>.zip`
+  key, a new `CodeSha256`, and a CloudFormation update of the function even
+  when nothing changed ("No updates are to be performed" was unreachable).
+  Every Lambda zip cargo-pmcp builds (the native engine's custom-Rust and
+  built-in-server artifacts, and `deploy/.build/deployment.zip` with bundled
+  assets, which `pmcp-run` uploads and `npx cdk deploy` packages from
+  `.build`) now goes through one writer: entries sorted by name, the zip
+  format's fixed epoch (1980-01-01) as every mtime, permissions fixed to 0755
+  for executables (the `bootstrap` keeps its executable bit) and 0644 for the
+  rest, recorded as Unix. The same binary gives the same zip bytes, S3 key
+  and digest; one changed byte still changes them.
+- **`deploy destroy` on `aws-lambda` removes the deploy artifacts it
+  uploaded (#406).** The zips stayed in `pmcp-deploy-<account>-<region>`
+  after the stack was gone. After the stack deletion succeeds, destroy
+  deletes exactly the keys deploy writes for this server —
+  `{server}/bootstrap-<hex>.zip`, a direct child of the `{server}/` prefix
+  (so server `a` never matches `ab/` or `a-b/`), and nothing else under it.
+  The bucket is shared by every server in the account and region and is
+  never deleted. If listing or deleting fails, destroy warns and prints the
+  exact `aws s3 rm` command, and still succeeds.
+- **`deploy destroy` on `aws-lambda` leaves no `/aws/lambda/<function>` log
+  group behind (#407).** Both engines' stacks already own the function's log
+  group and delete it with the stack (the scaffold's `removalPolicy: DESTROY`;
+  the native template's default `Delete`), but CloudFormation deletes it
+  before the function (its name refers to the function), and Lambda can
+  re-create it from a late log delivery in between — the likely source of the
+  empty group the live check found. Destroy now reads which functions the
+  stack owns just before deleting it, and once the stack is gone deletes each
+  function's
+  `/aws/lambda/<function>` group that still exists, except one the stack's
+  template retains (`DeletionPolicy: Retain`, which it reports as kept). A
+  failure warns with the exact `aws logs delete-log-group` command and never
+  fails the destroy. New dependency: `aws-sdk-cloudwatchlogs` (the same SDK
+  release as the `aws-sdk-*` crates already used).
+- **A passing post-deploy verification prints a summary (#408).** It printed
+  nothing, so success could not be told apart from verification not running.
+  It now prints one line naming the endpoint and the checks that ran, e.g.
+  `✓ Verified https://…/mcp: connectivity, conformance, apps`, and a skipped
+  verification says why (`--no-post-deploy-test`, `[post_deploy_tests]
+  enabled = false`, or no configured check applies). `--quiet` prints none of
+  these; failures print the banner as before.
+- **After a rename on the native engine, the unmodified `deploy/lib/stack.ts`
+  and `deploy/bin/app.ts` follow the new name (#409).** The engine deploys
+  from `.pmcp/deploy.toml` and never read them, so both kept the old name and
+  a later fallback to `npx cdk deploy` would have targeted the old stack (and
+  the stack guard refused it). After a successful native deploy, an
+  unmodified `stack.ts` is regenerated from the config (as the `npx cdk
+  deploy` path regenerates it) and an unmodified `app.ts` follows
+  `[server] name`. `deploy/.pmcp-scaffold.toml` now records `bin/app.ts`
+  beside `lib/stack.ts` (written by `deploy init` and whenever cargo-pmcp
+  rewrites it); a 0.28.0 record without it is read as before, and an
+  unmodified `app.ts` is adopted into it. Hand-modified files are preserved.
+- **A reachable endpoint that answers an HTTP 4xx is a failed check, exit 3
+  (#410).** `test apps` reports a failed connectivity check as an
+  infrastructure error, so with `mcp_path = "/nope"` a clean 404 exited 2
+  under `--on-test-failure fail`. The exit code now follows what the endpoint
+  did: an HTTP 4xx (401, 403, 404, 405, …) is a failed check (3); an
+  unreachable endpoint (connect, DNS or TLS error), a timeout, or an HTTP 5xx
+  is an infrastructure error (2) — which also moves a refused connection or a
+  5xx that `test check`/`test conformance` reported as a failed test from 3
+  to 2. `warn` still exits 0. `test apps --format=json` now carries the
+  connectivity check's own error in its infrastructure-error message. The
+  403/404 hints are unchanged.
+- **`cargo install cargo-pmcp` no longer installs `mock_test_binary` (#412).**
+  The `post_deploy_orchestrator` tests' helper was declared as a `[[bin]]`,
+  so every install since 0.13.0 put it into `~/.cargo/bin`. It now requires
+  the non-default `test-fixtures` feature, as does the test that execs it;
+  `make test-cargo-pmcp-integration` runs that test with the feature and
+  requires a nonzero count (it ran in no gate before).
+
 ## [0.28.0] - 2026-10-03
 
 The `aws-lambda` deployment's identity follows `[server] name`, and a rename can

@@ -428,8 +428,10 @@ pub struct DeployCommand {
     /// Values:
     ///   warn      Print failure banner; CLI exits 0 (also when a check hit an
     ///             infrastructure error); pipeline continues
-    ///   fail      Print failure banner with IS-LIVE warning; CLI exits 3, or
-    ///             2 when a check hit an infrastructure error (REVISION 3 HIGH-2)
+    ///   fail      Print failure banner with IS-LIVE warning; CLI exits 3 when
+    ///             a check failed (an HTTP 4xx answer included), or 2 when a
+    ///             check hit an infrastructure error (unreachable endpoint,
+    ///             timeout, HTTP 5xx)
     ///   rollback  REJECTED. Auto-rollback support will land in a future
     ///             phase that verifies the existing DeployTarget::rollback()
     ///             trait implementations. Use 'fail' (default) or 'warn'.
@@ -785,6 +787,21 @@ impl DeployCommand {
     /// `cargo run` scenarios.
     ///
     /// Cog ≤8.
+    /// #408: under `--no-post-deploy-test`, say the verification was skipped
+    /// (the orchestrator prints the line for every outcome where it runs).
+    /// Kept out of `execute_async` so that function's complexity does not
+    /// grow.
+    fn note_skipped_post_deploy_test(&self, global_flags: &crate::commands::GlobalFlags) {
+        if !self.no_post_deploy_test || !global_flags.should_output() {
+            return;
+        }
+        if let Some(line) =
+            crate::deployment::post_deploy_tests::VerificationReport::SkippedByFlag.summary_line()
+        {
+            println!("{line}");
+        }
+    }
+
     async fn pre_build_widgets_and_set_env(
         widgets: &[crate::deployment::widgets::WidgetConfig],
         project_root: &std::path::Path,
@@ -1287,6 +1304,7 @@ impl DeployCommand {
                         std::process::exit(failure.exit_code());
                     }
                 }
+                self.note_skipped_post_deploy_test(global_flags);
 
                 if global_flags.should_output() {
                     println!();

@@ -501,6 +501,19 @@ test-cargo-pmcp:
 #
 # Keeping both matters: the selectors make a deletion loud, and the -1 arm keeps
 # the two lists honest with each other.
+#
+# `post_deploy_orchestrator` (appended for cargo-pmcp 0.28.1, #412) is, like
+# `verb_help`, a pre-existing file that NO gate executed: measured 2026-10-03,
+# `grep -c post_deploy_orchestrator Makefile .github/workflows/*` returned 0,
+# so the deploy post-deploy verifier's exit-code and banner tests ran only by
+# hand. #412 gated its `mock_test_binary` helper (and therefore this test,
+# which execs it) behind cargo-pmcp's non-default `test-fixtures` feature, so
+# `cargo install cargo-pmcp` stops installing the helper. That gating makes a
+# plain `cargo test -p cargo-pmcp` SKIP this binary silently — so it is
+# registered in BOTH lists below in the same change, and the invocation enables
+# `--features test-fixtures`. Without the feature cargo refuses the explicit
+# `--test post_deploy_orchestrator` selector outright ("requires the features:
+# `test-fixtures`"), which is the loud failure, not a silent zero.
 # RUSTFLAGS is pinned EMPTY here, deliberately, and the value must stay
 # explicit rather than inherited. Three facts combine into a gate whose
 # strictness otherwise depends on the caller's environment:
@@ -528,7 +541,7 @@ test-cargo-pmcp:
 .PHONY: test-cargo-pmcp-integration
 test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 	@echo "$(BLUE)Running cargo-pmcp's contract/inspect integration tests...$(NC)"
-	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --test package_capture_contract --test package_attestation_contract --test package_inspect --test pmcp_package_pin --test package_save_load --test package_portability_contract --test package_artifact_framing --test verb_help --test validate_server_config -- --test-threads=1 2>&1); \
+	@out=$$(RUSTFLAGS= RUST_LOG=$(RUST_LOG) RUST_BACKTRACE=$(RUST_BACKTRACE) $(CARGO) test -p cargo-pmcp --features test-fixtures --test package_capture_contract --test package_attestation_contract --test package_inspect --test pmcp_package_pin --test package_save_load --test package_portability_contract --test package_artifact_framing --test verb_help --test validate_server_config --test post_deploy_orchestrator -- --test-threads=1 2>&1); \
 	status=$$?; \
 	echo "$$out"; \
 	if [ $$status -ne 0 ]; then exit $$status; fi; \
@@ -537,7 +550,7 @@ test-cargo-pmcp-integration: test-openapi-server-guard-selftest
 		echo "$(RED)✗ cargo-pmcp integration tests reported 0 tests — the gate is not reaching cargo-pmcp/tests/$(NC)"; \
 		exit 1; \
 	fi; \
-	REQUIRED_TEST_BINARIES="package_capture_contract package_attestation_contract package_inspect pmcp_package_pin package_save_load package_portability_contract package_artifact_framing verb_help validate_server_config"; \
+	REQUIRED_TEST_BINARIES="package_capture_contract package_attestation_contract package_inspect pmcp_package_pin package_save_load package_portability_contract package_artifact_framing verb_help validate_server_config post_deploy_orchestrator"; \
 	for b in $$REQUIRED_TEST_BINARIES; do \
 		n=$$(printf '%s\n' "$$out" | awk -v want="tests/$$b.rs" -f scripts/named-test-binary-count.awk); \
 		case "$$n" in \

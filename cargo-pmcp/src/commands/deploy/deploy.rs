@@ -209,13 +209,7 @@ impl DeployExecutor {
 
         let result = self.guard_then_regenerate(config, state);
         if let (Err(_), Some(before)) = (&result, app_ts_before) {
-            let app_ts = self.project_root.join("deploy").join("bin").join("app.ts");
-            std::fs::write(&app_ts, before).with_context(|| {
-                format!(
-                    "failed to restore {} after the refused deploy",
-                    app_ts.display()
-                )
-            })?;
+            scaffold_provenance::restore_app_ts(&self.project_root, &before)?;
         }
         result
     }

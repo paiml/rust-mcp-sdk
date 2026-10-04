@@ -338,7 +338,7 @@ async fn execute_json(
         let _ = emit_infra_error_json(
             PdrCommand::Apps,
             &url,
-            "Server connectivity check failed - cannot validate App metadata".to_string(),
+            connectivity_failure_message(&init_report.tests),
             started.elapsed(),
         );
         std::process::exit(2);
@@ -377,6 +377,33 @@ async fn execute_json(
     }
 
     finalize_json(report, started, &url, &mode_str)
+}
+
+/// The infrastructure-error message of a JSON-mode run whose connectivity
+/// check failed: the fixed summary plus each failed check's own error (#410).
+///
+/// The errors carry what the endpoint did (`... Request failed with status:
+/// 404 Not Found`, `... client error (Connect)`), which `cargo pmcp deploy`'s
+/// post-deploy verifier needs to tell an endpoint that answered (a failed
+/// check, exit 3) from one it could not reach (infrastructure, exit 2). The
+/// summary alone, as before 0.28.1, made a clean 404 exit 2.
+fn connectivity_failure_message(tests: &[mcp_tester::TestResult]) -> String {
+    const SUMMARY: &str = "Server connectivity check failed - cannot validate App metadata";
+    let mut errors: Vec<&str> = Vec::new();
+    for error in tests
+        .iter()
+        .filter(|t| t.status == TestStatus::Failed)
+        .filter_map(|t| t.error.as_deref())
+    {
+        if !errors.contains(&error) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        SUMMARY.to_string()
+    } else {
+        format!("{SUMMARY}: {}", errors.join("; "))
+    }
 }
 
 /// JSON-mode source-scan. Mirrors `execute_source_scan` shape but skips printing.
@@ -881,6 +908,45 @@ fn make_read_failure_result(uri: &str, reason: &str) -> mcp_tester::TestResult {
         details: Some(
             "[guide:handlers-before-connect] Widget HTML could not be fetched — the server may not register the widget resource, or the body is binary/empty.".to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod connectivity_message_tests {
+    //! #410: the apps step's infrastructure error names what the endpoint did.
+    use super::*;
+    use mcp_tester::{TestCategory, TestResult};
+
+    fn failed(error: &str) -> TestResult {
+        TestResult::failed("Initialize", TestCategory::Core, Duration::ZERO, error)
+    }
+
+    #[test]
+    fn the_message_carries_each_failed_checks_error_once() {
+        let not_found = "Transport error: Request error: Request failed with status: 404 Not Found";
+        let tests = vec![
+            TestResult::passed("Ping", TestCategory::Core, Duration::ZERO, "ok"),
+            failed(not_found),
+            failed(not_found),
+            failed("protocol version mismatch"),
+        ];
+        assert_eq!(
+            connectivity_failure_message(&tests),
+            format!(
+                "Server connectivity check failed - cannot validate App metadata: {not_found}; \
+                 protocol version mismatch"
+            )
+        );
+    }
+
+    #[test]
+    fn without_errors_the_message_is_the_summary() {
+        let mut no_error = failed("x");
+        no_error.error = None;
+        assert_eq!(
+            connectivity_failure_message(&[no_error]),
+            "Server connectivity check failed - cannot validate App metadata"
+        );
     }
 }
 

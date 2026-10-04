@@ -63,6 +63,8 @@ For AWS Lambda targets, `cargo pmcp deploy` runs:
 2. **Validates the `[iam]` section** — runs the same gate as [`cargo pmcp validate deploy`](validate.md#validate-deploy) and fails fast before any AWS API call if validation errors are present. Warnings print to stderr but don't block.
 3. Builds the Lambda binary (once: the `npx cdk deploy` fallback deploys the binary this step built).
 4. **Routes the deploy.** An unmodified `deploy/lib/stack.ts` scaffold is deployed by the native CloudFormation engine (no Node.js), as `{[server] name}-stack`, straight from `.pmcp/deploy.toml`. A hand-modified one goes through `npx cdk deploy` (steps 5-7). See [Unmodified vs hand-modified `stack.ts`](#unmodified-vs-hand-modified-stackts).
+   - The native engine uploads the function's zip to `pmcp-deploy-<account>-<region>/{[server] name}/bootstrap-<digest>.zip`. The zip is deterministic (entries in name order, a fixed 1980-01-01 mtime, permissions 0755 for executables and 0644 otherwise), so the same binary gives the same bytes, key and `CodeSha256`, and an unchanged redeploy leaves the stack alone ("No updates are to be performed"). Before 0.28.1 every entry carried the build time, so every deploy updated the function.
+   - After a successful native deploy, an unmodified `stack.ts` is regenerated from `.pmcp/deploy.toml` and an unmodified `deploy/bin/app.ts` is pointed at `[server] name`, exactly as the `npx cdk deploy` path does before deploying, so a later fallback to `npx cdk deploy` deploys the same stack. Before 0.28.1 a rename deployed natively left both naming the old server.
 5. On the `npx cdk deploy` path, when both scaffold files are still cargo-pmcp's own (`stack.ts` unmodified or missing, `deploy/bin/app.ts` unmodified), **points `app.ts` at the current `[server] name`**. Then it **checks the stack identity** — see [Stack-identity guard](#stack-identity-guard). This runs before step 6 can overwrite a hand-modified `stack.ts`. A missing `stack.ts` is scaffolded first, because the CDK app cannot be listed without it, and is removed again if the guard refuses (as is an `app.ts` change).
 6. **Regenerates `deploy/lib/stack.ts` from the loaded config** — splices the `[iam]` and `[metadata]` declarations, and the function's `[server]` sizing and `[environment]`, into the CDK template at single seams. Changes to `.pmcp/deploy.toml` therefore take effect on the next `cargo pmcp deploy` without manual re-init. **Guard:** a **hand-modified** `stack.ts` is **preserved** (the write is skipped and a one-line `preserved existing deploy/lib/stack.ts` notice prints) so an operator-curated stack is never silently overwritten. Pass `--regenerate-stack` (alias `--force`) to overwrite it. An unmodified scaffold, or a missing file, is written flag-free.
 7. Runs `cdk deploy {[server] name}-stack --require-approval never`, naming the stack explicitly.
@@ -72,6 +74,8 @@ The deploy prints the stack outputs once, at the end.
 ### Unmodified vs hand-modified `stack.ts`
 
 Every time cargo-pmcp writes `deploy/lib/stack.ts` (at `deploy init`, and whenever a deploy regenerates it) it records the file's SHA-256 in `deploy/.pmcp-scaffold.toml`. **Hand-modified** means "differs from the `stack.ts` cargo-pmcp last wrote". Commit `deploy/.pmcp-scaffold.toml` with `deploy/`; do not edit it.
+
+Since 0.28.1 the record holds `deploy/bin/app.ts` too (`bin/app.ts`, beside `lib/stack.ts`), written by `deploy init` and whenever a deploy rewrites `app.ts`. A record written by 0.28.0 has no `app.ts` entry; for it (and with no record at all) `app.ts` counts as unmodified when it is exactly the scaffold `deploy init` renders for some name, as in 0.28.0, and is then recorded. Once recorded, any edit makes `app.ts` hand-modified, including a hand edit of its `serverName` literal.
 
 Before cargo-pmcp 0.28.0, "hand-modified" meant "differs from what the *current* `.pmcp/deploy.toml` would render". A `[server] name` rename, an `[iam]` or `[metadata]` change, or a newer cargo-pmcp template therefore made an untouched scaffold look hand-modified: the deploy fell back to `npx cdk deploy`, built the binary twice, and ignored `[server] memory_mb`/`timeout_seconds`. With the record, those changes keep the scaffold unmodified; the scaffold is regenerated to match the config.
 
@@ -97,7 +101,7 @@ To recover, choose one:
 - **Keep deploying the existing stack:** set `[server] name` back to the name the declared stack was created with (the error suggests it, e.g. `[server] name = "old-server"`).
 - **Deploy under the new name:** set `const serverName = '<new name>';` in `deploy/bin/app.ts`, and the same `serverName` in `deploy/lib/stack.ts` if you customized it (an unmodified `stack.ts` is regenerated for you), then re-run. This creates a **new** stack; the old one keeps running until you delete it (`aws cloudformation delete-stack --stack-name <old>-stack --region <region>`).
 
-The guard applies only to the `npx cdk deploy` path. The native CloudFormation engine (used for an unmodified scaffold) deploys `{[server] name}-stack` directly from `.pmcp/deploy.toml` and never reads `app.ts`. `destroy` deletes the stack through CloudFormation and does not use `npx cdk` (see [deploy destroy](#deploy-destroy)). The `pmcp-run` target runs `cdk synth`, never `cdk deploy`, and keys the deployment on `[server] name`, so it is not affected.
+The guard applies only to the `npx cdk deploy` path. The native CloudFormation engine (used for an unmodified scaffold) deploys `{[server] name}-stack` directly from `.pmcp/deploy.toml` and never reads `app.ts`; after it deploys, it points an unmodified `app.ts` at `[server] name` (see step 4 above), so a later `npx cdk deploy` passes the guard. `destroy` deletes the stack through CloudFormation and does not use `npx cdk` (see [deploy destroy](#deploy-destroy)). The `pmcp-run` target runs `cdk synth`, never `cdk deploy`, and keys the deployment on `[server] name`, so it is not affected.
 
 ### Renaming a deployment
 
@@ -308,14 +312,27 @@ mcp_path = "/mcp"   # or "/" for a server that serves MCP at the root
 
 `mcp_path` must start with `/` and carry no query (`?`), fragment (`#`), whitespace or control characters; anything else fails the deploy before the build and fails `cargo pmcp validate deploy`. When a path is appended, `deploy outputs` and the deploy summary print the endpoint as the URL and keep the reported one as `service_url`. Before 0.28.0 every target verified the reported URL, so a Cloud Run server mounted at `/mcp` failed every check.
 
+**Output.** A verification that passes prints one line naming the endpoint and the checks that ran:
+
+```
+✓ Verified https://abc123.execute-api.us-east-1.amazonaws.com/mcp: connectivity, conformance, apps
+```
+
+A verification that does not run says so and why: `--no-post-deploy-test`, `[post_deploy_tests] enabled = false`, or no configured check applies (`apps` runs only when the project has widgets). A failing one prints the failure banner (stderr). `--quiet` prints none of these. Before 0.28.1 a passing verification printed nothing.
+
 **Exit codes.** The deploy itself has already succeeded when the checks run: the new revision is live either way.
 
-| `on_failure` | every check passed | a check failed | a check hit an infrastructure error |
+| `on_failure` | every check passed | a check failed (including an HTTP 4xx answer) | infrastructure: unreachable endpoint, timeout, HTTP 5xx |
 |---|---|---|---|
 | `fail` (default) | 0 | 3 | 2 (also when another check failed) |
 | `warn` | 0 | 0 | 0 |
 
-An infrastructure error is a check that could not produce a verdict: the child process failed to start, timed out, or could not reach the endpoint. The failure banner is printed in every failing case; under `warn` it ends with a line saying the deploy continues. With `CI` set, `fail` also prints a `::error::` annotation. Before 0.28.0 an infrastructure error exited 2 even under `warn`.
+Each failed check is classified by what the endpoint did, whichever check reported it:
+
+- **A failed check (3):** the endpoint was reached and answered, including an HTTP 4xx (401, 403, 404, 405, ...): the service is up and the check failed against it.
+- **Infrastructure (2):** no verdict on the deployed code could be reached: the endpoint was unreachable (a connect, DNS or TLS error), a check timed out, the endpoint answered an HTTP 5xx, or the check's child process failed.
+
+Before 0.28.1 the class was the child's own: `test apps` reported every failed connectivity check, a clean 404 included, as an infrastructure error (so `mcp_path = "/nope"` exited 2), while `test check` and `test conformance` reported a refused connection and a 5xx as failed tests (3). The failure banner is printed in every failing case; under `warn` it ends with a line saying the deploy continues. With `CI` set, `fail` also prints a `::error::` annotation. Before 0.28.0 an infrastructure error exited 2 even under `warn`.
 
 The banner adds a hint when a check's error names an HTTP status it recognizes:
 
@@ -487,7 +504,21 @@ On `aws-lambda`, `destroy` deletes the CloudFormation stack `{[server] name}-sta
 
 If no stack of that name exists, `destroy` says so ("nothing to delete") — unless `deploy/outputs.json` records another stack that still exists. Then the deployment lives under another name, and `destroy` refuses instead of reporting success (so `--clean` cannot delete the local files of a running deployment), naming both stacks and the two ways to remove it: set `[server] name` to the recorded one and re-run, or `aws cloudformation delete-stack --stack-name <stack> --region <region>`.
 
-Before 0.28.0, `destroy` ran `npx cdk destroy` in the shell's region, which reached only a stack the CDK app in `deploy/bin/app.ts` declared. The deploy-artifact bucket the native engine uses (`pmcp-deploy-<account>-<region>`) is shared by every server in the account and region and is not deleted.
+Before 0.28.0, `destroy` ran `npx cdk destroy` in the shell's region, which reached only a stack the CDK app in `deploy/bin/app.ts` declared.
+
+**After the stack is deleted**, `destroy` removes what outlived it (since 0.28.1):
+
+- **The deploy artifacts.** The native engine uploads each zip to `pmcp-deploy-<account>-<region>/{[server] name}/bootstrap-<digest>.zip`. `destroy` deletes exactly those keys: direct children of the `{[server] name}/` prefix named `bootstrap-<hex>.zip` (a server named `a` never matches `ab/` or `a-b/`), and nothing else under the prefix. The bucket is shared by every server in the account and region and is never deleted.
+- **The functions' log groups.** Both engines' stacks delete the function's `/aws/lambda/<function>` log group with the stack, but CloudFormation deletes it before the function, and Lambda can re-create it from the function's last log delivery. `destroy` reads which functions the stack owns just before deleting it, and afterwards deletes each one's `/aws/lambda/<function>` group if it still exists. A log group the stack's template retains (`DeletionPolicy: Retain`) is kept and reported.
+
+Neither step can fail the destroy. When one cannot be done (no permission, the account or the stack's resources could not be read), `destroy` warns and prints the exact command, for example:
+
+```
+aws s3 rm s3://pmcp-deploy-123456789012-us-east-1/acme/ --recursive --exclude "*" --include "bootstrap-*.zip" --region us-east-1
+aws logs delete-log-group --log-group-name /aws/lambda/acme --region us-east-1
+```
+
+When no stack existed ("nothing to delete"), nothing else is removed.
 
 ---
 

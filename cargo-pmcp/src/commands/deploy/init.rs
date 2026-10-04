@@ -744,7 +744,11 @@ impl InitCommand {
     fn create_app_ts(&self, deploy_dir: &PathBuf, server_name: &str) -> Result<()> {
         let bin_dir = deploy_dir.join("bin");
         std::fs::create_dir_all(&bin_dir)?;
-        std::fs::write(bin_dir.join("app.ts"), render_app_ts(server_name))?;
+        let app_ts = render_app_ts(server_name);
+        std::fs::write(bin_dir.join("app.ts"), &app_ts)?;
+        // Provenance (#409): recorded beside stack.ts, so a deploy can tell
+        // this file from a hand-edited one and keep it following the name.
+        crate::deployment::scaffold_provenance::record_app_ts(&self.project_root, &app_ts)?;
         Ok(())
     }
 
@@ -3026,6 +3030,66 @@ actions = [\"read\"]
         assert_eq!(
             recorded_stack_ts_digest(tmp.path()),
             Some(content_digest(&written))
+        );
+    }
+
+    /// #407, the `npx cdk` half: every log group the scaffolds declare (plain
+    /// aws-lambda, pmcp-run, and the three of the Cognito variant) is
+    /// destroyed with the stack. CDK's own default for `logs.LogGroup` is
+    /// RETAIN, which would leave the group behind on every destroy.
+    #[test]
+    fn every_scaffold_log_group_is_destroyed_with_the_stack() {
+        let tmp = project();
+        let deploy_dir = tmp.path().join("deploy");
+        let cmd = init(tmp.path(), "aws-lambda");
+        cmd.create_oauth_stack_ts(&deploy_dir, "acme")
+            .expect("oauth");
+        let oauth = std::fs::read_to_string(deploy_dir.join("lib/stack.ts")).expect("read");
+        let (iam, meta) = (
+            crate::deployment::config::IamConfig::default(),
+            crate::deployment::config::MetadataConfig::default(),
+        );
+        let renders = [
+            (
+                "aws-lambda",
+                render_stack_ts_for_deploy("aws-lambda", "acme", &iam, &meta),
+            ),
+            (
+                "pmcp-run",
+                render_stack_ts_for_deploy("pmcp-run", "acme", &iam, &meta),
+            ),
+            ("cognito", oauth),
+        ];
+        for (name, stack_ts) in renders {
+            let groups: Vec<&str> = stack_ts.split("new logs.LogGroup(").skip(1).collect();
+            assert!(!groups.is_empty(), "{name}: no log group declared");
+            for group in groups {
+                let block = &group[..group.find("});").expect("block end")];
+                assert!(
+                    block.contains("removalPolicy: cdk.RemovalPolicy.DESTROY,"),
+                    "{name}: {block}"
+                );
+            }
+        }
+    }
+
+    /// #409: init records the app.ts it writes beside stack.ts.
+    #[test]
+    fn init_records_the_scaffold_app_ts() {
+        let tmp = project();
+        let deploy_dir = tmp.path().join("deploy");
+        init(tmp.path(), "aws-lambda")
+            .create_app_ts(&deploy_dir, "acme")
+            .expect("write app.ts");
+        let written = std::fs::read_to_string(deploy_dir.join("bin/app.ts")).expect("read app.ts");
+        let record: toml::Table = toml::from_str(
+            &std::fs::read_to_string(tmp.path().join("deploy/.pmcp-scaffold.toml"))
+                .expect("a record must exist"),
+        )
+        .expect("parse record");
+        assert_eq!(
+            record["files"]["bin/app.ts"].as_str(),
+            Some(content_digest(&written).as_str())
         );
     }
 

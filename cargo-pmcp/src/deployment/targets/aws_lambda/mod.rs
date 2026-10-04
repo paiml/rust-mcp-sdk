@@ -148,9 +148,12 @@ impl DeploymentTarget for AwsLambdaTarget {
         // created is removed as surely as one `cdk deploy` created (see
         // `teardown`'s module docs).
         match teardown::destroy_stack(config).await? {
-            teardown::DestroyOutcome::Deleted => {
+            teardown::DestroyOutcome::Deleted { inventory } => {
                 println!();
                 println!("✅ CloudFormation stack {stack_name} deleted");
+                // #406/#407: only after the stack is gone, and never a reason
+                // to fail the destroy.
+                teardown::clean_up_after_destroy(config, inventory.as_ref()).await;
             },
             teardown::DestroyOutcome::NothingToDelete => {
                 println!(
