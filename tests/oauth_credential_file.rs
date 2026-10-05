@@ -18,7 +18,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -126,53 +125,22 @@ fn age(path: &Path, by: Duration) {
 }
 
 /// Counts completed credential-file writes by observing the store's own
-/// `tracing` event.
+/// `tracing` event (target `CREDENTIAL_WRITE_EVENT_TARGET`).
 ///
 /// This exists because "exactly one write" is not observable through the
 /// filesystem after the fact: an atomic rename leaves the same evidence whether
 /// it happened once or twice. Without a counter, removing the `save_with_issuer`
 /// override would produce a byte-identical file and every other assertion would
-/// still pass.
-#[derive(Debug, Default)]
-struct WriteCounter {
-    writes: Arc<AtomicUsize>,
-}
+/// still pass. See `tests/common/event_capture.rs` (and #396) for why the
+/// capture is one process-wide subscriber rather than a per-test `set_default`.
+#[path = "common/event_capture.rs"]
+mod event_capture;
 
-impl tracing::Subscriber for WriteCounter {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.target() == CREDENTIAL_WRITE_EVENT_TARGET
-    }
+use event_capture::{capture_events as count_writes, Captured};
 
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        if event.metadata().target() == CREDENTIAL_WRITE_EVENT_TARGET {
-            self.writes.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-/// Install the counter for the rest of the current test, on this thread.
-///
-/// `#[tokio::test]` without a flavor runs a current-thread runtime, so the whole
-/// future stays on the thread the dispatcher was installed on.
-fn count_writes() -> (Arc<AtomicUsize>, tracing::dispatcher::DefaultGuard) {
-    let writes = Arc::new(AtomicUsize::new(0));
-    let counter = WriteCounter {
-        writes: Arc::clone(&writes),
-    };
-    let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(counter));
-    (writes, guard)
+/// The credential-file writes captured so far.
+fn write_count(captured: &Captured) -> usize {
+    captured.count_target(CREDENTIAL_WRITE_EVENT_TARGET)
 }
 
 /// Three credentials over two servers, mirroring the fixture
@@ -680,12 +648,12 @@ async fn save_with_issuer_writes_the_file_exactly_once() {
         .await
         .expect("the combined update works");
     assert_eq!(
-        writes.load(Ordering::SeqCst),
+        write_count(&writes),
         1,
         "save_with_issuer must be ONE read-modify-write, not save-then-record"
     );
 
-    writes.store(0, Ordering::SeqCst);
+    writes.clear();
     let separate_dir = temp_dir();
     let separate = store_in(&separate_dir);
     separate
@@ -697,7 +665,7 @@ async fn save_with_issuer_writes_the_file_exactly_once() {
         .await
         .expect("the issuer record works");
     assert_eq!(
-        writes.load(Ordering::SeqCst),
+        write_count(&writes),
         2,
         "the counter cannot see a second write, so the assertion above proves nothing"
     );
@@ -731,7 +699,7 @@ async fn a_mutation_that_changes_nothing_does_not_write() {
         .expect("an unknown server logout works");
 
     assert_eq!(
-        writes.load(Ordering::SeqCst),
+        write_count(&writes),
         0,
         "a no-op mutation churned the credential file"
     );
