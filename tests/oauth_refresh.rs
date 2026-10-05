@@ -484,60 +484,22 @@ async fn stored(store: &Arc<dyn CredentialStore>, key: &CredentialKey) -> Stored
 // Warning capture — the refresh failure path has no other observable
 // ---------------------------------------------------------------------------
 
-/// Captures WARN-level event messages, so "the refresh failed, and the SDK said
-/// why" is ASSERTED rather than assumed.
-#[derive(Debug, Default)]
-struct WarnCapture {
-    messages: Arc<Mutex<Vec<String>>>,
-}
+/// WARN capture, so "the refresh failed, and the SDK said why" is ASSERTED
+/// rather than assumed. See `tests/common/event_capture.rs` (and #396) for why
+/// this is one process-wide subscriber rather than a per-test `set_default`.
+#[path = "common/event_capture.rs"]
+mod event_capture;
 
-/// Pulls the formatted `message` field out of a `tracing` event.
-struct MessageVisitor<'a>(&'a mut Vec<String>);
-
-impl tracing::field::Visit for MessageVisitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, val: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0.push(format!("{val:?}"));
-        }
-    }
-}
-
-impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        if *event.metadata().level() != tracing::Level::WARN {
-            return;
-        }
-        let mut held = self.messages.lock().expect("captured warnings");
-        event.record(&mut MessageVisitor(&mut held));
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
+use event_capture::{capture_events, Captured};
 
 /// Warnings that name a refresh failure, filtered out of everything else this
 /// module warns about (an unregistered redirect URI, an expiring token, a
 /// discarded legacy cache).
-fn refresh_failure_warnings(captured: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+fn refresh_failure_warnings(captured: &Captured) -> Vec<String> {
     captured
-        .lock()
-        .expect("captured warnings")
-        .iter()
+        .warnings()
+        .into_iter()
         .filter(|message| message.contains("refresh") && message.contains("failed"))
-        .cloned()
         .collect()
 }
 
@@ -796,9 +758,7 @@ async fn a_refresh_with_no_client_id_anywhere_names_both_places_it_looked() {
     // An empty stored client_id and no configured one.
     seed_expired(&store, &base, &SeedSpec::new().client_id("")).await;
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_events();
 
     let (helper, opened, _) = helper_for(&HelperSpec::new(&base).dcr(), &store);
     helper
@@ -1054,9 +1014,7 @@ async fn an_oversized_refresh_error_body_is_refused_naming_the_cap_and_no_conten
     let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
     seed_expired(&store, &base, &SeedSpec::new()).await;
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_events();
 
     let (helper, opened, _) = helper_for(&HelperSpec::new(&base), &store);
     helper
@@ -1099,9 +1057,7 @@ async fn a_rejected_refresh_falls_through_and_says_why() {
     let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
     seed_expired(&store, &base, &SeedSpec::new()).await;
 
-    let capture = WarnCapture::default();
-    let messages = capture.messages.clone();
-    let _guard = tracing::subscriber::set_default(capture);
+    let (messages, _guard) = capture_events();
 
     let (helper, opened, _) = helper_for(&HelperSpec::new(&base), &store);
     helper

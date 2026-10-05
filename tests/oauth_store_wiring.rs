@@ -249,119 +249,27 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 }
 
-/// Captures WARN-level event messages, so "a warning fired, and it named X" is
-/// ASSERTED rather than assumed.
+/// WARN capture, so "a warning fired, and it named X" is ASSERTED rather than
+/// assumed (see `tests/common/event_capture.rs`, and #396 for why it is one
+/// process-wide subscriber rather than a per-test one).
 ///
 /// Without this, the D-18 warn-and-proceed path would be tested only by its side
 /// effect (the flow proceeded), which a version that never warned at all would
 /// also satisfy — the same shape as 116-10's "a presence assertion is not a
 /// detector" finding.
-///
-/// ONE process-wide subscriber, installed once, routes each WARN to the buffer
-/// of the thread that emitted it. A per-test `set_default` subscriber was flaky
-/// (#396): `tracing` caches each callsite's interest process-wide, and tests in
-/// this binary run in parallel. When another thread with no subscriber reached
-/// the issuer-change `warn!` first, the callsite could be cached as disabled,
-/// and the event was skipped while `record_issuer` beside it still ran. This
-/// failed only under coverage instrumentation, and `rebuild_interest_cache()`
-/// did not prevent it. The global subscriber reports every WARN-or-higher
-/// callsite as `Interest::always`, so no callsite can be cached as disabled.
-#[derive(Debug)]
-struct WarnCapture;
+#[path = "common/event_capture.rs"]
+mod event_capture;
 
-thread_local! {
-    /// The capture buffer for the test running on this thread, if any.
-    static THREAD_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Clears this thread's capture buffer when the test's guard drops.
-struct CaptureGuard;
-
-impl Drop for CaptureGuard {
-    fn drop(&mut self) {
-        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
-    }
-}
-
-/// Start capturing WARN messages emitted on the current thread, and return the
-/// message list with the guard that keeps the capture active.
-///
-/// The `#[tokio::test]` runtime is current-thread, so the client code under test
-/// runs on this thread too.
-fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, CaptureGuard) {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        tracing::subscriber::set_global_default(WarnCapture)
-            .expect("no other global subscriber in this test binary");
-    });
-    let messages = Arc::new(Mutex::new(Vec::new()));
-    THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(messages.clone()));
-    (messages, CaptureGuard)
-}
-
-/// Pulls the formatted `message` field out of a `tracing` event.
-struct MessageVisitor<'a>(&'a mut Vec<String>);
-
-impl tracing::field::Visit for MessageVisitor<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0.push(format!("{value:?}"));
-        }
-    }
-}
-
-impl tracing::Subscriber for WarnCapture {
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if *metadata.level() <= tracing::Level::WARN {
-            tracing::subscriber::Interest::always()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
-    }
-
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        if *event.metadata().level() != tracing::Level::WARN {
-            return;
-        }
-        THREAD_CAPTURE.with(|slot| {
-            if let Some(messages) = slot.borrow().as_ref() {
-                let mut held = messages.lock().expect("captured warnings");
-                event.record(&mut MessageVisitor(&mut held));
-            }
-        });
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
+use event_capture::{capture_events as capture_warnings, Captured};
 
 /// Warnings that mention an authorization-server substitution, filtered out of
 /// everything else this module warns about (an unregistered redirect URI, an
 /// expired token, a discarded legacy cache).
-fn substitution_warnings(captured: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+fn substitution_warnings(captured: &Captured) -> Vec<String> {
     captured
-        .lock()
-        .expect("captured warnings")
-        .iter()
+        .warnings()
+        .into_iter()
         .filter(|message| message.contains("authorization server"))
-        .cloned()
         .collect()
 }
 
@@ -1065,7 +973,7 @@ async fn an_issuer_change_with_dcr_credentials_warns_naming_both_issuers_and_pro
     // a side-effect-free read, and the unfiltered message list separates "no
     // warnings at all" from "warnings, but none matched the filter".
     let warnings = substitution_warnings(&messages);
-    let all_messages = messages.lock().expect("captured warnings").clone();
+    let all_messages = messages.warnings();
     let recorded_issuer = store.last_issuer(&server_key).await;
     assert_eq!(
         warnings.len(),
