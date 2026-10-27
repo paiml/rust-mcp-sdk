@@ -1,6 +1,7 @@
 //! Axum Router convenience function for MCP servers.
 //!
-//! Provides `router` and `router_with_config` that return a
+//! Provides `concurrent_router` and `concurrent_router_with_config` (and the
+//! request-serializing `router` and `router_with_config`) that return a
 //! fully-configured `axum::Router` with DNS rebinding protection,
 //! security response headers, and origin-locked CORS applied as Tower
 //! Layers.
@@ -8,7 +9,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use pmcp::server::axum_router::{router, AllowedOrigins, RouterConfig};
+//! use pmcp::server::axum_router::{concurrent_router, AllowedOrigins, RouterConfig};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,10 +18,9 @@
 //!     .version("1.0.0")
 //!     .build()?;
 //!
-//! let server = Arc::new(tokio::sync::Mutex::new(server));
-//!
-//! // One-liner: secure MCP server with localhost protection
-//! let app = router(server.clone());
+//! // One-liner: secure MCP server with localhost protection. Requests are
+//! // handled concurrently; see `concurrent_router`.
+//! let app = concurrent_router(Arc::new(server));
 //!
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 //! axum::serve(listener, app).await?;
@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+use crate::server::streamable_http_server::server_handle::ServerHandle;
 use crate::server::streamable_http_server::{
     build_mcp_router, make_server_state, StreamableHttpServerConfig,
 };
@@ -69,6 +70,11 @@ pub struct RouterConfig {
 /// axum::serve(listener, app).await.unwrap();
 /// # }
 /// ```
+///
+/// # Requests are handled one at a time
+///
+/// The transport holds `server`'s mutex while each handler runs, so one slow
+/// tool call delays every other request. Prefer [`concurrent_router`].
 pub fn router(server: Arc<tokio::sync::Mutex<Server>>) -> Router {
     router_with_config(server, RouterConfig::default())
 }
@@ -88,7 +94,31 @@ pub fn router(server: Arc<tokio::sync::Mutex<Server>>) -> Router {
 /// });
 /// # }
 /// ```
+///
+/// Serializes request handling as [`router`] does; prefer
+/// [`concurrent_router_with_config`].
 pub fn router_with_config(server: Arc<tokio::sync::Mutex<Server>>, config: RouterConfig) -> Router {
+    secure_router(server.into(), config)
+}
+
+/// Create a secure MCP Axum Router that handles requests concurrently, with
+/// default localhost protection.
+///
+/// The same router as [`router`], except that requests share `server` without
+/// an outer mutex, so a slow tool call never delays another request. Every
+/// `Server` entry point takes `&self` and guards its own mutable state.
+pub fn concurrent_router(server: Arc<Server>) -> Router {
+    concurrent_router_with_config(server, RouterConfig::default())
+}
+
+/// Create a secure MCP Axum Router that handles requests concurrently, with
+/// explicit configuration. See [`concurrent_router`] and [`router_with_config`].
+pub fn concurrent_router_with_config(server: Arc<Server>, config: RouterConfig) -> Router {
+    secure_router(server.into(), config)
+}
+
+/// The one router construction both server shapes share.
+fn secure_router(server: ServerHandle, config: RouterConfig) -> Router {
     let allowed = config
         .allowed_origins
         .unwrap_or_else(AllowedOrigins::localhost);

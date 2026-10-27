@@ -416,6 +416,17 @@ pub async fn spawn_shared_with(
     http.start().await.expect("server starts")
 }
 
+/// [`spawn_with`] through the concurrent constructor, which dispatches requests
+/// in parallel instead of serializing them behind a mutex.
+pub async fn spawn_concurrent_with(
+    server: Server,
+    config: StreamableHttpServerConfig,
+) -> (SocketAddr, JoinHandle<()>) {
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+    let http = StreamableHttpServer::with_config_concurrent(addr, Arc::new(server), config);
+    http.start().await.expect("server starts")
+}
+
 /// [`spawn_shared_with`] with `StreamableHttpServerConfig::default()`.
 pub async fn spawn_shared(server: Arc<Mutex<Server>>) -> (SocketAddr, JoinHandle<()>) {
     spawn_shared_with(server, StreamableHttpServerConfig::default()).await

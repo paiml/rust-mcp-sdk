@@ -139,10 +139,10 @@ struct SessionInfo {
     ///
     /// # Why the level lives on the SESSION and not on the server
     ///
-    /// `ServerState::server` is one `Arc<tokio::sync::Mutex<Server>>` shared by
-    /// every session. A level stored there would let client B's `setLevel`
-    /// change client A's filtering — a cross-session information-disclosure
-    /// defect (T-118.2-07-01). The per-session home is also the correct LIFETIME:
+    /// `ServerState::server` is one `Server` shared by every session. A level
+    /// stored there would let client B's `setLevel` change client A's filtering
+    /// — a cross-session information-disclosure defect (T-118.2-07-01). The
+    /// per-session home is also the correct LIFETIME:
     /// `logging/setLevel` is retired in MCP 2026-07-28, which carries the level
     /// per request in `_meta` instead, so a v2 build allocates none of this.
     log_level: Option<crate::types::LoggingLevel>,

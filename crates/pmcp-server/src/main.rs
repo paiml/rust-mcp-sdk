@@ -4,7 +4,6 @@ use clap::Parser;
 use pmcp::server::streamable_http_server::StreamableHttpServer;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(
@@ -37,8 +36,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
 
     let server = pmcp_server::build_server()?;
-    let server = Arc::new(Mutex::new(server));
-    let http_server = StreamableHttpServer::new(addr, server);
+    let http_server = StreamableHttpServer::new_concurrent(addr, Arc::new(server));
     let (bound_addr, handle) = http_server
         .start()
         .await

@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 struct Add;
 
@@ -44,16 +43,30 @@ async fn main() -> pmcp::Result<()> {
         .tool("add", Add)
         .build()?;
 
-    let server = Arc::new(Mutex::new(server));
+    let server = Arc::new(server);
     let addr: SocketAddr = ([0,0,0,0], 8080).into();
 
-    // Default: stateful with SSE support
-    let http = StreamableHttpServer::new(addr, server.clone());
+    // Default: stateful with SSE support. Requests are handled concurrently.
+    let http = StreamableHttpServer::new_concurrent(addr, server.clone());
     let (bound, _handle) = http.start().await?;
     println!("Streamable HTTP listening on {}", bound);
     Ok(())
 }
 ```
+
+### Concurrency
+
+`new_concurrent` and `with_config_concurrent` take an `Arc<Server>` and handle
+requests in parallel, so a slow tool call never delays another client's
+request, `initialize` included. Use them for any deployment that accepts more
+than one request per process: containers, Cloud Run, a long-running `serve`.
+
+`new` and `with_config` take an `Arc<tokio::sync::Mutex<Server>>` and are kept
+for compatibility. They hold that mutex while each request is handled, so the
+process serves **one request at a time**. On a container platform that sends
+several requests to one instance, a 30-second tool call makes every other
+request on that instance wait for it. `pmcp::axum::concurrent_router` and
+`pmcp::axum::router` divide the same way.
 
 ### Stateless vs Stateful
 
@@ -66,7 +79,7 @@ let cfg = StreamableHttpServerConfig {
     on_session_initialized: None,
     on_session_closed: None,
 };
-let http = StreamableHttpServer::with_config(addr, server, cfg);
+let http = StreamableHttpServer::with_config_concurrent(addr, server, cfg);
 ```
 
 ## Protocol Details

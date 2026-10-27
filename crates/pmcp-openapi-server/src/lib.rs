@@ -46,7 +46,6 @@ use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpS
 use pmcp::Server;
 use pmcp_server_toolkit::http::OpenApiSchema;
 use pmcp_server_toolkit::ServerConfig;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Error from the Shape A [`run`] pipeline.
@@ -175,9 +174,11 @@ pub async fn serve(
     server: Server,
     addr: SocketAddr,
 ) -> Result<(SocketAddr, JoinHandle<()>), RunError> {
-    let shared = Arc::new(Mutex::new(server));
-    let http =
-        StreamableHttpServer::with_config(addr, shared, StreamableHttpServerConfig::default());
+    let http = StreamableHttpServer::with_config_concurrent(
+        addr,
+        Arc::new(server),
+        StreamableHttpServerConfig::default(),
+    );
     http.start().await.map_err(RunError::Serve)
 }
 

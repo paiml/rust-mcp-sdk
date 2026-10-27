@@ -67,13 +67,14 @@ pub mod simd;
 
 /// Axum Router convenience API for secure MCP server hosting.
 ///
-/// Re-exports `router`, `router_with_config`,
-/// `RouterConfig`, and `AllowedOrigins`
-/// for ergonomic usage: `pmcp::axum::router(server)`.
+/// Re-exports `concurrent_router`, `concurrent_router_with_config`, `router`,
+/// `router_with_config`, `RouterConfig`, and `AllowedOrigins`
+/// for ergonomic usage: `pmcp::axum::concurrent_router(server)`.
 #[cfg(feature = "streamable-http")]
 pub mod axum {
     pub use crate::server::axum_router::{
-        router, router_with_config, AllowedOrigins, RouterConfig,
+        concurrent_router, concurrent_router_with_config, router, router_with_config,
+        AllowedOrigins, RouterConfig,
     };
 }
 

@@ -18,8 +18,9 @@
 //! > behavior change for existing single-request servers.
 //!
 //! This module reproduces that property over HTTP, where the shape of the hazard
-//! is different but the hazard is the same. `dispatch_public_request` holds
-//! `state.server.lock().await` for the ENTIRE duration of a tool handler, so a
+//! is different but the hazard is the same. On the legacy `Arc<Mutex<Server>>`
+//! constructors (`server_handle::ServerHandle::Locked`), `dispatch_public_request`
+//! holds the server mutex for the ENTIRE duration of a tool handler, so a
 //! handler awaiting `peer.sample()` holds the server mutex while it waits for
 //! the client's answer — and that answer arrives as a POST whose gate
 //! (`run_v2_header_gate`, twice) and auth (`extract_and_validate_auth`) stages
@@ -107,9 +108,10 @@ const OUTBOUND_CAPACITY: usize = 100;
 /// that opens an SSE stream, triggers N tools that each park on a peer call, and
 /// then never answers grows the pending map without limit (T-118.1-10-05).
 ///
-/// And the pending map is not the only thing it pins. `dispatch_public_request`
-/// holds `state.server.lock().await` across the whole handler, so every parked
-/// peer call also holds the server mutex. A timed-out peer call RELEASES it: the
+/// And the pending map is not the only thing it pins. On the legacy `Locked`
+/// path `dispatch_public_request` holds the server mutex across the whole
+/// handler, so every parked peer call also holds it. A timed-out peer call
+/// RELEASES it: the
 /// dispatch returns `REQUEST_TIMEOUT`, the handler returns, its stack frame
 /// unwinds and `dispatch_public_request`'s guard drops. That is why this value is
 /// the transport's real upper bound on how long one absent client can serialize
@@ -546,7 +548,7 @@ async fn synthesised_v1_context(
     state: &ServerState,
 ) -> Option<crate::types::protocol::ProtocolContext> {
     let version = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         crate::types::protocol::context::first_v1_version(server.supported_protocol_versions())
     }?;
     Some(crate::types::protocol::ProtocolContext::new(
@@ -649,8 +651,8 @@ pub(crate) async fn attach_session_backchannel(
 ///
 /// # Why this must run before `resolve_v2_gate` and `extract_and_validate_auth`
 ///
-/// `dispatch_public_request` holds `state.server.lock().await` for the ENTIRE
-/// duration of a tool handler. A handler parked on `peer.sample()` therefore
+/// On the legacy `Locked` path, `dispatch_public_request` holds the server
+/// mutex for the ENTIRE duration of a tool handler. A handler parked on `peer.sample()` therefore
 /// holds the server mutex while it waits for the client's answer — and that
 /// answer arrives as a POST whose first stages all take the same mutex:
 ///

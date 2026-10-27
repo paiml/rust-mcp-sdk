@@ -77,6 +77,10 @@ pub(crate) mod v1;
 // ---------------------------------------------------------------------------
 pub(crate) mod peer_channel;
 
+// How the transport reaches its `Server`; see its module doc (field report F-4).
+pub(crate) mod server_handle;
+use server_handle::ServerHandle;
+
 /// Event store trait for resumability support.
 ///
 /// # This is NOT `crate::shared::event_store::EventStore`
@@ -476,7 +480,7 @@ impl StreamableHttpServerConfig {
 /// Server state shared across routes.
 #[derive(Clone)]
 pub(crate) struct ServerState {
-    server: Arc<tokio::sync::Mutex<Server>>,
+    server: ServerHandle,
     config: Arc<StreamableHttpServerConfig>,
     /// Pre-resolved allowed origins for CORS and DNS rebinding protection.
     allowed_origins: AllowedOrigins,
@@ -520,7 +524,7 @@ pub(crate) fn build_mcp_router(state: ServerState) -> Router<()> {
 /// Used by `pmcp::axum::router()` to construct state without a full
 /// [`StreamableHttpServer`].
 pub(crate) fn make_server_state(
-    server: Arc<tokio::sync::Mutex<Server>>,
+    server: ServerHandle,
     config: StreamableHttpServerConfig,
 ) -> ServerState {
     let allowed_origins = config
@@ -911,7 +915,7 @@ async fn map_unparsed_body_for_v2(
     // nothing.
     let raw_meta = params_meta_of(Some(&envelope));
     let resolved = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.resolve_raw_meta_protocol_context(raw_meta)
     };
     let Ok(Some(context)) = resolved else {
@@ -1563,9 +1567,9 @@ fn v2_retirement_message(retired: &'static str, replacement: Option<&'static str
 //
 // # Why the level is NOT stored on the server
 //
-// `ServerState::server` is one `Arc<tokio::sync::Mutex<Server>>` shared by every
-// session. A level held there would let client B's `setLevel` change client A's
-// filtering (T-118.2-07-01). The per-session home is also the correct lifetime:
+// `ServerState::server` is one `Server` shared by every session. A level held
+// there would let client B's `setLevel` change client A's filtering
+// (T-118.2-07-01). The per-session home is also the correct lifetime:
 // `setLevel` is a v1 RPC, and on a `full-v2` build `V1State` is a zero-sized twin
 // that allocates nothing for a mechanism that build does not have.
 //
@@ -2091,7 +2095,7 @@ async fn run_v2_header_gate(
     // below is a full `serde_json` walk of an arbitrarily large request, and on a
     // v1-only server every byte of its output was discarded.
     {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         if !crate::types::protocol::context::is_v2_opted_in(server.supported_protocol_versions()) {
             return (None, V2GateOutcome::Passthrough);
         }
@@ -2119,7 +2123,7 @@ async fn run_v2_header_gate(
     // on every request — under the server mutex — bought nothing: the happy path
     // never reads it.
     let resolved = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         // D-04 IS EVALUATED FIRST, and the disagreement short-circuit is INSIDE
         // that guard rather than above it. A server that never opted into v2
         // enforces NOTHING — `resolve_raw_meta_protocol_context` answers
@@ -2391,18 +2395,67 @@ fn classify_http_ingress(body: &[u8]) -> Option<HttpIngress> {
 }
 
 impl StreamableHttpServer {
-    /// Creates a new `StreamableHttpServer` with default config
+    /// Creates a new `StreamableHttpServer` with default config.
+    ///
+    /// # Requests are handled one at a time
+    ///
+    /// The transport takes `server`'s mutex for every request and holds it while
+    /// the handler runs, so a long tool call blocks every other request on this
+    /// process, including `initialize` and `server/discover`. Use
+    /// [`Self::new_concurrent`] to serve requests in parallel; it is the right
+    /// choice for any container deployment that accepts more than one
+    /// concurrent request per instance.
     pub fn new(addr: SocketAddr, server: Arc<tokio::sync::Mutex<Server>>) -> Self {
         Self::with_config(addr, server, StreamableHttpServerConfig::default())
     }
 
-    /// Creates a new `StreamableHttpServer` with custom config
+    /// Creates a new `StreamableHttpServer` with custom config.
+    ///
+    /// Serializes request handling exactly as [`Self::new`] does; see
+    /// [`Self::with_config_concurrent`] for the concurrent equivalent.
     pub fn with_config(
         addr: SocketAddr,
         server: Arc<tokio::sync::Mutex<Server>>,
         config: StreamableHttpServerConfig,
     ) -> Self {
-        let state = make_server_state(server, config);
+        let state = make_server_state(server.into(), config);
+        Self { addr, state }
+    }
+
+    /// Creates a new `StreamableHttpServer` that handles requests concurrently,
+    /// with default config.
+    ///
+    /// Every `Server` entry point takes `&self` and keeps its mutable state
+    /// behind its own locks, so requests share `server` without an outer mutex
+    /// and a slow tool call no longer delays anyone else's.
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> pmcp::Result<()> {
+    /// use std::sync::Arc;
+    /// use pmcp::server::streamable_http_server::StreamableHttpServer;
+    ///
+    /// let server = pmcp::Server::builder().name("demo").version("1.0.0").build()?;
+    /// let http = StreamableHttpServer::new_concurrent(
+    ///     "0.0.0.0:8080".parse().unwrap(),
+    ///     Arc::new(server),
+    /// );
+    /// let (_addr, handle) = http.start().await?;
+    /// # handle.abort();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_concurrent(addr: SocketAddr, server: Arc<Server>) -> Self {
+        Self::with_config_concurrent(addr, server, StreamableHttpServerConfig::default())
+    }
+
+    /// Creates a new `StreamableHttpServer` that handles requests concurrently,
+    /// with custom config. See [`Self::new_concurrent`].
+    pub fn with_config_concurrent(
+        addr: SocketAddr,
+        server: Arc<Server>,
+        config: StreamableHttpServerConfig,
+    ) -> Self {
+        let state = make_server_state(server.into(), config);
         Self { addr, state }
     }
 
@@ -2534,7 +2587,7 @@ async fn v2_verb_rejection(
         return None;
     }
     let opted_in = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         crate::types::protocol::context::is_v2_opted_in(server.supported_protocol_versions())
     };
     v2_method_not_allowed(headers, verb, opted_in)
@@ -3117,7 +3170,7 @@ async fn extract_and_validate_auth(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> std::result::Result<Option<crate::server::auth::AuthContext>, Response> {
-    let server = state.server.lock().await;
+    let server = state.server.get().await;
     if let Some(auth_provider) = server.get_auth_provider() {
         // Extract Authorization header
         let auth_header = headers
@@ -3555,7 +3608,7 @@ async fn extract_auth_with_middleware(
     http_middleware: &ServerHttpMiddlewareChain,
     context: &ServerHttpContext,
 ) -> std::result::Result<Option<crate::server::auth::AuthContext>, Response> {
-    let server = state.server.lock().await;
+    let server = state.server.get().await;
     let Some(auth_provider) = server.get_auth_provider() else {
         return Ok(None);
     };
@@ -3973,7 +4026,7 @@ async fn assemble_discover_response_fast(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_discover(id, protocol_context)
     };
     assemble_internal_fast(
@@ -4029,7 +4082,7 @@ async fn tasks_update_json_response(
     state: &ServerState,
     call: &TasksUpdateCall<'_>,
 ) -> crate::types::JSONRPCResponse {
-    let server = state.server.lock().await;
+    let server = state.server.get().await;
     server
         .handle_tasks_update(
             call.id.clone(),
@@ -4128,7 +4181,7 @@ async fn assemble_skills_list_fast(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_skills_list(id, protocol_context)
     };
     assemble_internal_fast(
@@ -4158,7 +4211,7 @@ async fn assemble_skills_list_with_middleware(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_skills_list(id, protocol_context)
     };
     assemble_internal_with_middleware(
@@ -4209,7 +4262,7 @@ async fn assemble_skills_get_fast(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_skills_get(id, params, protocol_context)
     };
     assemble_internal_fast(
@@ -4240,7 +4293,7 @@ async fn assemble_skills_get_with_middleware(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_skills_get(id, params, protocol_context)
     };
     assemble_internal_with_middleware(
@@ -4318,7 +4371,7 @@ async fn dispatch_public_request(
     auth_context: Option<crate::server::auth::AuthContext>,
     protocol_context: Option<crate::types::protocol::ProtocolContext>,
 ) -> crate::types::JSONRPCResponse {
-    let server = state.server.lock().await;
+    let server = state.server.get().await;
     server
         .handle_request_with_context(id, request, auth_context, protocol_context)
         .await
@@ -4351,10 +4404,11 @@ struct ListenServerView {
 /// Read the listen route's view of the server under ONE lock acquisition.
 ///
 /// The registry is taken here rather than re-locking at registration time: the
-/// whole point of this struct is that the listen route touches the server mutex
-/// — which serializes all dispatch on this transport — exactly once.
+/// whole point of this struct is that the listen route borrows the server —
+/// which, on the legacy `Locked` path, serializes all dispatch on this
+/// transport — exactly once.
 async fn listen_server_view(state: &ServerState) -> ListenServerView {
-    let server = state.server.lock().await;
+    let server = state.server.get().await;
     ListenServerView {
         capabilities: server.capabilities().clone(),
         info: server.info().clone(),
@@ -5202,7 +5256,7 @@ async fn assemble_discover_response_with_middleware(
 ) -> Response {
     let live_id = id.clone();
     let json_response = {
-        let server = state.server.lock().await;
+        let server = state.server.get().await;
         server.handle_discover(id, protocol_context)
     };
     assemble_internal_with_middleware(
@@ -7196,7 +7250,7 @@ mod tests {
             .build()
             .expect("server builds");
         make_server_state(
-            Arc::new(tokio::sync::Mutex::new(server)),
+            Arc::new(tokio::sync::Mutex::new(server)).into(),
             StreamableHttpServerConfig::default(),
         )
     }

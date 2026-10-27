@@ -53,7 +53,7 @@ async fn main() -> Result<(), Error> {
 
 /// Start the StreamableHttpServer on localhost in a background task.
 async fn start_http_in_background(server: pmcp::Server) -> Result<SocketAddr, Error> {
-    let server = std::sync::Arc::new(tokio::sync::Mutex::new(server));
+    let server = std::sync::Arc::new(server);
     let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
 
     let config = pmcp::server::streamable_http_server::StreamableHttpServerConfig {
@@ -67,9 +67,10 @@ async fn start_http_in_background(server: pmcp::Server) -> Result<SocketAddr, Er
         max_request_bytes: pmcp::server::limits::DEFAULT_MAX_REQUEST_BYTES,
     };
 
-    let http_server = pmcp::server::streamable_http_server::StreamableHttpServer::with_config(
-        addr, server, config,
-    );
+    let http_server =
+        pmcp::server::streamable_http_server::StreamableHttpServer::with_config_concurrent(
+            addr, server, config,
+        );
 
     let (bound, handle) = http_server
         .start()

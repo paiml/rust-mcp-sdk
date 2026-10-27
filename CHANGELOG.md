@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Fixed
+
+- **The streamable-HTTP server can now handle requests concurrently.** Field report F-4 (pmcp
+  2.22.7): the transport held the server mutex for a tool handler's whole duration, so one long
+  `tools/call` stalled every other request on the process, `initialize` and `server/discover`
+  included. On Cloud Run at concurrency 80, trivial calls measured p50 28.2 s behind a single 30 s
+  call. Every `Server` entry point takes `&self` and guards its own state, so the outer mutex
+  protected nothing.
+
+### Added
+
+- `StreamableHttpServer::new_concurrent` / `with_config_concurrent` and
+  `pmcp::axum::concurrent_router` / `concurrent_router_with_config`, which take an `Arc<Server>`
+  and dispatch requests in parallel. The existing `Arc<Mutex<Server>>` constructors are unchanged
+  and still serialize, because callers own that mutex; their docs now say so. `pmcp-sql-server`,
+  `pmcp-openapi-server`, `pmcp-workbook-server` and `pmcp-server` use the concurrent constructors.
+
 ## [2.22.7] - 2026-10-04
 
 Ships `cargo-pmcp` **0.28.1** (#413), with the follow-ups found by the 0.28.0 live check against
