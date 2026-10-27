@@ -735,7 +735,7 @@ mod tests {
         let mut out = HashMap::new();
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).expect("zip entry");
-            let name = entry.name().to_string();
+            let name = entry.name().expect("entry name").to_string();
             let mode = entry.unix_mode().unwrap_or(0);
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut entry, &mut buf).expect("read entry");
@@ -1464,7 +1464,14 @@ mod tests {
         let file = std::fs::File::open(&zip_path).expect("open zip");
         let mut archive = zip::ZipArchive::new(file).expect("parse zip");
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).expect("entry").name().to_string())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .expect("entry")
+                    .name()
+                    .expect("entry name")
+                    .to_string()
+            })
             .collect();
         let mut sorted = names.clone();
         sorted.sort();

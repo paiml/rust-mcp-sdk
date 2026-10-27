@@ -1015,9 +1015,9 @@ mod tests {
                 entry.last_modified(),
                 Some(zip::DateTime::DEFAULT),
                 "{} carries the build time",
-                entry.name()
+                entry.name().expect("entry name")
             );
-            names.push(entry.name().to_string());
+            names.push(entry.name().expect("entry name").to_string());
         }
         let mut sorted = names.clone();
         sorted.sort();
@@ -1102,7 +1102,7 @@ mod tests {
             std::collections::HashMap::new();
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).unwrap();
-            let name = entry.name().to_string();
+            let name = entry.name().expect("entry name").to_string();
             let mut buf = String::new();
             // bootstrap is binary; ignore read errors for non-UTF8 entries.
             use std::io::Read;

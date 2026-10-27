@@ -86,6 +86,12 @@
 # tooling. Randomness is not signing; these are admitted as dev-tooling, and
 # their presence is precisely why `exclude-dev = false` below matters.
 #
+# proptest 1.12 (2026-10-10) swapped `rand_chacha` for `chacha20` built with
+# ONLY its `rng` feature, plus `core_detect` (CPU-feature detection) to pick the
+# SIMD backend. Same role, same dev-only path: it is the test RNG, not a cipher
+# or signature in pmcp-package's graph. `rand_chacha` stays listed for proptest
+# 1.11 resolutions.
+#
 # ===========================================================================
 # WHAT THIS GATE CANNOT SEE (repo convention: a mechanism states its blind
 # spots — see cargo-pmcp/tests/pmcp_package_pin.rs for the same discipline)
@@ -181,8 +187,10 @@ allow = [
   { name = "bitflags" },
   { name = "block-buffer" },
   { name = "cfg-if" },
+  { name = "chacha20" },
   { name = "const_format" },
   { name = "const_format_proc_macros" },
+  { name = "core_detect" },
   { name = "cpufeatures" },
   { name = "crypto-common" },
   { name = "darling" },

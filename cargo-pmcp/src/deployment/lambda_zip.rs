@@ -149,7 +149,7 @@ mod tests {
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut entry, &mut bytes).expect("read entry");
                 Seen {
-                    name: entry.name().to_string(),
+                    name: entry.name().expect("entry name").to_string(),
                     modified: entry.last_modified(),
                     mode: entry.unix_mode().map(|m| m & 0o777),
                     bytes,

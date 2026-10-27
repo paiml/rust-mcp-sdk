@@ -85,8 +85,13 @@ umya-spreadsheet = "=3.0.0"
 # 0.37.x, zip 8.6.x via `cargo tree -p umya-spreadsheet`) so Cargo.lock keeps ONE
 # copy each (no forked second version). The reader stays pub(crate)-quarantined:
 # no quick-xml/zip type ever crosses a public signature (T-93-02-LEAK).
+#
+# zip's features mirror umya's own (`default-features = false`, `deflate`): an
+# .xlsx part is only ever stored or deflated, and zip's DEFAULT features drag in
+# zstd 0.13, which carries RUSTSEC-2026-0391/0398/0403. zip itself stays on 8.6
+# because umya 3.x pins `^8.6`; see `.cargo/audit.toml` for the zip advisories.
 quick-xml = "0.37"
-zip = "8.6"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # Test-only scratch dirs for the bundle-emit tests (no workspace artifacts leak).
@@ -98,7 +103,7 @@ tempfile = "3"
 # cached `<v>` results via `Formula::set_result` — the Plan 04 reconcile oracle.
 # Dev-only: the compiler never links a writer at runtime. Version mirrors the
 # runtime crate's pin (0.95, default-features off).
-rust_xlsxwriter = { version = "0.99", default-features = false }
+rust_xlsxwriter = { version = "0.101", default-features = false }
 # The CONSUMER contract: the direct toolkit loader round-trip test
 # (`emitted_bundle_loads_via_toolkit`) loads an emitted temp bundle through the
 # Phase 92 served loader. The `workbook` feature pulls the LocalDirSource + the

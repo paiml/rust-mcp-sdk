@@ -61,4 +61,23 @@ ignore = [
 
     # quick-xml 0.37.5: same crate/pin/path/tracking as RUSTSEC-2026-0194 above.
     "RUSTSEC-2026-0195",
+
+    # zip < 9.0.0: `ZipArchive::extract` / `ZipStreamReader::extract` preserve
+    # SUID/SGID bits (0367), follow attacker-controlled symlink targets (0368)
+    # and apply archive-supplied Unix permissions (0369). Published 2026-10-09/10.
+    # Every in-tree pin that CAN move is on zip 9 (cargo-pmcp, rust_xlsxwriter
+    # 0.101, the workbook-runtime dev-dep). Two copies cannot:
+    #   - zip 8.6: pmcp-workbook-compiler -> umya-spreadsheet 3.x, which pins
+    #     `^8.6` (only 4.0.0-beta moves to zip 9). umya and our raw reader only
+    #     read entries into memory; neither calls `extract`.
+    #   - zip 0.6: mcp-e2e-tests (publish = false) -> chromiumoxide_fetcher 0.9.1
+    #     (latest), whose zip features are `^0.6` or `^8`. It DOES call `extract`,
+    #     on the Chromium archive it downloads for the browser tests. Test-only.
+    # No shipped crate calls `extract`. Because cargo-audit ignores by ID, these
+    # entries also hide a NEW zip < 9 consumer: check `cargo tree -i zip` when
+    # adding one. Remove when umya ships a stable zip-9 release and
+    # chromiumoxide_fetcher moves off `^8`.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
