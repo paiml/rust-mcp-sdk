@@ -17,6 +17,9 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode: transitive, widely used, no drop-in replacement" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: transitive, no safe upgrade available" },
     { id = "RUSTSEC-2026-0002", reason = "lru 0.12.5: transitive via ratatui, fixed in 0.16 but ratatui pins 0.12" },
+    # Added to advisory-db mid-October 2026 (informational, no patched version);
+    # `.cargo/audit.toml` already allows it as a warning.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: via serde_yaml 0.9 (pmcp `skills` feature, mcp-tester); remove when serde_yaml moves to a safe-Rust parser such as serde-saphyr" },
 ]
 
 [licenses]
