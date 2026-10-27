@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and still serialize, because callers own that mutex; their docs now say so. `pmcp-sql-server`,
   `pmcp-openapi-server`, `pmcp-workbook-server` and `pmcp-server` use the concurrent constructors.
 
+### Documentation
+
+- **Tasks docs now match the `task_store(...)` path** (field report F-5, F-7, F-8). Covered in the
+  `task_store` rustdoc on both builders, the pmcp-book and pmcp-course Tasks chapters,
+  `docs/TASKS_WITH_POLLING.md` and the `pmcp-tasks` crate docs:
+  - `pmcp-tasks`' DynamoDB and Redis stores plug into the legacy `TaskRouter` path only.
+    `InMemoryTaskStore` is the only store `task_store(...)` accepts out of the box, so
+    multi-instance deployments need their own `TaskStore` implementation.
+  - Without authentication, tasks share an owner bucket (`"local"` on v1, `""` on v2), so any
+    caller holding a task id can read the task.
+  - The owner is the OAuth subject, not the `client_id`, as `TASKS_WITH_POLLING.md` had claimed.
+  - The high-level `Server::builder()` does take `task_store(...)`. Three pages said it did not.
+  - Long work belongs in a task, because hosts don't reliably cancel an abandoned synchronous call.
+- Corrected an internal comment that said the production stores refuse the shared anonymous owner
+  on the `task_store(...)` path. They aren't reachable there.
+
 ## [2.22.7] - 2026-10-04
 
 Ships `cargo-pmcp` **0.28.1** (#413), with the follow-ups found by the 0.28.0 live check against

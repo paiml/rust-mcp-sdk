@@ -81,7 +81,26 @@ let result = client.tasks_result(&task_id).await?;
 
 `client.tasks_list(cursor)` and `client.tasks_cancel(&task_id)` round out the typed client surface.
 
-> **Scope caveat (current SDK).** Task dispatch and the `TaskStore` live on `ServerCoreBuilder` / `ServerCore`. The high-level `pmcp::Server` (and `StreamableHttpServer`) does **not** yet carry a `TaskStore` — wire the task path through `ServerCore` for now. For a complete, runnable end-to-end round-trip (initialize → call-with-task → poll → result), see the reference example [`examples/s45_tool_as_task_lifecycle.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s45_tool_as_task_lifecycle.rs).
+Both `ServerCoreBuilder` and the high-level `Server::builder()` take `task_store(...)`, so the same pattern works behind `StreamableHttpServer`. For a complete, runnable end-to-end round-trip (initialize → call-with-task → poll → result), see the reference example [`examples/s45_tool_as_task_lifecycle.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s45_tool_as_task_lifecycle.rs).
+
+### Persistence: one instance or many
+
+`InMemoryTaskStore` is the only `TaskStore` implementation in the SDK. Its tasks are lost when the process restarts, and they are not shared between instances, so a task created on one instance cannot be polled on another. That rules it out for any deployment that runs more than one instance: every AWS Lambda deployment, and any container service that scales out. Such a server needs its own implementation of `pmcp::server::task_store::TaskStore` over a shared database such as DynamoDB, Firestore, Redis or Postgres. The trait's required methods are `create`, `get`, `update_status`, `list`, `cancel`, `cleanup_expired` and `config`. Every lookup takes the owner id and must return `NotFound` for a task that belongs to someone else.
+
+> **The `pmcp-tasks` backends don't plug in here.** The DynamoDB and Redis stores in `pmcp-tasks` implement that crate's own `TaskStore` trait, which serves the [legacy router path](#legacy-setting-up-taskstore-via-pmcp-tasks) below. `task_store(...)` doesn't accept them.
+
+### Owner isolation needs authentication
+
+Every task is bound to an owner, and `tasks/get`, `tasks/result`, `tasks/list` and `tasks/cancel` serve a task only to its owner. The owner is the authenticated OAuth subject, so isolation is only as strong as authentication:
+
+| Request | Auth provider | Owner |
+|---|---|---|
+| authenticated (v1 or v2) | any | the token's `sub` |
+| unauthenticated v1 | any | `"local"`, shared by every such caller |
+| unauthenticated v2 | configured | none: task creation is refused |
+| unauthenticated v2 | none | `""`, shared by every such caller |
+
+On a server without an auth provider, then, anyone who holds a task id can read that task's status and result. Task ids are random v4 UUIDs, which makes guessing one impractical, but nothing else protects the task. That is fine for a public demo. For anything private, configure `auth_provider(...)` on the builder.
 
 The rest of this chapter explains *why* the polling model exists, the task state machine, and the legacy `pmcp-tasks` path you may still encounter in older code.
 
@@ -102,7 +121,9 @@ Tasks replace the single request/response exchange with a two-phase pattern:
 - **Phase 1: Accept.** The server receives the request, creates a durable task record, and immediately returns a `CreateTaskResult` with a task ID and polling metadata.
 - **Phase 2: Poll.** The client calls `tasks/get` at intervals until the task reaches a terminal status, then retrieves the result with `tasks/result`.
 
-Because the task state lives in a store (not in connection state), this model is compatible with stateless deployments. A Lambda function can create the task on one invocation and serve the result on a completely different invocation minutes later.
+Because the task state lives in a store (not in connection state), this model is compatible with stateless deployments. A Lambda function can create the task on one invocation and serve the result on a completely different invocation minutes later, provided the store is shared between instances (see [Persistence](#persistence-one-instance-or-many)).
+
+> **Don't rely on a host timeout to stop the work.** When a host gives up on a long synchronous `tools/call`, the platform does not necessarily cancel the handler. On Cloud Run, handlers have been observed running about two minutes after the client disconnected, still occupying the instance. Long work belongs in a task or a background job, not in a synchronous call with a timeout. On the streamable-HTTP transport, also build the server with `StreamableHttpServer::new_concurrent` (or `pmcp::axum::concurrent_router`): the older `Arc<Mutex<Server>>` constructors handle one request at a time, so a single abandoned call there blocks every other request on the process.
 
 ```
 Phase 1: Accept                          Phase 2: Poll
@@ -194,9 +215,9 @@ The client can also list all its tasks with `tasks/list` and cancel an in-progre
 
 ## Legacy: Setting Up TaskStore via `pmcp-tasks`
 
-> **Legacy / experimental path.** The sections from here through "Writing Dual-Path Tool Handlers" describe the older `pmcp-tasks` + `TaskRouter` approach, where you hand-construct the store, wire it with `with_task_store(...)`, and emit `task` JSON by hand inside the handler. New code should prefer the [Recommended Pattern](#recommended-pattern-tools-as-tasks) above (`task_store(...)` + `with_task_support`), which removes the hand-rolled JSON entirely. The material below is retained because you may encounter it in existing servers and because the production backends (DynamoDB, Redis) documented here are still the way to persist tasks.
+> **Legacy / experimental path.** The sections from here through "Writing Dual-Path Tool Handlers" describe the older `pmcp-tasks` + `TaskRouter` approach, where you hand-construct the store, wire it with `with_task_store(...)`, and emit `task` JSON by hand inside the handler. New code should prefer the [Recommended Pattern](#recommended-pattern-tools-as-tasks) above (`task_store(...)` + `with_task_support`), which removes the hand-rolled JSON entirely. The material below is retained because you may encounter it in existing servers. The DynamoDB and Redis backends documented here work **only** on this legacy path: they implement `pmcp-tasks`' own `TaskStore` trait, not the one `task_store(...)` takes (see [Persistence](#persistence-one-instance-or-many)).
 
-Tasks need persistent storage. The `pmcp-tasks` crate provides the `TaskStore` trait and two ready-made backends:
+Tasks need persistent storage. The `pmcp-tasks` crate provides its own `TaskStore` trait and two ready-made backends for it:
 
 | Backend | Crate Feature | Use Case |
 |---------|--------------|----------|

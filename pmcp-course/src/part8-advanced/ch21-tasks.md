@@ -78,7 +78,7 @@ Client                    Lambda                    DynamoDB
   │<── CallToolResult ──────│                          │
 ```
 
-Each arrow to Lambda is a fresh invocation. The `TaskStore` (backed by DynamoDB, Redis, or another external store) provides the continuity that the stateless compute layer cannot.
+Each arrow to Lambda is a fresh invocation, possibly on a different instance. The `TaskStore`, backed by DynamoDB, Redis or another external store, provides the continuity that the stateless compute layer cannot. That only works if the store is shared: an in-memory store on one instance is invisible to the next.
 
 ## TaskStore: The External State Bridge
 
@@ -91,20 +91,23 @@ use std::sync::Arc;
 // For development and testing: in-memory store
 let store = Arc::new(InMemoryTaskStore::new());
 
-// For production: use pmcp-tasks crate with DynamoDB or Redis
-// let backend = DynamoDbBackend::new(client, table_name);
-// let store = Arc::new(GenericTaskStore::new(backend));
+// For production: your own `impl TaskStore` over a shared database
+// let store = Arc::new(MyDynamoDbTaskStore::new(client, table_name));
 ```
 
-The SDK provides `InMemoryTaskStore` for development. For production, the `pmcp-tasks` crate provides DynamoDB and Redis backends that survive Lambda cold starts and container restarts.
+The SDK provides `InMemoryTaskStore` for development. It is the only `TaskStore` implementation in the SDK, and its tasks don't survive a restart or reach other instances. For Lambda or any deployment that scales out, implement `pmcp::server::task_store::TaskStore` over a shared database. The required methods are `create`, `get`, `update_status`, `list`, `cancel`, `cleanup_expired` and `config`, and every lookup is scoped to the owner id.
 
-> **Recommended pattern (read the next section with this in mind).** The clean way to expose a tool as a Task is to declare `with_task_support` on the tool and register the store with `task_store(...)` on `ServerCoreBuilder`. The SDK then mints the task id, auto-advertises the `tasks` capability, and serves `tasks/get | result | list | cancel` typed from the store -- **you never hand-write `tasks/*` wire JSON**. The runnable reference is [`examples/s45_tool_as_task_lifecycle.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s45_tool_as_task_lifecycle.rs). Note the task path lives on `ServerCoreBuilder` / `ServerCore`; the high-level `pmcp::Server` (and `StreamableHttpServer`) does not yet carry a `TaskStore`.
+> **What about `pmcp-tasks`?** Its DynamoDB and Redis backends implement that crate's own `TaskStore` trait. They plug into the legacy `with_task_store(TaskRouterImpl)` path, not into `task_store(...)`.
 
-| Backend | Crate | Use Case |
-|---------|-------|----------|
-| `InMemoryTaskStore` | `pmcp` (core) | Development, testing, single-process servers |
-| `GenericTaskStore<DynamoDbBackend>` | `pmcp-tasks` | AWS Lambda, serverless, multi-instance |
-| `GenericTaskStore<RedisBackend>` | `pmcp-tasks` | Low-latency, container-based deployments |
+> **Recommended pattern (read the next section with this in mind).** The clean way to expose a tool as a Task is to declare `with_task_support` on the tool and register the store with `task_store(...)` on `ServerCoreBuilder`. The SDK then mints the task id, auto-advertises the `tasks` capability, and serves `tasks/get | result | list | cancel` typed from the store -- **you never hand-write `tasks/*` wire JSON**. The runnable reference is [`examples/s45_tool_as_task_lifecycle.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s45_tool_as_task_lifecycle.rs). The high-level `Server::builder()` takes `task_store(...)` too, so the same pattern works behind `StreamableHttpServer`.
+
+| Backend | Plugs into | Use Case |
+|---------|-----------|----------|
+| `InMemoryTaskStore` (`pmcp`) | `task_store(...)` | Development, testing, single-instance servers |
+| Your own `impl TaskStore` over a shared database | `task_store(...)` | AWS Lambda, serverless, multi-instance |
+| `GenericTaskStore<DynamoDbBackend>` / `<RedisBackend>` (`pmcp-tasks`) | legacy `with_task_store(TaskRouterImpl)` only | Existing servers on the router path |
+
+**Owner isolation needs authentication.** Each task is served only to its owner, the authenticated OAuth subject. Unauthenticated callers share one bucket (`"local"` on v1, `""` on a v2 server with no auth provider), so on a server without auth anyone holding a task id can read the task. Configure an auth provider before storing anything private.
 
 **Key point:** The `TaskStore` is not just storage -- it enforces the MCP state machine. Transitions like `completed -> working` are rejected at the store level, not in your handler code. This means you cannot accidentally corrupt task state regardless of how your handler logic is structured.
 

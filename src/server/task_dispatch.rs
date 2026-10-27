@@ -1226,10 +1226,17 @@ impl TaskDispatch<'_> {
     /// tasks in a single shared bucket BY DESIGN. That is a development / stdio
     /// affordance, NOT per-caller isolation, and it is defensible only because
     /// such a server has no notion of caller identity to separate in the first
-    /// place. The production backends refuse that bucket independently:
-    /// `TaskSecurityConfig::default()` sets `allow_anonymous: false`
-    /// (`crates/pmcp-tasks/src/security.rs:89`), so `GenericTaskStore` rejects an
-    /// anonymous owner unless an operator opts in (T-114-39).
+    /// place.
+    ///
+    /// Nothing on the `task_store()` path refuses that bucket. `pmcp-tasks`'
+    /// `TaskSecurityConfig::default()` does set `allow_anonymous: false`
+    /// (`crates/pmcp-tasks/src/security.rs`), so its `GenericTaskStore` rejects
+    /// an anonymous owner unless an operator opts in (T-114-39). But that store
+    /// implements `pmcp-tasks`' own `TaskStore` trait and reaches a server only
+    /// through a legacy [`TaskRouter`]. The SDK's `InMemoryTaskStore` accepts
+    /// the shared bucket, as does any operator-written store that does not check
+    /// for it. The `task_store()` builder docs say so to users (pmcp 2.22.7
+    /// field report F-8).
     ///
     /// TASK-05's own wording says owner binding "fails closed" when no stable
     /// identity exists, which row 3 does not do; that gap is recorded as its own

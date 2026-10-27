@@ -1164,14 +1164,47 @@ impl ServerCoreBuilder {
     ///   `tasks/result`, `tasks/list` and `tasks/cancel`; v2 (2026-07-28)
     ///   serves `tasks/get`, `tasks/update` and `tasks/cancel`, and answers
     ///   `-32601` for the two retired methods
-    /// - Resolves task owner from auth context. **v1** falls back through OAuth
-    ///   subject → client ID → session ID; **v2** has no session to fall back
-    ///   to and binds fail-closed on an auth-configured server (TASK-05, D-07)
+    /// - Binds every task to an owner, and serves it only to that owner. See
+    ///   *Owner isolation needs authentication* below.
     ///
     /// A tool declaring
     /// [`TaskSupport::Required`](crate::types::tools::TaskSupport::Required)
     /// with NO store (or router) makes [`Self::build`] return an `Err`, rather
     /// than advertising a hollow `tasks` capability whose endpoints cannot work.
+    ///
+    /// # Owner isolation needs authentication
+    ///
+    /// The owner is the authenticated OAuth subject. A caller without one has
+    /// no identity to isolate, so it lands in a bucket it shares:
+    ///
+    /// | Request | Auth provider | Owner |
+    /// |---|---|---|
+    /// | authenticated (v1 or v2) | any | the token's `sub` |
+    /// | unauthenticated v1 | any | `"local"`, shared by every such caller |
+    /// | unauthenticated v2 | configured | none: task creation is refused |
+    /// | unauthenticated v2 | none | `""`, shared by every such caller |
+    ///
+    /// On a server with no auth provider, anyone holding a task id can
+    /// therefore read that task's status and result. Task ids are random v4
+    /// UUIDs, but nothing else stands between a caller and a task.
+    /// [`InMemoryTaskStore`](crate::server::task_store::InMemoryTaskStore) does
+    /// not refuse the shared owners. Configure [`Self::auth_provider`] before
+    /// storing results that are not public.
+    ///
+    /// # Persistence
+    ///
+    /// [`InMemoryTaskStore`](crate::server::task_store::InMemoryTaskStore) is
+    /// the only [`TaskStore`](crate::server::task_store::TaskStore)
+    /// implementation in the SDK. Its tasks are lost on restart and are not
+    /// shared between instances, so a task created on one instance cannot be
+    /// polled on another. Any deployment that runs more than one instance
+    /// (every AWS Lambda deployment, a scaled container service) needs its own
+    /// implementation over a shared database.
+    ///
+    /// The `pmcp-tasks` crate's `DynamoDbBackend` and `RedisBackend` do **not**
+    /// plug in here: they implement that crate's own `TaskStore` trait and
+    /// reach a server only through the legacy router path,
+    /// [`Self::with_task_store`].
     ///
     /// See `examples/s45_tool_as_task_lifecycle.rs` for the full client
     /// round-trip.

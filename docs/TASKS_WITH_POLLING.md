@@ -37,10 +37,12 @@ let server = ServerCoreBuilder::new()
 The builder:
 - Sets the standard top-level `ServerCapabilities.tasks` automatically (list, cancel, tools/call) **because a store backs the endpoints** — a `TaskSupport::Required` tool with **no** store makes `build()` return `Err` (no hollow capability)
 - Dispatches `tasks/get`, `tasks/list`, `tasks/cancel`, and `tasks/result` through your store, serialized from typed structs
-- Resolves task owners from auth context for multi-tenant isolation
+- Binds each task to its owner, the authenticated OAuth subject (isolation needs authentication; see [Owner Resolution](#owner-resolution))
 - Mints the task id in the store and returns it to the client; returns `CreateTaskResult` or `CallToolResult` based on the client's request
 
-> **Scope caveat (current SDK):** the `TaskStore` path lives on `ServerCoreBuilder` / `ServerCore`. The high-level `pmcp::Server` (and `StreamableHttpServer`) does not yet carry a `TaskStore`. For a complete runnable round-trip, see [`examples/s45_tool_as_task_lifecycle.rs`](../examples/s45_tool_as_task_lifecycle.rs).
+Both `ServerCoreBuilder` and the high-level `Server::builder()` take `task_store(...)`, so the same setup works behind `StreamableHttpServer`. For a complete runnable round-trip, see [`examples/s45_tool_as_task_lifecycle.rs`](../examples/s45_tool_as_task_lifecycle.rs).
+
+> **Long work belongs in a task, not behind a timeout.** A host that gives up on a slow synchronous `tools/call` does not necessarily stop the handler; on Cloud Run, handlers have been observed running about two minutes after the client left. On the streamable-HTTP transport, build the server with `StreamableHttpServer::new_concurrent` so one long call doesn't hold up the others.
 
 > **Legacy path:** `with_task_store(Arc<dyn TaskRouter>)` (wrapping a store in `pmcp_tasks::TaskRouterImpl`) is the older experimental wiring; it advertises under `experimental.tasks` and expects hand-emitted `task` JSON. Prefer `task_store(...)` + `with_task_support` for new code.
 
@@ -344,7 +346,9 @@ impl TaskStore for MyDatabaseStore {
 }
 ```
 
-For production backends (DynamoDB, Redis), see the `pmcp-tasks` crate.
+`InMemoryTaskStore` is the only implementation in the SDK. Its tasks don't survive a restart and aren't shared between instances, so any deployment that runs more than one instance (every Lambda deployment, any container service that scales out) needs an implementation like the one above over a shared database.
+
+The DynamoDB and Redis backends in the `pmcp-tasks` crate implement that crate's **own** `TaskStore` trait and plug in only through the legacy `with_task_store(TaskRouterImpl)` path. They do not implement this trait, and `task_store(...)` doesn't accept them.
 
 ## Configuration
 
@@ -406,13 +410,18 @@ Expired tasks are filtered from `get()`, `list()`, and the `max_tasks_per_owner`
 
 When a request arrives, the server resolves the task owner from the auth context:
 
-| Auth Present | Owner ID |
-|-------------|----------|
-| OAuth token with `client_id` | `client_id` |
-| OAuth token without `client_id` | `subject` (sub claim) |
-| No auth | `"local"` (single-tenant) |
+| Request | Auth provider | Owner ID |
+|---|---|---|
+| Authenticated (v1 or v2) | any | `subject` (the `sub` claim) |
+| Unauthenticated v1 (2025-11-25) | any | `"local"`, shared by every such caller |
+| Unauthenticated v2 (2026-07-28) | configured | none: task creation is refused |
+| Unauthenticated v2 (2026-07-28) | none | `""`, shared by every such caller |
 
-This means multi-tenant deployments with OAuth get automatic task isolation -- User A cannot see or cancel User B's tasks.
+The owner is never the OAuth `client_id`: that identifies the client application, so keying on it would put every user of the same application in one bucket.
+
+With OAuth, User A therefore cannot see or cancel User B's tasks. Without it, every caller shares a bucket, so anyone holding a task id can read that task's status and result. Task ids are random v4 UUIDs, but nothing else protects them. Configure an auth provider before storing results that are not public. `InMemoryTaskStore` does not refuse the shared owners.
+
+The legacy `TaskRouter` path resolves owners differently (subject, then client ID, then session ID), and `pmcp-tasks`' stores refuse the shared `"local"` owner unless `TaskSecurityConfig::with_allow_anonymous(true)` is set.
 
 ## Architecture
 
@@ -440,4 +449,4 @@ This means multi-tenant deployments with OAuth get automatic task isolation -- U
 +--------------------------------------------------+
 ```
 
-The SDK provides everything needed for development and testing. Add `pmcp-tasks` when you need production persistence or PMCP extensions (task variables, result storage).
+The SDK provides everything needed for development and testing. `pmcp-tasks` serves the legacy `TaskRouter` path only; on the recommended `task_store(...)` path, production persistence means implementing `pmcp::server::task_store::TaskStore` over your own database.
