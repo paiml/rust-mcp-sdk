@@ -5,6 +5,38 @@ All notable changes to the `cargo-pmcp` crate will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-10-27
+
+Scaffolded servers no longer handle one request at a time. Requires `pmcp` 2.23.
+
+### Changed
+
+- **The server scaffolds use pmcp 2.23's concurrent constructors.** The
+  `sql-server`, `openapi-server` and `workbook-server` templates, the generic
+  server template and the `deploy init` Lambda wrapper used to wrap the server
+  in `Arc<tokio::sync::Mutex<Server>>` and pass it to
+  `StreamableHttpServer::with_config`. That constructor holds the mutex for a
+  handler's whole duration, so one long `tools/call` stalled every other
+  request, `initialize` included (pmcp field report F-4). They now pass
+  `Arc<Server>` to `with_config_concurrent`, and the generated `Cargo.toml`
+  requires `pmcp` 2.23. Projects generated earlier keep working; to get the
+  fix, make the same two-line change in their `main.rs`.
+- **The `pmcp` requirement the scaffolds emit moves to 2.23**
+  (`PMCP_VERSION_REQ`, the workbook template's `PMCP_VERSION`, and the SQL and
+  OpenAPI templates' `pmcp` lines).
+
+### Security
+
+- **zip 8.1 -> 9**, clearing RUSTSEC-2026-0367/0368/0369 (zip < 9 `extract`
+  preserved SUID bits, followed archive symlinks and applied archive
+  permissions). cargo-pmcp only writes zips, so it was not exposed, but the
+  vulnerable version is no longer in its dependency tree.
+
+### Known gap
+
+- `cargo pmcp app new` still scaffolds against `pmcp` 1.10 and the legacy
+  constructor. Moving that template to the 2.x line is a separate change.
+
 ## [0.28.1] - 2026-10-04
 
 Fixes from the live re-check of 0.28.0 against real AWS and GCP

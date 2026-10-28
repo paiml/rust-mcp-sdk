@@ -70,7 +70,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pmcp = {{ version = "2.22", features = ["streamable-http"] }}
+pmcp = {{ version = "2.23", features = ["streamable-http"] }}
 pmcp-server-toolkit = {{ version = "0.4", features = ["openapi-code-mode"] }}
 # The OpenAPI assemble orchestrators (`dispatch` builds the (HttpConnector,
 # HttpCodeExecutor) pair; `build_server` assembles the pmcp::Server). Unlike the
@@ -109,17 +109,16 @@ use pmcp::Server;
 use pmcp_openapi_server::{build_server, dispatch};
 use pmcp_server_toolkit::http::OpenApiSchema;
 use pmcp_server_toolkit::ServerConfig;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-/// Inline streamable-HTTP serve helper: collapses `with_config` + `start` into
+/// Inline streamable-HTTP serve helper: collapses `with_config_concurrent` + `start` into
 /// one call while inlining the `StreamableHttpServer` body (so `main` stays
 /// ≤15 statement lines).
 async fn serve(server: Server) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error>> {
-    let shared = Arc::new(Mutex::new(server));
+    let shared = Arc::new(server);
     let cfg = StreamableHttpServerConfig::default();
     Ok(
-        StreamableHttpServer::with_config("127.0.0.1:8080".parse()?, shared, cfg)
+        StreamableHttpServer::with_config_concurrent("127.0.0.1:8080".parse()?, shared, cfg)
             .start()
             .await?,
     )

@@ -42,7 +42,6 @@ use include_dir::{include_dir, Dir};
 use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpServerConfig};
 use pmcp::Server;
 use pmcp_server_toolkit::workbook::{EmbeddedSource, LocalDirSource, WorkbookBuilderExt};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// The committed synthetic golden bundle, baked into the binary at compile time.
@@ -51,14 +50,14 @@ use tokio::task::JoinHandle;
 /// the integration tests load via `LocalDirSource`.
 static EMBEDDED_BUNDLE: Dir = include_dir!("$CARGO_MANIFEST_DIR/tests/fixtures/tax-calc@1.1.0");
 
-/// Inline streamable-HTTP serve helper: collapses `with_config` + `start` and
+/// Inline streamable-HTTP serve helper: collapses `with_config_concurrent` + `start` and
 /// binds an ephemeral port (`127.0.0.1:0`) so the bound address is reported back
 /// for the smoke test / operator to read.
 async fn serve(server: Server) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error>> {
-    let shared = Arc::new(Mutex::new(server));
+    let shared = Arc::new(server);
     let cfg = StreamableHttpServerConfig::default();
     Ok(
-        StreamableHttpServer::with_config("127.0.0.1:0".parse()?, shared, cfg)
+        StreamableHttpServer::with_config_concurrent("127.0.0.1:0".parse()?, shared, cfg)
             .start()
             .await?,
     )

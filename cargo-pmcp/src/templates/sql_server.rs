@@ -54,7 +54,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pmcp = {{ version = "2.22", features = ["streamable-http"] }}
+pmcp = {{ version = "2.23", features = ["streamable-http"] }}
 pmcp-server-toolkit = {{ version = "0.4", features = ["code-mode", "sqlite", "http"] }}
 clap = {{ version = "4", features = ["derive", "env"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
@@ -88,16 +88,15 @@ use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpS
 use pmcp::Server;
 use pmcp_server_toolkit::sql::{SqlConnector, SqliteConnector};
 use pmcp_server_toolkit::{ServerBuilderExt, ServerConfig, StaticResourceHandler};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-/// Inline streamable-HTTP serve helper: collapses `with_config` + `start` into
+/// Inline streamable-HTTP serve helper: collapses `with_config_concurrent` + `start` into
 /// one call while inlining the `StreamableHttpServer` body.
 async fn serve(server: Server) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error>> {
-    let shared = Arc::new(Mutex::new(server));
+    let shared = Arc::new(server);
     let cfg = StreamableHttpServerConfig::default();
     Ok(
-        StreamableHttpServer::with_config("127.0.0.1:0".parse()?, shared, cfg)
+        StreamableHttpServer::with_config_concurrent("127.0.0.1:0".parse()?, shared, cfg)
             .start()
             .await?,
     )
@@ -396,7 +395,7 @@ mod tests {
     fn emitted_main_has_h1_h2_wiring_tokens() {
         // Defensive: even if line-by-line comparison were relaxed, these exact
         // wiring tokens must be present (H1 resolver + H2 ordering + serve). The
-        // serve() helper sits above main, so `StreamableHttpServer::with_config`
+        // serve() helper sits above main, so `StreamableHttpServer::with_config_concurrent`
         // is checked for presence, not strict source order.
         let m = emitted_main_rs();
         let tokens = [
@@ -405,7 +404,7 @@ mod tests {
             "execute_batch",
             "Arc::new(conn)",
             "try_code_mode_from_config_with_connector",
-            "StreamableHttpServer::with_config",
+            "StreamableHttpServer::with_config_concurrent",
             "PMCP_SQL_SERVER_ADDR",
         ];
         for tok in tokens {

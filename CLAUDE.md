@@ -565,6 +565,17 @@ and `pmcp-openapi-server`, `pmcp-sql-server` (toolkit + three connector pins), `
 (`TOOLKIT_VERSION` 0.4.0). Because `CodeModeSection` is now `#[non_exhaustive]`, the NEXT `[code_mode]`
 key is additive and needs no such cascade.
 
+**Bumped to 0.29.0 with pmcp 2.23.0 (2026-10-27, field report F-4).** The scaffolds moved from
+`Arc<Mutex<Server>>` + `StreamableHttpServer::with_config` to `Arc<Server>` + `with_config_concurrent`,
+which exists only from pmcp 2.23. So every emitted `pmcp` requirement moved to 2.23 in the same commit:
+`templates/workspace.rs` `PMCP_VERSION_REQ` ("2.23"), `templates/workbook_server.rs` `PMCP_VERSION`
+(2.23.0), and the `pmcp` line in `templates/sql_server.rs` and `templates/openapi_server.rs` ("2.23").
+The four server crates that call the concurrent constructors (`pmcp-sql-server`, `pmcp-openapi-server`,
+`pmcp-workbook-server`, `pmcp-server`) raised their own `pmcp` requirement to "2.23.0" for the same
+reason: their old "2.9.0"/"2.8.1" floors would let a consumer resolve a pmcp that lacks the method.
+`templates/mcp_app.rs` was deliberately left alone: it still emits `pmcp = "1.10"`, a pre-existing gap,
+and the concurrent constructor does not exist on 1.x.
+
 **This entry recorded `cargo-pmcp` at the Phase-122 version until 2026-09-28,
    by which time the tree was three patches past it (measured: 0.24.3).** A stale
    version here is not cosmetic — it is what a future releaser reads to know

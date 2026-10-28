@@ -50,7 +50,7 @@ static EMBEDDED_XLSX: &[u8] = include_bytes!("workbook_bundle/tax-calc.xlsx");
 /// The pinned `pmcp` version the emitted `Cargo.toml` declares. A test asserts
 /// this equals the workspace-root `pmcp` version so the hardcoded pin cannot
 /// silently drift from the released crate (Codex MEDIUM).
-const PMCP_VERSION: &str = "2.22.7";
+const PMCP_VERSION: &str = "2.23.0";
 
 /// The pinned `pmcp-server-toolkit` version the emitted `Cargo.toml` declares. A
 /// test asserts this equals the workspace `pmcp-server-toolkit` package version so
@@ -132,19 +132,18 @@ use include_dir::{include_dir, Dir};
 use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpServerConfig};
 use pmcp::Server;
 use pmcp_server_toolkit::workbook::{EmbeddedSource, WorkbookBuilderExt};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// The pre-compiled bundle, baked into the binary at compile time.
 static EMBEDDED_BUNDLE: Dir = include_dir!("$CARGO_MANIFEST_DIR/bundle/tax-calc@1.1.0");
 
-/// Inline streamable-HTTP serve helper: collapses `with_config` + `start` and
+/// Inline streamable-HTTP serve helper: collapses `with_config_concurrent` + `start` and
 /// binds an ephemeral port (`127.0.0.1:0`) so the bound address is reported back.
 async fn serve(server: Server) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error>> {
-    let shared = Arc::new(Mutex::new(server));
+    let shared = Arc::new(server);
     let cfg = StreamableHttpServerConfig::default();
     Ok(
-        StreamableHttpServer::with_config("127.0.0.1:0".parse()?, shared, cfg)
+        StreamableHttpServer::with_config_concurrent("127.0.0.1:0".parse()?, shared, cfg)
             .start()
             .await?,
     )

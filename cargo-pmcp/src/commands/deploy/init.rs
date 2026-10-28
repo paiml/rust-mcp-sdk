@@ -1328,7 +1328,7 @@ async fn build_server() -> pmcp::Result<pmcp::Server> {{
 /// Start the HTTP server in the background and return the bound address
 async fn start_http_in_background(default_port: u16, server_name: &str) -> pmcp::Result<SocketAddr> {{
     let server = build_server().await?;
-    let server = std::sync::Arc::new(tokio::sync::Mutex::new(server));
+    let server = std::sync::Arc::new(server);
 
     // Resolve bind host and port
     let port = std::env::var("PORT")
@@ -1354,7 +1354,7 @@ async fn start_http_in_background(default_port: u16, server_name: &str) -> pmcp:
         ..Default::default()
     }};
 
-    let http_server = pmcp::server::streamable_http_server::StreamableHttpServer::with_config(
+    let http_server = pmcp::server::streamable_http_server::StreamableHttpServer::with_config_concurrent(
         addr,
         server,
         config,

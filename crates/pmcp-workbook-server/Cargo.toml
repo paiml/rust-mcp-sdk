@@ -1,6 +1,6 @@
 [package]
 name = "pmcp-workbook-server"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paiml/rust-mcp-sdk"
@@ -26,7 +26,7 @@ name = "pmcp-workbook-server"
 path = "src/main.rs"
 
 [dependencies]
-pmcp = { version = "2.9.0", path = "../..", features = ["streamable-http"] }
+pmcp = { version = "2.23.0", path = "../..", features = ["streamable-http"] }
 # Why (D-02 / D-11): the binary depends ONLY on the toolkit, with the `workbook`
 # (NOT `workbook-embedded`) feature for the LocalDirSource boot surface plus the
 # `http` feature for the streamable-HTTP forward. It NEVER names

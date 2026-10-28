@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-10-27
+
+Ships the fixes from a team's field report against pmcp 2.22.7 (MCP Tasks on Cloud Run). The
+streamable-HTTP server no longer handles one request at a time, task handlers can hand work to a
+background worker, and the Tasks docs now describe the `task_store(...)` path as it is. Minor
+bump for the new API.
+
+Crates published in this release: `pmcp` **2.23.0**, `pmcp-sql-server` **0.4.1**,
+`pmcp-openapi-server` **0.4.2**, `pmcp-workbook-server` **0.4.1** and `pmcp-server` **0.2.5**
+(each now requires `pmcp` 2.23 and uses the concurrent constructors), `pmcp-workbook-compiler`
+**0.4.1** (zip default features off, dropping zstd 0.13 and RUSTSEC-2026-0391/0398/0403),
+`pmcp-tasks` **0.1.2** (docs only: which server path its stores serve) and `cargo-pmcp`
+**0.29.0** (see `cargo-pmcp/CHANGELOG.md`).
+
 ### Fixed
 
 - **The streamable-HTTP server can now handle requests concurrently.** Field report F-4 (pmcp

@@ -27,7 +27,6 @@ use pmcp::server::streamable_http_server::{StreamableHttpServer, StreamableHttpS
 use pmcp::Server;
 use pmcp_server_toolkit::sql::{SqlConnector, SqliteConnector};
 use pmcp_server_toolkit::{ServerBuilderExt, ServerConfig, StaticResourceHandler};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Harness-only fixtures dir (compile-time constant). The Plan 03 scaffold drops
@@ -36,14 +35,14 @@ use tokio::task::JoinHandle;
 const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fixtures");
 
 /// Inline streamable-HTTP serve helper (CONVERGENCE NOTE): collapses
-/// `with_config` + `start` so `main` stays under the ≤15-line budget while still
+/// `with_config_concurrent` + `start` so `main` stays under the ≤15-line budget while still
 /// inlining the `StreamableHttpServer` body (NOT importing `pmcp_sql_server::serve`,
 /// Pitfall §2). Plan 03's scaffold emits a call to the same shape.
 async fn serve(server: Server) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error>> {
-    let shared = Arc::new(Mutex::new(server));
+    let shared = Arc::new(server);
     let cfg = StreamableHttpServerConfig::default();
     Ok(
-        StreamableHttpServer::with_config("127.0.0.1:0".parse()?, shared, cfg)
+        StreamableHttpServer::with_config_concurrent("127.0.0.1:0".parse()?, shared, cfg)
             .start()
             .await?,
     )

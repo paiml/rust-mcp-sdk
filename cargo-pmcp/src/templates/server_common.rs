@@ -92,7 +92,6 @@ use pmcp::error::Error as PmcpError;
 use async_trait::async_trait;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use std::time::Duration;
@@ -245,8 +244,8 @@ pub async fn run_http(server: Server, server_name: &str, server_version: &str) -
         "Starting MCP HTTP server"
     );
 
-    // Wrap server in Arc<Mutex<>> for sharing
-    let server = Arc::new(Mutex::new(server));
+    // Share the server; `with_config_concurrent` serves requests in parallel
+    let server = Arc::new(server);
 
     // Create HTTP middleware chain with logging and optional auth
     let mut middleware_chain = ServerHttpMiddlewareChain::new();
@@ -285,7 +284,7 @@ pub async fn run_http(server: Server, server_name: &str, server_version: &str) -
     };
 
     // Create and start the HTTP server
-    let http_server = StreamableHttpServer::with_config(addr, server, config);
+    let http_server = StreamableHttpServer::with_config_concurrent(addr, server, config);
     let (bound_addr, server_handle) = http_server.start().await?;
 
     tracing::info!(
