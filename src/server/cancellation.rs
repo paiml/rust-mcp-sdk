@@ -299,7 +299,20 @@ pub struct RequestHandlerExtra {
     /// `peer`), so any clone the handler receives writes to the observed slot.
     #[cfg(not(target_arch = "wasm32"))]
     result_meta: Arc<std::sync::Mutex<Option<serde_json::Map<String, serde_json::Value>>>>,
+    /// The dispatcher's create-gate verdict for this request; see
+    /// [`RequestHandlerExtra::will_create_task`].
+    #[cfg(not(target_arch = "wasm32"))]
+    task_gate_open: bool,
+    /// The handler's [`RequestHandlerExtra::on_task_created`] hook. Shared
+    /// across clones like `result_meta`, so the dispatcher can drain it after
+    /// the handler has consumed `self`.
+    #[cfg(not(target_arch = "wasm32"))]
+    task_created_hook: Arc<std::sync::Mutex<Option<TaskCreatedHook>>>,
 }
+
+/// A handler-registered callback that receives the store-minted task.
+#[cfg(not(target_arch = "wasm32"))]
+type TaskCreatedHook = Box<dyn FnOnce(crate::server::task_store::CreatedTask) + Send>;
 
 impl RequestHandlerExtra {
     /// Create new handler extra context.
@@ -322,6 +335,10 @@ impl RequestHandlerExtra {
             peer: None,
             #[cfg(not(target_arch = "wasm32"))]
             result_meta: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(not(target_arch = "wasm32"))]
+            task_gate_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            task_created_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -678,9 +695,150 @@ impl RequestHandlerExtra {
         ResultMetaHandle(Arc::clone(&self.result_meta))
     }
 
-    /// Returns `true` if the client requested task-augmented behavior.
+    /// Returns `true` if the client asked for this call to run as a task.
+    ///
+    /// The signal depends on the protocol era, and this reads the same one the
+    /// dispatcher reads:
+    ///
+    /// | era | the client asked when |
+    /// |-----|-----------------------|
+    /// | 2025-11-25, or no resolved era | the `tools/call` carried a `task` field |
+    /// | 2026-07-28 | this request declared the `io.modelcontextprotocol/tasks` extension |
+    ///
+    /// On 2026-07-28 only the declaration on the `tools/call` itself counts. A
+    /// client that declared the extension on `initialize` or `tools/list` but
+    /// not on this call did not ask.
+    ///
+    /// The client asking is not enough for a task to be created: the server
+    /// also needs a task store and the tool needs task support. To branch on
+    /// whether returning a task-shaped value will actually produce a task, use
+    /// [`Self::will_create_task`].
     pub fn is_task_request(&self) -> bool {
-        self.task_request.is_some()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::server::task_dispatch::CreateTrigger::resolve(
+                self.era(),
+                self.task_request.is_some(),
+                self.protocol_context.as_ref(),
+            )
+            .fired()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.task_request.is_some()
+        }
+    }
+
+    /// Returns `true` if this `tools/call` becomes an MCP task when the handler
+    /// returns a task-shaped value (one carrying `taskId` and `status`).
+    ///
+    /// This is the dispatcher's own create gate, evaluated before the handler
+    /// runs. It holds when all of these hold:
+    ///
+    /// - the client asked for a task, as [`Self::is_task_request`] reports;
+    /// - the server has a task store
+    ///   ([`ServerBuilder::task_store`](crate::server::ServerBuilder::task_store));
+    /// - the tool declares [`TaskSupport::Required`](crate::types::TaskSupport::Required)
+    ///   or [`TaskSupport::Optional`](crate::types::TaskSupport::Optional).
+    ///
+    /// When it is `false`, a task-shaped return value is sent to the client as
+    /// an ordinary tool result, and a model reading it sees a task handle it
+    /// has no way to poll. A handler with both a synchronous and an
+    /// asynchronous path should take the asynchronous one only when this is
+    /// `true`.
+    ///
+    /// Always `false` outside a `tools/call` dispatch, for example on a
+    /// [`RequestHandlerExtra::default`] built in a test.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pmcp::RequestHandlerExtra;
+    /// use serde_json::{json, Value};
+    ///
+    /// fn respond(extra: &RequestHandlerExtra) -> Value {
+    ///     if extra.will_create_task() {
+    ///         // The dispatcher turns this into a task and mints its id.
+    ///         json!({ "taskId": "pending", "status": "working" })
+    ///     } else {
+    ///         json!({ "content": [{ "type": "text", "text": "done" }] })
+    ///     }
+    /// }
+    ///
+    /// let synchronous = respond(&RequestHandlerExtra::default());
+    /// assert!(synchronous.get("content").is_some());
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn will_create_task(&self) -> bool {
+        self.task_gate_open
+    }
+
+    /// Record the dispatcher's create-gate verdict for this request.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub(crate) fn with_task_gate(mut self, open: bool) -> Self {
+        self.task_gate_open = open;
+        self
+    }
+
+    /// Register a callback that receives the task once the store has created
+    /// it.
+    ///
+    /// The store mints the task id after the handler returns, so a handler
+    /// that hands work to a background worker has no id to give it. Register
+    /// the hand-off here instead: when the dispatcher creates the task, it
+    /// calls `hook` with the stored task and its owner, and the worker gets the
+    /// id the client will poll.
+    ///
+    /// - `hook` runs at most once, on the dispatcher's task, after the task is
+    ///   stored and before the response is sent. Keep it short: spawn the
+    ///   work rather than doing it inline.
+    /// - It runs only when a task is actually created, which requires
+    ///   [`Self::will_create_task`] and a task-shaped return value. Otherwise
+    ///   it is dropped without being called.
+    /// - Registering again replaces the earlier hook.
+    /// - A panic inside `hook` is caught and logged; the task and the
+    ///   response are unaffected.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use pmcp::server::task_store::{CreatedTask, TaskStore};
+    /// use pmcp::types::tasks::TaskStatus;
+    /// use pmcp::RequestHandlerExtra;
+    /// use serde_json::{json, Value};
+    ///
+    /// fn start(extra: &RequestHandlerExtra, store: Arc<dyn TaskStore>) -> Value {
+    ///     extra.on_task_created(move |created: CreatedTask| {
+    ///         tokio::spawn(async move {
+    ///             let id = &created.task.task_id;
+    ///             // ... the long-running work, keyed by `id` ...
+    ///             let _ = store
+    ///                 .update_status(id, &created.owner_id, TaskStatus::Completed, None)
+    ///                 .await;
+    ///         });
+    ///     });
+    ///     json!({ "taskId": "pending", "status": "working" })
+    /// }
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_task_created<F>(&self, hook: F)
+    where
+        F: FnOnce(crate::server::task_store::CreatedTask) + Send + 'static,
+    {
+        let mut guard = self
+            .task_created_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(Box::new(hook));
+    }
+
+    /// Clone the `on_task_created` slot into a handle the dispatcher keeps
+    /// after `self` moves into the handler.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn task_created_handle(&self) -> TaskCreatedHandle {
+        TaskCreatedHandle(Arc::clone(&self.task_created_hook))
     }
 
     /// Get the auth context if available.
@@ -968,6 +1126,10 @@ impl Default for RequestHandlerExtra {
             peer: None,
             #[cfg(not(target_arch = "wasm32"))]
             result_meta: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(not(target_arch = "wasm32"))]
+            task_gate_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            task_created_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -1000,6 +1162,39 @@ impl ResultMetaHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.take()
+    }
+}
+
+/// Drain handle for the handler's [`RequestHandlerExtra::on_task_created`]
+/// hook, cloned out before the extra moves into the handler (the twin of
+/// [`ResultMetaHandle`]).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct TaskCreatedHandle(Arc<std::sync::Mutex<Option<TaskCreatedHook>>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TaskCreatedHandle {
+    /// Call the registered hook, if any, with the created task. Takes the hook
+    /// out of the slot, so it runs at most once. A panicking hook is logged and
+    /// contained: the task already exists and the response must still go out.
+    pub(crate) fn fire(&self, created: crate::server::task_store::CreatedTask) {
+        let hook = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            let task_id = created.task.task_id.clone();
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || hook(created)));
+            if outcome.is_err() {
+                tracing::error!(
+                    target: "mcp.tasks",
+                    task_id = task_id.as_str(),
+                    "on_task_created hook panicked; the task was created and the response is unaffected"
+                );
+            }
+        }
     }
 }
 
@@ -1071,7 +1266,9 @@ impl std::fmt::Debug for RequestHandlerExtra {
             .field("log_level", &self.log_level)
             .field("extensions", &self.extensions);
         #[cfg(not(target_arch = "wasm32"))]
-        debug.field("peer", &self.peer.as_ref().map(|_| "Arc<dyn PeerHandle>"));
+        debug
+            .field("peer", &self.peer.as_ref().map(|_| "Arc<dyn PeerHandle>"))
+            .field("task_gate_open", &self.task_gate_open);
         debug.finish()
     }
 }
@@ -1339,6 +1536,83 @@ mod tests {
         let debug_out = format!("{:?}", extra);
         // http::Extensions Debug prints type names, not field values
         assert!(!debug_out.contains("SECRET_VALUE_DO_NOT_LEAK"));
+    }
+
+    // -- on_task_created / will_create_task (field report F-1, F-2) --
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn created(id: &str) -> crate::server::task_store::CreatedTask {
+        crate::server::task_store::CreatedTask::new(
+            crate::types::tasks::Task::new(id, crate::types::tasks::TaskStatus::Working),
+            "owner-1",
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn task_created_hook_runs_once_with_the_minted_task() {
+        let extra = RequestHandlerExtra::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        extra.on_task_created(move |task| {
+            sink.lock()
+                .unwrap()
+                .push((task.task.task_id, task.owner_id));
+        });
+
+        // The handle outlives the extra, as it does across the by-value move
+        // into the handler.
+        let handle = extra.task_created_handle();
+        drop(extra);
+        handle.fire(created("minted-1"));
+        handle.fire(created("minted-2"));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("minted-1".to_string(), "owner-1".to_string())]
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn re_registering_replaces_the_hook() {
+        let extra = RequestHandlerExtra::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = Arc::clone(&seen);
+        extra.on_task_created(move |_| first.lock().unwrap().push("first"));
+        let second = Arc::clone(&seen);
+        extra
+            .clone()
+            .on_task_created(move |_| second.lock().unwrap().push("second"));
+
+        extra.task_created_handle().fire(created("t"));
+        assert_eq!(*seen.lock().unwrap(), vec!["second"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_panicking_hook_is_contained() {
+        let extra = RequestHandlerExtra::default();
+        extra.on_task_created(|_| panic!("worker spawn failed"));
+        // Must not unwind into the dispatcher.
+        extra.task_created_handle().fire(created("t"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn will_create_task_reports_the_gate_and_defaults_closed() {
+        assert!(!RequestHandlerExtra::default().will_create_task());
+        assert!(RequestHandlerExtra::default()
+            .with_task_gate(true)
+            .will_create_task());
+    }
+
+    #[test]
+    fn is_task_request_without_an_era_reads_the_task_field() {
+        let extra = RequestHandlerExtra::default();
+        assert!(!extra.is_task_request());
+        let extra = extra.with_task_request(Some(serde_json::json!({})));
+        assert!(extra.is_task_request());
     }
 }
 

@@ -2546,6 +2546,18 @@ impl Server {
             .with_protocol_context(protocol_context),
         );
 
+        // Tell the handler what the create gate will decide (F-2), from the SAME
+        // predicate the gate reads after it returns, and keep a handle on its
+        // `on_task_created` hook (F-1), which outlives the move into the handler.
+        #[cfg(not(target_arch = "wasm32"))]
+        let task_created_handle = {
+            extra = extra.with_task_gate(
+                self.task_dispatch()
+                    .create_gate_open(create_trigger, tool_task_support),
+            );
+            extra.task_created_handle()
+        };
+
         // D-03.3 (TOUT-01): clone the interior-mutable result-`_meta` slot BEFORE
         // `extra` is moved into `handle_output`, so any `extra.set_result_meta(..)`
         // the handler performs can be drained back onto the Payload-path result.
@@ -2700,6 +2712,7 @@ impl Server {
                     create_trigger,
                     create_path_auth.as_ref(),
                     create_path_era,
+                    Some(&task_created_handle),
                 )
                 .await
             {

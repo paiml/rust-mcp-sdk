@@ -824,14 +824,27 @@ const ROUTES: &[RouteEntry] = &[
         function: "create_gate",
         method: RouteMethod::NotAWireMethod,
         guards: &[GuardRef {
-            needle: "trigger.fired()",
+            needle: "self.create_gate_open(",
             site: "create_gate",
         }],
         why:
-            "The ONE expression deciding whether a tools/call becomes a task. Era-awareness lives \
-              in CreateTrigger: v1 fires on the `task` field, v2 on the client's declaration and \
-              IGNORES the field. Reading the field on v2 would hand a task handle to a client with \
-              no rule for reading one, which the extension forbids.",
+            "The ONE expression deciding whether a tools/call becomes a task. Its pre-handler half \
+              lives in create_gate_open (below), which handlers also read through \
+              `extra.will_create_task()`; create_gate must keep delegating to it rather than \
+              re-spelling the trigger, or what a handler is told and what the dispatcher does \
+              drift apart (field report F-2).",
+    },
+    RouteEntry {
+        function: "create_gate_open",
+        method: RouteMethod::NotAWireMethod,
+        guards: &[GuardRef {
+            needle: "trigger.fired()",
+            site: "create_gate_open",
+        }],
+        why:
+            "Era-awareness lives in CreateTrigger: v1 fires on the `task` field, v2 on the client's \
+              declaration and IGNORES the field. Reading the field on v2 would hand a task handle \
+              to a client with no rule for reading one, which the extension forbids.",
     },
     RouteEntry {
         function: "maybe_build_task_created",

@@ -24,6 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and dispatch requests in parallel. The existing `Arc<Mutex<Server>>` constructors are unchanged
   and still serialize, because callers own that mutex; their docs now say so. `pmcp-sql-server`,
   `pmcp-openapi-server`, `pmcp-workbook-server` and `pmcp-server` use the concurrent constructors.
+- **Task handlers can hand work to a background worker** (field report F-1, F-2, F-6):
+  - `RequestHandlerExtra::will_create_task()` reports the dispatcher's create gate before the
+    handler runs: the client asked for a task, a store is configured, and the tool declares task
+    support. A handler that branches on it never returns a task handle the client cannot poll.
+  - `RequestHandlerExtra::on_task_created(hook)` registers a callback that receives the
+    store-minted task and its owner (`task_store::CreatedTask`) once the task exists. Until now
+    the store minted the id after the handler returned, so a worker had no id to report against.
+  - `TaskStore::set_status_message` changes a working task's `statusMessage` without changing its
+    status, so a worker can report progress. It is a defaulted trait method;
+    `InMemoryTaskStore` implements it.
+  - New example: `s58_task_background_worker`.
+
+### Changed
+
+- **`RequestHandlerExtra::is_task_request()` follows the protocol era** (field report F-2). On
+  2026-07-28 it now reports whether this `tools/call` declared the `io.modelcontextprotocol/tasks`
+  extension, the trigger the dispatcher uses, instead of reading the 2025-11-25 `task` field.
+  Before, it returned `false` for every conformant v2 task request, and `true` for a v2 request
+  that carried the v1 field even though the dispatcher ignores it there. 2025-11-25 behaviour is
+  unchanged.
 
 ### Documentation
 

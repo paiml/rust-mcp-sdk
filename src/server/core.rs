@@ -605,8 +605,14 @@ enum ToolCallOutcome {
     /// `task_dispatch::TaskDispatch::build_task_created_response` re-extracts the
     /// task id and the terminal [`CallToolResult`] from this value (store mints the
     /// canonical id; terminal result drives synchronous-completion persistence).
+    ///
+    /// `on_created` carries the handler's `on_task_created` hook to the create
+    /// path one frame up, where the store mints the task.
     #[cfg(not(target_arch = "wasm32"))]
-    TaskCreated { task_value: Value },
+    TaskCreated {
+        task_value: Value,
+        on_created: crate::server::cancellation::TaskCreatedHandle,
+    },
 }
 
 impl ServerCore {
@@ -983,6 +989,23 @@ impl ServerCore {
             .with_protocol_context(protocol_context),
         );
 
+        // Tell the handler what the create gate will decide (F-2) and keep a
+        // handle on its `on_task_created` hook (F-1); the twin of the
+        // high-level `Server` wiring. The gate below reads the same predicate.
+        #[cfg(not(target_arch = "wasm32"))]
+        let task_created_handle = {
+            let tool_task_support = self
+                .tool_infos
+                .get(&req.name)
+                .and_then(|info| info.execution.as_ref())
+                .and_then(|exec| exec.task_support);
+            extra = extra.with_task_gate(
+                self.task_dispatch()
+                    .create_gate_open(create_trigger, tool_task_support),
+            );
+            extra.task_created_handle()
+        };
+
         // D-03.3 (TOUT-01): clone the result-`_meta` slot before `extra` moves
         // into `handle_output` (see the high-level `Server` dispatcher for the
         // twin); drained onto the Payload envelope after the handler returns.
@@ -1145,7 +1168,10 @@ impl ServerCore {
                     // The shared create-path re-extracts the task id + terminal
                     // CallToolResult from the value, so only the raw value
                     // crosses here.
-                    return Ok(ToolCallOutcome::TaskCreated { task_value: value });
+                    return Ok(ToolCallOutcome::TaskCreated {
+                        task_value: value,
+                        on_created: task_created_handle,
+                    });
                 },
                 crate::server::task_dispatch::CreateGate::NotTaskShaped => {
                     // Tool declares task support but didn't return a Task — fall through to normal path
@@ -4297,6 +4323,7 @@ impl ServerCore {
         task_value: Value,
         auth_context: Option<&AuthContext>,
         era: Option<crate::types::protocol::Era>,
+        on_created: &crate::server::cancellation::TaskCreatedHandle,
     ) -> (JSONRPCResponse, DispatchEnvelopeClaim) {
         // Delegate to the shared TaskDispatch unit. It RE-EXTRACTS the task id and
         // the terminal result from `task_value` internally (store mints the id;
@@ -4308,7 +4335,7 @@ impl ServerCore {
         // a task is created under exactly the rule that later governs who may read
         // it — and on v2's refuse row nothing is minted at all (T-114-37).
         self.task_dispatch()
-            .build_task_created_response(id, task_value, auth_context, era)
+            .build_task_created_response(id, task_value, auth_context, era, Some(on_created))
             .await
     }
 
@@ -4464,7 +4491,10 @@ impl ServerCore {
                         {
                             Ok(outcome) => match outcome {
                                 #[cfg(not(target_arch = "wasm32"))]
-                                ToolCallOutcome::TaskCreated { task_value } => {
+                                ToolCallOutcome::TaskCreated {
+                                    task_value,
+                                    on_created,
+                                } => {
                                     // The shared unit re-extracts task_id + terminal
                                     // result from task_value (single-source create path).
                                     let (response, claim) = self
@@ -4473,6 +4503,7 @@ impl ServerCore {
                                             task_value,
                                             auth_context.as_ref(),
                                             call_tool_era,
+                                            &on_created,
                                         )
                                         .await;
                                     *dispatch_claim = claim;

@@ -44,6 +44,16 @@ Both `ServerCoreBuilder` and the high-level `Server::builder()` take `task_store
 
 > **Long work belongs in a task, not behind a timeout.** A host that gives up on a slow synchronous `tools/call` does not necessarily stop the handler; on Cloud Run, handlers have been observed running about two minutes after the client left. On the streamable-HTTP transport, build the server with `StreamableHttpServer::new_concurrent` so one long call doesn't hold up the others.
 
+### Background workers
+
+To hand the work to a worker instead of finishing it inside the handler:
+
+- branch on `extra.will_create_task()`, the dispatcher's create gate evaluated before the handler runs, and do the work synchronously when it is `false`;
+- register `extra.on_task_created(|created| ...)` to receive the store-minted task id and owner once the task exists, and spawn the worker there;
+- report progress with `store.set_status_message(id, owner, message)`, which changes the message without changing the `working` status.
+
+See [`examples/s58_task_background_worker.rs`](../examples/s58_task_background_worker.rs).
+
 > **Legacy path:** `with_task_store(Arc<dyn TaskRouter>)` (wrapping a store in `pmcp_tasks::TaskRouterImpl`) is the older experimental wiring; it advertises under `experimental.tasks` and expects hand-emitted `task` JSON. Prefer `task_store(...)` + `with_task_support` for new code.
 
 ## Recommended Client Walkthrough

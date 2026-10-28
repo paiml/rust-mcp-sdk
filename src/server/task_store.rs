@@ -6,21 +6,22 @@
 //!
 //! # Architecture
 //!
-//! The SDK defines the trait and a dev/test implementation. Production
-//! backends (DynamoDB, Redis) live in the `pmcp-tasks` crate. This
-//! follows the TypeScript SDK pattern where task store interfaces and
-//! an in-memory implementation are part of core.
+//! The SDK defines the trait and a dev/test implementation,
+//! `InMemoryTaskStore`. That store keeps tasks in process memory, so a
+//! deployment that runs more than one instance implements this trait over a
+//! shared database. This follows the TypeScript SDK pattern where task store
+//! interfaces and an in-memory implementation are part of core.
 //!
 //! # Differences from `pmcp-tasks`
 //!
-//! The SDK `TaskStore` trait is intentionally simplified compared to
-//! the `pmcp-tasks` `TaskStore` (see <https://docs.rs/pmcp-tasks/latest/pmcp_tasks/store/trait.TaskStore.html>):
-//! - No `set_variables` / `get_result` / `set_result` / `complete_with_result`
-//! - No `request_method` parameter on `create`
-//! - Returns `Task` (wire type) instead of `TaskRecord`
-//!
-//! These PMCP extensions remain in `pmcp-tasks`. The SDK trait covers
-//! the core MCP spec operations only.
+//! The `pmcp-tasks` crate defines a separate `TaskStore` trait (see
+//! <https://docs.rs/pmcp-tasks/latest/pmcp_tasks/store/trait.TaskStore.html>)
+//! for the legacy [`TaskRouter`](crate::server::tasks::TaskRouter) path. Its
+//! DynamoDB and Redis backends implement that trait, not this one, so they do
+//! not plug into `task_store(...)`. Compared with it, this trait has:
+//! - no `set_variables` / `complete_with_result`;
+//! - no `request_method` parameter on `create`;
+//! - `Task` (the wire type) as its return type instead of `TaskRecord`.
 //!
 //! # Recommended usage: expose a tool as an MCP Task
 //!
@@ -927,6 +928,79 @@ pub trait TaskStore: Send + Sync {
     fn supports_inputs(&self) -> bool {
         false
     }
+
+    /// Replace a task's `statusMessage` without changing its status.
+    ///
+    /// The state machine rejects `working -> working`, so
+    /// [`TaskStore::update_status`] cannot carry progress such as "step 12/40"
+    /// while a task stays `working`. This method can. It applies to any
+    /// non-terminal status and leaves the status itself alone.
+    ///
+    /// This is an **additive** trait method with a default implementation that
+    /// returns [`TaskStoreError::Internal`], so existing stores keep compiling.
+    /// Stores that can update the message in place override it.
+    ///
+    /// Implementations MUST return [`TaskStoreError::NotFound`] on owner
+    /// mismatch, and SHOULD refuse a terminal task with
+    /// [`TaskStoreError::InvalidTransition`] (from and to both the terminal
+    /// status): a finished task's message is part of its outcome.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pmcp::server::task_store::{InMemoryTaskStore, TaskStore};
+    /// use pmcp::types::tasks::TaskStatus;
+    ///
+    /// # async fn example() {
+    /// let store = InMemoryTaskStore::new();
+    /// let task = store.create("owner-1", None).await.unwrap();
+    ///
+    /// let task = store
+    ///     .set_status_message(&task.task_id, "owner-1", Some("step 12/40".into()))
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(task.status, TaskStatus::Working);
+    /// assert_eq!(task.status_message.as_deref(), Some("step 12/40"));
+    /// # }
+    /// ```
+    async fn set_status_message(
+        &self,
+        _task_id: &str,
+        _owner_id: &str,
+        _message: Option<String>,
+    ) -> Result<Task, TaskStoreError> {
+        Err(TaskStoreError::Internal {
+            message: "store does not support status-message updates".to_string(),
+        })
+    }
+}
+
+/// A task the dispatcher has just created for a `tools/call`, as handed to a
+/// [`RequestHandlerExtra::on_task_created`](crate::server::cancellation::RequestHandlerExtra::on_task_created)
+/// hook.
+///
+/// `task` is the store-minted task in the state the client will first see
+/// (`working`, or already `completed` or `input_required` when the handler's
+/// value said so). `owner_id` is the owner the dispatcher bound it to, which
+/// every later [`TaskStore`] call for this task needs.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CreatedTask {
+    /// The task as stored, carrying the id the client will poll.
+    pub task: Task,
+    /// The owner the task is bound to.
+    pub owner_id: String,
+}
+
+impl CreatedTask {
+    /// Build a `CreatedTask`, for example to unit-test an
+    /// `on_task_created` hook.
+    pub fn new(task: Task, owner_id: impl Into<String>) -> Self {
+        Self {
+            task,
+            owner_id: owner_id.into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1519,36 @@ impl TaskStore for InMemoryTaskStore {
 
     fn supports_inputs(&self) -> bool {
         true
+    }
+
+    async fn set_status_message(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        message: Option<String>,
+    ) -> Result<Task, TaskStoreError> {
+        let mut entry = self
+            .records
+            .get_mut(task_id)
+            .ok_or_else(|| TaskStoreError::NotFound {
+                task_id: task_id.to_string(),
+            })?;
+
+        let record = entry.value_mut();
+        Self::validate_access(record, task_id, owner_id)?;
+
+        let status = record.task.status;
+        if status.is_terminal() {
+            return Err(TaskStoreError::InvalidTransition {
+                task_id: task_id.to_string(),
+                from: status,
+                to: status,
+            });
+        }
+
+        record.task.last_updated_at = chrono::Utc::now().to_rfc3339();
+        record.task.status_message = message;
+        Ok(record.task.clone())
     }
 }
 
@@ -2496,5 +2600,129 @@ mod tests {
         // Requests, responses and error live on the INTERNAL record, so they are
         // purged with the task — there is no separate unexpiring map.
         assert!(store.records.is_empty());
+    }
+
+    // -- set_status_message (field report F-6) --
+
+    #[tokio::test]
+    async fn set_status_message_keeps_a_working_task_working() {
+        let store = InMemoryTaskStore::new();
+        let task = store.create("owner-1", None).await.unwrap();
+
+        let updated = store
+            .set_status_message(&task.task_id, "owner-1", Some("step 12/40".into()))
+            .await
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Working);
+        assert_eq!(updated.status_message.as_deref(), Some("step 12/40"));
+
+        let fetched = store.get(&task.task_id, "owner-1").await.unwrap();
+        assert_eq!(fetched.status_message.as_deref(), Some("step 12/40"));
+
+        let cleared = store
+            .set_status_message(&task.task_id, "owner-1", None)
+            .await
+            .unwrap();
+        assert_eq!(cleared.status_message, None);
+    }
+
+    #[tokio::test]
+    async fn set_status_message_hides_another_owners_task() {
+        let store = InMemoryTaskStore::new();
+        let task = store.create("owner-1", None).await.unwrap();
+        let err = store
+            .set_status_message(&task.task_id, "owner-2", Some("x".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TaskStoreError::NotFound { .. }), "{err:?}");
+        let fetched = store.get(&task.task_id, "owner-1").await.unwrap();
+        assert_eq!(fetched.status_message, None);
+    }
+
+    #[tokio::test]
+    async fn set_status_message_refuses_a_terminal_task() {
+        let store = InMemoryTaskStore::new();
+        let task = store.create("owner-1", None).await.unwrap();
+        store
+            .update_status(
+                &task.task_id,
+                "owner-1",
+                TaskStatus::Completed,
+                Some("done".into()),
+            )
+            .await
+            .unwrap();
+        let err = store
+            .set_status_message(&task.task_id, "owner-1", Some("late".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TaskStoreError::InvalidTransition {
+                    from: TaskStatus::Completed,
+                    to: TaskStatus::Completed,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let fetched = store.get(&task.task_id, "owner-1").await.unwrap();
+        assert_eq!(fetched.status_message.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn set_status_message_default_reports_unsupported() {
+        let store = DefaultOnlyStore {
+            config: StoreConfig::default(),
+        };
+        let err = store
+            .set_status_message("any", "owner-1", Some("x".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TaskStoreError::Internal { .. }), "{err:?}");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Any run of message updates leaves a working task working, the last
+        /// message wins, and once the task is terminal no message lands.
+        #[test]
+        fn status_messages_never_move_the_state_machine(
+            messages in proptest::collection::vec(
+                proptest::option::of("[a-z0-9 /]{0,24}"),
+                0..12,
+            ),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let store = InMemoryTaskStore::new();
+                let task = store.create("owner", None).await.unwrap();
+                let mut last = None;
+                for message in &messages {
+                    let updated = store
+                        .set_status_message(&task.task_id, "owner", message.clone())
+                        .await
+                        .unwrap();
+                    proptest::prop_assert_eq!(updated.status, TaskStatus::Working);
+                    last.clone_from(message);
+                }
+                let fetched = store.get(&task.task_id, "owner").await.unwrap();
+                proptest::prop_assert_eq!(fetched.status_message, last.clone());
+
+                store
+                    .update_status(&task.task_id, "owner", TaskStatus::Failed, None)
+                    .await
+                    .unwrap();
+                proptest::prop_assert!(store
+                    .set_status_message(&task.task_id, "owner", Some("late".into()))
+                    .await
+                    .is_err());
+                Ok(())
+            })?;
+        }
     }
 }

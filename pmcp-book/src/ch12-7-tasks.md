@@ -83,6 +83,36 @@ let result = client.tasks_result(&task_id).await?;
 
 Both `ServerCoreBuilder` and the high-level `Server::builder()` take `task_store(...)`, so the same pattern works behind `StreamableHttpServer`. For a complete, runnable end-to-end round-trip (initialize → call-with-task → poll → result), see the reference example [`examples/s45_tool_as_task_lifecycle.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s45_tool_as_task_lifecycle.rs).
 
+### Handing work to a background worker
+
+A handler that returns a task-shaped value at once and does the real work elsewhere (a spawned tokio task, an async Lambda invocation) needs three things from the SDK, all on `RequestHandlerExtra` and `TaskStore`:
+
+- **Whether a task will be created.** `extra.will_create_task()` is the dispatcher's own create gate, evaluated before the handler runs: the client asked for a task on this call, the server has a store, and the tool declares task support. When it is `false`, do the work synchronously. Otherwise a task-shaped value reaches the client as a plain result, and a model reading it sees a task handle it has no way to poll. (`extra.is_task_request()` reports only whether the client asked; on 2026-07-28 that means the client declared the tasks extension on this `tools/call`, not merely on `initialize`.)
+- **The task's id.** The store mints the id after the handler returns. Register `extra.on_task_created(|created| ...)` and the dispatcher calls it with the stored task and its owner once the task exists, before the response goes out. Spawn the worker there.
+- **A way to report progress.** The state machine rejects `working -> working`, so `update_status` cannot change the message on a running task. `store.set_status_message(id, owner, Some("step 2/4".into()))` can, and `tasks/get` shows it.
+
+```rust,ignore
+let tool = TypedTool::new_with_schema("backtest", schema, move |_args, extra: RequestHandlerExtra| {
+    let store = Arc::clone(&store);
+    if extra.will_create_task() {
+        extra.on_task_created(move |created| {
+            tokio::spawn(async move {
+                let (id, owner) = (created.task.task_id, created.owner_id);
+                store.set_status_message(&id, &owner, Some("step 1/4".into())).await.ok();
+                // ... the work ...
+                store.set_result(&id, &owner, CallToolResult::new(vec![Content::text("done")])).await.ok();
+                store.update_status(&id, &owner, TaskStatus::Completed, None).await.ok();
+            });
+        });
+        return Box::pin(async { Ok(json!({ "taskId": "assigned-by-the-store", "status": "working" })) });
+    }
+    Box::pin(async { Ok(json!({ "summary": "done" })) }) // the synchronous path
+})
+.with_execution(ToolExecution::new().with_task_support(TaskSupport::Optional));
+```
+
+`set_status_message` is a defaulted trait method: `InMemoryTaskStore` implements it, and your own store should too. The runnable version, which polls the progress messages over HTTP, is [`examples/s58_task_background_worker.rs`](https://github.com/paiml/rust-mcp-sdk/blob/main/examples/s58_task_background_worker.rs).
+
 ### Persistence: one instance or many
 
 `InMemoryTaskStore` is the only `TaskStore` implementation in the SDK. Its tasks are lost when the process restarts, and they are not shared between instances, so a task created on one instance cannot be polled on another. That rules it out for any deployment that runs more than one instance: every AWS Lambda deployment, and any container service that scales out. Such a server needs its own implementation of `pmcp::server::task_store::TaskStore` over a shared database such as DynamoDB, Firestore, Redis or Postgres. The trait's required methods are `create`, `get`, `update_status`, `list`, `cancel`, `cleanup_expired` and `config`. Every lookup takes the owner id and must return `NotFound` for a task that belongs to someone else.

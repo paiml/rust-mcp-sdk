@@ -1070,7 +1070,7 @@ impl CreateTrigger {
     }
 
     /// Did this era's trigger fire?
-    const fn fired(self) -> bool {
+    pub(crate) const fn fired(self) -> bool {
         match self {
             Self::V1TaskField { task_field_present } => task_field_present,
             Self::V2ClientDeclaration {
@@ -1397,12 +1397,19 @@ impl TaskDispatch<'_> {
     /// governs who may read it. On the v2 refuse row this answers `-32003` and
     /// mints nothing. WHETHER a v2 `tools/call` becomes a task at all is plan
     /// 114-12's decision (DQ1); this plan only decides WHOSE task it is.
+    ///
+    /// `on_created` is the handler's
+    /// [`on_task_created`](crate::server::cancellation::RequestHandlerExtra::on_task_created)
+    /// hook. It fires once the store-minted task is in its first visible state,
+    /// and only on the store path: without a store there is no minted id to
+    /// hand over (field report F-1).
     pub(crate) async fn build_task_created_response(
         &self,
         id: RequestId,
         value: Value,
         auth_context: Option<&AuthContext>,
         era: Option<crate::types::protocol::Era>,
+        on_created: Option<&crate::server::cancellation::TaskCreatedHandle>,
     ) -> (JSONRPCResponse, DispatchEnvelopeClaim) {
         let v1 = is_v1_task_era(era);
         let Some(store) = self.task_store.as_ref() else {
@@ -1501,6 +1508,15 @@ impl TaskDispatch<'_> {
             created
         };
 
+        // The task is stored and in the state the client will first see, so the
+        // handler's worker can now be given its real id (field report F-1).
+        if let Some(handle) = on_created {
+            handle.fire(crate::server::task_store::CreatedTask::new(
+                final_task.clone(),
+                owner_id.clone(),
+            ));
+        }
+
         // Build the wire envelope from the STORE-minted task (typed, no
         // hand-written task JSON) so task.taskId == _meta id == store id.
         //
@@ -1544,11 +1560,7 @@ impl TaskDispatch<'_> {
         task_support: Option<TaskSupport>,
         value: &Value,
     ) -> CreateGate {
-        let gate_open = trigger.fired()
-            && self.task_store.is_some()
-            && task_support
-                .is_some_and(|ts| matches!(ts, TaskSupport::Required | TaskSupport::Optional));
-        if !gate_open {
+        if !self.create_gate_open(trigger, task_support) {
             return CreateGate::Closed;
         }
         // Task-shaped value check: must carry BOTH a taskId and a status.
@@ -1559,6 +1571,25 @@ impl TaskDispatch<'_> {
         } else {
             CreateGate::NotTaskShaped
         }
+    }
+
+    /// The part of [`Self::create_gate`] that is known before the handler runs:
+    /// the era's trigger fired, a store backs the endpoints, and the tool
+    /// declares `Required` or `Optional` task support.
+    ///
+    /// Both dispatchers hand this to the handler as
+    /// [`RequestHandlerExtra::will_create_task`](crate::server::cancellation::RequestHandlerExtra::will_create_task),
+    /// and [`Self::create_gate`] reads the same function, so what a handler is
+    /// told and what the dispatcher does cannot drift apart (field report F-2).
+    pub(crate) fn create_gate_open(
+        &self,
+        trigger: CreateTrigger,
+        task_support: Option<TaskSupport>,
+    ) -> bool {
+        trigger.fired()
+            && self.task_store.is_some()
+            && task_support
+                .is_some_and(|ts| matches!(ts, TaskSupport::Required | TaskSupport::Optional))
     }
 
     /// Self-enforcing create-path gate: decide whether a `tools/call` becomes a
@@ -1590,6 +1621,13 @@ impl TaskDispatch<'_> {
     // Why: proven by the in-module `gate_tests` truth-table in Plan 01 and wired
     // into the `Server` create-path in Plan 02 (`handle_call_tool`), so it is
     // production-reachable — no `dead_code` allow is needed.
+    //
+    // Why `too_many_arguments`: the gate's contract is that callers pass RAW
+    // facts and this function enforces the whole rule. Bundling them into a
+    // struct would invite a call site to pre-compute part of it, which is the
+    // divergence this function exists to prevent. The eighth argument is the
+    // `on_task_created` handle (field report F-1).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn maybe_build_task_created(
         &self,
         id: RequestId,
@@ -1598,10 +1636,11 @@ impl TaskDispatch<'_> {
         trigger: CreateTrigger,
         auth_context: Option<&AuthContext>,
         era: Option<crate::types::protocol::Era>,
+        on_created: Option<&crate::server::cancellation::TaskCreatedHandle>,
     ) -> Option<(JSONRPCResponse, DispatchEnvelopeClaim)> {
         match self.create_gate(trigger, task_support, value) {
             CreateGate::Create => Some(
-                self.build_task_created_response(id, value.clone(), auth_context, era)
+                self.build_task_created_response(id, value.clone(), auth_context, era, on_created)
                     .await,
             ),
             CreateGate::NotTaskShaped | CreateGate::Closed => None,
@@ -2652,6 +2691,7 @@ mod gate_tests {
                 v1_trigger(false),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(out.is_none(), "task_requested=false must yield None");
@@ -2674,6 +2714,7 @@ mod gate_tests {
                 &value,
                 Some(TaskSupport::Required),
                 v1_trigger(true),
+                None,
                 None,
                 None,
             )
@@ -2700,6 +2741,7 @@ mod gate_tests {
                 v1_trigger(true),
                 None,
                 None,
+                None,
             )
             .await;
         assert!(out.is_none(), "Forbidden must yield None, never an error");
@@ -2717,7 +2759,7 @@ mod gate_tests {
         };
         let value = task_shaped_value();
         let out = dispatch
-            .maybe_build_task_created(id(), &value, None, v1_trigger(true), None, None)
+            .maybe_build_task_created(id(), &value, None, v1_trigger(true), None, None, None)
             .await;
         assert!(out.is_none(), "no task_support must yield None");
     }
@@ -2739,6 +2781,7 @@ mod gate_tests {
                 &value,
                 Some(TaskSupport::Required),
                 v1_trigger(true),
+                None,
                 None,
                 None,
             )
@@ -2791,6 +2834,7 @@ mod gate_tests {
                 v1_trigger(true),
                 None,
                 None,
+                None,
             )
             .await;
         let (resp, claim) = out.expect("Optional + task-shaped must yield Some");
@@ -2817,6 +2861,7 @@ mod gate_tests {
                 &value,
                 Some(TaskSupport::Required),
                 v1_trigger(true),
+                None,
                 None,
                 None,
             )
@@ -3702,11 +3747,11 @@ mod v2_shape_tests {
             "lastUpdatedAt": "2026-07-28T00:00:00Z"
         });
         let (_, v1_claim) = dispatch
-            .build_task_created_response(id(), value.clone(), None, Some(Era::V1))
+            .build_task_created_response(id(), value.clone(), None, Some(Era::V1), None)
             .await;
         assert_eq!(v1_claim, DispatchEnvelopeClaim::NONE);
         let (response, v2_claim) = dispatch
-            .build_task_created_response(id(), value, None, Some(Era::V2))
+            .build_task_created_response(id(), value, None, Some(Era::V2), None)
             .await;
         assert_eq!(v2_claim, DispatchEnvelopeClaim::TASK_CREATED);
         assert_eq!(

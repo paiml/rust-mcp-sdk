@@ -778,6 +778,11 @@ path = "examples/s57_typed_tool_garde_validation.rs"
 required-features = ["full"]
 
 [[example]]
+name = "s58_task_background_worker"
+path = "examples/s58_task_background_worker.rs"
+required-features = ["full"]
+
+[[example]]
 name = "s45_tool_as_task_lifecycle"
 path = "examples/s45_tool_as_task_lifecycle.rs"
 required-features = ["full"]
