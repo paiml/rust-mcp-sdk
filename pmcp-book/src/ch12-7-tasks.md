@@ -304,7 +304,7 @@ For Lambda deployments where each invocation is a separate process, you need ext
 
 ```toml
 [dependencies]
-pmcp-tasks = { version = "0.1", features = ["dynamodb"] }
+pmcp-tasks = { version = "0.2", features = ["dynamodb"] }
 ```
 
 ```rust

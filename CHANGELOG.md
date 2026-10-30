@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [pmcp-tasks 0.2.0] - 2026-10-30
+
+A `pmcp-tasks`-only release; no other crate changes. Minor bump for the new public API and the
+raised `pmcp` floor. Crate published in this release: `pmcp-tasks` **0.2.0**.
+
 ### Added
 
 - **`pmcp-tasks`: `ServerTaskStore`, so its DynamoDB and Redis stores plug into `task_store(...)`
