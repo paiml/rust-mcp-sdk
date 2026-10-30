@@ -31,7 +31,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # The DECLARED sync primitive for the in-memory backends (109-03 review): already
 # vendored via pmcp, no new third-party registry package in the default build.
-parking_lot = "0.12"
+parking_lot = "0.13"
 # clap + tracing-subscriber are used only by the `[[bin]]` targets. They are
 # wasm-compatible regular deps (no special class); the binaries are native-only
 # by nature of serving a transport.
