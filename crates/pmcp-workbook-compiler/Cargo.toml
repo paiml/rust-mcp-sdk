@@ -91,7 +91,7 @@ umya-spreadsheet = "=3.0.0"
 # zstd 0.13, which carries RUSTSEC-2026-0391/0398/0403. zip itself stays on 8.6
 # because umya 3.x pins `^8.6`; see `.cargo/audit.toml` for the zip advisories.
 quick-xml = "0.37"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # Test-only scratch dirs for the bundle-emit tests (no workspace artifacts leak).
